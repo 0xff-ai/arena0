@@ -1,7 +1,7 @@
 //! Bilateral Wasm execution and receipt verification.
 //!
 //! The live path drives the generated guest through the public Host API, and
-//! the verifier consumes the resulting sealed receipt artifact.
+//! the verifier consumes the resulting authenticated receipt artifact.
 
 use std::time::Duration;
 
@@ -41,6 +41,12 @@ async fn rock_paper_scissors_bilateral_runs_and_verifies_receipts() {
     assert_eq!(run.completed_outcome(0), run.completed_outcome(1));
     assert_eq!(run.session_hash(0), run.session_hash(1));
     assert_eq!(run.trace(0), run.trace(1));
+    assert_eq!(run.receipt_bytes(0), run.receipt_bytes(1));
+    assert_eq!(run.receipt(0).receipt_id(), run.receipt(1).receipt_id());
+    assert_eq!(
+        serde_json::to_value(run.receipt(0)).unwrap(),
+        serde_json::to_value(run.receipt(1)).unwrap()
+    );
     let verified = run.verify_all(&wasm).expect("both receipts replay-verify");
 
     for (i, full) in verified.into_iter().enumerate() {
@@ -65,8 +71,7 @@ async fn verify_light_is_sandbox_free_and_self_describing() {
     assert_eq!(verified.session_id, run.session_hash(0));
     assert_eq!(verified.steps as usize, run.trace(0).len());
 
-    // The receipt is content-addressed and sealed. Any byte-level mutation is
-    // rejected before a caller can reinterpret its terminal evidence.
+    // The receipt authenticates its evidence without an exporter seal.
     let mut tampered = bytes;
     let index = tampered.len() / 2;
     tampered[index] ^= 0xFF;
@@ -81,9 +86,8 @@ async fn receipt_terminal_and_activation_evidence_are_not_optional() {
 
     let mut trace = run.trace(0);
     trace.pop();
-    let mut forged = run.receipt(0);
-    // Reassembling a receipt with a truncated trace cannot retain the honest
-    // producer seal. The portable verifier therefore rejects the raw artifact.
+    let forged = run.receipt(0);
+    // A truncated trace cannot satisfy the certified terminal boundary.
     let body = arena0_protocol::ReceiptBody::new(
         forged.body().header().clone(),
         forged.body().outcome().to_vec(),
@@ -91,10 +95,7 @@ async fn receipt_terminal_and_activation_evidence_are_not_optional() {
         trace,
     )
     .expect("shape-only body assembly");
-    assert!(arena0_protocol::Receipt::new(body, forged.seal().clone()).is_err());
-    // Keep the variable consumed by the assertion above and make the intended
-    // failure explicit through the original receipt bytes.
-    let _ = &mut forged;
+    assert!(arena0_protocol::ReceiptArtifact::new(body).is_err());
     assert!(verify_light(&run.receipt_bytes(0)).is_ok());
 }
 
@@ -102,7 +103,11 @@ async fn receipt_terminal_and_activation_evidence_are_not_optional() {
 fn authenticated_stop_is_a_distinct_terminal_result() {
     let synthetic = Synthetic::new(2);
     let cause = synthetic.authenticated_stop(0, arena0_protocol::AbortKind::Fail, "guest failed");
-    let receipt = synthetic.stopped_receipt(0, cause, Vec::new());
+    let receipt = synthetic.stopped_receipt(cause, Vec::new());
+    assert!(matches!(
+        receipt,
+        arena0_protocol::ReceiptArtifact::StopReport(_)
+    ));
     let bytes = receipt.encode().expect("encode stopped receipt");
     let verified = verify_light(&bytes).expect("stopped receipt verifies");
     assert!(matches!(

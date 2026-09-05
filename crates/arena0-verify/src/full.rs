@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use arena0_program::{CallStatus, JsonBytes, PROGRAM_MAX_LEN, ProgramHash};
 use arena0_protocol::{
-    Committed, Effect, Ensemble, PublicEffect, PublicEvent, Receipt, SharedStateBytes, StateHash,
-    StopCause, TraceEntry,
+    Committed, Effect, Ensemble, PublicEffect, PublicEvent, ReceiptArtifact, SharedStateBytes,
+    StateHash, StopCause, TraceEntry,
 };
 use arena0_sandbox::{
     AdmittedProgram, InitializeCall, OutcomeCall, Program, SharedCall, SharedEvent, WasmtimeEngine,
@@ -184,17 +184,21 @@ fn verify_full_inner(
     })
 }
 
-fn decode_receipt(receipt_bytes: &[u8]) -> Result<Receipt, VerifyError> {
+fn decode_receipt(receipt_bytes: &[u8]) -> Result<ReceiptArtifact, VerifyError> {
     if receipt_bytes.len() > arena0_protocol::MAX_RECEIPT_BYTES {
         return Err(VerifyError::ReceiptTooLarge {
             actual: receipt_bytes.len(),
             max: arena0_protocol::MAX_RECEIPT_BYTES,
         });
     }
-    Receipt::decode(receipt_bytes).map_err(|error| VerifyError::ReceiptDecode(error.to_string()))
+    ReceiptArtifact::decode(receipt_bytes)
+        .map_err(|error| VerifyError::ReceiptDecode(error.to_string()))
 }
 
-fn verify_profile(admitted: &AdmittedProgram, receipt: &Receipt) -> Result<(), VerifyError> {
+fn verify_profile(
+    admitted: &AdmittedProgram,
+    receipt: &ReceiptArtifact,
+) -> Result<(), VerifyError> {
     let attested = receipt
         .body()
         .header()
@@ -352,10 +356,9 @@ mod tests {
     };
     use arena0_protocol::{
         Activation, AggregateAttestation, CHAIN_START, Ensemble, MessageId, Offer, OfferData,
-        OutcomeHash, PeerId, ProducerSeal, ProofId, PublicEffect, PublicEvent, ReceiptBody,
-        ReceiptId, ReceiptSealData, SessionHeader, SessionTerminal, SignerSet, StepCommitment,
-        TRACE_FORMAT_VERSION, TerminalCommitment, Ticket, TicketAction, TicketData, TicketHash,
-        TraceEntry, WitnessCommitment,
+        OutcomeHash, PeerId, PublicEffect, PublicEvent, ReceiptBody, SessionHeader,
+        SessionTerminal, SignerSet, StepCommitment, TRACE_FORMAT_VERSION, TerminalCommitment,
+        Ticket, TicketAction, TicketData, TicketHash, TraceEntry, WitnessCommitment,
     };
     use arena0_sandbox::SharedEvent;
 
@@ -614,22 +617,15 @@ mod tests {
                     arena0_protocol::ReceiptTermination::Stopped {
                         cause: arena0_protocol::StopCause::Authenticated(occurrence),
                     },
-                    peers[0],
                 ),
                 Vec::new(),
                 params.into_bytes(),
                 vec![first],
             )
             .expect("stopped receipt body");
-            let proof_id = ProofId::derive(&body).expect("proof id");
-            let receipt_id = ReceiptId::derive_body(&body).expect("receipt id");
-            let seal_data = ReceiptSealData::new(proof_id, receipt_id, peers[0]);
-            let seal = ProducerSeal::new(
-                seal_data,
-                identities[0].sign(&seal_data.signing_bytes().expect("seal bytes")),
-            );
-            return arena0_protocol::Receipt::new(body, seal)
-                .expect("sealed stopped receipt")
+
+            return arena0_protocol::ReceiptArtifact::new(body)
+                .expect("authenticated stop report")
                 .encode()
                 .expect("stopped receipt encoding");
         }
@@ -733,22 +729,15 @@ mod tests {
             SessionHeader::new(
                 activation,
                 arena0_protocol::ReceiptTermination::Completed { terminal },
-                peers[0],
             ),
             outcome,
             params.into_bytes(),
             vec![first, second],
         )
         .expect("receipt body");
-        let proof_id = ProofId::derive(&body).expect("proof id");
-        let receipt_id = ReceiptId::derive_body(&body).expect("receipt id");
-        let seal_data = ReceiptSealData::new(proof_id, receipt_id, peers[0]);
-        let seal = ProducerSeal::new(
-            seal_data,
-            identities[0].sign(&seal_data.signing_bytes().expect("seal bytes")),
-        );
-        arena0_protocol::Receipt::new(body, seal)
-            .expect("sealed receipt")
+
+        arena0_protocol::ReceiptArtifact::new(body)
+            .expect("authenticated artifact")
             .encode()
             .expect("receipt encoding")
     }
@@ -813,7 +802,7 @@ mod tests {
     fn receipt_construction_rejects_a_tampered_fuel_measurement() {
         let (_program, admitted) = admitted_replay_program();
         let receipt = replay_receipt(&admitted, false);
-        let decoded = Receipt::decode(&receipt).expect("decode fixture receipt");
+        let decoded = ReceiptArtifact::decode(&receipt).expect("decode fixture receipt");
         let body = decoded.body().clone();
         let mut trace = body.trace().to_vec();
         trace[1].fuel_used = trace[1].fuel_used.saturating_add(1);
@@ -821,26 +810,17 @@ mod tests {
             SessionHeader::new(
                 body.header().activation.clone(),
                 body.header().terminal.clone(),
-                body.header().producer,
             ),
             body.outcome().to_vec(),
             body.params().to_vec(),
             trace,
         )
         .expect("tampered body shape");
-        let proof_id = ProofId::derive(&body).expect("proof id");
-        let receipt_id = ReceiptId::derive_body(&body).expect("receipt id");
-        let producer = decoded.producer();
-        let identity = NodeKeys::from_secret(SecretKey::from_bytes([1; 32]));
-        let seal_data = ReceiptSealData::new(proof_id, receipt_id, producer);
-        let seal = ProducerSeal::new(
-            seal_data,
-            identity.sign(&seal_data.signing_bytes().expect("seal bytes")),
-        );
-        // Receipt construction validates the step agreement, which commits to
+
+        // ReceiptArtifact construction validates the step agreement, which commits to
         // fuel, before an invalid artifact can be serialized.
         assert!(matches!(
-            Receipt::new(body, seal),
+            ReceiptArtifact::new(body),
             Err(arena0_protocol::ProtocolError::InvalidCertificate(_))
         ));
     }

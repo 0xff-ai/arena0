@@ -58,8 +58,8 @@ impl RunStage {
             Self::Negotiation => "negotiating execution",
             Self::Activation => "activating session",
             Self::Execution => "waiting for execution",
-            Self::Verification => "verifying producer receipts",
-            Self::Replay => "replaying producer receipts",
+            Self::Verification => "verifying Host receipts",
+            Self::Replay => "replaying Host receipts",
         }
     }
 

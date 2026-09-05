@@ -14,9 +14,9 @@ use crate::{ExecId, PeerId, StateHash};
 
 use super::{
     ActiveTimer, ExecutionBinding, ExecutionStatus, ExecutionVersion, MAX_ACTIVE_TIMERS,
-    MAX_EXECUTION_STATE_BYTES, ParticipantStepSignature, PrivateCursor, ProducerSealRequest,
-    ProofId, ProtocolError, PublicCursor, Receipt, ReceiptBody, ReceiptId, TerminalOutcome,
-    TerminalProof, TimerId, ensure_encoded, validate_proposal,
+    MAX_EXECUTION_STATE_BYTES, ParticipantStepSignature, PrivateCursor, ProtocolError,
+    PublicCursor, ReceiptArtifact, ReceiptId, TerminalOutcome, TerminalProof, TimerId,
+    ensure_encoded, validate_proposal,
 };
 /// The pending public proposal retained in the durable aggregate.
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -191,16 +191,16 @@ impl TerminalCertificate {
 }
 
 /// A terminal publication commit.  Its effect is emitted only when the
-/// terminal certificate is full and the sealed receipt is present and valid.
+/// terminal certificate is full and the authenticated artifact is present and valid.
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct TerminalPublication {
-    pub(crate) receipt: Receipt,
+    pub(crate) receipt: ReceiptArtifact,
 }
 
 impl TerminalPublication {
-    /// Borrow the sealed receipt artifact.
+    /// Borrow the authenticated receipt artifact.
     #[must_use]
-    pub const fn receipt(&self) -> &Receipt {
+    pub const fn receipt(&self) -> &ReceiptArtifact {
         &self.receipt
     }
 }
@@ -345,7 +345,7 @@ impl ExecutionState {
         &self.binding
     }
 
-    /// Return the local producer identity used for the terminal seal.
+    /// Return the local Host identity owning this execution.
     #[must_use]
     pub const fn producer(&self) -> PeerId {
         self.producer
@@ -369,17 +369,10 @@ impl ExecutionState {
     /// receipt, and proof-artifact rows agree with the aggregate. Unpublished
     /// statuses return `None` and therefore must not have publication rows.
     #[must_use]
-    pub const fn published_terminal_ids(&self) -> Option<(ProofId, ReceiptId, PeerId)> {
+    pub const fn published_receipt_id(&self) -> Option<ReceiptId> {
         match &self.status {
-            ExecutionStatus::Completed { proof } => {
-                Some((proof.proof_id, proof.receipt_id, proof.producer))
-            }
-            ExecutionStatus::StoppedPublished {
-                proof_id,
-                receipt_id,
-                producer,
-                ..
-            } => Some((*proof_id, *receipt_id, *producer)),
+            ExecutionStatus::Completed { proof } => Some(proof.receipt_id),
+            ExecutionStatus::StoppedPublished { receipt_id, .. } => Some(*receipt_id),
             ExecutionStatus::Activating
             | ExecutionStatus::Active
             | ExecutionStatus::Waiting { .. }
@@ -447,38 +440,16 @@ impl ExecutionState {
         }
     }
 
-    /// Borrow the producer-seal request after the complete receipt is staged.
-    #[must_use]
-    pub fn producer_seal_request(&self) -> Option<&ProducerSealRequest> {
-        match self.status.terminal_proof() {
-            Some(TerminalProof::ReceiptAssembled { request, .. })
-            | Some(TerminalProof::StoppedReceiptAssembled { request, .. }) => Some(request),
-            _ => None,
-        }
-    }
-
     /// Borrow the terminal certificate once it has been formed.
     #[must_use]
     pub fn terminal_certificate(&self) -> Option<&TerminalCertificate> {
         match self.status.terminal_proof() {
-            Some(TerminalProof::Certified { certificate, .. })
-            | Some(TerminalProof::ReceiptAssembled { certificate, .. }) => Some(certificate),
+            Some(TerminalProof::Certified { certificate, .. }) => Some(certificate),
             Some(TerminalProof::Pending { .. }) => None,
-            Some(TerminalProof::StoppedReceiptAssembled { .. }) => None,
             None => self
                 .status
                 .published_proof()
                 .map(|proof| &proof.certificate),
-        }
-    }
-
-    /// Borrow the complete staged receipt body while waiting for the producer seal.
-    #[must_use]
-    pub fn receipt_body(&self) -> Option<&ReceiptBody> {
-        match self.status.terminal_proof() {
-            Some(TerminalProof::ReceiptAssembled { body, .. })
-            | Some(TerminalProof::StoppedReceiptAssembled { body, .. }) => Some(body),
-            _ => None,
         }
     }
 
@@ -488,9 +459,7 @@ impl ExecutionState {
     pub fn terminal_outcome(&self) -> Option<&TerminalOutcome> {
         match self.status.terminal_proof() {
             Some(TerminalProof::Pending { outcome, .. })
-            | Some(TerminalProof::Certified { outcome, .. })
-            | Some(TerminalProof::ReceiptAssembled { outcome, .. }) => Some(outcome),
-            Some(TerminalProof::StoppedReceiptAssembled { .. }) => None,
+            | Some(TerminalProof::Certified { outcome, .. }) => Some(outcome),
             None => self.status.published_proof().map(|proof| &proof.outcome),
         }
     }
@@ -597,7 +566,6 @@ impl ExecutionState {
         self.status.validate_binding(
             self.execution_id,
             &self.binding,
-            self.producer,
             self.public,
             self.private,
         )?;

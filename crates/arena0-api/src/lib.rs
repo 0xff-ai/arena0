@@ -18,14 +18,14 @@ mod events;
 mod request;
 mod response;
 
-pub use arena0_protocol::{ColorDepth, ExecLifecycle, PendingId, Receipt, TerminalResult, View};
+pub use arena0_protocol::{
+    ColorDepth, ExecLifecycle, PendingId, ReceiptArtifact, TerminalResult, View,
+};
 pub use events::{
     EventData, EventFilter, EventFrame, ExecOrigin, ExecutionFailureKind, NegotiationStage,
     SessionTerminal,
 };
-pub use request::{
-    AwaitState, EnsembleSpec, IdRef, ProgramRefError, ReceiptKey, ReceiptRef, Request,
-};
+pub use request::{AwaitState, EnsembleSpec, IdRef, ProgramRefError, ReceiptRef, Request};
 pub use response::{
     ActivationInspection, ActivationInspectionState, ActivationParticipant, ApiError, ApiErrorCode,
     DaemonInfo, ExecStatus, ExecStatusState, ExecutionInspection, FullVerifiedTerminal, IdInfo,
@@ -99,10 +99,7 @@ mod tests {
             (Request::ReceiptList, "receipt.list"),
             (
                 Request::ReceiptGet {
-                    key: ReceiptKey {
-                        session_id: SessionHash([9u8; 32]),
-                        producer: PeerId([10u8; 32]),
-                    },
+                    receipt: ReceiptRef::Produced(SessionHash([9u8; 32])),
                 },
                 "receipt.get",
             ),
@@ -355,6 +352,7 @@ mod tests {
         );
 
         let response = Ok(ResponseOk::Verified {
+            receipt_id: arena0_protocol::ReceiptId::from_bytes([9; 32]),
             program_id: ProgramHash([1; 32]),
             session_id: SessionHash([2; 32]),
             ensemble: vec![PeerId([3; 32])],
@@ -383,8 +381,8 @@ mod tests {
         use arena0_crypto::{ExecutionKey, ExecutionSalt, NodeKeys, SecretKey};
         use arena0_protocol::{
             AbortKind, AbortOccurrence, Activation, Offer, OfferData, PreparedActivation,
-            ReceiptBody, ReceiptId, ReceiptSealData, ReceiptTermination, SessionHeader, StateHash,
-            Ticket, TicketAction, TicketData, TicketHash,
+            ReceiptBody, ReceiptId, ReceiptTermination, SessionHeader, StateHash, Ticket,
+            TicketAction, TicketData, TicketHash,
         };
         let identities = [
             NodeKeys::from_secret(SecretKey::from_bytes([1; 32])),
@@ -495,23 +493,15 @@ mod tests {
                 ReceiptTermination::Stopped {
                     cause: arena0_protocol::StopCause::Authenticated(occurrence),
                 },
-                peer,
             ),
             Vec::new(),
             params.into_bytes(),
             Vec::new(),
         )
         .expect("receipt body");
-        let proof_id = arena0_protocol::ProofId::derive(&body).expect("proof id");
-        let receipt_id = ReceiptId::derive_body(&body).expect("receipt id");
-        let seal_data = ReceiptSealData::new(proof_id, receipt_id, peer);
-        let seal = arena0_protocol::ProducerSeal::new(
-            seal_data,
-            participants[0]
-                .1
-                .sign(&seal_data.signing_bytes().expect("seal bytes")),
-        );
-        let receipt = Receipt::new(body, seal).expect("receipt");
+
+        let receipt_id = ReceiptId::derive_body(&body).expect("id");
+        let receipt = ReceiptArtifact::new(body).expect("receipt");
         let id1 = receipt.receipt_id();
         let id2 = receipt.clone().receipt_id();
         assert_eq!(id1, id2, "receipt_id is deterministic");

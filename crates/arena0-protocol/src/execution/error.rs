@@ -1,5 +1,5 @@
 use crate::exec::ExecLifecycle;
-use crate::{ActivationError, PeerId, ReceiptId, StateHash};
+use crate::{ActivationError, PeerId, StateHash};
 
 use super::{OutboxId, TimerId};
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -123,15 +123,6 @@ pub enum ProtocolError {
     /// Terminal proof is missing.
     #[error("terminal proof is not pending")]
     TerminalProofMissing,
-    /// A producer seal did not bind the certified body and producer.
-    #[error("producer seal does not bind the certified receipt body")]
-    InvalidProducerSeal,
-    /// Producer seal verification failed due to malformed cryptographic data.
-    #[error("producer seal verification failed: {0}")]
-    InvalidProducerSealCrypto(String),
-    /// A receipt seal preimage has an unknown domain, version, or identity.
-    #[error("invalid receipt seal data")]
-    InvalidSealData,
     /// A complete receipt body does not match the durable execution binding.
     #[error("receipt body does not match the execution binding or terminal certificate")]
     ReceiptBodyMismatch,
@@ -181,9 +172,6 @@ pub enum ProtocolError {
     /// A standalone timer firing cannot be committed without its guest result.
     #[error("timer firing must be committed with its private guest result")]
     TimerResultRequired,
-    /// Producer seal identity does not match its receipt body bytes.
-    #[error("receipt id is not derived from its canonical payload")]
-    InvalidReceiptId { receipt_id: ReceiptId },
     /// Terminal proof is already complete.
     #[error("terminal proof is already published")]
     TerminalAlreadyPublished,

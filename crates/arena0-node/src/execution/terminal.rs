@@ -5,9 +5,7 @@
 
 use crate::context::{ExecError, SessionMessage};
 use arena0_crypto::NodeKeys;
-use arena0_protocol::{
-    AbortKind, AbortOccurrence, ExecutionInput, PeerIdSource, ReceiptSealData, ReceiptWork,
-};
+use arena0_protocol::{AbortKind, AbortOccurrence, ExecutionInput, PeerIdSource, ReceiptWork};
 use arena0_store::{ApplyOutcome, ExecutionStore};
 
 use super::{ExecutionActor, MAX_CAS_RETRIES, now_ms, truncate_reason};
@@ -121,12 +119,9 @@ impl ExecutionActor {
 }
 
 /// Complete local proof work from durable evidence even when the guest or a
-/// peer is unavailable. Outbox delivery retains its own causal order and may
-/// redeliver the same producer-seal request after this idempotent handoff.
-pub(crate) async fn finalize_receipt(
-    store: &mut ExecutionStore,
-    identity: &NodeKeys,
-) -> Result<(), ExecError> {
+/// peer is unavailable. The store atomically publishes the evidence and retains
+/// outbox delivery in its own causal order.
+pub(crate) async fn finalize_receipt(store: &mut ExecutionStore) -> Result<(), ExecError> {
     for _ in 0..MAX_CAS_RETRIES {
         let state = store
             .load_execution()
@@ -137,7 +132,7 @@ pub(crate) async fn finalize_receipt(
             | ReceiptWork::CollectSignatures
             | ReceiptWork::Published
             | ReceiptWork::Incomplete => return Ok(()),
-            ReceiptWork::Assemble => match store.assemble_and_stage_receipt_body(now_ms()).await? {
+            ReceiptWork::Assemble => match store.assemble_receipt(now_ms()).await? {
                 ApplyOutcome::Committed(_)
                 | ApplyOutcome::AlreadyApplied
                 | ApplyOutcome::VersionMismatch { .. } => {}
@@ -153,9 +148,6 @@ pub(crate) async fn finalize_receipt(
                     ));
                 }
             },
-            ReceiptWork::Seal(request) => {
-                return apply_producer_seal(store, identity, *request.data()).await;
-            }
         }
     }
     Err(ExecError::Unavailable(
@@ -188,8 +180,8 @@ pub(crate) async fn fail_execution(
             ));
         }
         let input = match state.status().receipt_work() {
-            ReceiptWork::Assemble | ReceiptWork::Seal(_) => {
-                finalize_receipt(store, identity).await?;
+            ReceiptWork::Assemble => {
+                finalize_receipt(store).await?;
                 return Ok(FailureOutcome::TerminalPreserved);
             }
             ReceiptWork::Published | ReceiptWork::Incomplete => {
@@ -211,7 +203,7 @@ pub(crate) async fn fail_execution(
         };
         match store.apply_input(input, now_ms()).await? {
             ApplyOutcome::Committed(_) | ApplyOutcome::AlreadyApplied => {
-                finalize_receipt(store, identity).await?;
+                finalize_receipt(store).await?;
                 return Ok(FailureOutcome::Recorded);
             }
             ApplyOutcome::VersionMismatch { .. } => continue,
@@ -230,41 +222,5 @@ pub(crate) async fn fail_execution(
     }
     Err(ExecError::Unavailable(
         "failure CAS retry limit exceeded".into(),
-    ))
-}
-
-pub(super) async fn apply_producer_seal(
-    store: &mut ExecutionStore,
-    identity: &NodeKeys,
-    data: ReceiptSealData,
-) -> Result<(), ExecError> {
-    if data.producer() != identity.peer_id() {
-        return Err(ExecError::InvalidState(
-            "producer seal names another Host".into(),
-        ));
-    }
-    let seal = arena0_protocol::ProducerSeal::new(data, identity.sign(&data.signing_bytes()?));
-    for _ in 0..MAX_CAS_RETRIES {
-        match store
-            .apply_input(ExecutionInput::ProducerSeal(seal.clone()), now_ms())
-            .await?
-        {
-            ApplyOutcome::Committed(_) | ApplyOutcome::AlreadyApplied => return Ok(()),
-            ApplyOutcome::VersionMismatch { .. } => continue,
-            ApplyOutcome::Conflict(conflict) => {
-                return Err(ExecError::InvalidState(format!(
-                    "producer seal conflicts with durable proof: {conflict:?}"
-                )));
-            }
-            ApplyOutcome::InboxAlreadyApplied { .. }
-            | ApplyOutcome::InboxAlreadyConsumed { .. } => {
-                return Err(ExecError::InvalidState(
-                    "producer seal unexpectedly carried inbox state".into(),
-                ));
-            }
-        }
-    }
-    Err(ExecError::Unavailable(
-        "producer seal CAS retry limit exceeded".into(),
     ))
 }

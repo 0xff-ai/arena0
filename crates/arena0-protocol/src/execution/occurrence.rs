@@ -35,8 +35,6 @@ pub enum OccurrenceKind {
     TerminalSignature,
     /// The complete assembled receipt body.
     ReceiptBody,
-    /// The producer's seal over a receipt body.
-    ProducerSeal,
     /// A signed local or peer abort/fail occurrence.
     Abort,
     /// A local interruption while terminal proof is being assembled.
@@ -54,7 +52,6 @@ impl OccurrenceKind {
             Self::StepSignature => 0x03,
             Self::TerminalSignature => 0x04,
             Self::ReceiptBody => 0x05,
-            Self::ProducerSeal => 0x06,
             Self::Abort => 0x07,
             Self::InterruptTerminal => 0x08,
         }
@@ -69,7 +66,6 @@ impl OccurrenceKind {
             0x03 => Ok(Self::StepSignature),
             0x04 => Ok(Self::TerminalSignature),
             0x05 => Ok(Self::ReceiptBody),
-            0x06 => Ok(Self::ProducerSeal),
             0x07 => Ok(Self::Abort),
             0x08 => Ok(Self::InterruptTerminal),
             tag => Err(borsh::io::Error::new(

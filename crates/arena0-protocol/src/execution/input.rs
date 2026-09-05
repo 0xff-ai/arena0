@@ -7,8 +7,8 @@ use crate::bounded::read_string as read_bounded_string;
 use super::{
     AbortOccurrence, ExecutionState, MAX_EXECUTION_INPUT_BYTES, MAX_TERMINAL_REASON_BYTES,
     OccurrenceDigest, OccurrenceEvidence, OccurrenceKey, OccurrenceKind, ParticipantStepSignature,
-    ParticipantTerminalSignature, PrivateDelta, ProducerSeal, ProtocolError, ReceiptBody,
-    SharedDelta, ensure_encoded, ensure_payload, validate_receipt_body_shape,
+    ParticipantTerminalSignature, PrivateDelta, ProtocolError, ReceiptBody, SharedDelta,
+    ensure_encoded, ensure_payload, validate_receipt_body_shape,
 };
 
 /// Explicit input to the pure execution reducer.
@@ -26,8 +26,6 @@ pub enum ExecutionInput {
     TerminalSignature(ParticipantTerminalSignature),
     /// Supply the complete receipt body after terminal certification.
     ReceiptBody(Box<ReceiptBody>),
-    /// Supply the producer's seal after the complete receipt body is staged.
-    ProducerSeal(ProducerSeal),
     /// Accept a signed local or peer abort/fail occurrence.  The sender and
     /// terminal kind are authenticated by the occurrence itself; there is no
     /// separate `PeerAbort` or unsigned `Fail` path.
@@ -61,10 +59,6 @@ impl BorshSerialize for ExecutionInput {
                 BorshSerialize::serialize(&5u8, writer)?;
                 BorshSerialize::serialize(body, writer)
             }
-            Self::ProducerSeal(seal) => {
-                BorshSerialize::serialize(&6u8, writer)?;
-                BorshSerialize::serialize(seal, writer)
-            }
             Self::Abort(occurrence) => {
                 BorshSerialize::serialize(&7u8, writer)?;
                 BorshSerialize::serialize(occurrence, writer)
@@ -94,9 +88,6 @@ impl BorshDeserialize for ExecutionInput {
             5 => Ok(Self::ReceiptBody(Box::new(
                 ReceiptBody::deserialize_reader(reader)?,
             ))),
-            6 => Ok(Self::ProducerSeal(ProducerSeal::deserialize_reader(
-                reader,
-            )?)),
             7 => Ok(Self::Abort(AbortOccurrence::deserialize_reader(reader)?)),
             8 => Ok(Self::InterruptTerminal(read_bounded_string(
                 reader,
@@ -174,11 +165,6 @@ impl ExecutionInput {
                 borsh::to_vec(&(state.public().next_step(), state.public().chain_hash()))
                     .map_err(|error| ProtocolError::Serialization(error.to_string()))?,
             ),
-            Self::ProducerSeal(seal) => (
-                OccurrenceKind::ProducerSeal,
-                borsh::to_vec(&seal.data().receipt_id())
-                    .map_err(|error| ProtocolError::Serialization(error.to_string()))?,
-            ),
             Self::Abort(occurrence) => (
                 OccurrenceKind::Abort,
                 borsh::to_vec(&(occurrence.sender(), *occurrence.coordinate()))
@@ -219,10 +205,7 @@ impl ExecutionInput {
             Self::InterruptTerminal(reason) => {
                 ensure_payload("terminal reason", reason.len(), MAX_TERMINAL_REASON_BYTES)?;
             }
-            Self::Activate
-            | Self::StepSignature(_)
-            | Self::TerminalSignature(_)
-            | Self::ProducerSeal(_) => {}
+            Self::Activate | Self::StepSignature(_) | Self::TerminalSignature(_) => {}
         }
         Ok(())
     }

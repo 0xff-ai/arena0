@@ -17,7 +17,7 @@ use anyhow::{Context, anyhow, bail};
 use arena0_client::answer;
 use arena0_client::api::{
     ApiErrorCode, AwaitState, EnsembleSpec, EventData, EventFilter, NextEvent, ProgramDetail,
-    ProgramSummary, ReceiptKey, ReceiptRef, Request, ResponseOk, VerifiedResult,
+    ProgramSummary, ReceiptRef, Request, ResponseOk, VerifiedResult,
 };
 use arena0_client::proto::{DaemonClient, Subscription};
 use arena0_client::protocol::{
@@ -201,7 +201,7 @@ enum TerminalConsensus {
     Stopped,
 }
 
-/// The authenticated terminal form returned to the CLI after every producer
+/// The authenticated terminal form returned to the CLI after every Host
 /// receipt agrees. Failures without receipt evidence never construct this type.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum AggregateTerminal {
@@ -233,11 +233,11 @@ impl AggregateTerminal {
     }
 }
 
-/// One producer's verified evidence.  Producer seals are intentionally not
-/// compared: each independent Host must seal its own receipt.
+/// The exact artifact independently verified by one local Host.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ProducerEvidence {
-    pub(crate) producer: PeerId,
+pub(crate) struct HostEvidence {
+    pub(crate) peer_id: PeerId,
+    pub(crate) receipt_id: arena0_client::protocol::ReceiptId,
     pub(crate) program_id: ProgramHash,
     pub(crate) session_id: SessionHash,
     pub(crate) ensemble: Vec<PeerId>,
@@ -245,9 +245,10 @@ pub(crate) struct ProducerEvidence {
     pub(crate) result: VerifiedResult,
 }
 
-/// Shared facts recovered from every producer receipt.
+/// Shared facts recovered from every Host receipt.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct EvidenceAgreement {
+    pub(crate) receipt_id: arena0_client::protocol::ReceiptId,
     pub(crate) program_id: ProgramHash,
     pub(crate) session_id: SessionHash,
     pub(crate) ensemble: Vec<PeerId>,
@@ -259,13 +260,14 @@ pub(crate) struct EvidenceAgreement {
 /// no private driver data.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AggregateResult {
+    pub(crate) receipt_id: arena0_client::protocol::ReceiptId,
     pub(crate) program_id: ProgramHash,
     pub(crate) session_id: SessionHash,
     pub(crate) participants: Vec<PeerId>,
     pub(crate) steps: u64,
     pub(crate) terminal: AggregateTerminal,
     pub(crate) verification: VerificationSummary,
-    pub(crate) receipts: Vec<ProducerEvidence>,
+    pub(crate) receipts: Vec<HostEvidence>,
 }
 
 /// Aggregate verification facts suitable for human or JSON presentation.
@@ -529,11 +531,11 @@ impl Coordinator {
                             tui.complete(outcome.clone()).await?
                         }
                         AggregateTerminal::Stopped => {
-                            tui.stop("run stopped; producer receipts verified".to_owned())
+                            tui.stop("run stopped; Host receipts verified".to_owned())
                                 .await?;
                         }
                         AggregateTerminal::Failed => {
-                            tui.fail("run failed; producer receipts verified".to_owned())
+                            tui.fail("run failed; Host receipts verified".to_owned())
                                 .await?;
                         }
                     }
@@ -774,6 +776,7 @@ impl Coordinator {
         let terminal = bind_verified_terminal(terminal, &agreement.result)?;
 
         Ok(AggregateResult {
+            receipt_id: agreement.receipt_id,
             program_id,
             session_id,
             participants: agreement.ensemble,
@@ -848,16 +851,16 @@ impl Coordinator {
         session_id: SessionHash,
         tier: VerificationTier,
         tui: Option<TuiHandle>,
-    ) -> anyhow::Result<Vec<ProducerEvidence>> {
+    ) -> anyhow::Result<Vec<HostEvidence>> {
         let mut jobs = JoinSet::new();
         for participant in &self.participants {
             let client = participant.client.clone();
-            let producer = participant.peer_id;
+            let peer_id = participant.peer_id;
             let host = participant.host.clone();
             jobs.spawn(async move {
-                verify_one_receipt(client, session_id, producer, tier)
+                verify_one_receipt(client, session_id, peer_id, tier)
                     .await
-                    .map(|evidence| (host, producer, evidence))
+                    .map(|evidence| (host, peer_id, evidence))
             });
         }
 
@@ -865,13 +868,13 @@ impl Coordinator {
         let mut verified = 0;
         while let Some(joined) = jobs.join_next().await {
             self.progress.advance();
-            let (host, producer, receipt) =
+            let (host, peer_id, receipt) =
                 joined.context("coordinated receipt verification task failed to join")??;
             verified += 1;
             if let Some(tui) = &tui {
                 tui.update(RunUpdate::ReceiptVerified {
                     host,
-                    producer,
+                    peer_id,
                     tier: tier.as_str(),
                 })
                 .await?;
@@ -884,7 +887,7 @@ impl Coordinator {
             }
             evidence.push(receipt);
         }
-        evidence.sort_by_key(|entry| entry.producer);
+        evidence.sort_by_key(|entry| entry.peer_id);
         Ok(evidence)
     }
 }
@@ -2001,31 +2004,29 @@ where
 async fn verify_one_receipt(
     client: DaemonClient,
     session_id: SessionHash,
-    producer: PeerId,
+    peer_id: PeerId,
     tier: VerificationTier,
-) -> anyhow::Result<ProducerEvidence> {
-    let key = ReceiptKey {
-        session_id,
-        producer,
-    };
+) -> anyhow::Result<HostEvidence> {
     let mut last_error = None;
     for attempt in 0..RECEIPT_RETRY_ATTEMPTS {
         match client
             .call_raw(&Request::ReceiptVerify {
-                receipt: ReceiptRef::Produced(key),
+                receipt: ReceiptRef::Produced(session_id),
                 full: tier.is_full(),
             })
             .await?
         {
             Ok(ResponseOk::Verified {
+                receipt_id,
                 program_id,
                 session_id,
                 ensemble,
                 steps,
                 result,
             }) => {
-                return Ok(ProducerEvidence {
-                    producer,
+                return Ok(HostEvidence {
+                    receipt_id,
+                    peer_id,
                     program_id,
                     session_id,
                     ensemble,
@@ -2096,30 +2097,34 @@ fn compare_terminals(terminals: &[HostTerminal]) -> anyhow::Result<TerminalConse
     Ok(consensus)
 }
 
-/// Compare the facts every producer receipt claims.  This is intentionally a
+/// Compare the facts every Host receipt claims.  This is intentionally a
 /// pure function so disagreement remains easy to test without a daemon.
-pub(crate) fn compare_evidence(receipts: &[ProducerEvidence]) -> anyhow::Result<EvidenceAgreement> {
+pub(crate) fn compare_evidence(receipts: &[HostEvidence]) -> anyhow::Result<EvidenceAgreement> {
     let Some(first) = receipts.first() else {
-        bail!("no producer receipts were verified");
+        bail!("no Host receipts were verified");
     };
     for receipt in &receipts[1..] {
+        if receipt.receipt_id != first.receipt_id {
+            bail!("Hosts retained different receipt artifacts");
+        }
         if receipt.program_id != first.program_id {
-            bail!("producer receipts disagree on ProgramHash");
+            bail!("Host receipts disagree on ProgramHash");
         }
         if receipt.session_id != first.session_id {
-            bail!("producer receipts disagree on SessionHash");
+            bail!("Host receipts disagree on SessionHash");
         }
         if receipt.ensemble != first.ensemble {
-            bail!("producer receipts disagree on ordered participant ensemble");
+            bail!("Host receipts disagree on ordered participant ensemble");
         }
         if receipt.steps != first.steps {
-            bail!("producer receipts disagree on step count");
+            bail!("Host receipts disagree on step count");
         }
         if receipt.result != first.result {
-            bail!("producer receipts disagree on terminal result");
+            bail!("Host receipts disagree on terminal result");
         }
     }
     Ok(EvidenceAgreement {
+        receipt_id: first.receipt_id,
         program_id: first.program_id,
         session_id: first.session_id,
         ensemble: first.ensemble.clone(),
@@ -2674,6 +2679,7 @@ mod tests {
                     outcome: Some(json!({"winner": "none"})),
                 })),
                 Ok(ResponseOk::Verified {
+                    receipt_id: arena0_client::protocol::ReceiptId::from_bytes([9; 32]),
                     program_id,
                     session_id,
                     ensemble: peers.to_vec(),
@@ -3218,11 +3224,11 @@ mod tests {
 
     #[test]
     fn evidence_comparison_rejects_terminal_disagreement() {
-        let producer_a = PeerId([1; 32]);
-        let producer_b = PeerId([2; 32]);
+        let peer_a = PeerId([1; 32]);
+        let peer_b = PeerId([2; 32]);
         let session_id = SessionHash([3; 32]);
         let program_id = ProgramHash([4; 32]);
-        let ensemble = vec![producer_a, producer_b];
+        let ensemble = vec![peer_a, peer_b];
         let result = VerifiedResult::Light {
             terminal: arena0_client::api::LightVerifiedTerminal::Completed {
                 outcome_borsh: vec![1],
@@ -3236,16 +3242,18 @@ mod tests {
             outcome_borsh.push(2);
         }
         let receipts = vec![
-            ProducerEvidence {
-                producer: producer_a,
+            HostEvidence {
+                receipt_id: arena0_client::protocol::ReceiptId::from_bytes([9; 32]),
+                peer_id: peer_a,
                 program_id,
                 session_id,
                 ensemble: ensemble.clone(),
                 steps: 1,
                 result,
             },
-            ProducerEvidence {
-                producer: producer_b,
+            HostEvidence {
+                receipt_id: arena0_client::protocol::ReceiptId::from_bytes([9; 32]),
+                peer_id: peer_b,
                 program_id,
                 session_id,
                 ensemble,
@@ -3258,6 +3266,33 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("terminal result")
+        );
+    }
+
+    #[test]
+    fn matching_outcomes_do_not_hide_different_receipt_ids() {
+        let first = HostEvidence {
+            peer_id: PeerId([1; 32]),
+            receipt_id: arena0_client::protocol::ReceiptId::from_bytes([3; 32]),
+            program_id: ProgramHash([4; 32]),
+            session_id: SessionHash([5; 32]),
+            ensemble: vec![PeerId([1; 32]), PeerId([2; 32])],
+            steps: 1,
+            result: VerifiedResult::Light {
+                terminal: LightVerifiedTerminal::Completed {
+                    outcome_borsh: vec![7],
+                },
+            },
+        };
+        let mut second = first.clone();
+        second.peer_id = PeerId([2; 32]);
+        assert!(compare_evidence(&[first.clone(), second.clone()]).is_ok());
+        second.receipt_id = arena0_client::protocol::ReceiptId::from_bytes([6; 32]);
+        assert!(
+            compare_evidence(&[first, second])
+                .unwrap_err()
+                .to_string()
+                .contains("different receipt artifacts")
         );
     }
 

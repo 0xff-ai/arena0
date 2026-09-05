@@ -300,12 +300,12 @@ fn dispatch_command(database: &mut Database, command: Command) {
         } => {
             let _ = reply.send(database.due_timers(execution_id, now_ms, limit));
         }
-        Command::AssembleAndStageReceiptBody {
+        Command::AssembleReceipt {
             execution_id,
             now_ms,
             reply,
         } => {
-            let _ = reply.send(database.assemble_and_stage_receipt_body(execution_id, now_ms));
+            let _ = reply.send(database.assemble_receipt(execution_id, now_ms));
         }
         Command::ImportReceipt {
             receipt,
@@ -314,8 +314,8 @@ fn dispatch_command(database: &mut Database, command: Command) {
         } => {
             let _ = reply.send(database.import_receipt(*receipt, now_ms));
         }
-        Command::LoadReceipt { key, reply } => {
-            let _ = reply.send(database.load_receipt(key));
+        Command::LoadReceipt { session_id, reply } => {
+            let _ = reply.send(database.load_receipt(session_id));
         }
         Command::LoadReceiptById { receipt_id, reply } => {
             let _ = reply.send(database.load_receipt_by_id(receipt_id));

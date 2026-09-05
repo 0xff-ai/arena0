@@ -1,13 +1,12 @@
-use arena0_crypto::SignScheme;
 #[cfg(feature = "performance-tracing")]
 use std::time::Instant;
 
 use super::super::{
     AbortOccurrence, DurableEffect, ExecutionState, ExecutionStatus, MAX_PROOF_SIGNATURES,
-    MAX_TERMINAL_REASON_BYTES, ParticipantTerminalSignature, PlanDraft, ProducerSeal,
-    ProducerSealRequest, ProtocolError, Receipt, ReceiptBody, TerminalProof, TerminalPublication,
-    TimerMutation, apply_timer_mutations, build_plan, ensure_payload, make_terminal_certificate,
-    require_active, validate_receipt_body,
+    MAX_TERMINAL_REASON_BYTES, ParticipantTerminalSignature, PlanDraft, ProtocolError,
+    ReceiptArtifact, ReceiptBody, TerminalProof, TerminalPublication, TimerMutation,
+    apply_timer_mutations, build_plan, ensure_payload, make_terminal_certificate, require_active,
+    validate_receipt_body,
 };
 
 /// Add one participant signature to a pending terminal commitment.
@@ -126,130 +125,23 @@ fn reduce_signature_inner(
     build_plan(state, next, None, None, None, Vec::new(), effects)
 }
 
-/// Stage and validate the complete store-assembled receipt body, then request
-/// the producer's typed Ed25519 seal over its stable identity.
+/// Authenticate the store-assembled evidence and publish it atomically.
 pub(crate) fn reduce_receipt_body(
     state: &ExecutionState,
     body: ReceiptBody,
 ) -> Result<PlanDraft, ProtocolError> {
-    let completion = state
-        .status()
-        .terminal_proof()
-        .and_then(TerminalProof::certified_parts);
-    let stopped = match state.status() {
-        ExecutionStatus::Stopped { cause } => Some(cause.clone()),
-        _ => None,
-    };
-    if completion.is_none() && stopped.is_none() {
-        return Err(ProtocolError::TerminalProofMissing);
-    }
-    validate_receipt_body(&state.binding, state.producer, &body)?;
-    let proof_id = super::super::ProofId::derive(&body)?;
-    let receipt_id = super::super::ReceiptId::derive_body(&body)?;
-    let request = ProducerSealRequest::new(proof_id, receipt_id, state.producer);
-    let proof = match (completion, stopped) {
-        (Some((certificate, outcome)), None) => {
-            let crate::ReceiptTermination::Completed { terminal } = body.termination() else {
-                return Err(ProtocolError::ReceiptBodyMismatch);
-            };
-            if terminal.final_step != certificate.commitment().final_step
-                || terminal.final_state != certificate.commitment().final_state
-                || terminal.outcome_hash != certificate.commitment().outcome_hash
-                || terminal.agreement != *certificate.agreement()
-                || body.outcome() != outcome.borsh()
-            {
-                return Err(ProtocolError::ReceiptBodyMismatch);
-            }
-            TerminalProof::receipt_assembled(certificate.clone(), outcome.clone(), body, request)
-        }
-        (None, Some(cause)) => {
-            let crate::ReceiptTermination::Stopped { cause: body_cause } = body.termination()
-            else {
-                return Err(ProtocolError::ReceiptBodyMismatch);
-            };
-            if body_cause != &cause {
-                return Err(ProtocolError::ReceiptBodyMismatch);
-            }
-            TerminalProof::stopped_receipt_assembled(cause, body, request)
-        }
-        _ => return Err(ProtocolError::InvalidTerminalStatus),
-    };
+    validate_receipt_body(&state.binding, &body)?;
+    let artifact = ReceiptArtifact::new(body)?;
+    let body = artifact.body();
     let mut next = state.clone();
-    let data = match &proof {
-        TerminalProof::ReceiptAssembled { request, .. }
-        | TerminalProof::StoppedReceiptAssembled { request, .. } => *request.data(),
-        _ => return Err(ProtocolError::InvalidTerminalStatus),
-    };
-    next.status = ExecutionStatus::from_terminal_proof(proof);
-    build_plan(
-        state,
-        next,
-        None,
-        None,
-        None,
-        Vec::new(),
-        vec![DurableEffect::RequestProducerSeal { data }],
-    )
-}
-
-/// Verify the producer seal against the durable staged body and publish the
-/// resulting sealed receipt artifact.
-pub(crate) fn reduce_producer_seal(
-    state: &ExecutionState,
-    seal: ProducerSeal,
-) -> Result<PlanDraft, ProtocolError> {
-    require_active(state, "producer seal")?;
-    enum Staged<'a> {
-        Completed {
-            certificate: &'a super::super::TerminalCertificate,
-            outcome: &'a super::super::TerminalOutcome,
-            body: &'a ReceiptBody,
-            request: &'a ProducerSealRequest,
-        },
-        Stopped {
-            cause: &'a super::super::StopCause,
-            body: &'a ReceiptBody,
-            request: &'a ProducerSealRequest,
-        },
-    }
-    let staged = match state.status().terminal_proof() {
-        Some(proof) => {
-            if let Some((certificate, outcome, body, request)) = proof.receipt_assembled_parts() {
-                Staged::Completed {
-                    certificate,
-                    outcome,
-                    body,
-                    request,
-                }
-            } else if let Some((cause, body, request)) = proof.stopped_receipt_assembled_parts() {
-                Staged::Stopped {
-                    cause,
-                    body,
-                    request,
-                }
-            } else {
-                return Err(ProtocolError::TerminalProofMissing);
-            }
-        }
-        None => return Err(ProtocolError::TerminalProofMissing),
-    };
-    let request = match &staged {
-        Staged::Completed { request, .. } | Staged::Stopped { request, .. } => request,
-    };
-    if seal.data() != request.data() {
-        return Err(ProtocolError::InvalidProducerSeal);
-    }
-    let body = match &staged {
-        Staged::Completed {
-            certificate,
-            outcome,
-            body,
-            ..
-        } => {
-            validate_receipt_body(&state.binding, state.producer, body)?;
-            let crate::ReceiptTermination::Completed { terminal } = body.termination() else {
-                return Err(ProtocolError::ReceiptBodyMismatch);
-            };
+    next.status = match (state.status(), body.termination()) {
+        (
+            ExecutionStatus::TerminalProof { proof },
+            crate::ReceiptTermination::Completed { terminal },
+        ) => {
+            let (certificate, outcome) = proof
+                .certified_parts()
+                .ok_or(ProtocolError::TerminalProofMissing)?;
             if terminal.final_step != certificate.commitment().final_step
                 || terminal.final_state != certificate.commitment().final_state
                 || terminal.outcome_hash != certificate.commitment().outcome_hash
@@ -258,68 +150,29 @@ pub(crate) fn reduce_producer_seal(
             {
                 return Err(ProtocolError::ReceiptBodyMismatch);
             }
-            body
+            ExecutionStatus::completed(certificate.clone(), outcome.clone(), artifact.receipt_id())
         }
-        Staged::Stopped { cause, body, .. } => {
-            validate_receipt_body(&state.binding, state.producer, body)?;
-            let crate::ReceiptTermination::Stopped { cause: body_cause } = body.termination()
-            else {
-                return Err(ProtocolError::ReceiptBodyMismatch);
-            };
-            if body_cause != *cause {
-                return Err(ProtocolError::ReceiptBodyMismatch);
-            }
-            body
+        (
+            ExecutionStatus::Stopped { cause },
+            crate::ReceiptTermination::Stopped { cause: body_cause },
+        ) if cause == body_cause => {
+            ExecutionStatus::stopped_published(cause.clone(), artifact.receipt_id())
         }
+        _ => return Err(ProtocolError::ReceiptBodyMismatch),
     };
-    let signing_bytes = request.signing_bytes()?;
-    let verified = arena0_crypto::verify(
-        SignScheme::Ed25519,
-        &state.producer.0,
-        &signing_bytes,
-        &seal.signature().0,
-    )
-    .map_err(|error| ProtocolError::InvalidProducerSealCrypto(error.to_string()))?;
-    if !verified {
-        return Err(ProtocolError::InvalidProducerSeal);
-    }
-    let receipt = Receipt::new(
-        (*body).clone(),
-        ProducerSeal::new(*request.data(), seal.signature()),
-    )?;
     let timer_mutations = state
         .timers
         .iter()
         .map(|timer| TimerMutation::cancel(timer.id))
         .collect::<Vec<_>>();
-    let mut next = state.clone();
     apply_timer_mutations(&mut next.timers, &timer_mutations)?;
-    next.status = match &staged {
-        Staged::Completed {
-            certificate,
-            outcome,
-            ..
-        } => ExecutionStatus::completed(
-            (*certificate).clone(),
-            (*outcome).clone(),
-            receipt.proof_id(),
-            receipt.receipt_id(),
-            state.producer,
-        ),
-        Staged::Stopped { cause, .. } => ExecutionStatus::stopped_published(
-            (*cause).clone(),
-            receipt.proof_id(),
-            receipt.receipt_id(),
-            state.producer,
-        ),
-    };
-    let effect = DurableEffect::publish_receipt(receipt.clone())?;
+    let effect = DurableEffect::publish_receipt(artifact.clone())?;
     build_plan(
         state,
         next,
         None,
         None,
-        Some(TerminalPublication { receipt }),
+        Some(TerminalPublication { receipt: artifact }),
         timer_mutations,
         vec![effect],
     )

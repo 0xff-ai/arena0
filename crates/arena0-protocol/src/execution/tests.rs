@@ -861,7 +861,7 @@ fn retrying_the_same_pre_state_reproduces_the_same_plan_identity() {
 }
 
 #[test]
-fn terminal_proof_requires_certificate_then_producer_seal() {
+fn terminal_proof_requires_certificate_then_atomic_publication() {
     let fixture = fixture();
     let state = pending_terminal(&fixture);
     let commitment = state.pending_terminal().unwrap().clone();
@@ -879,7 +879,6 @@ fn terminal_proof_requires_certificate_then_producer_seal() {
         partial.status().receipt_work(),
         ReceiptWork::CollectSignatures
     ));
-    assert!(partial.producer_seal_request().is_none());
     let second = ParticipantTerminalSignature::new(
         fixture.peers[1],
         fixture.other_bls.sign(&commitment.signing_bytes()),
@@ -894,7 +893,6 @@ fn terminal_proof_requires_certificate_then_producer_seal() {
         certified.status().receipt_work(),
         ReceiptWork::Assemble
     ));
-    assert!(certified.producer_seal_request().is_none());
     let public_state = active_state(&fixture);
     let public_plan = commit(
         transition(
@@ -958,7 +956,6 @@ fn terminal_proof_requires_certificate_then_producer_seal() {
         SessionHeader::new(
             fixture.activation.clone(),
             ReceiptTermination::Completed { terminal },
-            fixture.producer,
         ),
         vec![9, 8, 7],
         br#"{}"#.to_vec(),
@@ -974,40 +971,13 @@ fn terminal_proof_requires_certificate_then_producer_seal() {
         fuel_trace,
     )
     .expect("fuel receipt body");
-    assert_ne!(
-        ProofId::derive(&body).expect("proof id"),
-        ProofId::derive(&fuel_body).expect("fuel-bound proof id")
-    );
     let receipt_id = ReceiptId::derive_body(&body).expect("receipt id");
-    let mut expected = blake3::Hasher::new();
-    expected.update(b"arena0/receipt-body/v1");
-    expected.update(&borsh::to_vec(&body).expect("receipt body encoding"));
-    assert_eq!(receipt_id.as_bytes(), expected.finalize().as_bytes());
     assert_ne!(
         receipt_id,
-        ReceiptId::derive_body(&fuel_body).expect("fuel-bound receipt id")
+        ReceiptId::derive_body(&fuel_body).expect("fuel-bound id")
     );
-    let other_producer_body = ReceiptBody::new(
-        SessionHeader::new(
-            fixture.activation.clone(),
-            body.header().terminal.clone(),
-            fixture.peers[1],
-        ),
-        body.outcome().to_vec(),
-        body.params().to_vec(),
-        body.trace().to_vec(),
-    )
-    .expect("other producer body");
-    assert_eq!(
-        ProofId::derive(&body).expect("proof id"),
-        ProofId::derive(&other_producer_body).expect("producer-independent proof id")
-    );
-    assert_ne!(
-        ReceiptId::derive_body(&body).expect("receipt id"),
-        ReceiptId::derive_body(&other_producer_body).expect("other receipt id")
-    );
-    validate_receipt_body(certified.binding(), certified.producer(), &fuel_body)
-        .expect_err("fuel is authenticated trace evidence");
+    validate_receipt_body(certified.binding(), &fuel_body).expect_err("fuel is signed evidence");
+    assert!(ReceiptArtifact::new(fuel_body).is_err());
     let assembled = commit(
         transition(
             &certified,
@@ -1019,69 +989,32 @@ fn terminal_proof_requires_certificate_then_producer_seal() {
     .clone();
     assert!(matches!(
         assembled.status().receipt_work(),
-        ReceiptWork::Seal(_)
+        ReceiptWork::Published
     ));
-    let request = *assembled
-        .producer_seal_request()
-        .expect("producer seal request");
-    let producer_seal = ProducerSeal::new(
-        *request.data(),
-        fixture
-            .producer_keys
-            .sign(&request.signing_bytes().expect("seal data")),
+    assert_eq!(assembled.published_receipt_id(), Some(receipt_id));
+    assert_eq!(assembled.lifecycle(), ExecLifecycle::Completed);
+    let receipt = ReceiptArtifact::new(body).expect("canonical receipt");
+    assert!(matches!(receipt, ReceiptArtifact::Receipt(_)));
+    let bytes = receipt.encode().expect("encode");
+    assert_eq!(ReceiptArtifact::decode(&bytes).expect("decode"), receipt);
+    let mut tampered = bytes.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 1;
+    assert!(ReceiptArtifact::decode(&tampered).is_err());
+    let mut old_version = bytes;
+    old_version[0] = 1;
+    assert!(ReceiptArtifact::decode(&old_version).is_err());
+    let json = serde_json::to_value(&receipt).expect("json");
+    assert_eq!(
+        serde_json::from_value::<ReceiptArtifact>(json.clone()).expect("JSON round trip"),
+        receipt
     );
-    assert!(matches!(
-        Receipt::new(fuel_body, producer_seal.clone()),
-        Err(ProtocolError::InvalidProducerSeal)
-    ));
-    let sealed = Receipt::new(body.clone(), producer_seal.clone()).expect("sealed receipt");
-    assert_eq!(sealed.receipt_id(), request.data().receipt_id());
-    let mut encoded_sealed = sealed.encode().expect("sealed encoding");
-    let last = encoded_sealed.len() - 1;
-    encoded_sealed[last] ^= 1;
-    assert!(matches!(
-        Receipt::decode(&encoded_sealed),
-        Err(ProtocolError::InvalidProducerSeal)
-    ));
-    let wrong_key_seal = ProducerSeal::new(
-        *request.data(),
-        fixture
-            .other_keys
-            .sign(&request.signing_bytes().expect("seal data")),
-    );
-    assert!(matches!(
-        Receipt::new(body.clone(), wrong_key_seal),
-        Err(ProtocolError::InvalidProducerSeal)
-    ));
-    let mut tampered_signature = fixture
-        .producer_keys
-        .sign(&request.signing_bytes().expect("seal data"));
-    tampered_signature.0[0] ^= 1;
-    assert!(matches!(
-        Receipt::new(
-            body.clone(),
-            ProducerSeal::new(*request.data(), tampered_signature),
-        ),
-        Err(ProtocolError::InvalidProducerSeal)
-    ));
-    assert!(matches!(
-        transition(
-            &assembled,
-            ExecutionInput::ProducerSeal(ProducerSeal::new(
-                *request.data(),
-                fixture.producer_keys.sign(b"wrong body"),
-            ))
-        ),
-        Err(ProtocolError::InvalidProducerSeal)
-    ));
-    let published = commit(
-        transition(&assembled, ExecutionInput::ProducerSeal(producer_seal))
-            .expect("published receipt"),
-    )
-    .next_state()
-    .clone();
-    assert_eq!(published.lifecycle(), ExecLifecycle::Completed);
-    assert!(!published.terminal_pending());
+    let mut unknown_field = json.clone();
+    unknown_field["extra"] = true.into();
+    assert!(serde_json::from_value::<ReceiptArtifact>(unknown_field).is_err());
+    let mut wrong_kind = json;
+    wrong_kind["kind"] = "stop_report".into();
+    assert!(serde_json::from_value::<ReceiptArtifact>(wrong_kind).is_err());
 }
 
 #[test]
@@ -1141,7 +1074,6 @@ fn receipt_codecs_reject_oversized_fields_and_unknown_versions_without_panicking
                 reason: "stopped".to_owned(),
             },
         },
-        fixture.producer,
     );
     assert!(matches!(
         ReceiptBody::new(
@@ -1197,26 +1129,26 @@ fn receipt_codecs_reject_oversized_fields_and_unknown_versions_without_panicking
     let body = ReceiptBody::new(header.clone(), Vec::new(), Vec::new(), Vec::new())
         .expect("empty receipt body");
     let mut unknown_body_version = borsh::to_vec(&body).expect("body bytes");
-    unknown_body_version[0] = 2;
+    unknown_body_version[0] = 0xff;
     assert!(borsh::from_slice::<ReceiptBody>(&unknown_body_version).is_err());
 
-    let mut hostile_outcome = vec![1u8];
+    let mut hostile_outcome = vec![2u8, 2u8];
     hostile_outcome.extend(borsh::to_vec(body.header()).expect("header bytes"));
     hostile_outcome.extend_from_slice(&u32::MAX.to_le_bytes());
-    let result = std::panic::catch_unwind(|| Receipt::decode(&hostile_outcome));
+    let result = std::panic::catch_unwind(|| ReceiptArtifact::decode(&hostile_outcome));
     assert!(result.is_ok(), "hostile outcome length must not panic");
     assert!(result.expect("panic result").is_err());
 
-    let mut hostile_trace = vec![1u8];
+    let mut hostile_trace = vec![2u8, 2u8];
     hostile_trace.extend(borsh::to_vec(body.header()).expect("header bytes"));
     hostile_trace.extend_from_slice(&0u32.to_le_bytes());
     hostile_trace.extend_from_slice(&0u32.to_le_bytes());
     hostile_trace.extend_from_slice(&u32::MAX.to_le_bytes());
-    let result = std::panic::catch_unwind(|| Receipt::decode(&hostile_trace));
+    let result = std::panic::catch_unwind(|| ReceiptArtifact::decode(&hostile_trace));
     assert!(result.is_ok(), "hostile trace length must not panic");
     assert!(result.expect("panic result").is_err());
 
-    assert!(borsh::from_slice::<Receipt>(&[0xff]).is_err());
+    assert!(borsh::from_slice::<ReceiptArtifact>(&[0xff]).is_err());
 }
 
 #[test]

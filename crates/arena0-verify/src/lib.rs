@@ -1,7 +1,7 @@
-//! Verification of the portable arena0 [`arena0_protocol::Receipt`] artifact.
+//! Verification of the portable arena0 [`arena0_protocol::ReceiptArtifact`] artifact.
 //!
 //! [`verify_light`] accepts only the bounded, encoded receipt.  It performs the
-//! complete activation-chain, producer-seal, trace, and certificate checks and
+//! complete activation-chain, trace, and certificate checks and
 //! has no sandbox dependency. With the `replay` feature, full verification also
 //! accepts the exact Wasm bytes and replays every public call through fresh
 //! sandbox-admitted guest calls.

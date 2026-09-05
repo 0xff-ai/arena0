@@ -13,7 +13,7 @@ pub(crate) use shared::{
     reduce_propose as reduce_propose_shared, reduce_signature as reduce_step_signature,
 };
 pub(crate) use terminal::{
-    reduce_abort, reduce_interrupt_terminal, reduce_producer_seal, reduce_receipt_body,
+    reduce_abort, reduce_interrupt_terminal, reduce_receipt_body,
     reduce_signature as reduce_terminal_signature,
 };
 
@@ -47,7 +47,6 @@ pub(super) fn transition(
                 reduce_terminal_signature(state, signature)
             }
             ExecutionInput::ReceiptBody(body) => reduce_receipt_body(state, *body),
-            ExecutionInput::ProducerSeal(seal) => reduce_producer_seal(state, seal),
             ExecutionInput::Abort(occurrence) => reduce_abort(state, occurrence),
             ExecutionInput::InterruptTerminal(reason) => reduce_interrupt_terminal(state, reason),
         }?;
@@ -89,7 +88,6 @@ fn input_kind(input: &ExecutionInput) -> &'static str {
         ExecutionInput::Private(_) => "private",
         ExecutionInput::TerminalSignature(_) => "terminal_signature",
         ExecutionInput::ReceiptBody(_) => "receipt_body",
-        ExecutionInput::ProducerSeal(_) => "producer_seal",
         ExecutionInput::Abort(_) => "abort",
         ExecutionInput::InterruptTerminal(_) => "interrupt_terminal",
     }
@@ -121,17 +119,7 @@ fn is_already_applied(state: &ExecutionState, input: &ExecutionInput) -> bool {
                         && existing.signature == signature.signature
                 })
             }),
-        ExecutionInput::ReceiptBody(body) => state
-            .status()
-            .terminal_proof()
-            .is_some_and(|proof| {
-                proof
-                    .receipt_assembled_parts()
-                    .is_some_and(|(_, _, existing, _)| existing == body.as_ref())
-                    || proof
-                        .stopped_receipt_assembled_parts()
-                        .is_some_and(|(_, existing, _)| existing == body.as_ref())
-            }),
+        ExecutionInput::ReceiptBody(_) => false,
         ExecutionInput::Abort(occurrence) => state
             .status()
             .terminal_cause()

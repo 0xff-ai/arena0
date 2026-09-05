@@ -121,7 +121,6 @@ CREATE TABLE private_commits (
 CREATE TABLE terminal_proofs (
     execution_id BLOB NOT NULL CHECK (length(execution_id) = 32),
     version INTEGER NOT NULL CHECK (version >= 0),
-    proof_id BLOB NOT NULL CHECK (length(proof_id) = 32),
     receipt_id BLOB NOT NULL CHECK (length(receipt_id) = 32),
     publication BLOB NOT NULL,
     PRIMARY KEY (execution_id, version),
@@ -132,13 +131,14 @@ CREATE TABLE receipts (
     -- One immutable artifact row serves both local publications and foreign
     -- imports.  Provenance is derived from the independent fact tables below.
     receipt_id BLOB PRIMARY KEY NOT NULL CHECK (length(receipt_id) = 32),
-    proof_id BLOB NOT NULL CHECK (length(proof_id) = 32),
     session_id BLOB NOT NULL CHECK (length(session_id) = 32),
-    producer BLOB NOT NULL CHECK (length(producer) = 32),
+    kind TEXT NOT NULL CHECK (kind IN ('receipt', 'stop_report')),
     artifact BLOB NOT NULL,
-    stored_at_ms INTEGER NOT NULL CHECK (stored_at_ms >= 0),
-    UNIQUE (session_id, producer)
+    stored_at_ms INTEGER NOT NULL CHECK (stored_at_ms >= 0)
 ) STRICT;
+
+CREATE UNIQUE INDEX receipts_canonical_session ON receipts (session_id) WHERE kind = 'receipt';
+CREATE INDEX receipts_session ON receipts (session_id);
 
 -- A durable fact that this Host accepted the artifact through receipt import.
 -- It intentionally remains present when the same artifact is later produced
@@ -149,7 +149,7 @@ CREATE TABLE receipt_imports (
     FOREIGN KEY (receipt_id) REFERENCES receipts(receipt_id)
 ) STRICT;
 
--- The local execution relation for an artifact produced and sealed by this
+-- The local execution relation for an artifact produced by this
 -- Host.  A receipt and an execution each have at most one such relation.
 CREATE TABLE receipt_productions (
     receipt_id BLOB PRIMARY KEY NOT NULL CHECK (length(receipt_id) = 32),

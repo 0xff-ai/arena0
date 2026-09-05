@@ -11,8 +11,8 @@ use std::path::Path;
 use anyhow::{Context, bail};
 use arena0_client::api::{
     FullVerifiedTerminal as ApiFullVerifiedTerminal,
-    LightVerifiedTerminal as ApiLightVerifiedTerminal, Receipt, ReceiptRef, Request, ResponseOk,
-    VerifiedResult,
+    LightVerifiedTerminal as ApiLightVerifiedTerminal, ReceiptArtifact, ReceiptRef, Request,
+    ResponseOk, VerifiedResult,
 };
 use arena0_client::proto::DaemonClient;
 use arena0_client::protocol::{ABI_VERSION, PeerId, ProgramHash, SessionHash};
@@ -21,12 +21,13 @@ use arena0_verify::{LightVerifiedTerminal as LightVerifiedTerminalBytes, verify_
 use serde_json::json;
 use tokio::task::JoinSet;
 
-use crate::coordinated::{EvidenceAgreement, ProducerEvidence, compare_evidence};
+use crate::coordinated::{EvidenceAgreement, HostEvidence, compare_evidence};
 use crate::{Ctx, ui};
 
 /// The evidence a verification recovers, rendered the same whether it came from the
 /// daemon or a daemonless run.
 struct Evidence {
+    receipt_id: arena0_client::protocol::ReceiptId,
     program_id: ProgramHash,
     program_name: Option<String>,
     session_id: SessionHash,
@@ -45,7 +46,7 @@ pub(crate) async fn verify(ctx: &Ctx, target: String, full: bool) -> anyhow::Res
     }
 }
 
-/// Verify every producer of one resident session through independently named
+/// Verify every Host of one resident session through independently named
 /// local Hosts, then require their authenticated shared evidence to agree.
 pub(crate) async fn verify_hosts(
     mode: ui::Mode,
@@ -72,24 +73,18 @@ pub(crate) async fn verify_hosts(
                 other => bail!("unexpected daemon.info response from Host '{host}': {other:?}"),
             };
             let key = client
-                .resolve_receipt_key(&target)
+                .resolve_produced_receipt_ref(&target)
                 .await
                 .with_context(|| format!("resolve receipt on Host '{host}'"))?;
-            if key.producer != info.peer_id {
-                bail!(
-                    "Host '{host}' resolved producer {}, expected its own producer {}",
-                    key.producer,
-                    info.peer_id
-                );
-            }
             let response = client
                 .call(&Request::ReceiptVerify {
-                    receipt: ReceiptRef::Produced(key),
+                    receipt: key,
                     full: replay,
                 })
                 .await
-                .with_context(|| format!("verify producer receipt on Host '{host}'"))?;
+                .with_context(|| format!("verify Host receipt on Host '{host}'"))?;
             let ResponseOk::Verified {
+                receipt_id,
                 program_id,
                 session_id,
                 ensemble,
@@ -102,8 +97,9 @@ pub(crate) async fn verify_hosts(
             Ok::<_, anyhow::Error>((
                 index,
                 host,
-                ProducerEvidence {
-                    producer: info.peer_id,
+                HostEvidence {
+                    receipt_id,
+                    peer_id: info.peer_id,
                     program_id,
                     session_id,
                     ensemble,
@@ -116,7 +112,7 @@ pub(crate) async fn verify_hosts(
 
     let mut ordered = (0..hosts.len())
         .map(|_| None)
-        .collect::<Vec<Option<(HostName, ProducerEvidence)>>>();
+        .collect::<Vec<Option<(HostName, HostEvidence)>>>();
     while let Some(joined) = jobs.join_next().await {
         let (index, host, evidence) =
             joined.context("Host receipt verification task failed to join")??;
@@ -136,7 +132,7 @@ pub(crate) async fn verify_hosts(
     let agreement = compare_evidence(&receipts)?;
     let producers = receipts
         .iter()
-        .map(|receipt| receipt.producer)
+        .map(|receipt| receipt.peer_id)
         .collect::<HashSet<_>>();
     if producers.len() != hosts.len()
         || agreement.ensemble.len() != hosts.len()
@@ -146,7 +142,7 @@ pub(crate) async fn verify_hosts(
             .all(|peer| producers.contains(peer))
     {
         bail!(
-            "--hosts must name every independent producer in the {}-party receipt ensemble",
+            "--hosts must name every independent peer_id in the {}-party receipt ensemble",
             agreement.ensemble.len()
         );
     }
@@ -155,7 +151,7 @@ pub(crate) async fn verify_hosts(
     Ok(())
 }
 
-/// Receipt ids and session ids are bare opaque values. Any target with path
+/// Receipt IDs and session ids are bare opaque values. Any target with path
 /// syntax is an explicit file target, even when it does not exist yet; falling
 /// through to resident-id lookup would hide the actionable filesystem error.
 pub(crate) fn is_path_target(path: &Path, target: &str) -> bool {
@@ -174,17 +170,15 @@ async fn verify_resident(ctx: &Ctx, target: &str, full: bool) -> anyhow::Result<
             ctx.client.socket().display()
         );
     }
-    // A receipt-id prefix resolves to its exact producer; a session id uses the
-    // addressed daemon's producer.
-    let key = ctx.client().resolve_receipt_key(target).await?;
+    // A receipt-id prefix resolves to its exact peer_id; a session id uses the
+    // addressed daemon's peer_id.
+    let key = ctx.client().resolve_receipt_ref(target).await?;
     let resp = ctx
         .client()
-        .call(&Request::ReceiptVerify {
-            receipt: ReceiptRef::Produced(key),
-            full,
-        })
+        .call(&Request::ReceiptVerify { receipt: key, full })
         .await?;
     let ResponseOk::Verified {
+        receipt_id,
         program_id,
         session_id,
         ensemble,
@@ -200,6 +194,7 @@ async fn verify_resident(ctx: &Ctx, target: &str, full: bool) -> anyhow::Result<
         ctx.mode,
         ctx.palette,
         &Evidence {
+            receipt_id,
             program_name: names.get(&program_id).cloned(),
             program_id,
             session_id,
@@ -247,7 +242,7 @@ pub(crate) fn full_replay_requires_daemon() -> anyhow::Result<()> {
 }
 
 /// Read and parse an explicit receipt file before consulting a Host.
-pub(crate) fn read_receipt(path: &Path) -> anyhow::Result<Receipt> {
+pub(crate) fn read_receipt(path: &Path) -> anyhow::Result<ReceiptArtifact> {
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("parse receipt {}", path.display()))
 }
@@ -260,8 +255,7 @@ async fn verify_file_light(
     path: &Path,
 ) -> anyhow::Result<()> {
     let receipt = read_receipt(path)?;
-
-    let local = receipt.producer();
+    let receipt_id = receipt.receipt_id();
 
     // Light: fully offline.
     let encoded = receipt
@@ -272,13 +266,14 @@ async fn verify_file_light(
         terminal: terminal_of(&light.terminal),
     };
     let (program_name, local_peer) = match ctx {
-        Some(ctx) => enrich_offline(ctx, light.program_id, local).await,
-        None => (None, Some(local)),
+        Some(ctx) => enrich_offline(ctx, light.program_id).await,
+        None => (None, None),
     };
     render(
         mode,
         palette,
         &Evidence {
+            receipt_id,
             program_name,
             program_id: light.program_id,
             session_id: light.session_id,
@@ -292,7 +287,7 @@ async fn verify_file_light(
 }
 
 /// Delegate a file's verification to a reachable daemon (it holds the wasm).
-async fn delegate_to_daemon(ctx: &Ctx, receipt: Receipt, full: bool) -> anyhow::Result<()> {
+async fn delegate_to_daemon(ctx: &Ctx, receipt: ReceiptArtifact, full: bool) -> anyhow::Result<()> {
     let resp = ctx
         .client()
         .call(&Request::ReceiptVerify {
@@ -301,6 +296,7 @@ async fn delegate_to_daemon(ctx: &Ctx, receipt: Receipt, full: bool) -> anyhow::
         })
         .await?;
     let ResponseOk::Verified {
+        receipt_id,
         program_id,
         session_id,
         ensemble,
@@ -316,6 +312,7 @@ async fn delegate_to_daemon(ctx: &Ctx, receipt: Receipt, full: bool) -> anyhow::
         ctx.mode,
         ctx.palette,
         &Evidence {
+            receipt_id,
             program_name: names.get(&program_id).cloned(),
             program_id,
             session_id,
@@ -330,13 +327,9 @@ async fn delegate_to_daemon(ctx: &Ctx, receipt: Receipt, full: bool) -> anyhow::
 
 /// Best-effort enrichment for offline evidence: the program's handle name and our
 /// own peer id, all only if a daemon happens to be reachable.
-async fn enrich_offline(
-    ctx: &Ctx,
-    program_id: ProgramHash,
-    producer: PeerId,
-) -> (Option<String>, Option<PeerId>) {
+async fn enrich_offline(ctx: &Ctx, program_id: ProgramHash) -> (Option<String>, Option<PeerId>) {
     if !ctx.client().daemon_up().await {
-        return (None, Some(producer));
+        return (None, None);
     }
     let local_peer = node_peer_id(ctx).await;
     let mut name = None;
@@ -380,6 +373,7 @@ fn render(mode: crate::ui::Mode, palette: crate::ui::Palette, ev: &Evidence) {
             "program_id": ev.program_id.to_string(),
             "program": ev.program_name,
             "session_id": ev.session_id.to_string(),
+            "receipt_id": ev.receipt_id.to_string(),
             "ensemble": ev.ensemble.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "steps": ev.steps,
             "result": ev.result,
@@ -401,6 +395,7 @@ fn render(mode: crate::ui::Mode, palette: crate::ui::Palette, ev: &Evidence) {
         ABI_VERSION
     );
     println!("  session     {}", ev.session_id.fmt_short());
+    println!("  receipt     {}", ev.receipt_id);
     println!(
         "  ensemble    {}",
         render_ensemble(&ev.ensemble, ev.local_peer)
@@ -434,7 +429,7 @@ fn render_host_evidence(
     mode: ui::Mode,
     palette: ui::Palette,
     replay: bool,
-    evidence: &[(HostName, ProducerEvidence)],
+    evidence: &[(HostName, HostEvidence)],
     agreement: &EvidenceAgreement,
 ) {
     let tier = if replay { "full" } else { "light" };
@@ -443,12 +438,13 @@ fn render_host_evidence(
             "tier": tier,
             "program_id": agreement.program_id.to_string(),
             "session_id": agreement.session_id.to_string(),
+            "receipt_id": agreement.receipt_id.to_string(),
             "ensemble": agreement.ensemble.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "steps": agreement.steps,
             "result": agreement.result,
             "producers": evidence.iter().map(|(host, receipt)| json!({
                 "host": host.to_string(),
-                "producer": receipt.producer.to_string(),
+                "peer_id": receipt.peer_id.to_string(),
                 "result": "valid",
             })).collect::<Vec<_>>(),
             "all_verified": true,
@@ -458,7 +454,7 @@ fn render_host_evidence(
     }
 
     println!(
-        "{} {}/{} producer receipts ({})",
+        "{} {}/{} Host receipts ({})",
         palette.green("verified"),
         evidence.len(),
         agreement.ensemble.len(),
@@ -466,9 +462,10 @@ fn render_host_evidence(
     );
     println!("  program     {}", agreement.program_id.fmt_short());
     println!("  session     {}", agreement.session_id.fmt_short());
+    println!("  receipt     {}", agreement.receipt_id);
     println!("  steps       {}", agreement.steps);
     for (host, receipt) in evidence {
-        println!("  producer    {}  {}", host, receipt.producer.fmt_short());
+        println!("  peer_id    {}  {}", host, receipt.peer_id.fmt_short());
     }
     match &agreement.result {
         VerifiedResult::Full {

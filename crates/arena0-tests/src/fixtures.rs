@@ -438,6 +438,25 @@ impl Drop for LiveExecution {
 /// has no local side effects. The module still crosses the exact metadata,
 /// ABI, and fresh-instance sandbox boundary used by production guests.
 pub fn ordering_program_wasm(reject_shared: bool) -> Vec<u8> {
+    ordering_program(if reject_shared {
+        OrderingBehavior::RejectMessage
+    } else {
+        OrderingBehavior::Accept
+    })
+}
+
+/// A real ABI guest that unanimously fails on its first shared call.
+pub fn shared_stop_program_wasm() -> Vec<u8> {
+    ordering_program(OrderingBehavior::Fail)
+}
+
+enum OrderingBehavior {
+    Accept,
+    RejectMessage,
+    Fail,
+}
+
+fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
     let unit = JsonSchemaDocument::unit();
     let definition = ProgramDefinition {
         metadata: ProgramMetadata {
@@ -475,6 +494,7 @@ pub fn ordering_program_wasm(reject_shared: bool) -> Vec<u8> {
         r#"
         (module
           (import "arena0" "broadcast" (func $broadcast (param i32 i32)))
+          {stop_import}
           (memory (export "memory") 2)
           (global (export "arena0_abi_version") i32 (i32.const 20))
           (data (i32.const 2048) "{init}")
@@ -517,7 +537,16 @@ pub fn ordering_program_wasm(reject_shared: bool) -> Vec<u8> {
         init = init,
         shared = shared,
         rejected_shared = rejected_shared,
-        shared_export = if reject_shared {
+        stop_import = if matches!(behavior, OrderingBehavior::Fail) {
+            r#"(import "arena0" "fail" (func $fail (param i32 i32)))"#
+        } else {
+            ""
+        },
+        shared_export = if matches!(behavior, OrderingBehavior::Fail) {
+            r#"(func (export "arena0_shared") (param i32 i32) (result i64)
+            i32.const 10248 i32.const 4 call $fail
+            i32.const 4096 i32.const 5 call $pack)"#
+        } else if matches!(behavior, OrderingBehavior::RejectMessage) {
             r#"(func (export "arena0_shared") (param $input_ptr i32) (param i32) (result i64)
             (local $shared_len i32)
             local.get $input_ptr

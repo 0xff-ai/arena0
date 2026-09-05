@@ -26,8 +26,8 @@ use arena0_program::{JsonBytes, ProgramHash};
 use arena0_protocol::execution::{
     CommitPlan, DurableEffect, ExecutionInput, ExecutionState, ExecutionVersion, GuestSignData,
     OccurrenceConflict, OccurrenceDigest, OccurrenceEvidence, OccurrenceKey, OutboxId,
-    ParticipantStepSignature, ParticipantTerminalSignature, ProofId, Receipt, ReceiptId,
-    ReceiptKey, SharedDelta, TimerId, TimerMutation, TransitionOutcome,
+    ParticipantStepSignature, ParticipantTerminalSignature, ReceiptArtifact, ReceiptId,
+    SharedDelta, TimerId, TimerMutation, TransitionOutcome,
 };
 use arena0_protocol::{
     Activation, ExecFrame, ExecId, ExecLifecycle, ExecutionAdmission, LocalStateBytes, MessageId,
@@ -48,7 +48,7 @@ use lock::{
     OwnerLock, acquire_process_lock, configure_connection, initialize_schema, prepare_database_file,
 };
 
-const SCHEMA_VERSION: u64 = 1;
+const SCHEMA_VERSION: u64 = 2;
 const ENVELOPE_VERSION: u16 = 1;
 const ENVELOPE_MAGIC: [u8; 8] = *b"AR0STOR1";
 const ENVELOPE_DOMAIN: &[u8] = b"arena0/store-envelope/v1";
@@ -504,7 +504,7 @@ pub enum StoreError {
 /// instead of one operation overwriting the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiptProvenance {
-    /// The local Host produced and sealed this artifact.
+    /// The local Host produced this artifact.
     Produced,
     /// The artifact was imported from another Host.
     Imported,
@@ -530,7 +530,7 @@ impl ReceiptProvenance {
         matches!(self, Self::Imported | Self::Both)
     }
 
-    /// Whether this Host produced and sealed this artifact.
+    /// Whether this Host produced this artifact.
     #[must_use]
     pub const fn is_produced(self) -> bool {
         matches!(self, Self::Produced | Self::Both)
@@ -1042,21 +1042,16 @@ pub struct ActiveTimer {
     pub armed_version: ExecutionVersion,
 }
 
-/// A receipt loaded from the durable store with both its protocol lookup key
-/// and its content-addressed identities.
+/// A stored portable artifact with its content identity and local provenance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredReceipt {
-    /// The exact `(session_id, producer)` lookup key.
-    pub key: ReceiptKey,
-    /// The content-addressed proof identity.
-    pub proof_id: ProofId,
     /// The content-addressed public receipt identity.
     pub receipt_id: ReceiptId,
     /// Whether this Host imported, produced, or both imported and produced
     /// the artifact.
     pub provenance: ReceiptProvenance,
     /// The validated portable receipt artifact.
-    pub receipt: Receipt,
+    pub receipt: ReceiptArtifact,
 }
 
 impl StoredReceipt {
@@ -1365,18 +1360,18 @@ enum Command {
         limit: usize,
         reply: oneshot::Sender<Result<Vec<ActiveTimer>, StoreError>>,
     },
-    AssembleAndStageReceiptBody {
+    AssembleReceipt {
         execution_id: ExecId,
         now_ms: u64,
         reply: oneshot::Sender<Result<ApplyOutcome, StoreError>>,
     },
     ImportReceipt {
-        receipt: Box<Receipt>,
+        receipt: Box<ReceiptArtifact>,
         now_ms: u64,
         reply: oneshot::Sender<Result<ReceiptImportOutcome, StoreError>>,
     },
     LoadReceipt {
-        key: ReceiptKey,
+        session_id: SessionHash,
         reply: oneshot::Sender<Result<Option<StoredReceipt>, StoreError>>,
     },
     LoadReceiptById {
@@ -1817,7 +1812,7 @@ impl StoreHandle {
     /// artifact for an occupied receipt key is rejected.
     pub async fn import_receipt(
         &self,
-        receipt: Receipt,
+        receipt: ReceiptArtifact,
         now_ms: u64,
     ) -> Result<ReceiptImportOutcome, StoreError> {
         let encoded = receipt.encode()?;
@@ -1835,10 +1830,14 @@ impl StoreHandle {
         response.await.map_err(|_| StoreError::ReplyDropped)?
     }
 
-    /// Load one receipt by its exact protocol lookup key.
-    pub async fn load_receipt(&self, key: ReceiptKey) -> Result<Option<StoredReceipt>, StoreError> {
+    /// Load this Host's own publication for a session.
+    pub async fn load_receipt(
+        &self,
+        session_id: SessionHash,
+    ) -> Result<Option<StoredReceipt>, StoreError> {
         let (reply, response) = oneshot::channel();
-        self.send(Command::LoadReceipt { key, reply }, 128).await?;
+        self.send(Command::LoadReceipt { session_id, reply }, 128)
+            .await?;
         response.await.map_err(|_| StoreError::ReplyDropped)?
     }
 
@@ -2413,14 +2412,11 @@ impl ExecutionStore {
 
     /// Assemble the exact receipt body from authoritative rows and stage it
     /// through the protocol reducer in one SQLite transaction.
-    pub async fn assemble_and_stage_receipt_body(
-        &mut self,
-        now_ms: u64,
-    ) -> Result<ApplyOutcome, StoreError> {
+    pub async fn assemble_receipt(&mut self, now_ms: u64) -> Result<ApplyOutcome, StoreError> {
         let (reply, response) = oneshot::channel();
         self.handle
             .send(
-                Command::AssembleAndStageReceiptBody {
+                Command::AssembleReceipt {
                     execution_id: self.execution_id,
                     now_ms,
                     reply,

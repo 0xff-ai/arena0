@@ -279,7 +279,7 @@ pub(crate) enum RunUpdate {
     },
     ReceiptVerified {
         host: HostName,
-        producer: PeerId,
+        peer_id: PeerId,
         tier: &'static str,
     },
     VerificationProgress {
@@ -601,7 +601,7 @@ struct ViewSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReceiptSnapshot {
     host: HostName,
-    producer: PeerId,
+    peer_id: PeerId,
     tier: &'static str,
 }
 
@@ -847,19 +847,19 @@ impl ScreenState {
             }
             RunUpdate::ReceiptVerified {
                 host,
-                producer,
+                peer_id,
                 tier,
             } => {
                 if let Some(receipt) = self
                     .receipts
                     .iter_mut()
-                    .find(|receipt| receipt.host == host && receipt.producer == producer)
+                    .find(|receipt| receipt.host == host && receipt.peer_id == peer_id)
                 {
                     receipt.tier = tier;
                 } else {
                     self.receipts.push(ReceiptSnapshot {
                         host,
-                        producer,
+                        peer_id,
                         tier,
                     });
                 }
@@ -2305,7 +2305,7 @@ fn render_composer(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
                 state
                     .verification_progress
                     .map_or_else(String::new, |(verified, total, tier)| {
-                        format!("    verified {verified}/{total} producer receipts ({tier})")
+                        format!("    verified {verified}/{total} Host receipts ({tier})")
                     });
             (
                 format!("Run complete{evidence}    q to return"),
@@ -2313,7 +2313,7 @@ fn render_composer(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
             )
         } else if let Some((verified, total, tier)) = state.verification_progress {
             (
-                format!("Verified {verified}/{total} producer receipts ({tier})"),
+                format!("Verified {verified}/{total} Host receipts ({tier})"),
                 state.palette.success(),
             )
         } else {

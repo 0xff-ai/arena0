@@ -7,8 +7,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use arena0_api::{
-    EnsembleSpec, ExecStatusState, NextEvent, PendingId, ProgramSummary, ReceiptKey, ReceiptRef,
-    Request, ResponseOk, VerifiedResult,
+    EnsembleSpec, ExecStatusState, NextEvent, PendingId, ProgramSummary, ReceiptRef, Request,
+    ResponseOk, VerifiedResult,
 };
 use arena0_program::ParticipantCount;
 use arena0_protocol::{ExecId, PeerId, SessionHash};
@@ -683,21 +683,18 @@ impl Arena0Mcp {
         Parameters(arg): Parameters<VerifySessionArg>,
     ) -> Result<Json<VerifySessionOutput>, CallToolResult> {
         let session_id: SessionHash = parse(&arg.session.session_id, "session id")?;
-        let producer = peer_id(&self.daemon, &arg.session.host)?;
         match self
             .request(
                 &arg.session.host,
                 Request::ReceiptVerify {
-                    receipt: ReceiptRef::Produced(ReceiptKey {
-                        session_id,
-                        producer,
-                    }),
+                    receipt: ReceiptRef::Produced(session_id),
                     full: matches!(arg.mode, VerificationMode::Full),
                 },
             )
             .await?
         {
             ResponseOk::Verified {
+                receipt_id: _,
                 program_id,
                 session_id,
                 ensemble,

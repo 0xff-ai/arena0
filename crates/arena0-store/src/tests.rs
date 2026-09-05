@@ -11,8 +11,8 @@ use arena0_protocol::execution::{
 use arena0_protocol::{
     Activation, ActivationData, AggregateAttestation, Ensemble, ExecutionAdmission, FrameId,
     NegotiationId, Offer, OfferData, PreparedActivation, PrivateEffect, PrivateEvent,
-    PrivateRecord, PublicEffect, PublicEvent, ReceiptKey, TRACE_FORMAT_VERSION, Ticket,
-    TicketAction, TicketData,
+    PrivateRecord, PublicEffect, PublicEvent, TRACE_FORMAT_VERSION, Ticket, TicketAction,
+    TicketData,
 };
 use std::path::Path;
 
@@ -216,32 +216,17 @@ async fn certify_terminal(store: &Store, fixture: &ActivationFixture, execution_
     drop(writer);
 }
 
-async fn publish_staged_receipt(
+async fn publish_receipt(
     store: &Store,
     fixture: &ActivationFixture,
     execution_id: ExecId,
-) -> Receipt {
+) -> ReceiptArtifact {
     let mut writer = store
         .handle()
         .claim_execution(execution_id)
         .expect("execution writer");
-    let state = store
-        .handle()
-        .load_execution(execution_id)
-        .await
-        .expect("load staged")
-        .expect("staged state");
-    let request = *state.producer_seal_request().expect("seal request");
-    let producer_keys = NodeKeys::from_secret(SecretKey::from_bytes([1; 32]));
-    let seal = arena0_protocol::ProducerSeal::new(
-        *request.data(),
-        producer_keys.sign(&request.signing_bytes().expect("seal bytes")),
-    );
-    writer
-        .apply_input(ExecutionInput::ProducerSeal(seal), 13)
-        .await
-        .expect("publish");
-    let key = ReceiptKey::new(fixture.activation.session_hash(), fixture.producer);
+    writer.assemble_receipt(13).await.expect("publish");
+    let key = fixture.activation.session_hash();
     store
         .handle()
         .load_receipt(key)
@@ -251,7 +236,7 @@ async fn publish_staged_receipt(
         .receipt
 }
 
-fn receipt_with_different_content(receipt: &Receipt) -> Receipt {
+fn receipt_with_different_content(receipt: &ReceiptArtifact) -> ReceiptArtifact {
     let mut trace = receipt.body().trace().to_vec();
     trace[0].fuel_used = trace[0].fuel_used.saturating_add(1);
     let commitment = arena0_protocol::StepCommitment::for_entry(
@@ -276,16 +261,8 @@ fn receipt_with_different_content(receipt: &Receipt) -> Receipt {
         trace,
     )
     .expect("receipt body");
-    let proof_id = arena0_protocol::ProofId::derive(&body).expect("proof id");
-    let receipt_id = arena0_protocol::ReceiptId::derive_body(&body).expect("receipt id");
-    let seal_data =
-        arena0_protocol::ReceiptSealData::new(proof_id, receipt_id, body.header().producer);
-    let keys = NodeKeys::from_secret(SecretKey::from_bytes([1; 32]));
-    let seal = arena0_protocol::ProducerSeal::new(
-        seal_data,
-        keys.sign(&seal_data.signing_bytes().expect("seal bytes")),
-    );
-    Receipt::new(body, seal).expect("different receipt")
+
+    ReceiptArtifact::new(body).expect("different receipt")
 }
 
 pub(crate) fn activation_fixture() -> ActivationFixture {
@@ -1741,24 +1718,26 @@ async fn receipt_body_is_assembled_from_durable_rows_after_restart() {
         .claim_execution(execution_id)
         .expect("execution writer");
     assert!(matches!(
-        writer
-            .assemble_and_stage_receipt_body(12)
-            .await
-            .expect("assemble"),
+        writer.assemble_receipt(12).await.expect("assemble"),
         ApplyOutcome::Committed(_)
     ));
-    let staged = store
+    let state = store
         .handle()
         .load_execution(execution_id)
         .await
-        .expect("load staged")
-        .expect("staged execution");
-    assert!(staged.receipt_body().is_some());
-    assert_eq!(staged.receipt_body().expect("body").trace().len(), 1);
+        .expect("load published state")
+        .expect("published execution");
+    let published = store
+        .handle()
+        .load_receipt_by_id(state.published_receipt_id().expect("published id"))
+        .await
+        .expect("load")
+        .expect("artifact");
+    assert_eq!(published.receipt.body().trace().len(), 1);
     assert!(matches!(
         writer
             .apply_input(
-                ExecutionInput::ReceiptBody(Box::new(staged.receipt_body().expect("body").clone())),
+                ExecutionInput::ReceiptBody(Box::new(published.receipt.body().clone())),
                 12,
             )
             .await,
@@ -1767,16 +1746,16 @@ async fn receipt_body_is_assembled_from_durable_rows_after_restart() {
     drop(writer);
     store.shutdown().await.expect("shutdown after assembly");
 
-    let store = Store::open(StoreConfig::new(&path, fixture.producer)).expect("reopen staged");
-    let receipt = publish_staged_receipt(&store, &fixture, execution_id).await;
-    let key = ReceiptKey::new(fixture.activation.session_hash(), fixture.producer);
+    let store = Store::open(StoreConfig::new(&path, fixture.producer)).expect("reopen published");
+    let receipt = publish_receipt(&store, &fixture, execution_id).await;
+    let key = fixture.activation.session_hash();
     let by_id = store
         .handle()
         .load_receipt_by_id(receipt.receipt_id())
         .await
         .expect("secondary lookup")
         .expect("receipt by id");
-    assert_eq!(by_id.key, key);
+    assert_eq!(by_id.receipt.body().header().session_hash(), key);
     assert_eq!(by_id.receipt, receipt);
     assert_eq!(
         store.handle().list_receipts(8).await.expect("list"),
@@ -1832,10 +1811,7 @@ async fn stopped_receipt_is_assembled_after_restart_and_verifies() {
         .claim_execution(execution_id)
         .expect("execution writer");
     assert!(matches!(
-        writer
-            .assemble_and_stage_receipt_body(8)
-            .await
-            .expect("assemble stopped"),
+        writer.assemble_receipt(8).await.expect("assemble stopped"),
         ApplyOutcome::Committed(_)
     ));
     drop(writer);
@@ -1844,8 +1820,8 @@ async fn stopped_receipt_is_assembled_after_restart_and_verifies() {
         .await
         .expect("shutdown after stopped assembly");
 
-    let store = Store::open(StoreConfig::new(&path, fixture.producer)).expect("reopen staged");
-    let receipt = publish_staged_receipt(&store, &fixture, execution_id).await;
+    let store = Store::open(StoreConfig::new(&path, fixture.producer)).expect("reopen published");
+    let receipt = publish_receipt(&store, &fixture, execution_id).await;
     let encoded = receipt.encode().expect("encode receipt");
     let verified = arena0_verify::verify_light(&encoded).expect("verify stopped receipt");
     assert!(matches!(
@@ -1896,12 +1872,9 @@ async fn persisted_receipt_tampering_fails_closed_on_restart() {
         .apply_input(ExecutionInput::Abort(occurrence), 7)
         .await
         .expect("abort");
-    writer
-        .assemble_and_stage_receipt_body(8)
-        .await
-        .expect("assemble");
+    writer.assemble_receipt(8).await.expect("assemble");
     drop(writer);
-    let published = publish_staged_receipt(&store, &fixture, execution_id).await;
+    let published = publish_receipt(&store, &fixture, execution_id).await;
     store.shutdown().await.expect("shutdown");
 
     let connection = Connection::open(&path).expect("inspect");
@@ -1939,12 +1912,9 @@ async fn published_receipt_row_missing_fails_closed_on_restart() {
         .handle()
         .claim_execution(execution_id)
         .expect("execution writer");
-    writer
-        .assemble_and_stage_receipt_body(12)
-        .await
-        .expect("assemble");
+    writer.assemble_receipt(12).await.expect("assemble");
     drop(writer);
-    publish_staged_receipt(&store, &fixture, execution_id).await;
+    publish_receipt(&store, &fixture, execution_id).await;
     store.shutdown().await.expect("shutdown");
 
     let connection = Connection::open(&path).expect("inspect");
@@ -1974,14 +1944,9 @@ async fn unpublished_execution_rejects_terminal_projection_rows_on_restart() {
     connection
         .execute(
             "INSERT INTO terminal_proofs
-             (execution_id, version, proof_id, receipt_id, publication)
-             VALUES (?1, 1, ?2, ?3, ?4)",
-            rusqlite::params![
-                execution_id.0.to_vec(),
-                [1u8; 32].to_vec(),
-                [2u8; 32].to_vec(),
-                [3u8],
-            ],
+             (execution_id, version, receipt_id, publication)
+             VALUES (?1, 1, ?2, ?3)",
+            rusqlite::params![execution_id.0.to_vec(), [2u8; 32].to_vec(), [3u8],],
         )
         .expect("insert unexpected terminal row");
     drop(connection);
@@ -2003,12 +1968,9 @@ async fn published_terminal_row_missing_fails_closed_on_restart() {
         .handle()
         .claim_execution(execution_id)
         .expect("execution writer");
-    writer
-        .assemble_and_stage_receipt_body(12)
-        .await
-        .expect("assemble");
+    writer.assemble_receipt(12).await.expect("assemble");
     drop(writer);
-    publish_staged_receipt(&store, &fixture, execution_id).await;
+    publish_receipt(&store, &fixture, execution_id).await;
     store.shutdown().await.expect("shutdown");
 
     let connection = Connection::open(&path).expect("inspect");
@@ -2037,12 +1999,9 @@ async fn imported_receipt_is_durable_and_reimport_is_idempotent() {
         .handle()
         .claim_execution(ExecId([0x41; 32]))
         .expect("execution writer");
-    writer
-        .assemble_and_stage_receipt_body(12)
-        .await
-        .expect("assemble");
+    writer.assemble_receipt(12).await.expect("assemble");
     drop(writer);
-    let receipt = publish_staged_receipt(&produced, &fixture, ExecId([0x41; 32])).await;
+    let receipt = publish_receipt(&produced, &fixture, ExecId([0x41; 32])).await;
     produced.shutdown().await.expect("shutdown produced");
 
     let imported_host = other_peer(&fixture);
@@ -2063,10 +2022,10 @@ async fn imported_receipt_is_durable_and_reimport_is_idempotent() {
             .expect("re-import"),
         ReceiptImportOutcome::AlreadyImported
     );
-    let key = receipt.key();
+    let key = receipt.receipt_id();
     let stored = imported
         .handle()
-        .load_receipt(key)
+        .load_receipt_by_id(key)
         .await
         .expect("load imported")
         .expect("stored imported receipt");
@@ -2151,7 +2110,7 @@ async fn imported_receipt_is_durable_and_reimport_is_idempotent() {
 }
 
 #[tokio::test]
-async fn imported_receipt_rejects_key_conflict_without_overwrite() {
+async fn imported_receipt_rejects_canonical_conflict_without_overwrite() {
     let fixture = activation_fixture();
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("store.sqlite");
@@ -2162,12 +2121,9 @@ async fn imported_receipt_rejects_key_conflict_without_overwrite() {
         .handle()
         .claim_execution(ExecId([0x42; 32]))
         .expect("execution writer");
-    writer
-        .assemble_and_stage_receipt_body(12)
-        .await
-        .expect("assemble");
+    writer.assemble_receipt(12).await.expect("assemble");
     drop(writer);
-    let receipt = publish_staged_receipt(&produced, &fixture, ExecId([0x42; 32])).await;
+    let receipt = publish_receipt(&produced, &fixture, ExecId([0x42; 32])).await;
     produced.shutdown().await.expect("shutdown produced");
 
     let store = Store::open(StoreConfig::new(&path, other_peer(&fixture))).expect("open");
@@ -2178,13 +2134,18 @@ async fn imported_receipt_rejects_key_conflict_without_overwrite() {
         .expect("import");
     let different = receipt_with_different_content(&receipt);
     assert_ne!(different.receipt_id(), receipt.receipt_id());
-    assert_eq!(different.key(), receipt.key());
+    assert_eq!(
+        different.body().header().session_hash(),
+        receipt.body().header().session_hash()
+    );
     let error = store
         .handle()
         .import_receipt(different, 21)
         .await
         .expect_err("key conflict");
-    assert!(matches!(error, StoreError::Corruption(message) if message.contains("receipt key")));
+    assert!(
+        matches!(error, StoreError::Corruption(message) if message.contains("different canonical receipt"))
+    );
     let listed = store.handle().list_receipts(8).await.expect("list");
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].receipt, receipt);
@@ -2204,12 +2165,9 @@ async fn exact_imported_receipt_is_promoted_by_local_publication() {
         .handle()
         .claim_execution(ExecId([0x43; 32]))
         .expect("execution writer");
-    writer
-        .assemble_and_stage_receipt_body(12)
-        .await
-        .expect("assemble");
+    writer.assemble_receipt(12).await.expect("assemble");
     drop(writer);
-    let receipt = publish_staged_receipt(&source, &fixture, ExecId([0x43; 32])).await;
+    let receipt = publish_receipt(&source, &fixture, ExecId([0x43; 32])).await;
     source.shutdown().await.expect("shutdown source");
 
     let imported = Store::open(StoreConfig::new(&target_path, fixture.producer)).expect("open");
@@ -2229,16 +2187,13 @@ async fn exact_imported_receipt_is_promoted_by_local_publication() {
         .handle()
         .claim_execution(ExecId([0x44; 32]))
         .expect("execution writer");
-    writer
-        .assemble_and_stage_receipt_body(12)
-        .await
-        .expect("assemble");
+    writer.assemble_receipt(12).await.expect("assemble");
     drop(writer);
-    let published = publish_staged_receipt(&target, &fixture, ExecId([0x44; 32])).await;
+    let published = publish_receipt(&target, &fixture, ExecId([0x44; 32])).await;
     assert_eq!(published, receipt);
     let stored = target
         .handle()
-        .load_receipt(receipt.key())
+        .load_receipt_by_id(receipt.receipt_id())
         .await
         .expect("load promoted")
         .expect("promoted receipt");
@@ -2276,12 +2231,9 @@ async fn locally_produced_receipt_import_retains_both_provenance() {
         .handle()
         .claim_execution(execution_id)
         .expect("execution writer");
-    writer
-        .assemble_and_stage_receipt_body(12)
-        .await
-        .expect("assemble");
+    writer.assemble_receipt(12).await.expect("assemble");
     drop(writer);
-    let receipt = publish_staged_receipt(&store, &fixture, execution_id).await;
+    let receipt = publish_receipt(&store, &fixture, execution_id).await;
 
     assert_eq!(
         store
@@ -2293,7 +2245,7 @@ async fn locally_produced_receipt_import_retains_both_provenance() {
     );
     let stored = store
         .handle()
-        .load_receipt(receipt.key())
+        .load_receipt_by_id(receipt.receipt_id())
         .await
         .expect("load imported receipt")
         .expect("stored receipt");
@@ -2329,4 +2281,104 @@ async fn locally_produced_receipt_import_retains_both_provenance() {
         .expect("recovered receipt");
     assert_eq!(recovered.provenance, ReceiptProvenance::Both);
     reopened.shutdown().await.expect("shutdown reopened");
+}
+
+#[tokio::test]
+async fn distinct_stop_reports_coexist_without_impersonating_local_publication() {
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("reports.sqlite");
+    let store = Store::open(StoreConfig::new(&path, host(9))).unwrap();
+    let mut reports = Vec::new();
+    for index in [1u8, 2] {
+        let identity = NodeKeys::from_secret(SecretKey::from_bytes([index; 32]));
+        let unsigned = arena0_protocol::AbortOccurrence::unsigned(
+            fixture.activation.session_hash(),
+            arena0_protocol::PeerId(identity.ed25519_public_key().0),
+            arena0_protocol::AbortKind::Abort,
+            0,
+            "local observation",
+            arena0_protocol::PublicCursor::new(
+                0,
+                fixture.activation.offer().data().initial_state,
+                arena0_protocol::CHAIN_START,
+            ),
+        )
+        .unwrap();
+        let signature = identity.sign(&unsigned.signing_bytes().unwrap());
+        let body = arena0_protocol::ReceiptBody::new(
+            arena0_protocol::SessionHeader::new(
+                fixture.activation.clone(),
+                arena0_protocol::ReceiptTermination::Stopped {
+                    cause: arena0_protocol::StopCause::Authenticated(
+                        unsigned.with_signature(signature).unwrap(),
+                    ),
+                },
+            ),
+            Vec::new(),
+            fixture.activation.offer().data().params.as_bytes().to_vec(),
+            Vec::new(),
+        )
+        .unwrap();
+        let report = ReceiptArtifact::new(body).unwrap();
+        assert!(matches!(report, ReceiptArtifact::StopReport(_)));
+        assert_eq!(
+            store
+                .handle()
+                .import_receipt(report.clone(), 1)
+                .await
+                .unwrap(),
+            ReceiptImportOutcome::Imported
+        );
+        reports.push(report);
+    }
+    assert_ne!(reports[0].receipt_id(), reports[1].receipt_id());
+    assert!(
+        store
+            .handle()
+            .load_receipt(fixture.activation.session_hash())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    store.shutdown().await.unwrap();
+    let store = Store::open(StoreConfig::new(&path, host(9))).unwrap();
+    assert_eq!(store.handle().list_receipts(10).await.unwrap().len(), 2);
+    for report in reports {
+        let loaded = store
+            .handle()
+            .load_receipt_by_id(report.receipt_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.receipt.encode().unwrap(), report.encode().unwrap());
+        assert_eq!(loaded.provenance, ReceiptProvenance::Imported);
+        assert_eq!(
+            store.handle().import_receipt(report, 2).await.unwrap(),
+            ReceiptImportOutcome::AlreadyImported
+        );
+    }
+    store.shutdown().await.unwrap();
+}
+
+#[test]
+fn previous_store_schema_is_rejected_without_rewriting_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("old.sqlite");
+    let connection = Connection::open(&path).unwrap();
+    connection.execute_batch("PRAGMA user_version = 1; CREATE TABLE retained (artifact BLOB NOT NULL); INSERT INTO retained VALUES (x'010203');").unwrap();
+    drop(connection);
+    assert!(matches!(
+        Store::open(StoreConfig::new(&path, host(9))),
+        Err(StoreError::UnsupportedSchema(1))
+    ));
+    let connection = Connection::open(&path).unwrap();
+    let bytes: Vec<u8> = connection
+        .query_row("SELECT artifact FROM retained", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(bytes, [1, 2, 3]);
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 1);
 }

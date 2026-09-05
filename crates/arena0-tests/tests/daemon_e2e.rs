@@ -9,8 +9,8 @@ mod common;
 use std::path::Path;
 
 use arena0_api::{
-    EnsembleSpec, FullVerifiedTerminal, LightVerifiedTerminal, ReceiptKey, ReceiptRef, Request,
-    ResponseOk, VerifiedResult,
+    EnsembleSpec, FullVerifiedTerminal, LightVerifiedTerminal, ReceiptRef, Request, ResponseOk,
+    VerifiedResult,
 };
 use arena0_protocol::SessionHash;
 use common::{call, created, cumulative_sum_wasm, drive, ok, rps_wasm, two_daemons};
@@ -61,43 +61,39 @@ async fn two_daemons_play_and_verify() {
 
     // Receipts are fetchable and verify at both tiers, on both daemons, returning
     // evidence rather than a bool.
-    for (sock, sid, producer) in [(&d.sock_a, sid_a, d.peer_a), (&d.sock_b, sid_b, d.peer_b)] {
-        let ResponseOk::Receipt(_) = ok(call(
+    let mut artifacts = Vec::new();
+    for (sock, sid) in [(&d.sock_a, sid_a), (&d.sock_b, sid_b)] {
+        let ResponseOk::Receipt(receipt) = ok(call(
             sock,
             &Request::ReceiptGet {
-                key: ReceiptKey {
-                    session_id: sid,
-                    producer,
-                },
+                receipt: arena0_api::ReceiptRef::Produced(sid),
             },
         )
         .await) else {
             panic!("expected a receipt");
         };
-        assert_verified(sock, sid, producer, false).await;
-        assert_verified(sock, sid, producer, true).await;
+        artifacts.push(receipt);
+        assert_verified(sock, sid, false).await;
+        assert_verified(sock, sid, true).await;
     }
+    assert_eq!(
+        artifacts[0].encode().unwrap(),
+        artifacts[1].encode().unwrap()
+    );
 }
 
-async fn assert_verified(
-    socket: &Path,
-    session_id: SessionHash,
-    producer: arena0_protocol::PeerId,
-    full: bool,
-) {
+async fn assert_verified(socket: &Path, session_id: SessionHash, full: bool) {
     let resp = ok(call(
         socket,
         &Request::ReceiptVerify {
-            receipt: ReceiptRef::Produced(ReceiptKey {
-                session_id,
-                producer,
-            }),
+            receipt: ReceiptRef::Produced(session_id),
             full,
         },
     )
     .await);
     match resp {
         ResponseOk::Verified {
+            receipt_id: _,
             program_id: _,
             session_id: verified_sid,
             ensemble,
@@ -178,14 +174,11 @@ async fn joiner_without_params_adopts_creator_terms() {
     let (sid_a, sid_b) = tokio::join!(drive(&d.sock_a, exec_a), drive(&d.sock_b, exec_b));
     assert_eq!(sid_a, sid_b, "both parties confirmed the same session");
 
-    for (sock, sid, producer) in [(&d.sock_a, sid_a, d.peer_a), (&d.sock_b, sid_b, d.peer_b)] {
+    for (sock, sid) in [(&d.sock_a, sid_a), (&d.sock_b, sid_b)] {
         let resp = ok(call(
             sock,
             &Request::ReceiptVerify {
-                receipt: ReceiptRef::Produced(ReceiptKey {
-                    session_id: sid,
-                    producer,
-                }),
+                receipt: ReceiptRef::Produced(sid),
                 full: false,
             },
         )

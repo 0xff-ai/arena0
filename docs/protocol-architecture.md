@@ -471,50 +471,66 @@ and guest boundaries.
 ### Terminal proof and publication
 
 `SessionEnd` starts internal terminal proof collection. Every participant signs
-the exact terminal commitment, and the reducer stores the complete N-of-N
-certificate. The store then assembles the receipt body from durable activation,
-trace, outcome, and certificate rows. The local producer signs a
-`ProducerSeal` over that body and the store publishes the sealed receipt as a
-durable outbox effect.
+the exact terminal commitment. Once the N-of-N certificate is complete, the
+store assembles and validates the portable evidence from durable activation,
+trace, outcome, and certificate rows. One SQLite transaction publishes the
+artifact, its local execution relation, terminal status, and durable outbox
+effect. There is no separate producer seal or signing round.
 
-Terminal proof progress, the producer-seal request, and the seal signature are
-internal protocol and store records. They are not guest events, agent inputs,
-API methods, or public event payloads. A stopped execution follows the same
-receipt-body and producer-seal pipeline with an authenticated unilateral stop
-or a shared N-of-N stop cause; a stopped receipt has no outcome bytes.
+`ReceiptArtifact` distinguishes two guarantees:
 
-`ExecutionStatus::receipt_work()` derives the remaining work as a borrowed view:
-not terminal, collecting signatures, assembling a body, sealing a body,
-published, or frozen incomplete. It introduces no additional persisted state.
-Live actor failures and startup recovery use one node-owned failure transition;
-complete evidence is finalized and incomplete evidence remains frozen.
+- `Receipt`: unanimous evidence of completion or a certified shared program
+  abort/failure. Hosts retaining the same agreed execution produce identical
+  canonical bytes and the same `ReceiptId`.
+- `StopReport`: an authenticated unilateral `AbortOccurrence` and the certified
+  public prefix it references. Different observations can produce different
+  reports for the same session. A report never claims unanimous termination.
+
+Both forms retain their signed terminal evidence; stopped artifacts have no
+outcome bytes. The artifact contains no exporting Host identity, timestamps,
+local execution IDs, or private state. Existing activation, step, and terminal
+signatures authenticate the evidence. A stop report additionally carries its
+originating participant's Ed25519-signed occurrence.
+
+`ExecutionStatus::receipt_work()` derives the remaining operation: not terminal,
+collecting signatures, assembling and publishing, published, or frozen
+incomplete. Live actor failures and startup recovery use one node-owned failure
+transition. Complete evidence is published without contacting a peer or running
+the guest; incomplete terminal agreement remains frozen. A crash before the
+assembly transaction retries it; a crash after commit retains the exact artifact
+and resumes durable outbox delivery.
 
 ## 11. Receipts and verification
 
-`arena0_protocol::Receipt` owns portable proof evidence. Every participant produces
-and persists its own receipt, so the durable local address is:
+`ReceiptId` is BLAKE3 over the domain `arena0/receipt/v2` followed by the exact
+versioned Borsh artifact bytes. It is independent of which Host exports those
+bytes. The Borsh artifact and body versions are 2. JSON uses the tagged shape
+`{"kind":"receipt"|"stop_report","body":...}`; decoding rejects a kind that
+disagrees with the authenticated terminal evidence. `ProofId` and producer-bound
+receipt identities are replaced by this one content identity.
 
-```text
-(SessionHash, producer PeerId)
-```
+The store indexes artifacts by `ReceiptId`. It admits at most one canonical
+receipt per session and permits multiple distinct stop reports. Imports of
+identical evidence deduplicate without overwriting any artifact. The store keeps
+artifact bytes, import facts, and local production relations separately.
+`Produced`, `Imported`, and `Both` are local provenance, not receipt fields.
+Local publication retains an earlier import fact for the same artifact.
 
-Receipt listing preserves each producer; retrieval never silently selects one
-receipt for a shared session.
+An exact content reference can retrieve imported or locally produced evidence.
+A local session reference resolves only that Host's production relation; it
+never picks an arbitrary imported report. Each Host keeps its own database and
+proof evidence even when the canonical artifact is identical across Hosts.
 
-The store keeps each receipt artifact, import fact, and local production
-relation separately. A locally sealed artifact has a `Produced` relation to
-the local `ExecId`; `receipt.import` records an `Imported` fact without an
-execution relation. The derived provenance is `Produced`, `Imported`, or
-`Both`, so local publication never erases an earlier import. Repeating an
-import of the same artifact is idempotent, and a different artifact cannot
-occupy an existing `(SessionHash, producer)` key.
+Light verification checks the activation binding, trace chain, full participant
+agreements, terminal evidence, and derived receipt identity without loading the
+program. A completed result includes authenticated opaque `outcome_borsh` bytes.
+A stopped result includes the exact `StopCause`, preserving the distinction
+between an authenticated unilateral report and a shared N-of-N stop.
 
-Light verification returns a total typed result after checking the activation
-binding, producer seal, trace chain, participant set, aggregate agreements,
-terminal evidence, and receipt identity without loading the program. A
-completed result includes the authenticated opaque `outcome_borsh` bytes. A
-stopped result includes only its exact `StopCause`, either an authenticated
-unilateral occurrence or a shared N-of-N stop commitment.
+This release uses store schema version 2 and rejects earlier databases with an
+unsupported-schema error. It does not rewrite or delete old evidence. Version-1
+producer-sealed receipts are also rejected; they must be inspected with the
+matching older release. Automatic migration is not provided.
 
 Full verification first performs the light checks, then loads the exact Wasm,
 checks its content hash and execution profile, and replays every public call in
@@ -546,7 +562,7 @@ daemon restart. A nonterminal execution that cannot be truthfully resumed is
 durably marked failed during startup. A prepared, uncommitted activation stays
 eligible for activation recovery. Public terminal status does not end recovery:
 stopped executions without a produced receipt and terminal executions with
-unacknowledged outbox work remain eligible. Each Host assembles and seals its
+unacknowledged outbox work remain eligible. Each Host assembles and persists its
 local receipt from durable evidence before attempting further delivery. An
 unavailable guest or peer cannot prevent that local proof from being persisted;
 outbox delivery remains durable and ordered independently.
@@ -586,8 +602,7 @@ does not apply to the process-replacing, persistent `arena0 serve` path.
 `arena0_protocol::system_event::SystemEvent` is Host-only and non-Borsh. The
 daemon records redacted values as structured tracing on
 `arena0::system_event`. System events never carry params, outcomes, callout
-context, signatures, or raw private key material. Terminal proof progress and
-the producer seal remain internal store and protocol records. The daemon emits
+context, signatures, or raw private key material. Terminal proof progress remains internal to the store and protocol. The daemon emits
 only the safe lifecycle and execution observations defined by `arena0-api`.
 
 The Unix API uses its own safe event DTOs. System events do not cross into the
@@ -614,7 +629,7 @@ The public release guarantees:
 - one agreement per shared-state step;
 - deterministic fuel, memory, and replayable randomness behavior;
 - JSON-only agent values and guest-owned concrete DTO conversion;
-- producer-exact receipt ownership;
+- canonical receipt identity, distinct unilateral stop reports, and local provenance;
 - the `Transport` seam without changing runtime or proof semantics.
 
 The public workspace has no remote discovery, addressing, relay, remote program

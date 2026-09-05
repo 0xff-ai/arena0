@@ -12,7 +12,7 @@ use arena0_crypto::{ExecutionKey, ExecutionSalt, NodeKeys};
 use arena0_program::{JsonBytes, ProgramHash};
 use arena0_protocol::{
     Activation, Ensemble, ExecId, ExecutionAdmission, ExecutionInput, FrameId, LocalStateBytes,
-    PeerIdSource, PreparedActivation, Receipt, SessionHash, SharedStateBytes, View,
+    PeerIdSource, PreparedActivation, ReceiptArtifact, SessionHash, SharedStateBytes, View,
 };
 use arena0_sandbox::AdmittedProgram;
 use arena0_store::{
@@ -138,7 +138,7 @@ pub enum SessionMessage {
     /// A local notification became deliverable.
     Notification { frame_id: FrameId, payload: Vec<u8> },
     /// A final receipt was durably published locally.
-    ReceiptPublished { receipt: Receipt },
+    ReceiptPublished { receipt: ReceiptArtifact },
     /// The execution reached a completed terminal boundary.
     Completed {
         result: Vec<u8>,

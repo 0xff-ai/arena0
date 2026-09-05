@@ -65,12 +65,11 @@ pub use execution::{
     MAX_SHARED_EFFECTS, MAX_TERMINAL_OUTCOME_BYTES, MAX_TERMINAL_REASON_BYTES, MAX_TIMER_MUTATIONS,
     MAX_TIMER_PAYLOAD_BYTES, MAX_TRACE_ENTRY_BYTES, OutboxId, OutboxIntent,
     ParticipantStepSignature, ParticipantTerminalSignature, PendingId, PendingIdParseError, PlanId,
-    PrivateCause, PrivateCommit, PrivateCursor, PrivateDelta, ProducerSeal, ProducerSealRequest,
-    ProofId, ProtocolError, PublicCursor, PublishedProof, Receipt, ReceiptBody, ReceiptId,
-    ReceiptKey, ReceiptSealData, ReceiptWork, SharedCommit, SharedDelta, SharedProposal,
-    StepCertificate, StopCause, TerminalCertificate, TerminalOutcome, TerminalProof,
-    TerminalPublication, TimerFiring, TimerId, TimerMutation, TransitionOutcome, pending_id,
-    transition,
+    PrivateCause, PrivateCommit, PrivateCursor, PrivateDelta, ProtocolError, PublicCursor,
+    PublishedProof, Receipt, ReceiptArtifact, ReceiptBody, ReceiptId, ReceiptKind, ReceiptWork,
+    SharedCommit, SharedDelta, SharedProposal, StepCertificate, StopCause, StopReport,
+    TerminalCertificate, TerminalOutcome, TerminalProof, TerminalPublication, TimerFiring, TimerId,
+    TimerMutation, TransitionOutcome, pending_id, transition,
 };
 pub use fetch_frame::{FetchFrame, FetchFrameError};
 pub use id::IdParseError;

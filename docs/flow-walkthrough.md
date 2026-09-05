@@ -1,7 +1,7 @@
 # arena0 local flow walkthrough
 
 This walkthrough follows a two-Host rock-paper-scissors session from admission
-to producer-exact receipts. The formal rules live in
+to canonical receipts and unilateral stop reports. The formal rules live in
 [`protocol-architecture.md`](protocol-architecture.md). The same flow works
 for any N-party Ensemble.
 
@@ -151,44 +151,39 @@ leases retry after delivery failure and recover after a restart. A pending
 callout retains its context and `pending_id` in the store; recovery re-emits an
 acknowledged callout. Signing requests stay inside the actor.
 
-## 6. Each Host stores its own receipt
+## 6. Each Host retains evidence
 
-Every participant produces and persists its own `arena0_protocol::Receipt`.
-Receipt identity includes the producer:
+Alice and Bob independently assemble the same receipt after unanimous completion.
+Its versioned canonical bytes and `ReceiptId` are identical. A shared program
+abort also produces a canonical receipt. A unilateral failure instead produces
+an authenticated `StopReport`; different observations can yield different
+reports for the same session.
+
+The receipt API exchanges a typed envelope:
 
 ```rust
-struct ReceiptKey {
-    session_id: SessionHash,
-    producer: PeerId,
+enum ReceiptArtifact {
+    Receipt(Receipt),
+    StopReport(StopReport),
 }
 ```
 
-For Alice and Bob, a shared session therefore has two durable addresses:
-`(SessionHash, Alice)` and `(SessionHash, Bob)`. Receipt listing keeps both
-entries. Retrieval and verification require the exact session and producer;
-they never select whichever receipt happens to sort first.
+Each artifact contains activation, agreed params, the certified public trace,
+and terminal evidence. Completed receipts also contain the opaque Borsh outcome.
+Light verification checks signatures and commitments; full verification replays
+the exact Wasm and projects the completed outcome to JSON. A stopped result
+preserves its exact cause and has no outcome.
 
-A receipt contains the activation, accepted params, signed trace, outcome, and
-terminal agreement. The Host treats the deterministic Borsh params and outcome
-as opaque proof bytes. Terminal proof collection and the producer seal are
-internal records; no agent or event API exposes them. The agent receives a
-guest-produced JSON outcome or view. Light verification returns either opaque
-outcome bytes for a completed receipt or the exact stop cause. Full verification
-replays the exact Wasm in fresh admitted instances and returns both opaque
-outcome bytes and guest JSON for completion, or the same stop cause with no
-outcome field.
-
-The store keeps the receipt artifact, its imported fact, and its local
-production relation separately. Listing derives `Produced`, `Imported`, or
-`Both` provenance; local publication therefore cannot erase an earlier import.
-The production relation binds a locally sealed receipt to the producing Host's
-execution, while `receipt.import` records a verified portable artifact without
-an execution relation. Listing and retrieval preserve every producer.
+One store transaction persists the artifact, terminal status, production relation,
+and publication outbox effect. There is no exporter seal. Local production and
+import facts yield `Produced`, `Imported`, or `Both` provenance. Exact content
+IDs retrieve any held artifact; a session reference resolves only the addressed
+Host's local production relation.
 
 ## Observe the local run
 
 For the coordinated operator path, `arena0 run rock-paper-scissors` displays
-the guest-owned current `View`, execution lifecycle, and all-producer receipt
+the guest-owned current `View`, execution lifecycle, and all-Host receipt
 progress. Use `--no-tui` for inline output or `--json` with a driver bound to
 every Host for one machine-readable result.
 
@@ -202,4 +197,4 @@ params, outcomes, callout context, or signatures.
 One `arena0d` process supervises independent Hosts. `Explicit { peers }`
 selects the participant set, `Join { creator, negotiation_id }` names one
 exact negotiation, `LocalTransport` delivers the bounded protocol facts, and
-each Host commits, executes, and stores its own producer-keyed receipt.
+each Host commits, executes, and retains its own copy of the canonical receipt or unilateral stop report.

@@ -1,12 +1,11 @@
-//! Protocol-only validation of one complete sealed receipt.
+//! Protocol-only validation of one complete authenticated artifact.
 
-use arena0_crypto::SignScheme;
 use arena0_program::ProgramHash;
 use arena0_protocol::{
     AbortKind, Activation, AggregateAttestation, CHAIN_START, Committed, Ensemble,
-    MAX_PARTICIPANTS, MessageId, OutcomeHash, PeerId, ProofId, PublicCursor, PublicEffect,
-    PublicEvent, Receipt, ReceiptBody, ReceiptId, ReceiptTermination, SessionHash, StepCommitment,
-    StopCause, TRACE_FORMAT_VERSION, TerminalCommitment, TicketAction,
+    MAX_PARTICIPANTS, MessageId, OutcomeHash, PeerId, PublicCursor, PublicEffect, PublicEvent,
+    ReceiptArtifact, ReceiptBody, ReceiptTermination, SessionHash, StepCommitment, StopCause,
+    TRACE_FORMAT_VERSION, TerminalCommitment, TicketAction,
 };
 
 use crate::error::{VerifyError, sanitize_verify_message};
@@ -47,7 +46,7 @@ pub enum LightVerifiedTerminal {
     Stopped { cause: StopCause },
 }
 
-/// Verify a bounded encoded [`Receipt`] without loading Wasm or a
+/// Verify a bounded encoded [`ReceiptArtifact`] without loading Wasm or a
 /// sandbox.
 pub fn verify_light(receipt_bytes: &[u8]) -> Result<LightVerified, VerifyError> {
     verify_light_inner(receipt_bytes)
@@ -60,14 +59,14 @@ fn verify_light_inner(receipt_bytes: &[u8]) -> Result<LightVerified, VerifyError
             max: arena0_protocol::MAX_RECEIPT_BYTES,
         });
     }
-    let receipt = Receipt::decode(receipt_bytes)
+    let receipt = ReceiptArtifact::decode(receipt_bytes)
         .map_err(|error| VerifyError::ReceiptDecode(error.to_string()))?;
     verify_decoded(&receipt)
 }
 
 /// Verify a decoded receipt. The public entrypoint performs bounded decoding;
 /// replay uses this helper after it has decoded the same value.
-pub(crate) fn verify_decoded(receipt: &Receipt) -> Result<LightVerified, VerifyError> {
+pub(crate) fn verify_decoded(receipt: &ReceiptArtifact) -> Result<LightVerified, VerifyError> {
     let body = receipt.body();
     let header = body.header();
     let activation = &header.activation;
@@ -76,36 +75,11 @@ pub(crate) fn verify_decoded(receipt: &Receipt) -> Result<LightVerified, VerifyE
         .validate()
         .map_err(|error| VerifyError::ReceiptInvalid(format!("activation: {error}")))?;
 
-    verify_producer_seal(receipt)?;
-
-    let expected_proof = ProofId::derive(body)
-        .map_err(|error| VerifyError::ReceiptInvalid(format!("proof id: {error}")))?;
-    if expected_proof != receipt.proof_id() {
-        return Err(VerifyError::ProofIdMismatch);
-    }
-    let expected_receipt = ReceiptId::derive_body(body)
-        .map_err(|error| VerifyError::ReceiptInvalid(format!("receipt id: {error}")))?;
-    if expected_receipt != receipt.receipt_id() {
-        return Err(VerifyError::ReceiptIdMismatch);
-    }
-
-    if header.producer != receipt.producer() {
-        return Err(VerifyError::ProducerMismatch {
-            seal: receipt.producer(),
-            header: header.producer,
-        });
-    }
-
     if body.params() != activation.offer().data().params.as_bytes() {
         return Err(VerifyError::ParamsMismatch);
     }
 
     let (ensemble, participant_keys) = participant_set(activation)?;
-    if !ensemble.contains(&header.producer) {
-        return Err(VerifyError::ReceiptInvalid(
-            "producer is not a committed participant".to_owned(),
-        ));
-    }
     let session_id = activation.session_hash();
     let terminal = &header.terminal;
     verify_trace(body, session_id, &ensemble, &participant_keys, terminal)?;
@@ -127,34 +101,6 @@ pub(crate) fn verify_decoded(receipt: &Receipt) -> Result<LightVerified, VerifyE
         })?,
         terminal,
     })
-}
-
-fn verify_producer_seal(receipt: &Receipt) -> Result<(), VerifyError> {
-    let body_producer = receipt.body().header().producer;
-    let seal = receipt.seal();
-    let seal_producer = seal.data().producer();
-    if body_producer != seal_producer {
-        return Err(VerifyError::ProducerMismatch {
-            seal: seal_producer,
-            header: body_producer,
-        });
-    }
-    let signing_bytes = seal
-        .data()
-        .signing_bytes()
-        .map_err(|_| VerifyError::SealMismatch)?;
-    let valid = arena0_crypto::verify(
-        SignScheme::Ed25519,
-        &seal_producer.0,
-        &signing_bytes,
-        &seal.signature().0,
-    )
-    .map_err(|_| VerifyError::SealMismatch)?;
-    if valid {
-        Ok(())
-    } else {
-        Err(VerifyError::SealMismatch)
-    }
 }
 
 fn participant_set(
@@ -551,25 +497,13 @@ pub(crate) mod tests {
     use arena0_crypto::{BlsSignature, ExecutionKey, ExecutionSalt, NodeKeys, SecretKey};
     use arena0_program::ExecutionProfile;
     use arena0_protocol::{
-        Activation, AggregateAttestation, Offer, OfferData, PreparedActivation, ProducerSeal,
-        ReceiptSealData, SessionHeader, SessionTerminal, SignerSet, StateHash, Ticket,
-        TicketAction, TicketData, TraceEntry,
+        Activation, AggregateAttestation, Offer, OfferData, PreparedActivation, SessionHeader,
+        SessionTerminal, SignerSet, StateHash, Ticket, TicketAction, TicketData, TraceEntry,
     };
 
     fn fixture() -> Vec<u8> {
-        fixture_with_binding(ProgramHash([0x44; 32]), StateHash([0x11; 32]), false, false)
+        fixture_with_binding(ProgramHash([0x44; 32]), StateHash([0x11; 32]), false)
             .expect("valid fixture")
-    }
-
-    fn fixture_with_header_producer(
-        mismatched: bool,
-    ) -> Result<Vec<u8>, arena0_protocol::ProtocolError> {
-        fixture_with_binding(
-            ProgramHash([0x44; 32]),
-            StateHash([0x11; 32]),
-            false,
-            mismatched,
-        )
     }
 
     #[cfg(feature = "replay")]
@@ -577,15 +511,13 @@ pub(crate) mod tests {
         program_hash: ProgramHash,
         initial_state: StateHash,
     ) -> Vec<u8> {
-        fixture_with_binding(program_hash, initial_state, true, false)
-            .expect("valid replay fixture")
+        fixture_with_binding(program_hash, initial_state, true).expect("valid replay fixture")
     }
 
     fn fixture_with_binding(
         program_hash: ProgramHash,
         initial_state: StateHash,
         two_steps: bool,
-        mismatched_header_producer: bool,
     ) -> Result<Vec<u8>, arena0_protocol::ProtocolError> {
         let negotiation = arena0_protocol::NegotiationId([9; 32]);
         let keys = [
@@ -761,36 +693,15 @@ pub(crate) mod tests {
             )
             .expect("terminal aggregate"),
         };
-        let header_producer = if mismatched_header_producer {
-            PeerId([0xaa; 32])
-        } else {
-            creator
-        };
         let body = ReceiptBody::new(
-            SessionHeader::new(
-                activation,
-                ReceiptTermination::Completed { terminal },
-                header_producer,
-            ),
+            SessionHeader::new(activation, ReceiptTermination::Completed { terminal }),
             outcome,
             params,
             entries,
         )
         .expect("fixture body");
-        let proof_id = ProofId::derive(&body).expect("fixture proof id");
-        let receipt_id = ReceiptId::derive_body(&body).expect("fixture receipt id");
-        let seal_data = ReceiptSealData::new(proof_id, receipt_id, creator);
-        let creator_index = participants
-            .iter()
-            .position(|(peer, _, _)| *peer == creator)
-            .expect("creator index");
-        let seal = ProducerSeal::new(
-            seal_data,
-            participants[creator_index]
-                .1
-                .sign(&seal_data.signing_bytes().expect("seal bytes")),
-        );
-        arena0_protocol::Receipt::new(body, seal)?.encode()
+
+        arena0_protocol::ReceiptArtifact::new(body)?.encode()
     }
 
     #[test]
@@ -803,7 +714,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn valid_sealed_receipt_is_accepted() {
+    fn valid_canonical_receipt_is_accepted() {
         let bytes = fixture();
         let verified = verify_light(&bytes).expect("fixture verifies");
         assert_eq!(verified.steps, 1);
@@ -815,27 +726,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn tampered_producer_and_ids_fail_closed_without_panicking() {
+    fn tampered_evidence_fails_closed_without_panicking() {
         let original = fixture();
-        let cases = [
-            original.len().saturating_sub(96),  // seal producer
-            original.len().saturating_sub(160), // proof id
-            original.len().saturating_sub(128), // receipt id
-            original.len() / 2,                 // body
-        ];
+        let cases = [0, 1, original.len() / 2, original.len() - 1];
         for offset in cases {
             let mut bytes = original.clone();
             bytes[offset] ^= 1;
             assert!(verify_light(&bytes).is_err());
         }
-    }
-
-    #[test]
-    fn header_producer_mismatch_is_rejected_even_with_a_valid_seal() {
-        assert!(matches!(
-            fixture_with_header_producer(true),
-            Err(arena0_protocol::ProtocolError::InvalidProducerSeal)
-        ));
     }
 
     #[test]

@@ -407,8 +407,8 @@ fn receipt_lines(lines: &mut Vec<Line<'static>>, state: &ScreenState, host: &Hos
         any = true;
         lines.push(Line::styled(
             format!(
-                "  producer              {}  verified  {}",
-                receipt.producer.fmt_short(),
+                "  peer_id              {}  verified  {}",
+                receipt.peer_id.fmt_short(),
                 receipt.tier
             ),
             state.palette.muted(),

@@ -427,13 +427,6 @@ impl ExecutionActor {
                 }
                 Ok(())
             }
-            DurableEffect::RequestProducerSeal { data } => super::terminal::apply_producer_seal(
-                &mut self.context.store,
-                &self.context.identity,
-                *data,
-            )
-            .await
-            .map_err(Into::into),
             DurableEffect::SendAbort {
                 destination,
                 occurrence,
@@ -591,7 +584,6 @@ fn outbound_frame(effect: &DurableEffect) -> Option<(arena0_protocol::PeerId, Ex
         | DurableEffect::RequestSignature { .. }
         | DurableEffect::RetryInput { .. }
         | DurableEffect::PublishReceipt { .. }
-        | DurableEffect::RequestProducerSeal { .. }
         | DurableEffect::RequestStepSignature { .. }
         | DurableEffect::RequestTerminalSignature { .. } => None,
     }

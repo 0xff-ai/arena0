@@ -1,32 +1,19 @@
 //! Errors returned by receipt verification.
 
 use arena0_program::ProgramHash;
-use arena0_protocol::PeerId;
 
-/// A failure while validating a portable sealed receipt.
+/// A failure while validating a portable authenticated artifact.
 #[derive(Debug, thiserror::Error)]
 pub enum VerifyError {
     /// The input exceeded the protocol's encoded receipt bound.
-    #[error("sealed receipt is {actual} bytes; maximum is {max}")]
+    #[error("authenticated artifact is {actual} bytes; maximum is {max}")]
     ReceiptTooLarge { actual: usize, max: usize },
     /// The encoded receipt was not a bounded, version-1 wire value.
-    #[error("invalid sealed receipt: {0}")]
+    #[error("invalid authenticated artifact: {0}")]
     ReceiptDecode(String),
     /// The receipt failed a protocol or certificate invariant.
     #[error("invalid receipt: {0}")]
     ReceiptInvalid(String),
-    /// The receipt's producer is not the producer named by the session header.
-    #[error("receipt producer {seal} does not match session producer {header}")]
-    ProducerMismatch { seal: PeerId, header: PeerId },
-    /// The producer seal does not verify against the exact seal preimage.
-    #[error("producer Ed25519 seal is invalid")]
-    SealMismatch,
-    /// The seal carries a proof identity different from the body.
-    #[error("proof id does not match the receipt body")]
-    ProofIdMismatch,
-    /// The seal carries a receipt identity different from the body.
-    #[error("receipt id does not match the body")]
-    ReceiptIdMismatch,
     /// The encoded receipt body binds parameters different from the activation.
     #[error("receipt parameters do not match the activation")]
     ParamsMismatch,

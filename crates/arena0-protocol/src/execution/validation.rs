@@ -4,17 +4,16 @@ use crate::trace::{
     TRACE_FORMAT_VERSION, TraceEntry,
 };
 use crate::{
-    Ensemble, OutcomeHash, PeerId, PrivateEffect, PrivateEvent, PublicEffect, PublicEvent,
-    StateHash,
+    Ensemble, OutcomeHash, PrivateEffect, PrivateEvent, PublicEffect, PublicEvent, StateHash,
 };
 
 use super::{
     AbortKind, ActiveTimer, ExecutionBinding, ExecutionState, MAX_ACTIVE_TIMERS,
     MAX_EFFECT_PAYLOAD_BYTES, MAX_PRIVATE_EFFECTS, MAX_PRIVATE_RECORD_BYTES, MAX_RECEIPT_BYTES,
     MAX_SHARED_EFFECTS, MAX_TERMINAL_OUTCOME_BYTES, MAX_TERMINAL_REASON_BYTES,
-    MAX_TIMER_PAYLOAD_BYTES, MAX_TRACE_ENTRY_BYTES, ParticipantTerminalSignature, ProofId,
-    ProtocolError, PublicCursor, ReceiptBody, ReceiptId, SharedProposal, StopCause,
-    TerminalCertificate, TerminalOutcome, TerminalProof, TimerMutation,
+    MAX_TIMER_PAYLOAD_BYTES, MAX_TRACE_ENTRY_BYTES, ParticipantTerminalSignature, ProtocolError,
+    PublicCursor, ReceiptBody, SharedProposal, StopCause, TerminalCertificate, TerminalOutcome,
+    TerminalProof, TimerMutation,
 };
 
 /// Validate an input's total encoded size without decoding it first.
@@ -117,7 +116,6 @@ pub(crate) fn validate_proposal(
 
 pub(crate) fn validate_terminal_progress(
     binding: &ExecutionBinding,
-    producer: PeerId,
     public: PublicCursor,
     terminal: &TerminalProof,
 ) -> Result<(), ProtocolError> {
@@ -157,64 +155,6 @@ pub(crate) fn validate_terminal_progress(
     if let Some((certificate, outcome)) = terminal.certified_parts() {
         validate_terminal_outcome(&certificate.commitment, outcome)?;
         return validate_terminal_certificate(binding, public, certificate);
-    }
-    if let Some((certificate, outcome, body, request)) = terminal.seal_requested_parts() {
-        validate_terminal_outcome(&certificate.commitment, outcome)?;
-        validate_terminal_certificate(binding, public, certificate)?;
-        validate_receipt_body(binding, producer, body)?;
-        let ReceiptTermination::Completed { terminal } = body.termination() else {
-            return Err(ProtocolError::ReceiptBodyMismatch);
-        };
-        if terminal.final_step != certificate.commitment.final_step
-            || terminal.final_state != certificate.commitment.final_state
-            || terminal.outcome_hash != certificate.commitment.outcome_hash
-            || terminal.agreement != certificate.agreement
-            || body.outcome() != outcome.borsh()
-        {
-            return Err(ProtocolError::ReceiptBodyMismatch);
-        }
-        if ProofId::derive(body)? != request.proof_id() {
-            return Err(ProtocolError::InvalidProducerSeal);
-        }
-        request.data().validate()?;
-        if request.producer() != binding.activation.offer().data().creator
-            && !binding
-                .activation
-                .tickets()
-                .iter()
-                .any(|ticket| ticket.data.signer == request.producer())
-        {
-            return Err(ProtocolError::UnknownParticipant {
-                participant: request.producer(),
-            });
-        }
-        if request.proof_id() == ProofId::from_bytes([0; 32]) {
-            return Err(ProtocolError::InvalidCertificate(
-                "seal request has an empty proof id".into(),
-            ));
-        }
-        return Ok(());
-    }
-    if let Some((cause, body, request)) = terminal.stopped_receipt_assembled_parts() {
-        cause.validate()?;
-        super::status::validate_cause_binding(cause, binding, public)?;
-        validate_receipt_body(binding, producer, body)?;
-        let ReceiptTermination::Stopped { cause: body_cause } = body.termination() else {
-            return Err(ProtocolError::ReceiptBodyMismatch);
-        };
-        if body_cause != cause {
-            return Err(ProtocolError::ReceiptBodyMismatch);
-        }
-        if ProofId::derive(body)? != request.proof_id()
-            || ReceiptId::derive_body(body)? != request.data().receipt_id()
-        {
-            return Err(ProtocolError::InvalidProducerSeal);
-        }
-        request.data().validate()?;
-        if request.producer() != producer {
-            return Err(ProtocolError::InvalidProducerSeal);
-        }
-        return Ok(());
     }
     Err(ProtocolError::InvalidCertificate(
         "unknown terminal proof state".into(),
@@ -322,7 +262,6 @@ pub(crate) fn validate_receipt_body_shape(body: &ReceiptBody) -> Result<(), Prot
 /// validate an abort body against a successful certificate.
 pub(crate) fn validate_receipt_body(
     binding: &ExecutionBinding,
-    producer: PeerId,
     body: &ReceiptBody,
 ) -> Result<(), ProtocolError> {
     validate_receipt_body_shape(body)?;
@@ -334,7 +273,6 @@ pub(crate) fn validate_receipt_body(
     if header.activation != *binding.activation()
         || header.session_hash() != binding.session_id()
         || header.program_hash() != binding.program_hash()
-        || header.producer != producer
         || body.params() != binding.activation.offer().data().params.as_bytes()
     {
         return Err(ProtocolError::ReceiptBodyMismatch);

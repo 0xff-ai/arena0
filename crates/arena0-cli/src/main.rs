@@ -20,7 +20,6 @@ mod verify;
 mod watch;
 mod workspace;
 
-use std::fmt::Write as _;
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -28,8 +27,8 @@ use std::process::ExitCode;
 use anyhow::{Context, anyhow, bail};
 use arena0_client::answer;
 use arena0_client::api::{
-    ApiErrorCode, AwaitState, EnsembleSpec, ExecStatus, IdRef, NextEvent, PendingId, ReceiptKey,
-    ReceiptRef, Request, ResponseOk, VerifiedResult,
+    ApiErrorCode, AwaitState, EnsembleSpec, ExecStatus, IdRef, NextEvent, PendingId, Request,
+    ResponseOk, VerifiedResult,
 };
 use arena0_client::proto::DaemonClient;
 use arena0_client::protocol::{ExecId, PeerId, ReceiptTermination, SessionHash, View, Viewport};
@@ -146,7 +145,7 @@ enum Command {
         /// Request full replay from a running Host.
         #[arg(long)]
         replay: bool,
-        /// Verify every producer through these named local Hosts.
+        /// Verify every Host through these named local Hosts.
         #[arg(long, value_delimiter = ',', value_name = "HOSTS")]
         hosts: Vec<HostName>,
     },
@@ -166,7 +165,7 @@ enum Command {
         /// Program params as KEY=VALUE (repeatable).
         #[arg(long, value_name = "KEY=VALUE")]
         param: Vec<String>,
-        /// Fully replay every producer receipt before succeeding.
+        /// Fully replay every Host receipt before succeeding.
         #[arg(long)]
         replay: bool,
         /// Use inline terminal output instead of the focused TUI.
@@ -263,8 +262,6 @@ enum ReceiptCommand {
     /// Fetch one receipt; use --out to write the portable JSON artifact.
     Get {
         session: String,
-        #[arg(long)]
-        producer: Option<String>,
         #[arg(short = 'o', long)]
         out: Option<PathBuf>,
     },
@@ -275,8 +272,6 @@ enum ReceiptCommand {
     /// Verify a Host-resident receipt.
     Verify {
         session: String,
-        #[arg(long)]
-        producer: Option<String>,
         #[arg(long)]
         replay: bool,
     },
@@ -740,7 +735,7 @@ async fn run_with_connected_bindings(
     render_coordinated_result(mode, Palette::for_mode(mode), &program, &result);
     if !result.terminal.is_completed() {
         bail!(
-            "coordinated execution {}; producer receipts verified",
+            "coordinated execution {}; Host receipts verified",
             result.terminal.tag()
         );
     }
@@ -774,7 +769,8 @@ fn render_coordinated_result(
             .iter()
             .map(|receipt| {
                 json!({
-                    "producer": receipt.producer.to_string(),
+                    "peer_id": receipt.peer_id.to_string(),
+                    "receipt_id": receipt.receipt_id.to_string(),
                     "result": "valid",
                 })
             })
@@ -784,6 +780,7 @@ fn render_coordinated_result(
             "program": program,
             "program_id": result.program_id.to_string(),
             "session_id": result.session_id.to_string(),
+            "receipt_id": result.receipt_id.to_string(),
             "participants": result.participants.len(),
             "steps": result.steps,
             "verified": {
@@ -807,6 +804,7 @@ fn render_coordinated_result(
         };
         println!("{terminal} {program}");
         println!("  session      {}", result.session_id);
+        println!("  receipt      {}", result.receipt_id);
         println!("  participants {}", result.participants.len());
         println!("  steps        {}", result.steps);
         if let coordinated::AggregateTerminal::Completed {
@@ -1442,14 +1440,10 @@ fn render_next(ctx: &Ctx, event: &NextEvent) {
 
 async fn receipt(ctx: &Ctx, command: ReceiptCommand) -> anyhow::Result<()> {
     match command {
-        ReceiptCommand::Get {
-            session,
-            producer,
-            out,
-        } => {
-            let key = resolve_receipt_key(ctx, &session, producer.as_deref()).await?;
+        ReceiptCommand::Get { session, out } => {
+            let receipt = ctx.client().resolve_receipt_ref(&session).await?;
             let ResponseOk::Receipt(receipt) =
-                ctx.client().call(&Request::ReceiptGet { key }).await?
+                ctx.client().call(&Request::ReceiptGet { receipt }).await?
             else {
                 bail!("unexpected response to receipt.get");
             };
@@ -1459,7 +1453,7 @@ async fn receipt(ctx: &Ctx, command: ReceiptCommand) -> anyhow::Result<()> {
                 if ctx.mode.is_json() {
                     ui::print_json(&json!({
                         "wrote": path.display().to_string(),
-                        "receipt_id": receipt_id_text(&receipt),
+                        "receipt_id": receipt.receipt_id(),
                     }));
                 } else {
                     println!("wrote {}", path.display());
@@ -1472,7 +1466,7 @@ async fn receipt(ctx: &Ctx, command: ReceiptCommand) -> anyhow::Result<()> {
         }
         ReceiptCommand::Import { file } => {
             let bytes = std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
-            let receipt: arena0_client::protocol::Receipt =
+            let receipt: arena0_client::protocol::ReceiptArtifact =
                 serde_json::from_slice(&bytes).context("receipt must be valid JSON")?;
             match ctx
                 .client()
@@ -1502,7 +1496,7 @@ async fn receipt(ctx: &Ctx, command: ReceiptCommand) -> anyhow::Result<()> {
                             vec![
                                 entry.receipt_id[..8.min(entry.receipt_id.len())].to_string(),
                                 entry.session_id.fmt_short().to_string(),
-                                entry.producer.fmt_short().to_string(),
+                                format!("{:?}", entry.kind),
                                 entry.program_id.fmt_short().to_string(),
                                 if entry.completed {
                                     "completed"
@@ -1516,7 +1510,7 @@ async fn receipt(ctx: &Ctx, command: ReceiptCommand) -> anyhow::Result<()> {
                     print!(
                         "{}",
                         ui::render_table(
-                            &["RECEIPT", "SESSION", "PRODUCER", "PROGRAM", "STATE"],
+                            &["RECEIPT", "SESSION", "KIND", "PROGRAM", "STATE"],
                             &rows,
                             ctx.palette,
                             ctx.viewport().width,
@@ -1526,27 +1520,26 @@ async fn receipt(ctx: &Ctx, command: ReceiptCommand) -> anyhow::Result<()> {
             }
             other => bail!("unexpected response to receipt.list: {other:?}"),
         },
-        ReceiptCommand::Verify {
-            session,
-            producer,
-            replay,
-        } => {
-            let key = resolve_receipt_key(ctx, &session, producer.as_deref()).await?;
+        ReceiptCommand::Verify { session, replay } => {
+            let receipt = ctx.client().resolve_receipt_ref(&session).await?;
             match ctx
                 .client()
                 .call(&Request::ReceiptVerify {
-                    receipt: ReceiptRef::Produced(key),
+                    receipt,
                     full: replay,
                 })
                 .await?
             {
                 ResponseOk::Verified {
+                    receipt_id,
                     program_id,
                     session_id,
                     ensemble,
                     steps,
                     result,
-                } => render_verified(ctx, program_id, session_id, ensemble, steps, result),
+                } => render_verified(
+                    ctx, receipt_id, program_id, session_id, ensemble, steps, result,
+                ),
                 other => bail!("unexpected response to receipt.verify: {other:?}"),
             }
         }
@@ -1554,29 +1547,11 @@ async fn receipt(ctx: &Ctx, command: ReceiptCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn resolve_receipt_key(
-    ctx: &Ctx,
-    reference: &str,
-    producer: Option<&str>,
-) -> anyhow::Result<ReceiptKey> {
-    if let Some(producer) = producer {
-        return Ok(ReceiptKey {
-            session_id: reference
-                .parse::<SessionHash>()
-                .map_err(|_| anyhow!("invalid session id: {reference}"))?,
-            producer: producer
-                .parse::<PeerId>()
-                .map_err(|_| anyhow!("invalid producer peer id: {producer}"))?,
-        });
-    }
-    ctx.client().resolve_receipt_key(reference).await
-}
-
-fn render_receipt(receipt: &arena0_client::protocol::Receipt) {
-    println!("receipt {}", receipt_id_text(receipt));
+fn render_receipt(receipt: &arena0_client::protocol::ReceiptArtifact) {
+    println!("receipt {}", receipt.receipt_id());
     println!("  program  {}", receipt.body().header().program_hash());
     println!("  session  {}", receipt.body().header().session_hash());
-    println!("  producer {}", receipt.producer());
+    println!("  kind     {:?}", receipt.kind());
     println!("  steps    {}", receipt.body().trace().len());
     println!(
         "  terminal {}",
@@ -1587,19 +1562,9 @@ fn render_receipt(receipt: &arena0_client::protocol::Receipt) {
     );
 }
 
-fn receipt_id_text(receipt: &arena0_client::protocol::Receipt) -> String {
-    receipt
-        .receipt_id()
-        .as_bytes()
-        .iter()
-        .fold(String::with_capacity(64), |mut text, byte| {
-            let _ = write!(text, "{byte:02x}");
-            text
-        })
-}
-
 fn render_verified(
     ctx: &Ctx,
+    receipt_id: arena0_client::protocol::ReceiptId,
     program_id: arena0_client::protocol::ProgramHash,
     session_id: SessionHash,
     ensemble: Vec<PeerId>,
@@ -1611,6 +1576,7 @@ fn render_verified(
             VerifiedResult::Light { .. } => "Light",
             VerifiedResult::Full { .. } => "Full",
         },
+        "receipt_id": receipt_id.to_string(),
         "program_id": program_id.to_string(),
         "session_id": session_id.to_string(),
         "ensemble": ensemble.iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -1624,6 +1590,7 @@ fn render_verified(
             "verified ({})",
             document["tier"].as_str().unwrap_or("unknown")
         );
+        println!("  receipt  {}", receipt_id);
         println!("  program  {}", program_id);
         println!("  session  {}", session_id);
         println!("  ensemble {} participants", ensemble.len());
@@ -1643,6 +1610,18 @@ fn print_ack(ctx: &Ctx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receipt_commands_accept_content_references_without_a_producer() {
+        for command in ["get", "verify"] {
+            assert!(Cli::try_parse_from(["arena0", "receipt", command, "abcdef"]).is_ok());
+            assert!(
+                Cli::try_parse_from(["arena0", "receipt", command, "abcdef", "--producer", "peer"])
+                    .is_err()
+            );
+        }
+        assert!(Cli::try_parse_from(["arena0", "receipt", "list"]).is_ok());
+    }
 
     #[test]
     fn current_command_paths_parse() {

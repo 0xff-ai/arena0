@@ -90,7 +90,7 @@ echoes `exec_id` and contains the required `negotiation_id`, optional
 `exec.status` exposes the committed `session_id` as soon as activation commits.
 Once session progress exists, its `session` object also reports the public step,
 committed participants, pending callout summary, and whether this Host's
-producer receipt is durably available.
+receipt or stop report is durably available.
 
 `exec.inspect` is a bounded, Host-local diagnostic projection for operator
 interfaces. It returns `exec.status`, durable activation facts, participant
@@ -145,27 +145,36 @@ through the reducer, which commits state, trace or private records, timers, and
 outbox effects in one SQLite transaction. Outbox delivery uses leases and
 retries, and expired leases are recovered when the store opens. A pending
 callout retains its `pending_id` and guest context across a restart, so
-`exec.next` can return the same callout again. Terminal proof collection and
-the producer seal are internal records; the socket exposes only the terminal
-result and the sealed receipt.
+`exec.next` can return the same callout again. Terminal proof collection is internal; the socket exposes the terminal result
+and the authenticated portable artifact.
 
 ## Receipts
 
 | Method | Params | Success |
 |---|---|---|
-| `receipt.get` | `{key:{session_id,producer}}` | `Receipt` |
+| `receipt.get` | `{receipt}` | `Receipt` containing a `ReceiptArtifact` |
 | `receipt.import` | `{receipt}` | `ReceiptList` |
 | `receipt.list` | — | `ReceiptList` |
 | `receipt.verify` | `{receipt,full}` | `Verified` |
 
-Every produced receipt is addressed by `(SessionHash, producer PeerId)`.
-`ReceiptRef::Produced` uses this pair; `ReceiptRef::Inline` carries an explicit
-portable receipt. Listing preserves every producer and never deduplicates a
-session down to one participant. The response derives `Produced`, `Imported`,
-or `Both` provenance from independent local facts. Locally sealed artifacts
-bind to the local execution. `receipt.import` light-verifies a portable receipt,
-then records its imported fact without an execution binding; publishing an
-exact imported artifact retains both facts.
+`ReceiptRef` has three externally tagged JSON forms:
+
+- `{"Stored":"<receipt-id>"}` selects an exact content ID (64 lowercase hex digits).
+- `{"Produced":"<session-id>"}` selects the addressed Host's locally produced
+  artifact for that session. Imported reports do not participate in this lookup.
+- `{"Inline":<artifact>}` supplies a portable artifact directly.
+
+The artifact has `{"kind":"receipt"|"stop_report","body":...}` shape. Completion
+and unanimously agreed program stops are canonical receipts. Unilateral stops
+are signed reports; several can coexist for one session. `receipt.list` includes
+`receipt_id`, `session_id`, `kind`, `program_id`, `completed`, and local `provenance`.
+There is no artifact producer field. Identical imports deduplicate by content ID;
+local production and import facts independently yield `Produced`, `Imported`, or
+`Both`. Each `Verified` response includes the exact verified `receipt_id`.
+
+The earlier `{key:{session_id,producer}}` API and producer-sealed JSON format are
+replaced by these references and artifacts. Receipt format and store schema are
+version 2; older evidence requires its matching older release.
 
 Light verification returns cryptographically checked evidence without loading
 Wasm. Full verification is served by the daemon and replays the exact program.
@@ -232,6 +241,6 @@ request is sent.
 1. The Host owns identity, signing, sandbox, and persistence.
 2. MCP and Unix-socket adapters dispatch into the same Host service operations.
 3. Program values cross as typed JSON; program Borsh remains opaque to the Host.
-4. Receipt retrieval always identifies the producer.
+4. Receipt retrieval uses an exact content ID or the addressed Host's local session publication.
 5. The public socket contains no remote discovery, addressing, or transfer
    surface.

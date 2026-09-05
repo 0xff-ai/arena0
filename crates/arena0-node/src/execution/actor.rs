@@ -365,9 +365,8 @@ impl ExecutionActor {
         match state.status().receipt_work() {
             ReceiptWork::NotTerminal | ReceiptWork::CollectSignatures => {}
             ReceiptWork::Incomplete => return Ok(()),
-            ReceiptWork::Assemble | ReceiptWork::Seal(_) | ReceiptWork::Published => {
-                super::terminal::finalize_receipt(&mut self.context.store, &self.context.identity)
-                    .await?;
+            ReceiptWork::Assemble | ReceiptWork::Published => {
+                super::terminal::finalize_receipt(&mut self.context.store).await?;
                 return self.drain_outbox().await;
             }
         }
@@ -379,9 +378,8 @@ impl ExecutionActor {
         match state.status().receipt_work() {
             ReceiptWork::NotTerminal | ReceiptWork::CollectSignatures => {}
             ReceiptWork::Incomplete => return Ok(()),
-            ReceiptWork::Assemble | ReceiptWork::Seal(_) | ReceiptWork::Published => {
-                super::terminal::finalize_receipt(&mut self.context.store, &self.context.identity)
-                    .await?;
+            ReceiptWork::Assemble | ReceiptWork::Published => {
+                super::terminal::finalize_receipt(&mut self.context.store).await?;
                 return self.drain_outbox().await;
             }
         }

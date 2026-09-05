@@ -105,7 +105,7 @@ has five independent Host driver loops and one MCP server entry.
 
 Every completed event returns a Host-specific `SessionRef`. The `session_id`
 must match across the Ensemble, while the embedded Host reference identifies
-which independently produced receipt to verify.
+which Host's retained evidence to verify.
 
 Call `verify_session` for every returned `SessionRef`. Use `light` to verify
 the signed evidence without executing Wasm, or `full` to replay the receipt

@@ -1,4 +1,4 @@
-//! Crash cuts at the durable stop, receipt-body, and producer-seal boundaries.
+//! Crash cuts before and after atomic stop-report publication.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -7,7 +7,7 @@ use arena0_node::{ExecContext, Host, SessionMessage};
 use arena0_program::JsonBytes;
 use arena0_protocol::{
     AbortKind, AbortOccurrence, ExecId, ExecutionAdmission, ExecutionInput, NegotiationId,
-    PeerIdSource, ProducerSeal, StateHash,
+    PeerIdSource, StateHash,
 };
 use arena0_sandbox::{InitializeCall, Program, WasmtimeEngine};
 use arena0_store::{RecoveryCursor, Store, StoreConfig};
@@ -17,8 +17,7 @@ use arena0_transport::local::{LocalNetwork, LocalTransport};
 #[derive(Clone, Copy, Debug)]
 enum CrashAfter {
     Stop,
-    Body,
-    Seal,
+    Publication,
 }
 
 #[derive(Debug)]
@@ -112,17 +111,8 @@ async fn recover_after(cut: CrashAfter) {
             )
             .await
             .unwrap();
-        if matches!(cut, CrashAfter::Body | CrashAfter::Seal) {
-            writer.assemble_and_stage_receipt_body(8).await.unwrap();
-        }
-        if matches!(cut, CrashAfter::Seal) {
-            let state = writer.load_execution().await.unwrap().unwrap();
-            let data = *state.producer_seal_request().unwrap().data();
-            let seal = ProducerSeal::new(data, keys[0].sign(&data.signing_bytes().unwrap()));
-            writer
-                .apply_input(ExecutionInput::ProducerSeal(seal), 9)
-                .await
-                .unwrap();
+        if matches!(cut, CrashAfter::Publication) {
+            writer.assemble_receipt(8).await.unwrap();
         }
         // No actor runs between these durable mutations and the store close.
         // The reopened Host sees exactly the selected crash boundary.
@@ -179,7 +169,14 @@ async fn recover_after(cut: CrashAfter) {
         progress.push((Milestone::OutboxDrained, started.elapsed()));
         let receipts = store.handle().list_receipts(10).await.unwrap();
         assert_eq!(receipts.len(), 1);
-        assert_eq!(receipts[0].key.producer(), peers[0]);
+        assert_eq!(
+            receipts[0].provenance,
+            arena0_store::ReceiptProvenance::Produced
+        );
+        assert!(matches!(
+            receipts[0].receipt,
+            arena0_protocol::ReceiptArtifact::StopReport(_)
+        ));
         let verified =
             arena0_verify::verify_full(&wasm, &receipts[0].receipt.encode().unwrap()).unwrap();
         assert!(matches!(
@@ -215,11 +212,6 @@ async fn stopped_execution_recovers_before_receipt_assembly() {
 }
 
 #[tokio::test]
-async fn stopped_execution_recovers_before_producer_seal() {
-    recover_after(CrashAfter::Body).await;
-}
-
-#[tokio::test]
-async fn stopped_execution_recovers_unacknowledged_receipt_publication() {
-    recover_after(CrashAfter::Seal).await;
+async fn stopped_execution_recovers_after_atomic_publication() {
+    recover_after(CrashAfter::Publication).await;
 }

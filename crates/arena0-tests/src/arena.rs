@@ -20,7 +20,8 @@ use arena0_node::{
 use arena0_program::JsonBytes;
 use arena0_protocol::{
     EventSource, ExecId, ExecutionAdmission, NegotiationEvent, NegotiationId, OfferData, PeerId,
-    PeerIdSource, Receipt, SessionHash, SessionHeader, SessionTermination, StateHash, TraceEntry,
+    PeerIdSource, ReceiptArtifact, SessionHash, SessionHeader, SessionTermination, StateHash,
+    TraceEntry,
 };
 use arena0_sandbox::{InitializeCall, Program, WasmtimeEngine};
 use arena0_store::{Store, StoreConfig, StoreHandle};
@@ -574,7 +575,7 @@ fn unix_time_ms() -> u64 {
 fn record_event(
     session_hash: &mut Option<SessionHash>,
     termination: &mut Option<SessionTermination>,
-    receipt: &mut Option<Receipt>,
+    receipt: &mut Option<ReceiptArtifact>,
     event: &SessionMessage,
 ) {
     match event {
@@ -775,6 +776,30 @@ impl Run {
         self.wait_for_all_terminal("terminate").await
     }
 
+    /// Wait for portable artifacts, which may follow stopped lifecycle notifications.
+    pub async fn wait_all_receipts(&mut self) {
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        loop {
+            self.drain_events();
+            if self
+                .participants
+                .iter()
+                .all(|participant| participant.receipt.is_some())
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timeout waiting for receipt publication: {:?}",
+                self.participants
+                    .iter()
+                    .map(|participant| &participant.events)
+                    .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     pub fn node_count(&self) -> usize {
         self.participants.len()
     }
@@ -856,15 +881,15 @@ impl Run {
             .unwrap_or_default()
     }
 
-    /// Return a clone of participant `i`'s sealed portable receipt.
-    pub fn receipt(&self, i: usize) -> Receipt {
+    /// Return a clone of participant `i`'s portable artifact.
+    pub fn receipt(&self, i: usize) -> ReceiptArtifact {
         self.participants[i]
             .receipt
             .clone()
             .expect("participant receipt")
     }
 
-    /// Encode participant `i`'s sealed portable receipt for the verifier API.
+    /// Encode participant `i`'s portable artifact for the verifier API.
     pub fn receipt_bytes(&self, i: usize) -> Vec<u8> {
         self.receipt(i).encode().expect("encode receipt")
     }
@@ -1050,5 +1075,5 @@ struct ParticipantHandle {
     events: Vec<SessionMessage>,
     termination: Option<SessionTermination>,
     session_hash: Option<SessionHash>,
-    receipt: Option<Receipt>,
+    receipt: Option<ReceiptArtifact>,
 }

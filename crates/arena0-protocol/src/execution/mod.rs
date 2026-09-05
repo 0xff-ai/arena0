@@ -67,8 +67,8 @@ pub const MAX_RECEIPT_TRACE_ENTRIES: usize = 65_536;
 pub use abort::{ABORT_OCCURRENCE_DOMAIN, ABORT_OCCURRENCE_VERSION, AbortKind, AbortOccurrence};
 pub use binding::ExecutionBinding;
 pub use certificate::{
-    ParticipantStepSignature, ParticipantTerminalSignature, ProducerSeal, ProducerSealRequest,
-    ProofId, Receipt, ReceiptBody, ReceiptId, ReceiptKey, ReceiptSealData,
+    ParticipantStepSignature, ParticipantTerminalSignature, Receipt, ReceiptArtifact, ReceiptBody,
+    ReceiptId, ReceiptKind, StopReport,
 };
 pub use cursor::{ExecutionVersion, PrivateCursor, PublicCursor};
 pub use delta::{PrivateCause, PrivateContext, PrivateDelta, SharedDelta, pending_id};

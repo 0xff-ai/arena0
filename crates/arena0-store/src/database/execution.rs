@@ -357,20 +357,20 @@ impl Database {
 
     /// Assemble the canonical receipt body from durable source rows and stage
     /// it through the protocol reducer without leaving the transaction.
-    pub(super) fn assemble_and_stage_receipt_body(
+    pub(super) fn assemble_receipt(
         &mut self,
         execution_id: ExecId,
         now_ms: u64,
     ) -> Result<ApplyOutcome, StoreError> {
         self.begin()?;
-        let result = self.assemble_and_stage_receipt_body_in_transaction(execution_id, now_ms);
+        let result = self.assemble_receipt_in_transaction(execution_id, now_ms);
         match result {
             Ok(outcome) => self.commit_result(outcome),
             Err(error) => self.rollback_result(error),
         }
     }
 
-    fn assemble_and_stage_receipt_body_in_transaction(
+    fn assemble_receipt_in_transaction(
         &mut self,
         execution_id: ExecId,
         now_ms: u64,
@@ -379,16 +379,14 @@ impl Database {
             .load_execution_in_transaction(execution_id)?
             .ok_or(StoreError::ExecutionNotFound(execution_id))?;
 
-        // Once the body has been durably staged or the final artifact has been
-        // published, the assembly command is an idempotent acknowledgement.
-        if state.receipt_body().is_some()
-            || matches!(
-                state.status(),
-                arena0_protocol::ExecutionStatus::Completed { .. }
-                    | arena0_protocol::ExecutionStatus::StoppedPublished { .. }
-                    | arena0_protocol::ExecutionStatus::Incomplete { .. }
-            )
-        {
+        // Once the artifact is published or proof work is frozen, assembly
+        // is an idempotent acknowledgement.
+        if matches!(
+            state.status(),
+            arena0_protocol::ExecutionStatus::Completed { .. }
+                | arena0_protocol::ExecutionStatus::StoppedPublished { .. }
+                | arena0_protocol::ExecutionStatus::Incomplete { .. }
+        ) {
             return Ok(ApplyOutcome::AlreadyApplied);
         }
 
@@ -444,7 +442,7 @@ impl Database {
             arena0_protocol::ReceiptTermination::Stopped { .. } => Vec::new(),
         };
         let body = arena0_protocol::ReceiptBody::new(
-            arena0_protocol::SessionHeader::new(activation.clone(), termination, self.host_id),
+            arena0_protocol::SessionHeader::new(activation.clone(), termination),
             outcome,
             activation.offer().data().params.as_bytes().to_vec(),
             trace,
@@ -457,7 +455,7 @@ impl Database {
         )
     }
 
-    fn load_public_trace_in_transaction(
+    pub(super) fn load_public_trace_in_transaction(
         &mut self,
         state: &ExecutionState,
     ) -> Result<Vec<arena0_protocol::TraceEntry>, StoreError> {

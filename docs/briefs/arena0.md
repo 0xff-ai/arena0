@@ -16,7 +16,7 @@ Unix socket.
 
 - A program runs identically across N local participant Hosts.
 - Divergence aborts at the exact public edge.
-- Every Host persists its own signed receipt.
+- Every Host retains a canonical receipt or an authenticated unilateral stop report.
 - A third party can light-verify a receipt without the program or fully replay
   it with the exact Wasm. Both verification tiers return a typed terminal
   result for completion and stop cases.
@@ -71,15 +71,15 @@ recomputed initial state satisfy that preference.
 - Each Host commits the complete activation before `SessionStarted`.
 - Every shared step records one BLS aggregate agreement and signer bitmap.
 - Fuel usage and replayable randomness are recorded.
-- Receipts are addressed by `(SessionHash, producer PeerId)`.
+- Canonical receipts and unilateral stop reports are addressed by content-derived `ReceiptId`. Local production provenance stays in the Host store.
 - Authenticated inbound frames enter a durable inbox before transport
   acknowledgement.
 - Reducer state, trace commits, timers, and outbox effects commit in one SQLite
   transaction.
 - Leased outbox effects retry after transport failure and recover after a
   process restart.
-- Terminal proof collection and the producer seal remain internal. Public
-  receipts are published only after the seal is durable.
+- Terminal proof collection remains internal. Publication atomically persists the
+  verified artifact, terminal status, local production relation, and outbox effect.
 - Receipt artifacts, import facts, and production relations are separate; the
   public provenance projection retains `Produced`, `Imported`, or `Both`.
 

@@ -21,8 +21,8 @@ use arena0_api::{
     LightVerifiedTerminal, NegotiationStage, NextEvent, PendingCalloutStatus,
     PrivateCommitSummary as ApiPrivateCommitSummary, PrivateEffectKind as ApiPrivateEffectKind,
     PrivateEffectSummary as ApiPrivateEffectSummary, PrivateEventKind as ApiPrivateEventKind,
-    ProgramRefError, ReceiptKey, ReceiptRef, Request, Response, ResponseOk, SessionProgress,
-    SessionStatus, VerifiedResult, frame,
+    ProgramRefError, ReceiptRef, Request, Response, ResponseOk, SessionProgress, SessionStatus,
+    VerifiedResult, frame,
 };
 use arena0_crypto::{AgentPubKey, ExecutionKey, NodeKeys};
 use arena0_node::{ActivatedSession, NegotiationBook};
@@ -37,8 +37,8 @@ use arena0_protocol::{
     ActivationAnnouncement, EventSource, ExecCreationOrigin, ExecId, ExecutionAdmission,
     ExecutionEvent, ExecutionFailureCode, ExecutionStatus, FetchFrame, MAX_TICKET_LIFETIME_MS,
     NegotiationEvent, NegotiationFact, NegotiationGossip, NegotiationId, Offer, OfferData, PeerId,
-    PeerIdSource, PendingId, Receipt, SessionHash, StateHash, TerminalKind, Ticket, TicketAction,
-    TicketData, Viewport, system_event::SystemEvent,
+    PeerIdSource, PendingId, ReceiptArtifact, SessionHash, StateHash, TerminalKind, Ticket,
+    TicketAction, TicketData, Viewport, system_event::SystemEvent,
 };
 use arena0_sandbox::{AdmittedProgram, InitializeCall, Program, WasmtimeEngine};
 use arena0_transport::{NegotiationTopic, ProgramTopicEvent, Transport};
@@ -1925,20 +1925,9 @@ impl HostService {
                 Ok(ResponseOk::Ack)
             }
 
-            Request::ReceiptGet { key } => {
-                match self
-                    .store
-                    .load_receipt(arena0_protocol::ReceiptKey::new(
-                        key.session_id,
-                        key.producer,
-                    ))
-                    .await
-                    .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
-                {
-                    Some(stored) => Ok(ResponseOk::Receipt(Box::new(stored.receipt))),
-                    None => Err(ApiError::new(ApiErrorCode::NotFound, "no such receipt")),
-                }
-            }
+            Request::ReceiptGet { receipt } => Ok(ResponseOk::Receipt(Box::new(
+                self.resolve_receipt(receipt).await?,
+            ))),
             Request::ReceiptImport { receipt } => self.import_receipt(*receipt).await,
             Request::ReceiptList => {
                 let receipts = self
@@ -2077,10 +2066,7 @@ impl HostService {
         };
         let receipt_available = if let Some(state) = &state {
             self.store
-                .load_receipt(arena0_protocol::ReceiptKey::new(
-                    state.binding().session_id(),
-                    self.peer_id,
-                ))
+                .load_receipt(state.binding().session_id())
                 .await
                 .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
                 .is_some()
@@ -3131,20 +3117,20 @@ impl HostService {
     }
 
     /// Verify and persist a foreign receipt as an immutable artifact.
-    async fn import_receipt(&self, receipt: Receipt) -> Response {
+    async fn import_receipt(&self, receipt: ReceiptArtifact) -> Response {
         let receipt_bytes = receipt
             .encode()
             .map_err(|error| ApiError::new(ApiErrorCode::Verification, error.to_string()))?;
         verify_light(&receipt_bytes)
             .map_err(|e| ApiError::new(ApiErrorCode::Verification, format!("light: {e:?}")))?;
-        let key = receipt.key();
+        let receipt_id = receipt.receipt_id();
         self.store
             .import_receipt(receipt, unix_time_ms())
             .await
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
         let stored = self
             .store
-            .load_receipt(key)
+            .load_receipt_by_id(receipt_id)
             .await
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
             .ok_or_else(|| {
@@ -3153,21 +3139,21 @@ impl HostService {
         Ok(ResponseOk::ReceiptList(vec![receipt_list_entry(stored)]))
     }
 
+    async fn resolve_receipt(&self, reference: ReceiptRef) -> Result<ReceiptArtifact, ApiError> {
+        let stored = match reference {
+            ReceiptRef::Inline(receipt) => return Ok(*receipt),
+            ReceiptRef::Produced(session_id) => self.store.load_receipt(session_id).await,
+            ReceiptRef::Stored(receipt_id) => self.store.load_receipt_by_id(receipt_id).await,
+        }
+        .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
+        stored
+            .map(|stored| stored.receipt)
+            .ok_or_else(|| ApiError::new(ApiErrorCode::NotFound, "no such receipt or stop report"))
+    }
+
     /// Verify a receipt and return its evidence: light by default, full on request.
     async fn verify(&self, receipt: ReceiptRef, full: bool) -> Response {
-        let receipt = match receipt {
-            ReceiptRef::Inline(r) => *r,
-            ReceiptRef::Produced(ReceiptKey {
-                session_id,
-                producer,
-            }) => self
-                .store
-                .load_receipt(arena0_protocol::ReceiptKey::new(session_id, producer))
-                .await
-                .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
-                .map(|stored| stored.receipt)
-                .ok_or_else(|| ApiError::new(ApiErrorCode::NotFound, "no such receipt"))?,
-        };
+        let receipt = self.resolve_receipt(receipt).await?;
         let receipt_bytes = receipt
             .encode()
             .map_err(|error| ApiError::new(ApiErrorCode::Verification, error.to_string()))?;
@@ -3208,6 +3194,7 @@ impl HostService {
                 }
             };
             return Ok(ResponseOk::Verified {
+                receipt_id: receipt.receipt_id(),
                 program_id: light.program_id,
                 session_id: light.session_id,
                 ensemble: light.ensemble,
@@ -3223,6 +3210,7 @@ impl HostService {
             VerifiedLightTerminal::Stopped { cause } => LightVerifiedTerminal::Stopped { cause },
         };
         Ok(ResponseOk::Verified {
+            receipt_id: receipt.receipt_id(),
             program_id: light.program_id,
             session_id: light.session_id,
             ensemble: light.ensemble,
@@ -3437,8 +3425,8 @@ fn receipt_list_entry(stored: arena0_store::StoredReceipt) -> arena0_api::Receip
     };
     arena0_api::ReceiptListEntry {
         receipt_id: hex::encode(stored.receipt_id.as_bytes()),
-        session_id: stored.key.session_id(),
-        producer: stored.key.producer(),
+        session_id: stored.receipt.body().header().session_hash(),
+        kind: stored.receipt.kind(),
         program_id: stored.receipt.body().header().program_hash(),
         completed: stored
             .receipt

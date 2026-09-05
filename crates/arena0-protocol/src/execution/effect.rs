@@ -12,7 +12,7 @@ use crate::{ExecId, MessageId, PeerId, StateHash};
 
 use super::{
     AbortOccurrence, ExecutionVersion, GuestSignData, MAX_EFFECT_PAYLOAD_BYTES, MAX_RECEIPT_BYTES,
-    MAX_TERMINAL_REASON_BYTES, OUTBOX_DOMAIN, ProtocolError, Receipt, ensure_payload,
+    MAX_TERMINAL_REASON_BYTES, OUTBOX_DOMAIN, ProtocolError, ReceiptArtifact, ensure_payload,
 };
 
 /// A protocol broadcast's complete durable frame content. The transport layer
@@ -157,10 +157,8 @@ pub enum DurableEffect {
         pending_id: PendingId,
         reason: String,
     },
-    /// Publish an already validated, sealed receipt artifact.
-    PublishReceipt { receipt: Box<Receipt> },
-    /// Ask the local producer to sign one stable receipt seal preimage.
-    RequestProducerSeal { data: super::ReceiptSealData },
+    /// Publish an already validated, authenticated receipt artifact.
+    PublishReceipt { receipt: Box<ReceiptArtifact> },
     /// Propagate one authenticated abort/fail occurrence to a remote peer.
     SendAbort {
         destination: PeerId,
@@ -219,10 +217,6 @@ impl BorshSerialize for DurableEffect {
             Self::PublishReceipt { receipt } => {
                 BorshSerialize::serialize(&6u8, writer)?;
                 BorshSerialize::serialize(receipt, writer)
-            }
-            Self::RequestProducerSeal { data } => {
-                BorshSerialize::serialize(&7u8, writer)?;
-                BorshSerialize::serialize(data, writer)
             }
             Self::SendAbort {
                 destination,
@@ -295,10 +289,7 @@ impl BorshDeserialize for DurableEffect {
                 reason: read_bounded_string(reader, MAX_TERMINAL_REASON_BYTES, "retry reason")?,
             }),
             6 => Ok(Self::PublishReceipt {
-                receipt: Box::new(Receipt::deserialize_reader(reader)?),
-            }),
-            7 => Ok(Self::RequestProducerSeal {
-                data: super::ReceiptSealData::deserialize_reader(reader)?,
+                receipt: Box::new(ReceiptArtifact::deserialize_reader(reader)?),
             }),
             8 => Ok(Self::SendAbort {
                 destination: PeerId::deserialize_reader(reader)?,
@@ -373,7 +364,7 @@ impl DurableEffect {
         Ok(Self::RetryInput { pending_id, reason })
     }
 
-    pub(crate) fn publish_receipt(receipt: Receipt) -> Result<Self, ProtocolError> {
+    pub(crate) fn publish_receipt(receipt: ReceiptArtifact) -> Result<Self, ProtocolError> {
         ensure_payload(
             "receipt payload",
             receipt.encode()?.len(),
@@ -441,9 +432,6 @@ impl DurableEffect {
             Self::PublishReceipt { receipt } => {
                 receipt.encode().map_or(usize::MAX, |bytes| bytes.len())
             }
-            Self::RequestProducerSeal { data } => {
-                borsh::to_vec(data).map_or(usize::MAX, |bytes| bytes.len())
-            }
             Self::SendAbort { occurrence, .. } => occurrence.reason().len(),
             Self::RequestStepSignature { commitment } => {
                 borsh::to_vec(commitment).map_or(usize::MAX, |bytes| bytes.len())
@@ -486,14 +474,6 @@ impl DurableEffect {
                 receipt.encode()?.len(),
                 MAX_RECEIPT_BYTES,
             ),
-            Self::RequestProducerSeal { data } => {
-                data.validate()?;
-                ensure_payload(
-                    "producer seal request",
-                    self.payload_len(),
-                    MAX_EFFECT_PAYLOAD_BYTES,
-                )
-            }
             Self::SendAbort { occurrence, .. } => occurrence.validate_shape(),
             Self::RequestStepSignature { commitment } => {
                 if commitment.domain != crate::STEP_COMMIT_DOMAIN {

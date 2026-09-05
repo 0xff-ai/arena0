@@ -9,9 +9,9 @@ use arena0_crypto::{BlsSignature, NodeKeys, SecretKey};
 use arena0_program::ProgramHash;
 use arena0_protocol::{
     AbortKind, AbortOccurrence, Activation, AggregateAttestation, Ensemble, MessageId,
-    NegotiationId, PeerIdSource, ProofId, PublicCursor, PublicEffect, PublicEvent, Receipt,
-    ReceiptBody, ReceiptId, ReceiptSealData, ReceiptTermination, SessionHash, SessionHeader,
-    SignerSet, StateHash, StepCommitment, TraceEntry, WitnessCommitment,
+    NegotiationId, PeerIdSource, PublicCursor, PublicEffect, PublicEvent, ReceiptArtifact,
+    ReceiptBody, ReceiptTermination, SessionHash, SessionHeader, SignerSet, StateHash,
+    StepCommitment, TraceEntry, WitnessCommitment,
 };
 
 use crate::fixtures::activation_for;
@@ -82,41 +82,23 @@ impl Synthetic {
 
     /// Construct a header for an explicit stopped receipt. Successful headers
     /// are assembled by the live execution actor and are not faked here.
-    pub fn stopped_header(
-        &self,
-        producer_idx: usize,
-        cause: arena0_protocol::StopCause,
-    ) -> SessionHeader {
+    pub fn stopped_header(&self, cause: arena0_protocol::StopCause) -> SessionHeader {
         SessionHeader::new(
             self.activation.clone(),
             ReceiptTermination::Stopped { cause },
-            self.activation.tickets()[producer_idx].data.signer,
         )
     }
 
-    /// Build and seal a stopped receipt from protocol evidence. This is the
-    /// same producer-seal shape emitted by the store reducer; no DTO or guest
-    /// adapter is involved.
+    /// Construct a stopped artifact from authenticated protocol evidence.
     pub fn stopped_receipt(
         &self,
-        producer_idx: usize,
         cause: arena0_protocol::StopCause,
         trace: Vec<TraceEntry>,
-    ) -> Receipt {
-        let header = self.stopped_header(producer_idx, cause);
+    ) -> ReceiptArtifact {
+        let header = self.stopped_header(cause);
         let body =
             ReceiptBody::new(header, Vec::new(), br#"{}"#.to_vec(), trace).expect("receipt body");
-        let proof_id = ProofId::derive(&body).expect("proof id");
-        let receipt_id = ReceiptId::derive_body(&body).expect("receipt id");
-        let producer = self.cryptos[producer_idx].peer_id();
-        let seal_data = ReceiptSealData::new(proof_id, receipt_id, producer);
-        let signature =
-            self.cryptos[producer_idx].sign(&seal_data.signing_bytes().expect("seal bytes"));
-        Receipt::new(
-            body,
-            arena0_protocol::ProducerSeal::new(seal_data, signature),
-        )
-        .expect("valid stopped receipt")
+        ReceiptArtifact::new(body).expect("valid stopped receipt")
     }
 
     /// Construct one signed public entry and return its next chain commitment.

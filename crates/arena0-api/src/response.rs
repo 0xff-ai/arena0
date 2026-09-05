@@ -5,8 +5,8 @@
 use arena0_crypto::AgentPubKey;
 use arena0_program::{JsonSchemaDocument, ParticipantCount, ProgramHash, ProgramSchema};
 use arena0_protocol::{
-    ExecId, ExecLifecycle, NegotiationId, OfferHash, PeerId, PendingId, Receipt, SessionHash,
-    StateHash, StopCause, TicketHash, TraceEntry, View,
+    ExecId, ExecLifecycle, NegotiationId, OfferHash, PeerId, PendingId, ReceiptArtifact,
+    SessionHash, StateHash, StopCause, TicketHash, TraceEntry, View,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -58,12 +58,13 @@ pub enum ResponseOk {
         view: View,
     },
     Trace(Vec<TraceEntry>),
-    Receipt(Box<Receipt>),
+    Receipt(Box<ReceiptArtifact>),
     ReceiptList(Vec<ReceiptListEntry>),
     /// `receipt.verify`: the recovered evidence, not a bool. The result variant
     /// records whether structural light verification or Wasm replay ran, so a
     /// completed result cannot claim an unavailable JSON projection.
     Verified {
+        receipt_id: arena0_protocol::ReceiptId,
         program_id: ProgramHash,
         session_id: SessionHash,
         ensemble: Vec<PeerId>,
@@ -198,7 +199,7 @@ pub struct SessionStatus {
     /// The committed ensemble size, not the live transport stream count.
     pub participants: usize,
     pub pending_callout: Option<PendingCalloutStatus>,
-    /// Whether this Host's producer receipt is durably available.
+    /// Whether this Host's locally produced artifact is durably available.
     pub receipt_available: bool,
 }
 
@@ -441,7 +442,7 @@ pub enum NextEvent {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReceiptProvenance {
-    /// The daemon produced and sealed the artifact.
+    /// The daemon produced the artifact.
     Produced,
     /// The daemon imported the artifact from another Host.
     Imported,
@@ -455,7 +456,7 @@ pub enum ReceiptProvenance {
 pub struct ReceiptListEntry {
     pub receipt_id: String,
     pub session_id: SessionHash,
-    pub producer: PeerId,
+    pub kind: arena0_protocol::ReceiptKind,
     pub program_id: ProgramHash,
     pub completed: bool,
     pub provenance: ReceiptProvenance,

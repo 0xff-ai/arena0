@@ -2,7 +2,7 @@
 
 Status: current Phase 1 orientation
 
-arena0 is a Rust system for deterministic, verifiable program co-execution. Two or more Hosts run the same content-addressed Wasm program, agree on each public state transition, and retain producer-specific receipts.
+arena0 is a Rust system for deterministic, verifiable program co-execution. Two or more Hosts run the same content-addressed Wasm program, agree on each public state transition, and retain canonical receipts or authenticated unilateral stop reports.
 
 This document explains the current system as a whole. It is not a second protocol specification. The following sources remain authoritative:
 
@@ -58,7 +58,7 @@ The workspace manifests own dependency selection and exact versions. The table b
 | Agent encoding | Serde JSON | Host API requests, responses, callouts, queries, views, and outcomes |
 | Agent schemas | JSON Schema Draft 2020-12 | Input validation and program introspection |
 | Content identity | BLAKE3 | Program and protocol content hashes |
-| Persistent identity | Ed25519 | Host identity, tickets, and producer receipt seals |
+| Persistent identity | Ed25519 | Host identity, tickets, and unilateral stop reports |
 | Execution agreement | BLS12-381 MinSig through `blst` | Per-execution keys and N-of-N aggregate agreements |
 | Local Host API | Length-prefixed JSON over Unix domain sockets | Typed client access to one Host |
 | MCP API | RMCP and Axum over Streamable HTTP | One Host-explicit agent endpoint for an Ensemble |
@@ -154,8 +154,8 @@ local admission
     -> deterministic execution
     -> N-of-N agreement on each public step
     -> terminal proof
-    -> producer seal
-    -> producer-specific receipt
+    -> atomic artifact publication
+    -> canonical receipt or unilateral stop report
 ```
 
 Admission selects an exact program, participant set, parameter set, execution profile, initial state, and deadline. Each Host validates those facts locally. Every selected Host must already have the exact `ProgramHash` in its catalog.
@@ -210,9 +210,13 @@ arena0 is pre-1.0 and has not had an independent security audit. Report vulnerab
 
 ## Receipts and verification
 
-Each Host produces one receipt for its participation in a session. The durable receipt address is `(SessionHash, producer PeerId)`. A synthesized session receipt would lose producer provenance, so the store preserves every producer separately.
+Each Host independently persists evidence. Completion and shared program stops
+produce the same canonical receipt on every Host retaining the same agreed
+execution. Unilateral stops produce distinct authenticated reports. Both are
+exported through `ReceiptArtifact` and addressed by a content-derived `ReceiptId`.
+The store owns local production and import provenance separately from the bytes.
 
-Light verification checks the activation, identities, trace chain, aggregate agreements, terminal evidence, receipt identity, and producer seal without loading Wasm.
+Light verification checks the activation, identities, trace chain, aggregate agreements, terminal evidence, and receipt identity without loading Wasm.
 
 Full verification first performs light verification. It then loads the exact program and execution profile, repeats initialization and every public call, and compares state hashes, effects, fuel, randomness, and the terminal result.
 
@@ -234,7 +238,7 @@ The [protocol architecture](protocol-architecture.md) defines the complete invar
 
 - N-party execution is the default, and bilateral execution is the two-party case.
 - Every public state transition requires N-of-N agreement.
-- Every Host owns independent durable state and a producer-specific receipt.
+- Every Host owns independent durable state and its own copy of the receipt or stop report.
 - Admission is exact and local. It has no discovery fallback or implicit program acquisition.
 - Activation uses prepare-before-sign and commit-before-`SessionStarted` ordering.
 - The inbox and outbox preserve work across restart and duplicate delivery.

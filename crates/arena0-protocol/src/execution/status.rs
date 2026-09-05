@@ -11,13 +11,13 @@ use serde::{Deserialize, Serialize};
 use crate::bounded::read_string as read_bounded_string;
 use crate::exec::ExecLifecycle;
 use crate::trace::{PendingRecord, StepCommitment, TerminalCommitment};
-use crate::{ExecId, PeerId, TraceEntry};
+use crate::{ExecId, TraceEntry};
 
 use super::{
     AbortKind, AbortOccurrence, ExecutionBinding, MAX_PROOF_SIGNATURES, MAX_TERMINAL_REASON_BYTES,
-    ParticipantTerminalSignature, PendingCoordinate, PrivateCursor, ProducerSealRequest, ProofId,
-    ProtocolError, PublicCursor, ReceiptBody, ReceiptId, TerminalCertificate, TerminalOutcome,
-    ensure_payload, validate_pending_record, validate_terminal_progress,
+    ParticipantTerminalSignature, PendingCoordinate, PrivateCursor, ProtocolError, PublicCursor,
+    ReceiptId, TerminalCertificate, TerminalOutcome, ensure_payload, validate_pending_record,
+    validate_terminal_progress,
 };
 
 /// The one persisted owner of execution progress, waiting continuations,
@@ -36,17 +36,15 @@ pub enum ExecutionStatus {
     },
     /// Successful terminal proof collection is in progress.
     TerminalProof { proof: Box<TerminalProof> },
-    /// A complete terminal proof and producer seal were published.
+    /// A complete terminal proof and canonical receipt were published.
     Completed { proof: PublishedProof },
-    /// An authenticated or shared abort/failure ended the execution before a
-    /// producer receipt seal was available.
+    /// An authenticated or shared stop awaits local artifact publication.
     Stopped { cause: StopCause },
-    /// A stopped receipt was sealed and published atomically.
+    /// A canonical shared-stop receipt or unilateral report was published.
     StoppedPublished {
         cause: StopCause,
-        proof_id: ProofId,
+
         receipt_id: ReceiptId,
-        producer: PeerId,
     },
     /// Terminal proof work was interrupted before publication.
     Incomplete {
@@ -55,19 +53,17 @@ pub enum ExecutionStatus {
     },
 }
 
-/// Remaining terminal work, borrowed from the authoritative durable status.
+/// Remaining terminal work derived from the authoritative durable status.
 /// This view is never persisted and grants no permission to mutate frozen proof.
 #[derive(Debug, Clone, Copy)]
-pub enum ReceiptWork<'a> {
+pub enum ReceiptWork {
     /// Execution has not reached a terminal boundary.
     NotTerminal,
     /// The N-of-N terminal agreement is still incomplete.
     CollectSignatures,
     /// Complete terminal evidence can be assembled into a local receipt body.
     Assemble,
-    /// The staged body needs its local producer seal.
-    Seal(&'a ProducerSealRequest),
-    /// A producer receipt has already been persisted.
+    /// A locally produced artifact has already been persisted.
     Published,
     /// Interrupted proof is frozen and must not resume or publish.
     Incomplete,
@@ -87,31 +83,15 @@ pub enum TerminalProof {
         certificate: TerminalCertificate,
         outcome: TerminalOutcome,
     },
-    /// The receipt body is staged and the producer seal is requested.
-    ReceiptAssembled {
-        certificate: TerminalCertificate,
-        outcome: TerminalOutcome,
-        body: Box<ReceiptBody>,
-        request: ProducerSealRequest,
-    },
-    /// A stopped receipt body is staged and the producer seal is requested.
-    StoppedReceiptAssembled {
-        cause: StopCause,
-        body: Box<ReceiptBody>,
-        request: ProducerSealRequest,
-    },
 }
 
-/// The proof material retained after the producer publishes a sealed receipt.
-/// Proof identities and producer identity live here exactly once; no published
-/// terminal variant duplicates them inside [`TerminalProof`].
+/// Completion evidence and its single portable artifact identity.
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct PublishedProof {
     pub(crate) certificate: TerminalCertificate,
     pub(crate) outcome: TerminalOutcome,
-    pub(crate) proof_id: ProofId,
+
     pub(crate) receipt_id: ReceiptId,
-    pub(crate) producer: PeerId,
 }
 
 /// The one terminal-cause type used by [`ExecutionStatus`]. Local versus peer
@@ -165,17 +145,10 @@ impl BorshSerialize for ExecutionStatus {
                 BorshSerialize::serialize(proof, writer)?;
                 BorshSerialize::serialize(reason, writer)
             }
-            Self::StoppedPublished {
-                cause,
-                proof_id,
-                receipt_id,
-                producer,
-            } => {
+            Self::StoppedPublished { cause, receipt_id } => {
                 BorshSerialize::serialize(&7u8, writer)?;
                 BorshSerialize::serialize(cause, writer)?;
-                BorshSerialize::serialize(proof_id, writer)?;
-                BorshSerialize::serialize(receipt_id, writer)?;
-                BorshSerialize::serialize(producer, writer)
+                BorshSerialize::serialize(receipt_id, writer)
             }
         }
     }
@@ -209,9 +182,8 @@ impl BorshDeserialize for ExecutionStatus {
             }),
             7 => Ok(Self::StoppedPublished {
                 cause: StopCause::deserialize_reader(reader)?,
-                proof_id: ProofId::deserialize_reader(reader)?,
+
                 receipt_id: ReceiptId::deserialize_reader(reader)?,
-                producer: PeerId::deserialize_reader(reader)?,
             }),
             tag => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -242,28 +214,6 @@ impl BorshSerialize for TerminalProof {
                 BorshSerialize::serialize(certificate, writer)?;
                 BorshSerialize::serialize(outcome, writer)
             }
-            Self::ReceiptAssembled {
-                certificate,
-                outcome,
-                body,
-                request,
-            } => {
-                BorshSerialize::serialize(&2u8, writer)?;
-                BorshSerialize::serialize(certificate, writer)?;
-                BorshSerialize::serialize(outcome, writer)?;
-                BorshSerialize::serialize(body, writer)?;
-                BorshSerialize::serialize(request, writer)
-            }
-            Self::StoppedReceiptAssembled {
-                cause,
-                body,
-                request,
-            } => {
-                BorshSerialize::serialize(&3u8, writer)?;
-                BorshSerialize::serialize(cause, writer)?;
-                BorshSerialize::serialize(body, writer)?;
-                BorshSerialize::serialize(request, writer)
-            }
         }
     }
 }
@@ -279,17 +229,6 @@ impl BorshDeserialize for TerminalProof {
             1 => Ok(Self::Certified {
                 certificate: TerminalCertificate::deserialize_reader(reader)?,
                 outcome: TerminalOutcome::deserialize_reader(reader)?,
-            }),
-            2 => Ok(Self::ReceiptAssembled {
-                certificate: TerminalCertificate::deserialize_reader(reader)?,
-                outcome: TerminalOutcome::deserialize_reader(reader)?,
-                body: Box::<ReceiptBody>::deserialize_reader(reader)?,
-                request: ProducerSealRequest::deserialize_reader(reader)?,
-            }),
-            3 => Ok(Self::StoppedReceiptAssembled {
-                cause: StopCause::deserialize_reader(reader)?,
-                body: Box::<ReceiptBody>::deserialize_reader(reader)?,
-                request: ProducerSealRequest::deserialize_reader(reader)?,
             }),
             tag => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -382,32 +321,6 @@ impl TerminalProof {
         }
     }
 
-    pub(crate) fn receipt_assembled(
-        certificate: TerminalCertificate,
-        outcome: TerminalOutcome,
-        body: ReceiptBody,
-        request: ProducerSealRequest,
-    ) -> Self {
-        Self::ReceiptAssembled {
-            certificate,
-            outcome,
-            body: Box::new(body),
-            request,
-        }
-    }
-
-    pub(crate) fn stopped_receipt_assembled(
-        cause: StopCause,
-        body: ReceiptBody,
-        request: ProducerSealRequest,
-    ) -> Self {
-        Self::StoppedReceiptAssembled {
-            cause,
-            body: Box::new(body),
-            request,
-        }
-    }
-
     pub(crate) fn pending_parts(
         &self,
     ) -> Option<(
@@ -433,49 +346,6 @@ impl TerminalProof {
             } => Some((certificate, outcome)),
             _ => None,
         }
-    }
-
-    pub(crate) fn receipt_assembled_parts(
-        &self,
-    ) -> Option<(
-        &TerminalCertificate,
-        &TerminalOutcome,
-        &ReceiptBody,
-        &ProducerSealRequest,
-    )> {
-        match self {
-            Self::ReceiptAssembled {
-                certificate,
-                outcome,
-                body,
-                request,
-            } => Some((certificate, outcome, body, request)),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn stopped_receipt_assembled_parts(
-        &self,
-    ) -> Option<(&StopCause, &ReceiptBody, &ProducerSealRequest)> {
-        match self {
-            Self::StoppedReceiptAssembled {
-                cause,
-                body,
-                request,
-            } => Some((cause, body, request)),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn seal_requested_parts(
-        &self,
-    ) -> Option<(
-        &TerminalCertificate,
-        &TerminalOutcome,
-        &ReceiptBody,
-        &ProducerSealRequest,
-    )> {
-        self.receipt_assembled_parts()
     }
 }
 
@@ -511,7 +381,7 @@ impl StopCause {
 impl ExecutionStatus {
     /// Derive the next receipt operation without reconstructing optional facts.
     #[must_use]
-    pub fn receipt_work(&self) -> ReceiptWork<'_> {
+    pub fn receipt_work(&self) -> ReceiptWork {
         match self {
             Self::Activating | Self::Active | Self::Waiting { .. } => ReceiptWork::NotTerminal,
             Self::Stopped { .. } => ReceiptWork::Assemble,
@@ -520,10 +390,6 @@ impl ExecutionStatus {
             Self::TerminalProof { proof } => match proof.as_ref() {
                 TerminalProof::Pending { .. } => ReceiptWork::CollectSignatures,
                 TerminalProof::Certified { .. } => ReceiptWork::Assemble,
-                TerminalProof::ReceiptAssembled { request, .. }
-                | TerminalProof::StoppedReceiptAssembled { request, .. } => {
-                    ReceiptWork::Seal(request)
-                }
             },
         }
     }
@@ -635,33 +501,21 @@ impl ExecutionStatus {
     pub(crate) fn completed(
         certificate: TerminalCertificate,
         outcome: TerminalOutcome,
-        proof_id: ProofId,
+
         receipt_id: ReceiptId,
-        producer: PeerId,
     ) -> Self {
         Self::Completed {
             proof: PublishedProof {
                 certificate,
                 outcome,
-                proof_id,
+
                 receipt_id,
-                producer,
             },
         }
     }
 
-    pub(crate) fn stopped_published(
-        cause: StopCause,
-        proof_id: ProofId,
-        receipt_id: ReceiptId,
-        producer: PeerId,
-    ) -> Self {
-        Self::StoppedPublished {
-            cause,
-            proof_id,
-            receipt_id,
-            producer,
-        }
+    pub(crate) fn stopped_published(cause: StopCause, receipt_id: ReceiptId) -> Self {
+        Self::StoppedPublished { cause, receipt_id }
     }
 
     /// Construct a status from an authenticated abort/failure occurrence.
@@ -686,7 +540,7 @@ impl ExecutionStatus {
 
     /// Construct the status represented by one certified shared termination
     /// entry. Successful `SessionEnd` entries begin proof progress and are
-    /// therefore not terminal status until the producer seal is published.
+    /// therefore not terminal status until the canonical receipt is published.
     pub(crate) fn from_shared_entry(
         entry: &TraceEntry,
         commitment: StepCommitment,
@@ -719,7 +573,7 @@ impl ExecutionStatus {
         &self,
         execution_id: ExecId,
         binding: &ExecutionBinding,
-        producer: PeerId,
+
         public: PublicCursor,
         private: PrivateCursor,
     ) -> Result<(), ProtocolError> {
@@ -742,19 +596,14 @@ impl ExecutionStatus {
                 }
                 Ok(())
             }
-            Self::TerminalProof { proof } => {
-                validate_terminal_progress(binding, producer, public, proof)
-            }
+            Self::TerminalProof { proof } => validate_terminal_progress(binding, public, proof),
             Self::Completed { proof } => {
                 let progress = TerminalProof::Certified {
                     certificate: proof.certificate.clone(),
                     outcome: proof.outcome.clone(),
                 };
-                validate_terminal_progress(binding, producer, public, &progress)?;
-                if proof.proof_id == ProofId::from_bytes([0; 32])
-                    || proof.receipt_id == ReceiptId::from_bytes([0; 32])
-                    || proof.producer != producer
-                {
+                validate_terminal_progress(binding, public, &progress)?;
+                if proof.receipt_id == ReceiptId::from_bytes([0; 32]) {
                     return Err(ProtocolError::InvalidTerminalStatus);
                 }
                 Ok(())
@@ -763,25 +612,17 @@ impl ExecutionStatus {
                 cause.validate()?;
                 validate_cause_binding(cause, binding, public)
             }
-            Self::StoppedPublished {
-                cause,
-                proof_id,
-                receipt_id,
-                producer: published_producer,
-            } => {
+            Self::StoppedPublished { cause, receipt_id } => {
                 cause.validate()?;
                 validate_cause_binding(cause, binding, public)?;
-                if *proof_id == ProofId::from_bytes([0; 32])
-                    || *receipt_id == ReceiptId::from_bytes([0; 32])
-                    || *published_producer != producer
-                {
+                if *receipt_id == ReceiptId::from_bytes([0; 32]) {
                     return Err(ProtocolError::InvalidTerminalStatus);
                 }
                 Ok(())
             }
             Self::Incomplete { proof, reason } => {
                 ensure_reason(reason)?;
-                validate_terminal_progress(binding, producer, public, proof)?;
+                validate_terminal_progress(binding, public, proof)?;
                 Ok(())
             }
         }

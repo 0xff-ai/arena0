@@ -1,7 +1,7 @@
 //! Client-side id-prefix resolution for exec, session, and receipt ids.
 
 use anyhow::bail;
-use arena0_api::{ReceiptKey, Request, ResponseOk};
+use arena0_api::{ReceiptRef, Request, ResponseOk};
 use arena0_protocol::{ExecId, SessionHash};
 
 use crate::proto::DaemonClient;
@@ -147,34 +147,38 @@ impl DaemonClient {
         }
     }
 
-    /// Resolve a resident receipt reference to its exact session/producer key.
-    /// Receipt-id references use the list entry directly; a session reference uses
-    /// the addressed daemon's own identity because a session can have receipts from
-    /// several producers.
-    pub async fn resolve_receipt_key(&self, reference: &str) -> anyhow::Result<ReceiptKey> {
+    /// Resolve a content ID first, then this Host's publication for a session.
+    pub async fn resolve_receipt_ref(&self, reference: &str) -> anyhow::Result<ReceiptRef> {
         match self.resolve_receipt(reference).await {
-            Ok(entry) => Ok(ReceiptKey {
-                session_id: entry.session_id,
-                producer: entry.producer,
-            }),
-            Err(ResolveError::NotFound { .. }) => self.resolve_session_key(reference).await,
+            Ok(entry) => Ok(ReceiptRef::Stored(entry.receipt_id.parse()?)),
+            Err(ResolveError::NotFound { .. }) => self.resolve_session_ref(reference).await,
             Err(error) => Err(error.into()),
         }
     }
 
-    /// Resolve a session reference to the receipt produced by the addressed daemon.
-    /// This is the explicit one-host path for commands whose argument is a session,
-    /// not a receipt id; the daemon identity is obtained rather than inferred from
-    /// whichever producer happens to sort first in storage.
-    pub async fn resolve_session_key(&self, reference: &str) -> anyhow::Result<ReceiptKey> {
-        let session_id = self.resolve_session(reference).await?;
-        let ResponseOk::DaemonInfo(info) = self.call(&Request::DaemonInfo).await? else {
-            bail!("unexpected response to daemon.info");
-        };
-        Ok(ReceiptKey {
-            session_id,
-            producer: info.peer_id,
-        })
+    /// Resolve an ID or session to evidence this Host actually produced.
+    pub async fn resolve_produced_receipt_ref(
+        &self,
+        reference: &str,
+    ) -> anyhow::Result<ReceiptRef> {
+        match self.resolve_receipt(reference).await {
+            Ok(entry)
+                if matches!(
+                    entry.provenance,
+                    arena0_api::ReceiptProvenance::Produced | arena0_api::ReceiptProvenance::Both
+                ) =>
+            {
+                Ok(ReceiptRef::Produced(entry.session_id))
+            }
+            Ok(_) => bail!("receipt {reference} was imported but not produced by this Host"),
+            Err(ResolveError::NotFound { .. }) => self.resolve_session_ref(reference).await,
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Resolve this Host's own publication without selecting imported reports.
+    pub async fn resolve_session_ref(&self, reference: &str) -> anyhow::Result<ReceiptRef> {
+        Ok(ReceiptRef::Produced(self.resolve_session(reference).await?))
     }
 }
 
@@ -246,11 +250,43 @@ mod tests {
         arena0_api::ReceiptListEntry {
             receipt_id: id.into(),
             session_id: SessionHash([1; 32]),
-            producer: arena0_protocol::PeerId([2; 32]),
+            kind: arena0_protocol::ReceiptKind::Receipt,
             program_id: arena0_program::ProgramHash([3; 32]),
             completed: true,
             provenance: arena0_api::ReceiptProvenance::Produced,
         }
+    }
+
+    #[tokio::test]
+    async fn produced_receipt_resolution_preserves_local_provenance() {
+        let mut entry = receipt(&"ab".repeat(32));
+        entry.provenance = arena0_api::ReceiptProvenance::Both;
+        let (_dir, client, task) = serve_responses(vec![(
+            Request::ReceiptList,
+            Ok(ResponseOk::ReceiptList(vec![entry.clone()])),
+        )]);
+        assert_eq!(
+            client
+                .resolve_produced_receipt_ref(&entry.receipt_id)
+                .await
+                .unwrap(),
+            ReceiptRef::Produced(entry.session_id)
+        );
+        task.await.unwrap();
+        entry.provenance = arena0_api::ReceiptProvenance::Imported;
+        let (_dir, client, task) = serve_responses(vec![(
+            Request::ReceiptList,
+            Ok(ResponseOk::ReceiptList(vec![entry.clone()])),
+        )]);
+        assert!(
+            client
+                .resolve_produced_receipt_ref(&entry.receipt_id)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not produced")
+        );
+        task.await.unwrap();
     }
 
     #[tokio::test]
@@ -262,7 +298,7 @@ mod tests {
                 receipt("ab02"),
             ])),
         )]);
-        let error = client.resolve_receipt_key("ab").await.unwrap_err();
+        let error = client.resolve_receipt_ref("ab").await.unwrap_err();
         assert!(matches!(
             error.downcast_ref::<ResolveError>(),
             Some(ResolveError::Ambiguous { .. })
@@ -279,7 +315,7 @@ mod tests {
                 "unavailable",
             )),
         )]);
-        let error = client.resolve_receipt_key("ab").await.unwrap_err();
+        let error = client.resolve_receipt_ref("ab").await.unwrap_err();
         assert!(matches!(
             error.downcast_ref::<ResolveError>(),
             Some(ResolveError::Request(_))
@@ -288,44 +324,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_receipt_falls_back_to_exact_local_producer() {
-        let peer = arena0_protocol::PeerId([2; 32]);
+    async fn missing_receipt_falls_back_to_local_session() {
         let session = SessionHash([1; 32]);
-        let (_dir, client, task) = serve_responses(vec![
-            (Request::ReceiptList, Ok(ResponseOk::ReceiptList(vec![]))),
-            (
-                Request::DaemonInfo,
-                Ok(ResponseOk::DaemonInfo(arena0_api::DaemonInfo {
-                    name: "host-01".into(),
-                    peer_id: peer,
-                    transport_key: arena0_crypto::AgentPubKey([0; 32]),
-                    version: "test".into(),
-                    abi_version: 1,
-                    uptime_secs: 0,
-                    socket: String::new(),
-                    programs: 0,
-                    execs_active: 0,
-                })),
-            ),
-        ]);
+        let (_dir, client, task) = serve_responses(vec![(
+            Request::ReceiptList,
+            Ok(ResponseOk::ReceiptList(vec![])),
+        )]);
         let key = client
-            .resolve_receipt_key(&session.to_string())
+            .resolve_receipt_ref(&session.to_string())
             .await
             .unwrap();
-        assert_eq!(
-            key,
-            ReceiptKey {
-                session_id: session,
-                producer: peer
-            }
-        );
+        assert_eq!(key, ReceiptRef::Produced(session));
         task.await.unwrap();
     }
     #[tokio::test]
     async fn transport_failure_remains_a_request_error() {
         let dir = tempfile::tempdir().unwrap();
         let client = DaemonClient::new(dir.path().join("absent.sock"));
-        let error = client.resolve_receipt_key("ab").await.unwrap_err();
+        let error = client.resolve_receipt_ref("ab").await.unwrap_err();
         assert!(matches!(
             error.downcast_ref::<ResolveError>(),
             Some(ResolveError::Request(_))
@@ -337,7 +353,7 @@ mod tests {
     async fn unexpected_receipt_response_does_not_fall_back() {
         let (_dir, client, task) =
             serve_responses(vec![(Request::ReceiptList, Ok(ResponseOk::Ack))]);
-        let error = client.resolve_receipt_key("ab").await.unwrap_err();
+        let error = client.resolve_receipt_ref("ab").await.unwrap_err();
         assert!(matches!(
             error.downcast_ref::<ResolveError>(),
             Some(ResolveError::UnexpectedResponse)

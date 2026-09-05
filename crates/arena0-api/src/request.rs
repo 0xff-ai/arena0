@@ -9,7 +9,9 @@
 //! and forwards it unchanged; the guest converts it to concrete DTOs.
 
 use arena0_program::ProgramHash;
-use arena0_protocol::{ColorDepth, ExecId, NegotiationId, PeerId, PendingId, Receipt, SessionHash};
+use arena0_protocol::{
+    ColorDepth, ExecId, NegotiationId, PeerId, PendingId, ReceiptArtifact, SessionHash,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -129,9 +131,9 @@ pub enum Request {
 
     // Receipts / verification.
     #[serde(rename = "receipt.get")]
-    ReceiptGet { key: ReceiptKey },
+    ReceiptGet { receipt: ReceiptRef },
     #[serde(rename = "receipt.import")]
-    ReceiptImport { receipt: Box<Receipt> },
+    ReceiptImport { receipt: Box<ReceiptArtifact> },
     #[serde(rename = "receipt.list")]
     ReceiptList,
     #[serde(rename = "receipt.verify")]
@@ -169,19 +171,12 @@ pub enum IdRef {
     Label(String),
 }
 
-/// The durable address of a receipt produced by one participant.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ReceiptKey {
-    pub session_id: SessionHash,
-    pub producer: PeerId,
-}
-
-/// Reference a receipt to verify: daemon-resident by its session and producer, or
-/// inline for an offline blob the daemon does not hold.
+/// Select exact stored evidence, this Host's session publication, or an inline artifact.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ReceiptRef {
-    Produced(ReceiptKey),
-    Inline(Box<Receipt>),
+    Produced(SessionHash),
+    Stored(arena0_protocol::ReceiptId),
+    Inline(Box<ReceiptArtifact>),
 }
 
 /// Which program a `ProgramHash` inbound-resolution failure could have meant.

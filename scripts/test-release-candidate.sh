@@ -85,7 +85,8 @@ assert verified["tier"] == "full", verified
 assert verified["all_verified"] is True, verified
 assert verified["shared_evidence_agrees"] is True, verified
 assert len(receipts) == 2, receipts
-assert len({receipt["producer"] for receipt in receipts}) == 2, receipts
+assert len({receipt["peer_id"] for receipt in receipts}) == 2, receipts
+assert {receipt["receipt_id"] for receipt in receipts} == {result["receipt_id"]}, receipts
 assert all(receipt["result"] == "valid" for receipt in receipts), receipts
 PY
 

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use arena0_api::{
     AwaitState, ColorDepth, EnsembleSpec, EventData, EventFilter, EventFrame, ExecLifecycle,
-    Receipt, ReceiptKey, Request, Response, ResponseOk,
+    ReceiptArtifact, Request, Response, ResponseOk,
 };
 use arena0_protocol::{ExecId, Slot};
 use common::{call, created, drive, ok, rps_wasm, two_daemons};
@@ -113,7 +113,7 @@ async fn exec_new_returns_immediately_and_await_blocks() {
                 status
                     .session()
                     .is_some_and(|session| session.receipt_available),
-                "terminal status reports the durable producer receipt"
+                "terminal status reports the durable locally produced artifact"
             );
         }
         other => panic!("unexpected terminal status response: {other:?}"),
@@ -411,7 +411,7 @@ async fn collect_frames_unix(socket: std::path::PathBuf, filter: EventFilter) ->
     }
 }
 
-/// Receipt content addressing is stable; import is idempotent and lists a foreign
+/// ReceiptArtifact content addressing is stable; import is idempotent and lists a foreign
 /// receipt with imported provenance.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn receipt_id_import_idempotence_and_list() {
@@ -455,13 +455,10 @@ async fn receipt_id_import_idempotence_and_list() {
     let (sid, _sb) = tokio::join!(drive(&d.sock_a, exec_a), drive(&d.sock_b, exec_b));
 
     // Fetch A's receipt and confirm the content address is stable.
-    let receipt: Receipt = match ok(call(
+    let receipt: ReceiptArtifact = match ok(call(
         &d.sock_a,
         &Request::ReceiptGet {
-            key: ReceiptKey {
-                session_id: sid,
-                producer: d.peer_a,
-            },
+            receipt: arena0_api::ReceiptRef::Produced(sid),
         },
     )
     .await)
@@ -476,15 +473,15 @@ async fn receipt_id_import_idempotence_and_list() {
         "receipt_id is stable"
     );
 
-    // The other producer imports this Host's independently produced receipt.
+    // The other Host already produced the same canonical artifact.
     let imported = import_one(&d.sock_b, &receipt).await;
     assert_eq!(
         imported.provenance,
-        arena0_api::ReceiptProvenance::Imported,
-        "entry marked imported"
+        arena0_api::ReceiptProvenance::Both,
+        "identical local publication retains both provenance facts"
     );
     assert_eq!(imported.receipt_id, rid, "import keeps the content address");
-    assert_eq!(imported.producer, receipt.producer());
+    assert_eq!(imported.kind, receipt.kind());
 
     // Re-import is idempotent: still exactly one imported entry for that id.
     let _ = import_one(&d.sock_b, &receipt).await;
@@ -494,14 +491,26 @@ async fn receipt_id_import_idempotence_and_list() {
     };
     let imported: Vec<_> = list
         .iter()
-        .filter(|e| e.provenance == arena0_api::ReceiptProvenance::Imported)
+        .filter(|e| e.provenance == arena0_api::ReceiptProvenance::Both)
         .collect();
+    assert_eq!(list.len(), 1, "canonical imports deduplicate across Hosts");
     assert_eq!(imported.len(), 1, "re-import is idempotent");
     assert_eq!(imported[0].receipt_id, rid);
     assert_eq!(imported[0].session_id, sid);
+    let fetched = ok(call(
+        &d.sock_b,
+        &Request::ReceiptGet {
+            receipt: arena0_api::ReceiptRef::Stored(receipt.receipt_id()),
+        },
+    )
+    .await);
+    let ResponseOk::Receipt(fetched) = fetched else {
+        panic!("expected artifact by ID");
+    };
+    assert_eq!(fetched.encode().unwrap(), receipt.encode().unwrap());
 }
 
-async fn import_one(socket: &Path, receipt: &Receipt) -> arena0_api::ReceiptListEntry {
+async fn import_one(socket: &Path, receipt: &ReceiptArtifact) -> arena0_api::ReceiptListEntry {
     match ok(call(
         socket,
         &Request::ReceiptImport {

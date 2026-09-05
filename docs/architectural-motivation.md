@@ -79,20 +79,24 @@ the Host admits the exact local Wasm artifact and starts one execution actor;
 each guest call uses a fresh bounded Wasm instance. The process supervisor
 coordinates lifecycle, not protocol authority.
 
-## Why receipts include the producer
+## Why receipts are canonical and provenance is local
 
-Every participant independently owns its evidence. `SessionHash` alone names
-the shared activation but does not identify which Host produced a stored
-receipt. Retrieval by session alone either discards evidence or silently
-selects one producer.
+The unanimous proof of a completed session should have the same content identity
+regardless of who exports it. Activation, step, and terminal agreements already
+authenticate that proof, so an additional exporter seal would make identical
+shared evidence into different artifacts without strengthening the agreement.
 
-The durable address is therefore `(SessionHash, producer PeerId)`. The store
-keeps the receipt artifact, the fact that this Host imported it, and the local
-execution relation as separate records. Listing derives `Produced`, `Imported`,
-or `Both` from those facts, so publishing an exact imported artifact does not
-erase its import history. Verification can state exactly which evidence it
-consumed. Reimporting the same artifact is idempotent, while a different
-artifact cannot replace an existing producer key.
+Each Host independently assembles the same canonical receipt and keeps its own
+copy. Artifact identity is `ReceiptId`; local production and import records own
+provenance. Importing another Host's identical receipt adds an import fact to the
+same artifact, and publishing previously imported evidence retains both facts.
+
+A unilateral failure has a different guarantee. Hosts may observe different
+signed stops or different certified prefixes. Those become `StopReport` artifacts
+with their own content IDs, rather than being presented as unanimous receipts.
+Exact-ID retrieval preserves every report; local-session retrieval follows the
+selected Host's production relation. No receipt construction requires a new
+agreement round after peers become unavailable.
 
 ## Why executables are split
 

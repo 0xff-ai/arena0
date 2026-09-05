@@ -347,9 +347,16 @@ async fn participant_stream_closure_is_a_host_terminal_observation() {
     assert_eq!(
         receipts.len(),
         1,
-        "failure must seal its local receipt before notification"
+        "failure must persist its stop report before notification"
     );
-    assert_eq!(receipts[0].key.producer(), execution.peer_ids[0]);
+    assert_eq!(
+        receipts[0].provenance,
+        arena0_store::ReceiptProvenance::Produced
+    );
+    assert!(matches!(
+        receipts[0].receipt,
+        arena0_protocol::ReceiptArtifact::StopReport(_)
+    ));
     let verified = arena0_verify::verify_full(
         &execution.wasm,
         &receipts[0].receipt.encode().expect("receipt encoding"),

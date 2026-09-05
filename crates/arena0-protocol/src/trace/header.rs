@@ -65,21 +65,15 @@ pub struct SessionHeader {
     /// evidence. This field is intentionally non-optional: an artifact with no
     /// terminal evidence is not a receipt.
     pub terminal: ReceiptTermination,
-    /// The replica whose trace this header labels. Every replica persists its own
-    /// trace; the verifier's self-signature floor applies to this peer, and it must
-    /// be one of the committed participants. Lets a third party verify a receipt
-    /// without guessing which participant produced it.
-    pub producer: PeerId,
 }
 
 impl SessionHeader {
-    /// Build a header from the activation, proof-bearing terminal, and producer.
+    /// Build a header from the activation, proof-bearing terminal, and terminal evidence.
     #[must_use]
-    pub fn new(activation: Activation, terminal: ReceiptTermination, producer: PeerId) -> Self {
+    pub fn new(activation: Activation, terminal: ReceiptTermination) -> Self {
         Self {
             activation,
             terminal,
-            producer,
         }
     }
 

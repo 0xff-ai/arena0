@@ -7,8 +7,8 @@ arena0 serve
 ```
 
 The default service owns two independent logical Hosts, `host-01` and
-`host-02`. Each has its own identity, store, socket, execution, and producer
-receipt, even though both run on one machine.
+`host-02`. Each has its own identity, store, socket, execution, and retained
+evidence, even though both run on one machine.
 
 ## Play against a built-in policy
 
@@ -115,7 +115,7 @@ pre-session work identified by a `NegotiationId`. A `SessionHash` exists only
 after every participant commits the activation.
 
 The command drives all Hosts concurrently, requires them to report the same
-session and shared terminal facts, and verifies every producer receipt. The
+session and shared terminal facts, and verifies each Host's receipt. The
 default is light verification; `--replay` asks each Host to perform full Wasm
 replay. A failure or cancellation stops and reaps subprocess agents, while the
 Host-local execution records remain available through `arena0 exec` commands.

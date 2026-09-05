@@ -1,10 +1,9 @@
 //! Three independent replicas complete a sealed-bid auction and replay every
-//! producer receipt against the exact guest Wasm.
+//! locally produced artifact against the exact guest Wasm.
 
 use arena0_tests::arena::Arena;
 use arena0_tests::wasm::program_wasm;
 use arena0_verify::VerifiedTerminal;
-use std::collections::HashSet;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn vickrey_auction_runs_and_every_producer_replays() {
@@ -34,12 +33,14 @@ async fn vickrey_auction_runs_and_every_producer_replays() {
         .verify_all(&wasm)
         .expect("all three auction receipts replay-verify");
 
-    let expected_producers: HashSet<_> = (0..run.node_count()).map(|i| run.peer_id(i)).collect();
-    let actual_producers: HashSet<_> = (0..run.node_count())
-        .map(|i| run.receipt(i).producer())
-        .collect();
-    assert_eq!(actual_producers, expected_producers);
-    assert_eq!(actual_producers.len(), run.node_count());
+    for i in 1..run.node_count() {
+        assert_eq!(
+            run.receipt_bytes(0),
+            run.receipt_bytes(i),
+            "canonical auction receipt including joint randomness"
+        );
+        assert_eq!(run.receipt(0).receipt_id(), run.receipt(i).receipt_id());
+    }
 
     for (participant, (verified, expected_outcome)) in
         verified.into_iter().zip(&outcomes).enumerate()

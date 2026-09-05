@@ -182,14 +182,14 @@ fn stop_update_enters_a_redacted_terminal_state() {
     let mut state = ScreenState::new(config());
 
     state.apply(RunUpdate::Stopped {
-        summary: "run stopped; producer receipts verified".to_owned(),
+        summary: "run stopped; Host receipts verified".to_owned(),
     });
 
     assert!(state.complete);
     assert_eq!(state.lifecycle(), ExecLifecycle::Aborted);
     assert_eq!(
         state.failure.as_deref(),
-        Some("run stopped; producer receipts verified")
+        Some("run stopped; Host receipts verified")
     );
     assert!(state.callouts.is_empty());
 }
@@ -1073,13 +1073,13 @@ fn receipt_evidence_is_host_owned_and_progress_is_aggregate() {
     let mut state = ScreenState::new(config());
     state.apply(RunUpdate::ReceiptVerified {
         host: first_host(),
-        producer: PeerId([1; 32]),
-        tier: "producer",
+        peer_id: PeerId([1; 32]),
+        tier: "peer_id",
     });
     state.apply(RunUpdate::ReceiptVerified {
         host: "host-02".parse().expect("valid Host name"),
-        producer: PeerId([2; 32]),
-        tier: "producer",
+        peer_id: PeerId([2; 32]),
+        tier: "peer_id",
     });
     state.apply(RunUpdate::VerificationProgress {
         verified: 2,

@@ -115,11 +115,40 @@ async fn bilateral_peer_abort_publishes_a_stopped_receipt() {
 fn stopped_receipts_use_authenticated_terminal_evidence() {
     let synthetic = Synthetic::new(2);
     let cause = synthetic.authenticated_stop(0, AbortKind::Abort, "operator stop");
-    let receipt = synthetic.stopped_receipt(0, cause, Vec::new());
+    let receipt = synthetic.stopped_receipt(cause, Vec::new());
     let verified = verify_light(&receipt.encode().expect("encode receipt"))
         .expect("authenticated stop verifies");
     assert!(matches!(
         verified.terminal,
         LightVerifiedTerminal::Stopped { .. }
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn shared_program_stop_produces_one_canonical_receipt() {
+    let wasm = arena0_tests::fixtures::shared_stop_program_wasm();
+    let mut arena = arena0_tests::arena::Arena::new();
+    arena
+        .program(wasm.clone())
+        .participants(3)
+        .params(b"null".to_vec());
+    let mut run = arena.run().await;
+    run.wait_all_terminal().await;
+    run.wait_all_receipts().await;
+    let expected = run.receipt_bytes(0);
+    for i in 0..run.node_count() {
+        assert!(matches!(
+            run.receipt(i),
+            arena0_protocol::ReceiptArtifact::Receipt(_)
+        ));
+        assert_eq!(run.receipt_bytes(i), expected);
+        assert_eq!(run.receipt(i).receipt_id(), run.receipt(0).receipt_id());
+        let verified = verify_full(&wasm, &run.receipt_bytes(i)).expect("shared stop replay");
+        assert!(matches!(
+            verified.terminal,
+            arena0_verify::VerifiedTerminal::Stopped {
+                cause: arena0_protocol::StopCause::Shared { .. }
+            }
+        ));
+    }
 }
