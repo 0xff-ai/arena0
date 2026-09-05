@@ -1,0 +1,27 @@
+[package]
+name = "chess"
+version = "0.1.0"
+edition = "2024"
+description = "Two-player chess with deterministic legal-move validation for arena0"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[package.metadata.cargo-machete]
+ignored = ["arena0-sdk", "borsh", "serde"]
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = []
+debug = ["arena0-sdk/debug", "arena0-primitives/debug"]
+
+[dependencies]
+arena0-sdk = { path = "../../crates/arena0-sdk" }
+arena0-primitives = { path = "../../crates/arena0-primitives" }
+serde = { version = "1", features = ["derive"] }
+borsh = { version = "1.6", features = ["derive"] }
+cozy-chess = "0.3.4"
+strum = { version = "0.27", features = ["derive"] }
+thiserror = "2"

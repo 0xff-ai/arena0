@@ -1,0 +1,176 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/arena0-api",
+    "crates/arena0-client",
+    "crates/arena0-crypto",
+    "crates/arena0-home",
+    "crates/arena0-program",
+    "crates/arena0-protocol",
+    "crates/arena0-sandbox",
+    "crates/arena0-store",
+    "crates/arena0-sdk-macros",
+    "crates/arena0-sdk",
+    "crates/arena0-primitives",
+    "crates/arena0-transport",
+    "crates/arena0-wire",
+    "crates/arena0-verify",
+    "crates/arena0-node",
+    "crates/arena0-tests",
+    "crates/arena0-daemon",
+    "crates/arena0d",
+    "crates/arena0-cli",
+    "crates/cargo-arena0",
+]
+exclude = ["programs", "crates/private"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/0xff-ai/arena0"
+homepage = "https://github.com/0xff-ai/arena0"
+publish = false
+
+[workspace.dependencies]
+# Wasm runtime
+wasmtime = { version = "46.0.3", default-features = false, features = [
+    "anyhow",
+    "cache",
+    "cranelift",
+    "runtime",
+    "std",
+] }
+wasmparser = "0.221"
+wat = "1.221"
+moka = { version = "0.12", default-features = false, features = ["sync"] }
+
+# Proc macros
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "visit"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+unicode-width = "0.2.2"
+borsh = { version = "1.6", features = ["derive", "unstable__schema"] }
+schemars = { version = "=1.2.1", features = ["derive"] }
+jsonschema = { version = "=0.51.0", default-features = false }
+hex = "0.4"
+# Hashing
+blake3 = "1.5"
+sha2 = "0.10"
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+# Secret material is explicitly wiped when its owning value is dropped.
+zeroize = { version = "1", features = ["derive"] }
+
+# Signing
+# default-features = false keeps `rand_core`/getrandom out of the guest wasm graph
+# (spec -> sdk). All arena0 crypto is deterministic: ed25519 from_bytes/sign,
+# plus verification. No RNG keygen anywhere.
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "fast", "zeroize"] }
+# BLS12-381 (host-only; aggregate attestation + admission). MinSig: signatures in
+# G1 (48 bytes), public keys in G2 (96 bytes). arena0-crypto target-gates blst so
+# the C implementation never enters the Wasm guest graph.
+blst = "0.3"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+bytes = "1"
+retry = "2.2.0"
+
+# Agent interface
+rmcp = { version = "1.8.0", features = ["server", "transport-streamable-http-server", "macros", "schemars"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1.0.103"
+
+# RNG
+rand = "0.8"
+rand_chacha = "0.3"
+
+# Logging
+tracing = { version = "0.1", features = ["valuable"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "valuable"] }
+valuable = { version = "0.1.1", features = ["derive"] }
+
+# Authoritative per-Host SQLite storage.
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+# Transport seam
+async-trait = "0.1"
+
+# CLI (host-only)
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+indicatif = { version = "0.18.6", default-features = false, features = ["unicode-width"] }
+owo-colors = "4.4.0"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
+ratatui-textarea = { version = "0.9.2", default-features = false, features = ["crossterm"] }
+rattles = "0.3.1"
+
+# Testing
+tempfile = "3"
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+unused-async = "warn"
+missing-errors-doc = "allow"
+missing-panics-doc = "allow"
+missing-const-for-fn = "allow"
+redundant-pub-crate = "allow"
+doc-markdown = "allow"
+module-name-repetitions = "allow"
+too-long-first-doc-paragraph = "allow"
+
+[profile.release]
+debug = true
+
+# Debug builds default to full debuginfo, but the Wasmtime-heavy dev graph can
+# overflow hosted runners. Line tables keep breakpoints and symbolized
+# backtraces with substantially less disk use.
+# Override locally with CARGO_PROFILE_DEV_DEBUG=2 for full stepping.
+[profile.dev]
+debug = "line-tables-only"
+
+# The test harness compiles guest wasm at runtime through cranelift. At the dev
+# profile's default opt-level 0, cranelift itself is ~16x slower (3.4s vs 0.2s
+# to compile the 310KB sequential_count program), and every test sandbox
+# recompiles the program, so this dominates test wall time. Optimize the
+# compiler crates even in dev; the app crates stay at opt-level 0.
+[profile.dev.package.cranelift-bforest]
+opt-level = 3
+[profile.dev.package.cranelift-bitset]
+opt-level = 3
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+[profile.dev.package.cranelift-control]
+opt-level = 3
+[profile.dev.package.cranelift-entity]
+opt-level = 3
+[profile.dev.package.cranelift-frontend]
+opt-level = 3
+[profile.dev.package.cranelift-isle]
+opt-level = 3
+[profile.dev.package.cranelift-native]
+opt-level = 3
+[profile.dev.package.regalloc2]
+opt-level = 3
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 3
+
+[profile.optimized-release]
+inherits = "release"
+debug = false
+lto = true
+debug-assertions = false
+opt-level = 3
+panic = "abort"
+incremental = false

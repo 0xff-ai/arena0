@@ -1,0 +1,6 @@
+# Spec examples contain illustrative 64-hex IDs that trip generic-api-key.
+title = "arena0 gitleaks config"
+
+[allowlist]
+description = "Illustrative IDs in the events spec examples"
+paths = ['''docs/api/events/.*\.md$''']

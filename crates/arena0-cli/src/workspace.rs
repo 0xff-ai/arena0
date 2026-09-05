@@ -1,0 +1,1007 @@
+//! Interactive catalog and launch setup for one local coordinated run.
+
+use crate::ui::TuiPalette;
+use std::borrow::Cow;
+use std::collections::HashMap;
+
+use anyhow::{Context as _, anyhow, bail};
+use arena0_client::api::{ExecStatus, ProgramDetail, Request, ResponseOk};
+use arena0_client::proto::DaemonClient;
+use arena0_client::protocol::ProgramHash;
+use arena0_home::HostName;
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use futures::StreamExt as _;
+use ratatui::Frame;
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Style};
+use ratatui::symbols::{Marker, border};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use serde_json::Value;
+use unicode_width::UnicodeWidthChar as _;
+
+const MIN_WIDTH: u16 = 48;
+const MIN_HEIGHT: u16 = 23;
+const WIDE_WIDTH: u16 = 96;
+const SPLASH_LOGO_WIDTH: u16 = 40;
+const LOGO_SEGMENTS: [[f64; 4]; 29] = [
+    [1.0, 1.0, 7.0, 19.0],
+    [7.0, 19.0, 13.0, 1.0],
+    [3.5, 8.0, 10.5, 8.0],
+    [18.0, 1.0, 18.0, 19.0],
+    [18.0, 19.0, 28.0, 19.0],
+    [28.0, 19.0, 31.0, 16.0],
+    [31.0, 16.0, 31.0, 12.0],
+    [31.0, 12.0, 28.0, 9.0],
+    [28.0, 9.0, 18.0, 9.0],
+    [26.0, 9.0, 32.0, 1.0],
+    [37.0, 1.0, 37.0, 19.0],
+    [37.0, 19.0, 50.0, 19.0],
+    [37.0, 10.0, 48.0, 10.0],
+    [37.0, 1.0, 50.0, 1.0],
+    [56.0, 1.0, 56.0, 19.0],
+    [56.0, 19.0, 69.0, 1.0],
+    [69.0, 1.0, 69.0, 19.0],
+    [75.0, 1.0, 81.0, 19.0],
+    [81.0, 19.0, 87.0, 1.0],
+    [77.5, 8.0, 84.5, 8.0],
+    [94.0, 4.0, 94.0, 16.0],
+    [94.0, 16.0, 97.0, 19.0],
+    [97.0, 19.0, 103.0, 19.0],
+    [103.0, 19.0, 106.0, 16.0],
+    [106.0, 16.0, 106.0, 4.0],
+    [106.0, 4.0, 103.0, 1.0],
+    [103.0, 1.0, 97.0, 1.0],
+    [97.0, 1.0, 94.0, 4.0],
+    [96.0, 3.0, 104.0, 17.0],
+];
+
+/// The exact local setup selected by the user.
+#[derive(Debug)]
+pub(crate) struct Launch {
+    pub(crate) program: String,
+    pub(crate) participants: usize,
+    pub(crate) human_control: HumanControl,
+    pub(crate) params: Option<Value>,
+    pub(crate) replay: bool,
+}
+
+/// Which local Hosts send their callouts to the shared human interface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HumanControl {
+    OneHost { host: HostName },
+    AllHosts,
+}
+
+#[derive(Debug)]
+pub(crate) enum Exit {
+    Launch(Launch),
+    Quit,
+}
+
+/// Load the typed catalog and execution summary used by the workspace.
+pub(crate) async fn load(
+    client: &DaemonClient,
+) -> anyhow::Result<(Vec<ProgramDetail>, Vec<ExecStatus>)> {
+    let programs = match client.call(&Request::ProgramList).await? {
+        ResponseOk::ProgramList(programs) => programs,
+        other => bail!("unexpected program.list response: {other:?}"),
+    };
+    let mut details = Vec::with_capacity(programs.len());
+    for program in programs {
+        let response = client
+            .call(&Request::ProgramGet {
+                program: program.program_hash.to_string(),
+            })
+            .await
+            .with_context(|| format!("load program '{}' for workspace", program.name))?;
+        let ResponseOk::Program(detail) = response else {
+            bail!("unexpected program.get response: {response:?}");
+        };
+        details.push(*detail);
+    }
+    details.sort_by(|left, right| left.summary.display_name.cmp(&right.summary.display_name));
+    let executions = match client.call(&Request::ExecList).await? {
+        ResponseOk::ExecList(executions) => executions,
+        other => bail!("unexpected exec.list response: {other:?}"),
+    };
+    Ok((details, executions))
+}
+
+/// Present the catalog and return one validated launch selection.
+pub(crate) async fn choose(
+    programs: Vec<ProgramDetail>,
+    executions: Vec<ExecStatus>,
+    available_hosts: usize,
+    can_resize_hosts: bool,
+) -> anyhow::Result<Exit> {
+    if programs.is_empty() {
+        bail!("the local program catalog is empty");
+    }
+    let (mut terminal, _restore) = crate::terminal::enter()?;
+    let mut events = EventStream::new();
+    let mut state = State::new(programs, executions, available_hosts, can_resize_hosts);
+    loop {
+        let area = terminal.size().context("read workspace terminal size")?;
+        if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+            return Err(anyhow!(
+                "terminal is too small for the workspace (minimum {MIN_WIDTH}x{MIN_HEIGHT})"
+            ));
+        }
+        terminal
+            .draw(|frame| render(frame, &state))
+            .context("draw arena0 workspace")?;
+        let event = events
+            .next()
+            .await
+            .ok_or_else(|| anyhow!("terminal event stream closed"))??;
+        if let Event::Key(key) = event
+            && let Some(exit) = state.on_key(key)
+        {
+            return exit;
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Mode {
+    Browse,
+    EditParams { draft: String },
+    Help,
+}
+
+#[derive(Debug)]
+struct State {
+    programs: Vec<ProgramDetail>,
+    executions: Vec<ExecStatus>,
+    selected: usize,
+    participants: usize,
+    human_control: HumanControl,
+    replay: bool,
+    params: HashMap<ProgramHash, String>,
+    available_hosts: usize,
+    can_resize_hosts: bool,
+    mode: Mode,
+    error: Option<String>,
+    palette: TuiPalette,
+}
+
+impl State {
+    fn new(
+        programs: Vec<ProgramDetail>,
+        executions: Vec<ExecStatus>,
+        available_hosts: usize,
+        can_resize_hosts: bool,
+    ) -> Self {
+        let participants = initial_participants(&programs[0], available_hosts, can_resize_hosts);
+        Self {
+            programs,
+            executions,
+            selected: 0,
+            participants,
+            human_control: HumanControl::OneHost {
+                host: HostName::for_local_index(0),
+            },
+            replay: true,
+            params: HashMap::new(),
+            available_hosts,
+            can_resize_hosts,
+            mode: Mode::Browse,
+            error: None,
+            palette: TuiPalette::detect(),
+        }
+    }
+
+    fn program(&self) -> &ProgramDetail {
+        &self.programs[self.selected]
+    }
+
+    fn on_key(&mut self, key: KeyEvent) -> Option<anyhow::Result<Exit>> {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return None;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return Some(Ok(Exit::Quit));
+        }
+        match &mut self.mode {
+            Mode::EditParams { draft } => match key.code {
+                KeyCode::Esc => {
+                    self.mode = Mode::Browse;
+                    self.error = None;
+                    None
+                }
+                KeyCode::Enter => {
+                    let draft = draft.clone();
+                    let validation = validate_params(self.program(), &draft);
+                    match validation {
+                        Ok(_) => {
+                            self.params
+                                .insert(self.program().summary.program_hash, draft);
+                            self.mode = Mode::Browse;
+                            self.error = None;
+                        }
+                        Err(error) => self.error = Some(error.to_string()),
+                    }
+                    None
+                }
+                KeyCode::Backspace => {
+                    draft.pop();
+                    None
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    draft.push(character);
+                    None
+                }
+                _ => None,
+            },
+            Mode::Help => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
+                    self.mode = Mode::Browse;
+                }
+                None
+            }
+            Mode::Browse => match key.code {
+                KeyCode::Char('q') => Some(Ok(Exit::Quit)),
+                KeyCode::Char('?') => {
+                    self.mode = Mode::Help;
+                    None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if self.selected > 0 {
+                        self.selected -= 1;
+                        self.program_changed();
+                    }
+                    None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.selected + 1 < self.programs.len() {
+                        self.selected += 1;
+                        self.program_changed();
+                    }
+                    None
+                }
+                KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Right => {
+                    self.adjust_participants(1);
+                    None
+                }
+                KeyCode::Char('-') | KeyCode::Left => {
+                    self.adjust_participants(-1);
+                    None
+                }
+                KeyCode::Char('h') => {
+                    self.select_next_human_host();
+                    self.error = None;
+                    None
+                }
+                KeyCode::Char('c') => {
+                    self.human_control = match &self.human_control {
+                        HumanControl::OneHost { .. } => HumanControl::AllHosts,
+                        HumanControl::AllHosts => HumanControl::OneHost {
+                            host: HostName::for_local_index(0),
+                        },
+                    };
+                    self.error = None;
+                    None
+                }
+                KeyCode::Char('r') => {
+                    self.replay = !self.replay;
+                    self.error = None;
+                    None
+                }
+                KeyCode::Char('p') => {
+                    let draft = self.params_text().into_owned();
+                    self.mode = Mode::EditParams { draft };
+                    self.error = None;
+                    None
+                }
+                KeyCode::Enter => match self.launch() {
+                    Ok(launch) => Some(Ok(Exit::Launch(launch))),
+                    Err(error) => {
+                        let draft = self.params_text().into_owned();
+                        self.mode = Mode::EditParams { draft };
+                        self.error = Some(error.to_string());
+                        None
+                    }
+                },
+                _ => None,
+            },
+        }
+    }
+
+    fn program_changed(&mut self) {
+        self.participants =
+            initial_participants(self.program(), self.available_hosts, self.can_resize_hosts);
+        self.clamp_human_host();
+        self.error = None;
+    }
+
+    fn adjust_participants(&mut self, delta: i8) {
+        if !self.can_resize_hosts {
+            self.error = Some(format!(
+                "the existing service owns {} Hosts; quit and stop it before changing the local Ensemble",
+                self.available_hosts
+            ));
+            return;
+        }
+        let (min, max) = self.program().summary.participants.bounds();
+        let next = if delta > 0 {
+            self.participants.saturating_add(1)
+        } else {
+            self.participants.saturating_sub(1)
+        };
+        self.participants = next.clamp(usize::from(min), usize::from(max));
+        self.clamp_human_host();
+        self.error = None;
+    }
+
+    fn select_next_human_host(&mut self) {
+        let HumanControl::OneHost { host } = &self.human_control else {
+            return;
+        };
+        let current = (0..self.participants)
+            .position(|index| HostName::for_local_index(index) == *host)
+            .unwrap_or(0);
+        self.human_control = HumanControl::OneHost {
+            host: HostName::for_local_index((current + 1) % self.participants.max(1)),
+        };
+    }
+
+    fn clamp_human_host(&mut self) {
+        let HumanControl::OneHost { host } = &self.human_control else {
+            return;
+        };
+        if !(0..self.participants).any(|index| HostName::for_local_index(index) == *host) {
+            self.human_control = HumanControl::OneHost {
+                host: HostName::for_local_index(self.participants.saturating_sub(1)),
+            };
+        }
+    }
+
+    fn params_text(&self) -> Cow<'_, str> {
+        self.params
+            .get(&self.program().summary.program_hash)
+            .map_or_else(
+                || Cow::Owned(default_params(self.program(), self.participants)),
+                |params| Cow::Borrowed(params.as_str()),
+            )
+    }
+
+    fn validate_params(&self, input: &str) -> anyhow::Result<Option<Value>> {
+        validate_params(self.program(), input)
+    }
+
+    fn launch(&mut self) -> anyhow::Result<Launch> {
+        let program = self.program();
+        let participants = u16::try_from(self.participants).context("too many local Hosts")?;
+        if !program.summary.participants.accepts(participants) {
+            bail!(
+                "{} requires {} participants; the current service provides {} Hosts",
+                program.summary.display_name,
+                program.summary.participants,
+                self.participants
+            );
+        }
+        let params_text = self.params_text();
+        let params = self.validate_params(params_text.as_ref())?;
+        Ok(Launch {
+            program: program.summary.name.clone(),
+            participants: self.participants,
+            human_control: self.human_control.clone(),
+            params,
+            replay: self.replay,
+        })
+    }
+}
+
+fn render(frame: &mut Frame<'_>, state: &State) {
+    let area = frame.area();
+    let footer_height = if area.width >= 104 { 3 } else { 4 };
+    let show_error = state.error.is_some() && !matches!(state.mode, Mode::EditParams { .. });
+    let (main, error, footer) = if show_error {
+        let [main, error, footer] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(10),
+                Constraint::Length(3),
+                Constraint::Length(footer_height),
+            ])
+            .areas(area);
+        (main, error, footer)
+    } else {
+        let [main, footer] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(10), Constraint::Length(footer_height)])
+            .areas(area);
+        (main, Rect::default(), footer)
+    };
+    if area.width >= WIDE_WIDTH {
+        let [left, setup] = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(43), Constraint::Percentage(57)])
+            .areas(main);
+        let [splash, catalog] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(splash_height(left.width)),
+                Constraint::Min(7),
+            ])
+            .areas(left);
+        render_splash(frame, state, splash);
+        render_catalog(frame, state, catalog);
+        render_setup(frame, state, setup);
+    } else {
+        let catalog_height = u16::try_from(state.programs.len().saturating_add(2))
+            .unwrap_or(10)
+            .min(10);
+        let [splash, catalog, setup] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(splash_height(main.width)),
+                Constraint::Length(catalog_height),
+                Constraint::Min(8),
+            ])
+            .areas(main);
+        render_splash(frame, state, splash);
+        render_catalog(frame, state, catalog);
+        render_setup(frame, state, setup);
+    }
+    if show_error && let Some(message) = &state.error {
+        frame.render_widget(
+            Paragraph::new(message.as_str())
+                .style(state.palette.error())
+                .block(panel(" ERROR ", state.palette.error(), state)),
+            error,
+        );
+    }
+    let keys = if footer.width >= 104 {
+        vec![Line::raw(
+            "↑↓ select    +/- Hosts    c control    h Host    p params    r replay    Enter run    ? help    q quit",
+        )]
+    } else {
+        vec![
+            Line::raw("↑↓ select    +/- Hosts    c control    h Host"),
+            Line::raw("p params    r replay    Enter run    ? help    q quit"),
+        ]
+    };
+    frame.render_widget(
+        Paragraph::new(keys)
+            .style(state.palette.muted())
+            .block(panel(" COMMANDS ", state.palette.muted(), state)),
+        footer,
+    );
+    match &state.mode {
+        Mode::EditParams { draft } => render_params_editor(frame, state, draft),
+        Mode::Help => render_help(frame, state),
+        Mode::Browse => {}
+    }
+}
+
+const fn splash_height(width: u16) -> u16 {
+    if width >= 62 { 11 } else { 12 }
+}
+
+fn render_splash(frame: &mut Frame<'_>, state: &State, area: Rect) {
+    let capability_height = if area.width >= 62 { 1 } else { 2 };
+    let [logo_row, _, subtitle, _, capabilities, _] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(capability_height),
+            Constraint::Length(2),
+        ])
+        .areas(area);
+    let logo_width = SPLASH_LOGO_WIDTH.min(logo_row.width);
+    let logo = Rect::new(
+        logo_row
+            .x
+            .saturating_add(logo_row.width.saturating_sub(logo_width) / 2),
+        logo_row.y,
+        logo_width,
+        logo_row.height,
+    );
+    let color = state.palette.strong().fg.unwrap_or(Color::Reset);
+    frame.render_widget(
+        Canvas::default()
+            .marker(Marker::Braille)
+            .x_bounds([0.0, 108.0])
+            .y_bounds([0.0, 20.0])
+            .paint(move |context| {
+                for [x1, y1, x2, y2] in LOGO_SEGMENTS {
+                    context.draw(&CanvasLine::new(x1, y1, x2, y2, color));
+                }
+            }),
+        logo,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "verifiable co-execution for agents",
+            state.palette.emphasis(),
+        ))
+        .alignment(Alignment::Center),
+        subtitle,
+    );
+    let mut lines = Vec::new();
+    if area.width >= 62 {
+        lines.push(Line::styled(
+            "Wasm, p2p, state machines, cryptographic receipts",
+            state.palette.public(),
+        ));
+    } else {
+        lines.push(Line::styled(
+            "Wasm, p2p, state machines,",
+            state.palette.public(),
+        ));
+        lines.push(Line::styled(
+            "cryptographic receipts",
+            state.palette.public(),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center),
+        capabilities,
+    );
+}
+
+fn render_catalog(frame: &mut Frame<'_>, state: &State, area: Rect) {
+    let title = format!(" PROGRAMS  {} AVAILABLE ", state.programs.len());
+    let block = panel(&title, state.palette.strong(), state);
+    let body = block.inner(area);
+    let lines = state
+        .programs
+        .iter()
+        .enumerate()
+        .map(|(index, detail)| {
+            let selected = index == state.selected;
+            let marker = if selected { "▸" } else { " " };
+            let name_width = usize::from(body.width).saturating_sub(2);
+            let name = truncate(&detail.summary.display_name, name_width);
+            Line::from(vec![
+                Span::styled(format!("{marker} "), selected_style(state, selected)),
+                Span::styled(name, selected_style(state, selected)),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn render_setup(frame: &mut Frame<'_>, state: &State, area: Rect) {
+    let program = state.program();
+    let control_label = match state.human_control {
+        HumanControl::OneHost { .. } => "[●] One Host    [ ] All Hosts",
+        HumanControl::AllHosts => "[ ] One Host    [●] All Hosts",
+    };
+    let mut lines = vec![
+        Line::styled(
+            format!(
+                "{} Hosts ready    {} known executions",
+                state.available_hosts,
+                state.executions.len()
+            ),
+            state.palette.muted(),
+        ),
+        Line::default(),
+        Line::styled(
+            program.summary.display_name.clone(),
+            state.palette.emphasis(),
+        ),
+        Line::styled(program.summary.description.clone(), Style::default()),
+        Line::default(),
+        labeled(state, "Version", program.summary.version.clone()),
+        labeled(
+            state,
+            "Participants",
+            program.summary.participants.to_string(),
+        ),
+        Line::default(),
+        labeled(state, "Hosts", state.participants.to_string()),
+        Line::default(),
+        Line::styled("HUMAN CONTROL", state.palette.emphasis()),
+        Line::styled(control_label, state.palette.strong()),
+        Line::default(),
+        Line::from(vec![
+            Span::styled(format!("{:<14}", "HOST"), state.palette.muted()),
+            Span::styled("INPUT DRIVER", state.palette.muted()),
+        ]),
+    ];
+    for index in 0..state.participants {
+        let host = HostName::for_local_index(index);
+        let driver = match &state.human_control {
+            HumanControl::AllHosts => "YOU ANSWER",
+            HumanControl::OneHost { host: human } if *human == host => "YOU ANSWER",
+            HumanControl::OneHost { .. } => "BUILTIN sample",
+        };
+        lines.push(labeled(state, &format!("  {host}"), driver.to_owned()));
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        match &state.human_control {
+            HumanControl::OneHost { host } => {
+                format!("You answer {host}. Other Hosts use the sample policy.")
+            }
+            HumanControl::AllHosts => {
+                "You answer each Host independently. Concurrent requests are queued.".to_owned()
+            }
+        },
+        state.palette.muted(),
+    ));
+    lines.extend([
+        labeled(state, "Parameters", state.params_text().into_owned()),
+        labeled(
+            state,
+            "Verification",
+            if state.replay { "full replay" } else { "light" }.to_owned(),
+        ),
+    ]);
+    if !state.executions.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::styled("Recent executions", state.palette.emphasis()));
+        for execution in state.executions.iter().rev().take(3) {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{}  ", execution.exec_id.fmt_short()),
+                    state.palette.muted(),
+                ),
+                Span::raw(format!("{:?}", execution.lifecycle()).to_lowercase()),
+            ]));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(panel(" RUN SETUP ", state.palette.emphasis(), state)),
+        area,
+    );
+}
+
+fn render_params_editor(frame: &mut Frame<'_>, state: &State, draft: &str) {
+    let area = centered(
+        frame.area(),
+        82,
+        if state.error.is_some() { 16 } else { 15 },
+    );
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .title(Span::styled(" PARAMETERS  JSON ", state.palette.strong()))
+        .border_style(state.palette.strong());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [schema, input, error, hint] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(u16::from(state.error.is_some())),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
+    frame.render_widget(
+        Paragraph::new(crate::ui::compact_json(
+            state.program().schema.params.as_value(),
+        ))
+        .style(state.palette.muted())
+        .wrap(Wrap { trim: false }),
+        schema,
+    );
+    let available = input.width.saturating_sub(2);
+    let width = u16::try_from(crate::ui::display_width(draft)).unwrap_or(u16::MAX);
+    let horizontal = width.saturating_sub(available);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("› ", state.palette.strong()),
+            Span::raw(draft.to_owned()),
+        ]))
+        .scroll((0, horizontal)),
+        input,
+    );
+    let cursor_x = input
+        .x
+        .saturating_add(2)
+        .saturating_add(width.saturating_sub(horizontal))
+        .min(input.x.saturating_add(input.width.saturating_sub(1)));
+    frame.set_cursor_position((cursor_x, input.y));
+    if let Some(message) = &state.error {
+        frame.render_widget(
+            Paragraph::new(message.as_str()).style(state.palette.error()),
+            error,
+        );
+    }
+    frame.render_widget(
+        Paragraph::new("Enter apply    Esc cancel").style(state.palette.muted()),
+        hint,
+    );
+}
+
+fn render_help(frame: &mut Frame<'_>, state: &State) {
+    let area = centered(frame.area(), 68, 15);
+    frame.render_widget(Clear, area);
+    let lines = [
+        ("↑/↓ or j/k", "Select a program"),
+        ("+/-", "Change the exact local Host count"),
+        ("c", "Toggle One Host or All Hosts human control"),
+        ("h", "Select the human-controlled Host in One Host mode"),
+        ("p", "Edit program parameters as JSON"),
+        ("r", "Toggle light verification or full replay"),
+        ("Enter", "Launch the selected program"),
+        ("q / Ctrl-C", "Quit and stop an owned local service"),
+        ("? / Esc", "Close help"),
+    ]
+    .into_iter()
+    .map(|(key, description)| {
+        Line::from(vec![
+            Span::styled(format!("{key:<18}"), state.palette.strong()),
+            Span::raw(description),
+        ])
+    })
+    .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_set(border::ROUNDED)
+                .title(Span::styled(" HELP ", state.palette.strong()))
+                .border_style(state.palette.strong()),
+        ),
+        area,
+    );
+}
+
+fn labeled(state: &State, label: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<14}"), state.palette.muted()),
+        Span::raw(value),
+    ])
+}
+
+fn panel<'a>(title: &'a str, title_style: Style, state: &State) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(state.palette.muted())
+        .title(Span::styled(title, title_style))
+}
+
+fn selected_style(state: &State, selected: bool) -> Style {
+    if !selected {
+        Style::default()
+    } else {
+        state.palette.strong()
+    }
+}
+
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width.saturating_sub(2));
+    let height = height.min(area.height.saturating_sub(2));
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+fn initial_participants(
+    program: &ProgramDetail,
+    available_hosts: usize,
+    can_resize_hosts: bool,
+) -> usize {
+    if can_resize_hosts {
+        usize::from(program.summary.participants.bounds().0)
+    } else {
+        available_hosts
+    }
+}
+
+fn default_params(program: &ProgramDetail, participants: usize) -> String {
+    let schema = program.schema.params.as_value();
+    match jsonschema::validator_for(schema) {
+        Ok(validator) if validator.is_valid(&Value::Null) => return "null".to_owned(),
+        _ => {}
+    }
+    let mut params = serde_json::Map::new();
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        for (name, property) in properties {
+            if let Some(default) = property.get("default") {
+                params.insert(name.clone(), default.clone());
+            }
+        }
+    }
+    let target_size_is_required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|required| required.iter().any(|name| name == "target_size"));
+    if target_size_is_required {
+        params.insert("target_size".to_owned(), Value::from(participants));
+    }
+    Value::Object(params).to_string()
+}
+
+fn validate_params(program: &ProgramDetail, input: &str) -> anyhow::Result<Option<Value>> {
+    let value: Value = serde_json::from_str(input).context("parameters must be valid JSON")?;
+    let validator = jsonschema::validator_for(program.schema.params.as_value())
+        .context("invalid program parameter schema")?;
+    if let Err(error) = validator.validate(&value) {
+        let path = error.instance_path().as_str();
+        let path = if path.is_empty() { "$" } else { path };
+        bail!("{path}: {error}");
+    }
+    Ok((value != Value::Null).then_some(value))
+}
+
+fn truncate(text: &str, max_width: usize) -> String {
+    if crate::ui::display_width(text) <= max_width {
+        return text.to_owned();
+    }
+    if max_width <= 1 {
+        return "…".chars().take(max_width).collect();
+    }
+    let mut width = 0usize;
+    let mut truncated = String::new();
+    for character in text.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if width.saturating_add(character_width) >= max_width {
+            break;
+        }
+        width += character_width;
+        truncated.push(character);
+    }
+    truncated.push('…');
+    truncated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn program(participants: Value) -> ProgramDetail {
+        program_with_params(
+            participants,
+            serde_json::json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "null"
+            }),
+        )
+    }
+
+    fn program_with_params(participants: Value, params: Value) -> ProgramDetail {
+        let unit = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "null"
+        });
+        serde_json::from_value(serde_json::json!({
+            "summary": {
+                "program_hash": "0101010101010101010101010101010101010101010101010101010101010101",
+                "name": "test",
+                "display_name": "Test",
+                "version": "1.0.0",
+                "description": "Test program",
+                "participants": participants
+            },
+            "schema": {
+                "state": { "schema": unit, "max_bytes": 0 },
+                "callouts": [],
+                "messages": [],
+                "params": params,
+                "queries": [],
+                "outcome": unit
+            }
+        }))
+        .expect("program detail fixture")
+    }
+
+    #[test]
+    fn launch_state_keeps_participant_bounds_and_clamps_one_human_host() {
+        let mut state = State::new(
+            vec![program(
+                serde_json::json!({"kind": "range", "min": 2, "max": 4}),
+            )],
+            Vec::new(),
+            2,
+            true,
+        );
+        state.adjust_participants(1);
+        state.adjust_participants(1);
+        state.adjust_participants(1);
+        assert_eq!(state.participants, 4);
+        state.human_control = HumanControl::OneHost {
+            host: HostName::for_local_index(3),
+        };
+        state.adjust_participants(-1);
+        assert_eq!(state.participants, 3);
+        assert_eq!(
+            state.human_control,
+            HumanControl::OneHost {
+                host: HostName::for_local_index(2)
+            }
+        );
+        assert!(state.launch().is_ok());
+    }
+
+    #[test]
+    fn all_hosts_control_survives_participant_changes() {
+        let mut state = State::new(
+            vec![program(
+                serde_json::json!({"kind": "range", "min": 2, "max": 4}),
+            )],
+            Vec::new(),
+            2,
+            true,
+        );
+        state.human_control = HumanControl::AllHosts;
+
+        state.adjust_participants(1);
+
+        assert_eq!(state.human_control, HumanControl::AllHosts);
+        assert_eq!(
+            state.launch().unwrap().human_control,
+            HumanControl::AllHosts
+        );
+    }
+
+    #[test]
+    fn invalid_launch_parameters_keep_the_workspace_open_for_correction() {
+        let mut state = State::new(
+            vec![program_with_params(
+                serde_json::json!({"kind": "exact", "count": 2}),
+                serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {"item": {"type": "string"}},
+                    "required": ["item"]
+                }),
+            )],
+            Vec::new(),
+            2,
+            true,
+        );
+
+        let exit = state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(exit.is_none());
+        assert!(matches!(state.mode, Mode::EditParams { .. }));
+        assert!(
+            state
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("item"))
+        );
+
+        state.params.insert(
+            state.program().summary.program_hash,
+            serde_json::json!({"item": "rare book"}).to_string(),
+        );
+        state.mode = Mode::Browse;
+        let exit = state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(exit, Some(Ok(Exit::Launch(_)))));
+    }
+
+    #[test]
+    fn default_parameters_follow_schema_defaults_and_selected_host_count() {
+        let program = program_with_params(
+            serde_json::json!({"kind": "range", "min": 2, "max": 4}),
+            serde_json::json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "target_size": {"type": "integer"},
+                    "rounds": {"type": "integer", "default": 3}
+                },
+                "required": ["target_size", "rounds"]
+            }),
+        );
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&default_params(&program, 4)).unwrap(),
+            serde_json::json!({"target_size": 4, "rounds": 3})
+        );
+    }
+}

@@ -1,0 +1,22 @@
+[package]
+name = "arena0-program"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Program artifacts, guest ABI contracts, schemas, and execution profiles for arena0"
+publish = true
+
+[dependencies]
+arena0-crypto = { path = "../arena0-crypto", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+borsh.workspace = true
+schemars.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+blake3.workspace = true
+valuable.workspace = true
+
+[lints]
+workspace = true

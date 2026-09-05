@@ -1,0 +1,6 @@
+[build]
+# Required by tracing's `valuable` field recording. This affects host tracing
+# support only. The `arena0-protocol/system-events` feature remains disabled in
+# guest builds.
+rustflags = ["--cfg", "tracing_unstable"]
+rustdocflags = ["--cfg", "tracing_unstable"]

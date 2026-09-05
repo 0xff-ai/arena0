@@ -1,0 +1,28 @@
+[package]
+name = "arena0d"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "arena0 local Host ensemble daemon"
+publish.workspace = true
+
+[[bin]]
+name = "arena0d"
+path = "src/main.rs"
+
+[dependencies]
+arena0-daemon = { path = "../arena0-daemon" }
+arena0-home = { path = "../arena0-home" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+arena0-client = { path = "../arena0-client" }
+libc = "0.2"
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

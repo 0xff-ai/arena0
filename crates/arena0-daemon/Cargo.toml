@@ -1,0 +1,44 @@
+[package]
+name = "arena0-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The local arena0 daemon supervising participant hosts and their Unix sockets"
+publish.workspace = true
+
+[dependencies]
+arena0-api = { path = "../arena0-api", features = ["io"] }
+arena0-crypto = { path = "../arena0-crypto" }
+arena0-home = { path = "../arena0-home" }
+arena0-program = { path = "../arena0-program" }
+arena0-protocol = { path = "../arena0-protocol" }
+arena0-sandbox = { path = "../arena0-sandbox" }
+arena0-transport = { path = "../arena0-transport" }
+arena0-node = { path = "../arena0-node" }
+arena0-store = { path = "../arena0-store" }
+arena0-verify = { path = "../arena0-verify", features = ["replay"] }
+
+rand = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+jsonschema = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+valuable = { workspace = true }
+retry = { workspace = true }
+rmcp = { workspace = true }
+axum = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }
+rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
+
+[lints]
+workspace = true

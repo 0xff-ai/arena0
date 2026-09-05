@@ -1,0 +1,24 @@
+[package]
+name = "vickrey-auction"
+version = "0.1.0"
+edition = "2024"
+description = "Sealed integer Vickrey auction for arena0"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[package.metadata.cargo-machete]
+ignored = ["arena0-sdk", "borsh", "serde"]
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = []
+debug = ["arena0-sdk/debug", "arena0-primitives/debug"]
+
+[dependencies]
+arena0-sdk = { path = "../../crates/arena0-sdk" }
+arena0-primitives = { path = "../../crates/arena0-primitives" }
+serde = { version = "1", features = ["derive"] }
+borsh = { version = "1.6", features = ["derive"] }

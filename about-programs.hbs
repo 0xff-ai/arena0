@@ -1,0 +1,18 @@
+Embedded program third-party software licenses
+================================================
+
+This file lists the licenses selected for Rust dependencies linked into the
+sample Wasm programs embedded in the prebuilt arena0 binary.
+
+{{#each licenses}}
+--------------------------------------------------------------------------------
+{{{name}}} ({{id}})
+
+Used by:
+{{#each used_by}}
+- {{{crate.name}}} {{crate.version}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

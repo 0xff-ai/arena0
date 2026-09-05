@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A new push to a branch cancels the superseded run instead of paying for both.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Incremental artifacts only bloat the CI cache; they never get reused across runs.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # One job, not three. Wasmtime dominates compile time, so the win is
+  # building the dependency graph once and reusing the warm target dir across
+  # fmt -> clippy -> build -> test. Splitting into parallel jobs would recompile
+  # those heavy deps in each job's cold cache: more total compute, not less.
+  # Steps are ordered fast-fail: formatting and clippy run before the test phase.
+  check:
+    name: fmt + clippy + test
+    runs-on: [self-hosted, Linux, X64, raptor]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # rust-toolchain.toml is the source of truth: it pins the channel, clippy,
+      # rustfmt, and the wasm32 target. `rustup show` installs exactly that set.
+      - name: Install toolchain
+        run: rustup show
+
+      - name: Install nextest
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        with:
+          tool: nextest@0.9.143
+
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          # programs/ is a separate workspace excluded from the root, with its
+          # own target dir; cache both.
+          workspaces: |
+            . -> target
+            programs -> programs/target
+          # Persist the cache even when a later step fails. Without this, a run
+          # that builds the heavy Wasmtime dependency graph but then
+          # trips on a test recompiles everything cold next time.
+          cache-on-failure: true
+          # Self-hosted runners have persistent ~/.cargo/bin; the save-time
+          # cleanup would delete pre-existing binaries (rustup, cargo) there.
+          cache-bin: false
+
+      - name: Format
+        run: |
+          cargo fmt --all --check
+          cargo fmt --manifest-path programs/Cargo.toml --all --check
+
+      - name: Check dependencies
+        run: |
+          ./scripts/check-deps.sh
+          cargo test --locked -p arena0-sandbox --test engine_version
+
+      # cargo-arena0 builds the guest Wasm and embeds the arena0.metadata
+      # section before Clippy so the daemon build has its required inputs.
+      - name: Build programs (wasm32)
+        run: cd programs && cargo run --manifest-path ../Cargo.toml -p cargo-arena0 -- build
+
+      # Clippy runs at the project's chosen warn level (see [workspace.lints] in
+      # Cargo.toml), not -D warnings. The step still fails on deny-by-default
+      # correctness lints and compile errors.
+      - name: Clippy
+        run: |
+          cargo clippy --locked --workspace --all-targets
+          cargo clippy --locked --manifest-path programs/Cargo.toml --all-targets
+
+      - name: Documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --workspace --no-deps --all-features --lib
+
+      - name: Test (host workspace)
+        # The integration suites each boot several daemon/node processes; the
+        # nextest `integration` test group (see .config/nextest.toml) runs them
+        # a few at a time so the 24-core raptor runner isn't oversubscribed and
+        # the timing windows don't blow. Unit tests run in parallel.
+        run: cargo nextest run --locked --workspace --profile ci
+
+      # programs/ is excluded from the root workspace; run its in-process unit
+      # tests separately.
+      - name: Test (programs)
+        run: cargo nextest run --locked --manifest-path programs/Cargo.toml --profile ci

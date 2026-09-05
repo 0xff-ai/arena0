@@ -1,0 +1,21 @@
+# nextest configuration. Docs: https://nexte.st/docs/configuration/
+
+[profile.default]
+# Abort a test that runs longer than 60s without completing, so a hang in an
+# integration test fails the run instead of stalling it.
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+# The integration suites each boot several daemon/node processes; a handful can
+# run at once on the 24-core raptor runner before the timing windows start to
+# blow (tuned on a 2-core hosted runner with max-threads = 1). Unit tests stay
+# fully parallel.
+[test-groups]
+integration = { max-threads = 4 }
+
+[[profile.default.overrides]]
+filter = 'kind(test)'
+test-group = 'integration'
+
+# CI runs show every failure instead of stopping at the first one.
+[profile.ci]
+fail-fast = false

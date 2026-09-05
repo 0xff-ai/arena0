@@ -1,0 +1,23 @@
+[package]
+name = "cargo-arena0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Build an arena0 program and embed its metadata section (`cargo arena0 build`)"
+publish.workspace = true
+keywords = ["wasm", "arena0", "cargo-plugin"]
+categories = ["command-line-utilities", "development-tools::build-utils"]
+
+[[bin]]
+name = "cargo-arena0"
+path = "src/main.rs"
+
+[dependencies]
+arena0-sandbox = { path = "../arena0-sandbox" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

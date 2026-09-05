@@ -1,0 +1,34 @@
+[package]
+name = "arena0-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic Wasmtime sandbox for arena0 programs with capability gating and fuel metering"
+publish.workspace = true
+keywords = ["wasm", "sandbox", "deterministic", "wasmtime"]
+categories = ["wasm"]
+
+[dependencies]
+arena0-crypto = { path = "../arena0-crypto" }
+arena0-program = { path = "../arena0-program" }
+arena0-protocol = { path = "../arena0-protocol" }
+wasmtime = { workspace = true }
+wasmparser = { workspace = true }
+moka = { workspace = true }
+borsh = { workspace = true }
+jsonschema = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+wat = { workspace = true }
+wasmtime = { workspace = true, features = ["wat"] }
+tracing-subscriber = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

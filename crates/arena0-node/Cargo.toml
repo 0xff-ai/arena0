@@ -1,0 +1,31 @@
+[package]
+name = "arena0-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Host negotiation and durable execution actors for arena0"
+publish.workspace = true
+
+[dependencies]
+arena0-crypto = { path = "../arena0-crypto" }
+arena0-program = { path = "../arena0-program" }
+arena0-protocol = { path = "../arena0-protocol" }
+arena0-sandbox = { path = "../arena0-sandbox" }
+arena0-store = { path = "../arena0-store" }
+arena0-transport = { path = "../arena0-transport" }
+arena0-wire = { path = "../arena0-wire" }
+
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }
+wat = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,37 @@
+#!/bin/sh
+set -eu
+
+# Git supplies the resolved destination URL, even when pushing through an alias.
+destination=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
+destination=${destination%/}
+destination=${destination%.git}
+protected=false
+case "$destination" in
+    *github.com:0xff-ai/arena0|*github.com/0xff-ai/arena0|*github.com:*/0xff-ai/arena0)
+        protected=true ;;
+esac
+if [ "$1" = origin ]; then
+    protected=true
+fi
+
+# Save stdin so any previously installed hook receives the same ref updates.
+updates=$(mktemp)
+trap 'rm -f "$updates"' EXIT
+trap 'exit 1' HUP INT TERM
+cat > "$updates"
+if [ "$protected" = true ]; then
+    while read -r local_ref local_oid remote_ref remote_oid; do
+        # Deleting a remote ref cannot publish history.
+        case "$local_oid" in *[!0]*) ;; *) continue ;; esac
+        case "$local_ref:$remote_ref" in
+            refs/heads/archive/*:*|archive/*:*|*:refs/heads/archive/*)
+                printf >&2 'Blocked: archive branches must be pushed to history (0xff-ai/arena0-history), not %s.\n' "$2"
+                exit 1 ;;
+        esac
+    done < "$updates"
+fi
+
+previous=$(dirname "$0")/pre-push.previous
+if [ -x "$previous" ]; then
+    "$previous" "$@" < "$updates"
+fi

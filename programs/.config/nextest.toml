@@ -1,0 +1,8 @@
+# nextest configuration for the programs workspace (the wasm sandbox test
+# tier). The root workspace's .config/nextest.toml does not apply here, so this
+# mirrors the CI profile: run all tests even after failures, and abort hangs.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[profile.ci]
+fail-fast = false

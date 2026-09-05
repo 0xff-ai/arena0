@@ -1,0 +1,292 @@
+name: Release
+
+# Build the three public executables for each target, publish the guest-author
+# Rust crates in dependency order, and publish the npm packages: one platform
+# package per target (`@0xff-ai/arena0-<target>`) plus the main `@0xff-ai/arena0`
+# meta-package whose launcher resolves the right one. Triggered by a `v*` tag,
+# or manually (set `publish: true` to actually publish).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish; must match Cargo.toml (defaults to tag or workspace)'
+        required: false
+      publish:
+        description: 'Publish Rust crates and npm packages (otherwise build only)'
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # The gate compiles clippy + doc + tests into one target dir like the CI
+  # check job; keep the dev profile lean enough for the hosted runner disk.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: release gate
+    runs-on: [self-hosted, Linux, X64, raptor]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install toolchain
+        run: rustup show
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Install cargo-about
+        run: cargo install cargo-about --version 0.9.0 --locked --features cli
+
+      - name: Install nextest
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        with:
+          tool: nextest@0.9.143
+
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          workspaces: |
+            . -> target
+            programs -> programs/target
+          cache-on-failure: true
+          # Self-hosted runners have persistent ~/.cargo/bin; the save-time
+          # cleanup would delete pre-existing binaries (rustup, cargo) there.
+          cache-bin: false
+
+      - name: Format
+        run: |
+          cargo fmt --all --check
+          cargo fmt --manifest-path programs/Cargo.toml --all --check
+
+      - name: Check dependencies
+        run: |
+          ./scripts/check-deps.sh
+          cargo test --locked -p arena0-sandbox --test engine_version
+
+      # The daemon build script requires all seven metadata-bearing guest Wasm
+      # blobs, including when Clippy builds every workspace target.
+      - name: Build programs (wasm32)
+        run: cd programs && cargo run --manifest-path ../Cargo.toml -p cargo-arena0 -- build
+
+      - name: Clippy
+        run: |
+          cargo clippy --locked --workspace --all-targets
+          cargo clippy --locked --manifest-path programs/Cargo.toml --all-targets
+
+      - name: Dependency advisory audit
+        run: |
+          cargo audit --file Cargo.lock
+          cargo audit --file programs/Cargo.lock
+
+      - name: Dependency license notices
+        run: ./scripts/check-licenses.sh
+
+      - name: Documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --workspace --no-deps --all-features --lib
+
+      - name: Test
+        run: |
+          cargo nextest run --locked --workspace --profile ci
+          cargo nextest run --locked --manifest-path programs/Cargo.toml --profile ci
+
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            os: macos-14
+            release_dir: target/optimized-release
+          - target: linux-x64
+            os: ubuntu-22.04
+            release_dir: target/optimized-release
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # rust-toolchain.toml pins the channel and the wasm32 target the programs
+      # need; the host target is the runner's native one.
+      - name: Install toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          workspaces: |
+            . -> target
+            programs -> programs/target
+          cache-on-failure: true
+          # Self-hosted runners have persistent ~/.cargo/bin; the save-time
+          # cleanup would delete pre-existing binaries (rustup, cargo) there.
+          cache-bin: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+
+      # cargo-arena0 builds the guest Wasm and embeds the metadata section that
+      # the daemon's build script packages into the shipped binary.
+      - name: Build programs (wasm32)
+        run: cd programs && cargo run --manifest-path ../Cargo.toml -p cargo-arena0 -- build
+
+      - name: Build public executables
+        run: cargo build --locked --profile optimized-release \
+          -p arena0-cli -p arena0d -p cargo-arena0
+
+      - name: Check executable versions
+        run: |
+          "${{ matrix.release_dir }}/arena0" --version
+          "${{ matrix.release_dir }}/arena0d" --version
+          "${{ matrix.release_dir }}/cargo-arena0" --version
+
+      - name: Check Linux compatibility baseline
+        if: matrix.target == 'linux-x64'
+        run: ./scripts/check-linux-artifacts.sh "${{ matrix.release_dir }}"
+
+      - name: Stage executables
+        run: |
+          mkdir -p "dist/${{ matrix.target }}"
+          cp "${{ matrix.release_dir }}/arena0" "dist/${{ matrix.target }}/arena0"
+          cp "${{ matrix.release_dir }}/arena0d" "dist/${{ matrix.target }}/arena0d"
+          cp "${{ matrix.release_dir }}/cargo-arena0" "dist/${{ matrix.target }}/cargo-arena0"
+
+      - name: Checksum executables
+        run: |
+          set -euo pipefail
+          for binary in arena0 arena0d cargo-arena0; do
+            if command -v sha256sum >/dev/null 2>&1; then
+              (cd "dist/${{ matrix.target }}" && sha256sum "$binary" >"${binary}.sha256")
+            else
+              (cd "dist/${{ matrix.target }}" && shasum -a 256 "$binary" >"${binary}.sha256")
+            fi
+          done
+
+      # This runner owns the target-native binaries, so the packed artifact
+      # smoke can execute the installed commands without claiming cross-target
+      # support. The script also exercises the packaged SDK path.
+      - name: Test packed release candidate
+        env:
+          ARENA0_RELEASE_DIR: ${{ github.workspace }}/${{ matrix.release_dir }}
+        run: ./scripts/test-release-candidate.sh
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arena0-${{ matrix.target }}
+          path: dist/${{ matrix.target }}
+          if-no-files-found: error
+
+  publish:
+    name: publish to npm
+    needs: [gate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download macOS executables
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: arena0-darwin-arm64
+          path: dist/darwin-arm64
+
+      - name: Download Linux executables
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: arena0-linux-x64
+          path: dist/linux-x64
+
+      # upload-artifact stores files in ZIP archives and does not preserve
+      # executable mode bits across the download boundary.
+      - name: Restore executable permissions
+        run: chmod +x dist/{darwin-arm64,linux-x64}/{arena0,arena0d,cargo-arena0}
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            version=$(node -p "require('./npm/arena0/package.json').version")
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify checksums and versions
+        run: |
+          set -euo pipefail
+          for target in darwin-arm64 linux-x64; do
+            for binary in arena0 arena0d cargo-arena0; do
+              test -f "dist/${target}/${binary}"
+              (cd "dist/${target}" && shasum -a 256 -c "${binary}.sha256")
+            done
+          done
+          # The publish runner is Linux x64; execute only that target's
+          # binaries. The macOS artifact is checked by checksum and by its
+          # target-native build job above.
+          for binary in arena0 arena0d cargo-arena0; do
+            actual="$("./dist/linux-x64/${binary}" --version)"
+            expected="${binary} ${{ steps.ver.outputs.version }}"
+            test "$actual" = "$expected" || {
+              echo "version mismatch: expected '$expected', got '$actual'" >&2
+              exit 1
+            }
+          done
+
+      - name: Assemble platform packages
+        run: |
+          node npm/assemble.mjs darwin-arm64 dist/darwin-arm64 "${{ steps.ver.outputs.version }}"
+          node npm/assemble.mjs linux-x64    dist/linux-x64    "${{ steps.ver.outputs.version }}"
+
+      - name: Inspect package contents
+        run: |
+          npm pack --dry-run ./npm/arena0-darwin-arm64
+          npm pack --dry-run ./npm/arena0-linux-x64
+          npm pack --dry-run ./npm/arena0
+
+      - name: Verify publication credentials
+        if: github.event_name == 'push' || inputs.publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          : "${CARGO_REGISTRY_TOKEN:?CARGO_REGISTRY_TOKEN is required}"
+          : "${NODE_AUTH_TOKEN:?NPM_TOKEN is required}"
+          npm whoami --registry https://registry.npmjs.org
+
+      - name: Publish Rust guest SDK
+        if: github.event_name == 'push' || inputs.publish
+        env:
+          ARENA0_RELEASE_VERSION: ${{ steps.ver.outputs.version }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: ./scripts/publish-crates.sh
+
+      - name: Verify published guest SDK
+        if: github.event_name == 'push' || inputs.publish
+        env:
+          ARENA0_CARGO_BIN: ${{ github.workspace }}/dist/linux-x64/cargo-arena0
+        run: |
+          rustup show
+          ./scripts/test-registry-example.sh
+
+      - name: Publish
+        if: github.event_name == 'push' || inputs.publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          ARENA0_RELEASE_VERSION: ${{ steps.ver.outputs.version }}
+        run: ./scripts/publish-npm.sh

@@ -1,0 +1,42 @@
+[package]
+name = "arena0-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "arena0: the local Host client and offline proof verifier"
+publish.workspace = true
+
+[[bin]]
+name = "arena0"
+path = "src/main.rs"
+
+[dependencies]
+arena0-client = { path = "../arena0-client" }
+arena0-home = { path = "../arena0-home" }
+arena0-verify = { path = "../arena0-verify" }
+
+clap = { workspace = true }
+crossterm = { workspace = true }
+futures = { workspace = true }
+indicatif = { workspace = true }
+jsonschema = { workspace = true }
+owo-colors = { workspace = true }
+ratatui = { workspace = true }
+ratatui-textarea = { workspace = true }
+rattles = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+unicode-width = { workspace = true }
+rand = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

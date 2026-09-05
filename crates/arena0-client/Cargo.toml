@@ -1,0 +1,25 @@
+[package]
+name = "arena0-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "arena0: shared daemon-socket client, id resolution, and program-text sanitizer"
+publish.workspace = true
+
+[dependencies]
+arena0-api = { path = "../arena0-api", features = ["io"] }
+arena0-home = { path = "../arena0-home" }
+arena0-program = { path = "../arena0-program" }
+arena0-protocol = { path = "../arena0-protocol" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror.workspace = true
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+arena0-crypto = { path = "../arena0-crypto" }
+
+[lints]
+workspace = true

@@ -1,0 +1,30 @@
+[package]
+name = "arena0-verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Standalone verification of arena0 session proofs: light (cryptographic, no program) and full (deterministic replay)"
+publish.workspace = true
+
+[dependencies]
+arena0-crypto = { path = "../arena0-crypto" }
+arena0-program = { path = "../arena0-program" }
+arena0-protocol = { path = "../arena0-protocol" }
+arena0-sandbox = { path = "../arena0-sandbox", optional = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tracing-subscriber = { workspace = true }
+wat = { workspace = true }
+
+[features]
+default = []
+# Full verification: deterministic re-execution of the program. Pulls in the
+# Wasmtime sandbox; light verification needs neither this feature nor the program.
+replay = ["dep:arena0-sandbox"]
+
+[lints]
+workspace = true

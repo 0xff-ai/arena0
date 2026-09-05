@@ -1,0 +1,31 @@
+[package]
+name = "arena0-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Validated protocol-domain types for arena0: identity, events, effects, traces, attestations, and receipts"
+publish = true
+
+[features]
+performance-tracing = ["dep:tracing"]
+
+[dependencies]
+arena0-crypto = { path = "../arena0-crypto", version = "0.1.0" }
+arena0-program = { path = "../arena0-program", version = "0.1.0" }
+arena0-wire = { path = "../arena0-wire", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+borsh.workspace = true
+schemars.workspace = true
+thiserror.workspace = true
+hex = { workspace = true, features = ["serde"] }
+blake3.workspace = true
+valuable.workspace = true
+tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

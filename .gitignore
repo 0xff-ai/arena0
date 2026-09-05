@@ -1,0 +1,32 @@
+target/
+node_modules/
+/npm/arena0/examples/
+**/*.rs.bk
+*.pdb
+.DS_Store
+
+# Runtime/test artifacts (daemon homes, diagnostics, design prototypes).
+# test-home/ holds a keystore seed — never commit it.
+output/
+test-home/
+/web/
+
+# Agent runtime artifacts (subagent runs, missions).
+.pi-subagents/
+
+# Local tooling (caches, MCP config).
+.mcp.json
+
+# Local run artifacts (node keys, logs).
+/.runs/
+
+# Internal development material belongs in arena0-history.
+/.private/
+/.work/
+/.audit/
+/docs/private/
+/crates/private/
+/AGENTS.md
+/docs/agents/
+/.agents/
+/skills-lock.json

@@ -1,0 +1,27 @@
+[package]
+name = "arena0-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false          # never ships; workspace default
+
+[dependencies]            # lib = runtime-level harness only
+arena0-api = { path = "../arena0-api", features = ["io"] }
+arena0-crypto = { path = "../arena0-crypto" }
+arena0-program = { path = "../arena0-program" }
+arena0-daemon = { path = "../arena0-daemon" }
+arena0-transport = { path = "../arena0-transport" }
+arena0-node = { path = "../arena0-node" }
+arena0-sandbox = { path = "../arena0-sandbox" }
+arena0-store = { path = "../arena0-store" }
+arena0-protocol = { path = "../arena0-protocol" }
+arena0-verify = { path = "../arena0-verify", features = ["replay"] }
+blake3.workspace = true
+borsh.workspace = true
+hex.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+wat.workspace = true

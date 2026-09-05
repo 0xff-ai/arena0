@@ -1,0 +1,33 @@
+[package]
+name = "arena0-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SDK for writing arena0 programs targeting wasm32-unknown-unknown"
+publish = true
+
+[lib]
+name = "arena0"
+
+[dependencies]
+arena0-crypto = { path = "../arena0-crypto", version = "0.1.0" }
+arena0-program = { path = "../arena0-program", version = "0.1.0" }
+arena0-protocol = { path = "../arena0-protocol", version = "0.1.0" }
+arena0-sdk-macros = { path = "../arena0-sdk-macros", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+borsh.workspace = true
+schemars.workspace = true
+blake3.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+tiny-keccak.workspace = true
+anyhow.workspace = true
+
+[features]
+default = []
+debug = []
+
+[lints]
+workspace = true

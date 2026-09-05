@@ -1,0 +1,26 @@
+[package]
+name = "arena0-primitives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Composable commit-reveal, randomness, turn, ballot, and agreement primitives for arena0 programs"
+publish = true
+
+[package.metadata.cargo-machete]
+ignored = ["arena0-sdk", "serde"]
+
+[dependencies]
+arena0-sdk = { path = "../arena0-sdk", version = "0.1.0" }
+serde.workspace = true
+borsh.workspace = true
+blake3.workspace = true
+rand_chacha.workspace = true
+thiserror.workspace = true
+
+[features]
+default = []
+debug = []
+
+[lints]
+workspace = true
