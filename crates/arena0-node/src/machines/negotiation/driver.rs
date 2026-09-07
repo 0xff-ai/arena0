@@ -12,9 +12,10 @@ use std::time::Duration;
 use arena0_crypto::{BlsSignature, ExecutionKey, NodeKeys};
 use arena0_protocol::{
     Activation, ActivationAnnouncement, ActivationData, ActivationSignature, ActivationTickets,
-    Counteroffer, EventSource, ExecId, FetchActivationTickets, FetchFrame, NegotiationEvent,
-    NegotiationFact, NegotiationGossip, NegotiationStage, Offer, OfferData, OfferHash, PeerId,
-    PeerIdSource, PreparedActivation, SessionHash, Ticket, TicketAction, TicketData, TicketHash,
+    Counteroffer, EventSource, ExecId, FetchActivationTickets, FetchFrame, MAX_CLOCK_SKEW_MS,
+    NegotiationEvent, NegotiationFact, NegotiationGossip, NegotiationStage, Offer, OfferData,
+    OfferHash, PREPARE_WINDOW_MS, PeerId, PeerIdSource, PreparedActivation, SessionHash, Ticket,
+    TicketAction, TicketData, TicketHash,
 };
 use arena0_store::ExecutionStore;
 use arena0_transport::{NegotiationTopic, ProgramTopicEvent, RecvHandle, Transport};
@@ -38,6 +39,24 @@ const CADENCE_MS: u64 = 2_000;
 const REOFFER_MAX_ATTEMPTS: u32 = 8;
 /// Deadline window of a re-offer, in milliseconds (tunable).
 const REOFFER_WINDOW_MS: u64 = 30_000;
+/// Once a participant set has formed, bound convergence and activation.
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn ticket_prepare_window_ok(ticket: &Ticket, now: u64) -> bool {
+    let TicketAction::Active {
+        issued_at_unix_ms,
+        valid_for_ms,
+        ..
+    } = &ticket.data.action
+    else {
+        return false;
+    };
+    *issued_at_unix_ms <= now.saturating_add(MAX_CLOCK_SKEW_MS)
+        && issued_at_unix_ms
+            .saturating_add(u64::from(*valid_for_ms))
+            .saturating_sub(now)
+            >= MAX_CLOCK_SKEW_MS + PREPARE_WINDOW_MS
+}
 
 /// Role-specific state for one negotiation drive.
 ///
@@ -143,7 +162,7 @@ pub(crate) struct NegotiationDriver<'store, 'effects> {
     fetch_rx_closed: bool,
     /// The session hash this drive is currently registered for.
     registered_hash: Option<SessionHash>,
-    deadline: Instant,
+    deadline: Option<Instant>,
     neighbors: HashSet<PeerId>,
     role: NegotiationRole,
     emitted_signature: bool,
@@ -303,28 +322,37 @@ impl<'store, 'effects> NegotiationDriver<'store, 'effects> {
             }
             driver.emitted_signature = false;
         }
-        if let NegotiationRole::Creator(_) = &driver.role
-            && driver.local_ticket.is_none()
-        {
+        if driver.local_ticket.is_none() {
             // The creator ticket is formed from the same OfferData before the
             // Offer crosses this boundary. Re-issuing it here would change
             // its timestamp and therefore its TicketHash.
-            let ticket = creator_ticket.ok_or(NegotiationDriveError::InvalidLocalTicket)?;
-            if ticket.data.signer != identity.peer_id()
-                || ticket.data.negotiation_id != offer.data().negotiation_id
-                || ticket.data.offer_seq != offer.data().offer_seq
-                || TicketHash::of(&ticket.data) != offer.tickets()[0]
-            {
+            let creator = matches!(&driver.role, NegotiationRole::Creator(_));
+            if let Some(ticket) = creator_ticket.as_ref() {
+                if ticket.data.signer
+                    != if creator {
+                        identity.peer_id()
+                    } else {
+                        offer.data().creator
+                    }
+                    || ticket.data.negotiation_id != offer.data().negotiation_id
+                    || ticket.data.offer_seq != offer.data().offer_seq
+                    || TicketHash::of(&ticket.data) != offer.tickets()[0]
+                {
+                    return Err(NegotiationDriveError::InvalidLocalTicket);
+                }
+                driver
+                    .book
+                    .apply_ticket(ticket)
+                    .map_err(|_| NegotiationDriveError::InvalidLocalTicket)?;
+                if creator {
+                    if let Some(supervision) = &driver.supervision {
+                        let _ = supervision.ticket.send(Some(ticket.clone()));
+                    }
+                    driver.local_ticket = Some(ticket.clone());
+                }
+            } else if creator {
                 return Err(NegotiationDriveError::InvalidLocalTicket);
             }
-            driver
-                .book
-                .apply_ticket(&ticket)
-                .map_err(|_| NegotiationDriveError::InvalidLocalTicket)?;
-            if let Some(supervision) = &driver.supervision {
-                let _ = supervision.ticket.send(Some(ticket.clone()));
-            }
-            driver.local_ticket = Some(ticket);
         }
         driver.refresh_fetch_registration();
         Ok(driver)
@@ -437,7 +465,7 @@ impl<'store, 'effects> NegotiationDriver<'store, 'effects> {
         loop {
             tokio::select! {
                 biased;
-                () = sleep_until(self.deadline) => return Err(self.timeout_error()),
+                () = wait_deadline(self.deadline) => return Err(self.timeout_error()),
                 event = self.topic.recv() => {
                     match event {
                         Ok(event) => {
@@ -759,14 +787,18 @@ impl<'store, 'effects> NegotiationDriver<'store, 'effects> {
     }
 
     async fn creator_emit(&mut self) -> Result<Option<ActivatedSession>, NegotiationDriveError> {
-        // Desertion: the deadline passed without a complete activation. The
-        // creator re-offers with a new offer_seq tuned to the counteroffers'
-        // plurality, or gives up. Once frozen (the Prepared boundary) the
-        // creator is bound to the frozen SessionHash: prepared evidence
-        // continues independent of the pre-prepare admission deadline, and
-        // the drive keeps republishing its signature until the outer
-        // deadline.
-        if unix_time_ms() >= self.offer.data().deadline_unix_ms
+        // Open admission renews before the offer's remaining prepare window
+        // closes. A frozen proposal keeps its exact evidence and completes
+        // under the bounded activation deadline instead.
+        let renew_at = if self.deadline.is_none() {
+            self.offer
+                .data()
+                .deadline_unix_ms
+                .saturating_sub(PREPARE_WINDOW_MS + MAX_CLOCK_SKEW_MS)
+        } else {
+            self.offer.data().deadline_unix_ms
+        };
+        if unix_time_ms() >= renew_at
             && self
                 .role
                 .creator_state()
@@ -880,13 +912,26 @@ impl<'store, 'effects> NegotiationDriver<'store, 'effects> {
         if !matches!(&self.role, NegotiationRole::Creator(state) if state.frozen.is_none()) {
             return Ok(());
         }
+        let now = unix_time_ms();
+        if self.offer.data().deadline_unix_ms <= now {
+            return Ok(());
+        }
         let set = self.book.ticket_set(
             self.offer.data().negotiation_id,
             self.offer.data().offer_seq,
         );
+        let set = set
+            .into_iter()
+            .filter(|ticket| ticket_prepare_window_ok(ticket, now))
+            .take(self.offer.data().target_size as usize)
+            .collect::<Vec<_>>();
         if set.len() < self.offer.data().target_size as usize {
             return Ok(());
         }
+        // A creator may observe more active tickets than the requested
+        // ensemble size. Freeze the deterministic creator-first prefix so the
+        // prepared activation and its hashes contain exactly target_size
+        // participants.
         let hashes = set
             .iter()
             .map(|ticket| TicketHash::of(&ticket.data))
@@ -907,6 +952,7 @@ impl<'store, 'effects> NegotiationDriver<'store, 'effects> {
                 ));
             }
         }
+        self.arm_completion_deadline();
         let session_hash = activation.session_hash();
         if let Some(state) = self.role.creator_state_mut() {
             state.frozen = Some(activation);
@@ -998,18 +1044,14 @@ impl<'store, 'effects> NegotiationDriver<'store, 'effects> {
         Ok(Some(activated))
     }
 
-    /// The creator's re-offer selection on desertion: group valid
-    /// counteroffers by exact params bytes, count distinct signers, select the
-    /// highest support with bytewise deterministic tie-breaking. Auto re-offer
-    /// only when `support + creator >= target_size`; never auto-retry failed
-    /// params unless their support strictly increases; retain the local
-    /// attempt/time limit.
+    /// Prefer a supported counteroffer within the tuning budget. An open
+    /// creator otherwise renews the current terms without spending that
+    /// budget, preserving its negotiation identity while it waits.
     fn try_reoffer(&mut self) -> Result<(), NegotiationDriveError> {
-        if self
-            .role
-            .creator_state()
-            .is_none_or(|state| state.reoffer_attempts >= REOFFER_MAX_ATTEMPTS)
-            || Instant::now() >= self.deadline
+        if self.role.creator_state().is_none()
+            || self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
         {
             return Err(self.timeout_error());
         }
@@ -1021,8 +1063,8 @@ impl<'store, 'effects> NegotiationDriver<'store, 'effects> {
         {
             *groups.entry(counteroffer.data.params.clone()).or_insert(0) += 1;
         }
-        let Some((params, support)) = groups
-            .iter()
+        let candidate = groups
+            .into_iter()
             .max_by(
                 |(left_params, left_support), (right_params, right_support)| {
                     left_support
@@ -1030,38 +1072,39 @@ impl<'store, 'effects> NegotiationDriver<'store, 'effects> {
                         .then_with(|| right_params.cmp(left_params))
                 },
             )
-            .map(|(params, support)| (params.clone(), *support))
-        else {
-            // No counteroffers: nothing to tune to.
+            .filter(|(params, support)| {
+                *support + 1 >= self.offer.data().target_size as usize
+                    && self.role.creator_state().is_some_and(|state| {
+                        state.reoffer_attempts < REOFFER_MAX_ATTEMPTS
+                            && state
+                                .tried_params
+                                .get(params)
+                                .is_none_or(|previous| support > previous)
+                    })
+            });
+        let (params, initial_state) = if let Some((params, support)) = candidate {
+            let initial_state =
+                (self.recompute_initial_state)(&params).map_err(NegotiationDriveError::Prepare)?;
+            if let Some(state) = self.role.creator_state_mut() {
+                state.tried_params.insert(params.clone(), support);
+                state.reoffer_attempts += 1;
+            }
+            (params, initial_state)
+        } else if self.deadline.is_none() {
+            (
+                self.offer.data().params.as_bytes().to_vec(),
+                self.offer.data().initial_state,
+            )
+        } else {
             return Err(self.timeout_error());
         };
-        if support + 1 < self.offer.data().target_size as usize {
-            return Err(self.timeout_error());
-        }
-        // Never auto-retry a params that already failed unless its support
-        // strictly increases (the initial params are recorded at
-        // construction with support 0).
-        if self
-            .role
-            .creator_state()
-            .and_then(|state| state.tried_params.get(&params))
-            .is_some_and(|previous_support| support <= *previous_support)
-        {
-            return Err(self.timeout_error());
-        }
-        if let Some(state) = self.role.creator_state_mut() {
-            state.tried_params.insert(params.clone(), support);
-        }
-        let initial_state =
-            (self.recompute_initial_state)(&params).map_err(NegotiationDriveError::Prepare)?;
-        let outer_deadline_ms = unix_time_ms().saturating_add(
-            self.deadline
+        let new_deadline_ms = now_ms.saturating_add(REOFFER_WINDOW_MS);
+        let new_deadline_ms = self.deadline.map_or(new_deadline_ms, |deadline| {
+            let remaining = deadline
                 .saturating_duration_since(Instant::now())
-                .as_millis() as u64,
-        );
-        let new_deadline_ms = now_ms
-            .saturating_add(REOFFER_WINDOW_MS)
-            .min(outer_deadline_ms);
+                .as_millis() as u64;
+            new_deadline_ms.min(now_ms.saturating_add(remaining))
+        });
         let new_offer_data = OfferData::new(
             self.offer.data().negotiation_id,
             self.offer.data().offer_seq.saturating_add(1),
@@ -1075,9 +1118,6 @@ impl<'store, 'effects> NegotiationDriver<'store, 'effects> {
             new_deadline_ms,
         )
         .map_err(|error| NegotiationDriveError::Signing(error.to_string()))?;
-        if let Some(state) = self.role.creator_state_mut() {
-            state.reoffer_attempts += 1;
-        }
         // Form the creator ticket from the immutable offer body first. The
         // returned offer therefore already contains its real creator hash;
         // no empty or placeholder ticket list can cross this boundary.
@@ -1086,8 +1126,8 @@ impl<'store, 'effects> NegotiationDriver<'store, 'effects> {
             .create_creator_offer(new_offer_data, now_ms)
             .map_err(|_| NegotiationDriveError::InvalidLocalTicket)?;
         self.offer = offer;
-        // The book accumulates offer slots: the re-offer is a new slot, and
-        // the old slot's tickets remain as evidence.
+        // The re-offer is a new slot. Retire lower offer sequences after the
+        // valid slot is registered so stale tickets cannot consume capacity.
         self.book
             .register_offer(
                 self.offer.data().negotiation_id,
@@ -1095,6 +1135,10 @@ impl<'store, 'effects> NegotiationDriver<'store, 'effects> {
                 &self.offer,
             )
             .map_err(|_| NegotiationDriveError::InvalidLocalTicket)?;
+        self.book.prune_offers_before(
+            self.offer.data().negotiation_id,
+            self.offer.data().offer_seq,
+        );
         // The creator made the new offer: apply its ticket to the book and
         // retain it for the local signing/fetch path before gossiping either
         // value.
@@ -1168,6 +1212,10 @@ impl<'store, 'effects> NegotiationDriver<'store, 'effects> {
                 &self.offer,
             )
             .map_err(|_| NegotiationDriveError::InvalidLocalTicket)?;
+        self.book.prune_offers_before(
+            self.offer.data().negotiation_id,
+            self.offer.data().offer_seq,
+        );
         self.book
             .apply_ticket(&creator_ticket)
             .map_err(|_| NegotiationDriveError::InvalidLocalTicket)?;
@@ -1222,12 +1270,14 @@ impl<'store, 'effects> NegotiationDriver<'store, 'effects> {
     async fn send_fetch_request(&mut self) -> Result<(), NegotiationDriveError> {
         let session_hash = self.expected_session_hash()?;
         let creator = self.offer.data().creator;
-        let Ok(Ok(send)) = timeout_at(self.deadline, self.transport.open_fetch(&creator)).await
+        let operation_deadline = self.operation_deadline();
+        let Ok(Ok(send)) =
+            timeout_at(operation_deadline, self.transport.open_fetch(&creator)).await
         else {
             return Ok(());
         };
         let request = FetchFrame::FetchActivationTickets(FetchActivationTickets { session_hash });
-        let _ = timeout_at(self.deadline, send.send_fetch(&request)).await;
+        let _ = timeout_at(operation_deadline, send.send_fetch(&request)).await;
         Ok(())
     }
 
@@ -1283,7 +1333,7 @@ impl<'store, 'effects> NegotiationDriver<'store, 'effects> {
         };
         let local_hash = TicketHash::of(&local_ticket.data);
         if !self.offer.tickets().contains(&local_hash) {
-            return Ok(None);
+            return Err(NegotiationDriveError::NotSelected);
         }
         let activation = match PreparedActivation::new(self.offer.clone(), response.tickets.clone())
         {
@@ -1304,6 +1354,7 @@ impl<'store, 'effects> NegotiationDriver<'store, 'effects> {
                 ));
             }
         }
+        self.arm_completion_deadline();
         let session_hash = activation.session_hash();
         if let Some(state) = self.role.participant_state_mut() {
             state.prepared = Some(activation);
@@ -1381,7 +1432,7 @@ impl<'store, 'effects> NegotiationDriver<'store, 'effects> {
                 request,
                 frozen.session_hash(),
                 frozen.tickets(),
-                self.deadline,
+                self.operation_deadline(),
             )
             .await;
         } else if self.role.participant_state().is_some() {
@@ -1496,6 +1547,17 @@ impl<'store, 'effects> NegotiationDriver<'store, 'effects> {
         Ok(SessionHash::of(&activation_data))
     }
 
+    fn arm_completion_deadline(&mut self) {
+        if self.deadline.is_none() {
+            self.deadline = Some(Instant::now() + COMPLETION_TIMEOUT);
+        }
+    }
+
+    fn operation_deadline(&self) -> Instant {
+        self.deadline
+            .unwrap_or_else(|| Instant::now() + FETCH_TIMEOUT)
+    }
+
     /// Every selected Active ticket must pass the prepare-window check before
     /// a signer durably prepares and activation-signs.
     fn prepare_window_ok(&self, tickets: &[Ticket]) -> bool {
@@ -1504,26 +1566,9 @@ impl<'store, 'effects> NegotiationDriver<'store, 'effects> {
         if now >= self.offer.data().deadline_unix_ms {
             return false;
         }
-        tickets.iter().all(|ticket| {
-            let TicketAction::Active {
-                issued_at_unix_ms,
-                valid_for_ms,
-                ..
-            } = ticket.data.action
-            else {
-                return false;
-            };
-            // Future-issued rejection: not issued beyond the clock skew.
-            if issued_at_unix_ms > now.saturating_add(arena0_protocol::MAX_CLOCK_SKEW_MS) {
-                return false;
-            }
-            // The expiry margin: the ticket must remain valid through the
-            // clock skew plus the prepare window.
-            issued_at_unix_ms
-                .saturating_add(u64::from(valid_for_ms))
-                .saturating_sub(now)
-                >= arena0_protocol::MAX_CLOCK_SKEW_MS + arena0_protocol::PREPARE_WINDOW_MS
-        })
+        tickets
+            .iter()
+            .all(|ticket| ticket_prepare_window_ok(ticket, now))
     }
 
     fn sign_bls(&self, message: &[u8]) -> Result<BlsSignature, NegotiationDriveError> {
@@ -1540,7 +1585,7 @@ impl<'store, 'effects> NegotiationDriver<'store, 'effects> {
             .validate()
             .map_err(|error| NegotiationDriveError::Signing(error.to_string()))?;
         match timeout_at(
-            self.deadline,
+            self.operation_deadline(),
             self.topic.publish(frame.signing_bytes().into()),
         )
         .await
@@ -1555,7 +1600,7 @@ impl<'store, 'effects> NegotiationDriver<'store, 'effects> {
         let bootstrap = self.bootstrap_peers();
         let _ = self.topic.close().await;
         let topic = match timeout_at(
-            self.deadline,
+            self.operation_deadline(),
             self.transport
                 .subscribe_program(self.offer.data().program_hash, bootstrap),
         )
@@ -1697,6 +1742,13 @@ fn next_cadence(peer_id: PeerId, counter: u64) -> Instant {
     Instant::now() + Duration::from_millis(delay_ms)
 }
 
+async fn wait_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 fn bounded_count(count: usize) -> u16 {
     u16::try_from(count).unwrap_or(u16::MAX)
 }
@@ -1834,7 +1886,7 @@ mod tests {
                 preferred_params: None,
             },
             supervision: None,
-            deadline: Instant::now() + Duration::from_secs(30),
+            deadline: Some(Instant::now() + Duration::from_secs(30)),
         };
         let effects = NegotiationEffects {
             prepare,
@@ -1871,6 +1923,114 @@ mod tests {
             })
             .map(|(_, event)| event.clone())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn open_creator_renews_beyond_tuning_and_book_limits() {
+        let crypto = NodeKeys::from_secret(SecretKey::from_bytes([1; 32]));
+        let emit = |_, _| {};
+        let negotiation_id = NegotiationId([8; 32]);
+        let mut driver = test_driver(&crypto, ExecId([7; 32]), negotiation_id, &emit).await;
+        driver.deadline = None;
+        let params = driver.offer.data().params.clone();
+        let initial_state = driver.offer.data().initial_state;
+        for seq in 1..=100 {
+            driver.try_reoffer().expect("same terms remain open");
+            assert_eq!(driver.offer.data().negotiation_id, negotiation_id);
+            assert_eq!(driver.offer.data().offer_seq, seq);
+            assert_eq!(driver.offer.data().params, params);
+            assert_eq!(driver.offer.data().initial_state, initial_state);
+            assert_eq!(driver.book.len(negotiation_id, seq - 1), 0);
+            assert_eq!(driver.book.len(negotiation_id, seq), 1);
+        }
+        assert!(driver.deadline.is_none());
+        assert_eq!(driver.role.creator_state().unwrap().reoffer_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn oversubscribed_creator_freezes_exactly_the_requested_count() {
+        let crypto = NodeKeys::from_secret(SecretKey::from_bytes([1; 32]));
+        let emit = |_, _| {};
+        let negotiation_id = NegotiationId([8; 32]);
+        let mut driver = test_driver(&crypto, ExecId([7; 32]), negotiation_id, &emit).await;
+        driver.deadline = None;
+        let creator_ticket = driver.local_ticket.clone().unwrap();
+        let mut peers = Vec::new();
+        for seed in [2, 3] {
+            let peer = NodeKeys::from_secret(SecretKey::from_bytes([seed; 32]));
+            peers.push(peer.peer_id());
+            let execution = ExecutionKey::derive(
+                &ExecutionSalt::try_from_bytes([seed; 32]).unwrap(),
+                &[seed; 32],
+                &negotiation_id.0,
+            )
+            .unwrap();
+            let mut book = NegotiationBook::new(&peer, &execution);
+            book.register_offer(negotiation_id, 0, &driver.offer)
+                .unwrap();
+            book.apply_ticket(&creator_ticket).unwrap();
+            let ticket = book
+                .issue_ticket(negotiation_id, 0, 0, unix_time_ms())
+                .unwrap();
+            driver.book.apply_ticket(&ticket).unwrap();
+        }
+        assert_eq!(driver.book.len(negotiation_id, 0), 3);
+        driver.try_freeze().await.expect("freeze excess tickets");
+        let frozen = driver
+            .role
+            .creator_state()
+            .unwrap()
+            .frozen
+            .as_ref()
+            .unwrap();
+        assert_eq!(frozen.tickets().len(), 2);
+        assert_eq!(frozen.tickets()[0].data.signer, crypto.peer_id());
+        assert_eq!(
+            frozen.tickets()[1].data.signer,
+            *peers.iter().min().unwrap()
+        );
+        assert!(driver.deadline.is_some());
+    }
+
+    #[tokio::test]
+    async fn unsigned_complete_offer_cannot_reject_or_time_out_a_waiting_join() {
+        let crypto = NodeKeys::from_secret(SecretKey::from_bytes([1; 32]));
+        let emit = |_, _| {};
+        let negotiation_id = NegotiationId([8; 32]);
+        let mut driver = test_driver(&crypto, ExecId([7; 32]), negotiation_id, &emit).await;
+        driver.deadline = None;
+        let remote = NodeKeys::from_secret(SecretKey::from_bytes([2; 32]));
+        let mut data = driver.offer.data().clone();
+        data.creator = remote.peer_id();
+        let creator_book = NegotiationBook::new(&remote, driver.execution);
+        let (offer, ticket) = creator_book
+            .create_creator_offer(data, unix_time_ms())
+            .unwrap();
+        driver.offer = offer;
+        driver.role = super::NegotiationRole::Participant(super::ParticipantState::default());
+        driver.book = NegotiationBook::new(&crypto, driver.execution);
+        driver
+            .book
+            .register_offer(negotiation_id, 0, &driver.offer)
+            .unwrap();
+        driver.book.apply_ticket(&ticket).unwrap();
+        driver.issue_local_ticket().unwrap();
+        // Only the offer body is authenticated. This fabricated complete
+        // hash vector excludes local consent and has no creator response.
+        driver.offer = arena0_protocol::Offer::new(
+            driver.offer.data().clone(),
+            vec![
+                arena0_protocol::TicketHash::of(&ticket.data),
+                arena0_protocol::TicketHash([9; 32]),
+            ],
+        )
+        .unwrap();
+        driver
+            .try_fetch_and_prepare()
+            .await
+            .expect("untrusted selection stays pending");
+        assert!(driver.deadline.is_none());
+        assert!(driver.role.participant_state().unwrap().prepared.is_none());
     }
 
     #[tokio::test]

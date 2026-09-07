@@ -67,6 +67,68 @@ impl Database {
         self.load_execution_request_in_transaction(execution_id)
     }
 
+    pub(super) fn bind_join_target(
+        &mut self,
+        execution_id: ExecId,
+        target: NegotiationTarget,
+    ) -> Result<AdmissionBindingOutcome, StoreError> {
+        if target.creator == self.host_id {
+            return Err(StoreError::InvalidAdmission(
+                "a Host cannot join its own negotiation".into(),
+            ));
+        }
+        self.begin()?;
+        let result = (|| {
+            let request = self
+                .load_execution_request_in_transaction(execution_id)?
+                .ok_or(StoreError::ExecutionRequestNotFound(execution_id))?;
+            if request.failure().is_some() {
+                return Err(StoreError::ExecutionLifecycleStarted(execution_id));
+            }
+            if self.load_activation_in_transaction(execution_id)?.is_some() {
+                return Err(StoreError::ExecutionLifecycleStarted(execution_id));
+            }
+            let admission = match request.admission {
+                ExecutionAdmission::Join { target: None } => ExecutionAdmission::Join {
+                    target: Some(target),
+                },
+                ExecutionAdmission::Join {
+                    target: Some(existing),
+                } if existing == target => return Ok(AdmissionBindingOutcome::AlreadyBound),
+                ExecutionAdmission::Join { target: Some(_) } => {
+                    return Ok(AdmissionBindingOutcome::Conflict);
+                }
+                _ => {
+                    return Err(StoreError::InvalidAdmission(
+                        "execution admission is not an open Join".into(),
+                    ));
+                }
+            };
+            let admission_bytes = borsh::to_vec(&admission).map_err(|error| {
+                StoreError::InvalidAdmission(format!("admission encoding failed: {error}"))
+            })?;
+            if admission_bytes.len() > MAX_ADMISSION_BYTES {
+                return Err(StoreError::CommandTooLarge {
+                    required: admission_bytes.len(),
+                    capacity: MAX_ADMISSION_BYTES,
+                });
+            }
+            self.connection.execute(
+                "UPDATE exec_requests SET admission = ?1
+                 WHERE execution_id = ?2 AND failure IS NULL",
+                params![
+                    envelope(EnvelopeKind::ExecutionAdmission, &admission_bytes)?,
+                    execution_id.0.to_vec(),
+                ],
+            )?;
+            Ok(AdmissionBindingOutcome::Bound)
+        })();
+        match result {
+            Ok(outcome) => self.commit_result(outcome),
+            Err(error) => self.rollback_result(error),
+        }
+    }
+
     pub(super) fn load_execution_request_in_transaction(
         &mut self,
         execution_id: ExecId,
@@ -218,7 +280,7 @@ impl Database {
             || request.params.as_ref().is_some_and(|params| {
                 params.as_bytes() != prepared.offer().data().params.as_bytes()
             })
-            || request.admission.negotiation_id() != prepared.offer().data().negotiation_id
+            || request.admission.negotiation_id() != Some(prepared.offer().data().negotiation_id)
         {
             return Err(StoreError::Corruption(
                 "prepared activation does not match its execution request".into(),
@@ -321,7 +383,7 @@ impl Database {
                     || params
                         .as_ref()
                         .is_some_and(|params| offer.params.as_bytes() != params.as_bytes())
-                    || offer.negotiation_id != admission.negotiation_id()
+                    || admission.negotiation_id() != Some(offer.negotiation_id)
                 {
                     return Err(StoreError::Corruption(
                         "activation does not match its execution request".into(),
@@ -344,12 +406,20 @@ fn validate_local_admission(
     admission: &ExecutionAdmission,
 ) -> Result<(), StoreError> {
     match admission {
+        ExecutionAdmission::Create {
+            negotiation_id,
+            participant_count,
+        } => ExecutionAdmission::create(*negotiation_id, *participant_count)
+            .map(|_| ())
+            .map_err(|error| StoreError::InvalidAdmission(error.to_string())),
         ExecutionAdmission::Explicit { peers, .. } if !peers.contains(&host_id) => Err(
             StoreError::InvalidAdmission("explicit participant set omits the local Host".into()),
         ),
-        ExecutionAdmission::Join { creator, .. } if *creator == host_id => Err(
-            StoreError::InvalidAdmission("a Host cannot join its own negotiation".into()),
-        ),
+        ExecutionAdmission::Join {
+            target: Some(target),
+        } if target.creator == host_id => Err(StoreError::InvalidAdmission(
+            "a Host cannot join its own negotiation".into(),
+        )),
         _ => Ok(()),
     }
 }
@@ -358,9 +428,13 @@ fn validate_request_params(
     admission: &ExecutionAdmission,
     params_present: bool,
 ) -> Result<(), StoreError> {
-    if matches!(admission, ExecutionAdmission::Explicit { .. }) && !params_present {
+    if matches!(
+        admission,
+        ExecutionAdmission::Explicit { .. } | ExecutionAdmission::Create { .. }
+    ) && !params_present
+    {
         return Err(StoreError::InvalidAdmission(
-            "explicit admission requires params".into(),
+            "creator admission requires params".into(),
         ));
     }
     Ok(())
@@ -373,6 +447,16 @@ fn ensure_admission_authority(
 ) -> Result<(), StoreError> {
     let offer = prepared.offer().data();
     match admission {
+        ExecutionAdmission::Create {
+            participant_count,
+            negotiation_id: _,
+        } => {
+            if offer.creator != host_id || offer.target_size != *participant_count {
+                return Err(StoreError::InvalidAdmission(
+                    "prepared activation changes the creator participant count".into(),
+                ));
+            }
+        }
         ExecutionAdmission::Explicit { peers, .. } => {
             let admitted = arena0_protocol::Ensemble::from_peers(
                 prepared
@@ -388,12 +472,20 @@ fn ensure_admission_authority(
                 ));
             }
         }
-        ExecutionAdmission::Join { creator, .. } if offer.creator != *creator => {
+        ExecutionAdmission::Join {
+            target: Some(target),
+        } => {
+            if offer.creator != target.creator || offer.negotiation_id != target.negotiation_id {
+                return Err(StoreError::InvalidAdmission(
+                    "prepared activation came from a different creator".into(),
+                ));
+            }
+        }
+        ExecutionAdmission::Join { target: None } => {
             return Err(StoreError::InvalidAdmission(
-                "prepared activation came from a different creator".into(),
+                "prepared activation has no selected Join target".into(),
             ));
         }
-        ExecutionAdmission::Join { .. } => {}
     }
     Ok(())
 }

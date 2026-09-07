@@ -21,7 +21,7 @@ mod response;
 
 pub use activity::{ActivityData, ActivityFrame, ActivityResult};
 pub use arena0_protocol::{
-    ColorDepth, ExecLifecycle, PendingId, ReceiptArtifact, TerminalResult, View,
+    ColorDepth, ExecLifecycle, NegotiationTarget, PendingId, ReceiptArtifact, TerminalResult, View,
 };
 pub use events::{
     EventData, EventFilter, EventFrame, ExecOrigin, ExecutionFailureKind, NegotiationStage,
@@ -168,17 +168,19 @@ mod tests {
             program: String::new(),
             params: None,
             ensemble: EnsembleSpec::Join {
-                creator: PeerId([3u8; 32]),
-                negotiation_id: NegotiationId([2u8; 32]),
+                target: Some(NegotiationTarget::new(
+                    PeerId([3u8; 32]),
+                    NegotiationId([2u8; 32]),
+                )),
             },
         };
         let join_json = serde_json::to_value(&join_request).unwrap();
         assert_eq!(
-            join_json["params"]["ensemble"]["Join"]["creator"],
+            join_json["params"]["ensemble"]["Join"]["target"]["creator"],
             PeerId([3u8; 32]).to_string()
         );
         assert_eq!(
-            join_json["params"]["ensemble"]["Join"]["negotiation_id"],
+            join_json["params"]["ensemble"]["Join"]["target"]["negotiation_id"],
             NegotiationId([2u8; 32]).to_string()
         );
         assert_eq!(

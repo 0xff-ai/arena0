@@ -37,12 +37,13 @@ use arena0_program::{
 };
 use arena0_protocol::{
     ActivationAnnouncement, EventSource, ExecCreationOrigin, ExecId, ExecutionAdmission,
-    ExecutionEvent, ExecutionFailureCode, ExecutionStatus, FetchFrame, MAX_TICKET_LIFETIME_MS,
-    NegotiationEvent, NegotiationFact, NegotiationGossip, NegotiationId, Offer, OfferData, PeerId,
-    PeerIdSource, PendingId, ReceiptArtifact, SessionHash, StateHash, TerminalKind, Ticket,
-    TicketAction, TicketData, Viewport, system_event::SystemEvent,
+    ExecutionEvent, ExecutionFailureCode, ExecutionStatus, FetchFrame, MAX_CLOCK_SKEW_MS,
+    MAX_TICKET_LIFETIME_MS, NegotiationEvent, NegotiationFact, NegotiationGossip, NegotiationId,
+    NegotiationTarget, Offer, OfferData, OfferHash, PREPARE_WINDOW_MS, PeerId, PeerIdSource,
+    PendingId, ReceiptArtifact, SessionHash, StateHash, TerminalKind, Ticket, TicketAction,
+    TicketData, TicketHash, Viewport, system_event::SystemEvent,
 };
-use arena0_sandbox::{AdmittedProgram, InitializeCall, Program, WasmtimeEngine};
+use arena0_sandbox::{AdmittedProgram, InitializeCall, Program, ViewCall, WasmtimeEngine};
 use arena0_transport::{NegotiationTopic, ProgramTopicEvent, Transport};
 use arena0_verify::{LightVerifiedTerminal as VerifiedLightTerminal, verify_full, verify_light};
 use retry::delay::{Exponential, jitter};
@@ -61,9 +62,10 @@ use crate::schema;
 use crate::startup::{self, StartupStage, StartupTimeline};
 use crate::store::{Keystore, KeystoreError};
 use arena0_store::{
-    ActivationRecord, ActivationRecordStatus, ExecutionRequest, ExecutionRequestFailureOutcome,
-    MAX_PRIVATE_INSPECTION_RECORDS, PrivateCommitSummary as StorePrivateCommitSummary,
-    RecoveryCandidate, RecoveryCursor, StoreHandle,
+    ActivationRecord, ActivationRecordStatus, AdmissionBindingOutcome, ExecutionRequest,
+    ExecutionRequestFailureOutcome, MAX_PRIVATE_INSPECTION_RECORDS,
+    PrivateCommitSummary as StorePrivateCommitSummary, RecoveryCandidate, RecoveryCursor,
+    StoreHandle,
 };
 
 /// Capacity of the event broadcast bus. A slow subscriber that falls this far
@@ -286,8 +288,7 @@ enum NegotiationPlan {
         peers: Vec<PeerId>,
     },
     Join {
-        creator: PeerId,
-        negotiation_id: NegotiationId,
+        target: Option<NegotiationTarget>,
     },
 }
 
@@ -302,21 +303,22 @@ impl NegotiationPlan {
                 target_size: u16::try_from(peers.peers().len()).unwrap_or(u16::MAX),
                 peers: peers.peers().to_vec(),
             },
-            ExecutionAdmission::Join {
-                creator,
+            ExecutionAdmission::Create {
                 negotiation_id,
-            } => Self::Join {
-                creator: *creator,
+                participant_count,
+            } => Self::Create {
                 negotiation_id: *negotiation_id,
+                target_size: *participant_count,
+                peers: Vec::new(),
             },
+            ExecutionAdmission::Join { target } => Self::Join { target: *target },
         }
     }
 
-    fn negotiation_id(&self) -> NegotiationId {
+    fn negotiation_id(&self) -> Option<NegotiationId> {
         match self {
-            Self::Create { negotiation_id, .. } | Self::Join { negotiation_id, .. } => {
-                *negotiation_id
-            }
+            Self::Create { negotiation_id, .. } => Some(*negotiation_id),
+            Self::Join { target } => target.map(|target| target.negotiation_id),
         }
     }
 }
@@ -1237,12 +1239,17 @@ impl HostService {
             tracing::error!(exec_id = %entry.exec_id(), "read execution for negotiation event failed");
             return;
         };
+        let Some(negotiation_id) = request.negotiation_id() else {
+            // An open Join has no negotiation event identity until its first
+            // authenticated offer is durably selected.
+            return;
+        };
         self.events.emit(HostEvent::Negotiation {
             source: EventSource::Negotiation {
                 peer_id: self.peer_id,
                 exec_id: entry.exec_id(),
                 program_id: request.program_hash(),
-                negotiation_id: request.negotiation_id(),
+                negotiation_id,
             },
             event: NegotiationEvent::PeersChanged {
                 lifecycle: entry
@@ -1273,7 +1280,7 @@ impl HostService {
         while tasks.join_next().await.is_some() {}
         drop(tasks);
         for entry in &active {
-            let Ok(negotiation_id) = entry.negotiation_id().await else {
+            let Ok(Some(negotiation_id)) = entry.negotiation_id().await else {
                 continue;
             };
             if let Err(error) = self
@@ -1320,7 +1327,7 @@ impl HostService {
         result: Result<(), ApiError>,
     ) {
         match entry.negotiation_id().await {
-            Ok(negotiation_id) => {
+            Ok(Some(negotiation_id)) => {
                 if let Err(error) = self
                     .transport
                     .release_negotiation_blobs(negotiation_id)
@@ -1329,6 +1336,7 @@ impl HostService {
                     tracing::warn!(%negotiation_id, %error, "failed to release negotiation blobs");
                 }
             }
+            Ok(None) => {}
             Err(error) => {
                 tracing::error!(exec_id = %entry.exec_id(), %error, "read negotiation id for cleanup failed")
             }
@@ -1442,7 +1450,7 @@ impl HostService {
                 exec_id,
                 program_id: request.program_hash(),
             },
-            negotiation_id: Some(request.negotiation_id()),
+            negotiation_id: request.negotiation_id(),
             queue_position: None,
             origin: ExecCreationOrigin::Recovery,
         });
@@ -1603,7 +1611,7 @@ impl HostService {
                 "negotiation",
                 exec_id = %exec_id,
                 program_id = %request.program_hash(),
-                negotiation_id = %request.negotiation_id(),
+                negotiation_id = ?request.negotiation_id(),
             );
             self.tasks.lock().await.spawn(
                 async move {
@@ -1633,7 +1641,7 @@ impl HostService {
                     "negotiation",
                     exec_id = %exec_id,
                     program_id = %request.program_hash(),
-                    negotiation_id = %request.negotiation_id(),
+                    negotiation_id = ?request.negotiation_id(),
                 );
                 self.tasks.lock().await.spawn(
                     async move {
@@ -1716,25 +1724,23 @@ impl HostService {
                             .await;
                     }
                 };
-                let actor_key =
-                    match self
-                        .runtime
-                        .execution_key(&salt, &exec_id, &request.negotiation_id())
-                    {
-                        Ok(key) => key,
-                        Err(error) => {
-                            drop(execution_store);
-                            return self
-                                .fail_recovery_candidate(
-                                    candidate,
-                                    execution_present,
-                                    format!(
-                                        "committed execution crypto cannot be recovered: {error}"
-                                    ),
-                                )
-                                .await;
-                        }
-                    };
+                let actor_key = match self.runtime.execution_key(
+                    &salt,
+                    &exec_id,
+                    &activation.offer().data().negotiation_id,
+                ) {
+                    Ok(key) => key,
+                    Err(error) => {
+                        drop(execution_store);
+                        return self
+                            .fail_recovery_candidate(
+                                candidate,
+                                execution_present,
+                                format!("committed execution crypto cannot be recovered: {error}"),
+                            )
+                            .await;
+                    }
+                };
                 let entry = match self.execs.register_live(exec_id) {
                     Ok(entry) => entry,
                     Err(error) => {
@@ -2399,6 +2405,21 @@ impl HostService {
         ensemble: EnsembleSpec,
     ) -> Response {
         let (program_id, plan, admission) = match ensemble {
+            EnsembleSpec::Create { participant_count } => {
+                let program_id = self.resolve_program(&program).await?;
+                let negotiation_id = arena0_protocol::NegotiationId(rand::random());
+                (
+                    program_id,
+                    NegotiationPlan::Create {
+                        negotiation_id,
+                        target_size: participant_count,
+                        peers: Vec::new(),
+                    },
+                    ExecutionAdmission::create(negotiation_id, participant_count).map_err(
+                        |error| ApiError::new(ApiErrorCode::BadRequest, error.to_string()),
+                    )?,
+                )
+            }
             EnsembleSpec::Explicit { peers } => {
                 if peers.contains(&self.peer_id)
                     || peers.iter().collect::<std::collections::HashSet<_>>().len() != peers.len()
@@ -2432,17 +2453,19 @@ impl HostService {
                     )?,
                 )
             }
-            EnsembleSpec::Join {
-                creator,
-                negotiation_id,
-            } => (
-                self.resolve_program(&program).await?,
-                NegotiationPlan::Join {
-                    creator,
-                    negotiation_id,
-                },
-                ExecutionAdmission::join(creator, negotiation_id),
-            ),
+            EnsembleSpec::Join { target } => {
+                if target.is_some_and(|target| target.creator == self.peer_id) {
+                    return Err(ApiError::new(
+                        ApiErrorCode::BadRequest,
+                        "join creator must be a different Host",
+                    ));
+                }
+                let program_id = self.resolve_program(&program).await?;
+                let admission = target.map_or_else(ExecutionAdmission::join_open, |target| {
+                    ExecutionAdmission::join(target.creator, target.negotiation_id)
+                });
+                (program_id, NegotiationPlan::Join { target }, admission)
+            }
         };
 
         let registered_program = self
@@ -2509,7 +2532,7 @@ impl HostService {
                 exec_id,
                 program_id,
             },
-            negotiation_id: Some(negotiation_id),
+            negotiation_id,
             queue_position,
             origin: ExecCreationOrigin::Request,
         });
@@ -2520,7 +2543,7 @@ impl HostService {
             "negotiation",
             exec_id = %exec_id,
             program_id = %program_id,
-            negotiation_id = %negotiation_id,
+            negotiation_id = ?negotiation_id,
         );
         self.tasks.lock().await.spawn(
             async move {
@@ -2805,10 +2828,187 @@ impl HostService {
                 local_ticket,
                 activation: Box::new(prepared),
             },
-            deadline,
+            Some(deadline),
             execution_store,
         )
         .await
+    }
+
+    /// Wait for one usable offer and its authenticated creator ticket on a program
+    /// topic. Offers and tickets are broadcast independently, so the small maps
+    /// below tolerate either fact arriving first. An open Join is bound only after
+    /// the pair has passed the same program/profile/boot validation used by the
+    /// negotiation driver.
+    async fn receive_offer(
+        &self,
+        topic: &mut Box<dyn NegotiationTopic>,
+        program: &Program,
+        target: Option<NegotiationTarget>,
+        bootstrap: &[PeerId],
+        deadline: Option<Instant>,
+    ) -> Result<(Offer, Ticket), ApiError> {
+        let program_id = program.hash();
+        let local_peer = self.peer_id;
+        let expected_creator = target.map(|target| target.creator);
+        let expected_negotiation = target.map(|target| target.negotiation_id);
+        let events = &self.events;
+        let engine = Arc::clone(&self.engine);
+        const PENDING_FACTS: usize = 128;
+        let mut pending_offers = HashMap::<(PeerId, NegotiationId, u64), Offer>::new();
+        let mut pending_tickets = HashMap::<(PeerId, NegotiationId, u64), Ticket>::new();
+        let mut retry_delays =
+            Exponential::from_millis(100).map(|delay| jitter(delay.min(Duration::from_secs(2))));
+        let mut retry_at = Instant::now()
+            + retry_delays
+                .next()
+                .expect("an exponential retry iterator is infinite");
+        loop {
+            let event = match timeout_at(
+                deadline.map_or(retry_at, |deadline| deadline.min(retry_at)),
+                topic.recv(),
+            )
+            .await
+            {
+                Ok(event) => event
+                    .map_err(|error| ApiError::new(ApiErrorCode::Negotiation, error.to_string()))?,
+                Err(_) if deadline.is_some_and(|deadline| Instant::now() >= deadline) => {
+                    return Err(offer_timeout());
+                }
+                Err(_) => {
+                    let _ = topic.join_peers(bootstrap.to_vec()).await;
+                    retry_at = Instant::now()
+                        + retry_delays
+                            .next()
+                            .expect("an exponential retry iterator is infinite");
+                    continue;
+                }
+            };
+            let ProgramTopicEvent::Fact(fact) = event else {
+                match event {
+                    ProgramTopicEvent::Joined
+                    | ProgramTopicEvent::NeighborUp(_)
+                    | ProgramTopicEvent::NeighborDown(_) => continue,
+                    ProgramTopicEvent::Lagged | ProgramTopicEvent::Closed => {
+                        let operation_deadline =
+                            deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(5));
+                        let _ = timeout_at(operation_deadline, topic.close()).await;
+                        *topic = timeout_at(
+                            operation_deadline,
+                            self.subscribe_negotiation(program_id, bootstrap.to_vec()),
+                        )
+                        .await
+                        .map_err(|_| offer_timeout())??;
+                        continue;
+                    }
+                    ProgramTopicEvent::Fact(_) => unreachable!(),
+                }
+            };
+            let Ok(frame) = NegotiationGossip::decode(&fact.bytes) else {
+                continue;
+            };
+            if frame.program_id != program_id {
+                continue;
+            }
+            match frame.fact {
+                NegotiationFact::Offer(offer) => {
+                    let data = offer.data();
+                    if offer.validate().is_err()
+                        || data.program_hash != program_id
+                        || data.creator == local_peer
+                        || expected_creator.is_some_and(|creator| data.creator != creator)
+                        || expected_negotiation
+                            .is_some_and(|negotiation_id| data.negotiation_id != negotiation_id)
+                        // A complete offer has already frozen its participant set;
+                        // a fresh Join cannot safely add itself to that evidence.
+                        || offer.is_complete()
+                    {
+                        continue;
+                    }
+                    let key = (data.creator, data.negotiation_id, data.offer_seq);
+                    if let Some(ticket) = pending_tickets.get(&key)
+                        && creator_ticket_matches(&offer, ticket)
+                    {
+                        // Decode and initialize the offered params only after the
+                        // creator's Active ticket has authenticated this offer.
+                        if offer_is_usable_for_join(&offer, program, Arc::clone(&engine), deadline)
+                            .await
+                            && creator_ticket_matches(&offer, ticket)
+                        {
+                            let ticket = ticket.clone();
+                            pending_tickets.remove(&key);
+                            tracing::debug!(
+                                %program_id,
+                                negotiation_id = %data.negotiation_id,
+                                creator = %data.creator,
+                                "accepted offer"
+                            );
+                            events.emit(HostEvent::OfferSeen {
+                                program_id,
+                                negotiation_id: data.negotiation_id,
+                                creator: data.creator,
+                                offer_seq: data.offer_seq,
+                            });
+                            return Ok((offer, ticket));
+                        }
+                        pending_tickets.remove(&key);
+                        continue;
+                    }
+                    if pending_offers.len() >= PENDING_FACTS
+                        && let Some(key) = pending_offers.keys().next().copied()
+                    {
+                        pending_offers.remove(&key);
+                    }
+                    pending_offers.insert(key, offer);
+                }
+                NegotiationFact::Ticket(ticket) => {
+                    let data = &ticket.data;
+                    if ticket.validate().is_err()
+                        || !matches!(data.action, TicketAction::Active { .. })
+                        || expected_creator.is_some_and(|creator| data.signer != creator)
+                        || expected_negotiation
+                            .is_some_and(|negotiation_id| data.negotiation_id != negotiation_id)
+                    {
+                        continue;
+                    }
+                    let key = (data.signer, data.negotiation_id, data.offer_seq);
+                    if let Some(offer) = pending_offers.get(&key)
+                        && creator_ticket_matches(offer, &ticket)
+                    {
+                        if offer_is_usable_for_join(offer, program, Arc::clone(&engine), deadline)
+                            .await
+                            && creator_ticket_matches(offer, &ticket)
+                        {
+                            let offer = offer.clone();
+                            pending_offers.remove(&key);
+                            tracing::debug!(
+                                %program_id,
+                                negotiation_id = %data.negotiation_id,
+                                creator = %data.signer,
+                                "accepted offer"
+                            );
+                            events.emit(HostEvent::OfferSeen {
+                                program_id,
+                                negotiation_id: data.negotiation_id,
+                                creator: data.signer,
+                                offer_seq: data.offer_seq,
+                            });
+                            return Ok((offer, ticket));
+                        }
+                        pending_offers.remove(&key);
+                        continue;
+                    }
+                    if pending_tickets.len() >= PENDING_FACTS
+                        && let Some(key) = pending_tickets.keys().next().copied()
+                    {
+                        pending_tickets.remove(&key);
+                    }
+                    pending_tickets.insert(key, ticket);
+                }
+                NegotiationFact::ActivationSignature(_)
+                | NegotiationFact::ActivationAnnouncement(_)
+                | NegotiationFact::Counteroffer(_) => {}
+            }
+        }
     }
 
     async fn drive_negotiation(
@@ -2819,8 +3019,17 @@ impl HostService {
         plan: NegotiationPlan,
         mut execution_store: HostExecutionStore,
     ) -> Result<(), ApiError> {
-        let _guard = self.runtime.negotiation_guard().await;
-        let deadline = Instant::now() + NEGOTIATION_TIMEOUT;
+        let mut withdrawal = entry.withdrawal_receiver();
+        let _guard = tokio::select! {
+            biased;
+            () = wait_for_withdrawal(&mut withdrawal) => return Err(local_withdrawal()),
+            guard = self.runtime.negotiation_guard() => guard,
+        };
+        let deadline = match &plan {
+            NegotiationPlan::Create { peers, .. } if peers.is_empty() => None,
+            NegotiationPlan::Join { target: None } => None,
+            _ => Some(Instant::now() + NEGOTIATION_TIMEOUT),
+        };
 
         let program = self
             .catalog
@@ -2841,15 +3050,18 @@ impl HostService {
                 let (_admitted, initial_state) =
                     admit_for(&program, Arc::clone(&self.engine), params.clone(), "create").await?;
                 let issued_at = unix_time_ms();
-                let deadline_unix_ms =
-                    issued_at
-                        .checked_add(MAX_TICKET_LIFETIME_MS)
-                        .ok_or_else(|| {
-                            ApiError::new(
-                                ApiErrorCode::Negotiation,
-                                "offer deadline timestamp overflowed",
-                            )
-                        })?;
+                // Leave the creator ticket's clock-skew and prepare margins
+                // before the first offer is deserted. That gives the driver
+                // a clean re-offer boundary instead of a late-ticket dead
+                // zone between ticket expiry and offer expiry.
+                let offer_lifetime =
+                    MAX_TICKET_LIFETIME_MS.saturating_sub(MAX_CLOCK_SKEW_MS + PREPARE_WINDOW_MS);
+                let deadline_unix_ms = issued_at.checked_add(offer_lifetime).ok_or_else(|| {
+                    ApiError::new(
+                        ApiErrorCode::Negotiation,
+                        "offer deadline timestamp overflowed",
+                    )
+                })?;
                 let offer_data = OfferData::new(
                     negotiation_id,
                     0,
@@ -2884,31 +3096,51 @@ impl HostService {
                 let topic = self.subscribe_negotiation(program_id, bootstrap).await?;
                 (offer, Some(creator_ticket), topic, peers)
             }
-            NegotiationPlan::Join {
-                creator,
-                negotiation_id,
-            } => {
-                let bootstrap =
-                    negotiation_bootstrap(self.peer_id, Some(creator), std::iter::empty());
+            NegotiationPlan::Join { target } => {
+                let bootstrap = negotiation_bootstrap(
+                    self.peer_id,
+                    target.map(|target| target.creator),
+                    std::iter::empty(),
+                );
                 let mut topic = self
                     .subscribe_negotiation(program_id, bootstrap.clone())
                     .await?;
-                let offer = receive_offer(
-                    &mut *topic,
-                    program_id,
-                    Some(creator),
-                    Some(negotiation_id),
-                    &bootstrap,
-                    deadline,
-                    &self.events,
+                let received = tokio::select! {
+                    biased;
+                    () = wait_for_withdrawal(&mut withdrawal) => return Err(local_withdrawal()),
+                    result = self.receive_offer(&mut topic, &program, target, &bootstrap, deadline) => result,
+                };
+                let (offer, creator_ticket) = received?;
+                if *withdrawal.borrow() {
+                    return Err(local_withdrawal());
+                }
+                let selected_target =
+                    NegotiationTarget::new(offer.data().creator, offer.data().negotiation_id);
+                if target.is_none() {
+                    match execution_store
+                        .bind_join_target(selected_target)
+                        .await
+                        .map_err(|error| {
+                            ApiError::new(
+                                ApiErrorCode::Negotiation,
+                                format!("could not bind selected join target: {error}"),
+                            )
+                        })? {
+                        AdmissionBindingOutcome::Bound | AdmissionBindingOutcome::AlreadyBound => {}
+                        AdmissionBindingOutcome::Conflict => {
+                            return Err(ApiError::new(
+                                ApiErrorCode::Negotiation,
+                                "open Join was already bound to a different negotiation",
+                            ));
+                        }
+                    }
+                }
+                (
+                    offer,
+                    Some(creator_ticket),
+                    topic,
+                    vec![selected_target.creator],
                 )
-                .await?;
-                validate_participants(
-                    program.definition().metadata.participants,
-                    offer.data().target_size,
-                )
-                .map_err(|error| ApiError::new(ApiErrorCode::Negotiation, error.message))?;
-                (offer, None, topic, vec![creator])
             }
         };
 
@@ -2941,7 +3173,7 @@ impl HostService {
         program: Program,
         topic: Box<dyn NegotiationTopic>,
         start: NegotiationStart,
-        deadline: Instant,
+        deadline: Option<Instant>,
         mut execution_store: HostExecutionStore,
     ) -> Result<(), ApiError> {
         let (offer, withdrawal_capacity, rebuild_stage) = match &start {
@@ -3232,8 +3464,8 @@ impl HostService {
         })
     }
 
-    /// Render a live execution view. Finished or still-negotiating executions return
-    /// an `Execution` error so clients can keep rendering status/outcome cards.
+    /// Render the program view from live or terminal shared state. Terminal
+    /// projection uses its durable snapshot after the execution actor exits.
     async fn view(
         &self,
         exec_id: ExecId,
@@ -3256,6 +3488,50 @@ impl HostService {
                     "execution has no active state; view is available only while Active",
                 )
             })?;
+        let viewport = serde_json::to_vec(&Viewport { width, color })
+            .map_err(|error| ApiError::new(ApiErrorCode::BadRequest, error.to_string()))?;
+        let viewport = JsonBytes::try_new(viewport)
+            .map_err(|error| ApiError::new(ApiErrorCode::BadRequest, error.to_string()))?;
+        if state.lifecycle().is_terminal() {
+            if state.binding().execution_profile()
+                != arena0_program::ExecutionProfile::current().hash()
+            {
+                return Err(ApiError::new(
+                    ApiErrorCode::Execution,
+                    "execution profile is not supported by this runtime",
+                ));
+            }
+            let program = self
+                .catalog
+                .load_program(state.binding().program_hash())
+                .await
+                .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
+            let ensemble = arena0_protocol::Ensemble::from_peers(
+                state
+                    .binding()
+                    .activation()
+                    .tickets()
+                    .iter()
+                    .map(|ticket| ticket.data.signer)
+                    .collect(),
+            )
+            .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
+            let engine = Arc::clone(&self.engine);
+            let step = state.public().next_step();
+            let shared = state.shared_state().clone();
+            let projection = tokio::task::spawn_blocking(move || {
+                engine
+                    .admit(&program)?
+                    .view(ViewCall::new(shared, ensemble, viewport))
+            })
+            .await
+            .map_err(|error| ApiError::new(ApiErrorCode::Internal, error.to_string()))?
+            .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
+            let view = serde_json::from_slice(projection.output.as_bytes()).map_err(|error| {
+                ApiError::new(ApiErrorCode::Execution, format!("view projection: {error}"))
+            })?;
+            return Ok(ResponseOk::ExecView { step, view });
+        }
         if !matches!(
             state.lifecycle(),
             ExecLifecycle::Active | ExecLifecycle::Waiting
@@ -3272,10 +3548,6 @@ impl HostService {
             ApiError::new(ApiErrorCode::Execution, "execution has no live driver")
         })?;
 
-        let viewport = serde_json::to_vec(&Viewport { width, color })
-            .map_err(|error| ApiError::new(ApiErrorCode::BadRequest, error.to_string()))?;
-        let viewport = JsonBytes::try_new(viewport)
-            .map_err(|error| ApiError::new(ApiErrorCode::BadRequest, error.to_string()))?;
         let (step, view) = entry.view(viewport).await?;
         Ok(ResponseOk::ExecView { step, view })
     }
@@ -3412,7 +3684,7 @@ fn project_exec_status_facts(
 ) -> anyhow::Result<ExecStatus> {
     let exec_id = request.execution_id();
     let program_id = request.program_hash();
-    let negotiation_id = Some(request.negotiation_id());
+    let negotiation_id = request.negotiation_id();
     let pending_callout = pending.and_then(|request| match request {
         arena0_store::PendingRequest::Callout {
             pending_id,
@@ -3867,11 +4139,20 @@ fn recovery_event_source(peer_id: PeerId, candidate: &RecoveryCandidate) -> Even
             program_id: request.program_hash(),
             session_hash,
         },
-        _ => EventSource::Negotiation {
-            peer_id,
-            exec_id: request.execution_id(),
-            program_id: request.program_hash(),
-            negotiation_id: request.negotiation_id(),
+        _ => match request.negotiation_id() {
+            Some(negotiation_id) => EventSource::Negotiation {
+                peer_id,
+                exec_id: request.execution_id(),
+                program_id: request.program_hash(),
+                negotiation_id,
+            },
+            // An open Join may fail before any offer is accepted, so no
+            // negotiation identity exists for its recovery event.
+            None => EventSource::Execution {
+                peer_id,
+                exec_id: request.execution_id(),
+                program_id: request.program_hash(),
+            },
         },
     }
 }
@@ -3884,85 +4165,91 @@ fn recovery_reason(reason: String) -> String {
     reason
 }
 
-/// Wait for one valid, unexpired offer on a program topic. The offer is
-/// self-contained: params travel inside the offer, so no terms-blob fetch
-/// exists. Any valid offer is returned regardless of its params: a
-/// differing preference is countered by the driver, never filtered here.
-async fn receive_offer(
-    topic: &mut dyn NegotiationTopic,
-    program_id: ProgramHash,
-    expected_creator: Option<PeerId>,
-    expected_negotiation: Option<NegotiationId>,
-    bootstrap: &[PeerId],
-    deadline: Instant,
-    events: &Events,
-) -> Result<Offer, ApiError> {
-    let mut retry_delays =
-        Exponential::from_millis(100).map(|delay| jitter(delay.min(Duration::from_secs(2))));
-    let mut retry_at = Instant::now()
-        + retry_delays
-            .next()
-            .expect("an exponential retry iterator is infinite");
+fn local_withdrawal() -> ApiError {
+    ApiError::new(ApiErrorCode::Negotiation, LOCAL_WITHDRAWAL_REASON)
+}
+
+async fn wait_for_withdrawal(withdrawal: &mut watch::Receiver<bool>) {
     loop {
-        let event = match timeout_at(deadline.min(retry_at), topic.recv()).await {
-            Ok(event) => event
-                .map_err(|error| ApiError::new(ApiErrorCode::Negotiation, error.to_string()))?,
-            Err(_) if Instant::now() >= deadline => return Err(offer_timeout()),
-            Err(_) => {
-                let _ = topic.join_peers(bootstrap.to_vec()).await;
-                retry_at = Instant::now()
-                    + retry_delays
-                        .next()
-                        .expect("an exponential retry iterator is infinite");
-                continue;
-            }
-        };
-        let ProgramTopicEvent::Fact(fact) = event else {
-            match event {
-                ProgramTopicEvent::Joined
-                | ProgramTopicEvent::NeighborUp(_)
-                | ProgramTopicEvent::NeighborDown(_) => continue,
-                ProgramTopicEvent::Lagged | ProgramTopicEvent::Closed => {
-                    return Err(ApiError::new(
-                        ApiErrorCode::Negotiation,
-                        "negotiation topic closed before an offer arrived",
-                    ));
-                }
-                ProgramTopicEvent::Fact(_) => unreachable!(),
-            }
-        };
-        let Ok(frame) = NegotiationGossip::decode(&fact.bytes) else {
-            continue;
-        };
-        if frame.program_id != program_id {
-            continue;
+        if *withdrawal.borrow_and_update() {
+            return;
         }
-        let NegotiationFact::Offer(offer) = frame.fact else {
-            continue;
-        };
-        if offer.validate().is_err()
-            || offer.data().program_hash != program_id
-            || expected_creator.is_some_and(|creator| offer.data().creator != creator)
-            || expected_negotiation
-                .is_some_and(|negotiation_id| offer.data().negotiation_id != negotiation_id)
-            || offer.data().deadline_unix_ms <= unix_time_ms()
-        {
-            continue;
+        if withdrawal.changed().await.is_err() {
+            std::future::pending::<()>().await;
         }
-        tracing::debug!(
-            %program_id,
-            negotiation_id = %offer.data().negotiation_id,
-            creator = %offer.data().creator,
-            "accepted offer"
-        );
-        events.emit(HostEvent::OfferSeen {
-            program_id,
-            negotiation_id: offer.data().negotiation_id,
-            creator: offer.data().creator,
-            offer_seq: offer.data().offer_seq,
-        });
-        return Ok(offer);
     }
+}
+
+/// Check the creator's Active ticket against the exact offer body and the
+/// creator-first hash committed by that offer. This is the authentication
+/// boundary before an open Join is durably bound or allowed to issue a ticket.
+fn creator_ticket_matches(offer: &Offer, ticket: &Ticket) -> bool {
+    ticket.data.signer == offer.data().creator
+        && ticket.data.negotiation_id == offer.data().negotiation_id
+        && ticket.data.offer_seq == offer.data().offer_seq
+        && matches!(ticket.data.action, TicketAction::Active { .. })
+        && offer
+            .tickets()
+            .first()
+            .is_some_and(|hash| *hash == TicketHash::of(&ticket.data))
+        && ticket
+            .verify_for_offer(&OfferHash::of(offer.data()))
+            .is_ok()
+        && creator_ticket_has_window(ticket)
+}
+
+fn creator_ticket_has_window(ticket: &Ticket) -> bool {
+    let TicketAction::Active {
+        issued_at_unix_ms,
+        valid_for_ms,
+        ..
+    } = &ticket.data.action
+    else {
+        return false;
+    };
+    let now = unix_time_ms();
+    *issued_at_unix_ms <= now.saturating_add(MAX_CLOCK_SKEW_MS)
+        && issued_at_unix_ms.saturating_add(u64::from(*valid_for_ms))
+            >= now.saturating_add(MAX_CLOCK_SKEW_MS + PREPARE_WINDOW_MS)
+}
+
+async fn offer_is_usable_for_join(
+    offer: &Offer,
+    program: &Program,
+    engine: Arc<WasmtimeEngine>,
+    deadline: Option<Instant>,
+) -> bool {
+    let data = offer.data();
+    let now = unix_time_ms();
+    if data.deadline_unix_ms <= now.saturating_add(PREPARE_WINDOW_MS)
+        || data
+            .validate_for_profile(arena0_program::ExecutionProfile::current().hash())
+            .is_err()
+        || !program
+            .definition()
+            .metadata
+            .participants
+            .accepts(data.target_size)
+        || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+    {
+        return false;
+    }
+    // Decode and initialize the offered params before binding the durable
+    // target. A preference mismatch remains eligible: the creator may counter
+    // it after this offer is authenticated.
+    let Ok((_, initial_state)) = admit_for(
+        program,
+        engine,
+        data.params.as_bytes().to_vec(),
+        "join offer",
+    )
+    .await
+    else {
+        return false;
+    };
+    initial_state == data.initial_state
+        && data.deadline_unix_ms > unix_time_ms().saturating_add(PREPARE_WINDOW_MS)
+        && deadline.is_none_or(|deadline| Instant::now() < deadline)
 }
 
 /// Wire negotiation's durable boundaries directly to the supplied execution

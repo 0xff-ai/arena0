@@ -1183,11 +1183,15 @@ async fn create_executions(
     let negotiation_id = match created {
         Ok(ResponseOk::ExecCreated {
             exec_id,
-            negotiation_id,
+            negotiation_id: Some(negotiation_id),
             ..
         }) if exec_id == creator_exec => negotiation_id,
         Ok(ResponseOk::ExecCreated { exec_id, .. }) => {
-            let error = anyhow!("creator Host returned ExecId {exec_id}, requested {creator_exec}");
+            let error = if exec_id == creator_exec {
+                anyhow!("creator Host returned no negotiation id")
+            } else {
+                anyhow!("creator Host returned ExecId {exec_id}, requested {creator_exec}")
+            };
             let partial = LocalParticipant {
                 host: creator.host.clone(),
                 client: creator.client.clone(),
@@ -1245,8 +1249,10 @@ async fn create_executions(
                         program: program_id.to_string(),
                         params: None,
                         ensemble: EnsembleSpec::Join {
-                            creator: creator_peer,
-                            negotiation_id,
+                            target: Some(arena0_client::protocol::NegotiationTarget::new(
+                                creator_peer,
+                                negotiation_id,
+                            )),
                         },
                     },
                     &mut cancelled,
@@ -2873,7 +2879,7 @@ mod tests {
     ) -> Response {
         Ok(ResponseOk::ExecCreated {
             exec_id,
-            negotiation_id,
+            negotiation_id: Some(negotiation_id),
             session_id: None,
             exec_state: ExecLifecycle::Negotiating,
             queue_position: None,

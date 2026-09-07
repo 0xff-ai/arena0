@@ -29,7 +29,8 @@ pub enum ResponseOk {
     /// when this creation waits behind another daemon-wide negotiation.
     ExecCreated {
         exec_id: ExecId,
-        negotiation_id: NegotiationId,
+        /// The selected negotiation, absent while an open Join is listening.
+        negotiation_id: Option<NegotiationId>,
         /// Absent until the N-of-N activation is durably stored.
         session_id: Option<SessionHash>,
         exec_state: ExecLifecycle,

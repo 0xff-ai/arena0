@@ -31,6 +31,7 @@ use crate::server::{Events, HostEvent};
 /// How often to warn while an active session emits no messages.
 const STALL_TIMEOUT: Duration = Duration::from_secs(300);
 const EXECUTION_STOP_TIMEOUT: Duration = Duration::from_secs(6);
+/// Time allowed to finish a selected activation or an exact targeted join.
 pub(crate) const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
@@ -86,7 +87,7 @@ impl ExecutionHandle {
         Ok(self.store.load_activation(self.exec_id).await?)
     }
 
-    pub(crate) async fn negotiation_id(&self) -> anyhow::Result<NegotiationId> {
+    pub(crate) async fn negotiation_id(&self) -> anyhow::Result<Option<NegotiationId>> {
         self.request()
             .await?
             .map(|request| request.negotiation_id())
@@ -139,12 +140,21 @@ impl ExecutionHandle {
                 session_hash: state.binding().session_id(),
             });
         }
-        Ok(EventSource::Negotiation {
-            peer_id,
-            exec_id: self.exec_id,
-            program_id,
-            negotiation_id: self.negotiation_id().await?,
-        })
+        match self.negotiation_id().await? {
+            Some(negotiation_id) => Ok(EventSource::Negotiation {
+                peer_id,
+                exec_id: self.exec_id,
+                program_id,
+                negotiation_id,
+            }),
+            // An open Join can fail before it accepts an offer, so there is
+            // no negotiation identity to attach to its terminal event.
+            None => Ok(EventSource::Execution {
+                peer_id,
+                exec_id: self.exec_id,
+                program_id,
+            }),
+        }
     }
 
     pub(crate) async fn await_state(

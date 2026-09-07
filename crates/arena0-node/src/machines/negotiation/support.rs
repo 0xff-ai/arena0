@@ -57,8 +57,8 @@ pub enum NegotiationStart {
         /// The validated offer with the creator's ticket hash already present.
         offer: Offer,
         /// The creator's signed ticket matching the first hash in `offer`.
-        /// Participants leave this absent because they receive the creator's
-        /// ticket through gossip after accepting the offer.
+        /// A participant may receive this together with its selected offer,
+        /// avoiding a second ordering race; gossip remains the retry path.
         creator_ticket: Option<Ticket>,
         preferred_params: Option<Vec<u8>>,
     },
@@ -95,14 +95,17 @@ impl NegotiationSupervision {
     }
 }
 
-/// All domain inputs for one bounded negotiation attempt.
+/// All domain inputs for one negotiation attempt.
 #[allow(missing_debug_implementations)]
 pub struct NegotiationAttempt {
     pub topic: Box<dyn NegotiationTopic>,
     pub exec_id: ExecId,
     pub start: NegotiationStart,
     pub supervision: Option<NegotiationSupervision>,
-    pub deadline: Instant,
+    /// The outer deadline, when the caller wants bounded negotiation. `None`
+    /// keeps discovery open until the offer reaches the prepared boundary;
+    /// the driver then installs its bounded completion deadline.
+    pub deadline: Option<Instant>,
 }
 
 /// Async callback used at the durable prepared-activation boundary.
@@ -155,6 +158,9 @@ pub enum NegotiationDriveError {
     /// The local ticket was malformed, invalid, expired, or not bound to the offer.
     #[error("invalid local negotiation ticket")]
     InvalidLocalTicket,
+    /// The creator froze an exact participant set that excludes this Host.
+    #[error("creator selected a different participant set")]
+    NotSelected,
     /// The offer names a deterministic execution environment this Host cannot run.
     #[error("execution profile mismatch: offered {offered}, local {local}")]
     ExecutionProfileMismatch {

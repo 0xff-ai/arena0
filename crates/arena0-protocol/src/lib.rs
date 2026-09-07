@@ -42,7 +42,7 @@ pub use peer::Id as PeerId;
 pub use peer::IdSource as PeerIdSource;
 pub use session::Hash as SessionHash;
 
-pub use admission::ExecutionAdmission;
+pub use admission::{ExecutionAdmission, NegotiationTarget};
 pub use arena0_program::{
     ABI_VERSION, LocalStateBytes, MAX_LOCAL_STATE_BYTES, MAX_SHARED_STATE_BYTES, ProgramHash,
     SharedStateBytes, StateBytesError,

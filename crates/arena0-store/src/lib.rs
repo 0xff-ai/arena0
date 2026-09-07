@@ -31,8 +31,9 @@ use arena0_protocol::execution::{
 };
 use arena0_protocol::{
     Activation, ExecFrame, ExecId, ExecLifecycle, ExecutionAdmission, LocalStateBytes, MessageId,
-    PeerId, PreparedActivation, PrivateEffect, PrivateEvent, ProtocolError, SessionHash,
-    SharedStateBytes, StateHash, StepCommitment, TerminalCommitment, WitnessCommitment,
+    NegotiationTarget, PeerId, PreparedActivation, PrivateEffect, PrivateEvent, ProtocolError,
+    SessionHash, SharedStateBytes, StateHash, StepCommitment, TerminalCommitment,
+    WitnessCommitment,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -350,7 +351,7 @@ impl ExecutionRequest {
 
     /// Return the negotiation identity derived from the admission authority.
     #[must_use]
-    pub const fn negotiation_id(&self) -> arena0_protocol::NegotiationId {
+    pub const fn negotiation_id(&self) -> Option<arena0_protocol::NegotiationId> {
         self.admission.negotiation_id()
     }
 
@@ -381,6 +382,17 @@ pub enum ExecutionRequestOutcome {
     /// The exact request root already existed.
     AlreadyExists,
     /// The execution identity was already bound to different request facts.
+    Conflict,
+}
+
+/// Result of binding an open Join request to its first accepted offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionBindingOutcome {
+    /// The open request now names this exact creator and negotiation.
+    Bound,
+    /// The same target was already durably selected.
+    AlreadyBound,
+    /// A different target was already selected.
     Conflict,
 }
 
@@ -1208,6 +1220,11 @@ enum Command {
         created_at_ms: u64,
         reply: oneshot::Sender<Result<ExecutionRequestOutcome, StoreError>>,
     },
+    BindJoinTarget {
+        execution_id: ExecId,
+        target: NegotiationTarget,
+        reply: oneshot::Sender<Result<AdmissionBindingOutcome, StoreError>>,
+    },
     LoadExecutionRequest {
         execution_id: ExecId,
         reply: oneshot::Sender<Result<Option<ExecutionRequest>, StoreError>>,
@@ -1565,6 +1582,27 @@ impl StoreHandle {
                 reply,
             },
             128,
+        )
+        .await?;
+        response.await.map_err(|_| StoreError::ReplyDropped)?
+    }
+
+    /// Bind an open Join request to one exact offer before local consent is
+    /// signed. The store performs a compare-and-set: retries can observe the
+    /// same target, but they cannot replace it with another negotiation.
+    pub async fn bind_join_target(
+        &self,
+        execution_id: ExecId,
+        target: NegotiationTarget,
+    ) -> Result<AdmissionBindingOutcome, StoreError> {
+        let (reply, response) = oneshot::channel();
+        self.send(
+            Command::BindJoinTarget {
+                execution_id,
+                target,
+                reply,
+            },
+            256,
         )
         .await?;
         response.await.map_err(|_| StoreError::ReplyDropped)?
@@ -2017,6 +2055,16 @@ impl ExecutionStore {
     #[must_use]
     pub const fn execution_id(&self) -> ExecId {
         self.execution_id
+    }
+
+    /// Bind an open Join request to its selected offer before ticket signing.
+    pub async fn bind_join_target(
+        &mut self,
+        target: NegotiationTarget,
+    ) -> Result<AdmissionBindingOutcome, StoreError> {
+        self.handle
+            .bind_join_target(self.execution_id, target)
+            .await
     }
 
     /// Create the durable local admission root for this execution.

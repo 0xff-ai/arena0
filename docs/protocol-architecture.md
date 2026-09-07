@@ -186,28 +186,40 @@ agent APIs unchanged.
 
 ## 6. Admission
 
-The public API has exactly two admission forms:
+The current API has two admission forms:
 
 ```rust
 enum EnsembleSpec {
-    Explicit { peers: Vec<PeerId> },
-    Join {
-        creator: PeerId,
-        negotiation_id: NegotiationId,
-    },
+    Create { participant_count: u16 },
+    Join { target: Option<NegotiationTarget> },
 }
 ```
 
-`Explicit` creates a negotiation and selects exactly the listed peers plus the
-creator. The request must contain unique peers that exclude the local Host. The
-daemon canonicalizes the set, enforces the 2-to-64 participant bound, and
-checks that the program supports the resulting count. Fixed-size
-programs declare one exact count; variable-size programs declare an inclusive range.
-There is no discovery fallback.
+`Create` makes the local Host the creator and collects exactly
+`participant_count` Participants, including that Host. The daemon creates the
+`NegotiationId`, enforces the 2-to-64 participant bound, and checks that the
+program supports the requested count. Fixed-size programs declare one exact
+count; variable-size programs declare an inclusive range. The older
+`Explicit { peers }` form remains accepted for launcher compatibility and
+selects the listed peers plus the creator.
 
-`Join` subscribes to the program topic and accepts only the negotiation authored
-by the exact creator with the exact `NegotiationId`. There are no invite tokens,
+`Join` carries an optional `target`. With `target: Some`, it subscribes to the
+program topic and considers only the offer authored by that creator with that
+`NegotiationId`. With `target: None`, it listens for the first usable offer on
+the program topic. An open Join starts without a negotiation identity.
+
+An offer is usable only after the joiner validates its program hash, execution
+profile, participant count, initial state, and the creator's signed Active
+ticket. The daemon then compares and sets the open request's target before it
+signs a local ticket. The same target may be retried; a different target is
+rejected. The selected target and negotiation identity are durable, so a
+restart cannot move the execution to another offer. There are no invite tokens,
 peer-only joins, rooms, or guest-driven discovery.
+
+`Create` and targeted `Join` requests have a negotiation identity immediately.
+For an open Join, `ExecCreated.negotiation_id` is `null` until the authenticated
+offer is selected; status carries the same optional value, and the creation
+event omits it while it is unknown.
 
 The socket request has an optional local `params` value for both forms. An
 explicit request validates and stores its parameters before it publishes the
@@ -220,6 +232,13 @@ recomputes the initial state before it signs.
 
 The creator remains the participant-set authority. The transport and daemon
 supervisor do not add peers implicitly.
+
+An open Join keeps discovery open until an offer is authenticated or the
+execution is explicitly withdrawn. Once the offer reaches the prepared
+boundary, negotiation uses a bounded completion deadline. A client may observe
+`waiting` while polling through MCP; that result only ends the current bounded
+wait. Calling `await_execution_event` again renews the wait on the same durable
+execution.
 
 ## 7. Negotiation and activation
 
@@ -243,8 +262,9 @@ OfferData {
 
 The creator publishes an offer and its active ticket. Joiners validate the
 offer, compute the exact program initial state in their own bounded sandbox,
-publish their signed tickets, and converge on the ordered ticket set. The
-creator freezes the exact participant set when the target is reached.
+authenticate the creator's ticket, publish their signed tickets, and converge
+on the ordered ticket set. The creator freezes the exact participant set when
+the target is reached.
 
 Every selected Host independently validates:
 

@@ -43,9 +43,6 @@ pub(crate) struct MonitorArgs {
 /// Attach the unified observatory to a live daemon roster.
 pub(crate) async fn attach(entry_client: DaemonClient, args: MonitorArgs) -> anyhow::Result<()> {
     let roster = discover_hosts(&entry_client, &args.hosts).await?;
-    if roster.is_empty() {
-        bail!("daemon roster contains no Hosts to monitor");
-    }
     let config = TuiConfig {
         program: "daemon executions".to_owned(),
         hosts: roster
@@ -62,6 +59,7 @@ pub(crate) async fn attach(entry_client: DaemonClient, args: MonitorArgs) -> any
     let (mut session, mut actions) = TuiSession::start_monitor(config, cancel);
     let handle = session.handle();
     let mut workers = JoinSet::new();
+    let mut subscriptions = BTreeMap::new();
     let observe = async {
         handle
             .update(RunUpdate::Monitor(MonitorUpdate::Hosts {
@@ -71,17 +69,54 @@ pub(crate) async fn attach(entry_client: DaemonClient, args: MonitorArgs) -> any
         for host in roster {
             let client = entry_client.clone();
             let handle = handle.clone();
-            workers.spawn(async move { host_worker(host, client, handle).await });
+            let name = host.host.clone();
+            let peer = host.peer_id;
+            let task = workers.spawn(async move { host_worker(host, client, handle).await });
+            subscriptions.insert(name, (peer, task));
         }
         workers.spawn(activity_worker(entry_client.clone(), handle.clone()));
+        let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
         loop {
             tokio::select! {
+                _ = ticker.tick() => {
+                    let roster = match discover_hosts(&entry_client, &args.hosts).await {
+                        Ok(roster) => roster,
+                        Err(error) => {
+                            handle.update(RunUpdate::Monitor(MonitorUpdate::Gap {
+                                host: None,
+                                exec_id: None,
+                                summary: format!("Host roster unavailable: {error:#}"),
+                            })).await?;
+                            continue;
+                        }
+                    };
+                    subscriptions.retain(|name, (peer, task)| {
+                        let present = roster.iter().any(|host| &host.host == name && host.peer_id == *peer);
+                        if !present {
+                            task.abort();
+                        }
+                        present
+                    });
+                    for host in &roster {
+                        if !subscriptions.contains_key(&host.host) {
+                            let client = entry_client.clone();
+                            let handle = handle.clone();
+                            let observed = host.clone();
+                            let task = workers.spawn(async move { host_worker(observed, client, handle).await });
+                            subscriptions.insert(host.host.clone(), (host.peer_id, task));
+                        }
+                    }
+                    handle.update(RunUpdate::Monitor(MonitorUpdate::Hosts { hosts: roster })).await?;
+                }
                 action = actions.recv() => {
                     let Some(action) = action else { return Ok::<(), anyhow::Error>(()); };
                     submit_action(&entry_client, &handle, action).await?;
                 }
                 joined = workers.join_next() => {
                     let Some(joined) = joined else { return Ok(()); };
+                    if joined.as_ref().is_err_and(|error| error.is_cancelled()) {
+                        continue;
+                    }
                     joined.context("monitor subscription task")??;
                 }
             }

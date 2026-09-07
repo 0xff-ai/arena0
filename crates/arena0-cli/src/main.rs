@@ -14,6 +14,7 @@ mod process;
 mod progress;
 mod run;
 mod serve;
+mod setup;
 mod terminal;
 mod tui;
 mod ui;
@@ -124,6 +125,11 @@ enum Command {
     Skill,
     /// Start the persistent local Host service.
     Serve(serve::ServeArgs),
+    /// Create project-local harness skill and MCP configuration files.
+    Setup {
+        #[command(subcommand)]
+        target: setup::Target,
+    },
     /// Launch a headless emulation, or open the launcher when PROGRAM is omitted.
     Launch {
         /// Program name, id, or Wasm path.
@@ -328,6 +334,9 @@ fn main() -> ExitCode {
     if let Some(exit) = dispatch_skill(&cli) {
         return exit;
     }
+    if let Some(exit) = dispatch_setup(&cli) {
+        return exit;
+    }
     if cli.tmp && matches!(cli.command, Some(Command::Monitor(_))) {
         eprintln!("error: --tmp does not apply to `arena0 monitor`; attach to an existing home");
         return ExitCode::FAILURE;
@@ -401,6 +410,28 @@ fn dispatch_skill(cli: &Cli) -> Option<ExitCode> {
         Ok(())
     })();
 
+    Some(match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            ExitCode::FAILURE
+        }
+    })
+}
+
+/// Dispatch project-local setup before resolving Home, installing tracing, or
+/// creating a Tokio runtime. Setup only reads and creates files below cwd.
+fn dispatch_setup(cli: &Cli) -> Option<ExitCode> {
+    let target = match cli.command.as_ref() {
+        Some(Command::Setup { target }) => target.clone(),
+        _ => return None,
+    };
+    let result = (|| -> anyhow::Result<()> {
+        if cli.socket.is_some() || cli.host.is_some() || cli.tmp || cli.json {
+            bail!("--socket, --host, --tmp, and --json do not apply to arena0 setup");
+        }
+        setup::run(target)
+    })();
     Some(match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -583,6 +614,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             return serve::serve(args);
         }
+        Command::Setup { .. } => unreachable!("setup returned before runtime setup"),
         Command::Launch {
             program,
             hosts,
@@ -807,6 +839,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     match command {
         Command::Skill => unreachable!("offline skill returned before runtime setup"),
         Command::Serve(_) => unreachable!("serve returned before client construction"),
+        Command::Setup { .. } => unreachable!("setup returned before client construction"),
         Command::Status => status(&ctx, host_selected).await,
         Command::Stop => stop(&ctx).await,
         Command::Identity { command } => identity(&ctx, command).await,
@@ -1389,16 +1422,20 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
                     if ctx.mode.is_json() {
                         ui::print_json(&json!({
                             "exec_id": returned_exec_id.to_string(),
-                            "negotiation_id": negotiation_id.to_string(),
+                            "negotiation_id": negotiation_id.map(|id| id.to_string()),
                             "session_id": session_id.map(|id| id.to_string()),
                             "exec_state": exec_state,
                             "queue_position": queue_position,
                         }));
                     } else {
+                        let negotiation = negotiation_id.map_or_else(
+                            || "waiting for offer".to_owned(),
+                            |id| id.fmt_short().to_string(),
+                        );
                         println!(
                             "created exec {}  negotiation {}  state {:?}",
                             returned_exec_id.fmt_short(),
-                            negotiation_id.fmt_short(),
+                            negotiation,
                             exec_state
                         );
                     }
@@ -1939,6 +1976,7 @@ mod tests {
                 .is_err()
         );
         assert!(Cli::try_parse_from(["arena0", "--host", "host-01", "status"]).is_ok());
+        assert!(Cli::try_parse_from(["arena0", "mcp"]).is_err());
         assert!(
             Cli::try_parse_from([
                 "arena0",

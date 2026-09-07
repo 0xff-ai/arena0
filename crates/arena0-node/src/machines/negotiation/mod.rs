@@ -238,6 +238,21 @@ impl<'a> NegotiationBook<'a> {
         }
     }
 
+    /// Retain only this negotiation's current offer slot and newer slots.
+    ///
+    /// Re-offers supersede an older offer by reference. Once the new offer has
+    /// been validated and registered, keeping the retired slots only consumes
+    /// bounded book capacity and lets stale tickets remain addressable. The
+    /// current slot is retained so the caller can immediately apply its
+    /// creator ticket.
+    pub fn prune_offers_before(&mut self, negotiation_id: NegotiationId, minimum_offer_seq: u64) {
+        if let Some(state) = self.negotiations.get_mut(&negotiation_id) {
+            state
+                .offers
+                .retain(|offer_seq, _| *offer_seq >= minimum_offer_seq);
+        }
+    }
+
     /// Number of current tickets for one offer.
     #[must_use]
     pub fn len(&self, negotiation_id: NegotiationId, offer_seq: u64) -> usize {

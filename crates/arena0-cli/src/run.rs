@@ -4,7 +4,7 @@ use std::io::{IsTerminal as _, Write as _};
 
 use anyhow::{Context, bail};
 use arena0_client::api::{EnsembleSpec, HostRequest, NextEvent, ResponseOk};
-use arena0_client::protocol::{ExecId, NegotiationId, PeerId, SessionHash};
+use arena0_client::protocol::{ExecId, NegotiationId, NegotiationTarget, PeerId, SessionHash};
 use serde_json::Value;
 
 use crate::Ctx;
@@ -21,8 +21,7 @@ pub(crate) fn parse_join_ensemble(values: &[String]) -> anyhow::Result<EnsembleS
         .parse::<NegotiationId>()
         .map_err(|_| anyhow::anyhow!("invalid join negotiation id: {negotiation_id}"))?;
     Ok(EnsembleSpec::Join {
-        creator,
-        negotiation_id,
+        target: Some(NegotiationTarget::new(creator, negotiation_id)),
     })
 }
 

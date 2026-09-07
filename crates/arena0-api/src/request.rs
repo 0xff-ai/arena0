@@ -10,7 +10,7 @@
 
 use arena0_program::ProgramHash;
 use arena0_protocol::{
-    ColorDepth, ExecId, NegotiationId, PeerId, PendingId, ReceiptArtifact, SessionHash,
+    ColorDepth, ExecId, NegotiationTarget, PeerId, PendingId, ReceiptArtifact, SessionHash,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -165,19 +165,17 @@ pub enum AwaitState {
     Terminal,
 }
 
-/// How `exec.new` starts or joins a negotiation. `Explicit` creates one and
-/// contacts exactly `peers`; `Join` names the creator and exact negotiation to
-/// join.
+/// How `exec.new` starts or joins a negotiation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum EnsembleSpec {
-    Explicit {
-        peers: Vec<PeerId>,
-    },
-    /// Join one exact negotiation published by `creator`.
-    Join {
-        creator: PeerId,
-        negotiation_id: NegotiationId,
-    },
+    /// Create an offer and collect exactly this many participants, including
+    /// the local Host.
+    Create { participant_count: u16 },
+    /// Legacy launcher form retained while callers migrate to [`Self::Create`].
+    Explicit { peers: Vec<PeerId> },
+    /// Join the first valid offer on the program topic, or one exact offer
+    /// when `target` is supplied.
+    Join { target: Option<NegotiationTarget> },
 }
 
 /// Reference an identity by `PeerId` or operator label.

@@ -166,7 +166,7 @@ async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Re
     let (exec_a, negotiation_id) = match created {
         ResponseOk::ExecCreated {
             exec_id,
-            negotiation_id,
+            negotiation_id: Some(negotiation_id),
             ..
         } => (exec_id, negotiation_id),
         other => return Err(anyhow!("unexpected execution response: {other:?}")),
@@ -179,8 +179,10 @@ async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Re
                 program: "rock-paper-scissors".into(),
                 params: None,
                 ensemble: EnsembleSpec::Join {
-                    creator: peer_a,
-                    negotiation_id,
+                    target: Some(arena0_client::protocol::NegotiationTarget::new(
+                        peer_a,
+                        negotiation_id,
+                    )),
                 },
             },
         )

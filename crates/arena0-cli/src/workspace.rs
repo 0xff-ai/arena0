@@ -171,6 +171,9 @@ struct State {
     programs: Vec<ProgramDetail>,
     executions: Vec<ExecStatus>,
     selected: usize,
+    setup_focused: bool,
+    setup_scroll: u16,
+    setup_scroll_limit: std::cell::Cell<u16>,
     participants: usize,
     input_control: InputControl,
     replay: bool,
@@ -194,6 +197,9 @@ impl State {
             programs,
             executions,
             selected: 0,
+            setup_focused: false,
+            setup_scroll: 0,
+            setup_scroll_limit: std::cell::Cell::new(0),
             participants,
             input_control: InputControl::OneHost {
                 host: HostName::for_local_index(0),
@@ -246,6 +252,7 @@ impl State {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Some(Ok(Exit::Quit));
         }
+        self.setup_scroll = self.setup_scroll.min(self.setup_scroll_limit.get());
         match &mut self.mode {
             Mode::EditParams { draft } => match key.code {
                 KeyCode::Esc => {
@@ -288,30 +295,86 @@ impl State {
                 None
             }
             Mode::Browse => match key.code {
+                KeyCode::Left | KeyCode::Up => {
+                    self.setup_focused = false;
+                    None
+                }
+                KeyCode::Right | KeyCode::Down => {
+                    self.setup_focused = true;
+                    None
+                }
+                KeyCode::Tab | KeyCode::BackTab => {
+                    self.setup_focused = !self.setup_focused;
+                    None
+                }
+                KeyCode::Char('k') if self.setup_focused => {
+                    self.setup_scroll = self.setup_scroll.saturating_sub(1);
+                    None
+                }
+                KeyCode::Char('j') if self.setup_focused => {
+                    self.setup_scroll = self.setup_scroll.saturating_add(1);
+                    None
+                }
+                KeyCode::Char('u' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if self.setup_focused {
+                        self.setup_scroll = if key.code == KeyCode::Char('u') {
+                            self.setup_scroll.saturating_sub(8)
+                        } else {
+                            self.setup_scroll.saturating_add(8)
+                        };
+                    } else {
+                        self.selected = if key.code == KeyCode::Char('u') {
+                            self.selected.saturating_sub(8)
+                        } else {
+                            self.selected
+                                .saturating_add(8)
+                                .min(self.programs.len().saturating_sub(1))
+                        };
+                        self.program_changed();
+                    }
+                    None
+                }
+                KeyCode::Char('g' | 'G') => {
+                    if self.setup_focused {
+                        self.setup_scroll = if key.code == KeyCode::Char('g') {
+                            0
+                        } else {
+                            u16::MAX
+                        };
+                    } else {
+                        self.selected = if key.code == KeyCode::Char('g') {
+                            0
+                        } else {
+                            self.programs.len().saturating_sub(1)
+                        };
+                        self.program_changed();
+                    }
+                    None
+                }
                 KeyCode::Char('q') => Some(Ok(Exit::Quit)),
                 KeyCode::Char('?') => {
                     self.mode = Mode::Help;
                     None
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Char('k') if !self.setup_focused => {
                     if self.selected > 0 {
                         self.selected -= 1;
                         self.program_changed();
                     }
                     None
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Char('j') if !self.setup_focused => {
                     if self.selected + 1 < self.programs.len() {
                         self.selected += 1;
                         self.program_changed();
                     }
                     None
                 }
-                KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Right => {
+                KeyCode::Char('+') | KeyCode::Char('=') => {
                     self.adjust_participants(1);
                     None
                 }
-                KeyCode::Char('-') | KeyCode::Left => {
+                KeyCode::Char('-') => {
                     self.adjust_participants(-1);
                     None
                 }
@@ -509,15 +572,15 @@ fn render(frame: &mut Frame<'_>, state: &State) {
     }
     let keys = if matches!(state.input_control, InputControl::Configured(_)) {
         vec![Line::raw(
-            "↑↓ select    p params    r replay    Enter launch    ? help    q quit",
+            "j/k select  arrows focus    p params    r replay    Enter launch    ? help    q quit",
         )]
     } else if footer.width >= 104 {
         vec![Line::raw(
-            "↑↓ select    +/- Hosts    c control    h Host    p params    r replay    Enter run    ? help    q quit",
+            "j/k select  arrows focus    +/- Hosts    c control    h Host    p params    r replay    Enter run    ? help    q quit",
         )]
     } else {
         vec![
-            Line::raw("↑↓ select    +/- Hosts    c control    h Host"),
+            Line::raw("j/k select  arrows focus    +/- Hosts    c control    h Host"),
             Line::raw("p params    r replay    Enter run    ? help    q quit"),
         ]
     };
@@ -604,8 +667,20 @@ fn render_splash(frame: &mut Frame<'_>, state: &State, area: Rect) {
 }
 
 fn render_catalog(frame: &mut Frame<'_>, state: &State, area: Rect) {
-    let title = format!(" PROGRAMS  {} AVAILABLE ", state.programs.len());
-    let block = panel(&title, state.palette.strong(), state);
+    let title = format!(
+        " PROGRAMS  {} AVAILABLE{} ",
+        state.programs.len(),
+        if state.setup_focused { "" } else { "  [FOCUS]" }
+    );
+    let block = panel(
+        &title,
+        if state.setup_focused {
+            state.palette.muted()
+        } else {
+            state.palette.strong()
+        },
+        state,
+    );
     let body = block.inner(area);
     let lines = state
         .programs
@@ -622,7 +697,15 @@ fn render_catalog(frame: &mut Frame<'_>, state: &State, area: Rect) {
             ])
         })
         .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let scroll = state
+        .selected
+        .saturating_sub(usize::from(body.height.saturating_sub(1)));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
+            .block(block),
+        area,
+    );
 }
 
 fn render_setup(frame: &mut Frame<'_>, state: &State, area: Rect) {
@@ -731,12 +814,29 @@ fn render_setup(frame: &mut Frame<'_>, state: &State, area: Rect) {
             ]));
         }
     }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(panel(" RUN SETUP ", state.palette.emphasis(), state)),
-        area,
+    let title = if state.setup_focused {
+        " RUN SETUP  [FOCUS] "
+    } else {
+        " RUN SETUP "
+    };
+    let block = panel(
+        title,
+        if state.setup_focused {
+            state.palette.strong()
+        } else {
+            state.palette.muted()
+        },
+        state,
     );
+    let inner = block.inner(area);
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let last = paragraph
+        .line_count(inner.width)
+        .saturating_sub(usize::from(inner.height));
+    let last = u16::try_from(last).unwrap_or(u16::MAX);
+    state.setup_scroll_limit.set(last);
+    let scroll = state.setup_scroll.min(last);
+    frame.render_widget(paragraph.scroll((scroll, 0)).block(block), area);
 }
 
 fn render_params_editor(frame: &mut Frame<'_>, state: &State, draft: &str) {
@@ -800,10 +900,13 @@ fn render_params_editor(frame: &mut Frame<'_>, state: &State, draft: &str) {
 }
 
 fn render_help(frame: &mut Frame<'_>, state: &State) {
-    let area = centered(frame.area(), 68, 15);
+    let area = centered(frame.area(), 76, 17);
     frame.render_widget(Clear, area);
     let lines = [
-        ("↑/↓ or j/k", "Select a program"),
+        ("Arrows / Tab", "Move focus between Programs and Run Setup"),
+        ("j/k", "Select a program or scroll Run Setup"),
+        ("Ctrl-U / Ctrl-D", "Jump up or down in the focused pane"),
+        ("g / G", "First / last position"),
         ("+/-", "Change the exact local Host count"),
         ("c", "Toggle One Host or All Hosts human control"),
         ("h", "Select the human-controlled Host in One Host mode"),

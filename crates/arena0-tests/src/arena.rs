@@ -361,7 +361,7 @@ impl Arena {
                         preferred_params: None,
                     },
                     supervision: None,
-                    deadline,
+                    deadline: Some(deadline),
                 };
                 let prepare: arena0_node::PrepareEffect = Box::new(
                     |store: &mut arena0_store::ExecutionStore,

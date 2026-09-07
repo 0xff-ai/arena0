@@ -121,6 +121,58 @@ fn inspection(host_number: u8, sequence: u64) -> ExecutionInspection {
 }
 
 #[test]
+fn empty_monitor_discovers_participants_and_renders_their_views() {
+    let (actions, _receiver) = mpsc::channel(4);
+    let mut initial = config();
+    initial.hosts.clear();
+    let mut state = ScreenState::new_monitor(initial, actions);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    terminal.draw(|frame| render(frame, &state)).unwrap();
+    let screen = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    };
+    assert!(screen(&terminal).contains("Waiting for Participants"));
+
+    state.apply(RunUpdate::Monitor(MonitorUpdate::Hosts {
+        hosts: config()
+            .hosts
+            .into_iter()
+            .map(|host| MonitorHost {
+                host: host.host,
+                peer_id: host.peer_id,
+            })
+            .collect(),
+    }));
+    for index in [1, 2] {
+        let inspected = inspection(index, 0);
+        let status = inspected.status.clone();
+        state.apply(RunUpdate::Monitor(MonitorUpdate::Execution {
+            key: MonitorExecutionKey {
+                host: format!("host-{index:02}").parse().unwrap(),
+                exec_id: status.exec_id,
+            },
+            status,
+            inspection: Some(inspected),
+            view: Some((3, View::new().state("Current board"))),
+            trace: Vec::new(),
+            observed_at: epoch_seconds(),
+            stale: false,
+            gap: None,
+        }));
+    }
+    assert_eq!(state.monitor_projection().unwrap().config.hosts.len(), 2);
+    terminal.draw(|frame| render(frame, &state)).unwrap();
+    let output = screen(&terminal);
+    assert!(output.contains("Current board"), "{output}");
+}
+
+#[test]
 fn one_terminal_host_does_not_override_another_hosts_lifecycle() {
     let mut state = ScreenState::new(config());
     let mut completed = active_status();
@@ -512,7 +564,7 @@ fn composer_shortcut_then_backtab_returns_to_visible_records() {
     assert_eq!(state.page.region(), DetailRegion::Records);
     assert_eq!(state.page.inspector(), None);
     assert_eq!(state.focus, Focus::Workspace);
-    state.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    state.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
     assert_eq!(state.details_scroll, 0);
 }
 
@@ -566,7 +618,7 @@ fn detail_region_routes_program_hosts_and_inspector_scrolling() {
     state.host_scope = HostScope::All;
     assert_eq!(state.selected_host, Some(first_host()));
 
-    state.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    state.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
     assert_eq!(state.selected_host, Some("host-02".parse().unwrap()));
 
     state.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -629,7 +681,7 @@ fn hosts_have_an_independent_cursor_and_enter_activates_scope() {
     assert_eq!(state.host_cursor, 0);
     assert!(matches!(state.host_scope, HostScope::All));
 
-    state.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    state.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
     assert_eq!(state.host_cursor, 1);
     assert!(matches!(state.host_scope, HostScope::All));
     state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -753,7 +805,7 @@ fn view_history_is_bounded_and_navigable() {
 
     state.page.select(WorkspaceView::Program);
     state.focus = Focus::Workspace;
-    state.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+    state.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
     assert!(!state.is_live_view());
     assert_eq!(
         state
@@ -773,7 +825,7 @@ fn view_history_is_bounded_and_navigable() {
             .and_then(|view| view.slots.get(&Slot::State)),
         Some(&"score 258".to_owned())
     );
-    state.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+    state.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
     assert!(state.is_live_view());
     state.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
     assert!(state.is_live_view());
@@ -1265,9 +1317,18 @@ fn monitor_enter_scrolls_detail_and_escape_returns_to_overview() {
     assert!(state.monitor.as_ref().expect("monitor").detail);
     assert_eq!(
         state.monitor.as_ref().expect("monitor").view,
-        WorkspaceView::Program
+        WorkspaceView::Overview
     );
     state.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(state.page.pane(), OverviewPane::Program.next());
+    assert_eq!(state.monitor_projection().unwrap().page, state.page);
+    state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        state.monitor.as_ref().unwrap().view,
+        state.page.pane().view()
+    );
+    state.on_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+    state.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
     assert_eq!(state.details_scroll, 1);
 
     state.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -1392,7 +1453,7 @@ fn monitor_home_then_down_moves_to_second_row_after_last_selection() {
     }
     state.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
     state.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
-    state.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    state.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
     assert_eq!(
         state
             .monitor
@@ -1456,7 +1517,7 @@ fn monitor_trace_detail_decodes_messages_and_scrolls_inspector() {
     );
     state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     state.on_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
-    state.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    state.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
     assert_eq!(
         state
             .monitor_projection()
@@ -1469,7 +1530,7 @@ fn monitor_trace_detail_decodes_messages_and_scrolls_inspector() {
         state.monitor.as_ref().expect("monitor").region,
         DetailRegion::Inspector
     );
-    state.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    state.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
     assert_eq!(state.details_scroll, 1);
     state.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert_eq!(

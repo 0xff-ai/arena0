@@ -10,9 +10,9 @@ use arena0_protocol::execution::{
 };
 use arena0_protocol::{
     Activation, ActivationData, AggregateAttestation, Ensemble, ExecutionAdmission, FrameId,
-    NegotiationId, Offer, OfferData, PreparedActivation, PrivateEffect, PrivateEvent,
-    PrivateRecord, PublicEffect, PublicEvent, TRACE_FORMAT_VERSION, Ticket, TicketAction,
-    TicketData,
+    NegotiationId, NegotiationTarget, Offer, OfferData, PreparedActivation, PrivateEffect,
+    PrivateEvent, PrivateRecord, PublicEffect, PublicEvent, TRACE_FORMAT_VERSION, Ticket,
+    TicketAction, TicketData,
 };
 use std::path::Path;
 
@@ -667,6 +667,60 @@ async fn explicit_admission_requires_params() {
 }
 
 #[tokio::test]
+async fn create_admission_rejects_invalid_participant_counts() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("store.sqlite");
+    let host_id = host(3);
+    let store = Store::open(StoreConfig::new(&path, host_id)).expect("open");
+    let wasm = vec![0, 1, 2, 3];
+    let hash = ProgramHash::of(&wasm);
+    store
+        .handle()
+        .register_program(wasm, 1)
+        .await
+        .expect("program");
+
+    for (index, participant_count) in [0_u16, 1, u16::MAX].into_iter().enumerate() {
+        let byte = 0x7a_u8 + u8::try_from(index).expect("test index");
+        let execution_id = ExecId([byte; 32]);
+        let mut writer = store
+            .handle()
+            .claim_execution(execution_id)
+            .expect("execution writer");
+        let result = writer
+            .create_execution_request(
+                hash,
+                Some(JsonBytes::try_new(br#"{}"#.to_vec()).expect("params")),
+                ExecutionAdmission::Create {
+                    negotiation_id: NegotiationId([byte; 32]),
+                    participant_count,
+                },
+                2,
+            )
+            .await;
+        assert!(matches!(result, Err(StoreError::InvalidAdmission(_))));
+        assert!(
+            writer
+                .load_execution_request()
+                .await
+                .expect("load")
+                .is_none()
+        );
+        drop(writer);
+        assert!(
+            store
+                .handle()
+                .load_execution_request(execution_id)
+                .await
+                .expect("load after rollback")
+                .is_none()
+        );
+    }
+
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn join_without_params_accepts_creator_activation() {
     let fixture = activation_fixture();
     let directory = tempfile::tempdir().expect("tempdir");
@@ -759,6 +813,105 @@ async fn join_preferred_params_must_match_creator_activation() {
     ));
     drop(writer);
     store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn open_join_target_binding_is_compare_and_set_and_durable() {
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("store.sqlite");
+    let joiner = other_peer(&fixture);
+    let store = Store::open(StoreConfig::new(&path, joiner)).expect("open");
+    let hash = ProgramHash::of(&fixture.program);
+    store
+        .handle()
+        .register_program(fixture.program.clone(), 1)
+        .await
+        .expect("program");
+
+    let target = NegotiationTarget::new(fixture.producer, NegotiationId([0x76; 32]));
+    let other_target = NegotiationTarget::new(fixture.producer, NegotiationId([0x77; 32]));
+    let execution_id = ExecId([0x78; 32]);
+    let failed_execution_id = ExecId([0x79; 32]);
+    let mut writer = store
+        .handle()
+        .claim_execution(execution_id)
+        .expect("execution writer");
+    writer
+        .create_execution_request(hash, None, ExecutionAdmission::join_open(), 2)
+        .await
+        .expect("request");
+    let request = writer
+        .load_execution_request()
+        .await
+        .expect("load open request")
+        .expect("request");
+    assert_eq!(request.negotiation_id(), None);
+    assert_eq!(request.admission().target(), None);
+    assert_eq!(
+        writer.bind_join_target(target).await.expect("bind target"),
+        AdmissionBindingOutcome::Bound
+    );
+    assert_eq!(
+        writer.bind_join_target(target).await.expect("retry target"),
+        AdmissionBindingOutcome::AlreadyBound
+    );
+    assert_eq!(
+        writer
+            .bind_join_target(other_target)
+            .await
+            .expect("conflicting target result"),
+        AdmissionBindingOutcome::Conflict
+    );
+    let request = writer
+        .load_execution_request()
+        .await
+        .expect("load bound request")
+        .expect("request");
+    assert_eq!(request.negotiation_id(), Some(target.negotiation_id));
+    assert_eq!(request.admission().target(), Some(target));
+    drop(writer);
+
+    let mut failed_writer = store
+        .handle()
+        .claim_execution(failed_execution_id)
+        .expect("failed execution writer");
+    failed_writer
+        .create_execution_request(hash, None, ExecutionAdmission::join_open(), 3)
+        .await
+        .expect("failed request");
+    assert_eq!(
+        failed_writer
+            .record_execution_request_failure("negotiation unavailable")
+            .await
+            .expect("record failure"),
+        ExecutionRequestFailureOutcome::Recorded
+    );
+    assert!(matches!(
+        failed_writer.bind_join_target(target).await,
+        Err(StoreError::ExecutionLifecycleStarted(id)) if id == failed_execution_id
+    ));
+    drop(failed_writer);
+    store.shutdown().await.expect("shutdown");
+
+    let reopened = Store::open(StoreConfig::new(&path, joiner)).expect("reopen");
+    let request = reopened
+        .handle()
+        .load_execution_request(execution_id)
+        .await
+        .expect("load durable request")
+        .expect("request");
+    assert_eq!(request.admission().target(), Some(target));
+    assert_eq!(request.negotiation_id(), Some(target.negotiation_id));
+    let failed_request = reopened
+        .handle()
+        .load_execution_request(failed_execution_id)
+        .await
+        .expect("load failed request")
+        .expect("failed request");
+    assert_eq!(failed_request.failure(), Some("negotiation unavailable"));
+    assert_eq!(failed_request.admission().target(), None);
+    reopened.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]

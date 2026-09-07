@@ -12,12 +12,14 @@ use arena0_crypto::{ExecutionKey, ExecutionSalt, NodeKeys};
 use arena0_program::{JsonBytes, ProgramHash};
 use arena0_protocol::{
     Activation, Ensemble, ExecId, ExecutionAdmission, ExecutionInput, FrameId, LocalStateBytes,
-    PeerIdSource, PreparedActivation, ReceiptArtifact, SessionHash, SharedStateBytes, View,
+    NegotiationTarget, PeerIdSource, PreparedActivation, ReceiptArtifact, SessionHash,
+    SharedStateBytes, View,
 };
 use arena0_sandbox::AdmittedProgram;
 use arena0_store::{
-    CommitActivationOutcome, CreateExecutionOutcome, ExecutionRequestFailureOutcome,
-    ExecutionRequestOutcome, ExecutionStore, PrepareActivationOutcome, StoreError,
+    AdmissionBindingOutcome, CommitActivationOutcome, CreateExecutionOutcome,
+    ExecutionRequestFailureOutcome, ExecutionRequestOutcome, ExecutionStore,
+    PrepareActivationOutcome, StoreError,
 };
 use arena0_transport::{ExecDelivery, RecvHandle, Transport};
 use thiserror::Error;
@@ -238,6 +240,16 @@ impl HostExecutionStore {
         reason: impl Into<String>,
     ) -> Result<ExecutionRequestFailureOutcome, StoreError> {
         self.store.record_execution_request_failure(reason).await
+    }
+
+    /// Bind an open Join request to its first accepted offer before ticket
+    /// signing. The compare-and-set in the store makes retries idempotent and
+    /// prevents a later offer from replacing the selected target.
+    pub async fn bind_join_target(
+        &mut self,
+        target: NegotiationTarget,
+    ) -> Result<AdmissionBindingOutcome, StoreError> {
+        self.store.bind_join_target(target).await
     }
 
     /// Load or create the execution's durable local secret.

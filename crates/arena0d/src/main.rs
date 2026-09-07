@@ -16,8 +16,11 @@ use clap::Parser;
 struct Args {
     /// Host names to supervise. Repeat for each participant; defaults to two
     /// distinct Hosts so the local bilateral path works immediately.
-    #[arg(long = "host", value_name = "NAME")]
+    #[arg(long = "host", value_name = "NAME", conflicts_with = "no_hosts")]
     hosts: Vec<HostName>,
+    /// Start with no Hosts; MCP clients can open Hosts on demand.
+    #[arg(long, conflicts_with = "hosts")]
+    no_hosts: bool,
     /// Do not mint identities or import the built-in programs on first boot.
     #[arg(long)]
     no_bootstrap: bool,
@@ -37,7 +40,9 @@ async fn main() -> anyhow::Result<()> {
         .with_ansi(std::io::stderr().is_terminal())
         .init();
 
-    let names = if args.hosts.is_empty() {
+    let names = if args.no_hosts {
+        Vec::new()
+    } else if args.hosts.is_empty() {
         (0..2).map(HostName::for_local_index).collect()
     } else {
         args.hosts
@@ -45,4 +50,21 @@ async fn main() -> anyhow::Result<()> {
     let bearer_token = std::env::var("ARENA0_MCP_TOKEN").ok();
     let mcp = arena0_daemon::McpConfig::new(args.mcp_listen, bearer_token)?;
     arena0_daemon::run(names, !args.no_bootstrap, mcp).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_hosts_selects_an_empty_initial_topology() {
+        let args = Args::try_parse_from(["arena0d", "--no-hosts"]).expect("parse no-hosts");
+        assert!(args.no_hosts);
+        assert!(args.hosts.is_empty());
+    }
+
+    #[test]
+    fn no_hosts_cannot_be_combined_with_named_hosts() {
+        assert!(Args::try_parse_from(["arena0d", "--no-hosts", "--host", "host-01"]).is_err());
+    }
 }

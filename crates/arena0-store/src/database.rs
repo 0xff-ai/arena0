@@ -76,6 +76,13 @@ fn dispatch_command(database: &mut Database, command: Command) {
                 created_at_ms,
             ));
         }
+        Command::BindJoinTarget {
+            execution_id,
+            target,
+            reply,
+        } => {
+            let _ = reply.send(database.bind_join_target(execution_id, target));
+        }
         Command::LoadExecutionRequest {
             execution_id,
             reply,

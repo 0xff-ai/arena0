@@ -10,7 +10,7 @@ use arena0_api::{
     AwaitState, ColorDepth, EnsembleSpec, EventData, EventFilter, EventFrame, ExecLifecycle,
     HostRequest, ReceiptArtifact, Request, Response, ResponseOk,
 };
-use arena0_protocol::{ExecId, Slot};
+use arena0_protocol::{ExecId, NegotiationTarget, Slot};
 use common::{HostTarget, call, call_daemon, created, daemon, drive, ok, rps_wasm};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
@@ -55,7 +55,7 @@ async fn exec_new_returns_immediately_and_await_blocks() {
         ResponseOk::ExecCreated {
             exec_id,
             exec_state,
-            negotiation_id,
+            negotiation_id: Some(negotiation_id),
             ..
         } => (exec_id, exec_state, negotiation_id),
         other => panic!("unexpected: {other:?}"),
@@ -73,8 +73,7 @@ async fn exec_new_returns_immediately_and_await_blocks() {
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
             ensemble: EnsembleSpec::Join {
-                creator: d.peer_a,
-                negotiation_id,
+                target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
             },
         },
     )
@@ -157,7 +156,7 @@ async fn competing_callout_submissions_return_typed_conflict_and_execution_conti
     {
         ResponseOk::ExecCreated {
             exec_id,
-            negotiation_id,
+            negotiation_id: Some(negotiation_id),
             ..
         } => (exec_id, negotiation_id),
         other => panic!("unexpected creator response: {other:?}"),
@@ -170,8 +169,7 @@ async fn competing_callout_submissions_return_typed_conflict_and_execution_conti
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
                 ensemble: EnsembleSpec::Join {
-                    creator: d.peer_a,
-                    negotiation_id,
+                    target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
                 },
             },
         )
@@ -242,7 +240,7 @@ async fn stale_callout_after_terminal_is_typed_conflict_and_missing_exec_is_not_
     {
         ResponseOk::ExecCreated {
             exec_id,
-            negotiation_id,
+            negotiation_id: Some(negotiation_id),
             ..
         } => (exec_id, negotiation_id),
         other => panic!("unexpected creator response: {other:?}"),
@@ -255,8 +253,7 @@ async fn stale_callout_after_terminal_is_typed_conflict_and_missing_exec_is_not_
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
                 ensemble: EnsembleSpec::Join {
-                    creator: d.peer_a,
-                    negotiation_id,
+                    target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
                 },
             },
         )
@@ -434,7 +431,7 @@ async fn negotiating_ticket_can_be_withdrawn() {
     }
 }
 
-/// `exec.view` is served only while an execution is Active.
+/// `exec.view` renders active and terminal shared state, but not negotiation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executions() {
     let wasm = rps_wasm();
@@ -455,7 +452,7 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
     {
         ResponseOk::ExecCreated {
             exec_id,
-            negotiation_id,
+            negotiation_id: Some(negotiation_id),
             ..
         } => (exec_id, negotiation_id),
         other => panic!("unexpected creator response: {other:?}"),
@@ -486,8 +483,7 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
                 ensemble: EnsembleSpec::Join {
-                    creator: d.peer_a,
-                    negotiation_id,
+                    target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
                 },
             },
         )
@@ -539,17 +535,34 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
         };
         assert_eq!(status.lifecycle(), ExecLifecycle::Completed);
     }
-    let terminal = call(
-        &d.host_a,
-        &HostRequest::ExecView {
-            exec: exec_a,
-            width: 80,
-            color: ColorDepth::Ansi16,
-        },
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(terminal.code, arena0_api::ApiErrorCode::Execution);
+    let mut terminal_views = Vec::new();
+    for (socket, exec) in [(&d.host_a, exec_a), (&d.host_b, exec_b)] {
+        match ok(call(
+            socket,
+            &HostRequest::ExecView {
+                exec,
+                width: 80,
+                color: ColorDepth::Ansi16,
+            },
+        )
+        .await)
+        {
+            ResponseOk::ExecView { step, view } => {
+                assert!(step > 0);
+                assert!(
+                    view.slots
+                        .get(&Slot::Header)
+                        .is_some_and(|header| !header.is_empty())
+                );
+                terminal_views.push((step, view.slots));
+            }
+            other => panic!("unexpected terminal view: {other:?}"),
+        }
+    }
+    assert_eq!(
+        terminal_views[0], terminal_views[1],
+        "same terminal shared-state view"
+    );
 
     let missing = call(
         &d.host_a,
@@ -597,7 +610,7 @@ async fn events_subscribe_streams_negotiation_step_terminal() {
     {
         ResponseOk::ExecCreated {
             exec_id,
-            negotiation_id,
+            negotiation_id: Some(negotiation_id),
             ..
         } => (exec_id, negotiation_id),
         other => panic!("unexpected creator response: {other:?}"),
@@ -610,8 +623,7 @@ async fn events_subscribe_streams_negotiation_step_terminal() {
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
                 ensemble: EnsembleSpec::Join {
-                    creator: d.peer_a,
-                    negotiation_id,
+                    target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
                 },
             },
         )
@@ -708,7 +720,7 @@ async fn receipt_id_import_idempotence_and_list() {
     {
         ResponseOk::ExecCreated {
             exec_id,
-            negotiation_id,
+            negotiation_id: Some(negotiation_id),
             ..
         } => (exec_id, negotiation_id),
         other => panic!("unexpected creator response: {other:?}"),
@@ -721,8 +733,7 @@ async fn receipt_id_import_idempotence_and_list() {
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
                 ensemble: EnsembleSpec::Join {
-                    creator: d.peer_a,
-                    negotiation_id,
+                    target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
                 },
             },
         )

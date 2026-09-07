@@ -87,6 +87,10 @@ ensemble size must fall within it.
 | `exec.withdraw` | `{exec_id}` | `Ack` |
 | `exec.terminate` | `{exec_id, reason}` | `Ack` |
 
+`exec.view` renders the program's shared-state view during execution and after
+termination. Terminal views use the saved shared state and remain available
+after the live execution driver exits. Negotiating executions have no view yet.
+
 The client generates a unique `exec_id` before calling `exec.new`. The Host
 uses that exact identifier, allowing the client to send
 `exec.cancel_creation` with the same identifier if the creation response is
@@ -94,8 +98,12 @@ lost or interrupted. This cleanup follows an activation race if necessary and
 acknowledges only after the attempted execution is stopped. `exec.withdraw`
 remains negotiation-only; use `exec.terminate` for a formed session.
 `exec.new` returns immediately while negotiation continues. `ExecCreated`
-echoes `exec_id` and contains the required `negotiation_id`, optional
-`session_id`, the public lifecycle, and an optional queue position.
+echoes `exec_id` and contains an optional `negotiation_id`, optional
+`session_id`, the public lifecycle, and an optional queue position. Create and
+targeted Join requests have a negotiation ID in this response. An open Join
+returns `negotiation_id: null` until an authenticated offer is selected; the
+same field becomes available through `exec.status` after the durable target
+binding. The `exec.created` event omits the field while it is unknown.
 
 `exec.status` exposes the committed `session_id` as soon as activation commits.
 Once session progress exists, its `session` object also reports the public step,
@@ -113,21 +121,33 @@ semantic system-event stream.
 
 ### Admission
 
-The socket shape is the externally tagged Serde representation of exactly two
-variants:
+The socket shape is the externally tagged Serde representation of the current
+admission forms:
 
 ```json
-{"Explicit":{"peers":["<peer-id>","..."]}}
-{"Join":{"creator":"<peer-id>","negotiation_id":"<negotiation-id>"}}
+{"Create":{"participant_count":2}}
+{"Join":{"target":null}}
+{"Join":{"target":{"creator":"<peer-id>","negotiation_id":"<negotiation-id>"}}}
 ```
 
-`Explicit` creates an offer for the exact peers. `Join` accepts only the exact
-creator and negotiation. There is no implicit discovery or fallback. The
-request's `params` value is optional for a join. Without it, the Host accepts
-the creator's authenticated offer parameters. With it, the Host treats the
-value as a local preference, signs only a matching offer, and emits a signed
-counteroffer when the current offer differs. Explicit requests validate and
-store the offer parameters before negotiation.
+`Create` chooses the total participant count, including the local Host. The
+daemon creates the negotiation ID and checks that the selected program accepts
+the count. The older `Explicit` form, `{"Explicit":{"peers":[...]}}`, remains
+available for launcher compatibility.
+
+`Join` with `target: null` discovers the first usable offer on the program
+topic. A supplied target restricts discovery to that creator and negotiation.
+The joiner validates the offer and the creator's signed Active ticket before
+the daemon durably binds an open request to the target. Binding is compare and
+set: retrying the same target is safe, while a different target cannot replace
+the first one. The local ticket is signed only after this authenticated,
+durable binding.
+
+The request's `params` value is optional for a join. Without it, the Host
+accepts the creator's authenticated offer parameters. With it, the Host treats
+the value as a local preference, signs only a matching offer, and emits a
+signed counteroffer when the current offer differs. Create and Explicit
+requests validate and store offer parameters before negotiation.
 
 ### Agent values
 
@@ -274,6 +294,11 @@ withdrawal and active termination are one lifecycle-aware `stop_execution`
 operation. Params updates are unsupported because negotiation terms are
 immutable. Trace and raw receipt retrieval remain operator Unix API/CLI
 operations rather than agent tools.
+
+`await_execution_event` uses a bounded wait. A `waiting` result means that the
+wait elapsed without a callout or terminal event; it does not withdraw or
+finish the execution. Call the tool again with the retained execution reference
+to renew the wait, including while an open Join is still discovering an offer.
 
 MCP admission names daemon-local Hosts and uses an adjacent tag:
 

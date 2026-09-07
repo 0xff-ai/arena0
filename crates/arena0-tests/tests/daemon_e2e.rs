@@ -10,7 +10,7 @@ use arena0_api::{
     EnsembleSpec, FullVerifiedTerminal, HostRequest, LightVerifiedTerminal, ReceiptRef, ResponseOk,
     VerifiedResult,
 };
-use arena0_protocol::SessionHash;
+use arena0_protocol::{NegotiationTarget, SessionHash};
 use common::{HostTarget, call, created, cumulative_sum_wasm, daemon, drive, ok, rps_wasm};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -32,7 +32,7 @@ async fn daemon_hosts_play_and_verify() {
     let (exec_a, negotiation_id) = match ok(call(&d.host_a, &req_a).await) {
         ResponseOk::ExecCreated {
             exec_id,
-            negotiation_id,
+            negotiation_id: Some(negotiation_id),
             ..
         } => (exec_id, negotiation_id),
         other => panic!("unexpected creator response: {other:?}"),
@@ -45,8 +45,7 @@ async fn daemon_hosts_play_and_verify() {
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
                 ensemble: EnsembleSpec::Join {
-                    creator: d.peer_a,
-                    negotiation_id,
+                    target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
                 },
             },
         )
@@ -146,7 +145,7 @@ async fn joiner_without_params_adopts_creator_terms() {
     let (exec_a, negotiation_id) = match ok(call(&d.host_a, &req_a).await) {
         ResponseOk::ExecCreated {
             exec_id,
-            negotiation_id,
+            negotiation_id: Some(negotiation_id),
             ..
         } => (exec_id, negotiation_id),
         other => panic!("unexpected creator response: {other:?}"),
@@ -159,8 +158,7 @@ async fn joiner_without_params_adopts_creator_terms() {
                 program: d.program_id.to_string(),
                 params: None,
                 ensemble: EnsembleSpec::Join {
-                    creator: d.peer_a,
-                    negotiation_id,
+                    target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
                 },
             },
         )
