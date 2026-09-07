@@ -11,9 +11,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, bail};
 
 const DEFAULT_MCP_ENDPOINT: &str = "http://127.0.0.1:7330/mcp";
+const EXECUTABLE_MARKER: &str = "<!-- arena0:executable -->";
 
 /// A project-local harness supported by arena0 setup.
-#[derive(Debug, Clone, clap::Subcommand)]
+#[derive(Debug, clap::Subcommand)]
 pub(crate) enum Target {
     /// Configure Codex with the project-local skill and MCP server.
     Codex(Options),
@@ -21,7 +22,7 @@ pub(crate) enum Target {
     Claude(Options),
 }
 
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Debug, clap::Args)]
 pub(crate) struct Options {
     /// Print the complete plan without changing any files.
     #[arg(long)]
@@ -55,9 +56,9 @@ struct PlannedFile {
 }
 
 impl Target {
-    fn options(&self) -> Options {
+    fn options(&self) -> &Options {
         match self {
-            Self::Codex(options) | Self::Claude(options) => options.clone(),
+            Self::Codex(options) | Self::Claude(options) => options,
         }
     }
 
@@ -68,17 +69,19 @@ impl Target {
         }
     }
 
-    fn files(self, endpoint: &str) -> Vec<FileSpec> {
+    fn files(&self, executable: &str) -> anyhow::Result<Vec<FileSpec>> {
+        let endpoint = &self.options().endpoint;
         let codex_config = format!("[mcp_servers.arena0]\nurl = {}\n", encoded_string(endpoint));
         let claude_config = format!(
             "{{\n  \"mcpServers\": {{\n    \"arena0\": {{\n      \"type\": \"http\",\n      \"url\": {}\n    }}\n  }}\n}}\n",
             encoded_string(endpoint)
         );
-        match self {
+        let skill = installed_skill(executable)?;
+        Ok(match self {
             Self::Codex(_) => vec![
                 FileSpec {
                     relative: ".agents/skills/arena0/SKILL.md",
-                    content: include_str!("../../../skills/arena0/SKILL.md").to_owned(),
+                    content: skill,
                 },
                 FileSpec {
                     relative: ".codex/config.toml",
@@ -88,14 +91,18 @@ impl Target {
             Self::Claude(_) => vec![
                 FileSpec {
                     relative: ".claude/skills/arena0/SKILL.md",
-                    content: include_str!("../../../skills/arena0/SKILL.md").to_owned(),
+                    content: skill,
                 },
                 FileSpec {
                     relative: ".mcp.json",
                     content: claude_config,
                 },
+                FileSpec {
+                    relative: ".claude/settings.json",
+                    content: claude_settings(executable),
+                },
             ],
-        }
+        })
     }
 }
 
@@ -106,18 +113,76 @@ fn encoded_string(value: &str) -> String {
     serde_json::to_string(value).expect("encoding a string cannot fail")
 }
 
+fn installed_skill(executable: &str) -> anyhow::Result<String> {
+    let source = include_str!("../../../skills/arena0/SKILL.md");
+    let replacement = format!(
+        "For every shell command below, replace only the `arena0` executable with the quoted absolute path shown in this version check. Preserve the quoting.\n\n```sh\n{} --version\n```",
+        crate::harness_hook::shell_quote(executable)
+    );
+    let occurrences = source.matches(EXECUTABLE_MARKER).count();
+    if occurrences != 1 {
+        bail!(
+            "embedded arena0 skill must contain exactly one {EXECUTABLE_MARKER} marker; found {occurrences}"
+        );
+    }
+    Ok(source.replacen(EXECUTABLE_MARKER, &replacement, 1))
+}
+
+fn claude_settings(executable: &str) -> String {
+    let command = format!(
+        "{} hook claude-session-start",
+        crate::harness_hook::shell_quote(executable)
+    );
+    let settings = serde_json::json!({
+        "hooks": {
+            "SessionStart": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": command,
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+    serde_json::to_string_pretty(&settings).expect("encoding Claude settings cannot fail") + "\n"
+}
+
+fn current_executable() -> anyhow::Result<String> {
+    let path = std::env::current_exe().context("locate the arena0 executable")?;
+    if !path.is_absolute() {
+        bail!(
+            "arena0 executable path must be absolute; current_exe returned {}",
+            path.display()
+        );
+    }
+    let executable = path.to_str().context(
+        "arena0 executable path is not valid UTF-8; setup cannot write a portable shell command",
+    )?;
+    if executable.is_empty() || executable.chars().any(char::is_control) {
+        bail!(
+            "arena0 executable path contains control characters; setup cannot write a safe shell command"
+        );
+    }
+    Ok(executable.to_owned())
+}
+
 /// Run one project-local setup operation from the current working directory.
-pub(crate) fn run(target: Target) -> anyhow::Result<()> {
+pub(crate) fn run(target: &Target) -> anyhow::Result<()> {
+    let executable = current_executable()?;
     run_in(
         &std::env::current_dir().context("resolve project directory")?,
         target,
+        &executable,
     )
 }
 
-fn run_in(root: &Path, target: Target) -> anyhow::Result<()> {
+fn run_in(root: &Path, target: &Target, executable: &str) -> anyhow::Result<()> {
     let name = target.name();
     let options = target.options();
-    let plan = plan_with_endpoint(root, target.clone(), &options.endpoint)?;
+    let plan = plan(root, target, executable)?;
     print_plan(&plan, name);
 
     if options.dry_run {
@@ -164,18 +229,9 @@ fn run_in(root: &Path, target: Target) -> anyhow::Result<()> {
     apply(&plan)
 }
 
-#[cfg(test)]
-fn plan(root: &Path, target: Target) -> anyhow::Result<Vec<PlannedFile>> {
-    plan_with_endpoint(root, target, DEFAULT_MCP_ENDPOINT)
-}
-
-fn plan_with_endpoint(
-    root: &Path,
-    target: Target,
-    endpoint: &str,
-) -> anyhow::Result<Vec<PlannedFile>> {
+fn plan(root: &Path, target: &Target, executable: &str) -> anyhow::Result<Vec<PlannedFile>> {
     target
-        .files(endpoint)
+        .files(executable)?
         .into_iter()
         .map(|spec| {
             let path = root.join(spec.relative);
@@ -203,6 +259,11 @@ fn print_plan(plan: &[PlannedFile], target: &str) {
                     "warning: {} differs from the arena0 setup; leaving the whole file unchanged",
                     file.path.display()
                 );
+                if file.spec.relative == ".claude/settings.json" {
+                    eprintln!(
+                        "manual merge plan: add the displayed SessionStart hook to the existing hooks object"
+                    );
+                }
                 "different; leave unchanged"
             }
         };
@@ -272,6 +333,8 @@ mod tests {
     use super::*;
     use clap::Parser as _;
 
+    const TEST_EXECUTABLE: &str = "/tmp/arena0";
+
     #[derive(Debug, clap::Parser)]
     struct TestCli {
         #[command(subcommand)]
@@ -286,17 +349,16 @@ mod tests {
     #[test]
     fn codex_plan_contains_complete_skill_and_config() {
         let root = tempfile::tempdir().expect("temporary project");
-        let plan = plan(
-            root.path(),
-            Target::Codex(Options {
-                dry_run: true,
-                yes: false,
-                endpoint: DEFAULT_MCP_ENDPOINT.to_owned(),
-            }),
-        )
-        .expect("build setup plan");
+        let target = Target::Codex(Options {
+            dry_run: true,
+            yes: false,
+            endpoint: DEFAULT_MCP_ENDPOINT.to_owned(),
+        });
+        let plan = plan(root.path(), &target, TEST_EXECUTABLE).expect("build setup plan");
         assert_eq!(plan.len(), 2);
         assert!(plan[0].spec.content.starts_with("---\nname: arena0"));
+        assert!(!plan[0].spec.content.contains(EXECUTABLE_MARKER));
+        assert!(plan[0].spec.content.contains("--version"));
         assert!(plan[1].spec.content.contains("[mcp_servers.arena0]"));
         assert!(!plan[1].spec.content.contains("type = \"http\""));
         assert!(
@@ -313,31 +375,35 @@ mod tests {
     fn endpoint_is_written_to_both_harness_configs() {
         let root = tempfile::tempdir().expect("temporary project");
         let endpoint = "http://127.0.0.1:7440/mcp";
-        let codex = plan_with_endpoint(
-            root.path(),
-            Target::Codex(Options {
-                dry_run: true,
-                yes: false,
-                endpoint: endpoint.to_owned(),
-            }),
-            endpoint,
-        )
-        .expect("build Codex setup plan");
-        let claude = plan_with_endpoint(
-            root.path(),
-            Target::Claude(Options {
-                dry_run: true,
-                yes: false,
-                endpoint: endpoint.to_owned(),
-            }),
-            endpoint,
-        )
-        .expect("build Claude setup plan");
+        let codex_target = Target::Codex(Options {
+            dry_run: true,
+            yes: false,
+            endpoint: endpoint.to_owned(),
+        });
+        let codex =
+            plan(root.path(), &codex_target, TEST_EXECUTABLE).expect("build Codex setup plan");
+        let claude_target = Target::Claude(Options {
+            dry_run: true,
+            yes: false,
+            endpoint: endpoint.to_owned(),
+        });
+        let claude =
+            plan(root.path(), &claude_target, TEST_EXECUTABLE).expect("build Claude setup plan");
 
         assert!(!codex[1].spec.content.contains("type = \"http\""));
         assert!(codex[1].spec.content.contains(endpoint));
         assert!(claude[1].spec.content.contains("\"type\": \"http\""));
         assert!(claude[1].spec.content.contains(endpoint));
+        assert_eq!(claude[2].spec.relative, ".claude/settings.json");
+        let settings = serde_json::from_str::<serde_json::Value>(&claude[2].spec.content)
+            .expect("Claude settings JSON");
+        assert_eq!(
+            settings["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            format!(
+                "{} hook claude-session-start",
+                crate::harness_hook::shell_quote(TEST_EXECUTABLE)
+            )
+        );
     }
 
     #[test]
@@ -345,20 +411,21 @@ mod tests {
         let root = tempfile::tempdir().expect("temporary project");
         let skill = root.path().join(".agents/skills/arena0/SKILL.md");
         fs::create_dir_all(skill.parent().expect("skill parent")).expect("skill directory");
-        fs::write(&skill, include_str!("../../../skills/arena0/SKILL.md")).expect("skill");
+        fs::write(
+            &skill,
+            installed_skill(TEST_EXECUTABLE).expect("installed skill"),
+        )
+        .expect("skill");
         let config = root.path().join(".codex/config.toml");
         fs::create_dir_all(config.parent().expect("config parent")).expect("config directory");
         fs::write(&config, "user-owned\n").expect("config");
 
-        let plan = plan(
-            root.path(),
-            Target::Codex(Options {
-                dry_run: true,
-                yes: false,
-                endpoint: DEFAULT_MCP_ENDPOINT.to_owned(),
-            }),
-        )
-        .expect("build setup plan");
+        let target = Target::Codex(Options {
+            dry_run: true,
+            yes: false,
+            endpoint: DEFAULT_MCP_ENDPOINT.to_owned(),
+        });
+        let plan = plan(root.path(), &target, TEST_EXECUTABLE).expect("build setup plan");
         assert_eq!(plan[0].state, State::Identical);
         assert_eq!(plan[1].state, State::Different);
         apply(&plan).expect("apply setup plan");
@@ -371,15 +438,12 @@ mod tests {
     #[test]
     fn apply_creates_only_missing_files() {
         let root = tempfile::tempdir().expect("temporary project");
-        let plan = plan(
-            root.path(),
-            Target::Claude(Options {
-                dry_run: false,
-                yes: true,
-                endpoint: DEFAULT_MCP_ENDPOINT.to_owned(),
-            }),
-        )
-        .expect("build setup plan");
+        let target = Target::Claude(Options {
+            dry_run: false,
+            yes: true,
+            endpoint: DEFAULT_MCP_ENDPOINT.to_owned(),
+        });
+        let plan = plan(root.path(), &target, TEST_EXECUTABLE).expect("build setup plan");
         apply(&plan).expect("apply setup plan");
         let path = root.path().join(".mcp.json");
         assert_eq!(
@@ -389,8 +453,39 @@ mod tests {
         assert_eq!(
             fs::read_to_string(root.path().join(".claude/skills/arena0/SKILL.md"))
                 .expect("Claude skill"),
-            include_str!("../../../skills/arena0/SKILL.md")
+            installed_skill(TEST_EXECUTABLE).expect("installed skill")
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join(".claude/settings.json")).expect("Claude settings"),
+            claude_settings(TEST_EXECUTABLE)
         );
         apply(&plan).expect("repeat setup plan");
+    }
+
+    #[test]
+    fn differing_claude_settings_are_preserved_with_the_exact_hook_plan() {
+        let root = tempfile::tempdir().expect("temporary project");
+        let path = root.path().join(".claude/settings.json");
+        fs::create_dir_all(path.parent().expect("settings parent")).expect("settings directory");
+        fs::write(&path, "{\"hooks\":{\"SessionStart\":[]}}\n").expect("settings");
+
+        let target = Target::Claude(Options {
+            dry_run: true,
+            yes: false,
+            endpoint: DEFAULT_MCP_ENDPOINT.to_owned(),
+        });
+        let plan = plan(root.path(), &target, TEST_EXECUTABLE).expect("build setup plan");
+        let settings = plan
+            .iter()
+            .find(|file| file.spec.relative == ".claude/settings.json")
+            .expect("settings plan");
+        assert_eq!(settings.state, State::Different);
+        assert_eq!(settings.spec.content, claude_settings(TEST_EXECUTABLE));
+
+        apply(&plan).expect("apply setup plan");
+        assert_eq!(
+            fs::read_to_string(path).expect("settings contents"),
+            "{\"hooks\":{\"SessionStart\":[]}}\n"
+        );
     }
 }

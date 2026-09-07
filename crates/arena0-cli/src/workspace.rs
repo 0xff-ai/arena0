@@ -295,23 +295,15 @@ impl State {
                 None
             }
             Mode::Browse => match key.code {
-                KeyCode::Left | KeyCode::Up => {
-                    self.setup_focused = false;
-                    None
-                }
-                KeyCode::Right | KeyCode::Down => {
-                    self.setup_focused = true;
-                    None
-                }
                 KeyCode::Tab | KeyCode::BackTab => {
                     self.setup_focused = !self.setup_focused;
                     None
                 }
-                KeyCode::Char('k') if self.setup_focused => {
+                KeyCode::Up | KeyCode::Char('k') if self.setup_focused => {
                     self.setup_scroll = self.setup_scroll.saturating_sub(1);
                     None
                 }
-                KeyCode::Char('j') if self.setup_focused => {
+                KeyCode::Down | KeyCode::Char('j') if self.setup_focused => {
                     self.setup_scroll = self.setup_scroll.saturating_add(1);
                     None
                 }
@@ -356,14 +348,14 @@ impl State {
                     self.mode = Mode::Help;
                     None
                 }
-                KeyCode::Char('k') if !self.setup_focused => {
+                KeyCode::Up | KeyCode::Char('k') if !self.setup_focused => {
                     if self.selected > 0 {
                         self.selected -= 1;
                         self.program_changed();
                     }
                     None
                 }
-                KeyCode::Char('j') if !self.setup_focused => {
+                KeyCode::Down | KeyCode::Char('j') if !self.setup_focused => {
                     if self.selected + 1 < self.programs.len() {
                         self.selected += 1;
                         self.program_changed();
@@ -572,15 +564,15 @@ fn render(frame: &mut Frame<'_>, state: &State) {
     }
     let keys = if matches!(state.input_control, InputControl::Configured(_)) {
         vec![Line::raw(
-            "j/k select  arrows focus    p params    r replay    Enter launch    ? help    q quit",
+            "↑↓ move  Tab pane    p params    r replay    Enter launch    ? help    q quit",
         )]
     } else if footer.width >= 104 {
         vec![Line::raw(
-            "j/k select  arrows focus    +/- Hosts    c control    h Host    p params    r replay    Enter run    ? help    q quit",
+            "↑↓ move  Tab pane    +/- Hosts    c control    h Host    p params    r replay    Enter run    ? help    q quit",
         )]
     } else {
         vec![
-            Line::raw("j/k select  arrows focus    +/- Hosts    c control    h Host"),
+            Line::raw("↑↓ move  Tab pane    +/- Hosts    c control    h Host"),
             Line::raw("p params    r replay    Enter run    ? help    q quit"),
         ]
     };
@@ -903,8 +895,11 @@ fn render_help(frame: &mut Frame<'_>, state: &State) {
     let area = centered(frame.area(), 76, 17);
     frame.render_widget(Clear, area);
     let lines = [
-        ("Arrows / Tab", "Move focus between Programs and Run Setup"),
-        ("j/k", "Select a program or scroll Run Setup"),
+        (
+            "Tab / Shift-Tab",
+            "Move focus between Programs and Run Setup",
+        ),
+        ("↑↓ / j/k", "Select a program or scroll Run Setup"),
         ("Ctrl-U / Ctrl-D", "Jump up or down in the focused pane"),
         ("g / G", "First / last position"),
         ("+/-", "Change the exact local Host count"),
@@ -1077,6 +1072,42 @@ mod tests {
             }
         }))
         .expect("program detail fixture")
+    }
+
+    #[test]
+    fn launch_arrows_move_inside_the_pane_selected_by_tab() {
+        let first = program(serde_json::json!({"kind":"exact","count":2}));
+        let mut second = first.clone();
+        second.summary.program_hash = ProgramHash([42; 32]);
+        let selected_program = second.summary.program_hash.to_string();
+        let mut state = State::new(vec![first, second], Vec::new(), 2, true);
+        state.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.selected, 1);
+        assert!(!state.setup_focused);
+        state.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(state.selected, 0);
+        state.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(state.setup_focused);
+        state.setup_scroll_limit.set(30);
+        state.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.setup_scroll, 1);
+        assert_eq!(state.selected, 0);
+        for key in [KeyCode::Left, KeyCode::Right] {
+            state.on_key(KeyEvent::new(key, KeyModifiers::NONE));
+            assert!(state.setup_focused);
+            assert_eq!(state.participants, 2);
+        }
+        state.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(state.setup_scroll, 0);
+        state.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert!(!state.setup_focused);
+        state.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let Some(Ok(Exit::Launch(launch))) =
+            state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("selected program should launch");
+        };
+        assert_eq!(launch.program, selected_program);
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! One daemon-owned MCP surface for the complete local Ensemble.
 //!
-//! Tool calls carry explicit Host references, so one Streamable HTTP endpoint
-//! and one bearer token can safely drive every supervised participant.
+//! Tool calls are scoped by one daemon-issued JWT. The token resolves one
+//! durable Host before a tool handler runs; wire references contain only
+//! Host-local execution/program/session ids and public peer identities.
 
 use futures::{
     FutureExt as _,
@@ -27,6 +28,7 @@ use axum::extract::{Request as HttpRequest, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response as HttpResponse};
+use rmcp::handler::server::common::Extension;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::{Json, Parameters};
@@ -35,23 +37,42 @@ use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
+use serde::{Deserialize, de::Deserializer};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
 use crate::ensemble::{Daemon, McpConfig};
+use crate::mcp_auth::{AuthError, VerifiedClaims};
 use crate::server::HostService;
 use crate::startup::{self, StartupStage};
 
-#[derive(
-    Clone, Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq,
-)]
-#[serde(deny_unknown_fields)]
-struct HostRef {
-    /// Daemon-local Host id, as returned by `open_host` or `list_hosts`.
-    #[schemars(length(min = 1))]
-    id: String,
+/// The only Host selector available to authenticated MCP tools. It is kept
+/// private to this crate and inserted into RMCP request extensions after the
+/// central token check; no wire representation can construct it.
+#[derive(Clone)]
+pub(crate) struct AuthorizedHost {
+    pub(crate) host_name: arena0_home::HostName,
+    pub(crate) peer_id: PeerId,
+    pub(crate) service: Arc<HostService>,
+    pub(crate) claims: VerifiedClaims,
+}
+
+impl AuthorizedHost {
+    pub(crate) fn new(
+        host_name: arena0_home::HostName,
+        peer_id: PeerId,
+        service: Arc<HostService>,
+        claims: VerifiedClaims,
+    ) -> Self {
+        Self {
+            host_name,
+            peer_id,
+            service,
+            claims,
+        }
+    }
 }
 
 #[derive(
@@ -59,7 +80,6 @@ struct HostRef {
 )]
 #[serde(deny_unknown_fields)]
 struct ProgramRef {
-    host: HostRef,
     /// Exact program content id returned by `list_programs`.
     #[schemars(length(min = 1))]
     program_id: String,
@@ -70,7 +90,6 @@ struct ProgramRef {
 )]
 #[serde(deny_unknown_fields)]
 struct ExecRef {
-    host: HostRef,
     /// Host-local execution id (64 lowercase hex characters).
     exec_id: String,
 }
@@ -80,46 +99,92 @@ struct ExecRef {
 )]
 #[serde(deny_unknown_fields)]
 struct SessionRef {
-    host: HostRef,
     /// Cross-party session id (64 lowercase hex characters).
     session_id: String,
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct EmptyArgs {}
+/// A bearer token carried by the MCP JSON boundary. Its serialized form is
+/// the JWT string, while Debug is deliberately redacted so DTOs cannot leak
+/// credentials through diagnostics.
+#[derive(Clone, Eq, PartialEq, serde::Serialize, schemars::JsonSchema)]
+#[serde(transparent)]
+struct McpToken(String);
+
+impl McpToken {
+    fn into_raw(self) -> crate::mcp_auth::RawToken {
+        crate::mcp_auth::RawToken::new(self.0)
+    }
+
+    fn from_raw(token: crate::mcp_auth::RawToken) -> Self {
+        Self(token.as_str().to_owned())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for McpToken {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self)
+    }
+}
+
+impl std::fmt::Debug for McpToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted JWT>")
+    }
+}
+
+fn deserialize_optional_token<'de, D>(deserializer: D) -> Result<Option<McpToken>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::String(value) => Ok(Some(McpToken(value))),
+        Value::Null => Err(serde::de::Error::custom("token must be a string")),
+        _ => Err(serde::de::Error::custom("token must be a string")),
+    }
+}
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct OpenHostArg {
-    /// Omit to create a new Host; retain the returned id for reopening and retries.
-    id: Option<String>,
+struct HelloArg {
     /// Caller-reported harness and version, for example claude-code/1.0.
     #[schemars(length(min = 1, max = 256))]
-    user_agent: String,
+    user_agent: Option<String>,
+    /// A previously issued token renews the same Host.
+    #[serde(default, deserialize_with = "deserialize_optional_token")]
+    token: Option<McpToken>,
 }
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
-struct OpenHostOutput {
-    host: HostRef,
+struct HelloOutput {
+    token: McpToken,
     peer_id: String,
-    user_agent: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct HostArg {
-    host: HostRef,
+    expires_at: u64,
+    renew_after: u64,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ProgramArg {
+    #[serde(rename = "token")]
+    #[schemars(rename = "token")]
+    _token: McpToken,
     program: ProgramRef,
 }
 
-/// Agent-facing admission choice. Host names are resolved to the exact peer
-/// identities owned by this daemon before the protocol request is dispatched.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TokenArg {
+    #[serde(rename = "token")]
+    #[schemars(rename = "token")]
+    _token: McpToken,
+}
+
+/// Agent-facing admission choice. The authenticated Host is the owner; other
+/// Participants are selected by their public peer identities.
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -129,10 +194,10 @@ enum McpEnsemble {
         #[schemars(range(min = 2, max = 64))]
         participant_count: Option<u16>,
     },
-    /// Create an offer for these exact other local Hosts.
+    /// Create an offer for these exact other local peers.
     Explicit {
         #[schemars(length(min = 1))]
-        hosts: Vec<HostRef>,
+        peers: Vec<PeerId>,
     },
     /// Listen for a suitable offer, or join the specified negotiation.
     Join {
@@ -143,7 +208,7 @@ enum McpEnsemble {
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct McpNegotiationTarget {
-    creator: HostRef,
+    creator: PeerId,
     #[schemars(length(min = 1))]
     negotiation_id: String,
 }
@@ -152,11 +217,10 @@ impl McpEnsemble {
     async fn into_spec(
         self,
         server: &Arena0Mcp,
-        program: &ProgramRef,
+        owner: &AuthorizedHost,
+        program_id: &str,
     ) -> Result<EnsembleSpec, CallToolResult> {
-        let daemon = &server.daemon;
-        let owner = &program.host;
-        let owner_peer = peer_id(daemon, owner)?;
+        let owner_peer = owner.peer_id;
         match self {
             Self::Create { participant_count } => {
                 let participant_count = match participant_count {
@@ -165,7 +229,7 @@ impl McpEnsemble {
                         .request(
                             owner,
                             HostRequest::ProgramGet {
-                                program: program.program_id.clone(),
+                                program: program_id.to_owned(),
                             },
                         )
                         .await?
@@ -183,27 +247,18 @@ impl McpEnsemble {
                 };
                 Ok(EnsembleSpec::Create { participant_count })
             }
-            Self::Explicit { hosts } => {
-                if hosts.is_empty() {
-                    return Err(err("explicit ensemble needs at least one other Host"));
+            Self::Explicit { peers } => {
+                if peers.is_empty() {
+                    return Err(err("explicit ensemble needs at least one other peer"));
                 }
                 let mut seen = BTreeSet::new();
-                let mut peers = Vec::with_capacity(hosts.len());
-                for host in hosts {
-                    let peer = peer_id(daemon, &host)?;
-                    if peer == owner_peer {
-                        return Err(err(format!(
-                            "explicit ensemble must not include its owner Host '{}'",
-                            owner.id
-                        )));
+                for peer in &peers {
+                    if *peer == owner_peer {
+                        return Err(err("explicit ensemble must not include its owner peer"));
                     }
-                    if !seen.insert(peer) {
-                        return Err(err(format!(
-                            "explicit ensemble contains Host '{}' more than once",
-                            host.id
-                        )));
+                    if !seen.insert(*peer) {
+                        return Err(err("explicit ensemble contains a peer more than once"));
                     }
-                    peers.push(peer);
                 }
                 Ok(EnsembleSpec::Explicit { peers })
             }
@@ -215,13 +270,12 @@ impl McpEnsemble {
                         negotiation_id,
                     }),
             } => {
-                let creator_peer = peer_id(daemon, &creator)?;
-                if creator_peer == owner_peer {
-                    return Err(err("join creator must be a different Host"));
+                if creator == owner_peer {
+                    return Err(err("join creator must be a different peer"));
                 }
                 Ok(EnsembleSpec::Join {
                     target: Some(NegotiationTarget::new(
-                        creator_peer,
+                        creator,
                         parse(&negotiation_id, "negotiation id")?,
                     )),
                 })
@@ -233,6 +287,9 @@ impl McpEnsemble {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct StartExecutionArg {
+    #[serde(rename = "token")]
+    #[schemars(rename = "token")]
+    _token: McpToken,
     program: ProgramRef,
     /// Program params as JSON, validated against the program's params schema.
     params: Option<Value>,
@@ -242,12 +299,18 @@ struct StartExecutionArg {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ExecArg {
+    #[serde(rename = "token")]
+    #[schemars(rename = "token")]
+    _token: McpToken,
     execution: ExecRef,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct AwaitExecutionArg {
+    #[serde(rename = "token")]
+    #[schemars(rename = "token")]
+    _token: McpToken,
     execution: ExecRef,
     /// Wait up to this many milliseconds. Omit or use zero for an immediate check.
     #[serde(default)]
@@ -258,6 +321,9 @@ struct AwaitExecutionArg {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct AnswerCalloutArg {
+    #[serde(rename = "token")]
+    #[schemars(rename = "token")]
+    _token: McpToken,
     execution: ExecRef,
     /// Pending id returned by `await_execution_event`.
     pending_id: PendingId,
@@ -268,6 +334,9 @@ struct AnswerCalloutArg {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct QueryExecutionArg {
+    #[serde(rename = "token")]
+    #[schemars(rename = "token")]
+    _token: McpToken,
     execution: ExecRef,
     /// JSON query validated against the program's query request schema.
     query: Option<Value>,
@@ -276,6 +345,9 @@ struct QueryExecutionArg {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct StopExecutionArg {
+    #[serde(rename = "token")]
+    #[schemars(rename = "token")]
+    _token: McpToken,
     execution: ExecRef,
     /// Human-readable forfeit or resignation reason after activation.
     reason: Option<String>,
@@ -294,24 +366,13 @@ enum VerificationMode {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct VerifySessionArg {
+    #[serde(rename = "token")]
+    #[schemars(rename = "token")]
+    _token: McpToken,
     session: SessionRef,
     /// `light` checks portable proof evidence; `full` also replays the exact Wasm.
     #[serde(default)]
     mode: VerificationMode,
-}
-
-#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
-struct HostOutput {
-    host: HostRef,
-    peer_id: String,
-    user_agent: Option<String>,
-    programs: usize,
-    executions_active: usize,
-}
-
-#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
-struct HostListOutput {
-    hosts: Vec<HostOutput>,
 }
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
@@ -404,7 +465,6 @@ struct QueryExecutionOutput {
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
 struct ParticipantOutput {
-    host: Option<HostRef>,
     peer_id: String,
 }
 
@@ -483,75 +543,82 @@ impl Arena0Mcp {
 
     async fn request(
         &self,
-        host: &HostRef,
+        authorized: &AuthorizedHost,
         request: HostRequest,
     ) -> Result<ResponseOk, CallToolResult> {
-        let service = service(&self.daemon, host)?;
-        service
+        authorized
+            .service
             .dispatch(request)
             .await
-            .map_err(|error| api_error(&host.id, error))
+            .map_err(api_error)
     }
 
     fn participant(&self, peer_id: PeerId) -> ParticipantOutput {
-        let host = self.daemon.host_name(peer_id).map(|name| HostRef {
-            id: name.to_owned(),
-        });
         ParticipantOutput {
-            host,
             peer_id: peer_id.to_string(),
         }
+    }
+
+    fn issue_hello(
+        &self,
+        authorized: &AuthorizedHost,
+    ) -> Result<Json<HelloOutput>, CallToolResult> {
+        let issued = self
+            .daemon
+            .issue_token(authorized.claims.host_name(), authorized.claims.peer_id())
+            .map_err(|_| err("could not issue MCP token"))?;
+        Ok(Json(HelloOutput {
+            token: McpToken::from_raw(issued.token),
+            peer_id: issued.peer_id.to_string(),
+            expires_at: issued.expires_at,
+            renew_after: issued.renew_after,
+        }))
     }
 }
 
 #[tool_router]
 impl Arena0Mcp {
     #[tool(
-        description = "Open or create your Host. Supply its local id to reopen it, or omit id to generate a new Host. Retain the returned reference. user_agent records your harness/version for the monitor; it is not authentication. A repeated call without id creates another Host.",
-        output_schema = output_schema::<OpenHostOutput>(),
+        description = "Create a fresh authenticated Host with user_agent, or renew the same Host by supplying its token.",
+        output_schema = output_schema::<HelloOutput>(),
         annotations(title = "Open Host", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
-    async fn open_host(
+    async fn hello(
         &self,
-        Parameters(arg): Parameters<OpenHostArg>,
-    ) -> Result<Json<OpenHostOutput>, CallToolResult> {
+        Parameters(arg): Parameters<HelloArg>,
+    ) -> Result<Json<HelloOutput>, CallToolResult> {
+        if let Some(token) = arg.token {
+            if arg.user_agent.is_some() {
+                return Err(err("hello accepts either token or user_agent, not both"));
+            }
+            let authorized = self
+                .daemon
+                .authorize_token(token.into_raw())
+                .await
+                .map_err(auth_error)?;
+            return self.issue_hello(&authorized);
+        }
+        let user_agent = arg
+            .user_agent
+            .ok_or_else(|| err("hello requires user_agent or token"))?;
         let info = self
             .daemon
-            .open_host(arg.id, arg.user_agent)
+            .open_host(None, user_agent)
             .await
-            .map_err(|error| err(format!("{error:#}")))?;
-        Ok(Json(OpenHostOutput {
-            host: HostRef { id: info.id },
-            peer_id: info.peer_id.to_string(),
-            user_agent: info.user_agent,
+            .map_err(|_| err("Host unavailable"))?;
+        let issued = self
+            .daemon
+            .issue_token(
+                &info.id.parse().map_err(|_| err("Host unavailable"))?,
+                info.peer_id,
+            )
+            .map_err(|_| err("could not issue MCP token"))?;
+        Ok(Json(HelloOutput {
+            token: McpToken::from_raw(issued.token),
+            peer_id: issued.peer_id.to_string(),
+            expires_at: issued.expires_at,
+            renew_after: issued.renew_after,
         }))
-    }
-
-    #[tool(
-        description = "List every Host available through this daemon. Use the returned Host names in all other tools.",
-        output_schema = output_schema::<HostListOutput>(),
-        annotations(title = "List Hosts", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
-    )]
-    async fn list_hosts(
-        &self,
-        Parameters(_): Parameters<EmptyArgs>,
-    ) -> Result<Json<HostListOutput>, CallToolResult> {
-        let services = self.daemon.services();
-        let mut hosts = Vec::with_capacity(services.len());
-        for (name, service) in services {
-            let info = service
-                .host_status()
-                .await
-                .map_err(|error| err(format!("Host '{name}': {error}")))?;
-            hosts.push(HostOutput {
-                host: HostRef { id: name },
-                peer_id: info.host.peer_id.to_string(),
-                user_agent: info.host.user_agent,
-                programs: info.programs,
-                executions_active: info.execs_active,
-            });
-        }
-        Ok(Json(HostListOutput { hosts }))
     }
 
     #[tool(
@@ -561,14 +628,12 @@ impl Arena0Mcp {
     )]
     async fn list_programs(
         &self,
-        Parameters(HostArg { host }): Parameters<HostArg>,
+        Extension(authorized): Extension<AuthorizedHost>,
+        Parameters(_): Parameters<TokenArg>,
     ) -> Result<Json<ProgramListOutput>, CallToolResult> {
-        match self.request(&host, HostRequest::ProgramList).await? {
+        match self.request(&authorized, HostRequest::ProgramList).await? {
             ResponseOk::ProgramList(programs) => Ok(Json(ProgramListOutput {
-                programs: programs
-                    .iter()
-                    .map(|summary| summary_output(&host, summary))
-                    .collect(),
+                programs: programs.iter().map(summary_output).collect(),
             })),
             other => Err(unexpected(&other)),
         }
@@ -581,11 +646,12 @@ impl Arena0Mcp {
     )]
     async fn inspect_program(
         &self,
-        Parameters(ProgramArg { program }): Parameters<ProgramArg>,
+        Extension(authorized): Extension<AuthorizedHost>,
+        Parameters(ProgramArg { program, .. }): Parameters<ProgramArg>,
     ) -> Result<Json<ProgramOutput>, CallToolResult> {
         match self
             .request(
-                &program.host,
+                &authorized,
                 HostRequest::ProgramGet {
                     program: program.program_id,
                 },
@@ -593,7 +659,7 @@ impl Arena0Mcp {
             .await?
         {
             ResponseOk::Program(detail) => Ok(Json(ProgramOutput {
-                summary: summary_output(&program.host, &detail.summary),
+                summary: summary_output(&detail.summary),
                 schema: serialized_value(&detail.schema)?,
             })),
             other => Err(unexpected(&other)),
@@ -607,13 +673,17 @@ impl Arena0Mcp {
     )]
     async fn start_execution(
         &self,
+        Extension(authorized): Extension<AuthorizedHost>,
         Parameters(arg): Parameters<StartExecutionArg>,
     ) -> Result<Json<StartExecutionOutput>, CallToolResult> {
-        let ensemble = arg.ensemble.into_spec(self, &arg.program).await?;
+        let ensemble = arg
+            .ensemble
+            .into_spec(self, &authorized, &arg.program.program_id)
+            .await?;
         let exec_id = ExecId(rand::random());
         let created = self
             .request(
-                &arg.program.host,
+                &authorized,
                 HostRequest::ExecNew {
                     exec_id,
                     program: arg.program.program_id,
@@ -632,30 +702,19 @@ impl Arena0Mcp {
             } => {
                 if returned_exec_id != exec_id {
                     let cleanup = self
-                        .request(
-                            &arg.program.host,
-                            HostRequest::ExecCancelCreation { exec_id },
-                        )
+                        .request(&authorized, HostRequest::ExecCancelCreation { exec_id })
                         .await;
                     return match cleanup {
-                        Ok(ResponseOk::Ack) => Err(err(format!(
-                            "Host '{}' returned execution id {returned_exec_id}, requested {exec_id}; the requested id was withdrawn",
-                            arg.program.host.id
-                        ))),
-                        Ok(other) => Err(err(format!(
-                            "Host '{}' returned execution id {returned_exec_id}, requested {exec_id}; cleanup returned {other:?}",
-                            arg.program.host.id
-                        ))),
-                        Err(error) => Err(err(format!(
-                            "Host '{}' returned execution id {returned_exec_id}, requested {exec_id}; cleanup failed: {error:?}",
-                            arg.program.host.id
-                        ))),
+                        Ok(ResponseOk::Ack) => {
+                            Err(err("execution id mismatch; requested id withdrawn"))
+                        }
+                        Ok(_) | Err(_) => Err(err("execution id mismatch; cleanup failed")),
                     };
                 }
                 Ok(Json(StartExecutionOutput {
-                    execution: exec_ref(&arg.program.host, returned_exec_id),
+                    execution: exec_ref(returned_exec_id),
                     negotiation_id: negotiation_id.map(|id| id.to_string()),
-                    session: session_id.map(|id| session_ref(&arg.program.host, id)),
+                    session: session_id.map(session_ref),
                     state: serialized_value(&exec_state)?,
                     queue_position,
                 }))
@@ -671,14 +730,15 @@ impl Arena0Mcp {
     )]
     async fn get_execution_status(
         &self,
-        Parameters(ExecArg { execution }): Parameters<ExecArg>,
+        Extension(authorized): Extension<AuthorizedHost>,
+        Parameters(ExecArg { execution, .. }): Parameters<ExecArg>,
     ) -> Result<Json<ExecutionStatusOutput>, CallToolResult> {
         let exec_id = parse(&execution.exec_id, "execution id")?;
         match self
-            .request(&execution.host, HostRequest::ExecStatus { exec_id })
+            .request(&authorized, HostRequest::ExecStatus { exec_id })
             .await?
         {
-            ResponseOk::Status(status) => Ok(Json(status_output(&execution.host, status)?)),
+            ResponseOk::Status(status) => Ok(Json(status_output(status)?)),
             other => Err(unexpected(&other)),
         }
     }
@@ -690,13 +750,14 @@ impl Arena0Mcp {
     )]
     async fn list_executions(
         &self,
-        Parameters(HostArg { host }): Parameters<HostArg>,
+        Extension(authorized): Extension<AuthorizedHost>,
+        Parameters(_): Parameters<TokenArg>,
     ) -> Result<Json<ExecutionListOutput>, CallToolResult> {
-        match self.request(&host, HostRequest::ExecList).await? {
+        match self.request(&authorized, HostRequest::ExecList).await? {
             ResponseOk::ExecList(statuses) => Ok(Json(ExecutionListOutput {
                 executions: statuses
                     .into_iter()
-                    .map(|status| status_output(&host, status))
+                    .map(status_output)
                     .collect::<Result<_, _>>()?,
             })),
             other => Err(unexpected(&other)),
@@ -710,12 +771,13 @@ impl Arena0Mcp {
     )]
     async fn view_execution(
         &self,
-        Parameters(ExecArg { execution }): Parameters<ExecArg>,
+        Extension(authorized): Extension<AuthorizedHost>,
+        Parameters(ExecArg { execution, .. }): Parameters<ExecArg>,
     ) -> Result<Json<ExecutionViewOutput>, CallToolResult> {
         let exec = parse(&execution.exec_id, "execution id")?;
         match self
             .request(
-                &execution.host,
+                &authorized,
                 HostRequest::ExecView {
                     exec,
                     width: 80,
@@ -739,22 +801,25 @@ impl Arena0Mcp {
     )]
     async fn await_execution_event(
         &self,
-        Parameters(AwaitExecutionArg { execution, wait_ms }): Parameters<AwaitExecutionArg>,
+        Extension(authorized): Extension<AuthorizedHost>,
+        Parameters(AwaitExecutionArg {
+            execution, wait_ms, ..
+        }): Parameters<AwaitExecutionArg>,
     ) -> Result<Json<ExecutionEventOutput>, CallToolResult> {
         if wait_ms > 20_000 {
             return Err(err("wait_ms must be at most 20000"));
         }
         let exec_id = parse(&execution.exec_id, "execution id")?;
-        let service = service(&self.daemon, &execution.host)?;
+        let service = &authorized.service;
         let next = if wait_ms == 0 {
             service
                 .next_ready(exec_id)
                 .await
-                .map_err(|error| err(format!("Host '{}': {error}", execution.host.id)))?
+                .map_err(|_| err("execution unavailable"))?
         } else {
             match tokio::time::timeout(
                 std::time::Duration::from_millis(wait_ms),
-                self.request(&execution.host, HostRequest::ExecNext { exec_id }),
+                self.request(&authorized, HostRequest::ExecNext { exec_id }),
             )
             .await
             {
@@ -785,7 +850,7 @@ impl Arena0Mcp {
                 session_id,
                 outcome,
             }) => ExecutionEvent::Completed {
-                session: session_ref(&execution.host, session_id),
+                session: session_ref(session_id),
                 outcome,
             },
             Some(NextEvent::Failed { reason }) => ExecutionEvent::Failed { reason },
@@ -800,12 +865,13 @@ impl Arena0Mcp {
     )]
     async fn answer_callout(
         &self,
+        Extension(authorized): Extension<AuthorizedHost>,
         Parameters(arg): Parameters<AnswerCalloutArg>,
     ) -> Result<Json<AckOutput>, CallToolResult> {
         let exec_id = parse(&arg.execution.exec_id, "execution id")?;
         match self
             .request(
-                &arg.execution.host,
+                &authorized,
                 HostRequest::ExecSubmit {
                     exec_id,
                     pending_id: arg.pending_id,
@@ -826,12 +892,13 @@ impl Arena0Mcp {
     )]
     async fn query_execution(
         &self,
+        Extension(authorized): Extension<AuthorizedHost>,
         Parameters(arg): Parameters<QueryExecutionArg>,
     ) -> Result<Json<QueryExecutionOutput>, CallToolResult> {
         let exec_id = parse(&arg.execution.exec_id, "execution id")?;
         match self
             .request(
-                &arg.execution.host,
+                &authorized,
                 HostRequest::ExecQuery {
                     exec_id,
                     query: arg.query,
@@ -851,10 +918,11 @@ impl Arena0Mcp {
     )]
     async fn stop_execution(
         &self,
+        Extension(authorized): Extension<AuthorizedHost>,
         Parameters(arg): Parameters<StopExecutionArg>,
     ) -> Result<Json<AckOutput>, CallToolResult> {
         let exec_id = parse(&arg.execution.exec_id, "execution id")?;
-        let service = service(&self.daemon, &arg.execution.host)?;
+        let service = &authorized.service;
         let reason = arg
             .reason
             .unwrap_or_else(|| "agent stopped execution".to_string());
@@ -863,7 +931,7 @@ impl Arena0Mcp {
                 Ok(ResponseOk::Status(status)) => status,
                 Ok(other) => return Err(unexpected(&other)),
                 Err(error) => {
-                    return Err(err(format!("Host '{}': {error}", arg.execution.host.id)));
+                    return Err(err(format!("execution unavailable: {error}")));
                 }
             };
             let lifecycle = status.lifecycle();
@@ -892,19 +960,13 @@ impl Arena0Mcp {
                             continue;
                         }
                         _ => {
-                            return Err(err(format!(
-                                "Host '{}': {action_error}",
-                                arg.execution.host.id
-                            )));
+                            return Err(err(format!("execution action failed: {action_error}")));
                         }
                     }
                 }
             }
         }
-        Err(err(format!(
-            "Host '{}': execution lifecycle did not settle while stopping",
-            arg.execution.host.id
-        )))
+        Err(err("execution lifecycle did not settle while stopping"))
     }
 
     #[tool(
@@ -914,12 +976,13 @@ impl Arena0Mcp {
     )]
     async fn verify_session(
         &self,
+        Extension(authorized): Extension<AuthorizedHost>,
         Parameters(arg): Parameters<VerifySessionArg>,
     ) -> Result<Json<VerifySessionOutput>, CallToolResult> {
         let session_id: SessionHash = parse(&arg.session.session_id, "session id")?;
         match self
             .request(
-                &arg.session.host,
+                &authorized,
                 HostRequest::ReceiptVerify {
                     receipt: ReceiptRef::Produced(session_id),
                     full: matches!(arg.mode, VerificationMode::Full),
@@ -941,9 +1004,8 @@ impl Arena0Mcp {
                 };
                 Ok(Json(VerifySessionOutput {
                     mode: serialized_value(&mode)?,
-                    session: session_ref(&arg.session.host, session_id),
+                    session: session_ref(session_id),
                     program: ProgramRef {
-                        host: arg.session.host,
                         program_id: program_id.to_string(),
                     },
                     participants: ensemble
@@ -973,8 +1035,28 @@ impl ServerHandler for Arena0Mcp {
         } else {
             "unknown".to_owned()
         };
+        let authorization = if tool == "hello" || tool == "unknown" {
+            Ok(None)
+        } else {
+            let token = request
+                .arguments
+                .as_ref()
+                .and_then(|arguments| arguments.get("token"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            match token {
+                Some(token) => self
+                    .daemon
+                    .authorize_token(crate::mcp_auth::RawToken::new(token))
+                    .await
+                    .map(Some)
+                    .map_err(auth_error),
+                None => Err(token_required()),
+            }
+        };
+        let authorized = authorization.as_ref().ok().and_then(Option::as_ref);
         let (host, exec_id) = activity_scope(
-            &self.daemon,
+            authorized,
             request.name.as_ref(),
             request.arguments.as_ref(),
         );
@@ -986,29 +1068,29 @@ impl ServerHandler for Arena0Mcp {
             exec_id,
         });
         let mut activity_guard = ActivityGuard::new(activity, call_id, started);
-        let call = self
-            .tool_router
-            .call(ToolCallContext::new(self, request, context));
         let mut shutdown = self.daemon.shutdown_receiver();
-        let result = if *shutdown.borrow() {
+        let result = if let Err(error) = authorization {
+            Ok(error)
+        } else if *shutdown.borrow() {
             Err(rmcp::ErrorData::internal_error(
                 "daemon is shutting down",
                 None,
             ))
         } else {
+            let mut context = context;
+            if let Ok(Some(authorized)) = authorization.as_ref() {
+                context.extensions.insert(authorized.clone());
+            }
+            let call = self
+                .tool_router
+                .call(ToolCallContext::new(self, request, context));
             tokio::select! {
                 result = call => result,
                 changed = shutdown.changed() => {
                     if changed.is_ok() && *shutdown.borrow() {
-                        Err(rmcp::ErrorData::internal_error(
-                            "daemon is shutting down",
-                            None,
-                        ))
+                        Err(rmcp::ErrorData::internal_error("daemon is shutting down", None))
                     } else {
-                        Err(rmcp::ErrorData::internal_error(
-                            "daemon shutdown state was unavailable",
-                            None,
-                        ))
+                        Err(rmcp::ErrorData::internal_error("daemon shutdown state was unavailable", None))
                     }
                 }
             }
@@ -1030,8 +1112,8 @@ impl ServerHandler for Arena0Mcp {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.instructions = Some(
-            "When asked to play, drive the interaction to completion. Open your Host once and retain its reference. \
-             Inspect the program, then start_execution with ensemble mode create to publish an Offer or join to wait for one. \
+            "When asked to play, drive the interaction to completion. Call hello with user_agent once and retain its token; renew it with hello(token) when needed. \
+             Every other tool requires that token as a top-level argument. Inspect the program, then start_execution with ensemble mode create to publish an Offer or join to wait for one. \
              Keep calling await_execution_event with wait_ms:20000 and answer each callout without asking approval for routine moves. \
              Waiting means continue. Use view_execution to read the program state. \
              Verify completed sessions. Respect requests to stop. \
@@ -1281,58 +1363,32 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
-fn service(daemon: &Daemon, host: &HostRef) -> Result<Arc<HostService>, CallToolResult> {
-    daemon.service(&host.id).ok_or_else(|| {
-        let available = daemon
-            .services()
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect::<Vec<_>>();
-        err(format!(
-            "unknown Host '{}'; available Hosts: {}",
-            host.id,
-            available.join(", ")
-        ))
-    })
-}
-
-fn peer_id(daemon: &Daemon, host: &HostRef) -> Result<PeerId, CallToolResult> {
-    service(daemon, host).map(|service| service.peer_id())
-}
-
-fn exec_ref(host: &HostRef, exec_id: ExecId) -> ExecRef {
+fn exec_ref(exec_id: ExecId) -> ExecRef {
     ExecRef {
-        host: host.clone(),
         exec_id: exec_id.to_string(),
     }
 }
 
-fn session_ref(host: &HostRef, session_id: SessionHash) -> SessionRef {
+fn session_ref(session_id: SessionHash) -> SessionRef {
     SessionRef {
-        host: host.clone(),
         session_id: session_id.to_string(),
     }
 }
 
-fn status_output(
-    host: &HostRef,
-    status: arena0_api::ExecStatus,
-) -> Result<ExecutionStatusOutput, CallToolResult> {
+fn status_output(status: arena0_api::ExecStatus) -> Result<ExecutionStatusOutput, CallToolResult> {
     Ok(ExecutionStatusOutput {
-        execution: exec_ref(host, status.exec_id),
+        execution: exec_ref(status.exec_id),
         negotiation_id: status.negotiation_id.map(|id| id.to_string()),
         program: ProgramRef {
-            host: host.clone(),
             program_id: status.program_id.to_string(),
         },
         state: serialized_value(&status.state)?,
     })
 }
 
-fn summary_output(host: &HostRef, summary: &ProgramSummary) -> ProgramSummaryOutput {
+fn summary_output(summary: &ProgramSummary) -> ProgramSummaryOutput {
     ProgramSummaryOutput {
         program: ProgramRef {
-            host: host.clone(),
             program_id: summary.program_hash.to_string(),
         },
         name: summary.name.clone(),
@@ -1348,28 +1404,14 @@ fn serialized_value<T: serde::Serialize>(value: &T) -> Result<Value, CallToolRes
 }
 
 fn activity_scope(
-    daemon: &Daemon,
+    authorized: Option<&AuthorizedHost>,
     tool: &str,
     arguments: Option<&rmcp::model::JsonObject>,
 ) -> (Option<String>, Option<ExecId>) {
+    let host = authorized.map(|host| host.host_name.to_string());
     let Some(arguments) = arguments else {
-        return (None, None);
+        return (host, None);
     };
-    let host = match tool {
-        "list_programs" | "list_executions" => scoped_string(arguments, &["host", "id"]),
-        "inspect_program" | "start_execution" => {
-            scoped_string(arguments, &["program", "host", "id"])
-        }
-        "get_execution_status"
-        | "view_execution"
-        | "await_execution_event"
-        | "answer_callout"
-        | "query_execution"
-        | "stop_execution" => scoped_string(arguments, &["execution", "host", "id"]),
-        "verify_session" => scoped_string(arguments, &["session", "host", "id"]),
-        _ => None,
-    };
-    let host = host.filter(|name| daemon.service(name).is_some());
     let exec_id = match tool {
         "get_execution_status"
         | "view_execution"
@@ -1409,15 +1451,34 @@ fn err(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![Content::text(message.into())])
 }
 
-fn api_error(host: &str, error: ApiError) -> CallToolResult {
+fn token_required() -> CallToolResult {
     CallToolResult::structured_error(serde_json::json!({
-        "code": error.code,
-        "message": format!("Host '{host}': {}", error.message),
+        "code": "TokenRequired",
+        "message": "MCP token required",
     }))
 }
 
-fn unexpected(other: &ResponseOk) -> CallToolResult {
-    err(format!("unexpected daemon response: {other:?}"))
+fn auth_error(error: AuthError) -> CallToolResult {
+    let code = match error {
+        AuthError::InvalidToken => "InvalidToken",
+        AuthError::TokenExpired => "TokenExpired",
+        AuthError::HostUnavailable => "HostUnavailable",
+    };
+    CallToolResult::structured_error(serde_json::json!({
+        "code": code,
+        "message": error.to_string(),
+    }))
+}
+
+fn api_error(error: ApiError) -> CallToolResult {
+    CallToolResult::structured_error(serde_json::json!({
+        "code": error.code,
+        "message": error.message,
+    }))
+}
+
+fn unexpected(_other: &ResponseOk) -> CallToolResult {
+    err("unexpected daemon response")
 }
 
 #[cfg(test)]
@@ -1425,7 +1486,6 @@ mod tests {
     use super::*;
     use arena0_api::{ActivityFrame, Request, Response};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::path::Path;
     use std::time::Duration;
 
     use rmcp::model::{CallToolRequestParams, ClientInfo};
@@ -1476,6 +1536,23 @@ mod tests {
         name: &'static str,
         arguments: Value,
     ) -> Value {
+        let result = call_mcp_tool_result(client, name, arguments).await;
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "MCP tool '{name}' returned an error: {:?}",
+            result.content
+        );
+        result
+            .structured_content
+            .unwrap_or_else(|| panic!("MCP tool '{name}' returned no structured content"))
+    }
+
+    async fn call_mcp_tool_result(
+        client: &rmcp::Peer<RoleClient>,
+        name: &'static str,
+        arguments: Value,
+    ) -> CallToolResult {
         let allowed_wait = if name == "await_execution_event" {
             arguments
                 .get("wait_ms")
@@ -1492,59 +1569,7 @@ mod tests {
         .await
         .unwrap_or_else(|_| panic!("MCP tool '{name}' timed out"))
         .unwrap_or_else(|error| panic!("MCP tool '{name}' request failed: {error}"));
-        assert_ne!(
-            result.is_error,
-            Some(true),
-            "MCP tool '{name}' returned an error: {:?}",
-            result.content
-        );
         result
-            .structured_content
-            .unwrap_or_else(|| panic!("MCP tool '{name}' returned no structured content"))
-    }
-
-    async fn call_unix(socket: &Path, request: &Request) -> Response {
-        let stream = UnixStream::connect(socket)
-            .await
-            .expect("connect Host socket");
-        let (mut read, mut write) = stream.into_split();
-        arena0_api::frame::write_frame(&mut write, request)
-            .await
-            .expect("write Host request");
-        arena0_api::frame::read_frame::<_, Response>(&mut read)
-            .await
-            .expect("read Host response")
-            .expect("Host response frame")
-    }
-
-    async fn wait_for_mcp_activation(
-        client: &rmcp::Peer<RoleClient>,
-        alice_exec: &Value,
-        bob_exec: &Value,
-    ) {
-        for _ in 0..250 {
-            let alice = call_mcp_tool(
-                client,
-                "get_execution_status",
-                serde_json::json!({"execution": alice_exec}),
-            )
-            .await;
-            let bob = call_mcp_tool(
-                client,
-                "get_execution_status",
-                serde_json::json!({"execution": bob_exec}),
-            )
-            .await;
-            if alice["state"]["exec_state"] == "Active" && bob["state"]["exec_state"] == "Active" {
-                assert_eq!(
-                    alice["state"]["session"]["session_id"], bob["state"]["session"]["session_id"],
-                    "both Hosts activated the same SessionHash"
-                );
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("MCP-driven executions did not activate");
     }
 
     async fn wait_for_mcp_address(daemon: &Daemon) -> SocketAddr {
@@ -1562,33 +1587,6 @@ mod tests {
         .expect("MCP endpoint did not bind")
     }
 
-    async fn poll_mcp_host(client: &rmcp::Peer<RoleClient>, execution: &Value) -> Option<Value> {
-        let event = call_mcp_tool(
-            client,
-            "await_execution_event",
-            serde_json::json!({"execution": execution}),
-        )
-        .await;
-        match event["event"].as_str() {
-            Some("waiting") => None,
-            Some("callout") => {
-                call_mcp_tool(
-                    client,
-                    "answer_callout",
-                    serde_json::json!({
-                        "execution": execution,
-                    "pending_id": event["pending_id"],
-                    "answer": "Rock"
-                    }),
-                )
-                .await;
-                None
-            }
-            Some("completed") => Some(event["session"].clone()),
-            other => panic!("unexpected MCP execution event: {other:?} ({event})"),
-        }
-    }
-
     #[test]
     fn program_summary_output_preserves_participants() {
         let summary = ProgramSummary {
@@ -1599,36 +1597,12 @@ mod tests {
             description: "N-party".into(),
             participants: ParticipantCount::Range { min: 2, max: 64 },
         };
-        let output = summary_output(
-            &HostRef {
-                id: "host-01".into(),
-            },
-            &summary,
-        );
+        let output = summary_output(&summary);
         let encoded = serde_json::to_value(output).expect("encode MCP program summary");
         assert_eq!(
             encoded["participants"],
             serde_json::json!({"kind": "range", "min": 2, "max": 64})
         );
-    }
-
-    #[tokio::test]
-    async fn list_hosts_exposes_the_whole_ensemble_in_stable_order() {
-        let test = test_daemon().await;
-        let server = Arena0Mcp::new(Arc::clone(&test.daemon));
-        let Json(output) = server
-            .list_hosts(Parameters(EmptyArgs {}))
-            .await
-            .expect("list Hosts");
-        assert_eq!(
-            output
-                .hosts
-                .iter()
-                .map(|host| host.host.id.as_str())
-                .collect::<Vec<_>>(),
-            ["alice", "bob"]
-        );
-        assert_ne!(output.hosts[0].peer_id, output.hosts[1].peer_id);
     }
 
     #[tokio::test]
@@ -1639,11 +1613,10 @@ mod tests {
             ("answer_callout", false, true, false),
             ("await_execution_event", true, false, true),
             ("get_execution_status", true, false, true),
+            ("hello", false, false, false),
             ("inspect_program", true, false, true),
             ("list_executions", true, false, true),
-            ("list_hosts", true, false, true),
             ("list_programs", true, false, true),
-            ("open_host", false, false, false),
             ("query_execution", true, false, true),
             ("start_execution", false, false, false),
             ("stop_execution", false, true, true),
@@ -1676,10 +1649,17 @@ mod tests {
                 tool.name
             );
             assert_eq!(annotations.open_world_hint, Some(false), "{}", tool.name);
+            let schema = serde_json::to_value(&*tool.input_schema).expect("input schema");
+            if tool.name != "hello" {
+                assert!(
+                    schema["required"]
+                        .as_array()
+                        .is_some_and(|required| { required.iter().any(|value| value == "token") })
+                );
+                assert!(schema["properties"].get("host").is_none());
+            }
         }
-        let list_hosts = tool_input_schema(&server, "list_hosts");
-        assert_eq!(list_hosts["type"], "object");
-        assert_eq!(list_hosts["additionalProperties"], false);
+        assert_eq!(tools.len(), 12);
     }
 
     async fn post_mcp(address: SocketAddr, body: &str) -> String {
@@ -1710,7 +1690,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_hosts_http_dispatch_rejects_unknown_arguments_but_accepts_empty() {
+    async fn hello_http_dispatch_requires_a_user_agent() {
         let test = test_daemon().await;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1722,30 +1702,19 @@ mod tests {
 
         let omitted = post_mcp(
             address,
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_hosts"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hello","arguments":{}}}"#,
         )
         .await;
         assert!(omitted.starts_with("HTTP/1.1 200"), "{omitted}");
         assert_eq!(
             serde_json::from_str::<Value>(response_body(&omitted)).expect("JSON result")["result"]
                 ["isError"],
-            false
-        );
-
-        let empty = post_mcp(
-            address,
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_hosts","arguments":{}}}"#,
-        )
-        .await;
-        assert!(empty.starts_with("HTTP/1.1 200"), "{empty}");
-        assert_eq!(
-            serde_json::from_str::<Value>(response_body(&empty)).expect("JSON result")["result"]["isError"],
-            false
+            true
         );
 
         let rejected = post_mcp(
             address,
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_hosts","arguments":{"extra":true}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"hello","arguments":{"token":"bad","user_agent":"x"}}}"#,
         )
         .await;
         assert!(rejected.starts_with("HTTP/1.1 200"), "{rejected}");
@@ -1754,8 +1723,7 @@ mod tests {
         let error_text = rejected["result"]["content"][0]["text"]
             .as_str()
             .expect("tool error text");
-        assert!(error_text.contains("failed to deserialize parameters"));
-        assert!(error_text.contains("unknown field `extra`"));
+        assert!(error_text.contains("either token or user_agent"));
 
         serving.abort();
         serving
@@ -1788,11 +1756,11 @@ mod tests {
         let (first, second) = tokio::join!(
             post_mcp(
                 address,
-                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_hosts","arguments":{}}}"#,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hello","arguments":{"user_agent":"activity/1"}}}"#,
             ),
             post_mcp(
                 address,
-                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_hosts","arguments":{}}}"#,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hello","arguments":{"user_agent":"activity/2"}}}"#,
             ),
         );
         assert!(first.starts_with("HTTP/1.1 200"), "{first}");
@@ -1812,7 +1780,7 @@ mod tests {
                     host,
                     exec_id,
                 } => {
-                    assert_eq!(tool, "list_hosts");
+                    assert_eq!(tool, "hello");
                     assert_eq!(host, None);
                     assert_eq!(exec_id, None);
                     starts.push(call_id);
@@ -1843,123 +1811,18 @@ mod tests {
             .expect("daemon served");
     }
 
-    #[tokio::test]
-    async fn activity_scope_uses_only_public_reference_paths() {
-        let test = test_daemon().await;
+    #[test]
+    fn activity_scope_without_authorization_ignores_wire_references() {
         let public_exec = ExecId([0x11; 32]);
-        let private_exec = ExecId([0x22; 32]).to_string();
-        let cases = [
-            (
-                "list_hosts",
-                serde_json::json!({
-                    "host": {"id": "alice"},
-                    "exec_id": public_exec.to_string(),
-                }),
-                None,
-                None,
-            ),
-            (
-                "list_programs",
-                serde_json::json!({
-                    "host": {"id": "alice"},
-                    "params": {"host": {"id": "bob"}, "exec_id": private_exec},
-                }),
-                Some("alice"),
-                None,
-            ),
-            (
-                "inspect_program",
-                serde_json::json!({
-                    "program": {"host": {"id": "alice"}},
-                    "params": {"host": {"id": "bob"}, "exec_id": private_exec},
-                }),
-                Some("alice"),
-                None,
-            ),
-            (
-                "start_execution",
-                serde_json::json!({
-                    "program": {"host": {"id": "alice"}},
-                    "params": {"host": {"id": "bob"}, "exec_id": private_exec},
-                    "ensemble": {"mode": "explicit", "hosts": [{"id": "bob"}]},
-                }),
-                Some("alice"),
-                None,
-            ),
-            (
-                "get_execution_status",
-                serde_json::json!({
-                    "execution": {"host": {"id": "alice"}, "exec_id": public_exec},
-                    "params": {"host": {"id": "bob"}, "exec_id": private_exec},
-                }),
-                Some("alice"),
-                Some(public_exec),
-            ),
-            (
-                "await_execution_event",
-                serde_json::json!({
-                    "execution": {"host": {"id": "alice"}, "exec_id": public_exec},
-                    "params": {"host": {"id": "bob"}, "exec_id": private_exec},
-                }),
-                Some("alice"),
-                Some(public_exec),
-            ),
-            (
-                "answer_callout",
-                serde_json::json!({
-                    "execution": {"host": {"id": "alice"}, "exec_id": public_exec},
-                    "answer": {"host": {"id": "bob"}, "exec_id": private_exec},
-                }),
-                Some("alice"),
-                Some(public_exec),
-            ),
-            (
-                "query_execution",
-                serde_json::json!({
-                    "execution": {"host": {"id": "alice"}, "exec_id": public_exec},
-                    "query": {"host": {"id": "bob"}, "exec_id": private_exec},
-                }),
-                Some("alice"),
-                Some(public_exec),
-            ),
-            (
-                "stop_execution",
-                serde_json::json!({
-                    "execution": {"host": {"id": "alice"}, "exec_id": public_exec},
-                    "reason": "stop",
-                    "params": {"host": {"id": "bob"}, "exec_id": private_exec},
-                }),
-                Some("alice"),
-                Some(public_exec),
-            ),
-            (
-                "verify_session",
-                serde_json::json!({
-                    "session": {"host": {"id": "alice"}, "session_id": "aa"},
-                    "params": {"host": {"id": "bob"}, "exec_id": private_exec},
-                }),
-                Some("alice"),
-                None,
-            ),
-            (
-                "unknown_tool",
-                serde_json::json!({
-                    "host": {"id": "alice"},
-                    "exec_id": public_exec.to_string(),
-                }),
-                None,
-                None,
-            ),
-        ];
-
-        for (tool, value, expected_host, expected_exec) in cases {
-            let arguments = serde_json::from_value(value).expect("activity arguments object");
-            assert_eq!(
-                activity_scope(&test.daemon, tool, Some(&arguments)),
-                (expected_host.map(str::to_owned), expected_exec),
-                "activity scope for {tool}"
-            );
-        }
+        let arguments = serde_json::json!({
+            "token": "redacted",
+            "execution": {"host": {"id": "alice"}, "exec_id": public_exec},
+            "params": {"host": {"id": "bob"}, "exec_id": "private"},
+        });
+        assert_eq!(
+            activity_scope(None, "get_execution_status", arguments.as_object(),),
+            (None, Some(public_exec))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2117,291 +1980,374 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn one_mcp_client_drives_two_hosts_to_one_session() {
-        run_open_admission_scenario(false).await;
+    async fn two_mcp_clients_are_scoped_by_hello_tokens() {
+        let test = test_daemon().await;
+        let supervisor = tokio::spawn(Arc::clone(&test.daemon).serve());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind MCP test listener");
+        let address = listener.local_addr().expect("MCP listener address");
+        let daemon = Arc::clone(&test.daemon);
+        let serving =
+            tokio::spawn(async move { axum::serve(listener, router(daemon, None)).await });
+
+        let client_a = ClientInfo::default()
+            .serve(StreamableHttpClientTransport::from_config(
+                StreamableHttpClientTransportConfig::with_uri(format!("http://{address}/mcp")),
+            ))
+            .await
+            .expect("initialize first MCP client");
+        let client_b = ClientInfo::default()
+            .serve(StreamableHttpClientTransport::from_config(
+                StreamableHttpClientTransportConfig::with_uri(format!("http://{address}/mcp")),
+            ))
+            .await
+            .expect("initialize second MCP client");
+
+        let hello_a = call_mcp_tool(
+            &client_a,
+            "hello",
+            serde_json::json!({"user_agent": "client-a/1"}),
+        )
+        .await;
+        let hello_b = call_mcp_tool(
+            &client_b,
+            "hello",
+            serde_json::json!({"user_agent": "client-b/1"}),
+        )
+        .await;
+        let token_a = hello_a["token"].as_str().expect("first JWT").to_owned();
+        let token_b = hello_b["token"].as_str().expect("second JWT").to_owned();
+        assert_ne!(hello_a["peer_id"], hello_b["peer_id"]);
+        assert_ne!(token_a, token_b);
+
+        let programs_a = call_mcp_tool(
+            &client_a,
+            "list_programs",
+            serde_json::json!({"token": token_a}),
+        )
+        .await;
+        let programs_b = call_mcp_tool(
+            &client_b,
+            "list_programs",
+            serde_json::json!({"token": token_b}),
+        )
+        .await;
+        let program_a = programs_a["programs"]
+            .as_array()
+            .and_then(|programs| programs.first())
+            .expect("first client program")
+            .clone();
+        let program_b = programs_b["programs"]
+            .as_array()
+            .and_then(|programs| programs.first())
+            .expect("second client program")
+            .clone();
+        assert_eq!(
+            program_a["program"]["program_id"],
+            program_b["program"]["program_id"]
+        );
+
+        let bob_execution = call_mcp_tool(
+            &client_b,
+            "start_execution",
+            serde_json::json!({
+                "token": token_b,
+                "program": program_b["program"],
+                "params": null,
+                "ensemble": {"mode": "join"},
+            }),
+        )
+        .await;
+        let foreign = call_mcp_tool_result(
+            &client_a,
+            "get_execution_status",
+            serde_json::json!({
+                "token": token_a,
+                "execution": bob_execution["execution"],
+            }),
+        )
+        .await;
+        assert_eq!(foreign.is_error, Some(true));
+        let foreign_text = foreign
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(foreign_text.contains("execution"), "{foreign_text}");
+
+        call_mcp_tool(
+            &client_b,
+            "stop_execution",
+            serde_json::json!({
+                "token": token_b,
+                "execution": bob_execution["execution"],
+            }),
+        )
+        .await;
+
+        let renewed =
+            call_mcp_tool(&client_a, "hello", serde_json::json!({"token": token_a})).await;
+        assert_eq!(renewed["peer_id"], hello_a["peer_id"]);
+
+        let before_invalid = test.daemon.services().len();
+        let invalid = call_mcp_tool_result(
+            &client_a,
+            "hello",
+            serde_json::json!({"token": null, "user_agent": "must-not-provision"}),
+        )
+        .await;
+        assert_eq!(invalid.is_error, Some(true));
+        assert_eq!(test.daemon.services().len(), before_invalid);
+
+        client_a.cancel().await.expect("close first MCP client");
+        client_b.cancel().await.expect("close second MCP client");
+        serving.abort();
+        let _ = serving.await;
+        test.daemon.stop().await;
+        supervisor
+            .await
+            .expect("supervisor task")
+            .expect("clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn hello_reopens_only_the_original_identity_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = arena0_home::Home::from_root(directory.path().to_owned()).unwrap();
+        let engine = Arc::new(WasmtimeEngine::new().unwrap());
+        let mut token = String::new();
+        let mut wrong_identity_token = String::new();
+        let mut original_peer = Value::Null;
+        let mut identity_index = std::path::PathBuf::new();
+
+        for phase in 0..3 {
+            let daemon = Daemon::start(
+                vec![],
+                McpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap(),
+                Arc::clone(&engine),
+                home.clone(),
+                true,
+            )
+            .await
+            .unwrap();
+            let supervisor = tokio::spawn(Arc::clone(&daemon).serve());
+            let address = wait_for_mcp_address(&daemon).await;
+            let client = ClientInfo::default()
+                .serve(StreamableHttpClientTransport::from_config(
+                    StreamableHttpClientTransportConfig::with_uri(format!("http://{address}/mcp")),
+                ))
+                .await
+                .unwrap();
+            assert!(daemon.services().is_empty());
+
+            match phase {
+                0 => {
+                    let hello = call_mcp_tool(
+                        &client,
+                        "hello",
+                        serde_json::json!({"user_agent": "restart-client/1"}),
+                    )
+                    .await;
+                    token = hello["token"].as_str().unwrap().to_owned();
+                    original_peer = hello["peer_id"].clone();
+                    let info = daemon.services()[0].1.host_info();
+                    let name = info.id.parse().unwrap();
+                    identity_index = home.host(&name).state_dir().join("keys/index.json");
+                    wrong_identity_token = daemon
+                        .issue_token(&name, PeerId([9; 32]))
+                        .unwrap()
+                        .token
+                        .as_str()
+                        .to_owned();
+                }
+                1 => {
+                    let rejected = call_mcp_tool_result(
+                        &client,
+                        "hello",
+                        serde_json::json!({"token": wrong_identity_token}),
+                    )
+                    .await;
+                    assert_eq!(rejected.is_error, Some(true));
+                    assert!(daemon.services().is_empty());
+                    let (first, second) = tokio::join!(
+                        call_mcp_tool(&client, "hello", serde_json::json!({"token": token})),
+                        call_mcp_tool(&client, "hello", serde_json::json!({"token": token})),
+                    );
+                    assert_eq!(first["peer_id"], original_peer);
+                    assert_eq!(second["peer_id"], original_peer);
+                    assert_eq!(daemon.services().len(), 1);
+                    assert_eq!(
+                        daemon.services()[0].1.host_info().user_agent.as_deref(),
+                        Some("restart-client/1")
+                    );
+                    // Earlier tokens remain usable after renewal.
+                    call_mcp_tool(
+                        &client,
+                        "list_executions",
+                        serde_json::json!({"token": token}),
+                    )
+                    .await;
+                    call_mcp_tool(
+                        &client,
+                        "list_executions",
+                        serde_json::json!({"token": first["token"]}),
+                    )
+                    .await;
+                }
+                2 => {
+                    let rejected =
+                        call_mcp_tool_result(&client, "hello", serde_json::json!({"token": token}))
+                            .await;
+                    assert_eq!(rejected.is_error, Some(true));
+                    assert!(daemon.services().is_empty());
+                    assert!(!identity_index.exists(), "missing identity was recreated");
+                }
+                _ => unreachable!(),
+            }
+            client.cancel().await.unwrap();
+            daemon.stop().await;
+            supervisor.await.unwrap().unwrap();
+            drop(daemon);
+            if phase == 1 {
+                std::fs::remove_file(&identity_index).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_mcp_clients_complete_and_verify_one_session() {
+        run_token_admission_scenario(false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn open_join_waits_for_a_later_creator() {
-        run_open_admission_scenario(true).await;
+        run_token_admission_scenario(true).await;
     }
 
-    async fn run_open_admission_scenario(join_first: bool) {
+    async fn run_token_admission_scenario(join_first: bool) {
         timeout(Duration::from_secs(80), async {
             let test = test_daemon().await;
             let supervisor = tokio::spawn(Arc::clone(&test.daemon).serve());
-            while tokio::net::UnixStream::connect(test._homes[0].path().join("arena0.sock"))
-                .await
-                .is_err()
-            {
-                tokio::task::yield_now().await;
+            let address = wait_for_mcp_address(&test.daemon).await;
+            let mut clients = Vec::new();
+            let mut tokens = Vec::new();
+            let mut programs = Vec::new();
+            for user_agent in ["creator/1", "joiner/1"] {
+                let client = ClientInfo::default().serve(StreamableHttpClientTransport::from_config(
+                    StreamableHttpClientTransportConfig::with_uri(format!("http://{address}/mcp")),
+                )).await.unwrap();
+                let hello = call_mcp_tool(&client, "hello", serde_json::json!({"user_agent": user_agent})).await;
+                let token = hello["token"].clone();
+                let catalog = call_mcp_tool(&client, "list_programs", serde_json::json!({"token": token})).await;
+                programs.push(catalog["programs"].as_array().unwrap().iter()
+                    .find(|program| program["name"] == "rock-paper-scissors").unwrap()["program"].clone());
+                tokens.push(token);
+                clients.push(client);
             }
-            let listener = TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind MCP test listener");
-            let address = listener.local_addr().expect("MCP listener address");
-            let daemon = Arc::clone(&test.daemon);
-            let serving =
-                tokio::spawn(async move { axum::serve(listener, router(daemon, None)).await });
-
-            let transport = StreamableHttpClientTransport::from_config(
-                StreamableHttpClientTransportConfig::with_uri(format!("http://{address}/mcp")),
-            );
-            let client = ClientInfo::default()
-                .serve(transport)
-                .await
-                .expect("initialize one MCP client");
-
-            let opened_a = call_mcp_tool(
-                &client,
-                "open_host",
-                serde_json::json!({
-                    "user_agent": "claude-code/test"
-                }),
-            )
-            .await;
-            let opened_b = call_mcp_tool(
-                &client,
-                "open_host",
-                serde_json::json!({
-                    "id": "new-bob", "user_agent": "codex/test"
-                }),
-            )
-            .await;
-            let alice = opened_a["host"].clone();
-            let bob = opened_b["host"].clone();
-            assert_ne!(opened_a["peer_id"], opened_b["peer_id"]);
-            let reopened = call_mcp_tool(
-                &client,
-                "open_host",
-                serde_json::json!({
-                    "id": bob["id"], "user_agent": "codex/new"
-                }),
-            )
-            .await;
-            assert_eq!(reopened["peer_id"], opened_b["peer_id"]);
-            let hosts = call_mcp_tool(&client, "list_hosts", serde_json::json!({})).await;
-            let hosts = hosts["hosts"].as_array().expect("Host list");
-            assert_eq!(hosts.len(), 4);
-            let row = hosts
-                .iter()
-                .find(|row| row["host"] == bob)
-                .expect("new Host listed");
-            assert_eq!(row["user_agent"], "codex/new");
-            let service = test.daemon.service("new-bob").expect("ready Host");
-            let ResponseOk::HostStatus(info) = service.dispatch(HostRequest::Info).await.unwrap()
-            else {
-                panic!("expected Host info");
-            };
-            assert_eq!(row["peer_id"], info.host.peer_id.to_string());
-            assert_eq!(info.host.user_agent.as_deref(), Some("codex/new"));
-
-            let daemon_socket = test._homes[0].path().join("arena0.sock");
-            match call_unix(&daemon_socket, &Request::HostsList).await {
-                Ok(ResponseOk::Hosts(hosts)) => {
-                    assert_eq!(hosts.len(), 4, "Unix HostsList includes dynamic Hosts");
-                    let bob_info = hosts
-                        .iter()
-                        .find(|host| host.host.id == "new-bob")
-                        .expect("dynamically opened Host is visible");
-                    assert_eq!(bob_info.host.user_agent.as_deref(), Some("codex/new"));
-                    assert_eq!(
-                        bob_info.host.peer_id.to_string(),
-                        opened_b["peer_id"].as_str().unwrap()
-                    );
-                    assert!(
-                        hosts
-                            .iter()
-                            .any(|host| host.host.id == alice["id"].as_str().unwrap())
-                    );
-                }
-                other => panic!("unexpected Unix HostsList response: {other:?}"),
-            }
-
-            let alice_programs =
-                call_mcp_tool(&client, "list_programs", serde_json::json!({"host": alice})).await;
-            let bob_programs =
-                call_mcp_tool(&client, "list_programs", serde_json::json!({"host": bob})).await;
-            let rps = |programs: &Value| {
-                programs["programs"]
-                    .as_array()
-                    .expect("program list")
-                    .iter()
-                    .find(|program| program["name"] == "rock-paper-scissors")
-                    .expect("rock-paper-scissors program")["program"]
-                    .clone()
-            };
-            let alice_program = rps(&alice_programs);
-            let bob_program = rps(&bob_programs);
-            assert_eq!(
-                alice_program["program_id"], bob_program["program_id"],
-                "both Hosts admitted the same Wasm"
-            );
-
-            // Exercise cancellation before discovery binds a target.
-            let cancelled = call_mcp_tool(
-                &client,
-                "start_execution",
-                serde_json::json!({"program": bob_program, "params": null,
-                    "ensemble": {"mode": "join"}}),
-            )
-            .await;
+            assert_eq!(programs[0], programs[1]);
+            let start_join = || call_mcp_tool(&clients[1], "start_execution", serde_json::json!({
+                "token": tokens[1], "program": programs[1], "params": null, "ensemble": {"mode": "join"}
+            }));
+            let cancelled = start_join().await;
             assert!(cancelled["negotiation_id"].is_null());
-            timeout(
-                Duration::from_secs(2),
-                call_mcp_tool(
-                    &client,
-                    "stop_execution",
-                    serde_json::json!({"execution": cancelled["execution"]}),
-                ),
-            )
-            .await
-            .expect("unbound Join cancels promptly");
+            timeout(Duration::from_secs(2), call_mcp_tool(&clients[1], "stop_execution", serde_json::json!({
+                "token": tokens[1], "execution": cancelled["execution"]
+            }))).await.expect("unbound Join cancels promptly");
             let early_join = if join_first {
-                let joined = call_mcp_tool(
-                    &client,
-                    "start_execution",
-                    serde_json::json!({"program": bob_program, "params": null,
-                        "ensemble": {"mode": "join"}}),
-                )
-                .await;
+                let joined = start_join().await;
                 assert!(joined["negotiation_id"].is_null());
-                let waiting = call_mcp_tool(
-                    &client,
-                    "await_execution_event",
-                    serde_json::json!({"execution": joined["execution"], "wait_ms": 30}),
-                )
-                .await;
+                let waiting = call_mcp_tool(&clients[1], "await_execution_event", serde_json::json!({
+                    "token": tokens[1], "execution": joined["execution"], "wait_ms": 30
+                })).await;
                 assert_eq!(waiting, serde_json::json!({"event": "waiting"}));
                 Some(joined)
-            } else {
-                None
-            };
-
-            let created = call_mcp_tool(
-                &client,
-                "start_execution",
-                serde_json::json!({
-                    "program": alice_program,
-                    "params": null,
-                    "ensemble": {"mode": "create"}
-                }),
-            )
-            .await;
+            } else { None };
+            let created = call_mcp_tool(&clients[0], "start_execution", serde_json::json!({
+                "token": tokens[0], "program": programs[0], "params": null, "ensemble": {"mode": "create"}
+            })).await;
             assert_eq!(created["state"], "Negotiating");
             assert!(created["session"].is_null());
             assert!(created["negotiation_id"].is_string());
-            let alice_exec = created["execution"].clone();
-            assert_eq!(alice_exec["host"], alice);
             if !join_first {
-                // Cross the old 30s timeout and at least one offer renewal
-                // through the same bounded-wait API used by agents.
-                let wait_started = Instant::now();
+                // Preserve the existing regression check across the old 30s timeout.
+                let started = Instant::now();
                 for _ in 0..2 {
-                    let waiting = call_mcp_tool(
-                        &client,
-                        "await_execution_event",
-                        serde_json::json!({"execution": alice_exec, "wait_ms": 20000}),
-                    )
-                    .await;
+                    let waiting = call_mcp_tool(&clients[0], "await_execution_event", serde_json::json!({
+                        "token": tokens[0], "execution": created["execution"], "wait_ms": 20000
+                    })).await;
                     assert_eq!(waiting, serde_json::json!({"event": "waiting"}));
                 }
-                assert!(wait_started.elapsed() >= Duration::from_secs(40));
+                assert!(started.elapsed() >= Duration::from_secs(40));
             }
-            let recovered = call_mcp_tool(
-                &client,
-                "list_executions",
-                serde_json::json!({"host": alice}),
-            )
-            .await;
-            assert_eq!(recovered["executions"][0]["execution"], alice_exec);
-            let joined = if let Some(joined) = early_join {
-                joined
-            } else {
-                call_mcp_tool(
-                    &client,
-                    "start_execution",
-                    serde_json::json!({
-                        "program": bob_program,
-                        "params": null,
-                        "ensemble": {"mode": "join"}
-                    }),
-                )
-                .await
-            };
-            let bob_exec = joined["execution"].clone();
-            assert_eq!(bob_exec["host"], bob);
-
-            wait_for_mcp_activation(&client, &alice_exec, &bob_exec).await;
-
-            let mut alice_session = None;
-            let mut bob_session = None;
-            for _ in 0..100 {
-                if alice_session.is_none() {
-                    alice_session = poll_mcp_host(&client, &alice_exec).await;
+            let recovered = call_mcp_tool(&clients[0], "list_executions", serde_json::json!({"token": tokens[0]})).await;
+            assert_eq!(recovered["executions"][0]["execution"], created["execution"]);
+            let joined = if let Some(joined) = early_join { joined } else { start_join().await };
+            let executions = [created["execution"].clone(), joined["execution"].clone()];
+            let mut activated = false;
+            for _ in 0..250 {
+                let mut statuses = Vec::new();
+                for index in 0..2 {
+                    statuses.push(call_mcp_tool(&clients[index], "get_execution_status", serde_json::json!({
+                        "token": tokens[index], "execution": executions[index]
+                    })).await);
                 }
-                if bob_session.is_none() {
-                    bob_session = poll_mcp_host(&client, &bob_exec).await;
-                }
-                if alice_session.is_some() && bob_session.is_some() {
+                if statuses.iter().all(|status| status["state"]["exec_state"] == "Active") {
+                    assert_eq!(
+                        statuses[0]["state"]["session"]["session_id"],
+                        statuses[1]["state"]["session"]["session_id"]
+                    );
+                    activated = true;
                     break;
                 }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            let alice_session = alice_session.expect("Alice MCP execution did not complete");
-            let bob_session = bob_session.expect("Bob MCP execution did not complete");
-            assert_eq!(
-                alice_session["session_id"], bob_session["session_id"],
-                "both Hosts completed the same SessionHash"
-            );
-            assert_eq!(alice_session["host"], alice);
-            assert_eq!(bob_session["host"], bob);
-            for execution in [&alice_exec, &bob_exec] {
-                let view = call_mcp_tool(
-                    &client,
-                    "view_execution",
-                    serde_json::json!({"execution": execution}),
-                )
-                .await;
+            assert!(activated, "MCP-driven executions did not activate");
+            let mut sessions = [Value::Null, Value::Null];
+            for _ in 0..100 {
+                for index in 0..2 {
+                    if !sessions[index].is_null() { continue; }
+                    let event = call_mcp_tool(&clients[index], "await_execution_event", serde_json::json!({
+                        "token": tokens[index], "execution": executions[index], "wait_ms": 100
+                    })).await;
+                    match event["event"].as_str() {
+                        Some("waiting") => {},
+                        Some("callout") => {
+                            call_mcp_tool(&clients[index], "answer_callout", serde_json::json!({
+                                "token": tokens[index], "execution": executions[index],
+                                "pending_id": event["pending_id"], "answer": "Rock"
+                            })).await;
+                        }
+                        Some("completed") => sessions[index] = event["session"].clone(),
+                        _ => panic!("unexpected execution event"),
+                    }
+                }
+                if sessions.iter().all(|session| !session.is_null()) { break; }
+            }
+            assert!(sessions.iter().all(|session| !session.is_null()), "MCP executions did not complete");
+            assert_eq!(sessions[0], sessions[1]);
+            for index in 0..2 {
+                assert!(executions[index].get("host").is_none());
+                assert!(sessions[index].get("host").is_none());
+                let view = call_mcp_tool(&clients[index], "view_execution", serde_json::json!({
+                    "token": tokens[index], "execution": executions[index]
+                })).await;
                 assert!(view["view"]["slots"].is_object());
-            }
-
-            let alice_verified = call_mcp_tool(
-                &client,
-                "verify_session",
-                serde_json::json!({"session": alice_session, "mode": "full"}),
-            )
-            .await;
-            let bob_verified = call_mcp_tool(
-                &client,
-                "verify_session",
-                serde_json::json!({"session": bob_session, "mode": "full"}),
-            )
-            .await;
-            for verified in [&alice_verified, &bob_verified] {
-                assert_eq!(verified["participants"].as_array().map(Vec::len), Some(2));
+                let verified = call_mcp_tool(&clients[index], "verify_session", serde_json::json!({
+                    "token": tokens[index], "session": sessions[index], "mode": "full"
+                })).await;
+                assert_eq!(verified["session"], sessions[index]);
+                let participants = verified["participants"].as_array().unwrap();
+                assert_eq!(participants.len(), 2);
+                assert!(participants.iter().all(|participant| participant.get("host").is_none()));
                 assert!(verified["steps"].as_u64().is_some_and(|steps| steps > 0));
                 assert!(verified["terminal"].get("Completed").is_some());
             }
-            assert_eq!(
-                alice_verified["session"]["session_id"],
-                bob_verified["session"]["session_id"]
-            );
-            assert_eq!(alice_verified["session"]["host"], alice);
-            assert_eq!(bob_verified["session"]["host"], bob);
-
-            client.cancel().await.expect("close the one MCP client");
-            serving.abort();
-            serving
-                .await
-                .expect_err("aborted MCP server should report cancellation");
+            for client in clients { client.cancel().await.unwrap(); }
             test.daemon.stop().await;
-            supervisor
-                .await
-                .expect("supervisor task")
-                .expect("clean shutdown");
-        })
-        .await
-        .expect("one-client MCP scenario exceeded 80 seconds");
+            supervisor.await.unwrap().unwrap();
+        }).await.expect("two-client MCP scenario exceeded 80 seconds");
     }
 
     #[tokio::test]
@@ -2410,7 +2356,12 @@ mod tests {
         let server = Arena0Mcp::new(test.daemon);
         let start = tool_input_schema(&server, "start_execution");
         assert!(start["properties"]["program"]["$ref"].is_string());
-        assert!(start["$defs"]["ProgramRef"]["properties"]["host"]["$ref"].is_string());
+        assert!(start["$defs"]["ProgramRef"]["properties"]["program_id"].is_object());
+        assert!(
+            start["$defs"]["ProgramRef"]["properties"]
+                .get("host")
+                .is_none()
+        );
         let ensemble = &start["$defs"]["McpEnsemble"];
         let variants = ensemble["oneOf"].as_array().expect("ensemble variants");
         assert_eq!(variants.len(), 3);

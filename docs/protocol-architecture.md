@@ -43,7 +43,7 @@ A negotiation is not a session. `NegotiationId` names work before activation;
 arena0d process
 └── Daemon supervisor
     ├── Unix API `$ARENA0_HOME/arena0.sock` (explicit Host refs)
-    ├── MCP Streamable HTTP `/mcp` (all Hosts; explicit Host refs)
+    ├── MCP Streamable HTTP `/mcp` (one Host per access token)
     └── arena0_node::Ensemble
         ├── Host A ─ durable namespace A
         ├── Host B ─ durable namespace B
@@ -577,9 +577,28 @@ unless bootstrap is disabled.
 
 The Unix endpoint exposes one typed request surface. Host operations carry an
 explicit Host ID in `host.call`; daemon operations do not select a Host.
-`--host` selects a participant and `--socket` overrides the daemon endpoint.
+`--host` selects a Host and `--socket` overrides the daemon endpoint.
 The daemon supervisor owns coordinated shutdown: it closes its listeners and
 connections, drains Host services, stops the Ensemble once, and closes stores.
+
+Local agents call `arena0 hello` to create or reopen their Participant. The CLI
+reads `ARENA0_CONTEXT` or, when absent, `codex:<CODEX_THREAD_ID>`. A context is
+namespaced as `harness:session[:agent]`, has nonempty components, contains no
+control characters, and fits within 120 UTF-8 bytes. Its exact bytes become
+lowercase hexadecimal after the `agent-` prefix to form a validated `HostName`.
+This deterministic name reuses the existing Host namespace; no binding file or
+additional database owns the association. The context is a local routing key,
+not a credential or a protocol session ID.
+
+`arena0 hello` requires a context and delegates to `hosts.open`. Repeating it
+reopens the same namespace and retained identity while that state remains
+present, including after daemon restart. Ordinary Host commands select
+`--host`, then the harness context, then the existing default. An invalid
+selected context is an error. Those commands never provision a missing Host.
+Harness adapters supply context to each agent's command environment; they do
+not create Participants. Subagents acting as separate Participants require
+distinct contexts. Context resolution belongs to each CLI invocation, not the
+shared daemon process.
 
 `exec.list`, `exec.status`, and immediately available `exec.next` results read
 the durable execution record. Completed, aborted, and failed executions
@@ -593,18 +612,47 @@ local receipt from durable evidence before attempting further delivery. An
 unavailable guest or peer cannot prevent that local proof from being persisted;
 outbox delivery remains durable and ordered independently.
 
-The daemon exposes one MCP Streamable HTTP endpoint for its complete Ensemble.
-The tool catalog is stable across connections and carries an explicit Host
-reference in every Host-scoped request. The endpoint is stateless; its bearer
-token never selects a Host. The adapter dispatches to the same Host services as
-the Unix API and never owns identity, protocol, sandbox, or persistence state.
-MCP `open_host` accepts an optional local `id` and a required `user_agent`.
-The local ID selects a durable namespace, distinct from its cryptographic
-`peer_id`; omitting it allocates a fresh random ID. Reopening an ID preserves
-its identity and updates its durable user agent. The value must be nonblank,
-contain no control characters, and fit within 256 UTF-8 bytes. It describes the
-agent software and is operational metadata, never authenticated identity or
-protocol evidence.
+The daemon exposes one MCP Streamable HTTP endpoint with a stable tool catalog.
+`hello` accepts a required `user_agent` for a new Participant and returns a
+signed access token, public `peer_id`, expiry, and renewal time. It generates
+the local Host ID; callers cannot select an existing Host by name. The user
+agent must be nonblank, contain no control characters, and fit within 256 UTF-8
+bytes. It describes agent software and is operational metadata, never
+authenticated identity or protocol evidence.
+
+Every program, execution, and verification call carries a token. The adapter
+validates it once and dispatches through the authorized Host service. Program,
+execution, and receipt references contain no caller-selected Host. Admission
+targets and participant results use public `PeerId`s. MCP does not enumerate
+the daemon's Hosts or map other Participants to local Host names. Operator
+Unix API and monitor access remains daemon-wide.
+
+Host access uses HS256 JWTs with a dedicated 256-bit daemon signing key at
+`$ARENA0_HOME/mcp-signing.key`. Private, crash-safe persistence preserves that
+key across restarts; it is independent of Host identity keys. Verification
+requires the expected algorithm, token type, issuer, audience, Host ID,
+`PeerId`, issuance time, and unexpired deadline. An existing Host's identity
+must match before it is exposed. Missing identity data is an error, never a
+request to create a replacement. The daemon stores no per-token records.
+The optional `ARENA0_MCP_TOKEN` HTTP bearer credential remains a separate
+endpoint access gate; it does not grant access to a named Host.
+
+`hello` with a valid token renews access to the same Host while preserving its
+identity and user agent. The default lifetime is 24 hours, configurable by
+`--mcp-access-token-lifetime-secs` or
+`ARENA0_MCP_ACCESS_TOKEN_LIFETIME_SECS`. Expiry and renewal times are UTC Unix
+seconds. Renewed credentials do not revoke earlier tokens; those remain valid
+until their own deadlines. Expired or invalid tokens cannot renew. There is
+no `goodbye`, refresh-token record, or application session table. Access is
+checked at request dispatch; an accepted request may finish after expiry.
+Token expiry and transport closure do not stop a Host or its executions.
+
+Initial `hello` is not idempotent. Losing its response loses the credential;
+another call without a token creates another Host. The MCP adapter does not
+infer identity from caller metadata or promise recovery of an unknown token.
+It owns no protocol, execution, sandbox, or receipt state. These access rules
+restrict MCP dispatch, not other processes with access to the same home and
+administrative Unix socket.
 
 The daemon serializes provisioning through a bounded queue and admits at most
 64 local Hosts independently of each execution's exact participant set. It
@@ -612,7 +660,8 @@ reserves exclusive store ownership before accessing identity custody, restores
 durable state, and publishes a recovered Host in the shared routing roster. Failed opens
 release provisional resources. Shutdown rejects queued opens and settles
 in-progress provisioning before closing stores. Persisted namespaces outside
-the configured startup set reopen lazily by ID; startup does not claim every
+the configured startup set reopen lazily through operator-selected IDs or
+validated MCP tokens; startup does not claim every
 Host directory in the home. A daemon-wide process lock is acquired before
 opening Host stores; one live daemon owns a home and its Unix endpoint.
 Independent daemons use independent homes. The shared socket has its own

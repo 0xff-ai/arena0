@@ -83,6 +83,7 @@ retry = "2.2.0"
 
 # Agent interface
 rmcp = { version = "1.8.0", features = ["server", "transport-streamable-http-server", "macros", "schemars"] }
+jsonwebtoken = { version = "11.0.0", default-features = false, features = ["aws_lc_rs"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 
 # Error handling

@@ -4,7 +4,8 @@
 //! the sole terminal loop and state owner: this side fetches bounded snapshots,
 //! translates public daemon events, and executes an explicitly selected answer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
@@ -12,12 +13,11 @@ use arena0_client::api::{
     ActivityData, ActivityResult, ApiErrorCode, ColorDepth, EventData, EventFilter, HostRequest,
     NextEvent, ResponseOk,
 };
-use arena0_client::program::{BorshSchemaDocument, ProgramHash};
 use arena0_client::proto::DaemonClient;
-use arena0_client::protocol::{ExecId, TraceEntry};
+use arena0_client::protocol::{ExecId, ProgramHash, TraceEntry};
 use arena0_home::HostName;
 use clap::Args;
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
 use tokio::task::JoinSet;
 
 use crate::tui::{
@@ -30,6 +30,63 @@ const TRACE_LIMIT: u64 = 256;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_ACTIVITY_CALLS: usize = 1024;
+
+/// Fetch each immutable program schema once across all observed Hosts.
+/// Failed requests remain retryable on the next execution refresh.
+#[derive(Default)]
+struct MessageSchemas {
+    loaded: Mutex<BTreeSet<ProgramHash>>,
+}
+
+impl MessageSchemas {
+    async fn load(
+        &self,
+        client: &DaemonClient,
+        host: &HostName,
+        handle: &TuiHandle,
+        program_id: ProgramHash,
+    ) -> anyhow::Result<()> {
+        let mut loaded = self.loaded.lock().await;
+        if loaded.contains(&program_id) {
+            return Ok(());
+        }
+        let response = client
+            .call_host(
+                host,
+                &HostRequest::ProgramGet {
+                    program: program_id.to_string(),
+                },
+            )
+            .await;
+        let (schema, fetched) = match response {
+            Ok(ResponseOk::Program(detail)) => (
+                detail
+                    .schema
+                    .messages
+                    .into_iter()
+                    .next()
+                    .map(|message| message.borsh)
+                    .ok_or_else(|| "program has no message schema".to_owned()),
+                true,
+            ),
+            Ok(_) => (Err("unexpected program.get response".to_owned()), false),
+            Err(error) => (
+                Err(format!("message schema could not be loaded: {error:#}")),
+                false,
+            ),
+        };
+        handle
+            .update(RunUpdate::Monitor(MonitorUpdate::MessageSchema {
+                program_id,
+                schema,
+            }))
+            .await?;
+        if fetched {
+            loaded.insert(program_id);
+        }
+        Ok(())
+    }
+}
 
 /// Arguments for `arena0 monitor`.
 #[derive(Debug, Clone, Args)]
@@ -59,6 +116,7 @@ pub(crate) async fn attach(entry_client: DaemonClient, args: MonitorArgs) -> any
     let (mut session, mut actions) = TuiSession::start_monitor(config, cancel);
     let handle = session.handle();
     let mut workers = JoinSet::new();
+    let schemas = Arc::new(MessageSchemas::default());
     let mut subscriptions = BTreeMap::new();
     let observe = async {
         handle
@@ -71,7 +129,9 @@ pub(crate) async fn attach(entry_client: DaemonClient, args: MonitorArgs) -> any
             let handle = handle.clone();
             let name = host.host.clone();
             let peer = host.peer_id;
-            let task = workers.spawn(async move { host_worker(host, client, handle).await });
+            let schemas = Arc::clone(&schemas);
+            let task =
+                workers.spawn(async move { host_worker(host, client, handle, schemas).await });
             subscriptions.insert(name, (peer, task));
         }
         workers.spawn(activity_worker(entry_client.clone(), handle.clone()));
@@ -102,7 +162,8 @@ pub(crate) async fn attach(entry_client: DaemonClient, args: MonitorArgs) -> any
                             let client = entry_client.clone();
                             let handle = handle.clone();
                             let observed = host.clone();
-                            let task = workers.spawn(async move { host_worker(observed, client, handle).await });
+                            let schemas = Arc::clone(&schemas);
+                            let task = workers.spawn(async move { host_worker(observed, client, handle, schemas).await });
                             subscriptions.insert(host.host.clone(), (host.peer_id, task));
                         }
                     }
@@ -171,10 +232,10 @@ async fn host_worker(
     host: MonitorHost,
     client: DaemonClient,
     handle: TuiHandle,
+    schemas: Arc<MessageSchemas>,
 ) -> anyhow::Result<()> {
-    let mut message_schemas = BTreeMap::<ProgramHash, Option<BorshSchemaDocument>>::new();
     loop {
-        match run_host_connection(&host, &client, &handle, &mut message_schemas).await {
+        match run_host_connection(&host, &client, &handle, &schemas).await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 let _ = handle
@@ -194,13 +255,13 @@ async fn run_host_connection(
     host: &MonitorHost,
     client: &DaemonClient,
     handle: &TuiHandle,
-    message_schemas: &mut BTreeMap<ProgramHash, Option<BorshSchemaDocument>>,
+    schemas: &MessageSchemas,
 ) -> anyhow::Result<()> {
     let mut subscription = client
         .subscribe(&host.host, EventFilter::default())
         .await
         .with_context(|| format!("subscribe to Host '{}' events", host.host))?;
-    refresh_host(host, client, handle, message_schemas).await?;
+    refresh_host(host, client, handle, schemas).await?;
     let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
     let mut last_seq: Option<u64> = None;
     loop {
@@ -217,9 +278,9 @@ async fn run_host_connection(
                     })).await;
                 }
                 last_seq = Some(frame.seq);
-                observe_event(host, client, handle, frame, message_schemas).await?;
+                observe_event(host, client, handle, schemas, frame).await?;
             }
-            _ = ticker.tick() => refresh_host(host, client, handle, message_schemas).await?,
+            _ = ticker.tick() => refresh_host(host, client, handle, schemas).await?,
         }
     }
 }
@@ -228,7 +289,7 @@ async fn refresh_host(
     host: &MonitorHost,
     client: &DaemonClient,
     handle: &TuiHandle,
-    message_schemas: &mut BTreeMap<ProgramHash, Option<BorshSchemaDocument>>,
+    schemas: &MessageSchemas,
 ) -> anyhow::Result<()> {
     let statuses = match client.call_host(&host.host, &HostRequest::ExecList).await? {
         ResponseOk::ExecList(statuses) => statuses,
@@ -238,7 +299,7 @@ async fn refresh_host(
         ),
     };
     for status in statuses {
-        refresh_execution(host, client, handle, status, message_schemas).await?;
+        refresh_execution(host, client, handle, schemas, status).await?;
     }
     Ok(())
 }
@@ -250,18 +311,18 @@ async fn refresh_execution(
     host: &MonitorHost,
     client: &DaemonClient,
     handle: &TuiHandle,
+    schemas: &MessageSchemas,
     status: arena0_client::api::ExecStatus,
-    message_schemas: &mut BTreeMap<ProgramHash, Option<BorshSchemaDocument>>,
 ) -> anyhow::Result<()> {
+    schemas
+        .load(client, &host.host, handle, status.program_id)
+        .await?;
     let has_pending = status.pending_callout().is_some();
     let exec_id = status.exec_id;
-    let program_id = status.program_id;
     let key = MonitorExecutionKey {
         host: host.host.clone(),
         exec_id,
     };
-    let message_schema =
-        lookup_message_schema(client, &host.host, program_id, message_schemas).await;
     let inspection = fetch_inspection(client, &host.host, exec_id).await;
     let view = fetch_view(client, &host.host, exec_id, handle.view_width()).await;
     let trace = fetch_trace(client, &host.host, exec_id, status.step()).await;
@@ -292,7 +353,6 @@ async fn refresh_execution(
         .update(RunUpdate::Monitor(MonitorUpdate::Execution {
             key,
             status,
-            message_schema,
             inspection,
             view,
             trace,
@@ -305,35 +365,6 @@ async fn refresh_execution(
         let _ = fetch_pending_callout(client, host, exec_id, handle).await;
     }
     Ok(())
-}
-
-async fn lookup_message_schema(
-    client: &DaemonClient,
-    host: &HostName,
-    program_id: ProgramHash,
-    cache: &mut BTreeMap<ProgramHash, Option<BorshSchemaDocument>>,
-) -> Option<BorshSchemaDocument> {
-    if let Some(schema) = cache.get(&program_id) {
-        return schema.clone();
-    }
-    let Ok(ResponseOk::Program(program)) = client
-        .call_host(
-            host,
-            &HostRequest::ProgramGet {
-                program: program_id.to_string(),
-            },
-        )
-        .await
-    else {
-        return None;
-    };
-    let schema = program
-        .schema
-        .messages
-        .first()
-        .map(|message| message.borsh.clone());
-    cache.insert(program_id, schema.clone());
-    schema
 }
 
 async fn fetch_pending_callout(
@@ -446,8 +477,8 @@ async fn observe_event(
     host: &MonitorHost,
     client: &DaemonClient,
     handle: &TuiHandle,
+    schemas: &MessageSchemas,
     frame: arena0_client::api::EventFrame,
-    message_schemas: &mut BTreeMap<ProgramHash, Option<BorshSchemaDocument>>,
 ) -> anyhow::Result<()> {
     let key = frame.exec_id.map(|exec_id| MonitorExecutionKey {
         host: host.host.clone(),
@@ -527,7 +558,7 @@ async fn observe_event(
                 summary,
             }))
             .await?;
-        refresh_host(host, client, handle, message_schemas).await?;
+        refresh_host(host, client, handle, schemas).await?;
     } else if let Some(exec_id) = frame.exec_id {
         // The event is a freshness trigger. Refresh only this execution so a
         // busy Host with many executions does not make the selected view lag.
@@ -536,7 +567,7 @@ async fn observe_event(
             .await
         {
             Ok(ResponseOk::Status(status)) => {
-                refresh_execution(host, client, handle, status, message_schemas).await?;
+                refresh_execution(host, client, handle, schemas, status).await?;
             }
             Ok(other) => {
                 mark_execution_gap(

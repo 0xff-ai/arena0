@@ -168,6 +168,12 @@ impl Home {
             .unwrap_or_else(|| self.root.join("arena0.sock"))
     }
 
+    /// The daemon-wide signing key used for MCP access tokens.
+    #[must_use]
+    pub fn mcp_signing_key(&self) -> PathBuf {
+        self.root.join("mcp-signing.key")
+    }
+
     /// Derive the durable state directory for one Host.
     #[must_use]
     pub fn host(&self, name: &HostName) -> HostLocation {

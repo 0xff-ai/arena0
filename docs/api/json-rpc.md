@@ -242,11 +242,20 @@ and the actual bound `mcp_endpoint`, including an assigned ephemeral port.
 `user_agent`), public `transport_key`, program count, and active execution count.
 Host metadata contains no socket path.
 
-`hosts.open` uses the same serialized provisioning operation as MCP
-`open_host`. A supplied ID reopens its durable namespace; an omitted ID creates
+`hosts.open` uses the same serialized provisioning owner as MCP
+`hello`. A supplied ID reopens its durable namespace; an omitted ID creates
 a fresh one. The required user agent identifies caller software and follows
 the same validation as MCP. Opening is acknowledged only after recovery and
 publication in the daemon's authoritative roster.
+
+The local CLI exposes this operation as `arena0 hello --user-agent NAME/VERSION`.
+It uses a deterministic Host name derived from `ARENA0_CONTEXT`, or from
+`codex:<CODEX_THREAD_ID>` when the explicit context is absent. `--json` returns
+`HostInfo` with `id`, `peer_id`, and `user_agent`. No access token is returned on
+this Unix-socket path. Repeated calls reuse the context's durable namespace;
+ordinary CLI commands address that Host automatically without `--host`.
+See [context selection](../protocol-architecture.md#12-daemon-and-agent-api)
+for validation and precedence. MCP `hello` retains its token-based contract.
 
 One daemon owns each home. Its single listener serves concurrent requests and
 Host subscriptions. `daemon.stop` acknowledges before beginning coordinated
@@ -271,25 +280,36 @@ from semantic `EventFrame` values and durable receipt facts.
 
 ## MCP projection
 
-`arena0d` exposes one Streamable HTTP endpoint at `/mcp` for the complete local
-Ensemble. MCP auth is daemon-wide and the endpoint is stateless.
-Authentication never selects a Host; call `open_host` with
-`{id?,user_agent}` to receive an assigned Host reference and public metadata.
-Configure the endpoint once in an MCP harness and carry that reference through
-the same client. Interleave the Host driver states when
-`await_execution_event` returns `waiting`; do not open one MCP session per
-Host. See
-[Connect one harness to an Ensemble](../connect-over-mcp.md).
+`arena0d` exposes one stateless Streamable HTTP endpoint at `/mcp`.
+`hello({user_agent})` creates a Host and returns `{token,peer_id,expires_at,renew_after}`.
+Every other tool requires a top-level `token` argument; the daemon validates
+it and dispatches only to the named Host. Program, execution, and protocol
+session references contain their respective IDs, without a Host selector.
+Tokens are credentials and must not be shared between Participants. See
+[Connect an agent to arena0](../getting-started.md#configure-an-agent).
+
+`hello({token})` renews an unexpired token for the same Host. The times are UTC
+Unix seconds; the default lifetime is 24 hours. Preserve the latest token
+across reconnects and renew at `renew_after`, before `expires_at`. Old tokens
+remain valid until their own expiry. An expired or invalid token is rejected;
+the call never creates a replacement Host. Token expiry and transport closure
+do not stop executions. A lost initial `hello` response cannot be recovered
+through MCP without its credential; repeating creation allocates another Host.
+
+`ARENA0_MCP_TOKEN`, when configured, still protects the HTTP endpoint with an
+independent bearer credential. It does not replace the per-Host token. The
+adapter has no `goodbye` operation or server-side token records.
 
 The stable tool set is:
 
-- discovery: `open_host`, `list_programs`, `inspect_program`;
-- execution: `start_execution`, `get_execution_status`,
-  `await_execution_event`, `answer_callout`, `query_execution`,
+- access: `hello`;
+- programs: `list_programs`, `inspect_program`;
+- execution: `start_execution`, `get_execution_status`, `list_executions`,
+  `view_execution`, `await_execution_event`, `answer_callout`, `query_execution`,
   `stop_execution`;
 - evidence: `verify_session`.
 
-Host information is represented by the `open_host` result. Negotiation
+Public Participant identity is returned by `hello`. Negotiation
 withdrawal and active termination are one lifecycle-aware `stop_execution`
 operation. Params updates are unsupported because negotiation terms are
 immutable. Trace and raw receipt retrieval remain operator Unix API/CLI
@@ -300,15 +320,16 @@ wait elapsed without a callout or terminal event; it does not withdraw or
 finish the execution. Call the tool again with the retained execution reference
 to renew the wait, including while an open Join is still discovering an offer.
 
-MCP admission names daemon-local Hosts and uses an adjacent tag:
+MCP admission uses public Participant peer IDs:
 
 ```json
-{"mode":"explicit","hosts":[{"id":"host-02"}]}
-{"mode":"join","creator":{"id":"host-01"},"negotiation_id":"<negotiation-id>"}
+{"mode":"explicit","peers":["<peer-id>"]}
+{"mode":"join","target":{"creator":"<creator-peer-id>","negotiation_id":"<negotiation-id>"}}
 ```
 
-Mode-specific unknown or conflicting fields are rejected before a socket
-request is sent.
+Mode-specific unknown or conflicting fields are rejected before dispatch.
+Peer IDs identify protocol Participants; they do not grant access to another
+Host's tools, catalog, executions, or receipts.
 
 ## Boundary invariants
 

@@ -28,6 +28,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::assets::PROGRAMS;
 use crate::catalog::ProgramCatalog;
+use crate::mcp_auth::{AuthError, DEFAULT_ACCESS_TOKEN_LIFETIME, McpAuth, RawToken};
 use crate::paths::{FileLease as HomeLease, Paths};
 use crate::server::{Activity, HostService, HostServiceInit, UnixSocket};
 use crate::startup::{self, StartupStage, StartupTimeline};
@@ -46,17 +47,27 @@ const SERVE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Configuration for the daemon-owned MCP Streamable HTTP endpoint.
 ///
 /// Phase 1 deliberately binds only to loopback. `bearer_token` protects the
-/// whole daemon Ensemble; it never selects or scopes a Host.
+/// whole daemon ingress; it is separate from the per-Host JWT carried by MCP
+/// tool calls.
 #[derive(Clone)]
 pub struct McpConfig {
     pub(crate) listen: SocketAddr,
     pub(crate) bearer_token: Option<String>,
+    pub(crate) access_token_lifetime: Duration,
 }
 
 impl McpConfig {
-    /// Configure one loopback MCP endpoint. An optional bearer token applies to
-    /// every Host and every MCP session served at that endpoint.
+    /// Configure one loopback MCP endpoint with the default one-day JWT life.
     pub fn new(listen: SocketAddr, bearer_token: Option<String>) -> anyhow::Result<Self> {
+        Self::with_access_token_lifetime(listen, bearer_token, DEFAULT_ACCESS_TOKEN_LIFETIME)
+    }
+
+    /// Configure one loopback MCP endpoint and its JWT lifetime.
+    pub fn with_access_token_lifetime(
+        listen: SocketAddr,
+        bearer_token: Option<String>,
+        access_token_lifetime: Duration,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             listen.ip().is_loopback(),
             "Phase 1 MCP must listen on a loopback address"
@@ -64,9 +75,22 @@ impl McpConfig {
         if let Some(token) = &bearer_token {
             anyhow::ensure!(!token.is_empty(), "ARENA0_MCP_TOKEN must not be empty");
         }
+        anyhow::ensure!(
+            access_token_lifetime.as_secs() > 0,
+            "MCP access token lifetime must be greater than zero"
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| anyhow::anyhow!("system clock is before Unix epoch"))?
+            .as_secs();
+        anyhow::ensure!(
+            now.checked_add(access_token_lifetime.as_secs()).is_some(),
+            "MCP access token lifetime overflows Unix time"
+        );
         Ok(Self {
             listen,
             bearer_token,
+            access_token_lifetime,
         })
     }
 }
@@ -79,6 +103,7 @@ impl std::fmt::Debug for McpConfig {
                 "bearer_token",
                 &self.bearer_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("access_token_lifetime", &self.access_token_lifetime)
             .finish()
     }
 }
@@ -152,6 +177,60 @@ impl HostConfig {
         })
     }
 
+    /// Reopen one already-existing Host namespace without minting identity or
+    /// creating its directory/database. The expected peer is checked before
+    /// reserving the SQLite store or touching the shared runtime.
+    pub(crate) fn open_existing(
+        name: HostName,
+        paths: Paths,
+        expected_peer: PeerId,
+        bootstrap: bool,
+    ) -> anyhow::Result<Self> {
+        let state = std::fs::symlink_metadata(&paths.state_dir).with_context(|| {
+            format!("inspect existing Host state {}", paths.state_dir.display())
+        })?;
+        anyhow::ensure!(
+            !state.file_type().is_symlink() && state.is_dir(),
+            "existing Host state must be a regular directory"
+        );
+        // Reject a missing database before Store::reserve can create an owner
+        // lock or initialize an empty database.
+        let database = std::fs::symlink_metadata(&paths.db_path).with_context(|| {
+            format!("inspect existing Host database {}", paths.db_path.display())
+        })?;
+        anyhow::ensure!(
+            !database.file_type().is_symlink() && database.is_file(),
+            "existing Host database must be a regular file"
+        );
+        let reservation = Store::reserve(&paths.db_path).context("reserve Host ownership")?;
+        // Custody is opened only after this process owns the durable store. A
+        // mismatched or missing identity therefore cannot acquire identity
+        // custody while another process owns the database.
+        let keystore = Arc::new(Keystore::open(paths.keys_dir.clone())?);
+        let actual_peer = keystore
+            .active_peer_id()
+            .ok_or_else(|| anyhow::anyhow!("existing Host has no active identity"))?;
+        anyhow::ensure!(
+            actual_peer == expected_peer,
+            "existing Host identity does not match the authenticated peer"
+        );
+        let identity = Arc::new(keystore.active_crypto()?);
+        anyhow::ensure!(
+            identity.peer_id() == expected_peer,
+            "existing Host identity changed while opening"
+        );
+        let store = reservation
+            .open(StoreConfig::new(paths.db_path.clone(), expected_peer))
+            .with_context(|| format!("open SQLite store at {}", paths.db_path.display()))?;
+        Ok(Self {
+            name,
+            identity,
+            keystore,
+            store,
+            bootstrap,
+        })
+    }
+
     /// The persistent peer identity selected for this Host.
     #[must_use]
     pub(crate) fn peer_id(&self) -> PeerId {
@@ -191,9 +270,19 @@ async fn shutdown_startup_owners(
     shutdown_host_configs(configs).await;
 }
 
+enum OpenKind {
+    Create {
+        id: Option<HostName>,
+        user_agent: String,
+    },
+    Existing {
+        id: HostName,
+        expected_peer: PeerId,
+    },
+}
+
 struct OpenRequest {
-    id: Option<HostName>,
-    user_agent: String,
+    kind: OpenKind,
     reply: oneshot::Sender<anyhow::Result<HostInfo>>,
 }
 
@@ -216,6 +305,7 @@ pub struct Daemon {
     home: Home,
     bootstrap_new_hosts: bool,
     engine: Arc<WasmtimeEngine>,
+    mcp_auth: Arc<McpAuth>,
     opens: mpsc::Sender<OpenRequest>,
     open_requests: Mutex<Option<mpsc::Receiver<OpenRequest>>>,
     stop_requested: Notify,
@@ -294,6 +384,10 @@ impl Daemon {
     ) -> anyhow::Result<Arc<Self>> {
         validate_host_names(&names)?;
         let lease = HomeLease::acquire_home(&home)?;
+        let mcp_auth = Arc::new(
+            McpAuth::load_or_create(&home.mcp_signing_key(), mcp.access_token_lifetime)
+                .context("load daemon MCP signing key")?,
+        );
         startup::progress(StartupStage::HostsProvisioning, &startup);
         let mut hosts = Vec::with_capacity(names.len());
         for name in names {
@@ -325,6 +419,7 @@ impl Daemon {
             bootstrap_new_hosts,
             startup,
             lease,
+            mcp_auth,
         )
         .await
     }
@@ -337,6 +432,7 @@ impl Daemon {
         bootstrap_new_hosts: bool,
         startup: Arc<StartupTimeline>,
         lease: HomeLease,
+        mcp_auth: Arc<McpAuth>,
     ) -> anyhow::Result<Arc<Self>> {
         if hosts.iter().any(|host| host.bootstrap) {
             startup::progress(StartupStage::ProgramsBootstrapping, &startup);
@@ -425,6 +521,7 @@ impl Daemon {
             home,
             bootstrap_new_hosts,
             engine,
+            mcp_auth,
             opens,
             open_requests: Mutex::new(Some(open_requests)),
             stop_requested: Notify::new(),
@@ -454,8 +551,32 @@ impl Daemon {
         let (reply, result) = oneshot::channel();
         self.opens
             .send(OpenRequest {
-                id,
-                user_agent,
+                kind: OpenKind::Create { id, user_agent },
+                reply,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("daemon is shutting down"))?;
+        result
+            .await
+            .map_err(|_| anyhow::anyhow!("Host opening supervisor stopped"))?
+    }
+
+    /// Reopen an existing Host selected by an authenticated token. This uses
+    /// the same supervised queue as ordinary opens, but the worker must find
+    /// the namespace and verify its durable identity before publication.
+    pub(crate) async fn open_existing(
+        &self,
+        id: HostName,
+        expected_peer: PeerId,
+    ) -> anyhow::Result<HostInfo> {
+        anyhow::ensure!(
+            self.state.load(Ordering::Acquire) == RUNNING,
+            "daemon is not accepting Host opens"
+        );
+        let (reply, result) = oneshot::channel();
+        self.opens
+            .send(OpenRequest {
+                kind: OpenKind::Existing { id, expected_peer },
                 reply,
             })
             .await
@@ -609,7 +730,7 @@ impl Daemon {
                 Some(request) = opens.recv(), if opening.is_empty() => {
                     let daemon = Arc::clone(&self);
                     opening.spawn(async move {
-                        let result = daemon.prepare_open(request.id, request.user_agent).await;
+                        let result = daemon.prepare_open(request.kind).await;
                         (request.reply, result)
                     });
                 }
@@ -649,20 +770,49 @@ impl Daemon {
         outcome
     }
 
-    async fn prepare_open(
-        &self,
-        id: Option<HostName>,
-        user_agent: String,
-    ) -> anyhow::Result<OpenedHost> {
+    async fn prepare_open(&self, kind: OpenKind) -> anyhow::Result<OpenedHost> {
         anyhow::ensure!(
             self.state.load(Ordering::Acquire) == RUNNING,
             "daemon is shutting down"
         );
+        let (id, user_agent, expected_peer) = match kind {
+            OpenKind::Create { id, user_agent } => (id, Some(user_agent), None),
+            OpenKind::Existing { id, expected_peer } => (Some(id), None, Some(expected_peer)),
+        };
         if let Some(ref id) = id
             && let Some(service) = self.service(id.as_str())
         {
-            service.set_user_agent(user_agent).await?;
+            if let Some(expected_peer) = expected_peer {
+                anyhow::ensure!(
+                    service.peer_id() == expected_peer,
+                    "existing Host identity does not match the authenticated peer"
+                );
+            } else if let Some(user_agent) = user_agent {
+                service.set_user_agent(user_agent).await?;
+            }
             return Ok(OpenedHost::Existing(service.host_info()));
+        }
+        if let Some(expected_peer) = expected_peer {
+            let id =
+                id.ok_or_else(|| anyhow::anyhow!("existing Host reopen requires a Host id"))?;
+            anyhow::ensure!(
+                self.services().len() < MAX_LOCAL_HOSTS,
+                "daemon Host capacity reached ({MAX_LOCAL_HOSTS})"
+            );
+            let paths = Paths::from_location(&self.home.host(&id))?;
+            let bootstrap = self.bootstrap_new_hosts;
+            let allocated_id = id.clone();
+            let config = tokio::task::spawn_blocking(move || {
+                HostConfig::open_existing(id, paths, expected_peer, bootstrap)
+            })
+            .await
+            .context("join existing Host provisioning")?
+            .with_context(|| format!("reopen Host '{allocated_id}'"))?;
+            return self
+                .prepare_existing(config)
+                .await
+                .map(OpenedHost::Prepared)
+                .with_context(|| format!("prepare existing Host '{allocated_id}'"));
         }
         anyhow::ensure!(
             self.services().len() < MAX_LOCAL_HOSTS,
@@ -679,10 +829,13 @@ impl Daemon {
             .await
             .context("join Host provisioning")?
             .with_context(|| format!("open Host '{allocated_id}'"))?;
-        self.prepare_new(config, user_agent)
-            .await
-            .map(OpenedHost::Prepared)
-            .with_context(|| format!("prepare Host '{allocated_id}'"))
+        self.prepare_new(
+            config,
+            user_agent.ok_or_else(|| anyhow::anyhow!("new Host requires a user agent"))?,
+        )
+        .await
+        .map(OpenedHost::Prepared)
+        .with_context(|| format!("prepare Host '{allocated_id}'"))
     }
 
     fn generate_host_id(&self) -> anyhow::Result<HostName> {
@@ -729,6 +882,57 @@ impl Daemon {
             .ensemble
             .transport(&peer_id)
             .expect("new transport installed");
+        let service =
+            match compose_service(&config, transport, runtime, &self.engine, &self.startup) {
+                Ok(service) => service,
+                Err(error) => {
+                    self.close_provisional_host(peer_id, config.store).await?;
+                    return Err(error);
+                }
+            };
+        match service.prepare().await {
+            Ok(()) => Ok(PreparedHost {
+                id: config.name,
+                slot: HostSlot {
+                    service,
+                    store: config.store,
+                },
+            }),
+            Err(error) => {
+                service.stop().await;
+                self.close_provisional_host(peer_id, config.store).await?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn prepare_existing(&self, config: HostConfig) -> anyhow::Result<PreparedHost> {
+        let peer_id = config.peer_id();
+        let runtime = async {
+            // Existing Hosts retain their durable metadata. Built-in program
+            // registration remains idempotent and is allowed only after the
+            // expected identity was verified by HostConfig::open_existing.
+            bootstrap_programs(&config, &self.engine, &self.startup).await?;
+            self.ensemble
+                .add_host(Arc::clone(&config.identity), config.store.handle().clone())
+                .map_err(anyhow::Error::from)
+        }
+        .await;
+        let runtime = match runtime {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                config
+                    .store
+                    .shutdown()
+                    .await
+                    .context("close failed Host store")?;
+                return Err(error);
+            }
+        };
+        let transport = self
+            .ensemble
+            .transport(&peer_id)
+            .expect("existing transport installed");
         let service =
             match compose_service(&config, transport, runtime, &self.engine, &self.startup) {
                 Ok(service) => service,
@@ -858,10 +1062,45 @@ impl Daemon {
             .map(|slot| Arc::clone(&slot.service))
     }
 
-    pub(crate) fn host_name(&self, peer_id: PeerId) -> Option<String> {
-        self.services()
-            .into_iter()
-            .find_map(|(id, service)| (service.peer_id() == peer_id).then_some(id))
+    /// Verify one JWT and resolve its durable Host through the supervised
+    /// roster. A valid token for a persisted Host may lazily reopen that Host
+    /// after a daemon restart; missing or mismatched identities never fall
+    /// through to Host creation.
+    pub(crate) async fn authorize_token(
+        &self,
+        token: RawToken,
+    ) -> Result<crate::mcp::AuthorizedHost, AuthError> {
+        let claims = self.mcp_auth.verify(token)?;
+        let host_name = claims.host_name().clone();
+        let peer_id = claims.peer_id();
+        if let Some(service) = self.service(host_name.as_str()) {
+            if service.peer_id() != peer_id {
+                return Err(AuthError::InvalidToken);
+            }
+            return Ok(crate::mcp::AuthorizedHost::new(
+                host_name, peer_id, service, claims,
+            ));
+        }
+        self.open_existing(host_name.clone(), peer_id)
+            .await
+            .map_err(|_| AuthError::HostUnavailable)?;
+        let service = self
+            .service(host_name.as_str())
+            .ok_or(AuthError::HostUnavailable)?;
+        if service.peer_id() != peer_id {
+            return Err(AuthError::InvalidToken);
+        }
+        Ok(crate::mcp::AuthorizedHost::new(
+            host_name, peer_id, service, claims,
+        ))
+    }
+
+    pub(crate) fn issue_token(
+        &self,
+        host_name: &HostName,
+        peer_id: PeerId,
+    ) -> anyhow::Result<crate::mcp_auth::IssuedToken> {
+        self.mcp_auth.issue(host_name, peer_id)
     }
 
     pub(crate) async fn host_statuses(&self) -> Result<Vec<HostStatus>, ApiError> {

@@ -612,7 +612,11 @@ fn load_crypto_from_path(path: &Path, expected_peer_hex: &str) -> anyhow::Result
     Ok(crypto)
 }
 
-fn ensure_private_regular(path: &Path, metadata: &Metadata, kind: &str) -> anyhow::Result<()> {
+pub(crate) fn ensure_private_regular(
+    path: &Path,
+    metadata: &Metadata,
+    kind: &str,
+) -> anyhow::Result<()> {
     anyhow::ensure!(
         !metadata.file_type().is_symlink() && metadata.is_file(),
         "{kind} must be a regular non-symlink file: {}",
@@ -644,7 +648,7 @@ fn write_seed_bytes(path: &Path, seed: &[u8; 32]) -> anyhow::Result<()> {
 /// publication primitive available through the standard Unix filesystem API:
 /// an existing regular file, directory, or symlink makes the link fail with
 /// `AlreadyExists` rather than being replaced.
-fn publish_new_private(path: &Path, bytes: &[u8], kind: &str) -> anyhow::Result<()> {
+pub(crate) fn publish_new_private(path: &Path, bytes: &[u8], kind: &str) -> anyhow::Result<()> {
     crate::paths::validate_path(path).context("validate private file path")?;
     ensure_absent(path, kind)?;
 
@@ -722,7 +726,22 @@ fn create_private_temp(path: &Path) -> anyhow::Result<(PathBuf, File)> {
             options.mode(PRIVATE_FILE_MODE);
         }
         match options.open(&temp_path) {
-            Ok(file) => return Ok((temp_path, file)),
+            Ok(file) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Err(error) =
+                        file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+                    {
+                        drop(file);
+                        let _ = fs::remove_file(&temp_path);
+                        return Err(error).with_context(|| {
+                            format!("set private temporary file mode {}", temp_path.display())
+                        });
+                    }
+                }
+                return Ok((temp_path, file));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(error).with_context(|| {

@@ -6,7 +6,9 @@
 //! `arena0-verify`.
 
 mod agent;
+mod context;
 mod coordinated;
+mod harness_hook;
 mod line_input;
 mod local_daemon;
 mod monitor;
@@ -106,7 +108,7 @@ struct Cli {
     /// Daemon socket (default: ARENA0_SOCKET or ARENA0_HOME/arena0.sock).
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
-    /// Select the Host addressed by Host operations on the shared daemon socket.
+    /// Select a Host on the shared daemon socket, overriding the harness context.
     #[arg(long, global = true)]
     host: Option<HostName>,
     /// Emit machine-readable JSON on stdout.
@@ -123,12 +125,28 @@ struct Cli {
 enum Command {
     /// Print the agent-facing arena0 skill without contacting a Host.
     Skill,
+    /// Open the Host bound to the current harness context.
+    ///
+    /// The context is `ARENA0_CONTEXT=harness:session[:agent]`, falling back to
+    /// `codex:` followed by the value of `CODEX_THREAD_ID`. Repeating hello
+    /// reuses the same Host namespace.
+    Hello {
+        /// Caller-reported harness name and version.
+        #[arg(long, default_value_t = default_user_agent())]
+        user_agent: String,
+    },
     /// Start the persistent local Host service.
     Serve(serve::ServeArgs),
     /// Create project-local harness skill and MCP configuration files.
     Setup {
         #[command(subcommand)]
         target: setup::Target,
+    },
+    /// Run an internal harness lifecycle hook.
+    #[command(hide = true)]
+    Hook {
+        #[command(subcommand)]
+        command: HookCommand,
     },
     /// Launch a headless emulation, or open the launcher when PROGRAM is omitted.
     Launch {
@@ -220,10 +238,21 @@ enum Command {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum HookCommand {
+    /// Bind the current Claude Code session for later Bash commands.
+    #[command(name = "claude-session-start", hide = true)]
+    ClaudeSessionStart,
+}
+
 #[derive(serde::Serialize)]
 struct SkillOutput<'a> {
     name: &'static str,
     markdown: &'a str,
+}
+
+fn default_user_agent() -> String {
+    format!("arena0-cli/{}", env!("CARGO_PKG_VERSION"))
 }
 
 #[derive(Debug, Subcommand)]
@@ -331,6 +360,9 @@ enum ReceiptCommand {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Some(exit) = dispatch_hook(&cli) {
+        return exit;
+    }
     if let Some(exit) = dispatch_skill(&cli) {
         return exit;
     }
@@ -339,6 +371,10 @@ fn main() -> ExitCode {
     }
     if cli.tmp && matches!(cli.command, Some(Command::Monitor(_))) {
         eprintln!("error: --tmp does not apply to `arena0 monitor`; attach to an existing home");
+        return ExitCode::FAILURE;
+    }
+    if cli.tmp && matches!(cli.command, Some(Command::Hello { .. })) {
+        eprintln!("error: --tmp does not apply to `arena0 hello`; context Hosts are persistent");
         return ExitCode::FAILURE;
     }
     let _temporary_home = match prepare_temporary_home(cli.tmp) {
@@ -376,6 +412,33 @@ fn main() -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Dispatch harness hooks before resolving Home, installing tracing, or
+/// creating a Tokio runtime. Hooks are deliberately limited to local IO.
+fn dispatch_hook(cli: &Cli) -> Option<ExitCode> {
+    if !matches!(
+        cli.command.as_ref(),
+        Some(Command::Hook {
+            command: HookCommand::ClaudeSessionStart,
+        })
+    ) {
+        return None;
+    }
+
+    let result = (|| -> anyhow::Result<()> {
+        if cli.socket.is_some() || cli.host.is_some() || cli.tmp || cli.json {
+            bail!("--socket, --host, --tmp, and --json do not apply to arena0 hook");
+        }
+        harness_hook::claude_session_start()
+    })();
+    Some(match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            ExitCode::FAILURE
+        }
+    })
 }
 
 /// Dispatch the offline skill before resolving Home, installing tracing, or
@@ -423,7 +486,7 @@ fn dispatch_skill(cli: &Cli) -> Option<ExitCode> {
 /// creating a Tokio runtime. Setup only reads and creates files below cwd.
 fn dispatch_setup(cli: &Cli) -> Option<ExitCode> {
     let target = match cli.command.as_ref() {
-        Some(Command::Setup { target }) => target.clone(),
+        Some(Command::Setup { target }) => target,
         _ => return None,
     };
     let result = (|| -> anyhow::Result<()> {
@@ -603,6 +666,19 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     let command = match command.expect("checked above") {
         Command::Skill => unreachable!("offline skill returned before runtime setup"),
+        Command::Hello { user_agent } => {
+            if host.is_some() {
+                bail!("--host does not apply to `arena0 hello`; context selects the Host");
+            }
+            let agent_context = context::AgentContext::from_env()?.ok_or_else(|| {
+                anyhow!("arena0 hello requires ARENA0_CONTEXT or CODEX_THREAD_ID")
+            })?;
+            let client = match socket {
+                Some(socket) => DaemonClient::new(socket),
+                None => DaemonClient::from_env()?,
+            };
+            return hello(&client, &agent_context, user_agent, mode).await;
+        }
         Command::Serve(args) => {
             if tmp {
                 bail!(
@@ -785,8 +861,23 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         return verify::verify_hosts(mode, Palette::for_mode(mode), target, hosts, replay).await;
     }
 
-    let host_selected = host.is_some();
-    let host = host.unwrap_or_default();
+    // Context binding applies only to ordinary Host operations. Daemon-only
+    // commands and offline receipt verification retain their existing paths;
+    // an explicit --host also bypasses context parsing altogether.
+    let agent_context = match &command {
+        Command::Stop => None,
+        Command::Verify { target, replay, .. }
+            if !*replay && verify::is_path_target(Path::new(target), target) =>
+        {
+            None
+        }
+        _ if host.is_some() => None,
+        _ => context::AgentContext::from_env()?,
+    };
+    let host_selected = host.is_some() || agent_context.is_some();
+    let host = host
+        .or_else(|| agent_context.as_ref().map(|context| context.host().clone()))
+        .unwrap_or_default();
     if let Command::Verify {
         ref target, replay, ..
     } = command
@@ -838,8 +929,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     match command {
         Command::Skill => unreachable!("offline skill returned before runtime setup"),
+        Command::Hello { .. } => unreachable!("hello returned before client construction"),
         Command::Serve(_) => unreachable!("serve returned before client construction"),
         Command::Setup { .. } => unreachable!("setup returned before client construction"),
+        Command::Hook { .. } => unreachable!("hook returned before runtime setup"),
         Command::Status => status(&ctx, host_selected).await,
         Command::Stop => stop(&ctx).await,
         Command::Identity { command } => identity(&ctx, command).await,
@@ -1134,6 +1227,28 @@ fn render_coordinated_result(
             result.verification.tier.as_str()
         );
     }
+}
+
+async fn hello(
+    client: &DaemonClient,
+    context: &context::AgentContext,
+    user_agent: String,
+    mode: Mode,
+) -> anyhow::Result<()> {
+    let info = client
+        .open_host(Some(context.host().to_string()), user_agent)
+        .await?;
+    if mode.is_json() {
+        ui::print_json(&serde_json::to_value(&info)?);
+    } else {
+        println!(
+            "Host {}  peer={}  user-agent={}",
+            info.id,
+            info.peer_id,
+            info.user_agent.as_deref().unwrap_or("(none)")
+        );
+    }
+    Ok(())
 }
 
 async fn status(ctx: &Ctx, host_selected: bool) -> anyhow::Result<()> {

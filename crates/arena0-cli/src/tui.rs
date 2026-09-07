@@ -33,7 +33,7 @@
 //! only among controls inside the current view: Hosts, records, inspector, and
 //! composer. On the Overview they traverse Hosts and the five summary panes.
 //! `Enter` activates the cursor in Hosts or opens the focused summary, and `Escape` returns from a detail
-//! view to the Overview. Arrow keys move focus between visible panes. `j/k`,
+//! view to the Overview. Arrow keys move within the focused widget. `j/k`,
 //! page keys, `Home`, and `End` operate on the focused pane's records.
 //! `Enter` inspects the selected record. `Escape` closes
 //! an inspector before it returns to the Overview.
@@ -172,7 +172,7 @@ use arena0_client::api::{
     ActivationInspection, EventData, EventFrame, ExecStatus, ExecutionInspection,
     PrivateEffectKind, PrivateEventKind, SessionTerminal,
 };
-use arena0_client::program::BorshSchemaDocument;
+use arena0_client::program::{BorshSchemaDocument, ProgramHash};
 #[cfg(test)]
 use arena0_client::protocol::TicketHash;
 use arena0_client::protocol::{
@@ -331,7 +331,6 @@ pub(crate) struct MonitorHost {
 pub(crate) struct MonitorExecution {
     pub(crate) key: MonitorExecutionKey,
     pub(crate) status: ExecStatus,
-    pub(crate) message_schema: Option<BorshSchemaDocument>,
     pub(crate) inspection: Option<ExecutionInspection>,
     pub(crate) view: Option<(u64, View)>,
     pub(crate) trace: Vec<TraceEntry>,
@@ -355,13 +354,16 @@ pub(crate) struct MonitorActivity {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum MonitorUpdate {
+    MessageSchema {
+        program_id: ProgramHash,
+        schema: Result<BorshSchemaDocument, String>,
+    },
     Hosts {
         hosts: Vec<MonitorHost>,
     },
     Execution {
         key: MonitorExecutionKey,
         status: ExecStatus,
-        message_schema: Option<BorshSchemaDocument>,
         inspection: Option<ExecutionInspection>,
         view: Option<(u64, View)>,
         trace: Vec<TraceEntry>,
@@ -766,12 +768,12 @@ struct TraceViewEntry {
 }
 
 impl TraceViewEntry {
-    fn new(entry: TraceEntry, schema: Option<&BorshSchemaDocument>) -> Self {
+    fn new(entry: TraceEntry, schema: Result<&BorshSchemaDocument, &str>) -> Self {
         let message = match &entry.event {
             PublicEvent::SessionStarted { .. } => None,
             PublicEvent::MessageReceived { msg, .. } => Some(
                 schema
-                    .ok_or_else(|| "program has no message schema".to_owned())
+                    .map_err(str::to_owned)
                     .and_then(|schema| schema.decode_json(msg).map_err(|error| error.to_string())),
             ),
         };
@@ -808,6 +810,7 @@ enum ScopedRunState {
 
 #[derive(Debug)]
 struct MonitorState {
+    message_schemas: BTreeMap<ProgramHash, Result<BorshSchemaDocument, String>>,
     hosts: BTreeMap<HostName, MonitorHost>,
     executions: BTreeMap<MonitorExecutionKey, MonitorExecution>,
     events: BTreeMap<MonitorExecutionKey, Vec<EventFrame>>,
@@ -831,6 +834,7 @@ struct MonitorState {
 impl MonitorState {
     fn new(action_sender: mpsc::Sender<MonitorAction>) -> Self {
         Self {
+            message_schemas: BTreeMap::new(),
             hosts: BTreeMap::new(),
             executions: BTreeMap::new(),
             events: BTreeMap::new(),
@@ -965,6 +969,9 @@ impl MonitorState {
 
     fn apply(&mut self, update: MonitorUpdate, callouts: &mut CalloutQueue, palette: &TuiPalette) {
         match update {
+            MonitorUpdate::MessageSchema { program_id, schema } => {
+                self.message_schemas.insert(program_id, schema);
+            }
             MonitorUpdate::Hosts { hosts } => {
                 self.hosts = hosts
                     .into_iter()
@@ -974,7 +981,6 @@ impl MonitorState {
             MonitorUpdate::Execution {
                 key,
                 status,
-                message_schema,
                 inspection,
                 view,
                 trace,
@@ -1025,7 +1031,6 @@ impl MonitorState {
                     MonitorExecution {
                         key,
                         status,
-                        message_schema,
                         inspection,
                         view,
                         trace,
@@ -1178,7 +1183,6 @@ const MAX_MONITOR_ACTIVITY: usize = 64;
 
 #[derive(Debug)]
 struct ScreenState {
-    workspace_area: std::cell::Cell<Rect>,
     config: TuiConfig,
     statuses: BTreeMap<HostName, ExecStatus>,
     terminal_lifecycle: Option<ExecLifecycle>,
@@ -1219,7 +1223,6 @@ impl ScreenState {
     fn new(config: TuiConfig) -> Self {
         let selected_host = config.first_host().map(|host| host.host.clone());
         Self {
-            workspace_area: std::cell::Cell::new(Rect::new(0, 0, 120, 40)),
             config,
             statuses: BTreeMap::new(),
             terminal_lifecycle: None,
@@ -1331,7 +1334,14 @@ impl ScreenState {
                     .trace
                     .iter()
                     .cloned()
-                    .map(|entry| TraceViewEntry::new(entry, candidate.message_schema.as_ref()))
+                    .map(|entry| {
+                        let schema = monitor
+                            .message_schemas
+                            .get(&candidate.status.program_id)
+                            .ok_or("message schema has not been loaded")
+                            .and_then(|schema| schema.as_ref().map_err(String::as_str));
+                        TraceViewEntry::new(entry, schema)
+                    })
                     .collect(),
             );
             if let Some(agreement) = candidate.agreement {
@@ -1400,7 +1410,6 @@ impl ScreenState {
             projected.events_follow = self.events_follow;
             projected.program_scroll = self.program_scroll;
         }
-        projected.workspace_area.set(self.workspace_area.get());
         projected.details_scroll = self.details_scroll;
         projected.focus = Focus::Workspace;
         Some(projected)
@@ -1460,7 +1469,11 @@ impl ScreenState {
                     return;
                 }
                 let old_len = current.len();
-                let schema = self.config.message_schema.as_ref();
+                let schema = self
+                    .config
+                    .message_schema
+                    .as_ref()
+                    .ok_or("program has no message schema");
                 *current = entries
                     .into_iter()
                     .map(|entry| TraceViewEntry::new(entry, schema))
@@ -1899,6 +1912,9 @@ impl ScreenState {
             (Focus::Hosts, _) => {
                 self.focus = Focus::Workspace;
                 self.page.close_inspector();
+                if self.page.view() == WorkspaceView::Overview {
+                    self.page.set_pane(OverviewPane::Program);
+                }
             }
             (Focus::Composer, _) => self.focus = Focus::Hosts,
             (Focus::Workspace, Page::Overview(pane)) => {
@@ -1956,8 +1972,8 @@ impl ScreenState {
             }
             (Focus::Composer, _) => self.focus = Focus::Workspace,
             (Focus::Workspace, Page::Overview(pane)) => {
-                if pane == OverviewPane::Program && !self.callouts.is_empty() {
-                    self.focus = Focus::Composer;
+                if pane == OverviewPane::Program {
+                    self.focus = Focus::Hosts;
                 } else {
                     self.page.set_pane(pane.previous());
                 }
@@ -1978,81 +1994,8 @@ impl ScreenState {
                     ..
                 },
             ) => {
-                if self.callouts.is_empty() {
-                    self.page.open_inspector();
-                    self.details_scroll = 0;
-                } else {
-                    self.focus = Focus::Composer;
-                }
-            }
-        }
-    }
-
-    /// Arrow keys move focus using the visible overview geometry; they never
-    /// change a record cursor, text cursor, or scroll offset.
-    fn navigate_panes(&mut self, direction: KeyCode) {
-        let monitor_detail = self.monitor.as_ref().is_some_and(|monitor| monitor.detail);
-        if self.focus == Focus::Composer {
-            if matches!(direction, KeyCode::Up | KeyCode::Left) {
-                self.focus = Focus::Workspace;
-            }
-            return;
-        }
-        if self.focus == Focus::Hosts {
-            if matches!(direction, KeyCode::Right | KeyCode::Down) {
-                self.focus = Focus::Workspace;
-            }
-            return;
-        }
-        if self.monitor.is_some() && !monitor_detail {
-            if matches!(direction, KeyCode::Up | KeyCode::Left) {
-                self.focus = Focus::Hosts;
-            } else if direction == KeyCode::Down {
-                self.focus_monitor_composer();
-            }
-            return;
-        }
-        let pane = if self.page.view() == WorkspaceView::Overview {
-            if monitor_detail {
-                self.monitor_projection()
-                    .and_then(|projected| projected.adjacent_overview_pane(direction))
-            } else {
-                self.adjacent_overview_pane(direction)
-            }
-        } else {
-            None
-        };
-        if let Some(pane) = pane {
-            self.page.set_pane(pane);
-        } else if self.page.view() == WorkspaceView::Overview {
-            if direction == KeyCode::Left && !monitor_detail {
-                self.focus = Focus::Hosts;
-            } else if direction == KeyCode::Down {
-                if monitor_detail {
-                    self.focus_monitor_composer();
-                } else if !self.callouts.is_empty() {
-                    self.focus = Focus::Composer;
-                }
-            }
-        } else if matches!(direction, KeyCode::Left | KeyCode::Up) {
-            if self.page.region() == DetailRegion::Inspector {
-                self.page.close_inspector();
-            } else if direction == KeyCode::Left && !monitor_detail {
                 self.focus = Focus::Hosts;
             }
-        } else if !(monitor_detail && self.page.view() == WorkspaceView::Program)
-            && self.page.region() == DetailRegion::Records
-        {
-            self.page.open_inspector();
-        } else if direction == KeyCode::Down {
-            if monitor_detail {
-                self.focus_monitor_composer();
-            } else if !self.callouts.is_empty() {
-                self.focus = Focus::Composer;
-            }
-        }
-        if let Some(monitor) = &mut self.monitor {
-            monitor.region = self.page.region();
         }
     }
 
@@ -2067,60 +2010,6 @@ impl ScreenState {
         }
     }
 
-    fn adjacent_overview_pane(&self, direction: KeyCode) -> Option<OverviewPane> {
-        let layout = overview::overview_layout(self, self.workspace_area.get());
-        let panes = [
-            (OverviewPane::Program, layout.program),
-            (OverviewPane::Negotiation, layout.negotiation),
-            (OverviewPane::PublicTrace, layout.public_trace),
-            (OverviewPane::Wasm, layout.wasm),
-            (OverviewPane::SystemEvents, layout.system_events),
-        ];
-        let current = panes.iter().find(|(pane, _)| *pane == self.page.pane())?.1;
-        let horizontal = matches!(direction, KeyCode::Left | KeyCode::Right);
-        let center = |rect: Rect| {
-            if horizontal {
-                (
-                    i32::from(rect.x) * 2 + i32::from(rect.width),
-                    i32::from(rect.y) * 2 + i32::from(rect.height),
-                )
-            } else {
-                (
-                    i32::from(rect.y) * 2 + i32::from(rect.height),
-                    i32::from(rect.x) * 2 + i32::from(rect.width),
-                )
-            }
-        };
-        let (axis, cross) = center(current);
-        panes
-            .into_iter()
-            .filter_map(|(pane, rect)| {
-                if pane == self.page.pane() || rect.width == 0 || rect.height == 0 {
-                    return None;
-                }
-                let (next_axis, next_cross) = center(rect);
-                let distance = if matches!(direction, KeyCode::Right | KeyCode::Down) {
-                    next_axis - axis
-                } else {
-                    axis - next_axis
-                };
-                if distance <= 0 {
-                    return None;
-                }
-                let overlap = if horizontal {
-                    current.y < rect.bottom() && rect.y < current.bottom()
-                } else {
-                    current.x < rect.right() && rect.x < current.right()
-                };
-                if !overlap {
-                    return None;
-                }
-                Some(((distance, (next_cross - cross).abs()), pane))
-            })
-            .min_by_key(|(score, _)| *score)
-            .map(|(_, pane)| pane)
-    }
-
     fn on_key(&mut self, mut key: KeyEvent) -> Option<UiExit> {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return None;
@@ -2129,15 +2018,6 @@ impl ScreenState {
             return Some(UiExit::Cancelled);
         }
         if self.help && !matches!(key.code, KeyCode::Esc | KeyCode::Char('?' | 'q')) {
-            return None;
-        }
-        if matches!(
-            key.code,
-            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
-        ) {
-            if !self.help {
-                self.navigate_panes(key.code);
-            }
             return None;
         }
         // Vim navigation applies outside text entry. Keep ordinary j/k/h/l
@@ -2250,7 +2130,7 @@ impl ScreenState {
                 }
                 None
             }
-            KeyCode::Char('h')
+            KeyCode::Left | KeyCode::Char('h')
                 if !self.in_insert_mode()
                     && self.focus == Focus::Workspace
                     && self.page.view() == WorkspaceView::Program =>
@@ -2258,7 +2138,7 @@ impl ScreenState {
                 self.previous_view();
                 None
             }
-            KeyCode::Char('l')
+            KeyCode::Right | KeyCode::Char('l')
                 if !self.in_insert_mode()
                     && self.focus == Focus::Workspace
                     && self.page.view() == WorkspaceView::Program =>
@@ -2266,7 +2146,7 @@ impl ScreenState {
                 self.next_view();
                 None
             }
-            KeyCode::Char('k') if !self.in_insert_mode() => {
+            KeyCode::Up | KeyCode::Char('k') if !self.in_insert_mode() => {
                 if self.focus == Focus::Hosts {
                     self.move_host_cursor(1, false);
                 } else {
@@ -2274,7 +2154,7 @@ impl ScreenState {
                 }
                 None
             }
-            KeyCode::Char('j') if !self.in_insert_mode() => {
+            KeyCode::Down | KeyCode::Char('j') if !self.in_insert_mode() => {
                 if self.focus == Focus::Hosts {
                     self.move_host_cursor(1, true);
                 } else {
@@ -2378,6 +2258,21 @@ impl ScreenState {
             return None;
         }
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) && (in_insert || !monitor.detail) {
+            if in_insert && monitor.detail {
+                let backwards = key.code == KeyCode::BackTab;
+                if self.page.view() == WorkspaceView::Overview {
+                    self.page.set_pane(if backwards {
+                        OverviewPane::SystemEvents
+                    } else {
+                        OverviewPane::Program
+                    });
+                } else if backwards && self.page.view() != WorkspaceView::Program {
+                    self.page.open_inspector();
+                } else {
+                    self.page.close_inspector();
+                }
+                monitor.region = self.page.region();
+            }
             let content_focus = if monitor.detail {
                 Focus::Workspace
             } else {
@@ -2454,8 +2349,12 @@ impl ScreenState {
         }
         if self.focus == Focus::Workspace {
             match key.code {
-                KeyCode::Char('k') => self.details_scroll = self.details_scroll.saturating_sub(1),
-                KeyCode::Char('j') => self.details_scroll = self.details_scroll.saturating_add(1),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.details_scroll = self.details_scroll.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.details_scroll = self.details_scroll.saturating_add(1)
+                }
                 KeyCode::PageUp => self.details_scroll = self.details_scroll.saturating_sub(8),
                 KeyCode::PageDown => self.details_scroll = self.details_scroll.saturating_add(8),
                 KeyCode::Home => self.details_scroll = 0,
@@ -2468,8 +2367,8 @@ impl ScreenState {
             }
         }
         match key.code {
-            KeyCode::Char('k') => monitor.move_cursor(1, false),
-            KeyCode::Char('j') => monitor.move_cursor(1, true),
+            KeyCode::Up | KeyCode::Char('k') => monitor.move_cursor(1, false),
+            KeyCode::Down | KeyCode::Char('j') => monitor.move_cursor(1, true),
             KeyCode::PageUp => monitor.move_cursor(8, false),
             KeyCode::PageDown => monitor.move_cursor(8, true),
             KeyCode::Home => {
@@ -2514,6 +2413,11 @@ impl ScreenState {
         match key.code {
             KeyCode::Tab | KeyCode::BackTab if overview => {
                 let pane = projected.page.pane();
+                if (key.code == KeyCode::Tab && pane == OverviewPane::SystemEvents)
+                    || (key.code == KeyCode::BackTab && pane == OverviewPane::Program)
+                {
+                    self.focus_monitor_composer();
+                }
                 projected.page.set_pane(if key.code == KeyCode::BackTab {
                     pane.previous()
                 } else {
@@ -2521,6 +2425,12 @@ impl ScreenState {
                 });
             }
             KeyCode::Tab | KeyCode::BackTab if !program => {
+                if (key.code == KeyCode::Tab && projected.page.region() == DetailRegion::Inspector)
+                    || (key.code == KeyCode::BackTab
+                        && projected.page.region() == DetailRegion::Records)
+                {
+                    self.focus_monitor_composer();
+                }
                 if projected.page.region() == DetailRegion::Inspector {
                     projected.page.close_inspector();
                 } else {
@@ -2528,12 +2438,13 @@ impl ScreenState {
                 }
                 projected.details_scroll = 0;
             }
+            KeyCode::Tab | KeyCode::BackTab => self.focus_monitor_composer(),
             KeyCode::Enter if overview => projected.page.open_detail(),
             KeyCode::Enter if !program => {
                 projected.page.open_inspector();
                 projected.details_scroll = 0;
             }
-            KeyCode::Char('k') | KeyCode::PageUp => {
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::PageUp => {
                 let amount = if key.code == KeyCode::PageUp { 8 } else { 1 };
                 if program {
                     projected.details_scroll = projected.details_scroll.saturating_sub(amount);
@@ -2541,7 +2452,7 @@ impl ScreenState {
                     projected.scroll_focused_up(amount);
                 }
             }
-            KeyCode::Char('j') | KeyCode::PageDown => {
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::PageDown => {
                 let amount = if key.code == KeyCode::PageDown { 8 } else { 1 };
                 if program {
                     projected.details_scroll = projected.details_scroll.saturating_add(amount);
@@ -3205,10 +3116,10 @@ fn render(frame: &mut Frame<'_>, state: &ScreenState) {
                 Paragraph::new(vec![
                     help_line(
                         state,
-                        "j/k  Ctrl-D/Ctrl-U",
+                        "↑↓ / j/k  Ctrl-D/Ctrl-U",
                         "Move rows or scroll the focused pane",
                     ),
-                    help_line(state, "←↑↓→", "Move focus between panes"),
+                    help_line(state, "←↑↓→", "Move within the focused widget"),
                     help_line(state, "Tab / Shift-Tab", "Next / previous pane"),
                     help_line(state, "g / G", "First / last row or scroll position"),
                     help_line(state, "a", "Open the selected pending callout"),
@@ -3252,19 +3163,19 @@ fn render(frame: &mut Frame<'_>, state: &ScreenState) {
         frame.render_widget(Clear, overlay);
         frame.render_widget(
             Paragraph::new(vec![
-                help_line(state, "←↑↓→", "Move focus between panes (also in editor)"),
+                help_line(state, "←↑↓→", "Move within the focused widget or editor"),
                 help_line(state, "Tab / Shift-Tab", "Move focus inside this view"),
                 help_line(state, "1–6", "Switch workspace view"),
                 help_line(
                     state,
-                    "j/k in Hosts",
+                    "↑↓ / j/k in Hosts",
                     "Move through All Hosts and Host rows",
                 ),
                 help_line(state, "Enter in Hosts", "Use the highlighted Host scope"),
                 help_line(state, "a / c", "View all Hosts or compare two Hosts"),
                 help_line(
                     state,
-                    "j/k  Ctrl-U/Ctrl-D",
+                    "↑↓ / j/k  Ctrl-U/Ctrl-D",
                     "Move rows / scroll; jump up or down",
                 ),
                 help_line(state, "h/l (program)", "Browse state history"),
@@ -3351,7 +3262,6 @@ fn render_monitor(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
         };
         let [content, editor] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(editor_height)]).areas(body);
-        state.workspace_area.set(content);
         if monitor.view == WorkspaceView::Program {
             render_monitor_guest(frame, state, content);
         } else if let Some(mut projected) = state.monitor_projection() {
@@ -3369,13 +3279,13 @@ fn render_monitor(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
         let hint = if state.in_insert_mode() {
             "Enter submit  Esc close editor  ? help"
         } else if monitor.view == WorkspaceView::Overview {
-            "Arrows/Tab pane  Enter open  1–6 views  a answer  Esc monitor  q detach"
+            "Tab pane  ↑↓ move  Enter open  1–6 views  a answer  Esc monitor  q detach"
         } else if monitor.view == WorkspaceView::Program {
-            "1–6 views  j/k scroll  a answer  Esc monitor  q detach  ? help"
+            "1–6 views  ↑↓ scroll  a answer  Esc monitor  q detach  ? help"
         } else if monitor.region == DetailRegion::Inspector {
-            "j/k scroll  Esc records  1–6 views  q detach  ? help"
+            "↑↓ scroll  Esc records  1–6 views  q detach  ? help"
         } else {
-            "1–6 views  j/k move  Enter inspect  a answer  Esc monitor  q detach  ? help"
+            "1–6 views  ↑↓ move  Enter inspect  a answer  Esc monitor  q detach  ? help"
         };
         frame.render_widget(Paragraph::new(hint).style(state.palette.muted()), footer);
         return;
@@ -3412,9 +3322,9 @@ fn render_monitor(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
     }
     frame.render_widget(
         Paragraph::new(if area.width < 100 {
-            "q detach  a answer  Enter open  j/k move  Space freeze  / scope  ? help"
+            "q detach  a answer  Enter open  ↑↓ move  Space freeze  / scope  ? help"
         } else {
-            "q detach  1–6 views  j/k move  Enter open  a answer  Space freeze  / session  Esc back  ? help"
+            "q detach  1–6 views  ↑↓ move  Enter open  a answer  Space freeze  / session  Esc back  ? help"
         })
             .style(state.palette.muted()),
         footer,
@@ -3504,7 +3414,7 @@ fn render_monitor_table(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) 
             .add_modifier(Modifier::BOLD | Modifier::REVERSED),
     )
     .block(panel(
-        "HOSTS AND EXECUTIONS  j/k select  a answer",
+        "HOSTS AND EXECUTIONS  ↑↓ select  a answer",
         state,
         state.focus == Focus::Hosts,
     ));
@@ -3901,7 +3811,6 @@ fn render_hosts(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
 }
 
 fn render_workspace(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
-    state.workspace_area.set(area);
     let focused = state.focus == Focus::Workspace;
     match state.page.view() {
         WorkspaceView::Overview => render_overview(frame, state, area),
@@ -4271,7 +4180,7 @@ fn passive_hints(state: &ScreenState, width: u16) -> String {
         if state.complete {
             "1–6 views    Tab focus    Enter select/open    q return    ? help"
         } else if width >= 72 {
-            "1–6 views    Tab focus    Enter select/open    j/k move    ? help"
+            "1–6 views    Tab focus    Enter select/open    ↑↓ move    ? help"
         } else {
             "1–6 views    Tab focus    Enter open    ? help"
         }

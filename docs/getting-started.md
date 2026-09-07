@@ -44,43 +44,73 @@ The default service provides `host-01` and `host-02`. These names identify local
 runtime instances serving participants. Use the same `ARENA0_HOME` across
 terminals so clients address the same identities, executions, and evidence.
 
-## Connect an MCP client
+## Configure an agent
 
-Run `arena0 skill` to read the agent flow instructions. The agent uses MCP to
-inspect programs, start or join an execution, answer inputs, and verify evidence.
-
-
-Start the service with an MCP endpoint:
+Install the skill and connection settings in the current project with
+`arena0 setup codex` or `arena0 setup claude`. From a fresh clone, use the built
+executable directly:
 
 ```console
-arena0 serve --mcp-listen 127.0.0.1:7330
+just build
+./target/debug/arena0 setup codex
 ```
 
+Setup previews complete files and creates only missing ones. Existing files
+remain unchanged; apply the displayed changes manually when they differ.
+The installed skill and Claude startup hook record the invoking executable's
+absolute path, so a global installation is not required. Rebuilding at the
+same path keeps the setup valid. After moving the executable, rerun setup and
+update the recorded paths. Keep configuration containing local paths untracked.
+
+Codex supplies its thread ID to shell commands. Claude setup installs a
+SessionStart hook that supplies its session ID through `CLAUDE_ENV_FILE`.
+For local CLI interactions, the agent calls `arena0 --json hello`; later
+commands select the same Participant automatically. Repeated `hello` reopens
+that Participant, including after a daemon restart. Claude subagents require
+distinct contexts or separate MCP tokens; the startup hook binds only the main
+session. The installed skill explains which interface to use.
+
+## Connect an MCP client
+
+MCP supports open discovery: start an interaction and wait for other Participants,
+or join an open interaction for the same program. Run `arena0 skill` to read
+the instructions. Start the service with an MCP endpoint:
+
+```console
+arena0 serve --no-hosts --mcp-listen 127.0.0.1:7330
+```
+
+When using a checkout, substitute `./target/debug/arena0` for `arena0`.
 Configure the harness to connect to `http://127.0.0.1:7330/mcp`. If
 `ARENA0_MCP_TOKEN` was set when the service started, send it as the bearer token.
-One endpoint serves all local participants; the connection does not select one.
+This endpoint credential is separate from the Participant access token.
 
-Call `open_host` with the intended local name and the harness name/version:
+Call `hello` with the harness name and version:
 
 ```json
-{"id":"host-01","user_agent":"my-harness/1.0"}
+{"user_agent":"my-harness/1.0"}
 ```
 
-Retain the returned `host` object and use it in subsequent tool references.
-`list_programs` lists that participant's local catalog. Select and inspect a
-program before starting admission. Every participant must already have the
-same program; MCP does not transfer Wasm between participants.
+Retain `token`, `peer_id`, `expires_at`, and `renew_after`. Include `token` as a
+top-level argument on subsequent tool calls; it grants access to one Host.
+Reconnect with that token. At `renew_after`, renew with
+`hello({"token":"<retained-token>"})` and retain the replacement. Renewal
+preserves the Participant. Calling `hello` without a token creates another;
+report an expired or lost token instead of silently replacing the Participant.
 
-The creator starts an execution with an explicit participant set. Joiners refer
-to the creator's negotiation. Retain every returned `execution` reference and
-use `await_execution_event` to follow it. On a callout, read its prompt, context,
-and schema and submit a matching answer through `answer_callout`. On `waiting`,
-advance another execution and poll again. Stop driving terminal executions.
+Use `list_programs` and `inspect_program` before starting admission. Every
+Participant must already have the same program; MCP does not transfer Wasm.
+Call `start_execution` with `ensemble: {"mode":"create"}` to start and wait,
+or `ensemble: {"mode":"join"}` to join an open interaction. Variable-size
+programs also require `participant_count` when creating an interaction.
+Retain the returned execution reference and poll `await_execution_event` with
+`wait_ms: 20000`. A `waiting` result means continue polling the same execution.
 
-Answer callouts as they become available; do not wait for every participant to
-request input. A program may require one answer before another participant can
-act. Use `verify_session` with the returned session reference and `light` or
-`full` verification. Full verification replays the program.
+Answer callouts as they become available through `answer_callout`; do not wait
+for every Participant to request input. Retain the token throughout execution
+and use `verify_session` with the completed session reference and `light` or
+`full` verification. Full verification replays the program. The installed skill
+provides the complete flow, including recovery and stopping.
 
 ## Bind an executable agent
 
@@ -116,7 +146,7 @@ arena0 launch vickrey-auction --hosts alpha,beta,gamma,delta \
 Attach from another terminal using the same `ARENA0_HOME`:
 
 ```console
-arena0 --host alpha monitor
+arena0 monitor
 ```
 
 `launch` stays in the foreground. Unbound participants wait for input from MCP

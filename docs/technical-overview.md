@@ -9,7 +9,7 @@ This document explains the current system as a whole. It is not a second protoco
 | Concern | Source of truth |
 | --- | --- |
 | Phase 1 protocol behavior and invariants | [Protocol architecture](protocol-architecture.md) |
-| Reasons for the current boundaries | [Architectural motivation](architectural-motivation.md) |
+| Reasons for the current boundaries | [Architecture](architecture.md) |
 | Rust packages, dependency versions, and build profiles | [`Cargo.toml`](../Cargo.toml) and crate manifests |
 | Rust toolchain and Wasm target | [`rust-toolchain.toml`](../rust-toolchain.toml) |
 | Local Host API | [Local Host API](api/json-rpc.md) |
@@ -30,7 +30,7 @@ human or agent
     |
     +-- arena0 CLI -----------+
     |                         |
-    +-- Host-explicit MCP ----+--> arena0d
+    +-- Token-scoped MCP -----+--> arena0d
                                   |
                                   +-- Ensemble
                                       |
@@ -65,7 +65,7 @@ The workspace manifests own dependency selection and exact versions. The table b
 | Persistent identity | Ed25519 | Host identity, tickets, and unilateral stop reports |
 | Execution agreement | BLS12-381 MinSig through `blst` | Per-execution keys and N-of-N aggregate agreements |
 | Local Host API | Length-prefixed JSON over one daemon Unix socket | Explicit routing to independent Hosts |
-| MCP API | RMCP and Axum over Streamable HTTP | One Host-explicit agent endpoint for an Ensemble |
+| MCP API | RMCP and Axum over Streamable HTTP | One agent endpoint with access restricted to the Host named by a validated token |
 | Observability | `tracing` and `tracing-subscriber` | Redacted semantic events and opt-in performance records |
 | CLI | Clap, Ratatui, and Crossterm | Commands, the local workspace, and the execution observatory |
 | Build orchestration | Cargo and `just` | Program builds, workspace builds, tests, checks, docs, audits, and release artifacts |
@@ -168,7 +168,7 @@ Each Host prepares its activation record before it signs. A Host starts executio
 
 Every public transition binds the session, position, prior state, next state, event, effects, fuel, and replayable randomness. It commits only after every activated participant signs the same commitment.
 
-The [local flow walkthrough](flow-walkthrough.md) traces this lifecycle through a two-Host session.
+The [execution walkthrough](architecture.md#complete-execution-walkthrough) traces this lifecycle through an auction.
 
 ## Deterministic guest boundary
 
@@ -196,7 +196,7 @@ Recovery validates stored state and every nested projection before it exposes th
 
 Long-lived state uses one clear task or resource owner. Execution actors own live execution capabilities. The store thread owns its SQLite connection. The Ensemble owns coordinated local shutdown. The daemon owns its services and child task lifecycles.
 
-MCP `open_host` adds a Host to the running Ensemble through serialized, supervised provisioning. A supplied local ID reuses its durable identity; an omitted ID creates a fresh namespace. The daemon publishes the service after recovery. Persisted Hosts outside the startup set reopen on demand. Shutdown settles pending provisioning before releasing stores.
+MCP `hello` creates a Host through serialized, supervised provisioning and returns a signed access token. A valid token permits reopening or renewing access to that same Host; the daemon checks its cryptographic identity before publishing the service. The operator Unix API can also reopen by local ID. Persisted Hosts outside the startup set reopen on demand. Shutdown settles pending provisioning before releasing stores.
 
 Queues, channels, frames, blobs, guest calls, agent responses, pending work, and shutdown waits are bounded. Backpressure reaches the component that creates work instead of becoming unbounded memory growth.
 
@@ -205,6 +205,14 @@ Cancellation must preserve a recoverable durable boundary. A graceful shutdown s
 ## Trust and security boundaries
 
 Phase 1 assumes one machine operator controls all supervised Hosts. Separate identities and stores do not defend against compromise of that machine.
+
+MCP tools resolve a signed access token to one Host. `hello` creates or renews
+that access; other tools cannot select or enumerate local Hosts. The daemon
+persists one signing key independently of Participant identity keys and keeps
+no token table. Tokens expire without stopping execution, and renewal requires
+an unexpired credential. The optional endpoint bearer token remains a separate
+access gate. These rules restrict MCP access while leaving the operator Unix
+API and monitor available to the machine operator.
 
 Within that boundary, each Host still validates protocol facts independently. N-of-N agreement prevents the system from hiding one selected Host's disagreement inside a majority result. The same rule allows any selected Host to stop progress.
 
@@ -279,14 +287,13 @@ just check
 
 `just build-programs` builds the separate guest-program workspace and embeds program metadata. `just build` then builds the public host workspace. `just test` runs both workspaces and SDK documentation tests. `just check` verifies dependency boundaries, formatting, and Clippy.
 
-Release work adds documentation, security audit, license, package, and release-build checks. See the `release-check` recipe for the complete sequence.
+Release work adds documentation, security audit, package, and release-build checks. See the `release-check` recipe for the complete sequence.
 
 ## Where to read next
 
-- Read the [Phase 1 brief](briefs/arena0.md) for the compact product and architecture contract.
 - Read the [protocol architecture](protocol-architecture.md) before changing identity, admission, activation, execution, persistence, transport, or receipt behavior.
-- Read the [architectural motivation](architectural-motivation.md) for the reasons behind the major boundaries.
-- Follow the [local flow walkthrough](flow-walkthrough.md) for one complete execution.
-- Read [Build an arena0 program](build-a-program.md) for guest authoring.
-- Read the [Local Host API](api/json-rpc.md) or [MCP guide](connect-over-mcp.md) for integrations.
-- Read [CONTRIBUTING.md](../CONTRIBUTING.md) for change rules and required checks.
+- Read the [architecture guide](architecture.md) for the reasons behind the major boundaries.
+- Follow the [execution walkthrough](architecture.md#complete-execution-walkthrough) for one complete execution.
+- Read [Programming](programming.md) for guest authoring.
+- Read the [Local Host API](api/json-rpc.md) or [MCP guide](getting-started.md#connect-an-mcp-client) for integrations.
+- Read [Contributing](contributing.md) for change rules and required checks.

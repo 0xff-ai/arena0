@@ -41,9 +41,6 @@ arena0
 Choose a program, set its parameters, and assign inputs to humans or built-in
 policies. The terminal workspace follows negotiation, execution, and verification.
 
-For the agent flow, run `arena0 skill` and follow the
-[MCP connection instructions](docs/getting-started.md#connect-an-mcp-client).
-
 ## Demos
 
 <table>
@@ -75,9 +72,9 @@ Participants engage by finding other participants, negotiating on program parame
 
 Agents can use the arena0 framework for contract negotiation, work allocation, joint campaigns, auctions, and joint decisions. For example, a collaborative autoresearch program could enable agents to agree on a campaign structure, allocate tasks, commit to delivering local results, and be compensated for it. The program can record contributions, patch hashes, observed results, and unlock rewards, generate the next milestone, or finalize the campaign.
 
-Programs run sandboxed inside a restricted, capability-based Wasm runtime. They cannot interact with the outer world directly. The arena0 runtime delivers events to them, and they can only emit typed effects in return, which the environment will apply for them if, and only if, they have been granted the appropriate capabilities.
+Programs run inside a restricted, capability-based Wasm sandbox. They cannot interact with the outside world directly. The arena0 runtime delivers events to them and handles their typed effects only when the programs have been granted the required capabilities.
 
-When an execution concludes, every participant generates an identical receipt, which certifies success or a shared abort or failure, along with a canonical output shared by all participants. Anybody can check the signatures or replay public execution against the accepted program.
+When an execution completes, each participant retains the same canonical receipt. A participant that stops unilaterally produces an authenticated stop report, which does not establish shared completion. Anyone can verify the signatures or replay public execution against the accepted program.
 
 There is neither a blockchain nor central infrastructure. Similar to BitTorrent, arena0 has no global state to maintain. Soon we will launch discovery and program hubs so that agents can find each other and begin to collaborate in structured ways.
 
@@ -98,16 +95,17 @@ Smaller examples: [Cumulative sum](programs/cumulative-sum) · [Sequential count
 ## Supported today
 
 - **Programmable interactions:** define rules, expectations, conditions, and choreography in a multi-party shared state machine.
-- **Content-addressed Wasm programs:** acceptance is bound to the exact program artifact, including its metadata.
+- **Content-addressed Wasm programs:** programs and their metadata are guaranteed to be binary-equal across machines, so that all participants are bound to the same logic.
 - **Multi-party deterministic execution:** N participants execute, certify, and validate every public state transition.
 - **Capability-oriented sandboxing:** programs receive inputs and request effects through explicit interfaces. The runtime performs permitted effects; programs never execute side effects directly.
 - **Self-describing, strongly typed interfaces:** programs embed JSON and Borsh schemas describing parameters, inputs, results, and callouts. Content addressing covers this metadata. Programs own their encoding and expose views and queries for inspection.
-- **Negotiation and session activation:** participants accept exact terms, such as an auction's item, reserve price, and participant count. Signed tickets record consent to the offer. Execution starts only after every participant validates and durably commits the complete activation agreement.
-- **Signed transition chain:** participants exchange messages and certify public transitions with session-bound BLS keys. Aggregate certificates trace the session from start to end over the current local transport.
+- **Discovery and p2p networking** (WIP): arena0 uses Iroh and a custom Rendezvous protocol for participants wanting to execute a concrete program to be able to find each other on the Internet.
+- **Negotiation and session activation:** participants negotiate the exact terms for their programs. For example, when engaging in a multiparty auction, agents first have to agree on the item, reserve price, and participant count. Peers exchange signed tickets committing to engage under a concrete set of parameters. Once an agent obtains sufficient tickets to meet the program's participation threshold, the protocol enables them to activate a session.
+- **P2P session mesh:** all session activity flows over a dedicated p2p mesh linking the session participants. They exchange messages and broadcast certificates signed with a session-bound BLS key that every other peer aggregates to form a chain of multisigs tracing the session from start to end.
 - **Shared and local state:** participants can run private strategies (encoded in local state), as long as they abide by the shared program rules and state.
-- **Universal agreement:** the protocol requires N-of-N agreement at every public state transition, including transitions that record an application-level majority vote.
-- **Signed, replayable evidence:** completed executions produce canonical receipts; unilateral stops produce authenticated stop reports.
-- **Two verification modes:** check signed evidence without the program, or replay public execution with the exact Wasm artifact.
+- **Universal agreement:** the protocol requires N-of-N agreement to advance the program at every state transition. Lighter p2p consensus models are also being studied.
+- **Signed, replayable evidence:** each participant produces the same canonical receipt if the program completes, or an authenticated unilateral stop report if it stops unilaterally.
+- **Two verification modes:** proofs can be verified with or without access to the arena0 program itself.
 - **Human and agent interfaces:** participate through interactive input, built-in policies, executable agents, or MCP.
 - **Inspectable execution:** follow program state, messages, agreement, and activity through the tracing subsystem and the TUI.
 - **Composable programs:** bundled examples and SDK primitives cover auctions, work allocation, games, commit-reveal, turn-taking, and voting.
@@ -116,10 +114,11 @@ Smaller examples: [Cumulative sum](programs/cumulative-sum) · [Sequential count
 
 Planned work and research. No release dates yet.
 
-- **P2P networking:** connect independently operated participants using Iroh, directly or through relays, with each participant controlling its own runtime and keys.
+- **P2P networking:** true decentralized multiparty co-execution using Iroh, with each participant controlling its own runtime and keys. Connect directly or through relays (there's a branch for this but, given the trust boundaries at play, it needs quite a bit of hardening, like all things networking)
 - **Discovery and invites:** find agents looking to co-execute a particular program, or share invite locators out-of-band to invite an agent to participate in a session (e.g. RFQ, tender, etc.).
 - **Program sharing:** publish programs for others to discover, inspect, and run.
-- **Suspend, reconnect, and resume:** continue an interrupted session from its recorded state and signed history.
+- **Suspendable and resumable** (WIP): long-running programs can suspend and resume executions safely, thanks to our approach with Wasm linear memory.
+- **Reconnect and resume:** continue an interrupted session from its recorded state and signed history.
 - **Receipt browser:** publish, inspect, compare, export, and verify receipts in a browser.
 - **Private negotiation:** keep negotiation terms private before a session begins.
 - **Time:** let programs use a source of globally monotonic time.

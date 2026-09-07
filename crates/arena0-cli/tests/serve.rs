@@ -29,6 +29,8 @@ fn serve_execs_the_sibling_daemon_with_exact_arguments_and_status() {
             "alpha,beta",
             "--mcp-listen",
             "127.0.0.1:7440",
+            "--mcp-access-token-lifetime-secs",
+            "7200",
         ])
         .output()
         .expect("run arena0 serve");
@@ -36,7 +38,7 @@ fn serve_execs_the_sibling_daemon_with_exact_arguments_and_status() {
     assert_eq!(output.status.code(), Some(23));
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "--host\nalpha\n--host\nbeta\n--mcp-listen\n127.0.0.1:7440\n"
+        "--host\nalpha\n--host\nbeta\n--mcp-listen\n127.0.0.1:7440\n--mcp-access-token-lifetime-secs\n7200\n"
     );
 }
 
@@ -74,4 +76,21 @@ fn serve_rejects_client_only_global_options() {
         stderr.contains("--socket, --host, and --json do not apply"),
         "unexpected stderr: {stderr}"
     );
+}
+
+#[test]
+fn serve_rejects_zero_token_lifetime_before_launching_the_daemon() {
+    let output = Command::new(env!("CARGO_BIN_EXE_arena0"))
+        .args(["serve", "--mcp-access-token-lifetime-secs", "0"])
+        .output()
+        .expect("run invalid token lifetime invocation");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("--mcp-access-token-lifetime-secs"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("invalid value"), "{stderr}");
 }

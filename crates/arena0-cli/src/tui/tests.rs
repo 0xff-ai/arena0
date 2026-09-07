@@ -1170,7 +1170,6 @@ fn monitor_keeps_same_host_executions_separate() {
                 exec_id: status.exec_id,
             },
             status,
-            message_schema: None,
             inspection: None,
             view: None,
             trace: Vec::new(),
@@ -1221,7 +1220,6 @@ fn monitor_a_opens_only_the_selected_execution_callout() {
                 exec_id: status.exec_id,
             },
             status,
-            message_schema: None,
             inspection: None,
             view: None,
             trace: Vec::new(),
@@ -1303,7 +1301,6 @@ fn monitor_enter_scrolls_detail_and_escape_returns_to_overview() {
             exec_id: status.exec_id,
         },
         status,
-        message_schema: None,
         inspection: None,
         view: None,
         trace: Vec::new(),
@@ -1320,6 +1317,8 @@ fn monitor_enter_scrolls_detail_and_escape_returns_to_overview() {
         WorkspaceView::Overview
     );
     state.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(state.page.pane(), OverviewPane::Program);
+    state.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     assert_eq!(state.page.pane(), OverviewPane::Program.next());
     assert_eq!(state.monitor_projection().unwrap().page, state.page);
     state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1363,7 +1362,6 @@ fn monitor_session_filter_and_freeze_keep_bounded_display_snapshot() {
                 exec_id: status.exec_id,
             },
             status,
-            message_schema: None,
             inspection: None,
             view: None,
             trace: Vec::new(),
@@ -1408,7 +1406,6 @@ fn monitor_session_filter_and_freeze_keep_bounded_display_snapshot() {
             exec_id: fresh.exec_id,
         },
         status: fresh,
-        message_schema: None,
         inspection: None,
         view: None,
         trace: Vec::new(),
@@ -1442,7 +1439,6 @@ fn monitor_home_then_down_moves_to_second_row_after_last_selection() {
                 exec_id: status.exec_id,
             },
             status,
-            message_schema: None,
             inspection: None,
             view: None,
             trace: Vec::new(),
@@ -1491,13 +1487,16 @@ fn monitor_trace_detail_decodes_messages_and_scrolls_inspector() {
             agreement: arena0_client::protocol::AggregateAttestation::empty(),
         })
         .collect();
+    state.apply(RunUpdate::Monitor(MonitorUpdate::MessageSchema {
+        program_id: status.program_id,
+        schema: Ok(BorshSchemaDocument::for_type::<u32>()),
+    }));
     state.apply(RunUpdate::Monitor(MonitorUpdate::Execution {
         key: MonitorExecutionKey {
             host: first_host(),
             exec_id,
         },
         status,
-        message_schema: Some(BorshSchemaDocument::for_type::<u32>()),
         inspection: None,
         view: None,
         trace,
@@ -1610,4 +1609,117 @@ async fn tui_session_join_can_be_cancelled_and_retried() {
     done_sender.send(()).expect("pending session is alive");
     session.wait().await.expect("second join succeeds");
     assert!(session.task.is_none());
+}
+
+#[test]
+fn arrows_edit_the_answer_and_numbers_remain_text_while_typing() {
+    let mut state = ScreenState::new(config());
+    let (reply, _answer) = oneshot::channel();
+    state.apply(RunUpdate::Callout {
+        host: first_host(),
+        exec_id: active_status().exec_id,
+        pending_id: PendingId::new(1),
+        callout_index: 1,
+        name: "Choose".into(),
+        prompt: "Choose".into(),
+        context: Value::Null,
+        schema: serde_json::json!({"type":"string"}),
+        reply,
+    });
+    state.set_answer_text("ab\ncd");
+    let page = state.page;
+    for (key, cursor) in [
+        (KeyCode::Left, (1, 1)),
+        (KeyCode::Up, (0, 1)),
+        (KeyCode::Right, (0, 2)),
+        (KeyCode::Down, (1, 2)),
+    ] {
+        state.on_key(KeyEvent::new(key, KeyModifiers::NONE));
+        assert_eq!(state.focus, Focus::Composer);
+        assert_eq!(state.page, page);
+        assert_eq!(state.callouts.selected().unwrap().editor.cursor(), cursor);
+    }
+    state.on_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+    assert_eq!(state.answer_text(), "ab\ncd3");
+    assert_eq!(state.page, page);
+    state.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(state.focus, Focus::Hosts);
+    state.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(state.host_cursor, 1);
+    assert_eq!(state.focus, Focus::Hosts);
+    state.on_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+    assert_eq!(state.page.view(), WorkspaceView::PublicTrace);
+    assert_eq!(state.focus, Focus::Workspace);
+}
+
+#[test]
+fn overview_tab_cycles_panes_without_changing_views() {
+    let mut state = ScreenState::new(config());
+    state.focus = Focus::Hosts;
+    for pane in [
+        OverviewPane::Program,
+        OverviewPane::PublicTrace,
+        OverviewPane::Negotiation,
+        OverviewPane::Wasm,
+        OverviewPane::SystemEvents,
+    ] {
+        state.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.focus, Focus::Workspace);
+        assert_eq!(state.page.pane(), pane);
+        assert_eq!(state.page.view(), WorkspaceView::Overview);
+        state.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.page.pane(), pane);
+        assert_eq!(state.focus, Focus::Workspace);
+    }
+    state.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(state.focus, Focus::Hosts);
+    state.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(state.page.pane(), OverviewPane::Program);
+    state.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+    assert_eq!(state.focus, Focus::Hosts);
+}
+
+#[test]
+fn monitor_tab_reaches_the_answer_pane_and_returns_in_order() {
+    let (actions, _receiver) = mpsc::channel(4);
+    let mut state = ScreenState::new_monitor(config(), actions);
+    let status = active_status();
+    let exec_id = status.exec_id;
+    state.apply(RunUpdate::Monitor(MonitorUpdate::Execution {
+        key: MonitorExecutionKey {
+            host: first_host(),
+            exec_id,
+        },
+        status,
+        inspection: None,
+        view: None,
+        trace: Vec::new(),
+        observed_at: 1,
+        stale: false,
+        gap: None,
+    }));
+    state.apply(RunUpdate::Monitor(MonitorUpdate::Callout {
+        host: first_host(),
+        exec_id,
+        pending_id: PendingId::new(1),
+        callout_index: 1,
+        name: "Choose".into(),
+        prompt: "Choose".into(),
+        context: Value::Null,
+        schema: serde_json::json!({"type":"string"}),
+    }));
+    state.focus = Focus::Hosts;
+    state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    for _ in 0..5 {
+        state.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    }
+    assert_eq!(state.focus, Focus::Composer);
+    state.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(state.focus, Focus::Workspace);
+    assert_eq!(state.page.pane(), OverviewPane::Program);
+    state.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+    assert_eq!(state.focus, Focus::Composer);
+    state.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+    assert_eq!(state.focus, Focus::Workspace);
+    assert_eq!(state.page.pane(), OverviewPane::SystemEvents);
 }

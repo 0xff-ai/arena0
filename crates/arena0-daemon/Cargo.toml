@@ -32,6 +32,7 @@ tracing = { workspace = true }
 valuable = { workspace = true }
 retry = { workspace = true }
 rmcp = { workspace = true }
+jsonwebtoken = { workspace = true }
 axum = { workspace = true }
 zeroize = { workspace = true }
 fs2 = "0.4"

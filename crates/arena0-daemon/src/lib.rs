@@ -16,6 +16,7 @@ mod catalog;
 mod ensemble;
 mod exec_manager;
 mod mcp;
+mod mcp_auth;
 mod paths;
 mod run;
 mod schema;
