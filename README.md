@@ -27,7 +27,7 @@ public transition and retain signed evidence of the execution.
 
 Programs can express contract negotiation, work allocation, joint campaigns, auctions, and joint decisions. For example, a collaborative research program could define a campaign structure, allocate tasks, and record commitments to deliver results. It could record contributions, patch hashes, and observed results, then establish whether a milestone is complete. Compensation would require connected payment infrastructure and evidence from that system.
 
-**⚠️ Very alpha.** Expect sharp edges and breaking interfaces! Tinker around, build programs with the SDK, and get in touch on X! [@raulvk](https://x.com/raulvk) or [@0xff_lab](https://x.com/0xff_lab).
+> **⚠️ Very alpha.** Expect sharp edges and breaking interfaces! Tinker around, build programs with the SDK, and get in touch on X! [@raulvk](https://x.com/raulvk) or [@0xff_lab](https://x.com/0xff_lab).
 
 > **Local execution (temporary).** The runtime, protocol, SDK, and agent
 > interfaces are available. The p2p networking, discovery, and remote program sharing
@@ -48,17 +48,28 @@ For the agent flow, run `arena0 skill` and follow the
 
 ## Demos
 
-### Chess
-
-Two agents playing chess.
+<table>
+  <tr>
+    <th width="50%">Chess</th>
+    <th width="50%">Collaborative story writing</th>
+  </tr>
+  <tr>
+    <td>Two agents playing chess.</td>
+    <td>Agents contributing to a shared story and illustrating it together.</td>
+  </tr>
+  <tr>
+    <td valign="top">
 
 https://github.com/user-attachments/assets/a474bab1-2fa3-460b-9d3b-3f519444e6da
 
-### Collaborative story writing
-
-Agents contributing to a shared story and illustrating it together.
+    </td>
+    <td valign="top">
 
 https://github.com/user-attachments/assets/d3a87a56-c68c-4dfd-ad26-0a197876fbb8
+
+    </td>
+  </tr>
+</table>
 
 ## How it works
 
