@@ -18,6 +18,131 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, foc
     render_guest_view(frame, state, area, selected_host, focused);
 }
 
+/// Render a monitor snapshot with the same guest-owned slot projection used by
+/// the run observatory.  The monitor supplies its own `(Host, ExecId)` title;
+/// this helper deliberately never interprets slot text as protocol state.
+pub(super) fn render_guest_view_data(
+    frame: &mut Frame<'_>,
+    state: &ScreenState,
+    area: Rect,
+    title: String,
+    view: Option<(&View, u64)>,
+    focused: bool,
+    scroll: u16,
+) {
+    let block = panel(title, state, focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let Some((view, _step)) = view else {
+        frame.render_widget(
+            Paragraph::new("Waiting for the program view").style(state.palette.muted()),
+            inner,
+        );
+        return;
+    };
+    if inner.height < 6 {
+        let [header, agents, state_area, status] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .areas(inner);
+        render_inline_slot(
+            frame,
+            state,
+            header,
+            view,
+            Slot::Header,
+            "Header",
+            state.palette.emphasis(),
+        );
+        render_inline_slot(
+            frame,
+            state,
+            agents,
+            view,
+            Slot::Agents,
+            "Agents",
+            state.palette.strong(),
+        );
+        render_inline_slot(
+            frame,
+            state,
+            state_area,
+            view,
+            Slot::State,
+            "State",
+            Style::default(),
+        );
+        render_inline_slot(
+            frame,
+            state,
+            status,
+            view,
+            Slot::StatusBar,
+            "StatusBar",
+            state.palette.muted(),
+        );
+        return;
+    }
+    // Agent rows are guest-owned content. Give the slot its natural height so
+    // a four-participant view does not hide bidders under a fixed two-line
+    // allocation while leaving the State pane mostly empty.
+    let agent_lines = view
+        .slots
+        .get(&Slot::Agents)
+        .map_or(1, |value| plain_slot(value).lines().count())
+        .try_into()
+        .unwrap_or(u16::MAX);
+    let max_agents = inner.height.saturating_sub(4).max(1);
+    let agents_height = agent_lines.min(max_agents).max(1);
+    let [header, agents, state_label, state_area, status] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(agents_height),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
+    render_inline_slot(
+        frame,
+        state,
+        header,
+        view,
+        Slot::Header,
+        "Header",
+        state.palette.emphasis(),
+    );
+    render_inline_slot(
+        frame,
+        state,
+        agents,
+        view,
+        Slot::Agents,
+        "Agents",
+        state.palette.strong(),
+    );
+    frame.render_widget(
+        Paragraph::new("State").style(state.palette.emphasis()),
+        state_label,
+    );
+    render_state(frame, state_area, view, scroll);
+    render_inline_slot(
+        frame,
+        state,
+        status,
+        view,
+        Slot::StatusBar,
+        "StatusBar",
+        state.palette.muted(),
+    );
+}
+
 fn selected_host<'a>(state: &ScreenState, hosts: &'a [HostName]) -> Option<&'a HostName> {
     state
         .primary_host()
@@ -83,104 +208,17 @@ fn render_guest_view(
         );
         return;
     };
-    let view = &snapshot.view;
-    let step_title = format!(
-        "Program view  guest output  Host {}  exact step {}",
-        snapshot.host, snapshot.step
-    );
-    let block = panel(step_title, state, focused);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.height < 6 {
-        let [header, agents, state_area, status] = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ])
-            .areas(inner);
-        render_inline_slot(
-            frame,
-            state,
-            header,
-            view,
-            Slot::Header,
-            "Header",
-            state.palette.emphasis(),
-        );
-        render_inline_slot(
-            frame,
-            state,
-            agents,
-            view,
-            Slot::Agents,
-            "Agents",
-            state.palette.strong(),
-        );
-        render_inline_slot(
-            frame,
-            state,
-            state_area,
-            view,
-            Slot::State,
-            "State",
-            Style::default(),
-        );
-        render_inline_slot(
-            frame,
-            state,
-            status,
-            view,
-            Slot::StatusBar,
-            "StatusBar",
-            state.palette.muted(),
-        );
-        return;
-    }
-
-    let [header, agents, state_label, state_area, status] = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(2),
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .areas(inner);
-    render_inline_slot(
+    render_guest_view_data(
         frame,
         state,
-        header,
-        view,
-        Slot::Header,
-        "Header",
-        state.palette.emphasis(),
-    );
-    render_inline_slot(
-        frame,
-        state,
-        agents,
-        view,
-        Slot::Agents,
-        "Agents",
-        state.palette.strong(),
-    );
-    frame.render_widget(
-        Paragraph::new("State").style(state.palette.emphasis()),
-        state_label,
-    );
-    render_state(frame, state, state_area, view);
-    render_inline_slot(
-        frame,
-        state,
-        status,
-        view,
-        Slot::StatusBar,
-        "StatusBar",
-        state.palette.muted(),
+        area,
+        format!(
+            "Program view  guest output  Host {}  exact step {}",
+            snapshot.host, snapshot.step
+        ),
+        Some((&snapshot.view, snapshot.step)),
+        focused,
+        state.program_scroll,
     );
 }
 
@@ -207,7 +245,7 @@ fn render_inline_slot(
     frame.render_widget(Paragraph::new(rendered).wrap(Wrap { trim: false }), area);
 }
 
-fn render_state(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, view: &View) {
+fn render_state(frame: &mut Frame<'_>, area: Rect, view: &View, scroll: u16) {
     let value = view
         .slots
         .get(&Slot::State)
@@ -215,7 +253,7 @@ fn render_state(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, view: &V
     frame.render_widget(
         Paragraph::new(value)
             .wrap(Wrap { trim: false })
-            .scroll((state.program_scroll, 0)),
+            .scroll((scroll, 0)),
         area,
     );
 }

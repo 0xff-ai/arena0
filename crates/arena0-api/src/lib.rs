@@ -14,10 +14,12 @@
 #[cfg(feature = "io")]
 pub mod frame;
 
+mod activity;
 mod events;
 mod request;
 mod response;
 
+pub use activity::{ActivityData, ActivityFrame, ActivityResult};
 pub use arena0_protocol::{
     ColorDepth, ExecLifecycle, PendingId, ReceiptArtifact, TerminalResult, View,
 };

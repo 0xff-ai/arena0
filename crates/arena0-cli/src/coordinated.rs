@@ -76,6 +76,8 @@ fn record_stage(
 /// from the order in which these values are supplied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DriverSpec {
+    /// An independently connected MCP or monitor client supplies answers.
+    External,
     /// Reserved for the focused TUI path.  The JSON coordinator rejects it
     /// until a caller supplies an interactive input function.
     Human,
@@ -153,7 +155,7 @@ impl ValidatedBindings {
                     );
                 }
                 DriverSpec::Builtin(strategy) => validate_builtin_strategy(strategy)?,
-                DriverSpec::Executable(_) => {}
+                DriverSpec::Executable(_) | DriverSpec::External => {}
             }
         }
         if human_frontend == HumanFrontend::InlineSingle && human_count > 1 {
@@ -484,6 +486,7 @@ impl Coordinator {
                         DriverSpec::Human => TuiDriver::Human,
                         DriverSpec::Builtin(strategy) => TuiDriver::Builtin(strategy.clone()),
                         DriverSpec::Executable(_) => TuiDriver::Agent,
+                        DriverSpec::External => TuiDriver::External,
                     },
                 })
                 .collect();
@@ -1410,6 +1413,41 @@ async fn drive_to_terminal(
     tui: Option<TuiHandle>,
     progress: RunProgress,
 ) -> anyhow::Result<HostTerminal> {
+    if driver == DriverSpec::External {
+        let await_terminal = async {
+            loop {
+                match client
+                    .call_raw(&Request::ExecAwait {
+                        exec_id,
+                        until: AwaitState::Terminal,
+                    })
+                    .await?
+                {
+                    Ok(ResponseOk::Awaited { .. }) => break,
+                    Err(error) if error.code == ApiErrorCode::Timeout => continue,
+                    Err(error) => return Err(error.into()),
+                    other => bail!("unexpected exec.await response: {other:?}"),
+                }
+            }
+            match client.call(&Request::ExecNext { exec_id }).await? {
+                ResponseOk::Next(NextEvent::Completed {
+                    session_id,
+                    outcome,
+                }) => Ok(HostTerminal::Completed {
+                    session_id,
+                    outcome,
+                }),
+                ResponseOk::Next(NextEvent::Failed { reason }) => {
+                    Ok(HostTerminal::Failed { reason })
+                }
+                other => bail!("unexpected terminal exec.next response: {other:?}"),
+            }
+        };
+        return tokio::select! {
+            result = await_terminal => result,
+            () = wait_for_cancel(&mut cancelled) => bail!("coordinated run cancelled while observing {exec_id}"),
+        };
+    }
     let mut driver = ActiveDriver::start(driver, tui.clone())?;
     let result = drive_loop(
         &host,
@@ -1488,14 +1526,16 @@ async fn drive_loop(
                 };
                 let submit = async {
                     match client
-                        .call(&Request::ExecSubmit {
+                        .call_raw(&Request::ExecSubmit {
                             exec_id,
                             pending_id,
                             answer: Some(answer),
                         })
                         .await?
                     {
-                        ResponseOk::Ack => Ok(()),
+                        Ok(ResponseOk::Ack) => Ok(()),
+                        Err(error) if error.code == ApiErrorCode::CalloutNotPending => Ok(()),
+                        Err(error) => Err(error.into()),
                         other => bail!("unexpected exec.submit response: {other:?}"),
                     }
                 };
@@ -1814,6 +1854,7 @@ enum ActiveDriver {
 impl ActiveDriver {
     fn start(spec: DriverSpec, tui: Option<TuiHandle>) -> anyhow::Result<Self> {
         match spec {
+            DriverSpec::External => bail!("external executions do not own a local driver"),
             DriverSpec::Human => Ok(Self::Human(tui)),
             DriverSpec::Builtin(strategy) => Ok(Self::Builtin(strategy)),
             DriverSpec::Executable(path) => Ok(Self::Executable(Box::new(ExecutableAgent::spawn(
@@ -2561,6 +2602,131 @@ mod tests {
                 .expect("write scripted response");
         }
         requests
+    }
+
+    #[tokio::test]
+    async fn driver_continues_after_another_client_answers_the_callout() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("answer-race.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let exec_id = ExecId([0x81; 32]);
+        let session_id = SessionHash([0x82; 32]);
+        let pending_id = PendingId::new(17);
+        let server = tokio::spawn(serve_script(
+            listener,
+            vec![
+                Ok(ResponseOk::Next(NextEvent::Callout {
+                    pending_id,
+                    callout_index: 0,
+                    name: "Decide".into(),
+                    prompt: "Choose".into(),
+                    schema: arena0_client::program::JsonSchemaDocument::new(schema(
+                        json!({"type":"string", "enum":["yes"]}),
+                    ))
+                    .unwrap(),
+                    context: Value::Null,
+                })),
+                Err(arena0_client::api::ApiError::new(
+                    ApiErrorCode::CalloutNotPending,
+                    "already answered",
+                )),
+                Ok(ResponseOk::Next(NextEvent::Completed {
+                    session_id,
+                    outcome: None,
+                })),
+            ],
+        ));
+        let (_cancel, cancelled) = watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            drive_to_terminal(
+                host("host-01"),
+                DaemonClient::new(socket),
+                exec_id,
+                DriverSpec::Builtin("first-allowed".into()),
+                cancelled,
+                None,
+                test_progress(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            result,
+            HostTerminal::Completed {
+                session_id,
+                outcome: None
+            }
+        );
+        let requests = server.await.unwrap();
+        assert!(
+            matches!(requests.as_slice(), [Request::ExecNext { .. }, Request::ExecSubmit { pending_id: id, .. }, Request::ExecNext { .. }] if *id == pending_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn external_driver_waits_for_terminal_without_consuming_or_answering_callouts() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("external.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let exec_id = ExecId([0x83; 32]);
+        let session_id = SessionHash([0x84; 32]);
+        let server = tokio::spawn(serve_script(
+            listener,
+            vec![
+                Err(arena0_client::api::ApiError::new(
+                    ApiErrorCode::Timeout,
+                    "still active",
+                )),
+                Ok(ResponseOk::Awaited {
+                    exec_id,
+                    exec_state: ExecLifecycle::Completed,
+                    reason: None,
+                }),
+                Ok(ResponseOk::Next(NextEvent::Completed {
+                    session_id,
+                    outcome: None,
+                })),
+            ],
+        ));
+        let (_cancel, cancelled) = watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            drive_to_terminal(
+                host("host-01"),
+                DaemonClient::new(socket),
+                exec_id,
+                DriverSpec::External,
+                cancelled,
+                None,
+                test_progress(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            result,
+            HostTerminal::Completed {
+                session_id,
+                outcome: None
+            }
+        );
+        assert!(matches!(
+            server.await.unwrap().as_slice(),
+            [
+                Request::ExecAwait {
+                    until: AwaitState::Terminal,
+                    ..
+                },
+                Request::ExecAwait {
+                    until: AwaitState::Terminal,
+                    ..
+                },
+                Request::ExecNext { .. }
+            ]
+        ));
     }
 
     fn created_response(

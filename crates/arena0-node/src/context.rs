@@ -30,6 +30,10 @@ pub enum ExecError {
     /// No durable execution exists for the requested identity.
     #[error("execution {0} was not found")]
     NotFound(ExecId),
+    /// An agent answer raced with another answer and no longer names the
+    /// durable callout continuation.
+    #[error("callout is no longer pending")]
+    CalloutNotPending,
     /// Durable or guest state violates an execution invariant.
     #[error("invalid execution state: {0}")]
     InvalidState(String),

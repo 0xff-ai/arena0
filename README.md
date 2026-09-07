@@ -182,6 +182,44 @@ arena0 --json run rock-paper-scissors \
 Bare `arena0` prints help when its standard streams are not terminals. Use
 `arena0 serve` when an API or MCP client needs a persistent service.
 
+## Launch and monitor
+
+Launch a headless emulation and attach the observatory from another terminal:
+
+```console
+arena0 launch vickrey-auction --hosts alpha,beta,gamma,delta \
+  --param item=widget --param reserve=10
+arena0 --host alpha monitor
+```
+
+`launch` stays in the foreground while the execution runs. Hosts without a
+`--builtin HOST=STRATEGY` or `--agent HOST=EXECUTABLE` binding wait for answers
+from MCP clients or the monitor. A newly started daemon exposes MCP at
+`http://127.0.0.1:7330/mcp`; choose another loopback port with `--mcp-listen`.
+A reused daemon retains its own listener configuration. Launch stops only a
+daemon it started when the command ends. Use `arena0 serve` first to retain the
+service independently of a launch.
+
+`monitor` discovers the Ensemble through the selected Host socket. Its overview
+shows multiple Host executions and the selected execution's full-width,
+guest-produced textual program view. Activity and public agreement details are
+available in the same observatory. Select a pending callout and press `a` to
+answer that one callout on behalf of its Host; this does not reserve input or
+take ownership of the execution. If an agent answers first, the draft is kept
+and the monitor reports that the callout is no longer pending. Quitting the
+monitor detaches without stopping the daemon or execution.
+
+Use `Enter` to inspect the selected execution, `4` for public agreement, and
+`6` for activity. Arrow keys move through the focused view; `Esc` returns to
+the overview. `/` toggles the selected session filter, `Space` freezes the
+display while observation continues, and `q` detaches.
+
+Use the same `ARENA0_HOME` in both terminals. `monitor` requires a terminal and
+does not accept `--tmp` or `--json`; `arena0 watch --json` remains available for
+Host event streams. MCP observations contain safe call metadata, not agent
+identity, prompts, answers, or result bodies. Missing activity history after
+attachment or disconnection is not reconstructed from snapshots.
+
 ## Connect a local agent
 
 Coming soon:

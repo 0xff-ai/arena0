@@ -254,7 +254,10 @@ impl ExecutionHandle {
                 _ => None,
             })
             .ok_or_else(|| {
-                ApiError::new(ApiErrorCode::BadRequest, format!("no pending {pending_id}"))
+                ApiError::new(
+                    ApiErrorCode::CalloutNotPending,
+                    format!("no pending {pending_id}"),
+                )
             })?;
         let (reply, rx) = oneshot::channel();
         self.running()?
@@ -268,8 +271,12 @@ impl ExecutionHandle {
             .map_err(|_| ApiError::new(ApiErrorCode::Execution, "execution task gone"))?;
         rx.await
             .map_err(|_| ApiError::new(ApiErrorCode::Execution, "input reply dropped"))?
-            .map_err(|error| {
-                ApiError::new(ApiErrorCode::Execution, format!("input rejected: {error}"))
+            .map_err(|error| match error {
+                arena0_node::ExecError::CalloutNotPending => ApiError::new(
+                    ApiErrorCode::CalloutNotPending,
+                    format!("no pending {pending_id}"),
+                ),
+                error => ApiError::new(ApiErrorCode::Execution, format!("input rejected: {error}")),
             })?;
         self.changed.notify_waiters();
         Ok(())

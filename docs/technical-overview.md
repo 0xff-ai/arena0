@@ -236,6 +236,14 @@ Daemon information and event frames share a Host metadata projection: local ID, 
 
 The CLI, execution observatory, JSON output, and MCP tools project typed Host state. Presentation code does not own protocol or execution state.
 
+`arena0 launch` performs headless coordinated setup and supervises configured
+local drivers. `arena0 monitor` attaches independently to the existing daemon
+and uses the same terminal observatory for multiparty execution tables,
+guest-owned textual views, activity, and public agreement. The monitor can
+answer one pending callout through the existing Host submission boundary;
+competing stale answers receive `CalloutNotPending`. MCP activity has its own
+bounded operational stream, separate from semantic Host events.
+
 ## Fixed Phase 1 constraints
 
 The [protocol architecture](protocol-architecture.md) defines the complete invariant set. The constraints most relevant to implementation are:

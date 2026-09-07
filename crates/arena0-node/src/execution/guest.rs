@@ -96,16 +96,12 @@ impl ExecutionActor {
     ) -> Result<(), ExecError> {
         let state = self.load_state().await?;
         let Some((pending, _)) = state.status().pending() else {
-            return Err(ExecError::InvalidState(
-                "execution is not waiting for input".into(),
-            ));
+            return Err(ExecError::CalloutNotPending);
         };
         if pending.id != pending_id
             || pending.operation != (arena0_protocol::PendingOperation::Callout { callout_index })
         {
-            return Err(ExecError::InvalidState(
-                "input does not match the durable callout continuation".into(),
-            ));
+            return Err(ExecError::CalloutNotPending);
         }
         self.run_local(
             LocalEvent::InputReceived {

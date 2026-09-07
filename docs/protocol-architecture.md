@@ -601,6 +601,22 @@ transport, sandbox, and runtime resource. The CLI owns only child-process
 supervision and typed socket clients. It reuses a service only when every exact
 Host is already reachable and never resizes or stops a borrowed service.
 
+`arena0 launch` uses the same coordinated admission and receipt verification
+without opening the terminal interface. It supervises explicitly configured
+local drivers; unbound Hosts wait for independent clients. `arena0 monitor`
+attaches through an existing Host socket and observes the complete daemon
+Ensemble. It owns subscriptions and presentation only, and detaching never
+stops the daemon or its executions. Executions are keyed by Host and local
+execution ID; negotiation and session identities group multiparty views.
+
+A monitor may submit one pending callout answer through the ordinary
+`exec.submit` operation. Reading or editing a callout grants no ownership or
+reservation. The execution actor serializes competing answers; the losing
+submission reports `CalloutNotPending`, and a local driver continues to its
+next decision point. Schema, storage, and other execution failures retain their
+own error categories. A lost submission response is an unknown outcome and
+must not trigger automatic resubmission.
+
 The workspace projects the typed program catalog and lets a human select one
 program, an admitted Host count, a CLI-local human control policy for one or
 all selected Hosts, program parameters, and the receipt verification tier.
@@ -614,7 +630,8 @@ help instead of opening a terminal interface when any standard stream is not a
 terminal.
 The global `--tmp` option scopes these client paths to one private temporary
 arena0 home and removes it after all command-owned processes have stopped. It
-does not apply to the process-replacing, persistent `arena0 serve` path.
+does not apply to the process-replacing, persistent `arena0 serve` path or to
+`arena0 monitor`, which attaches to an existing home.
 
 ## 13. Events
 
@@ -630,6 +647,13 @@ agent. Event frames capture this metadata when emitted, so reopening a Host
 with a new user agent does not relabel buffered history. Hosts never opened
 through MCP may have no user agent. System events do not cross into the guest
 and are not receipt evidence.
+
+The daemon also publishes a separate bounded MCP activity stream for local
+observers. It records tool names, safe Host/execution correlation, call
+completion classes, and elapsed time. It contains no request or result bodies
+and establishes no agent-to-Host identity binding. The stream does not replay
+history; dropped observations are reported explicitly. MCP activity is
+operational observation, not a semantic Host event or receipt fact.
 
 Operational timings use a separate opt-in `arena0::performance` tracing
 target. Debug records cover aggregate work such as state decode, reducer work,

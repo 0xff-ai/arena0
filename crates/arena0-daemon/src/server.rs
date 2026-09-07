@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant as StdInstant};
@@ -16,14 +17,14 @@ use std::{future::Future, path::PathBuf};
 
 use anyhow::Context as _;
 use arena0_api::{
-    ActivationInspection, ActivationInspectionState, ActivationParticipant, ApiError, ApiErrorCode,
-    DaemonInfo, EnsembleSpec, EventData, EventFilter, EventFrame, ExecLifecycle, ExecOrigin,
-    ExecStatus, ExecStatusState, ExecutionFailureKind, ExecutionInspection, FullVerifiedTerminal,
-    HostInfo, LightVerifiedTerminal, NegotiationStage, NextEvent, PendingCalloutStatus,
-    PrivateCommitSummary as ApiPrivateCommitSummary, PrivateEffectKind as ApiPrivateEffectKind,
-    PrivateEffectSummary as ApiPrivateEffectSummary, PrivateEventKind as ApiPrivateEventKind,
-    ProgramRefError, ReceiptRef, Request, Response, ResponseOk, SessionProgress, SessionStatus,
-    VerifiedResult, frame,
+    ActivationInspection, ActivationInspectionState, ActivationParticipant, ActivityData,
+    ActivityFrame, ApiError, ApiErrorCode, DaemonInfo, EnsembleSpec, EventData, EventFilter,
+    EventFrame, ExecLifecycle, ExecOrigin, ExecStatus, ExecStatusState, ExecutionFailureKind,
+    ExecutionInspection, FullVerifiedTerminal, HostInfo, LightVerifiedTerminal, NegotiationStage,
+    NextEvent, PendingCalloutStatus, PrivateCommitSummary as ApiPrivateCommitSummary,
+    PrivateEffectKind as ApiPrivateEffectKind, PrivateEffectSummary as ApiPrivateEffectSummary,
+    PrivateEventKind as ApiPrivateEventKind, ProgramRefError, ReceiptRef, Request, Response,
+    ResponseOk, SessionProgress, SessionStatus, VerifiedResult, frame,
 };
 use arena0_crypto::{AgentPubKey, ExecutionKey, NodeKeys};
 use arena0_node::{ActivatedSession, NegotiationBook};
@@ -69,6 +70,9 @@ use arena0_store::{
 /// Capacity of the event broadcast bus. A slow subscriber that falls this far
 /// behind gets a drop-oldest `stream.lagged` frame rather than blocking producers.
 const EVENT_BUS_CAP: usize = 1024;
+/// Capacity of the daemon-wide MCP activity bus. Slow monitors receive one
+/// bounded lag marker and never hold up tool dispatch.
+const ACTIVITY_BUS_CAP: usize = 1024;
 const LOCAL_WITHDRAWAL_REASON: &str = "negotiation withdrawn locally";
 const CREATION_ARRIVAL_GRACE: Duration = Duration::from_secs(1);
 
@@ -740,6 +744,62 @@ impl Events {
     }
 }
 
+/// Daemon-scoped MCP activity junction. Unlike [`Events`], this bus is shared
+/// by every Host service in one process so one Unix subscription observes the
+/// complete MCP surface.
+#[derive(Debug, Clone)]
+pub(crate) struct Activity {
+    boot_id: String,
+    next_seq: Arc<AtomicU64>,
+    next_call_id: Arc<AtomicU64>,
+    publisher: Arc<StdMutex<()>>,
+    activity: broadcast::Sender<ActivityFrame>,
+}
+
+impl Activity {
+    pub(crate) fn new() -> Self {
+        let (activity, _keepalive) = broadcast::channel(ACTIVITY_BUS_CAP);
+        Self {
+            boot_id: hex::encode(rand::random::<[u8; 16]>()),
+            next_seq: Arc::new(AtomicU64::new(1)),
+            next_call_id: Arc::new(AtomicU64::new(1)),
+            publisher: Arc::new(StdMutex::new(())),
+            activity,
+        }
+    }
+
+    pub(crate) fn next_call_id(&self) -> String {
+        self.next_call_id
+            .fetch_add(1, Ordering::Relaxed)
+            .to_string()
+    }
+
+    pub(crate) fn emit(&self, data: ActivityData) {
+        let _publisher = self.publisher.lock().expect("activity publisher");
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let frame = ActivityFrame {
+            boot_id: self.boot_id.clone(),
+            seq,
+            ts: unix_time_ms(),
+            data,
+        };
+        let _ = self.activity.send(frame);
+    }
+
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<ActivityFrame> {
+        self.activity.subscribe()
+    }
+
+    pub(crate) fn lagged(&self, seq: u64, skipped: u64) -> ActivityFrame {
+        ActivityFrame {
+            boot_id: self.boot_id.clone(),
+            seq,
+            ts: unix_time_ms(),
+            data: ActivityData::Lagged { skipped },
+        }
+    }
+}
+
 /// Owns the Unix listener path and every connection task spawned from it.
 #[derive(Debug)]
 struct UnixSocket {
@@ -1020,6 +1080,8 @@ pub(crate) struct HostService {
     engine: Arc<WasmtimeEngine>,
     startup: Arc<StartupTimeline>,
     pub(crate) events: Events,
+    pub(crate) activity: Arc<Activity>,
+    host_directory: Weak<crate::ensemble::HostDirectory>,
     started: StdInstant,
     /// Protocol ingress, negotiation, and execution machinery shared with the
     /// greybox harness.
@@ -1052,6 +1114,8 @@ pub(crate) struct HostServiceInit {
     pub(crate) store: StoreHandle,
     pub(crate) engine: Arc<WasmtimeEngine>,
     pub(crate) startup: Arc<StartupTimeline>,
+    pub(crate) activity: Arc<Activity>,
+    pub(crate) host_directory: Weak<crate::ensemble::HostDirectory>,
 }
 
 impl HostService {
@@ -1118,6 +1182,8 @@ impl HostService {
             store,
             engine,
             startup,
+            activity,
+            host_directory,
         } = init;
 
         let identity = runtime.identity_keys();
@@ -1148,6 +1214,8 @@ impl HostService {
             engine,
             startup,
             events,
+            activity,
+            host_directory,
             started: StdInstant::now(),
             runtime,
             owns_runtime,
@@ -1773,6 +1841,16 @@ impl HostService {
         let (read, mut write) = stream.into_split();
         let mut read = BufReader::new(read);
         while let Some(req) = frame::read_frame::<_, Request>(&mut read).await? {
+            if let Request::ActivitySubscribe = req {
+                let rx = self.activity.subscribe();
+                frame::write_frame(
+                    &mut write,
+                    &Ok::<_, ApiError>(ResponseOk::ActivitySubscribed),
+                )
+                .await?;
+                self.stream_activity_unix(rx, &mut read, &mut write).await?;
+                return Ok(());
+            }
             if let Request::EventsSubscribe { filter } = req {
                 // Register before acknowledging: events after this point cannot race
                 // between the ack and receiver creation.
@@ -1827,6 +1905,47 @@ impl HostService {
                 },
                 // Detect client disconnect: a subscriber sends nothing, so any read
                 // that returns 0 (EOF) or errors means the connection is gone.
+                n = read.read(&mut sink) => {
+                    if matches!(n, Ok(0) | Err(_)) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stream daemon-wide MCP activity until the client hangs up.
+    async fn stream_activity_unix<R, W>(
+        &self,
+        mut rx: broadcast::Receiver<ActivityFrame>,
+        read: &mut R,
+        write: &mut W,
+    ) -> anyhow::Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let mut pending_skipped = 0u64;
+        let mut sink = [0u8; 256];
+        loop {
+            tokio::select! {
+                recv = rx.recv() => match recv {
+                    Ok(frame_msg) => {
+                        if pending_skipped > 0 {
+                            let lagged = self.activity.lagged(
+                                frame_msg.seq.saturating_sub(1),
+                                pending_skipped,
+                            );
+                            frame::write_frame(write, &lagged).await?;
+                            pending_skipped = 0;
+                        }
+                        frame::write_frame(write, &frame_msg).await?;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        pending_skipped = pending_skipped.saturating_add(skipped);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                },
                 n = read.read(&mut sink) => {
                     if matches!(n, Ok(0) | Err(_)) {
                         return Ok(());
@@ -1981,27 +2100,19 @@ impl HostService {
                 ApiErrorCode::BadRequest,
                 "events.subscribe must be the only method on its connection",
             )),
+            Request::ActivitySubscribe => Err(ApiError::new(
+                ApiErrorCode::BadRequest,
+                "activity.subscribe must be the only method on its connection",
+            )),
 
-            Request::DaemonInfo => {
-                let programs = self
-                    .catalog
-                    .list()
-                    .await
-                    .map_err(|error| {
-                        ApiError::new(ApiErrorCode::Storage, format!("list programs: {error}"))
-                    })?
-                    .len();
-                Ok(ResponseOk::DaemonInfo(DaemonInfo {
-                    host: self.host_info(),
-                    transport_key: AgentPubKey(self.peer_id.0),
-                    version: env!("CARGO_PKG_VERSION").to_string(),
-                    abi_version: ABI_VERSION,
-                    uptime_secs: self.started.elapsed().as_secs(),
-                    socket: self.paths.socket.display().to_string(),
-                    programs,
-                    execs_active: self.active_execution_count().await?,
-                }))
-            }
+            Request::DaemonInfo => self.daemon_info().await.map(ResponseOk::DaemonInfo),
+            Request::HostsList => self
+                .host_directory
+                .upgrade()
+                .ok_or_else(|| ApiError::new(ApiErrorCode::Internal, "Host directory unavailable"))?
+                .infos()
+                .await
+                .map(ResponseOk::Hosts),
             Request::DaemonStop => {
                 // Ack first (the response is written before the connection task
                 // yields), then wake the serve loop. Its cleanup path owns the
@@ -2179,6 +2290,27 @@ impl HostService {
             .iter()
             .filter(|state| !state.status().is_terminal())
             .count())
+    }
+
+    pub(crate) async fn daemon_info(&self) -> Result<DaemonInfo, ApiError> {
+        let programs = self
+            .catalog
+            .list()
+            .await
+            .map_err(|error| {
+                ApiError::new(ApiErrorCode::Storage, format!("list programs: {error}"))
+            })?
+            .len();
+        Ok(DaemonInfo {
+            host: self.host_info(),
+            transport_key: AgentPubKey(self.peer_id.0),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            abi_version: ABI_VERSION,
+            uptime_secs: self.started.elapsed().as_secs(),
+            socket: self.paths.socket.display().to_string(),
+            programs,
+            execs_active: self.active_execution_count().await?,
+        })
     }
 
     async fn project_next(&self, exec_id: ExecId) -> Result<NextProjection, ApiError> {
@@ -3047,31 +3179,31 @@ impl HostService {
         pending_id: PendingId,
         answer: Option<serde_json::Value>,
     ) -> Response {
-        let entry = self
-            .execs
-            .get(&exec_id)
-            .ok_or_else(|| ApiError::new(ApiErrorCode::NotFound, "no such execution"))?;
-        let callout_index = self
+        let request = self
             .store
-            .list_pending_requests(exec_id)
+            .load_execution_request(exec_id)
             .await
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
-            .into_iter()
-            .find_map(|request| match request {
-                arena0_store::PendingRequest::Callout {
-                    pending_id: id,
-                    callout_index,
-                    ..
-                } if id == pending_id => Some(callout_index),
-                _ => None,
-            })
+            .ok_or_else(|| ApiError::new(ApiErrorCode::NotFound, "no such execution"))?;
+        let callout_index = self
+            .pending_callout_index(exec_id, pending_id)
+            .await?
             .ok_or_else(|| {
-                ApiError::new(ApiErrorCode::BadRequest, format!("no pending {pending_id}"))
+                ApiError::new(
+                    ApiErrorCode::CalloutNotPending,
+                    format!("no pending {pending_id}"),
+                )
             })?;
-        let program_id = entry
-            .program_id()
-            .await
-            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
+        let entry = match self.execs.get(&exec_id) {
+            Some(entry) => entry,
+            None => {
+                let error = ApiError::new(ApiErrorCode::Execution, "execution has no live driver");
+                return Err(self
+                    .reclassify_submit_failure(exec_id, pending_id, error)
+                    .await);
+            }
+        };
+        let program_id = request.program_hash();
         let contract = self
             .catalog
             .schema(program_id)
@@ -3088,7 +3220,11 @@ impl HostService {
         let bytes = schema::encode_json_field(&output_schema, answer.as_ref(), "answer")?;
         let bytes = JsonBytes::try_new(bytes)
             .map_err(|error| ApiError::new(ApiErrorCode::BadRequest, error.to_string()))?;
-        entry.submit(pending_id, bytes).await?;
+        if let Err(error) = entry.submit(pending_id, bytes).await {
+            return Err(self
+                .reclassify_submit_failure(exec_id, pending_id, error)
+                .await);
+        }
         self.events.emit(HostEvent::SessionCalloutAnswered {
             source: entry
                 .event_source()
@@ -3097,6 +3233,42 @@ impl HostService {
             pending_id,
         });
         Ok(ResponseOk::Ack)
+    }
+
+    async fn pending_callout_index(
+        &self,
+        exec_id: ExecId,
+        pending_id: PendingId,
+    ) -> Result<Option<u32>, ApiError> {
+        Ok(self
+            .store
+            .list_pending_requests(exec_id)
+            .await
+            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
+            .into_iter()
+            .find_map(|request| match request {
+                arena0_store::PendingRequest::Callout {
+                    pending_id: id,
+                    callout_index,
+                    ..
+                } if id == pending_id => Some(callout_index),
+                _ => None,
+            }))
+    }
+
+    async fn reclassify_submit_failure(
+        &self,
+        exec_id: ExecId,
+        pending_id: PendingId,
+        error: ApiError,
+    ) -> ApiError {
+        match self.pending_callout_index(exec_id, pending_id).await {
+            Ok(None) => ApiError::new(
+                ApiErrorCode::CalloutNotPending,
+                format!("no pending {pending_id}"),
+            ),
+            Ok(Some(_)) | Err(_) => error,
+        }
     }
 
     /// Validate the query against the program's public request schema, run it,
@@ -3950,6 +4122,8 @@ mod tests {
             store: store_handle,
             engine,
             startup: Arc::new(StartupTimeline::new(1, 0)),
+            activity: Arc::new(Activity::new()),
+            host_directory: Weak::new(),
         })
         .unwrap();
         (dir, store, daemon, identity.peer_id)
@@ -4014,6 +4188,41 @@ mod tests {
             .expect_err("fixed-size programs must reject other ensemble sizes");
         assert_eq!(error.code, ApiErrorCode::BadRequest);
         assert!(error.message.contains("program accepts 2"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn activity_publisher_sequences_are_monotonic_under_concurrent_emitters() {
+        const EMITTERS: usize = 8;
+        const FRAMES_PER_EMITTER: usize = 64;
+        let activity = Arc::new(Activity::new());
+        let mut receiver = activity.subscribe();
+        let mut emitters = Vec::with_capacity(EMITTERS);
+        for emitter in 0..EMITTERS {
+            let activity = Arc::clone(&activity);
+            emitters.push(tokio::spawn(async move {
+                for frame in 0..FRAMES_PER_EMITTER {
+                    activity.emit(ActivityData::Started {
+                        call_id: format!("{emitter}-{frame}"),
+                        tool: "test".into(),
+                        host: None,
+                        exec_id: None,
+                    });
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        for emitter in emitters {
+            emitter.await.expect("activity emitter joined");
+        }
+
+        let mut sequences = Vec::with_capacity(EMITTERS * FRAMES_PER_EMITTER);
+        for _ in 0..(EMITTERS * FRAMES_PER_EMITTER) {
+            sequences.push(receiver.recv().await.expect("activity frame received").seq);
+        }
+        assert_eq!(
+            sequences,
+            (1..=(EMITTERS * FRAMES_PER_EMITTER) as u64).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

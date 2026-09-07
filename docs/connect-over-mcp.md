@@ -51,6 +51,18 @@ for display and diagnostics.
 Do not configure a separate MCP server entry for each Host. The endpoint is
 selected by the server URL; Host selection is explicit in each tool argument.
 
+Attach `arena0 monitor` in another terminal to inspect all Hosts, their program
+views, pending callouts, and safe MCP call activity. Select an entry Host with
+`arena0 --host NAME monitor` when the service does not include `host-01`.
+The monitor does not require a particular harness or claim that a client owns
+a Host.
+
+A human can answer one pending callout from the monitor while an agent is
+working. An agent whose retained answer loses that race receives
+`CalloutNotPending`; fetch the next decision point instead of terminating the
+execution or resubmitting that answer. There is no input reservation or pause
+of the external harness. Other validation and execution errors remain errors.
+
 ## Select the Hosts and program
 
 Call `list_programs` for the assigned Host:

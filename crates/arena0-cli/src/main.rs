@@ -9,6 +9,7 @@ mod agent;
 mod coordinated;
 mod line_input;
 mod local_daemon;
+mod monitor;
 mod process;
 mod progress;
 mod run;
@@ -85,7 +86,7 @@ impl Ctx {
 #[command(
     name = "arena0",
     about = "Run local Hosts, inspect executions, and verify receipts",
-    after_help = "Examples:\n  arena0\n  arena0 run rock-paper-scissors --human host-01 --builtin host-02=sample\n  arena0 serve\n  arena0 status\n  arena0 verify receipt.json\n\nOn a terminal, bare `arena0` opens the local program workspace. `arena0 run` starts command-scoped local Hosts when needed; `arena0 serve` keeps them running for API and MCP clients.",
+    after_help = "Examples:\n  arena0\n  arena0 launch rock-paper-scissors --hosts host-01,host-02\n  arena0 monitor\n  arena0 run rock-paper-scissors --human host-01 --builtin host-02=sample\n  arena0 serve\n  arena0 verify receipt.json\n\nOn a terminal, bare `arena0` opens the local program workspace. `arena0 launch` starts a headless emulation; `arena0 monitor` attaches to its daemon. `arena0 serve` keeps Hosts running independently for API and MCP clients.",
     version
 )]
 struct Cli {
@@ -111,6 +112,31 @@ enum Command {
     Skill,
     /// Start the persistent local Host service.
     Serve(serve::ServeArgs),
+    /// Launch a headless local emulation; attach with `arena0 monitor`.
+    Launch {
+        /// Program name, id, or Wasm path.
+        program: String,
+        /// Participating Hosts (default: host-01,host-02). Unbound Hosts use external clients.
+        #[arg(long, value_delimiter = ',', value_name = "NAME")]
+        hosts: Vec<HostName>,
+        /// MCP listener for a newly started daemon; a reused service keeps its listener.
+        #[arg(long, default_value = "127.0.0.1:7330", value_name = "ADDR")]
+        mcp_listen: std::net::SocketAddr,
+        /// Bind a deterministic strategy as HOST=STRATEGY.
+        #[arg(long, value_name = "HOST=STRATEGY")]
+        builtin: Vec<String>,
+        /// Bind an executable JSONL agent as HOST=EXECUTABLE.
+        #[arg(long, value_name = "HOST=EXECUTABLE")]
+        agent: Vec<String>,
+        /// Program params as KEY=VALUE.
+        #[arg(long, value_name = "KEY=VALUE")]
+        param: Vec<String>,
+        /// Fully replay every Host receipt before succeeding.
+        #[arg(long)]
+        replay: bool,
+    },
+    /// Observe the local daemon and optionally answer individual callouts.
+    Monitor(monitor::MonitorArgs),
     /// Show the selected Host and active executions.
     Status,
     /// Ask the selected Host (and its local ensemble supervisor) to stop.
@@ -290,6 +316,10 @@ fn main() -> ExitCode {
     if let Some(exit) = dispatch_skill(&cli) {
         return exit;
     }
+    if cli.tmp && matches!(cli.command, Some(Command::Monitor(_))) {
+        eprintln!("error: --tmp does not apply to `arena0 monitor`; attach to an existing home");
+        return ExitCode::FAILURE;
+    }
     let _temporary_home = match prepare_temporary_home(cli.tmp) {
         Ok(home) => home,
         Err(error) => {
@@ -297,7 +327,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    init_tracing();
+    // The monitor renders diagnostics in its own panes; stderr tracing would
+    // overwrite the alternate screen when it shares the terminal.
+    if !matches!(cli.command, Some(Command::Monitor(_))) {
+        init_tracing();
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -530,6 +564,64 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             return serve::serve(args);
         }
+        Command::Launch {
+            program,
+            hosts,
+            mcp_listen,
+            builtin,
+            agent,
+            param,
+            replay,
+        } => {
+            if socket.is_some() || host.is_some() {
+                bail!("--socket and --host do not apply to `arena0 launch`; use --hosts");
+            }
+            let bindings = launch_bindings(hosts, builtin, agent)?;
+            if bindings.len() < 2 {
+                bail!("an emulation requires at least two distinct Hosts");
+            }
+            if !mcp_listen.ip().is_loopback() || mcp_listen.port() == 0 {
+                bail!("--mcp-listen requires a loopback address with a nonzero port");
+            }
+            let params = answer::assemble_params(&param).map_err(anyhow::Error::msg)?;
+            let daemon = local_daemon::LocalDaemon::connect_or_start_with_mcp(
+                bindings
+                    .iter()
+                    .map(|binding| binding.host.clone())
+                    .collect(),
+                mcp_listen,
+            )
+            .await?;
+            if !mode.is_json() {
+                let home = arena0_home::Home::from_env()?;
+                eprintln!(
+                    "launching headless emulation; attach with `arena0 --host {} monitor` using ARENA0_HOME={}",
+                    bindings[0].host,
+                    home.root().display()
+                );
+                if daemon.is_spawned() {
+                    eprintln!("MCP endpoint: http://{mcp_listen}/mcp");
+                } else {
+                    eprintln!("using the existing daemon and its configured MCP endpoint");
+                }
+            }
+            let result =
+                run_with_connected_bindings(mode, program, params, bindings, replay, true).await;
+            return finish_with_daemon(result, daemon).await;
+        }
+        Command::Monitor(args) => {
+            if json || tmp {
+                bail!("--json and --tmp do not apply to `arena0 monitor`");
+            }
+            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                bail!("arena0 monitor requires a terminal; use `arena0 watch --json` for a stream");
+            }
+            let client = match socket {
+                Some(socket) => DaemonClient::new(socket),
+                None => DaemonClient::for_host(&host.unwrap_or_default())?,
+            };
+            return monitor::attach(client, args).await;
+        }
         Command::Run {
             program,
             human,
@@ -634,6 +726,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Receipt { command } => receipt(&ctx, command).await,
         Command::Verify { target, replay, .. } => verify::verify(&ctx, target, replay).await,
         Command::Run { .. } => unreachable!("coordinated run returned before client construction"),
+        Command::Launch { .. } | Command::Monitor(_) => {
+            unreachable!("launch/monitor returned before client construction")
+        }
     }
 }
 
@@ -645,6 +740,48 @@ struct CoordinatedCliArgs {
     params: Vec<String>,
     replay: bool,
     no_tui: bool,
+}
+
+fn launch_bindings(
+    mut hosts: Vec<HostName>,
+    builtins: Vec<String>,
+    agents: Vec<String>,
+) -> anyhow::Result<Vec<coordinated::DriverBinding>> {
+    let bindings = builtins
+        .iter()
+        .map(|value| parse_builtin_binding(value))
+        .chain(agents.iter().map(|value| parse_agent_binding(value)))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if hosts.is_empty() {
+        hosts = local_daemon::host_names(2);
+    }
+    let mut seen = std::collections::HashSet::new();
+    for host in &hosts {
+        if !seen.insert(host) {
+            bail!("Host '{host}' was selected more than once");
+        }
+    }
+    let mut drivers = std::collections::HashSet::new();
+    for binding in &bindings {
+        if !drivers.insert(&binding.host) {
+            bail!("Host '{}' has more than one driver binding", binding.host);
+        }
+        if !hosts.contains(&binding.host) {
+            bail!("driver Host '{}' is not selected by --hosts", binding.host);
+        }
+    }
+    Ok(hosts
+        .into_iter()
+        .map(|host| {
+            let driver = bindings
+                .iter()
+                .find(|binding| binding.host == host)
+                .map_or(coordinated::DriverSpec::External, |binding| {
+                    binding.driver.clone()
+                });
+            coordinated::DriverBinding::new(host, driver)
+        })
+        .collect())
 }
 
 async fn coordinated_run(mode: Mode, args: CoordinatedCliArgs) -> anyhow::Result<()> {
@@ -1664,6 +1801,51 @@ fn print_ack(ctx: &Ctx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_selects_any_number_of_hosts_and_leaves_unbound_hosts_external() {
+        let hosts = ["alpha", "beta", "gamma", "delta"]
+            .map(|name| name.parse().unwrap())
+            .to_vec();
+        let bindings = launch_bindings(hosts, vec!["beta=sample".into()], vec![]).unwrap();
+        assert_eq!(bindings.len(), 4);
+        assert_eq!(
+            bindings
+                .iter()
+                .map(|binding| binding.host.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta", "gamma", "delta"]
+        );
+        let defaults = launch_bindings(vec![], vec!["host-01=sample".into()], vec![]).unwrap();
+        assert_eq!(defaults.len(), 2);
+        assert_eq!(defaults[1].driver, coordinated::DriverSpec::External);
+        assert_eq!(
+            bindings
+                .iter()
+                .filter(|binding| binding.driver == coordinated::DriverSpec::External)
+                .count(),
+            3
+        );
+        assert!(
+            launch_bindings(
+                vec!["alpha".parse().unwrap(), "beta".parse().unwrap()],
+                vec!["other=sample".into()],
+                vec![]
+            )
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "arena0",
+                "launch",
+                "program",
+                "--hosts",
+                "alpha,beta,gamma,delta"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["arena0", "monitor"]).is_ok());
+    }
 
     #[test]
     fn receipt_commands_accept_content_references_without_a_producer() {

@@ -1,0 +1,762 @@
+//! Live daemon attachment for the unified execution observatory.
+//!
+//! This module owns only the effectful monitor shell.  [`crate::tui`] remains
+//! the sole terminal loop and state owner: this side fetches bounded snapshots,
+//! translates public daemon events, and executes an explicitly selected answer.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
+
+use anyhow::{Context as _, anyhow, bail};
+use arena0_client::api::{
+    ActivityData, ActivityResult, ApiErrorCode, ColorDepth, EventData, EventFilter, NextEvent,
+    Request, ResponseOk,
+};
+use arena0_client::proto::DaemonClient;
+use arena0_client::protocol::{ExecId, TraceEntry};
+use arena0_home::HostName;
+use clap::Args;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
+
+use crate::tui::{
+    MonitorAction, MonitorActivity, MonitorExecutionKey, MonitorHost, MonitorSubmission,
+    MonitorUpdate, PRIVATE_INSPECTION_LIMIT, RunUpdate, TuiConfig, TuiDriver, TuiHandle, TuiHost,
+    TuiSession,
+};
+
+const TRACE_LIMIT: u64 = 256;
+const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const MAX_ACTIVITY_CALLS: usize = 1024;
+
+/// Arguments for `arena0 monitor`.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct MonitorArgs {
+    /// Restrict the attachment to these daemon Host names.  With no filter,
+    /// the roster returned by the selected daemon is observed.
+    #[arg(long = "hosts", value_delimiter = ',', value_name = "NAME")]
+    pub(crate) hosts: Vec<HostName>,
+}
+
+/// Attach the unified observatory to a live daemon roster.
+pub(crate) async fn attach(entry_client: DaemonClient, args: MonitorArgs) -> anyhow::Result<()> {
+    let roster = discover_hosts(&entry_client, &args.hosts).await?;
+    if roster.is_empty() {
+        bail!("daemon roster contains no Hosts to monitor");
+    }
+    let config = TuiConfig {
+        program: "daemon executions".to_owned(),
+        hosts: roster
+            .iter()
+            .map(|host| TuiHost {
+                host: host.host.clone(),
+                peer_id: host.peer_id,
+                driver: TuiDriver::External,
+            })
+            .collect(),
+        message_schema: None,
+    };
+    let (cancel, _cancelled) = watch::channel(None::<String>);
+    let (mut session, mut actions) = TuiSession::start_monitor(config, cancel);
+    let handle = session.handle();
+    let mut transport = MonitorTransport::new(entry_client, roster);
+    let result = tokio::select! {
+        result = transport.run(&handle, &mut actions) => {
+            let result = result.context("monitor transport");
+            let _ = session.close().await;
+            result
+        }
+        result = session.wait() => {
+            result.context("monitor TUI")
+        }
+    };
+    transport.workers.shutdown().await;
+    result
+}
+
+async fn discover_hosts(
+    entry_client: &DaemonClient,
+    selected: &[HostName],
+) -> anyhow::Result<Vec<MonitorHost>> {
+    let response = entry_client
+        .call(&Request::HostsList)
+        .await
+        .context("list daemon Hosts")?;
+    let ResponseOk::Hosts(infos) = response else {
+        bail!("unexpected response to hosts.list");
+    };
+    let mut roster = Vec::with_capacity(infos.len());
+    for info in infos {
+        let host = info
+            .host
+            .id
+            .parse::<HostName>()
+            .with_context(|| format!("daemon returned invalid Host name {:?}", info.host.id))?;
+        roster.push(MonitorHost {
+            host,
+            peer_id: info.host.peer_id,
+            socket: info.socket,
+        });
+    }
+    if selected.is_empty() {
+        return Ok(roster);
+    }
+    let names = selected.iter().cloned().collect::<BTreeSet<_>>();
+    let filtered = roster
+        .into_iter()
+        .filter(|host| names.contains(&host.host))
+        .collect::<Vec<_>>();
+    let found = filtered
+        .iter()
+        .map(|host| host.host.clone())
+        .collect::<BTreeSet<_>>();
+    if let Some(missing) = names.difference(&found).next() {
+        bail!("Host '{missing}' is not present in the daemon roster");
+    }
+    Ok(filtered)
+}
+
+struct MonitorTransport {
+    entry_client: DaemonClient,
+    roster: Vec<MonitorHost>,
+    workers: JoinSet<anyhow::Result<()>>,
+}
+
+impl MonitorTransport {
+    fn new(entry_client: DaemonClient, roster: Vec<MonitorHost>) -> Self {
+        Self {
+            entry_client,
+            roster,
+            workers: JoinSet::new(),
+        }
+    }
+
+    async fn run(
+        &mut self,
+        handle: &TuiHandle,
+        actions: &mut mpsc::Receiver<MonitorAction>,
+    ) -> anyhow::Result<()> {
+        handle
+            .update(RunUpdate::Monitor(MonitorUpdate::Hosts {
+                hosts: self.roster.clone(),
+            }))
+            .await?;
+        let clients = self
+            .roster
+            .iter()
+            .map(|host| (host.host.clone(), DaemonClient::new(host.socket.clone())))
+            .collect::<BTreeMap<_, _>>();
+        for host in &self.roster {
+            let client = clients
+                .get(&host.host)
+                .cloned()
+                .expect("client built for every roster entry");
+            let handle = handle.clone();
+            let host = host.clone();
+            self.workers
+                .spawn(async move { host_worker(host, client, handle).await });
+        }
+        let activity_handle = handle.clone();
+        let activity_client = self.entry_client.clone();
+        self.workers
+            .spawn(async move { activity_worker(activity_client, activity_handle).await });
+
+        loop {
+            tokio::select! {
+                action = actions.recv() => {
+                    let Some(action) = action else { return Ok(()); };
+                    submit_action(&clients, handle, action).await?;
+                }
+                joined = self.workers.join_next() => {
+                    if let Some(joined) = joined {
+                        joined.context("monitor subscription task")??;
+                    } else {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn host_worker(
+    host: MonitorHost,
+    client: DaemonClient,
+    handle: TuiHandle,
+) -> anyhow::Result<()> {
+    loop {
+        match run_host_connection(&host, &client, &handle).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let _ = handle
+                    .update(RunUpdate::Monitor(MonitorUpdate::Connection {
+                        host: host.host.clone(),
+                        message: format!("disconnected: {error:#}"),
+                        stale: true,
+                    }))
+                    .await;
+                tokio::time::sleep(RECONNECT_DELAY).await;
+            }
+        }
+    }
+}
+
+async fn run_host_connection(
+    host: &MonitorHost,
+    client: &DaemonClient,
+    handle: &TuiHandle,
+) -> anyhow::Result<()> {
+    let mut subscription = client
+        .subscribe(EventFilter::default())
+        .await
+        .with_context(|| format!("subscribe to Host '{}' events", host.host))?;
+    refresh_host(host, client, handle).await?;
+    let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
+    let mut last_seq: Option<u64> = None;
+    loop {
+        tokio::select! {
+            event = subscription.next() => {
+                let frame = event?.ok_or_else(|| anyhow!("Host event stream closed"))?;
+                if let Some(previous) = last_seq
+                    && frame.seq > previous.saturating_add(1)
+                {
+                    let _ = handle.update(RunUpdate::Monitor(MonitorUpdate::Gap {
+                        host: Some(host.host.clone()),
+                        exec_id: frame.exec_id,
+                        summary: format!("event gap after #{previous}; snapshot refreshed"),
+                    })).await;
+                }
+                last_seq = Some(frame.seq);
+                observe_event(host, client, handle, frame).await?;
+            }
+            _ = ticker.tick() => refresh_host(host, client, handle).await?,
+        }
+    }
+}
+
+async fn refresh_host(
+    host: &MonitorHost,
+    client: &DaemonClient,
+    handle: &TuiHandle,
+) -> anyhow::Result<()> {
+    let statuses = match client.call(&Request::ExecList).await? {
+        ResponseOk::ExecList(statuses) => statuses,
+        other => bail!(
+            "unexpected response to exec.list from '{}': {other:?}",
+            host.host
+        ),
+    };
+    for status in statuses {
+        refresh_execution(host, client, handle, status).await?;
+    }
+    Ok(())
+}
+
+/// Refresh one execution while retaining whatever parts of its last snapshot
+/// could not be fetched during a transient daemon/storage failure. The TUI
+/// applies stale updates as patches for exactly that reason.
+async fn refresh_execution(
+    host: &MonitorHost,
+    client: &DaemonClient,
+    handle: &TuiHandle,
+    status: arena0_client::api::ExecStatus,
+) -> anyhow::Result<()> {
+    let has_pending = status.pending_callout().is_some();
+    let exec_id = status.exec_id;
+    let key = MonitorExecutionKey {
+        host: host.host.clone(),
+        exec_id,
+    };
+    let inspection = fetch_inspection(client, exec_id).await;
+    let view = fetch_view(client, exec_id, handle.view_width()).await;
+    let trace = fetch_trace(client, exec_id, status.step()).await;
+    let mut gap = None;
+    let inspection = match inspection {
+        Ok(value) => Some(value),
+        Err(error) => {
+            gap = Some(format!("inspection unavailable: {error:#}"));
+            None
+        }
+    };
+    let view = match view {
+        Ok(value) => value,
+        Err(error) => {
+            gap.get_or_insert_with(|| format!("view unavailable: {error:#}"));
+            None
+        }
+    };
+    let trace = match trace {
+        Ok(value) => value,
+        Err(error) => {
+            gap.get_or_insert_with(|| format!("trace unavailable: {error:#}"));
+            Vec::new()
+        }
+    };
+    let stale = gap.is_some();
+    handle
+        .update(RunUpdate::Monitor(MonitorUpdate::Execution {
+            key,
+            status,
+            inspection,
+            view,
+            trace,
+            observed_at: now_epoch_seconds(),
+            stale,
+            gap,
+        }))
+        .await?;
+    if has_pending {
+        let _ = fetch_pending_callout(client, host, exec_id, handle).await;
+    }
+    Ok(())
+}
+
+async fn fetch_pending_callout(
+    client: &DaemonClient,
+    host: &MonitorHost,
+    exec_id: ExecId,
+    handle: &TuiHandle,
+) -> anyhow::Result<()> {
+    let response = tokio::time::timeout(
+        Duration::from_millis(250),
+        client.call(&Request::ExecNext { exec_id }),
+    )
+    .await
+    .context("bounded pending callout lookup")??;
+    let ResponseOk::Next(NextEvent::Callout {
+        pending_id,
+        callout_index,
+        name,
+        prompt,
+        schema,
+        context,
+    }) = response
+    else {
+        return Ok(());
+    };
+    handle
+        .update(RunUpdate::Monitor(MonitorUpdate::Callout {
+            host: host.host.clone(),
+            exec_id,
+            pending_id,
+            callout_index,
+            name,
+            prompt,
+            context,
+            schema: schema.as_value().clone(),
+        }))
+        .await
+}
+
+async fn fetch_inspection(
+    client: &DaemonClient,
+    exec_id: ExecId,
+) -> anyhow::Result<arena0_client::api::ExecutionInspection> {
+    match client
+        .call(&Request::ExecInspect {
+            exec_id,
+            private_from: None,
+            private_limit: PRIVATE_INSPECTION_LIMIT,
+        })
+        .await?
+    {
+        ResponseOk::Inspection(inspection) => Ok(inspection),
+        other => bail!("unexpected exec.inspect response: {other:?}"),
+    }
+}
+
+async fn fetch_view(
+    client: &DaemonClient,
+    exec_id: ExecId,
+    width: u16,
+) -> anyhow::Result<Option<(u64, arena0_client::protocol::View)>> {
+    match client
+        .call_raw(&Request::ExecView {
+            exec: exec_id,
+            width,
+            color: ColorDepth::Mono,
+        })
+        .await?
+    {
+        Ok(ResponseOk::ExecView { step, view }) => Ok(Some((step, view))),
+        Err(error) if error.code == ApiErrorCode::Execution => Ok(None),
+        Err(error) => bail!("{error}"),
+        Ok(other) => bail!("unexpected exec.view response: {other:?}"),
+    }
+}
+
+async fn fetch_trace(
+    client: &DaemonClient,
+    exec_id: ExecId,
+    step: Option<u64>,
+) -> anyhow::Result<Vec<TraceEntry>> {
+    let end = step.map_or(TRACE_LIMIT, |step| step.saturating_add(1));
+    let from = end.saturating_sub(TRACE_LIMIT);
+    match client
+        .call(&Request::ExecTrace {
+            exec_id,
+            from,
+            to: end,
+        })
+        .await?
+    {
+        ResponseOk::Trace(entries) => Ok(entries),
+        other => bail!("unexpected exec.trace response: {other:?}"),
+    }
+}
+
+async fn observe_event(
+    host: &MonitorHost,
+    client: &DaemonClient,
+    handle: &TuiHandle,
+    frame: arena0_client::api::EventFrame,
+) -> anyhow::Result<()> {
+    let key = frame.exec_id.map(|exec_id| MonitorExecutionKey {
+        host: host.host.clone(),
+        exec_id,
+    });
+    if let Some(key) = &key {
+        handle
+            .update(RunUpdate::Monitor(MonitorUpdate::SystemEvent {
+                key: key.clone(),
+                frame: frame.clone(),
+            }))
+            .await?;
+    }
+    if let Some(exec_id) = frame.exec_id {
+        let activity = MonitorActivity {
+            host: Some(host.host.clone()),
+            exec_id: Some(exec_id),
+            sequence: Some(frame.seq),
+            ts: frame.ts,
+            kind: frame.kind().to_owned(),
+            summary: event_summary(&frame.data),
+            stale: false,
+        };
+        handle
+            .update(RunUpdate::Monitor(MonitorUpdate::Activity { activity }))
+            .await?;
+    }
+    match (&frame.data, key) {
+        (
+            EventData::SessionCallout {
+                pending_id,
+                callout_index,
+                name,
+                prompt,
+                schema,
+                context,
+            },
+            Some(key),
+        ) => {
+            handle
+                .update(RunUpdate::Monitor(MonitorUpdate::Callout {
+                    host: key.host,
+                    exec_id: key.exec_id,
+                    pending_id: *pending_id,
+                    callout_index: *callout_index,
+                    name: name.clone(),
+                    prompt: prompt.clone(),
+                    context: context.clone(),
+                    schema: schema.as_value().clone(),
+                }))
+                .await?;
+        }
+        (
+            EventData::SessionStep {
+                signers,
+                participants,
+                ..
+            },
+            Some(key),
+        ) => {
+            handle
+                .update(RunUpdate::Monitor(MonitorUpdate::Agreement {
+                    key,
+                    agreed: *signers,
+                    total: *participants,
+                }))
+                .await?;
+        }
+        _ => {}
+    }
+    if let EventData::Lagged { skipped } = frame.data {
+        let summary = format!("Host event stream lagged by {skipped}; snapshot refreshed");
+        handle
+            .update(RunUpdate::Monitor(MonitorUpdate::Gap {
+                host: Some(host.host.clone()),
+                exec_id: None,
+                summary,
+            }))
+            .await?;
+        refresh_host(host, client, handle).await?;
+    } else if let Some(exec_id) = frame.exec_id {
+        // The event is a freshness trigger. Refresh only this execution so a
+        // busy Host with many executions does not make the selected view lag.
+        match client.call(&Request::ExecStatus { exec_id }).await {
+            Ok(ResponseOk::Status(status)) => {
+                refresh_execution(host, client, handle, status).await?;
+            }
+            Ok(other) => {
+                mark_execution_gap(
+                    host,
+                    handle,
+                    exec_id,
+                    format!("unexpected exec.status response: {other:?}"),
+                )
+                .await?;
+            }
+            Err(error) => {
+                mark_execution_gap(
+                    host,
+                    handle,
+                    exec_id,
+                    format!("execution refresh unavailable: {error:#}"),
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn mark_execution_gap(
+    host: &MonitorHost,
+    handle: &TuiHandle,
+    exec_id: ExecId,
+    summary: String,
+) -> anyhow::Result<()> {
+    handle
+        .update(RunUpdate::Monitor(MonitorUpdate::Gap {
+            host: Some(host.host.clone()),
+            exec_id: Some(exec_id),
+            summary,
+        }))
+        .await
+}
+
+async fn activity_worker(client: DaemonClient, handle: TuiHandle) -> anyhow::Result<()> {
+    let mut calls = BTreeMap::<String, (Option<HostName>, Option<ExecId>, String)>::new();
+    loop {
+        let mut subscription = match client.subscribe_activity().await {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                report_activity_gap(&handle, format!("activity stream unavailable: {error:#}"))
+                    .await?;
+                calls.clear();
+                tokio::time::sleep(RECONNECT_DELAY).await;
+                continue;
+            }
+        };
+        loop {
+            let frame = match subscription.next().await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
+                    report_activity_gap(&handle, "activity stream closed".to_owned()).await?;
+                    calls.clear();
+                    break;
+                }
+                Err(error) => {
+                    report_activity_gap(
+                        &handle,
+                        format!("activity stream disconnected: {error:#}"),
+                    )
+                    .await?;
+                    calls.clear();
+                    break;
+                }
+            };
+            match frame.data {
+                ActivityData::Started {
+                    call_id,
+                    tool,
+                    host,
+                    exec_id,
+                } => {
+                    let host = host.and_then(|host| host.parse::<HostName>().ok());
+                    if calls.len() >= MAX_ACTIVITY_CALLS {
+                        calls.clear();
+                        report_activity_gap(
+                            &handle,
+                            format!("in-flight activity limit ({MAX_ACTIVITY_CALLS}) reset"),
+                        )
+                        .await?;
+                    }
+                    calls.insert(call_id.clone(), (host.clone(), exec_id, tool.clone()));
+                    send_activity(
+                        &handle,
+                        MonitorActivity {
+                            host,
+                            exec_id,
+                            sequence: Some(frame.seq),
+                            ts: frame.ts,
+                            kind: "MCP START".to_owned(),
+                            summary: format!("{tool}  call {call_id}"),
+                            stale: false,
+                        },
+                    )
+                    .await?;
+                }
+                ActivityData::Finished {
+                    call_id,
+                    elapsed_ms,
+                    result,
+                } => {
+                    let (host, exec_id, tool) = calls.remove(&call_id).unwrap_or((
+                        None,
+                        None,
+                        "unobserved start".to_owned(),
+                    ));
+                    send_activity(
+                        &handle,
+                        MonitorActivity {
+                            host,
+                            exec_id,
+                            sequence: Some(frame.seq),
+                            ts: frame.ts,
+                            kind: "MCP DONE".to_owned(),
+                            summary: format!(
+                                "{tool}  {elapsed_ms}ms  {}  call {call_id}",
+                                activity_result(&result)
+                            ),
+                            stale: false,
+                        },
+                    )
+                    .await?;
+                }
+                ActivityData::Lagged { skipped } => {
+                    calls.clear();
+                    send_activity(
+                        &handle,
+                        MonitorActivity {
+                            host: None,
+                            exec_id: None,
+                            sequence: Some(frame.seq),
+                            ts: frame.ts,
+                            kind: "ACTIVITY GAP".to_owned(),
+                            summary: format!("{skipped} activity records skipped"),
+                            stale: true,
+                        },
+                    )
+                    .await?;
+                    handle
+                        .update(RunUpdate::Monitor(MonitorUpdate::Gap {
+                            host: None,
+                            exec_id: None,
+                            summary: format!("activity stream lagged by {skipped} records"),
+                        }))
+                        .await?;
+                }
+            }
+        }
+        tokio::time::sleep(RECONNECT_DELAY).await;
+    }
+}
+
+async fn report_activity_gap(handle: &TuiHandle, summary: String) -> anyhow::Result<()> {
+    send_activity(
+        handle,
+        MonitorActivity {
+            host: None,
+            exec_id: None,
+            sequence: None,
+            ts: now_epoch_seconds().saturating_mul(1000),
+            kind: "ACTIVITY GAP".to_owned(),
+            summary: summary.clone(),
+            stale: true,
+        },
+    )
+    .await?;
+    handle
+        .update(RunUpdate::Monitor(MonitorUpdate::Gap {
+            host: None,
+            exec_id: None,
+            summary,
+        }))
+        .await
+}
+
+async fn send_activity(handle: &TuiHandle, activity: MonitorActivity) -> anyhow::Result<()> {
+    handle
+        .update(RunUpdate::Monitor(MonitorUpdate::Activity { activity }))
+        .await
+}
+
+async fn submit_action(
+    clients: &BTreeMap<HostName, DaemonClient>,
+    handle: &TuiHandle,
+    action: MonitorAction,
+) -> anyhow::Result<()> {
+    let MonitorAction::Submit {
+        host,
+        exec_id,
+        pending_id,
+        answer,
+    } = action;
+    let result = match clients.get(&host) {
+        None => MonitorSubmission::TransportUnknown(format!("Host '{host}' is not connected")),
+        Some(client) => match client
+            .call_raw(&Request::ExecSubmit {
+                exec_id,
+                pending_id,
+                answer: Some(answer),
+            })
+            .await
+        {
+            Ok(Ok(ResponseOk::Ack)) => MonitorSubmission::Accepted,
+            Ok(Err(error)) if error.code == ApiErrorCode::CalloutNotPending => {
+                MonitorSubmission::CalloutNotPending(error.message)
+            }
+            Ok(Err(error)) => MonitorSubmission::Rejected(error.to_string()),
+            Ok(Ok(other)) => {
+                MonitorSubmission::Rejected(format!("unexpected exec.submit response: {other:?}"))
+            }
+            Err(error) => {
+                MonitorSubmission::TransportUnknown(format!("answer outcome unknown: {error:#}"))
+            }
+        },
+    };
+    handle
+        .update(RunUpdate::Monitor(MonitorUpdate::Submission {
+            host,
+            exec_id,
+            pending_id,
+            result,
+        }))
+        .await
+}
+
+fn event_summary(data: &EventData) -> String {
+    match data {
+        EventData::SessionCallout { name, .. } => format!("callout {name}"),
+        EventData::SessionCalloutAnswered { pending_id } => {
+            format!("callout {pending_id} answered")
+        }
+        EventData::SessionStep {
+            step,
+            fuel_used,
+            signers,
+            participants,
+            ..
+        } => format!("step {step}  agreement {signers}/{participants}  fuel {fuel_used}"),
+        EventData::SessionEnded { .. } => "session ended".to_owned(),
+        EventData::Created { .. } => "execution created".to_owned(),
+        EventData::Terminated { reason, .. } => reason.clone(),
+        _ => data.kind().to_owned(),
+    }
+}
+
+fn activity_result(result: &ActivityResult) -> &'static str {
+    match result {
+        ActivityResult::Ok => "ok",
+        ActivityResult::ToolError { .. } => "tool error",
+        ActivityResult::Interrupted => "interrupted",
+    }
+}
+
+fn now_epoch_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}

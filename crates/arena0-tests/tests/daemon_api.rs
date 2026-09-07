@@ -16,6 +16,22 @@ use common::{call, created, drive, ok, rps_wasm, two_daemons};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 
+async fn next_from_either(
+    socket_a: &Path,
+    exec_a: ExecId,
+    socket_b: &Path,
+    exec_b: ExecId,
+) -> (bool, Response) {
+    let request_a = Request::ExecNext { exec_id: exec_a };
+    let request_b = Request::ExecNext { exec_id: exec_b };
+    let mut next_a = Box::pin(call(socket_a, &request_a));
+    let mut next_b = Box::pin(call(socket_b, &request_b));
+    tokio::select! {
+        response = &mut next_a => (true, response),
+        response = &mut next_b => (false, response),
+    }
+}
+
 /// `exec.new` returns immediately in `Negotiating`; `exec.await` blocks for `Active`
 /// then `Terminal`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -117,6 +133,259 @@ async fn exec_new_returns_immediately_and_await_blocks() {
             );
         }
         other => panic!("unexpected terminal status response: {other:?}"),
+    }
+}
+
+/// Two concurrent answers to one durable callout resolve exactly once. The
+/// loser receives the typed conflict and the actor remains live for the rest
+/// of the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn competing_callout_submissions_return_typed_conflict_and_execution_continues() {
+    let wasm = rps_wasm();
+    let d = two_daemons(&wasm).await;
+    let (exec_a, negotiation_id) = match ok(call(
+        &d.sock_a,
+        &Request::ExecNew {
+            exec_id: ExecId([line!() as u8; 32]),
+            program: d.program_id.to_string(),
+            params: Some(serde_json::json!(null)),
+            ensemble: EnsembleSpec::Explicit {
+                peers: vec![d.peer_b],
+            },
+        },
+    )
+    .await)
+    {
+        ResponseOk::ExecCreated {
+            exec_id,
+            negotiation_id,
+            ..
+        } => (exec_id, negotiation_id),
+        other => panic!("unexpected creator response: {other:?}"),
+    };
+    let exec_b = created(
+        call(
+            &d.sock_b,
+            &Request::ExecNew {
+                exec_id: ExecId([line!() as u8; 32]),
+                program: d.program_id.to_string(),
+                params: Some(serde_json::json!(null)),
+                ensemble: EnsembleSpec::Join {
+                    creator: d.peer_a,
+                    negotiation_id,
+                },
+            },
+        )
+        .await,
+    );
+
+    let pending_id = match ok(call(&d.sock_a, &Request::ExecNext { exec_id: exec_a }).await) {
+        ResponseOk::Next(arena0_api::NextEvent::Callout { pending_id, .. }) => pending_id,
+        ResponseOk::Next(arena0_api::NextEvent::Failed { reason }) => {
+            panic!("execution failed before callout: {reason}")
+        }
+        other => panic!("unexpected event before callout: {other:?}"),
+    };
+
+    let request = Request::ExecSubmit {
+        exec_id: exec_a,
+        pending_id,
+        answer: Some(serde_json::json!("Rock")),
+    };
+    let (left, right) = tokio::join!(call(&d.sock_a, &request), call(&d.sock_a, &request));
+    let responses = [left, right];
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|response| matches!(response, Ok(ResponseOk::Ack)))
+            .count(),
+        1,
+        "one competing answer is accepted"
+    );
+    let conflict = responses
+        .into_iter()
+        .find_map(Result::err)
+        .expect("one competing answer is rejected");
+    assert_eq!(conflict.code, arena0_api::ApiErrorCode::CalloutNotPending);
+
+    let (_session_a, _session_b) = tokio::join!(drive(&d.sock_a, exec_a), drive(&d.sock_b, exec_b));
+    match ok(call(&d.sock_a, &Request::ExecStatus { exec_id: exec_a }).await) {
+        ResponseOk::Status(status) => assert_eq!(status.lifecycle(), ExecLifecycle::Completed),
+        other => panic!("unexpected final status: {other:?}"),
+    }
+}
+
+/// The other RPS Host answers first in the final round, then the human answers
+/// the final callout. Once the terminal supervisor has cleaned up, replaying
+/// that old pending id is a typed conflict while an unknown execution remains
+/// NotFound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_callout_after_terminal_is_typed_conflict_and_missing_exec_is_not_found() {
+    let d = two_daemons(&rps_wasm()).await;
+    let (exec_a, negotiation_id) = match ok(call(
+        &d.sock_a,
+        &Request::ExecNew {
+            exec_id: ExecId([line!() as u8; 32]),
+            program: d.program_id.to_string(),
+            params: Some(serde_json::json!(null)),
+            ensemble: EnsembleSpec::Explicit {
+                peers: vec![d.peer_b],
+            },
+        },
+    )
+    .await)
+    {
+        ResponseOk::ExecCreated {
+            exec_id,
+            negotiation_id,
+            ..
+        } => (exec_id, negotiation_id),
+        other => panic!("unexpected creator response: {other:?}"),
+    };
+    let exec_b = created(
+        call(
+            &d.sock_b,
+            &Request::ExecNew {
+                exec_id: ExecId([line!() as u8; 32]),
+                program: d.program_id.to_string(),
+                params: Some(serde_json::json!(null)),
+                ensemble: EnsembleSpec::Join {
+                    creator: d.peer_a,
+                    negotiation_id,
+                },
+            },
+        )
+        .await,
+    );
+
+    let (human_socket, human_exec, final_pending) = loop {
+        let (is_a, response) = next_from_either(&d.sock_a, exec_a, &d.sock_b, exec_b).await;
+        let next = ok(response);
+        let ResponseOk::Next(arena0_api::NextEvent::Callout {
+            pending_id,
+            context,
+            ..
+        }) = next
+        else {
+            panic!("expected RPS callout, got {next:?}");
+        };
+        let round = context
+            .get("round")
+            .and_then(serde_json::Value::as_u64)
+            .expect("RPS callout round");
+        let other_socket = if is_a { &d.sock_a } else { &d.sock_b };
+        let other_exec = if is_a { exec_a } else { exec_b };
+        ok(call(
+            other_socket,
+            &Request::ExecSubmit {
+                exec_id: other_exec,
+                pending_id,
+                answer: Some(serde_json::json!("Rock")),
+            },
+        )
+        .await);
+
+        if round == 3 {
+            let human_socket = if is_a { &d.sock_b } else { &d.sock_a };
+            let human_exec = if is_a { exec_b } else { exec_a };
+            let final_pending = match ok(call(
+                human_socket,
+                &Request::ExecNext {
+                    exec_id: human_exec,
+                },
+            )
+            .await)
+            {
+                ResponseOk::Next(arena0_api::NextEvent::Callout {
+                    pending_id,
+                    context,
+                    ..
+                }) => {
+                    assert_eq!(
+                        context.get("round").and_then(serde_json::Value::as_u64),
+                        Some(3),
+                        "human answer is the final RPS round"
+                    );
+                    pending_id
+                }
+                other => panic!("unexpected final human event: {other:?}"),
+            };
+            ok(call(
+                human_socket,
+                &Request::ExecSubmit {
+                    exec_id: human_exec,
+                    pending_id: final_pending,
+                    answer: Some(serde_json::json!("Rock")),
+                },
+            )
+            .await);
+            break (human_socket, human_exec, final_pending);
+        }
+    };
+
+    let await_a = Request::ExecAwait {
+        exec_id: exec_a,
+        until: AwaitState::Terminal,
+    };
+    let await_b = Request::ExecAwait {
+        exec_id: exec_b,
+        until: AwaitState::Terminal,
+    };
+    let (terminal_a, terminal_b) =
+        tokio::join!(call(&d.sock_a, &await_a), call(&d.sock_b, &await_b));
+    for terminal in [terminal_a, terminal_b] {
+        match ok(terminal) {
+            ResponseOk::Awaited { exec_state, .. } => {
+                assert_eq!(exec_state, ExecLifecycle::Completed)
+            }
+            other => panic!("unexpected terminal await response: {other:?}"),
+        }
+    }
+    // Let the terminal message reach the supervisor before replaying the old
+    // answer; this is the stale-handle path that previously returned NotFound.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let stale = call(
+        human_socket,
+        &Request::ExecSubmit {
+            exec_id: human_exec,
+            pending_id: final_pending,
+            answer: Some(serde_json::json!("Rock")),
+        },
+    )
+    .await
+    .expect_err("completed callout must be rejected");
+    assert_eq!(stale.code, arena0_api::ApiErrorCode::CalloutNotPending);
+
+    let missing = call(
+        &d.sock_a,
+        &Request::ExecSubmit {
+            exec_id: ExecId([0xFA; 32]),
+            pending_id: final_pending,
+            answer: Some(serde_json::json!("Rock")),
+        },
+    )
+    .await
+    .expect_err("unknown execution must remain NotFound");
+    assert_eq!(missing.code, arena0_api::ApiErrorCode::NotFound);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hosts_list_is_complete_from_one_host_socket() {
+    let d = two_daemons(&rps_wasm()).await;
+    match ok(call(&d.sock_a, &Request::HostsList).await) {
+        ResponseOk::Hosts(hosts) => {
+            assert_eq!(hosts.len(), 2);
+            assert_eq!(
+                hosts
+                    .iter()
+                    .map(|host| host.host.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["a", "b"]
+            );
+            assert_ne!(hosts[0].host.peer_id, hosts[1].host.peer_id);
+        }
+        other => panic!("unexpected HostsList response: {other:?}"),
     }
 }
 

@@ -8,8 +8,9 @@ The daemon exposes one typed JSON request surface on each Host's Unix socket.
 
 Each request and response is UTF-8 JSON preceded by a big-endian `u32`
 length. A normal connection carries one request and one response.
-`events.subscribe` is the exception: the server sends `Subscribed` and then a
-bounded stream of `EventFrame` values until the connection closes.
+`events.subscribe` sends `Subscribed` and then a bounded stream of `EventFrame`
+values until the connection closes. `activity.subscribe` similarly sends
+`ActivitySubscribed`, followed by daemon-wide `ActivityFrame` observations.
 
 The request shape is:
 
@@ -25,7 +26,8 @@ type Response = Result<ResponseOk, ApiError>;
 
 `ApiError` contains a stable category and a human-readable message. Categories
 are `NotFound`, `BadRequest`, `Ambiguous`, `Schema`, `Negotiation`,
-`Execution`, `Verification`, `Storage`, `Timeout`, and `Internal`.
+`Execution`, `Verification`, `Storage`, `Timeout`, `Internal`, and
+`CalloutNotPending`.
 
 ## Identity and custody
 
@@ -121,6 +123,13 @@ store the offer parameters before negotiation.
 
 ### Agent values
 
+`exec.submit` returns `CalloutNotPending` when its pending ID is no longer the
+current callout. A competing human or agent answer may have consumed it. Fetch
+the next decision point; do not resubmit the stale answer or terminate an
+otherwise healthy execution. This category is also preserved for a stale
+answer already queued at the execution actor. Other validation, storage, and
+execution errors remain distinct.
+
 `params`, callout answers, query values, and terminal projections are JSON.
 The daemon validates agent inputs against the program's public JSON Schema.
 Only generated guest code performs concrete DTO conversion to and from Borsh.
@@ -192,8 +201,10 @@ unilateral evidence or a shared N-of-N stop commitment.
 | Method | Params | Success |
 |---|---|---|
 | `daemon.info` | — | `DaemonInfo` |
+| `hosts.list` | — | `Hosts`, containing `DaemonInfo` for each supervised Host |
 | `daemon.stop` | — | `Ack` |
 | `events.subscribe` | `{filter}` | `Subscribed`, then `EventFrame` stream |
+| `activity.subscribe` | — | `ActivitySubscribed`, then `ActivityFrame` stream |
 
 `DaemonInfo` contains a `host` object with the selected Host's local `id`,
 `PeerId`, and optional caller `user_agent`, followed by its public identity key,
@@ -202,6 +213,21 @@ When one Host asks to stop, the process supervisor coordinates shutdown of the
 whole local Ensemble.
 
 Event tags and filtering are documented in [events/README.md](events/README.md).
+
+`activity.subscribe` observes MCP calls across the complete local daemon;
+subscribe through one Host socket rather than once per Host. Each frame has
+`boot_id`, `seq`, `ts`, `kind`, and `data`. Started records carry a call ID,
+tool name, and optional Host/execution correlation. Finished records carry that call ID,
+elapsed milliseconds, and a safe result class. `Interrupted` means the server
+dispatch future ended before an outcome was observed; it is not proof that
+an action failed or a client received no response. No arguments, answers, or
+result bodies appear.
+
+Activity is bounded and live-only. A lag record reports dropped observations;
+reconnecting cannot replay them. Frame order describes daemon observation,
+not multiparty protocol causality. Read current execution state and evidence
+through the ordinary Host methods after a gap. MCP activity remains separate
+from semantic `EventFrame` values and durable receipt facts.
 
 ## MCP projection
 

@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use arena0_api::HostInfo;
+use arena0_api::{ApiError, DaemonInfo, HostInfo};
 use arena0_crypto::NodeKeys;
 use arena0_home::{Home, HostName};
 use arena0_node::Ensemble;
@@ -26,7 +26,7 @@ use tokio::task::JoinSet;
 use crate::assets::PROGRAMS;
 use crate::catalog::ProgramCatalog;
 use crate::paths::Paths;
-use crate::server::{HostService, HostServiceInit};
+use crate::server::{Activity, HostService, HostServiceInit};
 use crate::startup::{self, StartupStage, StartupTimeline};
 use crate::store::Keystore;
 
@@ -182,16 +182,99 @@ enum OpenedHost {
     Prepared(PreparedHost),
 }
 
+/// Authoritative owner of the daemon's live Host roster.
+///
+/// Services only retain a weak reference to this owner for `hosts.list`, so a
+/// service cannot keep the daemon alive and the listing always follows the
+/// same map used by dynamic provisioning and shutdown.
+#[derive(Default)]
+pub(crate) struct HostDirectory {
+    hosts: RwLock<BTreeMap<HostName, HostSlot>>,
+}
+
+impl HostDirectory {
+    fn replace(&self, hosts: BTreeMap<HostName, HostSlot>) {
+        *self
+            .hosts
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = hosts;
+    }
+
+    fn services(&self) -> Vec<(String, Arc<HostService>)> {
+        self.hosts
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .map(|(id, slot)| (id.to_string(), Arc::clone(&slot.service)))
+            .collect()
+    }
+
+    fn service(&self, host: &str) -> Option<Arc<HostService>> {
+        self.hosts
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(host)
+            .map(|slot| Arc::clone(&slot.service))
+    }
+
+    pub(crate) async fn infos(&self) -> Result<Vec<DaemonInfo>, ApiError> {
+        let services = self.services();
+        let mut infos = Vec::with_capacity(services.len());
+        for (_, service) in services {
+            infos.push(service.daemon_info().await?);
+        }
+        Ok(infos)
+    }
+
+    fn take(&self) -> BTreeMap<HostName, HostSlot> {
+        std::mem::take(
+            &mut *self
+                .hosts
+                .write()
+                .unwrap_or_else(|error| error.into_inner()),
+        )
+    }
+
+    fn insert_if_running(
+        &self,
+        state: &AtomicU8,
+        id: HostName,
+        slot: HostSlot,
+    ) -> Result<(), HostSlot> {
+        let mut hosts = self
+            .hosts
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.load(Ordering::Acquire) == RUNNING {
+            hosts.insert(id, slot);
+            Ok(())
+        } else {
+            Err(slot)
+        }
+    }
+
+    fn begin_shutdown(&self, state: &AtomicU8) {
+        let _hosts = self
+            .hosts
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let _ = state.fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            matches!(state, STARTING | RUNNING).then_some(FINISHING)
+        });
+    }
+}
+
 /// One-process owner of ready Hosts and serialized, supervised provisioning.
 pub struct Daemon {
     ensemble: Ensemble,
-    hosts: RwLock<BTreeMap<HostName, HostSlot>>,
+    hosts: Arc<HostDirectory>,
     home: Home,
     bootstrap_new_hosts: bool,
     engine: Arc<WasmtimeEngine>,
     opens: mpsc::Sender<OpenRequest>,
     open_requests: Mutex<Option<mpsc::Receiver<OpenRequest>>>,
     stop_requested: Notify,
+    activity: Arc<Activity>,
     mcp: McpConfig,
     startup: Arc<StartupTimeline>,
     state: AtomicU8,
@@ -245,14 +328,32 @@ impl Daemon {
                 .map(|host| (Arc::clone(&host.identity), host.store.handle().clone()))
                 .collect(),
         )?;
+        let activity = Arc::new(Activity::new());
+        let directory = Arc::new(HostDirectory::default());
         let mut ready = BTreeMap::new();
         for config in hosts {
             let peer_id = config.peer_id();
-            let runtime = ensemble.host(&peer_id).expect("initial Host installed");
+            let runtime = ensemble
+                .host(&peer_id)
+                .ok_or_else(|| anyhow::anyhow!("ensemble omitted Host {peer_id}"))?;
             let transport = ensemble
                 .transport(&peer_id)
-                .expect("initial transport installed");
-            let service = compose_service(&config, transport, runtime, &engine, &startup)?;
+                .ok_or_else(|| anyhow::anyhow!("ensemble omitted transport {peer_id}"))?;
+            let service = HostService::start_with_runtime(
+                HostServiceInit {
+                    name: config.name.to_string(),
+                    transport,
+                    paths: config.paths.clone(),
+                    keystore: Arc::clone(&config.keystore),
+                    catalog: ProgramCatalog::new(config.store.handle().clone()),
+                    store: config.store.handle().clone(),
+                    engine: Arc::clone(&engine),
+                    startup: Arc::clone(&startup),
+                    activity: Arc::clone(&activity),
+                    host_directory: Arc::downgrade(&directory),
+                },
+                runtime,
+            )?;
             startup::host_progress(StartupStage::HostComposed, config.name.as_str(), &startup);
             ready.insert(
                 config.name,
@@ -262,17 +363,19 @@ impl Daemon {
                 },
             );
         }
+        directory.replace(ready);
         let (finished, _) = watch::channel(false);
         let (opens, open_requests) = mpsc::channel(OPEN_QUEUE_CAPACITY);
         Ok(Arc::new(Self {
             ensemble,
-            hosts: RwLock::new(ready),
+            hosts: directory,
             home,
             bootstrap_new_hosts,
             engine,
             opens,
             open_requests: Mutex::new(Some(open_requests)),
             stop_requested: Notify::new(),
+            activity,
             mcp,
             startup,
             state: AtomicU8::new(NEW),
@@ -321,6 +424,14 @@ impl Daemon {
             .unwrap_or_else(|error| error.into_inner())
             .take()
             .expect("first serve owns open queue");
+        let mcp_listener = match crate::mcp::bind(&self.mcp).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                startup::progress(StartupStage::Failed, &self.startup);
+                self.cleanup().await;
+                return Err(error);
+            }
+        };
         let (mcp_shutdown, mcp_shutdown_rx) = watch::channel(false);
         let mut servers = JoinSet::new();
         let mut outcome = Ok(());
@@ -348,7 +459,9 @@ impl Daemon {
         {
             let daemon = Arc::clone(&self);
             let mcp = self.mcp.clone();
-            servers.spawn(async move { crate::mcp::serve(daemon, mcp, mcp_shutdown_rx).await });
+            servers.spawn(async move {
+                crate::mcp::serve(daemon, mcp, mcp_listener, mcp_shutdown_rx).await
+            });
         }
         // ponytail: one provisioning job at a time; only parallelize after measured contention.
         let mut opening = JoinSet::new();
@@ -508,14 +621,21 @@ impl Daemon {
             .ensemble
             .transport(&peer_id)
             .expect("new transport installed");
-        let service =
-            match compose_service(&config, transport, runtime, &self.engine, &self.startup) {
-                Ok(service) => service,
-                Err(error) => {
-                    self.close_provisional_host(peer_id, config.store).await?;
-                    return Err(error);
-                }
-            };
+        let service = match compose_service(
+            &config,
+            transport,
+            runtime,
+            &self.engine,
+            &self.startup,
+            &self.activity,
+            &self.hosts,
+        ) {
+            Ok(service) => service,
+            Err(error) => {
+                self.close_provisional_host(peer_id, config.store).await?;
+                return Err(error);
+            }
+        };
         match service.prepare().await {
             Ok(listener) => Ok(PreparedHost {
                 id: config.name,
@@ -555,34 +675,32 @@ impl Daemon {
             }
             Ok(OpenedHost::Prepared(prepared)) => prepared,
         };
-        {
-            // Publication and begin_shutdown share this short lock: an open
-            // either commits before shutdown or follows the rollback path.
-            let mut hosts = self
-                .hosts
-                .write()
-                .unwrap_or_else(|error| error.into_inner());
-            if self.state.load(Ordering::Acquire) == RUNNING {
-                let info = prepared.slot.service.host_info();
-                servers.spawn(Arc::clone(&prepared.slot.service).serve_prepared(prepared.listener));
-                hosts.insert(prepared.id, prepared.slot);
+        // Publication and begin_shutdown share the directory lock: an open
+        // either commits before shutdown or follows the rollback path.
+        let PreparedHost { id, slot, listener } = prepared;
+        let info = slot.service.host_info();
+        let service = Arc::clone(&slot.service);
+        match self.hosts.insert_if_running(&self.state, id, slot) {
+            Ok(()) => {
+                servers.spawn(service.serve_prepared(listener));
                 let _ = reply.send(Ok(info));
-                return;
+            }
+            Err(slot) => {
+                drop(listener);
+                slot.service.remove_prepared_socket();
+                slot.service.stop().await;
+                let cleanup = self
+                    .close_provisional_host(slot.service.peer_id(), slot.store)
+                    .await;
+                let error = match cleanup {
+                    Ok(()) => anyhow::anyhow!("daemon is shutting down"),
+                    Err(error) => {
+                        anyhow::anyhow!("daemon is shutting down; Host cleanup failed: {error:#}")
+                    }
+                };
+                let _ = reply.send(Err(error));
             }
         }
-        prepared.slot.service.remove_prepared_socket();
-        drop(prepared.listener);
-        prepared.slot.service.stop().await;
-        let cleanup = self
-            .close_provisional_host(prepared.slot.service.peer_id(), prepared.slot.store)
-            .await;
-        let error = match cleanup {
-            Ok(()) => anyhow::anyhow!("daemon is shutting down"),
-            Err(error) => {
-                anyhow::anyhow!("daemon is shutting down; Host cleanup failed: {error:#}")
-            }
-        };
-        let _ = reply.send(Err(error));
     }
 
     /// Services relinquish their socket and stop before this releases store ownership.
@@ -594,12 +712,11 @@ impl Daemon {
     }
 
     pub(crate) fn services(&self) -> Vec<(String, Arc<HostService>)> {
-        self.hosts
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .iter()
-            .map(|(id, slot)| (id.to_string(), Arc::clone(&slot.service)))
-            .collect()
+        self.hosts.services()
+    }
+
+    pub(crate) fn activity(&self) -> Arc<Activity> {
+        Arc::clone(&self.activity)
     }
 
     pub(crate) fn startup_timeline(&self) -> Arc<StartupTimeline> {
@@ -607,11 +724,7 @@ impl Daemon {
     }
 
     pub(crate) fn service(&self, host: &str) -> Option<Arc<HostService>> {
-        self.hosts
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(host)
-            .map(|slot| Arc::clone(&slot.service))
+        self.hosts.service(host)
     }
 
     pub(crate) fn peer_id(&self, host: &str) -> Option<PeerId> {
@@ -625,15 +738,7 @@ impl Daemon {
     }
 
     fn begin_shutdown(&self) {
-        let _hosts = self
-            .hosts
-            .write()
-            .unwrap_or_else(|error| error.into_inner());
-        let _ = self
-            .state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                matches!(state, STARTING | RUNNING).then_some(FINISHING)
-            });
+        self.hosts.begin_shutdown(&self.state);
     }
 
     /// Request coordinated shutdown, including pending dynamic opens.
@@ -666,12 +771,7 @@ impl Daemon {
     }
 
     async fn cleanup(&self) {
-        let hosts = std::mem::take(
-            &mut *self
-                .hosts
-                .write()
-                .unwrap_or_else(|error| error.into_inner()),
-        );
+        let hosts = self.hosts.take();
         futures::future::join_all(hosts.values().map(|slot| slot.service.stop())).await;
         // Also clear paths for listeners aborted at the shutdown deadline.
         // Old service handles must lose unlink authority before another daemon
@@ -696,6 +796,8 @@ fn compose_service(
     runtime: Arc<arena0_node::Host>,
     engine: &Arc<WasmtimeEngine>,
     startup: &Arc<StartupTimeline>,
+    activity: &Arc<Activity>,
+    directory: &Arc<HostDirectory>,
 ) -> anyhow::Result<Arc<HostService>> {
     let store = config.store.handle().clone();
     HostService::start_with_runtime(
@@ -708,6 +810,8 @@ fn compose_service(
             store,
             engine: Arc::clone(engine),
             startup: Arc::clone(startup),
+            activity: Arc::clone(activity),
+            host_directory: Arc::downgrade(directory),
         },
         runtime,
     )

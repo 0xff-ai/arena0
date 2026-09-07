@@ -5,9 +5,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail};
-pub use arena0_api::EventFrame;
 use arena0_api::frame;
-use arena0_api::{EventFilter, Request, Response, ResponseOk};
+pub use arena0_api::{ActivityFrame, EventFrame};
+use arena0_api::{DaemonInfo, EventFilter, Request, Response, ResponseOk};
 use arena0_home::{Home, HomeError, HostName};
 use arena0_program::ProgramHash;
 use tokio::io::BufReader;
@@ -115,6 +115,35 @@ impl DaemonClient {
         })
     }
 
+    /// Open the daemon-wide MCP activity stream, consuming its ack.
+    pub async fn subscribe_activity(&self) -> anyhow::Result<ActivitySubscription> {
+        let stream = UnixStream::connect(&self.socket)
+            .await
+            .with_context(|| format!("connect to daemon at {}", self.socket.display()))?;
+        let (read, write) = stream.into_split();
+        let mut read = BufReader::new(read);
+        let mut write = write;
+        frame::write_frame(&mut write, &Request::ActivitySubscribe).await?;
+        match frame::read_frame::<_, Response>(&mut read).await? {
+            Some(Ok(ResponseOk::ActivitySubscribed)) => {}
+            Some(Ok(other)) => bail!("unexpected activity subscribe response: {other:?}"),
+            Some(Err(e)) => bail!("activity subscribe failed: {e}"),
+            None => bail!("daemon closed the connection before acking the activity subscription"),
+        }
+        Ok(ActivitySubscription {
+            read,
+            _write: write,
+        })
+    }
+
+    /// List every Host supervised by this daemon through one Host socket.
+    pub async fn list_hosts(&self) -> anyhow::Result<Vec<DaemonInfo>> {
+        match self.call(&Request::HostsList).await? {
+            ResponseOk::Hosts(hosts) => Ok(hosts),
+            other => bail!("unexpected hosts list response: {other:?}"),
+        }
+    }
+
     /// Best-effort map of `program_id -> handle name`, for rendering program names in
     /// listings that only carry the id. Empty on any error (the caller falls back to the
     /// short id).
@@ -141,5 +170,19 @@ impl Subscription {
     /// The next event frame, or `None` when the daemon closed the stream.
     pub async fn next(&mut self) -> anyhow::Result<Option<EventFrame>> {
         Ok(frame::read_frame::<_, EventFrame>(&mut self.read).await?)
+    }
+}
+
+/// A live daemon-wide MCP activity subscription.
+#[allow(missing_debug_implementations)]
+pub struct ActivitySubscription {
+    read: BufReader<OwnedReadHalf>,
+    _write: OwnedWriteHalf,
+}
+
+impl ActivitySubscription {
+    /// The next activity frame, or `None` when the daemon closed the stream.
+    pub async fn next(&mut self) -> anyhow::Result<Option<ActivityFrame>> {
+        Ok(frame::read_frame::<_, ActivityFrame>(&mut self.read).await?)
     }
 }

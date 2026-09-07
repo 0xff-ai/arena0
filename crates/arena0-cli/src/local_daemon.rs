@@ -36,6 +36,16 @@ pub(crate) struct LocalDaemon {
 impl LocalDaemon {
     /// Reuse a daemon serving every requested Host, or start and await one.
     pub(crate) async fn connect_or_start(hosts: Vec<HostName>) -> anyhow::Result<Self> {
+        Self::connect_or_start_with_mcp(hosts, "127.0.0.1:0".parse().expect("loopback address"))
+            .await
+    }
+
+    /// Select the MCP listener for a newly started service. A borrowed service
+    /// retains its own listener configuration.
+    pub(crate) async fn connect_or_start_with_mcp(
+        hosts: Vec<HostName>,
+        mcp_listen: std::net::SocketAddr,
+    ) -> anyhow::Result<Self> {
         if hosts.is_empty() {
             bail!("a local daemon requires at least one Host");
         }
@@ -67,7 +77,7 @@ impl LocalDaemon {
         }
         command
             .arg("--mcp-listen")
-            .arg("127.0.0.1:0")
+            .arg(mcp_listen.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

@@ -120,10 +120,17 @@ pub enum Request {
     // connection until the client hangs up.
     #[serde(rename = "events.subscribe")]
     EventsSubscribe { filter: EventFilter },
+    /// Subscribe to daemon-wide MCP tool activity. The connection becomes a
+    /// stream after the ack, just like `events.subscribe`.
+    #[serde(rename = "activity.subscribe")]
+    ActivitySubscribe,
 
     // Local observability.
     #[serde(rename = "daemon.info")]
     DaemonInfo,
+    /// List every Host supervised by this daemon from any Host socket.
+    #[serde(rename = "hosts.list")]
+    HostsList,
     /// Graceful shutdown: stop the Host, close the transport, remove the socket,
     /// and exit the serve loop. The daemon process ends when the loop returns.
     #[serde(rename = "daemon.stop")]

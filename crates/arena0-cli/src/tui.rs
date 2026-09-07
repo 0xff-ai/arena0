@@ -191,6 +191,7 @@ use ratatui::widgets::{
 use ratatui_textarea::TextArea;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
@@ -221,6 +222,9 @@ pub(crate) enum TuiDriver {
     Human,
     Builtin(String),
     Agent,
+    /// An execution is waiting for a separately attached monitor or MCP
+    /// client.  It has no local answer policy.
+    External,
 }
 
 impl TuiConfig {
@@ -239,6 +243,11 @@ impl TuiConfig {
     }
 }
 
+// Monitor snapshots intentionally travel through the same bounded update
+// channel as the legacy run updates.  Boxing every snapshot field would add a
+// second allocation at the state boundary without changing ownership or
+// backpressure, so keep the domain payload contiguous here.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum RunUpdate {
     Status {
@@ -296,7 +305,122 @@ pub(crate) enum RunUpdate {
     Failed {
         summary: String,
     },
+    /// Monitor updates use a stable `(Host, ExecId)` key so a Host can expose
+    /// several live executions without one overwriting another in the screen.
+    Monitor(MonitorUpdate),
     Close,
+}
+
+/// A stable execution identity for monitor state and pending callouts.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct MonitorExecutionKey {
+    pub(crate) host: HostName,
+    pub(crate) exec_id: ExecId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MonitorHost {
+    pub(crate) host: HostName,
+    pub(crate) peer_id: PeerId,
+    pub(crate) socket: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MonitorExecution {
+    pub(crate) key: MonitorExecutionKey,
+    pub(crate) status: ExecStatus,
+    pub(crate) inspection: Option<ExecutionInspection>,
+    pub(crate) view: Option<(u64, View)>,
+    pub(crate) trace: Vec<TraceEntry>,
+    pub(crate) agreement: Option<(u16, u16)>,
+    pub(crate) observed_at: u64,
+    pub(crate) stale: bool,
+    pub(crate) gap: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MonitorActivity {
+    pub(crate) host: Option<HostName>,
+    pub(crate) exec_id: Option<ExecId>,
+    pub(crate) sequence: Option<u64>,
+    pub(crate) ts: u64,
+    pub(crate) kind: String,
+    pub(crate) summary: String,
+    pub(crate) stale: bool,
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub(crate) enum MonitorUpdate {
+    Hosts {
+        hosts: Vec<MonitorHost>,
+    },
+    Execution {
+        key: MonitorExecutionKey,
+        status: ExecStatus,
+        inspection: Option<ExecutionInspection>,
+        view: Option<(u64, View)>,
+        trace: Vec<TraceEntry>,
+        observed_at: u64,
+        stale: bool,
+        gap: Option<String>,
+    },
+    Activity {
+        activity: MonitorActivity,
+    },
+    SystemEvent {
+        key: MonitorExecutionKey,
+        frame: EventFrame,
+    },
+    Agreement {
+        key: MonitorExecutionKey,
+        agreed: u16,
+        total: u16,
+    },
+    Gap {
+        host: Option<HostName>,
+        exec_id: Option<ExecId>,
+        summary: String,
+    },
+    Callout {
+        host: HostName,
+        exec_id: ExecId,
+        pending_id: PendingId,
+        callout_index: u32,
+        name: String,
+        prompt: String,
+        context: Value,
+        schema: Value,
+    },
+    Submission {
+        host: HostName,
+        exec_id: ExecId,
+        pending_id: PendingId,
+        result: MonitorSubmission,
+    },
+    Connection {
+        host: HostName,
+        message: String,
+        stale: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MonitorSubmission {
+    Accepted,
+    CalloutNotPending(String),
+    Rejected(String),
+    TransportUnknown(String),
+}
+
+#[derive(Debug)]
+pub(crate) enum MonitorAction {
+    Submit {
+        host: HostName,
+        exec_id: ExecId,
+        pending_id: PendingId,
+        answer: Value,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -404,11 +528,51 @@ impl TuiSession {
             width: width_rx,
             private_page: private_page_rx,
         };
-        let task = tokio::spawn(run_screen(config, receiver, width, private_page, cancel));
+        let task = tokio::spawn(run_screen(
+            config,
+            receiver,
+            width,
+            private_page,
+            cancel,
+            None,
+        ));
         Self {
             handle,
             task: Some(task),
         }
+    }
+
+    /// Start the same terminal loop in monitor mode.  The returned receiver
+    /// carries answer actions to the monitor transport owner; the UI remains
+    /// a single state owner and never performs daemon I/O while rendering.
+    pub(crate) fn start_monitor(
+        config: TuiConfig,
+        cancel: watch::Sender<Option<String>>,
+    ) -> (Self, mpsc::Receiver<MonitorAction>) {
+        let (updates, receiver) = mpsc::channel(UPDATE_CAPACITY);
+        let (width, width_rx) = watch::channel(80);
+        let (private_page, private_page_rx) = watch::channel(None);
+        let (actions, action_receiver) = mpsc::channel(UPDATE_CAPACITY);
+        let handle = TuiHandle {
+            updates,
+            width: width_rx,
+            private_page: private_page_rx,
+        };
+        let task = tokio::spawn(run_screen(
+            config,
+            receiver,
+            width,
+            private_page,
+            cancel,
+            Some(actions),
+        ));
+        (
+            Self {
+                handle,
+                task: Some(task),
+            },
+            action_receiver,
+        )
     }
 
     #[must_use]
@@ -426,6 +590,10 @@ impl TuiSession {
         self.join().await.map(|_| ())
     }
 
+    pub(crate) async fn wait(&mut self) -> anyhow::Result<()> {
+        self.join().await.map(|_| ())
+    }
+
     pub(crate) async fn fail(&mut self, summary: String) -> anyhow::Result<()> {
         self.handle.update(RunUpdate::Failed { summary }).await?;
         self.join().await.map(|_| ())
@@ -437,10 +605,12 @@ impl TuiSession {
     }
 
     async fn join(&mut self) -> anyhow::Result<UiExit> {
-        let Some(task) = self.task.take() else {
+        let Some(task) = self.task.as_mut() else {
             return Ok(UiExit::Closed);
         };
-        task.await.context("run TUI task failed to join")?
+        let result = task.await;
+        self.task = None;
+        result.context("run TUI task failed to join")?
     }
 }
 
@@ -619,6 +789,389 @@ enum ScopedRunState {
 }
 
 #[derive(Debug)]
+struct MonitorState {
+    hosts: BTreeMap<HostName, MonitorHost>,
+    executions: BTreeMap<MonitorExecutionKey, MonitorExecution>,
+    events: BTreeMap<MonitorExecutionKey, Vec<EventFrame>>,
+    selected: Option<MonitorExecutionKey>,
+    cursor: usize,
+    activities: VecDeque<MonitorActivity>,
+    connections: BTreeMap<HostName, String>,
+    action_sender: mpsc::Sender<MonitorAction>,
+    view: WorkspaceView,
+    detail: bool,
+    region: DetailRegion,
+    session_filter: Option<SessionHash>,
+    frozen_executions: Option<BTreeMap<MonitorExecutionKey, MonitorExecution>>,
+    frozen_events: Option<BTreeMap<MonitorExecutionKey, Vec<EventFrame>>>,
+    frozen_activities: Option<VecDeque<MonitorActivity>>,
+    frozen_connections: Option<BTreeMap<HostName, String>>,
+    frozen_selected: Option<MonitorExecutionKey>,
+    trace_cursor: usize,
+}
+
+impl MonitorState {
+    fn new(action_sender: mpsc::Sender<MonitorAction>) -> Self {
+        Self {
+            hosts: BTreeMap::new(),
+            executions: BTreeMap::new(),
+            events: BTreeMap::new(),
+            selected: None,
+            cursor: 0,
+            activities: VecDeque::new(),
+            connections: BTreeMap::new(),
+            action_sender,
+            view: WorkspaceView::Overview,
+            detail: false,
+            region: DetailRegion::Records,
+            session_filter: None,
+            frozen_executions: None,
+            frozen_events: None,
+            frozen_activities: None,
+            frozen_connections: None,
+            frozen_selected: None,
+            trace_cursor: 0,
+        }
+    }
+
+    fn ordered_keys(&self) -> Vec<MonitorExecutionKey> {
+        self.display_executions()
+            .iter()
+            .filter(|(_, execution)| {
+                self.session_filter
+                    .is_none_or(|session| execution.status.session_id() == Some(session))
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    fn selected_execution(&self) -> Option<&MonitorExecution> {
+        self.selected
+            .as_ref()
+            .and_then(|key| self.executions.get(key))
+    }
+
+    fn display_executions(&self) -> &BTreeMap<MonitorExecutionKey, MonitorExecution> {
+        self.frozen_executions.as_ref().unwrap_or(&self.executions)
+    }
+
+    fn display_events(&self) -> &BTreeMap<MonitorExecutionKey, Vec<EventFrame>> {
+        self.frozen_events.as_ref().unwrap_or(&self.events)
+    }
+
+    fn display_activities(&self) -> &VecDeque<MonitorActivity> {
+        self.frozen_activities.as_ref().unwrap_or(&self.activities)
+    }
+
+    fn display_connections(&self) -> &BTreeMap<HostName, String> {
+        self.frozen_connections
+            .as_ref()
+            .unwrap_or(&self.connections)
+    }
+
+    fn display_selected_key(&self) -> Option<&MonitorExecutionKey> {
+        self.frozen_selected.as_ref().or(self.selected.as_ref())
+    }
+
+    fn display_selected_execution(&self) -> Option<&MonitorExecution> {
+        self.display_selected_key()
+            .and_then(|key| self.display_executions().get(key))
+    }
+
+    fn is_frozen(&self) -> bool {
+        self.frozen_executions.is_some()
+    }
+
+    fn toggle_freeze(&mut self) {
+        if self.is_frozen() {
+            self.frozen_executions = None;
+            self.frozen_events = None;
+            self.frozen_activities = None;
+            self.frozen_connections = None;
+            self.frozen_selected = None;
+        } else {
+            self.frozen_executions = Some(self.executions.clone());
+            self.frozen_events = Some(self.events.clone());
+            self.frozen_activities = Some(self.activities.clone());
+            self.frozen_connections = Some(self.connections.clone());
+            self.frozen_selected = self.selected.clone();
+        }
+    }
+
+    fn toggle_session_filter(&mut self) {
+        let selected_session = self
+            .selected_execution()
+            .and_then(|execution| execution.status.session_id());
+        self.session_filter = match (self.session_filter, selected_session) {
+            (Some(current), Some(selected)) if current == selected => None,
+            (_, selected) => selected,
+        };
+        self.cursor = 0;
+        self.trace_cursor = 0;
+        self.reconcile();
+    }
+
+    fn reconcile(&mut self) {
+        let keys = self.ordered_keys();
+        if keys.is_empty() {
+            self.selected = None;
+            self.cursor = 0;
+            return;
+        }
+        if let Some(selected) = &self.selected
+            && let Some(index) = keys.iter().position(|key| key == selected)
+        {
+            self.cursor = index;
+        } else {
+            self.cursor = self.cursor.min(keys.len() - 1);
+            self.selected = Some(keys[self.cursor].clone());
+        }
+    }
+
+    fn move_cursor(&mut self, amount: usize, forward: bool) {
+        let keys = self.ordered_keys();
+        let Some(last) = keys.len().checked_sub(1) else {
+            return;
+        };
+        self.cursor = if forward {
+            self.cursor.saturating_add(amount).min(last)
+        } else {
+            self.cursor.saturating_sub(amount)
+        };
+        let selected = keys[self.cursor].clone();
+        if self.selected.as_ref() != Some(&selected) {
+            self.trace_cursor = 0;
+        }
+        self.selected = Some(selected);
+    }
+
+    fn move_trace_cursor(&mut self, amount: usize, forward: bool) {
+        let Some(last) = self
+            .display_selected_execution()
+            .and_then(|execution| execution.trace.len().checked_sub(1))
+        else {
+            self.trace_cursor = 0;
+            return;
+        };
+        self.trace_cursor = if forward {
+            self.trace_cursor.saturating_add(amount).min(last)
+        } else {
+            self.trace_cursor.saturating_sub(amount)
+        };
+    }
+
+    fn apply(&mut self, update: MonitorUpdate, callouts: &mut CalloutQueue, palette: &TuiPalette) {
+        match update {
+            MonitorUpdate::Hosts { hosts } => {
+                self.hosts = hosts
+                    .into_iter()
+                    .map(|host| (host.host.clone(), host))
+                    .collect();
+            }
+            MonitorUpdate::Execution {
+                key,
+                status,
+                inspection,
+                view,
+                trace,
+                observed_at,
+                stale,
+                gap,
+            } => {
+                let previous = self.executions.get(&key).cloned();
+                let view_missing = view.is_none();
+                // A stale refresh can lose one bounded endpoint independently
+                // of the others. Keep the last good value visible while the
+                // status and the gap marker make that uncertainty explicit.
+                let inspection = if stale {
+                    inspection.or_else(|| {
+                        previous
+                            .as_ref()
+                            .and_then(|execution| execution.inspection.clone())
+                    })
+                } else {
+                    inspection
+                };
+                let view = if stale {
+                    view.or_else(|| {
+                        previous
+                            .as_ref()
+                            .and_then(|execution| execution.view.clone())
+                    })
+                } else {
+                    view
+                };
+                let trace = if stale && trace.is_empty() {
+                    previous
+                        .as_ref()
+                        .map_or(trace, |execution| execution.trace.clone())
+                } else {
+                    trace
+                };
+                let agreement = previous.as_ref().and_then(|execution| execution.agreement);
+                let observed_at = if stale && view_missing {
+                    previous
+                        .as_ref()
+                        .map_or(observed_at, |execution| execution.observed_at)
+                } else {
+                    observed_at
+                };
+                self.executions.insert(
+                    key.clone(),
+                    MonitorExecution {
+                        key,
+                        status,
+                        inspection,
+                        view,
+                        trace,
+                        agreement,
+                        observed_at,
+                        stale,
+                        gap,
+                    },
+                );
+                self.reconcile();
+            }
+            MonitorUpdate::Activity { mut activity } => {
+                // Activity can arrive before the first snapshot; the global
+                // bounded history remains authoritative until reconciliation.
+                activity.kind = plain_slot(&activity.kind);
+                activity.summary = plain_slot(&activity.summary);
+                self.activities.push_back(activity);
+                while self.activities.len() > MAX_MONITOR_ACTIVITY {
+                    self.activities.pop_front();
+                }
+            }
+            MonitorUpdate::SystemEvent { key, frame } => {
+                let events = self.events.entry(key).or_default();
+                events.push(frame);
+                if events.len() > MAX_SYSTEM_EVENTS {
+                    events.drain(..events.len() - MAX_SYSTEM_EVENTS);
+                }
+            }
+            MonitorUpdate::Agreement { key, agreed, total } => {
+                if let Some(execution) = self.executions.get_mut(&key) {
+                    execution.agreement = Some((agreed, total));
+                }
+            }
+            MonitorUpdate::Gap {
+                host,
+                exec_id,
+                summary,
+            } => {
+                let summary = plain_slot(&summary);
+                if let Some(host_name) = host.clone()
+                    && let Some(exec_id) = exec_id
+                    && let Some(execution) = self.executions.get_mut(&MonitorExecutionKey {
+                        host: host_name.clone(),
+                        exec_id,
+                    })
+                {
+                    execution.stale = true;
+                    execution.gap = Some(summary.clone());
+                }
+                if let Some(host) = host {
+                    self.connections.insert(host, summary);
+                }
+            }
+            MonitorUpdate::Callout {
+                host,
+                exec_id,
+                pending_id,
+                callout_index,
+                name,
+                prompt,
+                context,
+                schema,
+            } => {
+                let mut editor = TextArea::default();
+                editor.set_style(Style::default());
+                editor.set_cursor_line_style(Style::default());
+                editor.set_cursor_style(palette.strong().add_modifier(Modifier::REVERSED));
+                editor.set_placeholder_text("Enter answer");
+                editor.set_placeholder_style(palette.muted());
+                let request = PendingCallout {
+                    host,
+                    exec_id,
+                    pending_id,
+                    callout_index,
+                    name: plain_slot(&name),
+                    prompt: plain_slot(&prompt),
+                    context,
+                    schema,
+                    editor,
+                    scroll: 0,
+                    validation_error: None,
+                    submitting: false,
+                    submission_error: None,
+                    not_pending: false,
+                    reply: None,
+                };
+                let _ = callouts.push(request);
+            }
+            MonitorUpdate::Submission {
+                host,
+                exec_id,
+                pending_id,
+                result,
+            } => {
+                let result = match result {
+                    MonitorSubmission::Accepted => MonitorSubmission::Accepted,
+                    MonitorSubmission::CalloutNotPending(message) => {
+                        MonitorSubmission::CalloutNotPending(plain_slot(&message))
+                    }
+                    MonitorSubmission::Rejected(message) => {
+                        MonitorSubmission::Rejected(plain_slot(&message))
+                    }
+                    MonitorSubmission::TransportUnknown(message) => {
+                        MonitorSubmission::TransportUnknown(plain_slot(&message))
+                    }
+                };
+                match result {
+                    MonitorSubmission::Accepted => {
+                        let _ = callouts.remove(&host, exec_id, pending_id);
+                    }
+                    MonitorSubmission::CalloutNotPending(message) => {
+                        if let Some(callout) = callouts.get_mut(&host, exec_id, pending_id) {
+                            callout.submitting = false;
+                            callout.not_pending = true;
+                            callout.submission_error = Some(message);
+                        }
+                    }
+                    MonitorSubmission::Rejected(message)
+                    | MonitorSubmission::TransportUnknown(message) => {
+                        if let Some(callout) = callouts.get_mut(&host, exec_id, pending_id) {
+                            callout.submitting = false;
+                            callout.submission_error = Some(message);
+                        }
+                    }
+                }
+            }
+            MonitorUpdate::Connection {
+                host,
+                message,
+                stale,
+            } => {
+                let message = plain_slot(&message);
+                self.connections.insert(host.clone(), message.clone());
+                if stale {
+                    for execution in self
+                        .executions
+                        .values_mut()
+                        .filter(|execution| execution.key.host == host)
+                    {
+                        execution.stale = true;
+                        execution.gap = Some(message.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
+const MAX_MONITOR_ACTIVITY: usize = 64;
+
+#[derive(Debug)]
 struct ScreenState {
     config: TuiConfig,
     statuses: BTreeMap<HostName, ExecStatus>,
@@ -653,6 +1206,7 @@ struct ScreenState {
     trace_follow: FollowState,
     events_follow: FollowState,
     private_page_request: Option<PrivatePageRequest>,
+    monitor: Option<MonitorState>,
 }
 
 impl ScreenState {
@@ -692,7 +1246,142 @@ impl ScreenState {
             trace_follow: FollowState::default(),
             events_follow: FollowState::default(),
             private_page_request: None,
+            monitor: None,
         }
+    }
+
+    fn new_monitor(config: TuiConfig, actions: mpsc::Sender<MonitorAction>) -> Self {
+        let mut state = Self::new(config);
+        state.monitor = Some(MonitorState::new(actions));
+        state
+    }
+
+    fn monitor_projection(&self) -> Option<ScreenState> {
+        let monitor = self.monitor.as_ref()?;
+        let execution = monitor.display_selected_execution()?.clone();
+        let session_id = execution.status.session_id();
+        let negotiation_id = execution.status.negotiation_id;
+        let related = monitor
+            .display_executions()
+            .iter()
+            .filter(|(key, candidate)| match session_id {
+                Some(session) => candidate.status.session_id() == Some(session),
+                None => match negotiation_id {
+                    Some(negotiation) => candidate.status.negotiation_id == Some(negotiation),
+                    None => *key == &execution.key,
+                },
+            })
+            .map(|(_, candidate)| candidate.clone())
+            .collect::<Vec<_>>();
+        let mut projected_config = self.config.clone();
+        projected_config.hosts = related
+            .iter()
+            .filter_map(|candidate| {
+                self.config
+                    .hosts
+                    .iter()
+                    .find(|host| host.host == candidate.key.host)
+                    .cloned()
+                    .or_else(|| {
+                        monitor.hosts.get(&candidate.key.host).map(|host| TuiHost {
+                            host: host.host.clone(),
+                            peer_id: host.peer_id,
+                            driver: TuiDriver::External,
+                        })
+                    })
+            })
+            .collect();
+        if projected_config.hosts.is_empty() {
+            return None;
+        }
+        let mut projected = ScreenState::new(projected_config);
+        let selected_host = execution.key.host.clone();
+        projected.host_scope = HostScope::All;
+        projected.selected_host = Some(selected_host.clone());
+        for candidate in &related {
+            let host = candidate.key.host.clone();
+            projected
+                .statuses
+                .insert(host.clone(), candidate.status.clone());
+            if let Some(inspection) = &candidate.inspection {
+                projected
+                    .inspections
+                    .insert(host.clone(), inspection.clone());
+            }
+            if let Some((step, view)) = &candidate.view {
+                projected.view_history.insert(
+                    host.clone(),
+                    VecDeque::from([ViewSnapshot {
+                        host: host.clone(),
+                        step: *step,
+                        view: view.clone(),
+                    }]),
+                );
+            }
+            projected.traces.insert(
+                host.clone(),
+                candidate
+                    .trace
+                    .iter()
+                    .cloned()
+                    .map(|entry| {
+                        let message = match &entry.event {
+                            PublicEvent::SessionStarted { .. } => None,
+                            PublicEvent::MessageReceived { msg, .. } => Some(
+                                self.config
+                                    .message_schema
+                                    .as_ref()
+                                    .ok_or_else(|| "program has no message schema".to_owned())
+                                    .and_then(|schema| {
+                                        schema.decode_json(msg).map_err(|error| error.to_string())
+                                    }),
+                            ),
+                        };
+                        TraceViewEntry { entry, message }
+                    })
+                    .collect(),
+            );
+            if let Some(agreement) = candidate.agreement {
+                projected.agreements.insert(host, agreement);
+            }
+        }
+        let related_keys = related
+            .iter()
+            .map(|candidate| &candidate.key)
+            .collect::<BTreeSet<_>>();
+        projected.system_events = related_keys
+            .iter()
+            .flat_map(|key| monitor.display_events().get(*key).into_iter().flatten())
+            .cloned()
+            .collect();
+        projected
+            .system_events
+            .sort_by_key(|event| (event.host.id.clone(), event.seq));
+        if let Some(event) = monitor
+            .display_events()
+            .get(&execution.key)
+            .and_then(|events| events.last())
+        {
+            projected.selected_event = Some(EventKey {
+                host: event.host.id.clone(),
+                boot_id: event.boot_id.clone(),
+                seq: event.seq,
+            });
+        }
+        let trace_cursor = monitor
+            .trace_cursor
+            .min(execution.trace.len().saturating_sub(1));
+        projected.selected_public_position =
+            execution.trace.get(trace_cursor).map(|entry| entry.step);
+        projected.trace_cursor = trace_cursor;
+        projected.view_cursor = 0;
+        projected.page.select(monitor.view);
+        if monitor.region == DetailRegion::Inspector && monitor.view != WorkspaceView::Overview {
+            projected.page.open_inspector();
+        }
+        projected.details_scroll = self.details_scroll;
+        projected.focus = Focus::Workspace;
+        Some(projected)
     }
 
     fn apply(&mut self, update: RunUpdate) {
@@ -840,7 +1529,10 @@ impl ScreenState {
                     editor,
                     scroll: 0,
                     validation_error: None,
-                    reply,
+                    submitting: false,
+                    submission_error: None,
+                    not_pending: false,
+                    reply: Some(reply),
                 };
                 if self.callouts.push(callout) && self.callouts.len() == 1 {
                     self.focus = Focus::Composer;
@@ -886,6 +1578,27 @@ impl ScreenState {
                 self.terminal_lifecycle = Some(ExecLifecycle::Failed);
                 self.callouts.clear();
                 self.failure = Some(summary);
+            }
+            RunUpdate::Monitor(update) => {
+                let accepted_selected = matches!(
+                    &update,
+                    MonitorUpdate::Submission {
+                        host,
+                        exec_id,
+                        pending_id,
+                        result: MonitorSubmission::Accepted,
+                    } if self.callouts.selected().is_some_and(|callout| {
+                        callout.host == *host
+                            && callout.exec_id == *exec_id
+                            && callout.pending_id == *pending_id
+                    })
+                );
+                if let Some(monitor) = &mut self.monitor {
+                    monitor.apply(update, &mut self.callouts, &self.palette);
+                }
+                if accepted_selected && self.focus == Focus::Composer {
+                    self.focus = Focus::Hosts;
+                }
             }
             RunUpdate::Close => {}
         }
@@ -1268,6 +1981,9 @@ impl ScreenState {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Some(UiExit::Cancelled);
         }
+        if self.monitor.is_some() {
+            return self.on_monitor_key(key);
+        }
         if self.complete && key.code == KeyCode::Char('q') {
             return Some(UiExit::Completed);
         }
@@ -1445,6 +2161,201 @@ impl ScreenState {
             }
             _ => None,
         }
+    }
+
+    fn on_monitor_key(&mut self, key: KeyEvent) -> Option<UiExit> {
+        let in_insert = self.in_insert_mode();
+        let Some(monitor) = &mut self.monitor else {
+            return None;
+        };
+        if key.code == KeyCode::Char('q') && !in_insert {
+            return Some(UiExit::Completed);
+        }
+        if key.code == KeyCode::Char('?') && !in_insert {
+            self.help = !self.help;
+            return None;
+        }
+        if key.code == KeyCode::Esc {
+            if self.help {
+                self.help = false;
+            } else if in_insert {
+                self.focus = Focus::Hosts;
+            } else if monitor.region == DetailRegion::Inspector {
+                monitor.region = DetailRegion::Records;
+                self.details_scroll = 0;
+            } else if monitor.detail {
+                monitor.detail = false;
+                monitor.region = DetailRegion::Records;
+                monitor.view = WorkspaceView::Overview;
+                self.focus = Focus::Hosts;
+                self.details_scroll = 0;
+            }
+            return None;
+        }
+        if key.code == KeyCode::Tab {
+            if in_insert {
+                self.focus = Focus::Hosts;
+            } else if monitor.detail && self.focus == Focus::Workspace {
+                self.focus = if monitor.display_selected_key().is_some_and(|selected| {
+                    self.callouts.select_for(&selected.host, selected.exec_id)
+                }) {
+                    Focus::Composer
+                } else {
+                    Focus::Hosts
+                };
+            } else {
+                let selected = monitor.selected.clone();
+                self.focus = if let Some(selected) = selected
+                    && self.callouts.select_for(&selected.host, selected.exec_id)
+                {
+                    Focus::Composer
+                } else {
+                    Focus::Hosts
+                };
+            }
+            return None;
+        }
+        if key.code == KeyCode::Char('a') && !in_insert {
+            let selected = monitor.selected.clone();
+            let pending = selected.as_ref().and_then(|selected| {
+                monitor
+                    .selected_execution()
+                    .filter(|execution| execution.key == *selected)
+                    .and_then(|execution| execution.status.pending_callout())
+                    .map(|pending| pending.pending_id)
+            });
+            let selected_callout = selected.is_some_and(|selected| {
+                pending.is_some_and(|pending_id| {
+                    self.callouts
+                        .select_for_pending(&selected.host, selected.exec_id, pending_id)
+                }) || self.callouts.select_for(&selected.host, selected.exec_id)
+            });
+            if selected_callout {
+                self.focus = Focus::Composer;
+            }
+            return None;
+        }
+        if in_insert {
+            if key.code == KeyCode::Enter {
+                self.submit_answer();
+            } else if let Some(callout) = self.callouts.selected_mut() {
+                callout.editor.input(key);
+                callout.validation_error = None;
+            }
+            return None;
+        }
+        if let KeyCode::Char(number) = key.code
+            && let Some(view) = WorkspaceView::from_number(number)
+        {
+            monitor.view = view;
+            monitor.region = DetailRegion::Records;
+            monitor.trace_cursor = 0;
+            self.details_scroll = 0;
+            return None;
+        }
+        if key.code == KeyCode::Char(' ') {
+            monitor.toggle_freeze();
+            return None;
+        }
+        if key.code == KeyCode::Char('/') {
+            monitor.toggle_session_filter();
+            self.details_scroll = 0;
+            return None;
+        }
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') if self.focus == Focus::Hosts => {
+                monitor.move_cursor(1, false)
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.focus == Focus::Hosts => {
+                monitor.move_cursor(1, true)
+            }
+            KeyCode::PageUp if self.focus == Focus::Hosts => monitor.move_cursor(8, false),
+            KeyCode::PageDown if self.focus == Focus::Hosts => monitor.move_cursor(8, true),
+            KeyCode::Home => {
+                if self.focus == Focus::Hosts {
+                    if let Some(key) = monitor.ordered_keys().first() {
+                        monitor.selected = Some(key.clone());
+                        monitor.cursor = 0;
+                    }
+                } else {
+                    if monitor.view == WorkspaceView::PublicTrace
+                        && monitor.region == DetailRegion::Records
+                    {
+                        monitor.trace_cursor = 0;
+                    } else {
+                        self.details_scroll = 0;
+                    }
+                }
+            }
+            KeyCode::End => {
+                if self.focus == Focus::Hosts {
+                    let keys = monitor.ordered_keys();
+                    if let Some(key) = keys.last() {
+                        monitor.selected = Some(key.clone());
+                        monitor.cursor = keys.len().saturating_sub(1);
+                    }
+                } else {
+                    if monitor.view == WorkspaceView::PublicTrace
+                        && monitor.region == DetailRegion::Records
+                    {
+                        monitor.trace_cursor = monitor
+                            .display_selected_execution()
+                            .map_or(0, |execution| execution.trace.len().saturating_sub(1));
+                    } else {
+                        self.details_scroll = usize::MAX;
+                    }
+                }
+            }
+            KeyCode::Enter if self.focus == Focus::Hosts => {
+                if monitor.selected.is_some() {
+                    monitor.detail = true;
+                    monitor.region = DetailRegion::Records;
+                    monitor.view = WorkspaceView::Program;
+                    self.focus = Focus::Workspace;
+                    self.details_scroll = 0;
+                }
+            }
+            KeyCode::Enter if self.focus == Focus::Workspace && monitor.detail => {
+                if monitor.view != WorkspaceView::Overview {
+                    monitor.region = DetailRegion::Inspector;
+                    self.details_scroll = 0;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::PageUp
+                if self.focus == Focus::Workspace && monitor.detail =>
+            {
+                let amount = if matches!(key.code, KeyCode::PageUp) {
+                    8
+                } else {
+                    1
+                };
+                if monitor.view == WorkspaceView::PublicTrace
+                    && monitor.region == DetailRegion::Records
+                {
+                    monitor.move_trace_cursor(amount, false);
+                } else {
+                    self.details_scroll = self.details_scroll.saturating_sub(amount);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::PageDown
+                if self.focus == Focus::Workspace && monitor.detail =>
+            {
+                let amount = if matches!(key.code, KeyCode::PageDown) {
+                    8
+                } else {
+                    1
+                };
+                if monitor.view == WorkspaceView::PublicTrace
+                    && monitor.region == DetailRegion::Records
+                {
+                    monitor.move_trace_cursor(amount, true);
+                } else {
+                    self.details_scroll = self.details_scroll.saturating_add(amount);
+                }
+            }
+            _ => {}
+        }
+        None
     }
 
     fn in_insert_mode(&self) -> bool {
@@ -1830,11 +2741,40 @@ impl ScreenState {
             callout.validation_error = Some(format!("{path}: {error}"));
             return;
         }
+        if self.monitor.is_some() {
+            let Some(monitor) = &self.monitor else {
+                return;
+            };
+            let Some(callout) = self.callouts.selected_mut() else {
+                return;
+            };
+            if callout.not_pending || callout.submitting {
+                return;
+            }
+            let action = MonitorAction::Submit {
+                host: callout.host.clone(),
+                exec_id: callout.exec_id,
+                pending_id: callout.pending_id,
+                answer: value,
+            };
+            match monitor.action_sender.try_send(action) {
+                Ok(()) => {
+                    callout.submitting = true;
+                    callout.submission_error = None;
+                }
+                Err(error) => {
+                    callout.submission_error = Some(format!("monitor action unavailable: {error}"));
+                }
+            }
+            return;
+        }
         let callout = self
             .callouts
             .remove_selected()
             .expect("callout checked above");
-        let _ = callout.reply.send(value);
+        if let Some(reply) = callout.reply {
+            let _ = reply.send(value);
+        }
         if !self.callouts.is_empty() {
             self.focus = Focus::Composer;
         } else {
@@ -1919,8 +2859,17 @@ async fn run_screen(
     width: watch::Sender<u16>,
     private_page: watch::Sender<Option<PrivatePageRequest>>,
     cancel: watch::Sender<Option<String>>,
+    monitor_actions: Option<mpsc::Sender<MonitorAction>>,
 ) -> anyhow::Result<UiExit> {
-    let result = run_screen_inner(config, &mut updates, width, private_page, &cancel).await;
+    let result = run_screen_inner(
+        config,
+        &mut updates,
+        width,
+        private_page,
+        &cancel,
+        monitor_actions,
+    )
+    .await;
     if let Err(error) = &result {
         cancel.send_replace(Some(format!("{error:#}")));
     }
@@ -1933,10 +2882,15 @@ async fn run_screen_inner(
     width: watch::Sender<u16>,
     private_page: watch::Sender<Option<PrivatePageRequest>>,
     cancel: &watch::Sender<Option<String>>,
+    monitor_actions: Option<mpsc::Sender<MonitorAction>>,
 ) -> anyhow::Result<UiExit> {
     let (mut terminal, _restore) = crate::terminal::enter()?;
     let mut events = EventStream::new();
-    let mut state = ScreenState::new(config);
+    let mut state = if let Some(actions) = monitor_actions {
+        ScreenState::new_monitor(config, actions)
+    } else {
+        ScreenState::new(config)
+    };
 
     loop {
         let area = terminal.size().context("read terminal size")?;
@@ -1957,7 +2911,7 @@ async fn run_screen_inner(
                     let event = event.ok_or_else(|| anyhow!("terminal event stream closed"))??;
                     if let Event::Key(key) = event {
                         if let Some(exit) = state.on_key(key) {
-                            if exit == UiExit::Cancelled {
+                            if exit == UiExit::Cancelled && state.monitor.is_none() {
                                 cancel.send_replace(Some("run stopped from the TUI".to_owned()));
                             }
                             return Ok(exit);
@@ -1988,7 +2942,7 @@ async fn run_screen_inner(
                 match event {
                     Event::Key(key) => {
                         if let Some(exit) = state.on_key(key) {
-                            if exit == UiExit::Cancelled {
+                            if exit == UiExit::Cancelled && state.monitor.is_none() {
                                 cancel.send_replace(Some("run stopped from the TUI".to_owned()));
                             }
                             return Ok(exit);
@@ -2027,6 +2981,26 @@ fn render_too_small(frame: &mut Frame<'_>, area: Rect) {
 
 fn render(frame: &mut Frame<'_>, state: &ScreenState) {
     let area = frame.area();
+    if state.monitor.is_some() {
+        render_monitor(frame, state, area);
+        if state.help {
+            let overlay = centered(area, 72, 10);
+            frame.render_widget(Clear, overlay);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    help_line(state, "↑/↓  PgUp/PgDn", "Select an execution"),
+                    help_line(state, "a", "Open the selected pending callout"),
+                    help_line(state, "Enter", "Submit the editable answer"),
+                    help_line(state, "Esc", "Close the answer editor or help"),
+                    help_line(state, "q", "Detach from the daemon"),
+                    help_line(state, "Ctrl-C", "Detach from the daemon"),
+                ])
+                .block(panel(" MONITOR HELP ", state, true)),
+                overlay,
+            );
+        }
+        return;
+    }
     let canvas_width = canvas_width(area.width);
     let requested_composer = composer_height(state, canvas_width);
     let composer_capacity = Rect::new(0, 0, canvas_width, area.height.saturating_sub(2));
@@ -2072,8 +3046,387 @@ fn render(frame: &mut Frame<'_>, state: &ScreenState) {
     }
 }
 
+fn render_monitor(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
+    let Some(monitor) = &state.monitor else {
+        return;
+    };
+    let [masthead, tabs, body, footer] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+    let [left, right] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(42)])
+        .areas(masthead);
+    let scope = monitor.session_filter.map_or_else(String::new, |session| {
+        format!("  session {}", session.fmt_short())
+    });
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("arena0  MONITOR", state.palette.strong()),
+            Span::styled(scope, state.palette.muted()),
+        ])),
+        left,
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{} Hosts  {} executions  {}{}",
+            monitor.hosts.len(),
+            monitor.display_executions().len(),
+            if monitor.is_frozen() {
+                "FROZEN"
+            } else {
+                "LIVE"
+            },
+            if monitor.display_connections().is_empty() {
+                ""
+            } else {
+                "  notices"
+            },
+        ))
+        .alignment(Alignment::Right)
+        .style(state.palette.muted()),
+        right,
+    );
+    render_tab_bar(frame, state, tabs);
+
+    let composer = if state.focus == Focus::Composer && !state.callouts.is_empty() {
+        let max_composer = body.height.saturating_sub(6).max(5);
+        composer_height(state, area.width.saturating_sub(2)).clamp(5, max_composer)
+    } else {
+        0
+    };
+    let activity = if body.height < 28 { 3 } else { 7 };
+    let table_height = monitor
+        .ordered_keys()
+        .len()
+        .saturating_add(3)
+        .try_into()
+        .unwrap_or(u16::MAX)
+        .clamp(3, 10);
+    let [table, guest, recent, editor] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(table_height.min(body.height)),
+            Constraint::Fill(1),
+            Constraint::Length(activity.min(body.height)),
+            Constraint::Length(composer),
+        ])
+        .areas(body);
+    render_monitor_table(frame, state, table);
+    render_monitor_guest(frame, state, guest);
+    render_monitor_activity(frame, state, recent);
+    if composer != 0 {
+        render_composer(frame, state, editor);
+    }
+    frame.render_widget(
+        Paragraph::new(if area.width < 100 {
+            "q detach  a answer  Enter inspect  ↑↓ move  Space freeze  / scope  ? help"
+        } else {
+            "q detach  1–6 views  ↑↓ move  Enter inspect  a answer  Space freeze  / session  Esc back  ? help"
+        })
+            .style(state.palette.muted()),
+        footer,
+    );
+}
+
+fn render_monitor_table(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
+    let Some(monitor) = &state.monitor else {
+        return;
+    };
+    let keys = monitor.ordered_keys();
+    let rows = keys.iter().filter_map(|key| {
+        let execution = monitor.display_executions().get(key)?;
+        let status = &execution.status;
+        let pending = status.pending_callout().map_or_else(
+            || "".to_owned(),
+            |callout| {
+                state
+                    .callouts
+                    .name_for(&key.host, key.exec_id, callout.pending_id)
+                    .map_or_else(
+                        || format!("pending {}", callout.pending_id),
+                        |name| format!("pending {name}"),
+                    )
+            },
+        );
+        let state_label = format!("{:?}", status.lifecycle()).to_ascii_uppercase();
+        let step = status
+            .step()
+            .map_or_else(|| "-".to_owned(), |step| step.to_string());
+        let agreement = execution.agreement.map_or_else(
+            || "-".to_owned(),
+            |(agreed, total)| format!("{agreed}/{total}"),
+        );
+        let stale = if execution.stale { " STALE" } else { "" };
+        let selected = monitor.selected.as_ref() == Some(key);
+        Some(
+            Row::new([
+                Cell::from(key.host.to_string()),
+                Cell::from(key.exec_id.fmt_short().to_string()),
+                Cell::from(state_label),
+                Cell::from(step),
+                Cell::from(agreement),
+                Cell::from(format!("{pending}{stale}")),
+            ])
+            .style(if selected {
+                state.palette.strong().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            }),
+        )
+    });
+    let mut table_state = TableState::default();
+    table_state.select(
+        monitor
+            .selected
+            .as_ref()
+            .and_then(|key| keys.iter().position(|candidate| candidate == key)),
+    );
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(14),
+            Constraint::Length(10),
+            Constraint::Length(12),
+            Constraint::Length(6),
+            Constraint::Length(9),
+            Constraint::Min(18),
+        ],
+    )
+    .header(
+        Row::new([
+            "Host",
+            "Exec",
+            "State",
+            "Step",
+            "Agree",
+            "Callout / freshness",
+        ])
+        .style(state.palette.emphasis()),
+    )
+    .column_spacing(1)
+    .row_highlight_style(
+        state
+            .palette
+            .strong()
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+    )
+    .block(panel(
+        "HOSTS AND EXECUTIONS  ↑/↓ select  a answer",
+        state,
+        state.focus == Focus::Hosts,
+    ));
+    if keys.is_empty() {
+        frame.render_widget(
+            Paragraph::new("Waiting for the daemon execution roster")
+                .style(state.palette.muted())
+                .block(panel(
+                    "HOSTS AND EXECUTIONS",
+                    state,
+                    state.focus == Focus::Hosts,
+                )),
+            area,
+        );
+    } else {
+        frame.render_stateful_widget(table, area, &mut table_state);
+    }
+}
+
+fn render_monitor_guest(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
+    let Some(monitor) = &state.monitor else {
+        return;
+    };
+    let selected_view = monitor.view;
+    let Some(execution) = monitor.display_selected_execution() else {
+        frame.render_widget(
+            Paragraph::new("Select an execution to inspect its guest view")
+                .style(state.palette.muted())
+                .block(panel("GUEST VIEW", state, false)),
+            area,
+        );
+        return;
+    };
+    let age = epoch_seconds().saturating_sub(execution.observed_at);
+    let freshness = if execution.stale {
+        execution.gap.as_deref().map_or_else(
+            || format!("STALE  fetched {age}s ago"),
+            |gap| format!("STALE  {gap}  fetched {age}s ago"),
+        )
+    } else {
+        format!("LIVE  fetched {age}s ago")
+    };
+    let step = execution
+        .view
+        .as_ref()
+        .map(|(step, _)| *step)
+        .or_else(|| execution.status.step());
+    let title = format!(
+        "GUEST VIEW  {}  exec {}  step {}  {}",
+        execution.key.host,
+        execution.key.exec_id.fmt_short(),
+        step.map_or_else(|| "-".to_owned(), |step| step.to_string()),
+        freshness,
+    );
+    if matches!(
+        selected_view,
+        WorkspaceView::Overview | WorkspaceView::Program
+    ) {
+        let view = execution.view.as_ref().map(|(step, view)| (view, *step));
+        program::render_guest_view_data(
+            frame,
+            state,
+            area,
+            title,
+            view,
+            false,
+            u16::try_from(state.details_scroll).unwrap_or(u16::MAX),
+        );
+    } else if selected_view == WorkspaceView::SystemEvents {
+        render_monitor_activity_detail(frame, state, area);
+    } else if let Some(projected) = state.monitor_projection() {
+        render_workspace(frame, &projected, area);
+    }
+}
+
+fn render_monitor_activity(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
+    let Some(monitor) = &state.monitor else {
+        return;
+    };
+    let lines = if monitor.activities.is_empty() {
+        vec![Line::styled("Waiting for activity", state.palette.muted())]
+    } else {
+        monitor
+            .display_activities()
+            .iter()
+            .rev()
+            .take(5)
+            .map(|activity| {
+                let host = activity
+                    .host
+                    .as_ref()
+                    .map_or("DAEMON".to_owned(), ToString::to_string);
+                let exec = activity
+                    .exec_id
+                    .map_or_else(String::new, |id| format!(" exec {}", id.fmt_short()));
+                let stale = if activity.stale { " STALE" } else { "" };
+                Line::from(vec![
+                    Span::styled(format!("{host}  "), state.palette.strong()),
+                    Span::styled(
+                        format!("{}{}{}  ", activity.kind, exec, stale),
+                        state.palette.emphasis(),
+                    ),
+                    Span::raw(plain_slot(&activity.summary)),
+                ])
+            })
+            .collect()
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(panel(
+                "RECENT ACTIVITY  bounded, host-local observation",
+                state,
+                false,
+            )),
+        area,
+    );
+}
+
+fn render_monitor_activity_detail(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
+    let Some(monitor) = &state.monitor else {
+        return;
+    };
+    let selected_session = monitor.session_filter;
+    let lines = monitor
+        .display_activities()
+        .iter()
+        .filter(|activity| {
+            selected_session.is_none_or(|session| {
+                activity.exec_id.is_none_or(|exec_id| {
+                    monitor.display_executions().iter().any(|(key, execution)| {
+                        key.exec_id == exec_id
+                            && activity.host.as_ref().is_none_or(|host| key.host == *host)
+                            && execution.status.session_id() == Some(session)
+                    })
+                })
+            })
+        })
+        .map(|activity| {
+            let host = activity
+                .host
+                .as_ref()
+                .map_or("DAEMON".to_owned(), ToString::to_string);
+            let exec = activity
+                .exec_id
+                .map_or_else(String::new, |id| format!(" exec {}", id.fmt_short()));
+            let sequence = activity
+                .sequence
+                .map_or_else(String::new, |sequence| format!(" #{sequence}"));
+            let stale = if activity.stale { " STALE" } else { "" };
+            Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{}  {}{}{}  ",
+                        events::event_time(activity.ts),
+                        host,
+                        exec,
+                        sequence
+                    ),
+                    state.palette.muted(),
+                ),
+                Span::styled(
+                    format!("{}{}  ", plain_slot(&activity.kind), stale),
+                    state.palette.emphasis(),
+                ),
+                Span::raw(plain_slot(&activity.summary)),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let lines = if lines.is_empty() {
+        vec![Line::styled("Waiting for activity", state.palette.muted())]
+    } else {
+        lines
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((u16::try_from(state.details_scroll).unwrap_or(u16::MAX), 0))
+            .block(panel(
+                format!(
+                    "ACTIVITY  {} records{}",
+                    monitor.display_activities().len(),
+                    if monitor.is_frozen() { "  FROZEN" } else { "" }
+                ),
+                state,
+                state.focus == Focus::Workspace,
+            )),
+        area,
+    );
+}
+
 fn render_tab_bar(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
-    let titles = if area.width >= 78 {
+    let selected_view = state
+        .monitor
+        .as_ref()
+        .map_or_else(|| state.page.view(), |monitor| monitor.view);
+    let titles = if state.monitor.is_some() && area.width >= 78 {
+        vec![
+            "1 Overview",
+            "2 Negotiation",
+            "3 Program",
+            "4 Agreement",
+            "5 Private",
+            "6 Activity",
+        ]
+    } else if state.monitor.is_some() {
+        vec!["1 Ovr", "2 Nego", "3 Prog", "4 Agr", "5 Priv", "6 Act"]
+    } else if area.width >= 78 {
         vec![
             "1 Overview",
             "2 Negotiation",
@@ -2087,7 +3440,7 @@ fn render_tab_bar(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
     };
     frame.render_widget(
         Tabs::new(titles)
-            .select(state.page.view().index())
+            .select(selected_view.index())
             .style(state.palette.muted())
             .highlight_style(
                 state
@@ -2185,6 +3538,7 @@ fn render_hosts(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
             TuiDriver::Human => "YOU".to_owned(),
             TuiDriver::Builtin(strategy) => strategy.to_ascii_uppercase(),
             TuiDriver::Agent => "AGENT".to_owned(),
+            TuiDriver::External => "EXTERNAL".to_owned(),
         };
         let lifecycle =
             state
@@ -2372,6 +3726,20 @@ fn callout_detail_lines(state: &ScreenState, callout: &PendingCallout) -> Vec<Li
     if let Some(error) = &callout.validation_error {
         lines.push(Line::styled(
             format!("Invalid answer  {error}"),
+            state.palette.error(),
+        ));
+    }
+    if callout.submitting {
+        lines.push(Line::styled("Submitting answer…", state.palette.strong()));
+    } else if callout.not_pending {
+        lines.push(Line::styled(
+            "Callout is no longer pending; refresh the execution before answering",
+            state.palette.error(),
+        ));
+    }
+    if let Some(error) = &callout.submission_error {
+        lines.push(Line::styled(
+            format!("Submission status  {error}"),
             state.palette.error(),
         ));
     }
@@ -2632,6 +4000,12 @@ fn plain_slot(value: &str) -> String {
         .map(sanitize::strip_ansi)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 fn program_width(area: Rect) -> u16 {

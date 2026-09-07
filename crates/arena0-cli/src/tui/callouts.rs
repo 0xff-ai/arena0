@@ -14,7 +14,13 @@ pub(super) struct PendingCallout {
     pub(super) editor: TextArea<'static>,
     pub(super) scroll: u16,
     pub(super) validation_error: Option<String>,
-    pub(super) reply: oneshot::Sender<Value>,
+    /// The monitor has sent this answer to the daemon and is waiting for the
+    /// explicit result.  Keeping the editor alive here protects the draft when
+    /// the transport outcome is unknown.
+    pub(super) submitting: bool,
+    pub(super) submission_error: Option<String>,
+    pub(super) not_pending: bool,
+    pub(super) reply: Option<oneshot::Sender<Value>>,
 }
 
 impl PendingCallout {
@@ -78,6 +84,87 @@ impl CalloutQueue {
         self.requests.iter().any(|request| &request.host == host)
     }
 
+    pub(super) fn name_for(
+        &self,
+        host: &HostName,
+        exec_id: ExecId,
+        pending_id: PendingId,
+    ) -> Option<&str> {
+        self.requests
+            .iter()
+            .find(|request| {
+                request.host == *host
+                    && request.exec_id == exec_id
+                    && request.pending_id == pending_id
+            })
+            .map(|request| request.name.as_str())
+    }
+
+    pub(super) fn select_for(&mut self, host: &HostName, exec_id: ExecId) -> bool {
+        let Some(index) = self
+            .requests
+            .iter()
+            .position(|request| {
+                request.host == *host && request.exec_id == exec_id && !request.not_pending
+            })
+            .or_else(|| {
+                self.requests
+                    .iter()
+                    .position(|request| request.host == *host && request.exec_id == exec_id)
+            })
+        else {
+            return false;
+        };
+        self.selected = index;
+        true
+    }
+
+    pub(super) fn select_for_pending(
+        &mut self,
+        host: &HostName,
+        exec_id: ExecId,
+        pending_id: PendingId,
+    ) -> bool {
+        let Some(index) = self.requests.iter().position(|request| {
+            request.host == *host
+                && request.exec_id == exec_id
+                && request.pending_id == pending_id
+                && !request.not_pending
+        }) else {
+            return false;
+        };
+        self.selected = index;
+        true
+    }
+
+    pub(super) fn get_mut(
+        &mut self,
+        host: &HostName,
+        exec_id: ExecId,
+        pending_id: PendingId,
+    ) -> Option<&mut PendingCallout> {
+        self.requests.iter_mut().find(|request| {
+            request.host == *host && request.exec_id == exec_id && request.pending_id == pending_id
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn submission_error_for(
+        &self,
+        host: &HostName,
+        exec_id: ExecId,
+        pending_id: PendingId,
+    ) -> Option<&str> {
+        self.requests
+            .iter()
+            .find(|request| {
+                request.host == *host
+                    && request.exec_id == exec_id
+                    && request.pending_id == pending_id
+            })
+            .and_then(|request| request.submission_error.as_deref())
+    }
+
     pub(super) fn next(&mut self) {
         if !self.is_empty() {
             self.selected = (self.selected + 1) % self.len();
@@ -96,5 +183,19 @@ impl CalloutQueue {
     pub(super) fn clear(&mut self) {
         self.requests.clear();
         self.selected = 0;
+    }
+
+    pub(super) fn remove(
+        &mut self,
+        host: &HostName,
+        exec_id: ExecId,
+        pending_id: PendingId,
+    ) -> Option<PendingCallout> {
+        let index = self.requests.iter().position(|request| {
+            request.host == *host && request.exec_id == exec_id && request.pending_id == pending_id
+        })?;
+        let request = self.requests.remove(index);
+        self.selected = self.selected.min(self.requests.len().saturating_sub(1));
+        request
     }
 }

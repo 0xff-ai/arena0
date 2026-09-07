@@ -2,6 +2,7 @@ use super::*;
 use arena0_client::api::{
     ExecStatusState, HostInfo, PrivateEffectSummary, PrivateEventKind, SessionStatus,
 };
+use std::time::Duration;
 
 fn config() -> TuiConfig {
     TuiConfig {
@@ -1099,4 +1100,433 @@ fn receipt_evidence_is_host_owned_and_progress_is_aggregate() {
     assert_eq!(state.receipts.len(), 2);
     assert_eq!(state.receipts[0].host, first_host());
     assert_eq!(state.verification_progress, Some((2, 2, "aggregate")));
+}
+
+#[test]
+fn monitor_keeps_same_host_executions_separate() {
+    let (actions, _receiver) = mpsc::channel(4);
+    let mut state = ScreenState::new_monitor(config(), actions);
+    let mut first = active_status();
+    first.exec_id = ExecId([1; 32]);
+    let mut second = active_status();
+    second.exec_id = ExecId([2; 32]);
+    let host = first_host();
+    for status in [first.clone(), second.clone()] {
+        state.apply(RunUpdate::Monitor(MonitorUpdate::Execution {
+            key: MonitorExecutionKey {
+                host: host.clone(),
+                exec_id: status.exec_id,
+            },
+            status,
+            inspection: None,
+            view: None,
+            trace: Vec::new(),
+            observed_at: 7,
+            stale: false,
+            gap: None,
+        }));
+    }
+    let monitor = state.monitor.as_ref().expect("monitor state");
+    assert_eq!(monitor.executions.len(), 2);
+    assert_eq!(
+        monitor.selected.as_ref().map(|key| key.exec_id),
+        Some(ExecId([1; 32]))
+    );
+    assert_eq!(
+        monitor.executions[&MonitorExecutionKey {
+            host: host.clone(),
+            exec_id: ExecId([1; 32])
+        }]
+            .status
+            .exec_id,
+        ExecId([1; 32])
+    );
+    assert_eq!(
+        monitor.executions[&MonitorExecutionKey {
+            host,
+            exec_id: ExecId([2; 32])
+        }]
+            .status
+            .exec_id,
+        ExecId([2; 32])
+    );
+}
+
+#[test]
+fn monitor_a_opens_only_the_selected_execution_callout() {
+    let (actions, _receiver) = mpsc::channel(4);
+    let mut state = ScreenState::new_monitor(config(), actions);
+    let host = first_host();
+    let mut first = active_status();
+    first.exec_id = ExecId([1; 32]);
+    let mut second = active_status();
+    second.exec_id = ExecId([2; 32]);
+    for status in [first.clone(), second.clone()] {
+        state.apply(RunUpdate::Monitor(MonitorUpdate::Execution {
+            key: MonitorExecutionKey {
+                host: host.clone(),
+                exec_id: status.exec_id,
+            },
+            status,
+            inspection: None,
+            view: None,
+            trace: Vec::new(),
+            observed_at: 1,
+            stale: false,
+            gap: None,
+        }));
+    }
+    for exec_id in [first.exec_id, second.exec_id] {
+        state.apply(RunUpdate::Monitor(MonitorUpdate::Callout {
+            host: host.clone(),
+            exec_id,
+            pending_id: PendingId::new(exec_id.0[0] as u64),
+            callout_index: 1,
+            name: "Choose".to_owned(),
+            prompt: "choose".to_owned(),
+            context: Value::Null,
+            schema: serde_json::json!({"type": "string"}),
+        }));
+    }
+    state.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    let first_callout = state.callouts.selected().expect("first callout");
+    assert_eq!(state.focus, Focus::Composer);
+    assert_eq!(first_callout.exec_id, first.exec_id);
+    state.focus = Focus::Hosts;
+    state
+        .monitor
+        .as_mut()
+        .expect("monitor")
+        .move_cursor(1, true);
+    state.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    let second_callout = state.callouts.selected().expect("second callout");
+    assert_eq!(second_callout.exec_id, second.exec_id);
+}
+
+#[test]
+fn monitor_acceptance_removes_only_the_answered_key() {
+    let (actions, _receiver) = mpsc::channel(4);
+    let mut state = ScreenState::new_monitor(config(), actions);
+    let host = first_host();
+    for byte in [1_u8, 2] {
+        state.apply(RunUpdate::Monitor(MonitorUpdate::Callout {
+            host: host.clone(),
+            exec_id: ExecId([byte; 32]),
+            pending_id: PendingId::new(u64::from(byte)),
+            callout_index: 1,
+            name: "Choose".to_owned(),
+            prompt: "choose".to_owned(),
+            context: Value::Null,
+            schema: serde_json::json!({"type": "string"}),
+        }));
+    }
+    state.apply(RunUpdate::Monitor(MonitorUpdate::Submission {
+        host: host.clone(),
+        exec_id: ExecId([1; 32]),
+        pending_id: PendingId::new(1),
+        result: MonitorSubmission::Accepted,
+    }));
+    assert_eq!(state.callouts.len(), 1);
+    assert_eq!(
+        state
+            .callouts
+            .selected()
+            .expect("remaining callout")
+            .exec_id,
+        ExecId([2; 32])
+    );
+}
+
+#[test]
+fn monitor_enter_scrolls_detail_and_escape_returns_to_overview() {
+    let (actions, _receiver) = mpsc::channel(4);
+    let mut state = ScreenState::new_monitor(config(), actions);
+    let status = active_status();
+    let host = first_host();
+    state.apply(RunUpdate::Monitor(MonitorUpdate::Execution {
+        key: MonitorExecutionKey {
+            host,
+            exec_id: status.exec_id,
+        },
+        status,
+        inspection: None,
+        view: None,
+        trace: Vec::new(),
+        observed_at: 1,
+        stale: false,
+        gap: None,
+    }));
+
+    state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(state.focus, Focus::Workspace);
+    assert!(state.monitor.as_ref().expect("monitor").detail);
+    assert_eq!(
+        state.monitor.as_ref().expect("monitor").view,
+        WorkspaceView::Program
+    );
+    state.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(state.details_scroll, 1);
+
+    state.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    let monitor = state.monitor.as_ref().expect("monitor");
+    assert_eq!(state.focus, Focus::Hosts);
+    assert!(!monitor.detail);
+    assert_eq!(monitor.view, WorkspaceView::Overview);
+}
+
+#[test]
+fn monitor_session_filter_and_freeze_keep_bounded_display_snapshot() {
+    let (actions, _receiver) = mpsc::channel(4);
+    let mut state = ScreenState::new_monitor(config(), actions);
+    for byte in [1_u8, 2, 3] {
+        let mut status = active_status();
+        status.exec_id = ExecId([byte; 32]);
+        if byte == 3 {
+            status.state = ExecStatusState::Active {
+                session: SessionStatus {
+                    session_id: SessionHash([0x77; 32]),
+                    ..status.session().expect("active session").clone()
+                },
+            };
+        }
+        state.apply(RunUpdate::Monitor(MonitorUpdate::Execution {
+            key: MonitorExecutionKey {
+                host: if byte == 2 {
+                    "host-02".parse().expect("valid Host")
+                } else {
+                    first_host()
+                },
+                exec_id: status.exec_id,
+            },
+            status,
+            inspection: None,
+            view: None,
+            trace: Vec::new(),
+            observed_at: 1,
+            stale: false,
+            gap: None,
+        }));
+    }
+    assert_eq!(
+        state
+            .monitor
+            .as_ref()
+            .expect("monitor")
+            .ordered_keys()
+            .len(),
+        3
+    );
+
+    state.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    assert_eq!(
+        state
+            .monitor
+            .as_ref()
+            .expect("monitor")
+            .ordered_keys()
+            .len(),
+        2
+    );
+    state.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    assert!(state.monitor.as_ref().expect("monitor").is_frozen());
+    let frozen_count = state
+        .monitor
+        .as_ref()
+        .expect("monitor")
+        .display_executions()
+        .len();
+    let mut fresh = active_status();
+    fresh.exec_id = ExecId([9; 32]);
+    state.apply(RunUpdate::Monitor(MonitorUpdate::Execution {
+        key: MonitorExecutionKey {
+            host: first_host(),
+            exec_id: fresh.exec_id,
+        },
+        status: fresh,
+        inspection: None,
+        view: None,
+        trace: Vec::new(),
+        observed_at: 2,
+        stale: false,
+        gap: None,
+    }));
+    assert_eq!(
+        state
+            .monitor
+            .as_ref()
+            .expect("monitor")
+            .display_executions()
+            .len(),
+        frozen_count
+    );
+    state.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    assert!(!state.monitor.as_ref().expect("monitor").is_frozen());
+}
+
+#[test]
+fn monitor_home_then_down_moves_to_second_row_after_last_selection() {
+    let (actions, _receiver) = mpsc::channel(4);
+    let mut state = ScreenState::new_monitor(config(), actions);
+    for byte in [1_u8, 2, 3] {
+        let mut status = active_status();
+        status.exec_id = ExecId([byte; 32]);
+        state.apply(RunUpdate::Monitor(MonitorUpdate::Execution {
+            key: MonitorExecutionKey {
+                host: first_host(),
+                exec_id: status.exec_id,
+            },
+            status,
+            inspection: None,
+            view: None,
+            trace: Vec::new(),
+            observed_at: 1,
+            stale: false,
+            gap: None,
+        }));
+    }
+    state.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+    state.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+    state.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(
+        state
+            .monitor
+            .as_ref()
+            .expect("monitor")
+            .selected
+            .as_ref()
+            .map(|key| key.exec_id),
+        Some(ExecId([2; 32]))
+    );
+}
+
+#[test]
+fn monitor_trace_detail_selects_a_shared_session_step_and_scrolls_inspector() {
+    let (actions, _receiver) = mpsc::channel(4);
+    let mut state = ScreenState::new_monitor(config(), actions);
+    let status = active_status();
+    let exec_id = status.exec_id;
+    let trace = (0..3)
+        .map(|step| TraceEntry {
+            trace_version: arena0_client::protocol::TRACE_FORMAT_VERSION,
+            step,
+            event: PublicEvent::MessageReceived {
+                message_id: arena0_client::protocol::MessageId([step as u8; 32]),
+                from: PeerId([1; 32]),
+                position: step,
+                pre_state: arena0_client::protocol::StateHash([step as u8; 32]),
+                msg: Vec::new(),
+            },
+            effects: Vec::new(),
+            pre_state: arena0_client::protocol::StateHash([step as u8; 32]),
+            post_state: arena0_client::protocol::StateHash([(step + 1) as u8; 32]),
+            fuel_used: 1,
+            witness: None,
+            agreement: arena0_client::protocol::AggregateAttestation::empty(),
+        })
+        .collect();
+    state.apply(RunUpdate::Monitor(MonitorUpdate::Execution {
+        key: MonitorExecutionKey {
+            host: first_host(),
+            exec_id,
+        },
+        status,
+        inspection: None,
+        view: None,
+        trace,
+        observed_at: 1,
+        stale: false,
+        gap: None,
+    }));
+    state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    state.on_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+    state.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(
+        state
+            .monitor_projection()
+            .expect("projection")
+            .selected_public_position,
+        Some(1)
+    );
+    state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        state.monitor.as_ref().expect("monitor").region,
+        DetailRegion::Inspector
+    );
+    state.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(state.details_scroll, 1);
+    state.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(
+        state.monitor.as_ref().expect("monitor").region,
+        DetailRegion::Records
+    );
+}
+
+#[test]
+fn monitor_submission_routes_to_exact_callout_and_closes_selected_composer() {
+    let (actions, _receiver) = mpsc::channel(4);
+    let mut state = ScreenState::new_monitor(config(), actions);
+    let host = first_host();
+    for byte in [1_u8, 2] {
+        state.apply(RunUpdate::Monitor(MonitorUpdate::Callout {
+            host: host.clone(),
+            exec_id: ExecId([byte; 32]),
+            pending_id: PendingId::new(u64::from(byte)),
+            callout_index: 1,
+            name: format!("Choice-{byte}"),
+            prompt: "choose".to_owned(),
+            context: Value::Null,
+            schema: serde_json::json!({"type": "string"}),
+        }));
+    }
+    state.focus = Focus::Composer;
+    state.apply(RunUpdate::Monitor(MonitorUpdate::Submission {
+        host: host.clone(),
+        exec_id: ExecId([2; 32]),
+        pending_id: PendingId::new(2),
+        result: MonitorSubmission::Rejected("\u{1b}[31mtransport\u{1b}[0m".to_owned()),
+    }));
+    assert_eq!(state.focus, Focus::Composer);
+    assert_eq!(
+        state
+            .callouts
+            .submission_error_for(&host, ExecId([2; 32]), PendingId::new(2),),
+        Some("transport")
+    );
+    state.apply(RunUpdate::Monitor(MonitorUpdate::Submission {
+        host,
+        exec_id: ExecId([1; 32]),
+        pending_id: PendingId::new(1),
+        result: MonitorSubmission::Accepted,
+    }));
+    assert_eq!(state.focus, Focus::Hosts);
+    assert_eq!(state.callouts.len(), 1);
+}
+
+#[tokio::test]
+async fn tui_session_join_can_be_cancelled_and_retried() {
+    let (updates, _receiver) = mpsc::channel(1);
+    let (_width, width_receiver) = watch::channel(80);
+    let (_private_page, private_receiver) = watch::channel(None);
+    let (done_sender, done_receiver) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = done_receiver.await;
+        Ok(UiExit::Closed)
+    });
+    let mut session = TuiSession {
+        handle: TuiHandle {
+            updates,
+            width: width_receiver,
+            private_page: private_receiver,
+        },
+        task: Some(task),
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), session.wait())
+            .await
+            .is_err()
+    );
+    assert!(session.task.is_some());
+    done_sender.send(()).expect("pending session is alive");
+    session.wait().await.expect("second join succeeds");
+    assert!(session.task.is_none());
 }

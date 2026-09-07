@@ -5,10 +5,11 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use arena0_api::{
-    EnsembleSpec, ExecStatusState, NextEvent, PendingId, ProgramSummary, ReceiptRef, Request,
-    ResponseOk, VerifiedResult,
+    ActivityData, ActivityResult, ApiError, ApiErrorCode, EnsembleSpec, ExecStatusState, NextEvent,
+    PendingId, ProgramSummary, ReceiptRef, Request, ResponseOk, VerifiedResult,
 };
 use arena0_program::ParticipantCount;
 use arena0_protocol::{ExecId, PeerId, SessionHash};
@@ -19,8 +20,9 @@ use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response as HttpResponse};
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolRequestParams, CallToolResult, Content, ServerCapabilities, ServerInfo};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -349,6 +351,49 @@ struct Arena0Mcp {
     daemon: Arc<Daemon>,
 }
 
+struct ActivityGuard {
+    activity: Arc<crate::server::Activity>,
+    call_id: String,
+    started: Instant,
+    finished: bool,
+}
+
+impl ActivityGuard {
+    fn new(activity: Arc<crate::server::Activity>, call_id: String, started: Instant) -> Self {
+        Self {
+            activity,
+            call_id,
+            started,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, result: ActivityResult) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.activity.emit(ActivityData::Finished {
+            call_id: self.call_id.clone(),
+            elapsed_ms: self
+                .started
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            result,
+        });
+    }
+}
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish(ActivityResult::Interrupted);
+        }
+    }
+}
+
 impl Arena0Mcp {
     fn new(daemon: Arc<Daemon>) -> Self {
         Self {
@@ -366,7 +411,7 @@ impl Arena0Mcp {
         service
             .dispatch(request)
             .await
-            .map_err(|error| err(format!("Host '{}': {error}", host.id)))
+            .map_err(|error| api_error(&host.id, error))
     }
 
     fn participant(&self, peer_id: PeerId) -> ParticipantOutput {
@@ -767,6 +812,49 @@ impl Arena0Mcp {
 
 #[tool_handler]
 impl ServerHandler for Arena0Mcp {
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let activity = self.daemon.activity();
+        let call_id = activity.next_call_id();
+        let tool = if self.tool_router.get(request.name.as_ref()).is_some() {
+            request.name.to_string()
+        } else {
+            "unknown".to_owned()
+        };
+        let (host, exec_id) = activity_scope(
+            &self.daemon,
+            request.name.as_ref(),
+            request.arguments.as_ref(),
+        );
+        let started = Instant::now();
+        activity.emit(ActivityData::Started {
+            call_id: call_id.clone(),
+            tool,
+            host,
+            exec_id,
+        });
+        let mut activity_guard = ActivityGuard::new(activity, call_id, started);
+        let call = self
+            .tool_router
+            .call(ToolCallContext::new(self, request, context));
+        let result = call.await;
+        let activity_result = match &result {
+            Ok(result) if result.is_error != Some(true) => ActivityResult::Ok,
+            Ok(result) => ActivityResult::ToolError {
+                code: result
+                    .structured_content
+                    .as_ref()
+                    .and_then(activity_error_code),
+            },
+            Err(_) => ActivityResult::ToolError { code: None },
+        };
+        activity_guard.finish(activity_result);
+        result
+    }
+
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.instructions = Some(
@@ -784,20 +872,18 @@ impl ServerHandler for Arena0Mcp {
     }
 }
 
+pub(crate) async fn bind(config: &McpConfig) -> anyhow::Result<tokio::net::TcpListener> {
+    Ok(tokio::net::TcpListener::bind(config.listen).await?)
+}
+
 pub(crate) async fn serve(
     daemon: Arc<Daemon>,
     config: McpConfig,
+    listener: tokio::net::TcpListener,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let startup = daemon.startup_timeline();
     let router = router(daemon, config.bearer_token);
-    let listener = match tokio::net::TcpListener::bind(config.listen).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            startup::progress(StartupStage::Failed, &startup);
-            return Err(error.into());
-        }
-    };
     let address = match listener.local_addr() {
         Ok(address) => address,
         Err(error) => {
@@ -946,6 +1032,56 @@ fn serialized_value<T: serde::Serialize>(value: &T) -> Result<Value, CallToolRes
     serde_json::to_value(value).map_err(|error| err(format!("encode structured value: {error}")))
 }
 
+fn activity_scope(
+    daemon: &Daemon,
+    tool: &str,
+    arguments: Option<&rmcp::model::JsonObject>,
+) -> (Option<String>, Option<ExecId>) {
+    let Some(arguments) = arguments else {
+        return (None, None);
+    };
+    let host = match tool {
+        "list_programs" => scoped_string(arguments, &["host", "id"]),
+        "inspect_program" | "start_execution" => {
+            scoped_string(arguments, &["program", "host", "id"])
+        }
+        "get_execution_status"
+        | "await_execution_event"
+        | "answer_callout"
+        | "query_execution"
+        | "stop_execution" => scoped_string(arguments, &["execution", "host", "id"]),
+        "verify_session" => scoped_string(arguments, &["session", "host", "id"]),
+        _ => None,
+    };
+    let host = host.filter(|name| daemon.service(name).is_some());
+    let exec_id = match tool {
+        "get_execution_status"
+        | "await_execution_event"
+        | "answer_callout"
+        | "query_execution"
+        | "stop_execution" => {
+            scoped_string(arguments, &["execution", "exec_id"]).and_then(|value| value.parse().ok())
+        }
+        _ => None,
+    };
+    (host, exec_id)
+}
+
+fn scoped_string(arguments: &rmcp::model::JsonObject, path: &[&str]) -> Option<String> {
+    let (first, rest) = path.split_first()?;
+    let mut value = arguments.get(*first)?;
+    for field in rest {
+        value = value.get(*field)?;
+    }
+    value.as_str().map(str::to_owned)
+}
+
+fn activity_error_code(value: &Value) -> Option<ApiErrorCode> {
+    value
+        .get("code")
+        .and_then(|code| serde_json::from_value(code.clone()).ok())
+}
+
 fn parse<T: std::str::FromStr>(value: &str, what: &str) -> Result<T, CallToolResult> {
     value
         .parse::<T>()
@@ -956,6 +1092,13 @@ fn err(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![Content::text(message.into())])
 }
 
+fn api_error(host: &str, error: ApiError) -> CallToolResult {
+    CallToolResult::structured_error(serde_json::json!({
+        "code": error.code,
+        "message": format!("Host '{host}': {}", error.message),
+    }))
+}
+
 fn unexpected(other: &ResponseOk) -> CallToolResult {
     err(format!("unexpected daemon response: {other:?}"))
 }
@@ -963,7 +1106,9 @@ fn unexpected(other: &ResponseOk) -> CallToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arena0_api::{ActivityFrame, Response};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::path::Path;
     use std::time::Duration;
 
     use crate::{HostConfig, Paths};
@@ -972,8 +1117,8 @@ mod tests {
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     };
     use rmcp::{RoleClient, ServiceExt};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream, UnixStream};
     use tokio::time::timeout;
 
     struct TestDaemon {
@@ -1039,6 +1184,20 @@ mod tests {
         result
             .structured_content
             .unwrap_or_else(|| panic!("MCP tool '{name}' returned no structured content"))
+    }
+
+    async fn call_unix(socket: &Path, request: &Request) -> Response {
+        let stream = UnixStream::connect(socket)
+            .await
+            .expect("connect Host socket");
+        let (mut read, mut write) = stream.into_split();
+        arena0_api::frame::write_frame(&mut write, request)
+            .await
+            .expect("write Host request");
+        arena0_api::frame::read_frame::<_, Response>(&mut read)
+            .await
+            .expect("read Host response")
+            .expect("Host response frame")
     }
 
     async fn wait_for_mcp_activation(
@@ -1272,6 +1431,290 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn activity_stream_correlation_survives_duplicate_mcp_request_ids() {
+        let test = test_daemon().await;
+        let service = test.daemon.service("alice").expect("alice service");
+        let socket = test._homes[0].path().join("arena0.sock");
+        let listener = service.prepare().await.expect("prepare Host socket");
+        let service_task = tokio::spawn(Arc::clone(&service).serve_prepared(listener));
+        for _ in 0..100 {
+            if UnixStream::connect(&socket).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let mut activity = subscribe_activity(&socket).await;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind MCP test listener");
+        let address = listener.local_addr().expect("MCP listener address");
+        let daemon = Arc::clone(&test.daemon);
+        let serving =
+            tokio::spawn(async move { axum::serve(listener, router(daemon, None)).await });
+
+        let (first, second) = tokio::join!(
+            post_mcp(
+                address,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_hosts","arguments":{}}}"#,
+            ),
+            post_mcp(
+                address,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_hosts","arguments":{}}}"#,
+            ),
+        );
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        assert!(second.starts_with("HTTP/1.1 200"), "{second}");
+
+        let started_one = next_activity(&mut activity).await;
+        let finished_one = next_activity(&mut activity).await;
+        let started_two = next_activity(&mut activity).await;
+        let finished_two = next_activity(&mut activity).await;
+        let mut starts = Vec::new();
+        let mut finishes = Vec::new();
+        for frame in [started_one, finished_one, started_two, finished_two] {
+            match frame.data {
+                ActivityData::Started {
+                    call_id,
+                    tool,
+                    host,
+                    exec_id,
+                } => {
+                    assert_eq!(tool, "list_hosts");
+                    assert_eq!(host, None);
+                    assert_eq!(exec_id, None);
+                    starts.push(call_id);
+                }
+                ActivityData::Finished {
+                    call_id,
+                    result: ActivityResult::Ok,
+                    ..
+                } => finishes.push(call_id),
+                other => panic!("unexpected activity frame: {other:?}"),
+            }
+        }
+        assert_eq!(starts.len(), 2);
+        assert_eq!(finishes.len(), 2);
+        assert_ne!(starts[0], starts[1], "daemon activity ids are unique");
+        assert_eq!(
+            starts.into_iter().collect::<BTreeSet<_>>(),
+            finishes.into_iter().collect::<BTreeSet<_>>(),
+            "each finished frame closes one started call"
+        );
+
+        serving.abort();
+        let _ = serving.await;
+        test.daemon.stop().await;
+        service_task.abort();
+        let _ = service_task.await;
+    }
+
+    #[tokio::test]
+    async fn activity_scope_uses_only_public_reference_paths() {
+        let test = test_daemon().await;
+        let public_exec = ExecId([0x11; 32]);
+        let private_exec = ExecId([0x22; 32]).to_string();
+        let cases = [
+            (
+                "list_hosts",
+                serde_json::json!({
+                    "host": {"id": "alice"},
+                    "exec_id": public_exec.to_string(),
+                }),
+                None,
+                None,
+            ),
+            (
+                "list_programs",
+                serde_json::json!({
+                    "host": {"id": "alice"},
+                    "params": {"host": {"id": "bob"}, "exec_id": private_exec},
+                }),
+                Some("alice"),
+                None,
+            ),
+            (
+                "inspect_program",
+                serde_json::json!({
+                    "program": {"host": {"id": "alice"}},
+                    "params": {"host": {"id": "bob"}, "exec_id": private_exec},
+                }),
+                Some("alice"),
+                None,
+            ),
+            (
+                "start_execution",
+                serde_json::json!({
+                    "program": {"host": {"id": "alice"}},
+                    "params": {"host": {"id": "bob"}, "exec_id": private_exec},
+                    "ensemble": {"mode": "explicit", "hosts": [{"id": "bob"}]},
+                }),
+                Some("alice"),
+                None,
+            ),
+            (
+                "get_execution_status",
+                serde_json::json!({
+                    "execution": {"host": {"id": "alice"}, "exec_id": public_exec},
+                    "params": {"host": {"id": "bob"}, "exec_id": private_exec},
+                }),
+                Some("alice"),
+                Some(public_exec),
+            ),
+            (
+                "await_execution_event",
+                serde_json::json!({
+                    "execution": {"host": {"id": "alice"}, "exec_id": public_exec},
+                    "params": {"host": {"id": "bob"}, "exec_id": private_exec},
+                }),
+                Some("alice"),
+                Some(public_exec),
+            ),
+            (
+                "answer_callout",
+                serde_json::json!({
+                    "execution": {"host": {"id": "alice"}, "exec_id": public_exec},
+                    "answer": {"host": {"id": "bob"}, "exec_id": private_exec},
+                }),
+                Some("alice"),
+                Some(public_exec),
+            ),
+            (
+                "query_execution",
+                serde_json::json!({
+                    "execution": {"host": {"id": "alice"}, "exec_id": public_exec},
+                    "query": {"host": {"id": "bob"}, "exec_id": private_exec},
+                }),
+                Some("alice"),
+                Some(public_exec),
+            ),
+            (
+                "stop_execution",
+                serde_json::json!({
+                    "execution": {"host": {"id": "alice"}, "exec_id": public_exec},
+                    "reason": "stop",
+                    "params": {"host": {"id": "bob"}, "exec_id": private_exec},
+                }),
+                Some("alice"),
+                Some(public_exec),
+            ),
+            (
+                "verify_session",
+                serde_json::json!({
+                    "session": {"host": {"id": "alice"}, "session_id": "aa"},
+                    "params": {"host": {"id": "bob"}, "exec_id": private_exec},
+                }),
+                Some("alice"),
+                None,
+            ),
+            (
+                "unknown_tool",
+                serde_json::json!({
+                    "host": {"id": "alice"},
+                    "exec_id": public_exec.to_string(),
+                }),
+                None,
+                None,
+            ),
+        ];
+
+        for (tool, value, expected_host, expected_exec) in cases {
+            let arguments = serde_json::from_value(value).expect("activity arguments object");
+            assert_eq!(
+                activity_scope(&test.daemon, tool, Some(&arguments)),
+                (expected_host.map(str::to_owned), expected_exec),
+                "activity scope for {tool}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn occupied_mcp_port_fails_before_unix_services_start() {
+        let home_a = tempfile::tempdir().expect("temporary Host home");
+        let home_b = tempfile::tempdir().expect("temporary Host home");
+        let socket = home_a.path().join("arena0.sock");
+        let host_a = HostConfig::open(
+            "occupied-port-a",
+            Paths::new(home_a.path().to_path_buf(), socket.clone()),
+            true,
+        )
+        .expect("open Host A");
+        let host_b = HostConfig::open(
+            "occupied-port-b",
+            Paths::new(
+                home_b.path().to_path_buf(),
+                home_b.path().join("arena0.sock"),
+            ),
+            true,
+        )
+        .expect("open Host B");
+        let occupied = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind occupied MCP port");
+        let address = occupied.local_addr().expect("occupied MCP address");
+        let mcp = McpConfig::new(address, None).expect("MCP config");
+        let dynamic_home =
+            arena0_home::Home::from_root(home_a.path().to_path_buf()).expect("dynamic Host home");
+        let daemon = Daemon::start(
+            vec![host_a, host_b],
+            mcp,
+            Arc::new(WasmtimeEngine::new().expect("sandbox engine")),
+            dynamic_home,
+            true,
+        )
+        .await
+        .expect("start daemon");
+
+        let result = timeout(Duration::from_secs(10), daemon.serve())
+            .await
+            .expect("serve should fail promptly");
+        assert!(result.is_err(), "occupied MCP port must fail startup");
+        assert!(
+            !socket.exists(),
+            "Unix service must not start after bind failure"
+        );
+        drop(occupied);
+    }
+
+    struct ActivityTestSubscription {
+        read: BufReader<tokio::net::unix::OwnedReadHalf>,
+        _write: tokio::net::unix::OwnedWriteHalf,
+    }
+
+    async fn subscribe_activity(socket: &std::path::Path) -> ActivityTestSubscription {
+        let stream = UnixStream::connect(socket)
+            .await
+            .expect("connect activity socket");
+        let (read, mut write) = stream.into_split();
+        let mut read = BufReader::new(read);
+        arena0_api::frame::write_frame(&mut write, &Request::ActivitySubscribe)
+            .await
+            .expect("write activity subscribe");
+        assert!(matches!(
+            arena0_api::frame::read_frame::<_, Response>(&mut read)
+                .await
+                .expect("read activity ack")
+                .expect("activity ack frame"),
+            Ok(ResponseOk::ActivitySubscribed)
+        ));
+        ActivityTestSubscription {
+            read,
+            _write: write,
+        }
+    }
+
+    async fn next_activity(subscription: &mut ActivityTestSubscription) -> ActivityFrame {
+        timeout(
+            Duration::from_secs(5),
+            arena0_api::frame::read_frame::<_, ActivityFrame>(&mut subscription.read),
+        )
+        .await
+        .expect("activity frame timeout")
+        .expect("read activity frame")
+        .expect("activity stream closed")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn one_mcp_client_drives_two_hosts_to_one_session() {
         timeout(Duration::from_secs(30), async {
             let test = test_daemon().await;
@@ -1341,6 +1784,33 @@ mod tests {
             };
             assert_eq!(row["peer_id"], info.host.peer_id.to_string());
             assert_eq!(info.host.user_agent.as_deref(), Some("codex/new"));
+
+            let alice_socket = test
+                .daemon
+                .service("alice")
+                .expect("initial Host")
+                .socket_path()
+                .to_path_buf();
+            match call_unix(&alice_socket, &Request::HostsList).await {
+                Ok(ResponseOk::Hosts(hosts)) => {
+                    assert_eq!(hosts.len(), 4, "Unix HostsList includes dynamic Hosts");
+                    let bob_info = hosts
+                        .iter()
+                        .find(|host| host.host.id == "new-bob")
+                        .expect("dynamically opened Host is visible");
+                    assert_eq!(bob_info.host.user_agent.as_deref(), Some("codex/new"));
+                    assert_eq!(
+                        bob_info.host.peer_id.to_string(),
+                        opened_b["peer_id"].as_str().unwrap()
+                    );
+                    assert!(
+                        hosts
+                            .iter()
+                            .any(|host| host.host.id == alice["id"].as_str().unwrap())
+                    );
+                }
+                other => panic!("unexpected Unix HostsList response: {other:?}"),
+            }
 
             let alice_programs =
                 call_mcp_tool(&client, "list_programs", serde_json::json!({"host": alice})).await;

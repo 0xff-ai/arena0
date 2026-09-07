@@ -74,6 +74,11 @@ pub enum ResponseOk {
     DaemonInfo(DaemonInfo),
     /// The ack for `events.subscribe`; `EventFrame`s follow on the same connection.
     Subscribed,
+    /// The ack for `activity.subscribe`; `ActivityFrame`s follow on the same
+    /// connection.
+    ActivitySubscribed,
+    /// The complete daemon-local Host roster.
+    Hosts(Vec<DaemonInfo>),
 }
 
 /// Public metadata for one Host. The local id locates its namespace; the peer
@@ -123,6 +128,9 @@ pub enum ApiErrorCode {
     NotFound,
     /// The request was malformed or referenced an invalid state.
     BadRequest,
+    /// A callout answer raced with another answer and the pending callout is
+    /// no longer available.
+    CalloutNotPending,
     /// A program handle resolved to more than one program.
     Ambiguous,
     /// A JSON value failed validation against the program's public schema.
