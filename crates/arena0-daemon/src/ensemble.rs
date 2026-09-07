@@ -193,13 +193,6 @@ pub(crate) struct HostDirectory {
 }
 
 impl HostDirectory {
-    fn replace(&self, hosts: BTreeMap<HostName, HostSlot>) {
-        *self
-            .hosts
-            .write()
-            .unwrap_or_else(|error| error.into_inner()) = hosts;
-    }
-
     fn services(&self) -> Vec<(String, Arc<HostService>)> {
         self.hosts
             .read()
@@ -363,7 +356,10 @@ impl Daemon {
                 },
             );
         }
-        directory.replace(ready);
+        *directory
+            .hosts
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = ready;
         let (finished, _) = watch::channel(false);
         let (opens, open_requests) = mpsc::channel(OPEN_QUEUE_CAPACITY);
         Ok(Arc::new(Self {
@@ -725,10 +721,6 @@ impl Daemon {
 
     pub(crate) fn service(&self, host: &str) -> Option<Arc<HostService>> {
         self.hosts.service(host)
-    }
-
-    pub(crate) fn peer_id(&self, host: &str) -> Option<PeerId> {
-        self.service(host).map(|service| service.peer_id())
     }
 
     pub(crate) fn host_name(&self, peer_id: PeerId) -> Option<String> {

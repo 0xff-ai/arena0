@@ -26,14 +26,14 @@ pub(super) fn render_guest_view_data(
     state: &ScreenState,
     area: Rect,
     title: String,
-    view: Option<(&View, u64)>,
+    view: Option<&View>,
     focused: bool,
     scroll: u16,
 ) {
     let block = panel(title, state, focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let Some((view, _step)) = view else {
+    let Some(view) = view else {
         frame.render_widget(
             Paragraph::new("Waiting for the program view").style(state.palette.muted()),
             inner,
@@ -216,7 +216,7 @@ fn render_guest_view(
             "Program view  guest output  Host {}  exact step {}",
             snapshot.host, snapshot.step
         ),
-        Some((&snapshot.view, snapshot.step)),
+        Some(&snapshot.view),
         focused,
         state.program_scroll,
     );

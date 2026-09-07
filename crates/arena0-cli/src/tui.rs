@@ -761,6 +761,20 @@ struct TraceViewEntry {
     message: Option<Result<Value, String>>,
 }
 
+impl TraceViewEntry {
+    fn new(entry: TraceEntry, schema: Option<&BorshSchemaDocument>) -> Self {
+        let message = match &entry.event {
+            PublicEvent::SessionStarted { .. } => None,
+            PublicEvent::MessageReceived { msg, .. } => Some(
+                schema
+                    .ok_or_else(|| "program has no message schema".to_owned())
+                    .and_then(|schema| schema.decode_json(msg).map_err(|error| error.to_string())),
+            ),
+        };
+        Self { entry, message }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ViewSnapshot {
     host: HostName,
@@ -1258,7 +1272,7 @@ impl ScreenState {
 
     fn monitor_projection(&self) -> Option<ScreenState> {
         let monitor = self.monitor.as_ref()?;
-        let execution = monitor.display_selected_execution()?.clone();
+        let execution = monitor.display_selected_execution()?;
         let session_id = execution.status.session_id();
         let negotiation_id = execution.status.negotiation_id;
         let related = monitor
@@ -1271,7 +1285,7 @@ impl ScreenState {
                     None => *key == &execution.key,
                 },
             })
-            .map(|(_, candidate)| candidate.clone())
+            .map(|(_, candidate)| candidate)
             .collect::<Vec<_>>();
         let mut projected_config = self.config.clone();
         projected_config.hosts = related
@@ -1324,34 +1338,22 @@ impl ScreenState {
                     .trace
                     .iter()
                     .cloned()
-                    .map(|entry| {
-                        let message = match &entry.event {
-                            PublicEvent::SessionStarted { .. } => None,
-                            PublicEvent::MessageReceived { msg, .. } => Some(
-                                self.config
-                                    .message_schema
-                                    .as_ref()
-                                    .ok_or_else(|| "program has no message schema".to_owned())
-                                    .and_then(|schema| {
-                                        schema.decode_json(msg).map_err(|error| error.to_string())
-                                    }),
-                            ),
-                        };
-                        TraceViewEntry { entry, message }
-                    })
+                    .map(|entry| TraceViewEntry::new(entry, self.config.message_schema.as_ref()))
                     .collect(),
             );
             if let Some(agreement) = candidate.agreement {
                 projected.agreements.insert(host, agreement);
             }
         }
-        let related_keys = related
+        projected.system_events = related
             .iter()
-            .map(|candidate| &candidate.key)
-            .collect::<BTreeSet<_>>();
-        projected.system_events = related_keys
-            .iter()
-            .flat_map(|key| monitor.display_events().get(*key).into_iter().flatten())
+            .flat_map(|execution| {
+                monitor
+                    .display_events()
+                    .get(&execution.key)
+                    .into_iter()
+                    .flatten()
+            })
             .cloned()
             .collect();
         projected
@@ -1441,19 +1443,7 @@ impl ScreenState {
                 let schema = self.config.message_schema.as_ref();
                 *current = entries
                     .into_iter()
-                    .map(|entry| {
-                        let message = match &entry.event {
-                            PublicEvent::SessionStarted { .. } => None,
-                            PublicEvent::MessageReceived { msg, .. } => Some(
-                                schema
-                                    .ok_or_else(|| "program has no message schema".to_owned())
-                                    .and_then(|schema| {
-                                        schema.decode_json(msg).map_err(|error| error.to_string())
-                                    }),
-                            ),
-                        };
-                        TraceViewEntry { entry, message }
-                    })
+                    .map(|entry| TraceViewEntry::new(entry, schema))
                     .collect();
                 let added = current.len().saturating_sub(old_len);
                 self.trace_follow.items_added(added);
@@ -3277,7 +3267,7 @@ fn render_monitor_guest(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) 
         selected_view,
         WorkspaceView::Overview | WorkspaceView::Program
     ) {
-        let view = execution.view.as_ref().map(|(step, view)| (view, *step));
+        let view = execution.view.as_ref().map(|(_, view)| view);
         program::render_guest_view_data(
             frame,
             state,

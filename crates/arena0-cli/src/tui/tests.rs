@@ -1489,7 +1489,10 @@ fn monitor_submission_routes_to_exact_callout_and_closes_selected_composer() {
     assert_eq!(
         state
             .callouts
-            .submission_error_for(&host, ExecId([2; 32]), PendingId::new(2),),
+            .get_mut(&host, ExecId([2; 32]), PendingId::new(2))
+            .expect("retained callout")
+            .submission_error
+            .as_deref(),
         Some("transport")
     );
     state.apply(RunUpdate::Monitor(MonitorUpdate::Submission {

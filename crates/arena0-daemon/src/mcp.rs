@@ -457,19 +457,20 @@ impl Arena0Mcp {
         &self,
         Parameters(_): Parameters<EmptyArgs>,
     ) -> Result<Json<HostListOutput>, CallToolResult> {
-        let mut hosts = Vec::with_capacity(self.daemon.services().len());
-        for (name, service) in self.daemon.services() {
-            match service.dispatch(Request::DaemonInfo).await {
-                Ok(ResponseOk::DaemonInfo(info)) => hosts.push(HostOutput {
-                    host: HostRef { id: name.clone() },
-                    peer_id: info.host.peer_id.to_string(),
-                    user_agent: info.host.user_agent,
-                    programs: info.programs,
-                    executions_active: info.execs_active,
-                }),
-                Ok(other) => return Err(unexpected(&other)),
-                Err(error) => return Err(err(format!("Host '{name}': {error}"))),
-            }
+        let services = self.daemon.services();
+        let mut hosts = Vec::with_capacity(services.len());
+        for (name, service) in services {
+            let info = service
+                .daemon_info()
+                .await
+                .map_err(|error| err(format!("Host '{name}': {error}")))?;
+            hosts.push(HostOutput {
+                host: HostRef { id: name },
+                peer_id: info.host.peer_id.to_string(),
+                user_agent: info.host.user_agent,
+                programs: info.programs,
+                executions_active: info.execs_active,
+            });
         }
         Ok(Json(HostListOutput { hosts }))
     }
@@ -971,18 +972,7 @@ fn service(daemon: &Daemon, host: &HostRef) -> Result<Arc<HostService>, CallTool
 }
 
 fn peer_id(daemon: &Daemon, host: &HostRef) -> Result<PeerId, CallToolResult> {
-    daemon.peer_id(&host.id).ok_or_else(|| {
-        let available = daemon
-            .services()
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect::<Vec<_>>();
-        err(format!(
-            "unknown Host '{}'; available Hosts: {}",
-            host.id,
-            available.join(", ")
-        ))
-    })
+    service(daemon, host).map(|service| service.peer_id())
 }
 
 fn exec_ref(host: &HostRef, exec_id: ExecId) -> ExecRef {

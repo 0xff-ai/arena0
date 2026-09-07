@@ -148,23 +148,6 @@ impl CalloutQueue {
         })
     }
 
-    #[cfg(test)]
-    pub(super) fn submission_error_for(
-        &self,
-        host: &HostName,
-        exec_id: ExecId,
-        pending_id: PendingId,
-    ) -> Option<&str> {
-        self.requests
-            .iter()
-            .find(|request| {
-                request.host == *host
-                    && request.exec_id == exec_id
-                    && request.pending_id == pending_id
-            })
-            .and_then(|request| request.submission_error.as_deref())
-    }
-
     pub(super) fn next(&mut self) {
         if !self.is_empty() {
             self.selected = (self.selected + 1) % self.len();

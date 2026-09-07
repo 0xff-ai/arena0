@@ -4,7 +4,7 @@
 //! the sole terminal loop and state owner: this side fetches bounded snapshots,
 //! translates public daemon events, and executes an explicitly selected answer.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
@@ -16,7 +16,7 @@ use arena0_client::proto::DaemonClient;
 use arena0_client::protocol::{ExecId, TraceEntry};
 use arena0_home::HostName;
 use clap::Args;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::tui::{
@@ -60,18 +60,45 @@ pub(crate) async fn attach(entry_client: DaemonClient, args: MonitorArgs) -> any
     let (cancel, _cancelled) = watch::channel(None::<String>);
     let (mut session, mut actions) = TuiSession::start_monitor(config, cancel);
     let handle = session.handle();
-    let mut transport = MonitorTransport::new(entry_client, roster);
+    let clients = roster
+        .iter()
+        .map(|host| (host.host.clone(), DaemonClient::new(host.socket.clone())))
+        .collect::<BTreeMap<_, _>>();
+    let mut workers = JoinSet::new();
+    let observe = async {
+        handle
+            .update(RunUpdate::Monitor(MonitorUpdate::Hosts {
+                hosts: roster.clone(),
+            }))
+            .await?;
+        for host in roster {
+            let client = clients[&host.host].clone();
+            let handle = handle.clone();
+            workers.spawn(async move { host_worker(host, client, handle).await });
+        }
+        workers.spawn(activity_worker(entry_client, handle.clone()));
+        loop {
+            tokio::select! {
+                action = actions.recv() => {
+                    let Some(action) = action else { return Ok::<(), anyhow::Error>(()); };
+                    submit_action(&clients, &handle, action).await?;
+                }
+                joined = workers.join_next() => {
+                    let Some(joined) = joined else { return Ok(()); };
+                    joined.context("monitor subscription task")??;
+                }
+            }
+        }
+    };
     let result = tokio::select! {
-        result = transport.run(&handle, &mut actions) => {
+        result = observe => {
             let result = result.context("monitor transport");
             let _ = session.close().await;
             result
         }
-        result = session.wait() => {
-            result.context("monitor TUI")
-        }
+        result = session.wait() => result.context("monitor TUI"),
     };
-    transport.workers.shutdown().await;
+    workers.shutdown().await;
     result
 }
 
@@ -79,13 +106,10 @@ async fn discover_hosts(
     entry_client: &DaemonClient,
     selected: &[HostName],
 ) -> anyhow::Result<Vec<MonitorHost>> {
-    let response = entry_client
-        .call(&Request::HostsList)
+    let infos = entry_client
+        .list_hosts()
         .await
         .context("list daemon Hosts")?;
-    let ResponseOk::Hosts(infos) = response else {
-        bail!("unexpected response to hosts.list");
-    };
     let mut roster = Vec::with_capacity(infos.len());
     for info in infos {
         let host = info
@@ -102,82 +126,15 @@ async fn discover_hosts(
     if selected.is_empty() {
         return Ok(roster);
     }
-    let names = selected.iter().cloned().collect::<BTreeSet<_>>();
-    let filtered = roster
-        .into_iter()
-        .filter(|host| names.contains(&host.host))
-        .collect::<Vec<_>>();
-    let found = filtered
+    // ponytail: scan small daemon rosters; index names if rosters grow.
+    if let Some(missing) = selected
         .iter()
-        .map(|host| host.host.clone())
-        .collect::<BTreeSet<_>>();
-    if let Some(missing) = names.difference(&found).next() {
+        .find(|name| !roster.iter().any(|host| &host.host == *name))
+    {
         bail!("Host '{missing}' is not present in the daemon roster");
     }
-    Ok(filtered)
-}
-
-struct MonitorTransport {
-    entry_client: DaemonClient,
-    roster: Vec<MonitorHost>,
-    workers: JoinSet<anyhow::Result<()>>,
-}
-
-impl MonitorTransport {
-    fn new(entry_client: DaemonClient, roster: Vec<MonitorHost>) -> Self {
-        Self {
-            entry_client,
-            roster,
-            workers: JoinSet::new(),
-        }
-    }
-
-    async fn run(
-        &mut self,
-        handle: &TuiHandle,
-        actions: &mut mpsc::Receiver<MonitorAction>,
-    ) -> anyhow::Result<()> {
-        handle
-            .update(RunUpdate::Monitor(MonitorUpdate::Hosts {
-                hosts: self.roster.clone(),
-            }))
-            .await?;
-        let clients = self
-            .roster
-            .iter()
-            .map(|host| (host.host.clone(), DaemonClient::new(host.socket.clone())))
-            .collect::<BTreeMap<_, _>>();
-        for host in &self.roster {
-            let client = clients
-                .get(&host.host)
-                .cloned()
-                .expect("client built for every roster entry");
-            let handle = handle.clone();
-            let host = host.clone();
-            self.workers
-                .spawn(async move { host_worker(host, client, handle).await });
-        }
-        let activity_handle = handle.clone();
-        let activity_client = self.entry_client.clone();
-        self.workers
-            .spawn(async move { activity_worker(activity_client, activity_handle).await });
-
-        loop {
-            tokio::select! {
-                action = actions.recv() => {
-                    let Some(action) = action else { return Ok(()); };
-                    submit_action(&clients, handle, action).await?;
-                }
-                joined = self.workers.join_next() => {
-                    if let Some(joined) = joined {
-                        joined.context("monitor subscription task")??;
-                    } else {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-    }
+    roster.retain(|host| selected.contains(&host.host));
+    Ok(roster)
 }
 
 async fn host_worker(

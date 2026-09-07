@@ -747,12 +747,11 @@ impl Events {
 /// Daemon-scoped MCP activity junction. Unlike [`Events`], this bus is shared
 /// by every Host service in one process so one Unix subscription observes the
 /// complete MCP surface.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct Activity {
     boot_id: String,
-    next_seq: Arc<AtomicU64>,
-    next_call_id: Arc<AtomicU64>,
-    publisher: Arc<StdMutex<()>>,
+    next_seq: StdMutex<u64>,
+    next_call_id: AtomicU64,
     activity: broadcast::Sender<ActivityFrame>,
 }
 
@@ -761,9 +760,8 @@ impl Activity {
         let (activity, _keepalive) = broadcast::channel(ACTIVITY_BUS_CAP);
         Self {
             boot_id: hex::encode(rand::random::<[u8; 16]>()),
-            next_seq: Arc::new(AtomicU64::new(1)),
-            next_call_id: Arc::new(AtomicU64::new(1)),
-            publisher: Arc::new(StdMutex::new(())),
+            next_seq: StdMutex::new(1),
+            next_call_id: AtomicU64::new(1),
             activity,
         }
     }
@@ -775,8 +773,9 @@ impl Activity {
     }
 
     pub(crate) fn emit(&self, data: ActivityData) {
-        let _publisher = self.publisher.lock().expect("activity publisher");
-        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let mut next_seq = self.next_seq.lock().expect("activity publisher");
+        let seq = *next_seq;
+        *next_seq = seq.wrapping_add(1);
         let frame = ActivityFrame {
             boot_id: self.boot_id.clone(),
             seq,
