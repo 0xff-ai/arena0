@@ -31,30 +31,41 @@ permissions:
 jobs:
   gate:
     name: release gate
-    runs-on: [self-hosted, Linux, X64, raptor]
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install toolchain
         run: rustup show
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --version 0.22.2 --locked
-
-      - name: Install nextest
-        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+      - name: Install verification tools
+        uses: taiki-e/install-action@84f5ac3124727fb3d284d4d22ee9ab3654fd09a6 # v2.87.7
         with:
-          tool: nextest@0.9.143
+          tool: nextest@0.9.143, cargo-audit@0.22.2
 
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - name: Identify compiler
+        id: compiler
+        shell: bash
+        run: echo "identity=$(rustc -vV | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Rust cache
+        id: rust-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          workspaces: |
-            . -> target
-            programs -> programs/target
-          cache-on-failure: true
-          # Self-hosted runners have persistent ~/.cargo/bin; the save-time
-          # cleanup would delete pre-existing binaries (rustup, cargo) there.
-          cache-bin: false
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+            target
+            programs/target
+            !target/doc
+            !target/**/incremental
+            !programs/target/**/incremental
+          key: rust-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu24-dev-${{ steps.compiler.outputs.identity }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '**/.cargo/config.toml') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            rust-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu24-dev-${{ steps.compiler.outputs.identity }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '**/.cargo/config.toml') }}-
+            rust-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu24-dev-${{ steps.compiler.outputs.identity }}-
 
       - name: Format
         run: |
@@ -91,6 +102,22 @@ jobs:
           cargo nextest run --locked --workspace --profile ci
           cargo nextest run --locked --manifest-path programs/Cargo.toml --profile ci
 
+      - name: Save Rust cache
+        if: ${{ !cancelled() && steps.rust-cache.outputs.cache-primary-key != '' }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+            target
+            programs/target
+            !target/doc
+            !target/**/incremental
+            !programs/target/**/incremental
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+
   build:
     name: build ${{ matrix.target }}
     strategy:
@@ -112,15 +139,29 @@ jobs:
       - name: Install toolchain
         run: rustup show
 
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - name: Identify compiler
+        id: compiler
+        shell: bash
+        run: echo "identity=$(rustc -vV | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Rust cache
+        id: rust-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          workspaces: |
-            . -> target
-            programs -> programs/target
-          cache-on-failure: true
-          # Self-hosted runners have persistent ~/.cargo/bin; the save-time
-          # cleanup would delete pre-existing binaries (rustup, cargo) there.
-          cache-bin: false
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+            target
+            programs/target
+            !target/doc
+            !target/**/incremental
+            !programs/target/**/incremental
+          key: rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.os }}-optimized-release-${{ steps.compiler.outputs.identity }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '**/.cargo/config.toml') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.os }}-optimized-release-${{ steps.compiler.outputs.identity }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '**/.cargo/config.toml') }}-
+            rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.os }}-optimized-release-${{ steps.compiler.outputs.identity }}-
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -176,6 +217,22 @@ jobs:
           name: arena0-${{ matrix.target }}
           path: dist/${{ matrix.target }}
           if-no-files-found: error
+
+      - name: Save Rust cache
+        if: ${{ !cancelled() && steps.rust-cache.outputs.cache-primary-key != '' }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+            target
+            programs/target
+            !target/doc
+            !target/**/incremental
+            !programs/target/**/incremental
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
 
   publish:
     name: publish to npm
