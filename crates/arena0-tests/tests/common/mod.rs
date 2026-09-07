@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use arena0_api::{NextEvent, Request, Response, ResponseOk};
 use arena0_daemon::{Daemon, HostConfig, McpConfig, Paths};
+use arena0_home::Home;
 use arena0_program::ProgramHash;
 use arena0_protocol::{PeerId, SessionHash};
 use tokio::io::BufReader;
@@ -141,6 +142,7 @@ pub fn created(resp: Response) -> arena0_protocol::ExecId {
 pub struct TwoDaemons {
     pub _dir_a: tempfile::TempDir,
     pub _dir_b: tempfile::TempDir,
+    pub _home: tempfile::TempDir,
     /// The one process-level public supervisor that owns both Host services.
     pub _supervisor: Arc<Daemon>,
     pub peer_a: PeerId,
@@ -155,6 +157,7 @@ pub struct TwoDaemons {
 pub async fn two_daemons(wasm: &[u8]) -> TwoDaemons {
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
     let sock_a = dir_a.path().join("arena0.sock");
     let sock_b = dir_b.path().join("arena0.sock");
     let host_a = HostConfig::open(
@@ -173,9 +176,15 @@ pub async fn two_daemons(wasm: &[u8]) -> TwoDaemons {
     let peer_b = host_b.peer_id();
     let mcp = McpConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)), None).unwrap();
     let engine = Arc::new(arena0_sandbox::WasmtimeEngine::new().expect("sandbox engine"));
-    let supervisor = Daemon::start(vec![host_a, host_b], mcp, engine)
-        .await
-        .unwrap_or_else(|error| panic!("start daemon supervisor: {error}"));
+    let supervisor = Daemon::start(
+        vec![host_a, host_b],
+        mcp,
+        engine,
+        Home::from_root(home_dir.path().to_path_buf()).unwrap(),
+        true,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("start daemon supervisor: {error}"));
     tokio::spawn(Arc::clone(&supervisor).serve());
     wait_for_socket(&sock_a).await;
     wait_for_socket(&sock_b).await;
@@ -186,6 +195,7 @@ pub async fn two_daemons(wasm: &[u8]) -> TwoDaemons {
     TwoDaemons {
         _dir_a: dir_a,
         _dir_b: dir_b,
+        _home: home_dir,
         _supervisor: supervisor,
         peer_a,
         peer_b,

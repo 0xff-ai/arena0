@@ -323,6 +323,12 @@ fn dispatch_command(database: &mut Database, command: Command) {
         Command::ListReceipts { limit, reply } => {
             let _ = reply.send(database.list_receipts(limit));
         }
+        Command::LoadUserAgent { reply } => {
+            let _ = reply.send(database.load_user_agent());
+        }
+        Command::SetUserAgent { value, reply } => {
+            let _ = reply.send(database.set_user_agent(value));
+        }
         Command::Shutdown { reply } => {
             let _ = reply.send(Ok(()));
         }
@@ -470,6 +476,39 @@ impl Database {
                 )?;
             }
         }
+        let stored_user_agent = self
+            .connection
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'user_agent'",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        if let Some(bytes) = stored_user_agent {
+            decode_user_agent(bytes)?;
+        }
+        Ok(())
+    }
+
+    fn load_user_agent(&mut self) -> Result<Option<String>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'user_agent'",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(decode_user_agent)
+            .transpose()
+    }
+
+    fn set_user_agent(&mut self, value: String) -> Result<(), StoreError> {
+        validate_user_agent(&value)?;
+        self.connection.execute(
+            "INSERT INTO meta (key, value) VALUES ('user_agent', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![value.into_bytes()],
+        )?;
         Ok(())
     }
 

@@ -36,7 +36,10 @@ the final segment in `<domain>.*` or `<domain>.<subdomain>.*`.
 
 `EventFrame` is the JSON object sent after the subscription acknowledgement.
 `kind` is the closed tag and `data` contains only the payload for that tag.
-Correlation IDs stay in the frame and never repeat in `data`.
+Correlation IDs stay in the frame and never repeat in `data`. The `host`
+field is a self-contained emission-time `HostInfo` snapshot:
+`{"id":"...","peer_id":"...","user_agent":...}`. It is metadata for
+the occurrence, not a mutable lookup performed by the consumer.
 
 - `exec_id` is present if and only if `kind` starts with `exec.`.
 - `session_id` is present on all `exec.session.*` events and on the activation

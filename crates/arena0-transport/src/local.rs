@@ -43,10 +43,11 @@ enum InboundPayload {
     Fetch(RecvHandle),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct InboundSenders {
     exec: mpsc::Sender<InboundPayload>,
     fetch: mpsc::Sender<InboundPayload>,
+    streams: StdMutex<Vec<Weak<StreamState>>>,
 }
 
 /// Shared local network that multiple [`LocalTransport`] instances
@@ -64,6 +65,7 @@ struct LocalNetworkInner {
     next_conn_id: AtomicU64,
     next_stream_id: AtomicU64,
     channel_capacity: usize,
+    peers: StdMutex<HashMap<PeerId, Arc<InboundSenders>>>,
     topics: StdMutex<HashMap<ProgramHash, LocalTopicBroker>>,
     blobs: StdMutex<HashMap<PeerId, LocalPeerBlobs>>,
 }
@@ -152,10 +154,45 @@ impl LocalNetwork {
                 next_conn_id: AtomicU64::new(1),
                 next_stream_id: AtomicU64::new(1),
                 channel_capacity,
+                peers: StdMutex::new(HashMap::new()),
                 topics: StdMutex::new(HashMap::new()),
                 blobs: StdMutex::new(HashMap::new()),
             }),
         }
+    }
+
+    /// Attach one peer endpoint to this network.
+    ///
+    /// A peer identity has one live endpoint at a time. The endpoint is
+    /// removed when its transport is closed or dropped, after which the same
+    /// identity can be attached again.
+    pub fn attach(&self, peer_id: PeerId) -> Result<LocalTransport, TransportError> {
+        let (exec_inbound_tx, exec_inbound_rx) = mpsc::channel(64);
+        let (fetch_inbound_tx, fetch_inbound_rx) = mpsc::channel(64);
+        let registration = Arc::new(InboundSenders {
+            exec: exec_inbound_tx.clone(),
+            fetch: fetch_inbound_tx.clone(),
+            streams: StdMutex::new(Vec::new()),
+        });
+        {
+            let mut peers = lock_unpoisoned(&self.inner.peers);
+            if peers.contains_key(&peer_id) {
+                return Err(TransportError::DuplicatePeer { peer_id });
+            }
+            peers.insert(peer_id, Arc::clone(&registration));
+        }
+        self.ensure_blob_store(peer_id);
+
+        Ok(LocalTransport {
+            peer_id,
+            network: self.clone(),
+            registration,
+            _exec_inbound_tx: exec_inbound_tx,
+            _fetch_inbound_tx: fetch_inbound_tx,
+            exec_inbound_rx: Arc::new(Mutex::new(exec_inbound_rx)),
+            fetch_inbound_rx: Arc::new(Mutex::new(fetch_inbound_rx)),
+            closed: Arc::new(StreamState::new()),
+        })
     }
 
     fn next_conn_id(&self) -> u64 {
@@ -164,6 +201,60 @@ impl LocalNetwork {
 
     fn next_stream_id(&self) -> u64 {
         self.inner.next_stream_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn inbound_sender(
+        &self,
+        peer: &PeerId,
+        proto: StreamProtocol,
+    ) -> Result<(mpsc::Sender<InboundPayload>, Arc<InboundSenders>), TransportError> {
+        let peers = lock_unpoisoned(&self.inner.peers);
+        peers
+            .get(peer)
+            .map(|senders| {
+                let tx = match proto {
+                    StreamProtocol::Exec => senders.exec.clone(),
+                    StreamProtocol::Fetch => senders.fetch.clone(),
+                };
+                (tx, Arc::clone(senders))
+            })
+            .ok_or_else(|| {
+                TransportError::PeerNotFound(format!("peer {peer} not registered on this network"))
+            })
+    }
+
+    fn register_stream(
+        &self,
+        peer: PeerId,
+        registration: &Arc<InboundSenders>,
+        state: &Arc<StreamState>,
+    ) -> bool {
+        let peers = lock_unpoisoned(&self.inner.peers);
+        if !peers
+            .get(&peer)
+            .is_some_and(|current| Arc::ptr_eq(current, registration))
+        {
+            return false;
+        }
+        lock_unpoisoned(&registration.streams).push(Arc::downgrade(state));
+        true
+    }
+
+    fn detach_peer(&self, peer_id: PeerId, registration: &Arc<InboundSenders>) {
+        let mut peers = lock_unpoisoned(&self.inner.peers);
+        let remove = peers
+            .get(&peer_id)
+            .is_some_and(|current| Arc::ptr_eq(current, registration));
+        if remove {
+            peers.remove(&peer_id);
+        }
+        drop(peers);
+        for state in lock_unpoisoned(&registration.streams)
+            .drain(..)
+            .filter_map(|state| state.upgrade())
+        {
+            state.close();
+        }
     }
 
     fn ensure_blob_store(&self, peer_id: PeerId) {
@@ -425,99 +516,25 @@ impl Default for LocalNetwork {
 pub struct LocalTransport {
     peer_id: PeerId,
     network: LocalNetwork,
+    registration: Arc<InboundSenders>,
     _exec_inbound_tx: mpsc::Sender<InboundPayload>,
     _fetch_inbound_tx: mpsc::Sender<InboundPayload>,
     exec_inbound_rx: Arc<Mutex<mpsc::Receiver<InboundPayload>>>,
     fetch_inbound_rx: Arc<Mutex<mpsc::Receiver<InboundPayload>>>,
     closed: Arc<StreamState>,
-    /// Peer registry uses `std::sync::Mutex` so transport construction needs no
-    /// async runtime.
-    peers: Arc<StdMutex<HashMap<PeerId, InboundSenders>>>,
-    streams: Arc<StdMutex<HashMap<PeerId, Vec<Weak<StreamState>>>>>,
 }
 
 impl LocalTransport {
-    fn lock_peer_registry(
-        peers: &StdMutex<HashMap<PeerId, InboundSenders>>,
-    ) -> std::sync::MutexGuard<'_, HashMap<PeerId, InboundSenders>> {
-        lock_unpoisoned(peers)
-    }
-
-    fn inbound_sender(
-        &self,
-        peer: &PeerId,
-        proto: StreamProtocol,
-    ) -> Result<mpsc::Sender<InboundPayload>, TransportError> {
-        let peers = Self::lock_peer_registry(&self.peers);
-        peers
-            .get(peer)
-            .map(|senders| match proto {
-                StreamProtocol::Exec => senders.exec.clone(),
-                StreamProtocol::Fetch => senders.fetch.clone(),
-            })
-            .ok_or_else(|| {
-                TransportError::PeerNotFound(format!("peer {peer} not registered on this network"))
-            })
-    }
-
-    fn register_stream(&self, peer: PeerId, state: &Arc<StreamState>) {
-        let mut streams = lock_unpoisoned(&self.streams);
-        streams.entry(peer).or_default().push(Arc::downgrade(state));
-    }
-
-    fn close_streams(&self, peer: PeerId) {
-        let mut streams = lock_unpoisoned(&self.streams);
-        let Some(states) = streams.get_mut(&peer) else {
-            return;
-        };
-        states.retain(|state| {
-            let Some(state) = state.upgrade() else {
-                return false;
-            };
-            state.close();
-            true
-        });
-    }
-
     /// Create N transports sharing the same network and peer registry.
-    #[must_use]
-    pub fn create_network(network: &LocalNetwork, peer_ids: Vec<PeerId>) -> Vec<Self> {
-        let shared_peers: Arc<StdMutex<HashMap<PeerId, InboundSenders>>> =
-            Arc::new(StdMutex::new(HashMap::new()));
-        let streams: Arc<StdMutex<HashMap<PeerId, Vec<Weak<StreamState>>>>> =
-            Arc::new(StdMutex::new(HashMap::new()));
-
+    pub fn create_network(
+        network: &LocalNetwork,
+        peer_ids: Vec<PeerId>,
+    ) -> Result<Vec<Self>, TransportError> {
         let mut transports = Vec::with_capacity(peer_ids.len());
-
         for peer_id in peer_ids {
-            let (exec_inbound_tx, exec_inbound_rx) = mpsc::channel(64);
-            let (fetch_inbound_tx, fetch_inbound_rx) = mpsc::channel(64);
-            {
-                let mut peers = Self::lock_peer_registry(&shared_peers);
-                peers.insert(
-                    peer_id,
-                    InboundSenders {
-                        exec: exec_inbound_tx.clone(),
-                        fetch: fetch_inbound_tx.clone(),
-                    },
-                );
-            }
-            network.ensure_blob_store(peer_id);
-
-            transports.push(Self {
-                peer_id,
-                network: network.clone(),
-                _exec_inbound_tx: exec_inbound_tx,
-                _fetch_inbound_tx: fetch_inbound_tx,
-                exec_inbound_rx: Arc::new(Mutex::new(exec_inbound_rx)),
-                fetch_inbound_rx: Arc::new(Mutex::new(fetch_inbound_rx)),
-                closed: Arc::new(StreamState::new()),
-                peers: shared_peers.clone(),
-                streams: streams.clone(),
-            });
+            transports.push(network.attach(peer_id)?);
         }
-
-        transports
+        Ok(transports)
     }
 
     /// This transport's peer identity.
@@ -570,19 +587,32 @@ impl LocalTransport {
             state: Arc::clone(&state),
         };
 
-        self.register_stream(self.peer_id, &state);
-        self.register_stream(*peer, &state);
+        if !self
+            .network
+            .register_stream(self.peer_id, &self.registration, &state)
+            || self.closed.is_closed()
+        {
+            state.close();
+            return Err(TransportError::ConnectionClosed);
+        }
 
         // Register the shared state before handing the receiver to the remote
         // endpoint. A concurrent remote close must be able to close a stream
         // even while this bounded inbound queue is backpressured.
-        let remote_tx = match self.inbound_sender(peer, proto) {
+        let (remote_tx, remote_registration) = match self.network.inbound_sender(peer, proto) {
             Ok(sender) => sender,
             Err(error) => {
                 state.close();
                 return Err(error);
             }
         };
+        if !self
+            .network
+            .register_stream(*peer, &remote_registration, &state)
+        {
+            state.close();
+            return Err(TransportError::ConnectionClosed);
+        }
         let payload = match (proto, session_hash) {
             (StreamProtocol::Exec, Some(session_hash)) => {
                 InboundPayload::Exec(AcceptedExecStream::new(
@@ -610,10 +640,7 @@ impl LocalTransport {
         if !self.closed.close() {
             return;
         }
-        let mut peers = Self::lock_peer_registry(&self.peers);
-        peers.remove(&self.peer_id);
-        drop(peers);
-        self.close_streams(self.peer_id);
+        self.network.detach_peer(self.peer_id, &self.registration);
     }
 }
 
@@ -961,7 +988,8 @@ mod tests {
     fn transports() -> (LocalNetwork, Vec<LocalTransport>) {
         let network = LocalNetwork::new();
         let peers =
-            LocalTransport::create_network(&network, vec![peer(1), peer(2), peer(3), peer(4)]);
+            LocalTransport::create_network(&network, vec![peer(1), peer(2), peer(3), peer(4)])
+                .expect("attach local transports");
         (network, peers)
     }
 
@@ -994,6 +1022,88 @@ mod tests {
 
     async fn joined(topic: &mut Box<dyn NegotiationTopic>) {
         assert_eq!(topic.recv().await.unwrap(), ProgramTopicEvent::Joined);
+    }
+
+    #[tokio::test]
+    async fn attach_supports_incremental_bidirectional_streams_and_reopen() {
+        let network = LocalNetwork::new();
+        let first = network.attach(peer(1)).expect("attach first peer");
+        let second = network.attach(peer(2)).expect("attach second peer");
+        assert!(matches!(
+            network.attach(peer(1)),
+            Err(TransportError::DuplicatePeer { peer_id }) if peer_id == peer(1)
+        ));
+
+        let first_to_second = first
+            .open_exec(second.peer_id(), SessionHash([31; 32]))
+            .await
+            .expect("open first-to-second stream");
+        let second_recv = second.accept_exec().await.expect("accept first-to-second");
+        let (_, first_recv) = second_recv.into_parts();
+        let first_frame = message_frame(31);
+        let first_send_task =
+            tokio::spawn(async move { first_to_second.send_exec(&first_frame).await });
+        let first_delivery = first_recv
+            .recv_exec()
+            .await
+            .expect("receive first-to-second frame");
+        assert_eq!(first_delivery.source(), peer(1));
+        assert_eq!(first_delivery.frame(), &message_frame(31));
+        first_delivery
+            .acknowledge()
+            .expect("ack first-to-second frame");
+        first_send_task
+            .await
+            .expect("first-to-second send task")
+            .expect("send first-to-second frame");
+
+        let second_to_first = second
+            .open_exec(first.peer_id(), SessionHash([32; 32]))
+            .await
+            .expect("open second-to-first stream");
+        let first_recv = first.accept_exec().await.expect("accept second-to-first");
+        let (_, second_recv) = first_recv.into_parts();
+        let second_frame = message_frame(32);
+        let second_send_task =
+            tokio::spawn(async move { second_to_first.send_exec(&second_frame).await });
+        let second_delivery = second_recv
+            .recv_exec()
+            .await
+            .expect("receive second-to-first frame");
+        assert_eq!(second_delivery.source(), peer(2));
+        assert_eq!(second_delivery.frame(), &message_frame(32));
+        second_delivery
+            .acknowledge()
+            .expect("ack second-to-first frame");
+        second_send_task
+            .await
+            .expect("second-to-first send task")
+            .expect("send second-to-first frame");
+
+        first.close().await;
+        let reopened = network.attach(peer(1)).expect("reopen first peer");
+        // Dropping the closed generation must not detach the reopened peer.
+        drop(first);
+        let reopened_send = reopened
+            .open_fetch(second.peer_id())
+            .await
+            .expect("open stream from reopened peer");
+        let _reopened_recv = second.accept_fetch().await.expect("accept reopened stream");
+        drop(reopened_send);
+    }
+
+    #[test]
+    fn create_network_rolls_back_new_attachments_on_duplicate() {
+        let network = LocalNetwork::new();
+        let _existing = network.attach(peer(1)).expect("attach existing peer");
+        assert!(matches!(
+            LocalTransport::create_network(&network, vec![peer(2), peer(1)]),
+            Err(TransportError::DuplicatePeer { peer_id }) if peer_id == peer(1)
+        ));
+        let recovered = network
+            .attach(peer(2))
+            .expect("failed batch attachment rolled back");
+        drop(recovered);
     }
 
     #[tokio::test]
@@ -1490,7 +1600,8 @@ mod tests {
     #[tokio::test]
     async fn exec_stream_queue_is_bounded_before_receivers_accept() {
         let network = LocalNetwork::with_capacity(1);
-        let peers = LocalTransport::create_network(&network, vec![peer(1), peer(2)]);
+        let peers = LocalTransport::create_network(&network, vec![peer(1), peer(2)])
+            .expect("attach local transports");
         let send = peers[0]
             .open_exec(peers[1].peer_id(), SessionHash([17; 32]))
             .await

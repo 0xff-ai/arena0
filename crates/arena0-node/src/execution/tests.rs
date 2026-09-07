@@ -109,7 +109,8 @@ impl Fixture {
 
         let network = LocalNetwork::new();
         let mut transports =
-            LocalTransport::create_network(&network, vec![local_peer, remote_peer]);
+            LocalTransport::create_network(&network, vec![local_peer, remote_peer])
+                .expect("attach local transports");
         let local_transport = Arc::new(transports.remove(0));
         let remote_transport = Arc::new(transports.remove(0));
         Self {

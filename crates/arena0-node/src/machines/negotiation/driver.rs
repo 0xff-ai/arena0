@@ -1736,6 +1736,7 @@ mod tests {
         let network = LocalNetwork::new();
         let [transport, _]: [LocalTransport; 2] =
             LocalTransport::create_network(&network, vec![crypto.peer_id(), remote.peer_id()])
+                .expect("attach local transports")
                 .try_into()
                 .expect("two transports");
         let transport = Arc::new(transport);

@@ -128,7 +128,7 @@ async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Re
     let client_b = DaemonClient::new(&socket_b);
     let info_b = client_b.call(&Request::DaemonInfo).await?;
     let peer_b = match info_b {
-        ResponseOk::DaemonInfo(info) => info.peer_id,
+        ResponseOk::DaemonInfo(info) => info.host.peer_id,
         other => return Err(anyhow!("unexpected host-02 info response: {other:?}")),
     };
     let program = match client_a.call(&Request::ProgramList).await? {
@@ -159,7 +159,7 @@ async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Re
     };
     let info_a = client_a.call(&Request::DaemonInfo).await?;
     let peer_a = match info_a {
-        ResponseOk::DaemonInfo(info) => info.peer_id,
+        ResponseOk::DaemonInfo(info) => info.host.peer_id,
         other => return Err(anyhow!("unexpected host-01 info response: {other:?}")),
     };
     let created_b = client_b

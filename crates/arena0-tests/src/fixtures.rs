@@ -199,6 +199,7 @@ pub async fn spawn_live_execution(
         transport_peers.push(outsider);
     }
     let transports = LocalTransport::create_network(&network, transport_peers)
+        .expect("attach local transports")
         .into_iter()
         .map(Arc::new)
         .collect::<Vec<_>>();

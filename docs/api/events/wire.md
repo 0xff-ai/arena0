@@ -14,7 +14,11 @@ object. The object must satisfy `MAX_FRAME_BYTES` in
 
 ```json
 {
-  "host": "host-01",
+  "host": {
+    "id": "host-01",
+    "peer_id": "a2f28686c4b4328ae4ce1c3a924d7522e2c08da862e3c2e7af5c912505eaea9a",
+    "user_agent": "arena0d/0.6"
+  },
   "boot_id": "4c7a91f2b8e64d20a5c3f1e89b6d2a47",
   "seq": 12,
   "ts": 1788022419880,
@@ -32,7 +36,8 @@ object. The object must satisfy `MAX_FRAME_BYTES` in
 }
 ```
 
-- `host` identifies the Host that publishes the frame.
+- `host` is the self-contained emission-time HostInfo snapshot for the Host
+  that publishes the frame (`id`, `peer_id`, and optional `user_agent`).
 - `boot_id` identifies one process instance.
 - `seq` is the publisher sequence. It starts at one for publisher events.
 - `ts` is the Unix-millisecond observation time.
@@ -98,14 +103,17 @@ An empty or absent `include` selects all catalog tags. An empty or absent
 
 ```json
 {
-  "host": "host-01",
+  "host": {
+    "id": "host-01",
+    "peer_id": "a2f28686c4b4328ae4ce1c3a924d7522e2c08da862e3c2e7af5c912505eaea9a",
+    "user_agent": "arena0d/0.6"
+  },
   "boot_id": "4c7a91f2b8e64d20a5c3f1e89b6d2a47",
   "seq": 0,
   "ts": 1788022390012,
   "kind": "host.started",
   "data": {
     "version": "0.6.0",
-    "peer_id": "a2f28686c4b4328ae4ce1c3a924d7522e2c08da862e3c2e7af5c912505eaea9a",
     "transport_key": "a2f28686c4b4328ae4ce1c3a924d7522e2c08da862e3c2e7af5c912505eaea9a",
     "socket": "/home/you/arena0/hosts/host-01/arena0.sock",
     "abi_version": 20
@@ -117,7 +125,11 @@ An empty or absent `include` selects all catalog tags. An empty or absent
 
 ```json
 {
-  "host": "host-01",
+  "host": {
+    "id": "host-01",
+    "peer_id": "a2f28686c4b4328ae4ce1c3a924d7522e2c08da862e3c2e7af5c912505eaea9a",
+    "user_agent": "arena0d/0.6"
+  },
   "boot_id": "4c7a91f2b8e64d20a5c3f1e89b6d2a47",
   "seq": 1,
   "ts": 1788022390990,
@@ -135,7 +147,11 @@ An empty or absent `include` selects all catalog tags. An empty or absent
 
 ```json
 {
-  "host": "host-01",
+  "host": {
+    "id": "host-01",
+    "peer_id": "a2f28686c4b4328ae4ce1c3a924d7522e2c08da862e3c2e7af5c912505eaea9a",
+    "user_agent": "arena0d/0.6"
+  },
   "boot_id": "4c7a91f2b8e64d20a5c3f1e89b6d2a47",
   "seq": 2,
   "ts": 1788022391200,
@@ -153,7 +169,11 @@ An empty or absent `include` selects all catalog tags. An empty or absent
 
 ```json
 {
-  "host": "host-01",
+  "host": {
+    "id": "host-01",
+    "peer_id": "a2f28686c4b4328ae4ce1c3a924d7522e2c08da862e3c2e7af5c912505eaea9a",
+    "user_agent": "arena0d/0.6"
+  },
   "boot_id": "4c7a91f2b8e64d20a5c3f1e89b6d2a47",
   "seq": 3,
   "ts": 1788022391700,
@@ -174,7 +194,11 @@ An empty or absent `include` selects all catalog tags. An empty or absent
 
 ```json
 {
-  "host": "host-01",
+  "host": {
+    "id": "host-01",
+    "peer_id": "a2f28686c4b4328ae4ce1c3a924d7522e2c08da862e3c2e7af5c912505eaea9a",
+    "user_agent": "arena0d/0.6"
+  },
   "boot_id": "4c7a91f2b8e64d20a5c3f1e89b6d2a47",
   "seq": 20,
   "ts": 1788022419999,

@@ -66,10 +66,11 @@ The daemon-private emitter records the typed system value on the
 `arena0::system_event` tracing target. It does not own a parallel event bus.
 
 The Unix API exposes `events.subscribe` on each Host socket. The daemon
-sequences `EventFrame` values with the Host name, boot ID, sequence number,
-timestamp, correlation IDs, and typed `EventData`. An occurrence does not
-require a parallel system-event variant; projection remains internal to
-`Events::emit`.
+sequences `EventFrame` values with a self-contained emission-time `HostInfo`
+snapshot, boot ID, sequence number, timestamp, correlation IDs, and typed
+`EventData`. Consumers order frames by `(host.id, boot_id, seq)`. An
+occurrence does not require a parallel system-event variant; projection
+remains internal to `Events::emit`.
 
 ## Assert events in greybox tests
 

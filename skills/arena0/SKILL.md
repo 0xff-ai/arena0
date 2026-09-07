@@ -1,62 +1,109 @@
 ---
 name: arena0
-description: Run and verify an arena0 co-execution through arena0d's Host-explicit MCP tools. Use when an agent should choose a local Host and program, join an exact Ensemble, answer callouts, and verify the resulting session.
+description: Run and verify an arena0 co-execution through arena0d's MCP tools. Use when an agent needs an assigned Host, an exact program and Ensemble, callout handling, and receipt verification.
 ---
 
-# Running an arena0 session
+# Run an arena0 execution
 
-Connect once to the Streamable HTTP endpoint exposed by `arena0d`, normally
-`http://127.0.0.1:7330/mcp`. If `ARENA0_MCP_TOKEN` was set when the daemon
-started, send it as the bearer token for this connection.
+Connect one MCP client to the Streamable HTTP endpoint exposed by `arena0d`,
+normally `http://127.0.0.1:7330/mcp`. If the daemon requires a bearer token,
+send it on this connection. Authentication selects no Host.
 
-The endpoint and token cover the complete local Ensemble. They never select a
-Host. Carry the structured Host reference returned by `list_hosts` in every
-later call. The Host owns identity, signing, admission, execution, persistence,
-sandbox limits, and receipt production. Agent-facing values are JSON; never
-hand-encode program bytes or sign proof material.
+Start by assigning this agent a Host:
+
+```json
+{
+  "user_agent": "claude-code/1.0"
+}
+```
+
+Call `open_host` with that object. To reopen a known Host, include its id:
+
+```json
+{
+  "id": "host-01",
+  "user_agent": "claude-code/1.0"
+}
+```
+
+Use the actual harness name and version in `user_agent`; `claude-code/1.0` is
+only an example.
+
+The result contains the Host reference and public metadata:
+
+```json
+{
+  "host": {"id": "host-01"},
+  "peer_id": "<peer-id>",
+  "user_agent": "claude-code/1.0"
+}
+```
+
+Retain the returned `host` object exactly and pass it in every later
+Host-scoped reference. Keep the `peer_id` and `user_agent` with the result for
+diagnostics; they identify the assigned Host at this point in the session.
+If a later call says that the retained Host id is absent, first call `open_host`
+again with that retained `id` and the same `user_agent`; a daemon may be
+recovering a lazily started namespace. Only if that cannot recover the
+namespace, and the user or task permits replacing the participant, call
+`open_host` without `id` to allocate a fresh Host. Replace the Host reference
+in all later program, execution, and session references only after that
+intentional replacement.
 
 ## Tools
 
 | Tool | Purpose |
 |---|---|
-| `list_hosts` | List every Host supervised by this daemon. |
+| `open_host` | Assign or reopen one local Host and return its `{id}` reference and public metadata. |
 | `list_programs` | List programs installed on one Host. |
-| `inspect_program` | Read one program's summary and full public JSON Schema. |
+| `inspect_program` | Read one program's summary and public JSON Schema. |
 | `start_execution` | Create or join one exact execution on a Host. |
 | `get_execution_status` | Read a durable lifecycle snapshot without waiting. |
-| `await_execution_event` | Wait for a callout, completion, or failure. |
-| `answer_callout` | Answer the pending callout using its inline schema. |
+| `await_execution_event` | Return the next callout, waiting state, completion, or failure. |
+| `answer_callout` | Submit one JSON answer for a pending callout. |
 | `query_execution` | Run a guest-defined read-only JSON query. |
 | `stop_execution` | Withdraw during negotiation or terminate after activation. |
-| `verify_session` | Light-verify proof evidence or fully replay the exact Wasm. |
+| `verify_session` | Verify the Host-produced receipt with light checks or full replay. |
 
-## Workflow
+## Select and inspect a program
 
-1. Call `list_hosts {}` and choose a returned `host` object.
-2. Call `list_programs {"host": <host>}`.
-3. Call `inspect_program` with the `program` reference returned by step 2.
-4. Start or join an execution. Keep the returned structured `execution`
-   reference; it includes both Host and execution id.
-5. Alternate `await_execution_event` and `answer_callout` until completion.
-6. Keep the returned structured `session` reference and call `verify_session`.
+List programs on the assigned Host and retain one exact `program` reference:
 
-Optional fields may be omitted. IDs are lowercase hex strings. Params, answers,
-queries, and outcomes must match the inspected program schema.
+```json
+{"host":{"id":"host-01"}}
+```
 
-## Exact admission
-
-The creator names the exact other daemon-local Hosts:
+Use the returned program content id in both the program reference and
+`inspect_program`:
 
 ```json
 {
   "program": {
-    "host":{"name":"default"},
-    "program_id":"<program-id>"
+    "host": {"id":"host-01"},
+    "program_id": "<program-id>"
+  }
+}
+```
+
+Read the public params, callout, query, and message schemas before sending
+values. Params, answers, queries, and outcomes are JSON. The exact Wasm and
+its public metadata stay owned by the Host.
+
+## Exact admission
+
+The creator supplies the exact other Host ids. Every selected Host must
+already contain the same exact program:
+
+```json
+{
+  "program": {
+    "host": {"id":"host-01"},
+    "program_id": "<program-id>"
   },
-  "params": {"rounds":3},
+  "params": {"rounds": 3},
   "ensemble": {
-    "mode":"explicit",
-    "hosts":[{"name":"host-2"}]
+    "mode": "explicit",
+    "hosts": [{"id":"host-02"}]
   }
 }
 ```
@@ -66,35 +113,58 @@ A joiner names the creator Host and the creator's negotiation id:
 ```json
 {
   "program": {
-    "host":{"name":"host-2"},
-    "program_id":"<program-id>"
+    "host": {"id":"host-02"},
+    "program_id": "<program-id>"
   },
   "ensemble": {
-    "mode":"join",
-    "creator":{"name":"default"},
-    "negotiation_id":"<negotiation-id>"
+    "mode": "join",
+    "creator": {"id":"host-01"},
+    "negotiation_id": "<negotiation-id>"
   }
 }
 ```
 
-Every selected Host must already have the exact program. A joiner normally
-omits params and adopts the creator's immutable terms.
+Keep each returned `execution` reference, including its Host id and execution
+id. A joiner normally omits params and adopts the creator's immutable terms.
 
-## Drive and verify
+## Drive callouts
 
-Call `await_execution_event {"execution":<execution-ref>}` repeatedly.
+Call `await_execution_event` repeatedly with the retained execution reference.
+There is no timeout argument or timeout guarantee in this tool flow.
 
-- On `callout`, read `schema`, `context`, `prompt`, and `pending_id`. The
-  pending id is a decimal string; preserve it exactly. Submit one matching
-  JSON answer with the same execution reference and pending id.
-- On `completed`, retain the returned `session` reference and stop driving.
-- On `failed`, stop and report the reason.
+- `{"event":"waiting"}` means no durable event is ready now. Poll again and
+  advance another Host's execution if the Ensemble has other drivers.
+- `{"event":"callout", "pending_id": ..., "name": ..., "prompt": ..., "schema": ..., "context": ...}`
+  requires one immediate `answer_callout` call. Read the inline `schema` and
+  `context`; submit exactly one JSON `answer` with the same execution and
+  pending id.
+- `{"event":"completed", "session": ..., "outcome": ...}` is terminal.
+  Retain its Host-specific session reference.
+- `{"event":"failed", "reason": ...}` is terminal and should be reported.
 
 Use `get_execution_status` for non-blocking lifecycle inspection and
-`query_execution` for guest-defined read-only state. `stop_execution` is safe
-to repeat after success and chooses withdrawal or termination from lifecycle.
+`query_execution` for a guest-defined read-only query. Use `stop_execution`
+only when the operator asks to withdraw or terminate an execution.
 
-Call `verify_session` with `mode:"light"` for portable cryptographic checks or
-`mode:"full"` to replay the registered Wasm and recover terminal evidence. The
-Host in the session reference identifies the receipt producer; a session id by
-itself never silently selects evidence.
+## Verify the receipt
+
+Verify every completed session using the Host reference embedded in the
+returned session object:
+
+```json
+{
+  "session": {
+    "host": {"id":"host-01"},
+    "session_id": "<session-id>"
+  },
+  "mode": "light"
+}
+```
+
+`light` checks the portable signed evidence. `full` also replays the exact
+registered Wasm. A successful result reports the program, participant set,
+steps, and terminal evidence. A session id alone never selects a receipt
+producer.
+
+Keep Host, program, execution, and session references from tool results. Do
+not invent ids, transfer program bytes, or sign proof material.

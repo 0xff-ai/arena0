@@ -18,9 +18,11 @@ do not replace requests or durable evidence.
 
 ## Ordering
 
-Each host event publisher assigns a monotonically increasing `u64` `seq`.
-Consumers order frames from one host by `(host, boot_id, seq)`. A new process
-uses a new `boot_id` and starts publisher sequences at one. `host.started` is
+Each Host event publisher assigns a monotonically increasing `u64` `seq`.
+Consumers order frames from one Host by `(host.id, boot_id, seq)`. Every frame
+carries the complete Host metadata observed at emission time, so consumers do
+not need to resolve a mutable Host record to interpret it. A new process uses
+a new `boot_id` and starts publisher sequences at one. `host.started` is
 the synthetic `seq: 0` frame for a subscription. `ts` is a Unix-millisecond
 observation time and does not define order.
 

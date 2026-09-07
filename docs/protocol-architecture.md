@@ -572,7 +572,26 @@ The tool catalog is stable across connections and carries an explicit Host
 reference in every Host-scoped request. The endpoint is stateless; its bearer
 token never selects a Host. The adapter dispatches to the same Host services as
 the Unix API and never owns identity, protocol, sandbox, or persistence state.
-The CLI remains a Unix-socket client. `arena0 serve` replaces the CLI process
+MCP `open_host` accepts an optional local `id` and a required `user_agent`.
+The local ID selects a durable namespace, distinct from its cryptographic
+`peer_id`; omitting it allocates a fresh random ID. Reopening an ID preserves
+its identity and updates its durable user agent. The value must be nonblank,
+contain no control characters, and fit within 256 UTF-8 bytes. It describes the
+agent software and is operational metadata, never authenticated identity or
+protocol evidence.
+
+The daemon serializes provisioning through a bounded queue and admits at most
+64 local Hosts independently of each execution's exact participant set. It
+reserves exclusive store ownership before accessing identity custody, restores
+durable state, and binds the socket before publishing a new Host. Failed opens
+release provisional resources. Shutdown rejects queued opens and settles
+in-progress provisioning before closing stores. Persisted namespaces outside
+the configured startup set reopen lazily by ID; startup does not claim every
+Host directory in the shared home.
+
+The CLI remains a Unix-socket client. `arena0 skill` prints the packaged,
+MCP-only agent instructions offline; `--json` wraps the same Markdown in a
+machine-readable response. `arena0 serve` replaces the CLI process
 with the installed `arena0d` executable and provides a persistent service for
 API and MCP clients. Bare `arena0` on a human terminal opens a local workspace;
 `arena0 run` provides the explicit scriptable grammar. These paths may start an
@@ -605,8 +624,12 @@ daemon records redacted values as structured tracing on
 context, signatures, or raw private key material. Terminal proof progress remains internal to the store and protocol. The daemon emits
 only the safe lifecycle and execution observations defined by `arena0-api`.
 
-The Unix API uses its own safe event DTOs. System events do not cross into the
-guest and are not receipt evidence.
+The Unix API uses its own safe event DTOs. `DaemonInfo.host` and each
+`EventFrame.host` expose the local ID, persistent peer ID, and optional user
+agent. Event frames capture this metadata when emitted, so reopening a Host
+with a new user agent does not relabel buffered history. Hosts never opened
+through MCP may have no user agent. System events do not cross into the guest
+and are not receipt evidence.
 
 Operational timings use a separate opt-in `arena0::performance` tracing
 target. Debug records cover aggregate work such as state decode, reducer work,

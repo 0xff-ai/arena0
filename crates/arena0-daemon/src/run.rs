@@ -71,7 +71,15 @@ pub async fn run(names: Vec<HostName>, bootstrap: bool, mcp: McpConfig) -> anyho
         }
     };
     startup::progress(StartupStage::EngineReady, &timeline);
-    let daemon = match Daemon::start_with_timeline(hosts, mcp, engine, Arc::clone(&timeline)).await
+    let daemon = match Daemon::start_with_timeline(
+        hosts,
+        mcp,
+        engine,
+        home,
+        bootstrap,
+        Arc::clone(&timeline),
+    )
+    .await
     {
         Ok(daemon) => daemon,
         Err(error) => {
@@ -151,9 +159,15 @@ mod tests {
         ];
         let mcp = McpConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)), None).expect("MCP config");
         let engine = Arc::new(WasmtimeEngine::new().expect("sandbox engine"));
-        let daemon = Daemon::start(hosts, mcp, engine)
-            .await
-            .expect("start daemon");
+        let daemon = Daemon::start(
+            hosts,
+            mcp,
+            engine,
+            Home::from_root(first.path().to_path_buf()).unwrap(),
+            true,
+        )
+        .await
+        .expect("start daemon");
         let shutdown = async {
             wait_for_socket(&first_socket).await;
             wait_for_socket(&second_socket).await;

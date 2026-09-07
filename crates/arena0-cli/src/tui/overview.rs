@@ -551,6 +551,7 @@ fn render_overview_events(frame: &mut Frame<'_>, state: &ScreenState, area: Rect
         .filter(|event| {
             event
                 .host
+                .id
                 .parse::<HostName>()
                 .is_ok_and(|host| state.host_is_visible(&host))
         })

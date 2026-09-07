@@ -20,7 +20,7 @@ mod verify;
 mod watch;
 mod workspace;
 
-use std::io::IsTerminal as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -107,6 +107,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Print the agent-facing arena0 skill without contacting a Host.
+    Skill,
     /// Start the persistent local Host service.
     Serve(serve::ServeArgs),
     /// Show the selected Host and active executions.
@@ -172,6 +174,12 @@ enum Command {
         #[arg(long)]
         no_tui: bool,
     },
+}
+
+#[derive(serde::Serialize)]
+struct SkillOutput<'a> {
+    name: &'static str,
+    markdown: &'a str,
 }
 
 #[derive(Debug, Subcommand)]
@@ -279,6 +287,9 @@ enum ReceiptCommand {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Some(exit) = dispatch_skill(&cli) {
+        return exit;
+    }
     let _temporary_home = match prepare_temporary_home(cli.tmp) {
         Ok(home) => home,
         Err(error) => {
@@ -310,6 +321,47 @@ fn main() -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Dispatch the offline skill before resolving Home, installing tracing, or
+/// creating a Tokio runtime. The skill is a packaged static artifact and must
+/// remain usable in a clean environment with no Host service.
+fn dispatch_skill(cli: &Cli) -> Option<ExitCode> {
+    if !matches!(cli.command.as_ref(), Some(Command::Skill)) {
+        return None;
+    }
+
+    let result = (|| -> anyhow::Result<()> {
+        if cli.socket.is_some() || cli.host.is_some() || cli.tmp {
+            bail!("--socket, --host, and --tmp do not apply to `arena0 skill`");
+        }
+        let markdown = include_str!("../../../skills/arena0/SKILL.md");
+        let bytes = if cli.json {
+            let mut bytes = serde_json::to_vec(&SkillOutput {
+                name: "arena0",
+                markdown,
+            })
+            .context("encode arena0 skill JSON")?;
+            bytes.push(b'\n');
+            bytes
+        } else {
+            markdown.as_bytes().to_vec()
+        };
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(&bytes)
+            .context("write arena0 skill to stdout")?;
+        stdout.flush().context("flush arena0 skill stdout")?;
+        Ok(())
+    })();
+
+    Some(match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            ExitCode::FAILURE
+        }
+    })
 }
 
 fn prepare_temporary_home(enabled: bool) -> anyhow::Result<Option<tempfile::TempDir>> {
@@ -466,6 +518,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     let command = match command.expect("checked above") {
+        Command::Skill => unreachable!("offline skill returned before runtime setup"),
         Command::Serve(args) => {
             if tmp {
                 bail!(
@@ -570,6 +623,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     };
 
     match command {
+        Command::Skill => unreachable!("offline skill returned before runtime setup"),
         Command::Serve(_) => unreachable!("serve returned before client construction"),
         Command::Status => status(&ctx).await,
         Command::Stop => stop(&ctx).await,
@@ -854,8 +908,7 @@ async fn status(ctx: &Ctx) -> anyhow::Result<()> {
     if ctx.mode.is_json() {
         ui::print_json(&json!({
             "reachable": true,
-            "name": info.name,
-            "peer_id": info.peer_id.to_string(),
+            "host": info.host,
             "socket": info.socket,
             "abi_version": info.abi_version,
             "programs": info.programs,
@@ -864,9 +917,10 @@ async fn status(ctx: &Ctx) -> anyhow::Result<()> {
         }));
     } else {
         println!(
-            "Host {}  peer={}  programs={}  active executions={}  uptime={}s",
-            info.name,
-            info.peer_id.fmt_short(),
+            "Host {}  peer={}  ua={}  programs={}  active executions={}  uptime={}s",
+            info.host.id,
+            info.host.peer_id.fmt_short(),
+            info.host.user_agent.as_deref().unwrap_or("(none)"),
             info.programs,
             active,
             info.uptime_secs

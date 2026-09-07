@@ -195,7 +195,8 @@ unilateral evidence or a shared N-of-N stop commitment.
 | `daemon.stop` | — | `Ack` |
 | `events.subscribe` | `{filter}` | `Subscribed`, then `EventFrame` stream |
 
-`DaemonInfo` contains the selected Host's name, `PeerId`, public identity key,
+`DaemonInfo` contains a `host` object with the selected Host's local `id`,
+`PeerId`, and optional caller `user_agent`, followed by its public identity key,
 version, ABI version, uptime, socket, program count, and active execution count.
 When one Host asks to stop, the process supervisor coordinates shutdown of the
 whole local Ensemble.
@@ -206,31 +207,33 @@ Event tags and filtering are documented in [events/README.md](events/README.md).
 
 `arena0d` exposes one Streamable HTTP endpoint at `/mcp` for the complete local
 Ensemble. MCP auth is daemon-wide and the endpoint is stateless.
-Authentication never selects a Host; Host-scoped calls carry a structured Host
-reference returned by `list_hosts`. Configure the endpoint once in an MCP
-harness and carry those references through the same client. Interleave the
-Host driver states when `await_execution_event` returns `waiting`; do not open
-one MCP session per Host. See
+Authentication never selects a Host; call `open_host` with
+`{id?,user_agent}` to receive an assigned Host reference and public metadata.
+Configure the endpoint once in an MCP harness and carry that reference through
+the same client. Interleave the Host driver states when
+`await_execution_event` returns `waiting`; do not open one MCP session per
+Host. See
 [Connect one harness to an Ensemble](../connect-over-mcp.md).
 
 The stable tool set is:
 
-- discovery: `list_hosts`, `list_programs`, `inspect_program`;
+- discovery: `open_host`, `list_programs`, `inspect_program`;
 - execution: `start_execution`, `get_execution_status`,
   `await_execution_event`, `answer_callout`, `query_execution`,
   `stop_execution`;
 - evidence: `verify_session`.
 
-Host information is represented by `list_hosts`. Negotiation withdrawal and active
-termination are one lifecycle-aware `stop_execution` operation. Params updates
-are unsupported because negotiation terms are immutable. Trace and raw receipt
-retrieval remain operator Unix API/CLI operations rather than agent tools.
+Host information is represented by the `open_host` result. Negotiation
+withdrawal and active termination are one lifecycle-aware `stop_execution`
+operation. Params updates are unsupported because negotiation terms are
+immutable. Trace and raw receipt retrieval remain operator Unix API/CLI
+operations rather than agent tools.
 
 MCP admission names daemon-local Hosts and uses an adjacent tag:
 
 ```json
-{"mode":"explicit","hosts":[{"name":"host-02"}]}
-{"mode":"join","creator":{"name":"host-01"},"negotiation_id":"<negotiation-id>"}
+{"mode":"explicit","hosts":[{"id":"host-02"}]}
+{"mode":"join","creator":{"id":"host-01"},"negotiation_id":"<negotiation-id>"}
 ```
 
 Mode-specific unknown or conflicting fields are rejected before a socket

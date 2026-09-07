@@ -1,8 +1,7 @@
 # Connect one harness to an Ensemble
 
-Use one MCP server entry for the whole local arena0 Ensemble. The endpoint
-returns explicit Host references; it does not bind the MCP client to a current
-Host.
+Use one MCP server entry for the local arena0 Ensemble. The endpoint is
+stateless and does not bind a client to a current Host.
 
 ## Start the service
 
@@ -12,106 +11,139 @@ Start the default two-Host Ensemble and expose its MCP endpoint:
 arena0 serve --mcp-listen 127.0.0.1:7330
 ```
 
-Configure `http://127.0.0.1:7330/mcp` once in the harness. Do not configure a
-separate MCP server entry for each Host. If `ARENA0_MCP_TOKEN` was set when the
-service started, send its value as a bearer token on that one endpoint.
+Configure `http://127.0.0.1:7330/mcp` once in the harness. If
+`ARENA0_MCP_TOKEN` was set when the service started, send its value as a
+bearer token on that connection. Authentication selects no Host.
 
-The endpoint is stateless. A Host is selected only by passing a `host`,
-`program`, `execution`, or `session` reference returned by an arena0 tool.
+## Assign a Host
+
+Call `open_host` before any Host-scoped operation. Pass a stable caller
+identity in `user_agent`; use the actual harness name and version. Omit `id` to
+create a new Host namespace or include the id to reopen an existing one:
+
+```json
+{"user_agent":"claude-code/1.0"}
+```
+
+```json
+{"id":"host-01","user_agent":"claude-code/1.0"}
+```
+
+The result is self-contained public Host metadata:
+
+```json
+{
+  "host": {"id":"host-01"},
+  "peer_id": "<peer-id>",
+  "user_agent": "claude-code/1.0"
+}
+```
+
+Retain the returned `host` object and pass it unchanged in every later
+program, execution, admission, and session reference. If a later operation
+reports that the retained id is absent, first call `open_host` again with the
+retained id and the same user agent so a lazy namespace restart can recover
+the durable identity. Only when that fails, and the user or task permits
+replacing the participant, call `open_host` without `id` to create a fresh
+Host and replace all references. Keep the returned `peer_id` and `user_agent`
+for display and diagnostics.
+
+Do not configure a separate MCP server entry for each Host. The endpoint is
+selected by the server URL; Host selection is explicit in each tool argument.
 
 ## Select the Hosts and program
 
-Call `list_hosts` first. Retain each returned `host` object instead of copying
-its name into a new shape:
+Call `list_programs` for the assigned Host:
+
+```json
+{"host":{"id":"host-01"}}
+```
+
+Select one exact returned `program_id` and inspect it with its Host reference:
 
 ```json
 {
-  "hosts": [
-    {"host": {"name": "host-01"}, "peer_id": "..."},
-    {"host": {"name": "host-02"}, "peer_id": "..."}
-  ]
+  "program": {
+    "host": {"id":"host-01"},
+    "program_id": "<program-id>"
+  }
 }
 ```
 
-Call `list_programs` once for each selected Host. Select the same
-`program_id` from every result. Programs are admitted locally, so one Host's
-`ProgramRef` cannot be used for another Host.
+Every Host selected for an execution must already contain that exact program.
+The local MCP surface does not transfer Wasm between Hosts.
 
 ## Negotiate and activate
 
-Start the creator with the exact other Hosts:
+The creator supplies the exact other Host ids:
 
 ```json
 {
   "program": {
-    "host": {"name": "host-01"},
+    "host": {"id":"host-01"},
     "program_id": "<program-id>"
   },
-  "params": null,
+  "params": {"rounds":3},
   "ensemble": {
-    "mode": "explicit",
-    "hosts": [{"name": "host-02"}]
+    "mode":"explicit",
+    "hosts":[{"id":"host-02"}]
   }
 }
 ```
 
-Retain the returned `execution` and `negotiation_id`. Start the other Host by
-joining that exact negotiation with its own `ProgramRef`:
+A joiner names the creator Host and the creator's negotiation id:
 
 ```json
 {
   "program": {
-    "host": {"name": "host-02"},
+    "host": {"id":"host-02"},
     "program_id": "<program-id>"
   },
-  "params": null,
   "ensemble": {
-    "mode": "join",
-    "creator": {"name": "host-01"},
-    "negotiation_id": "<negotiation-id>"
+    "mode":"join",
+    "creator":{"id":"host-01"},
+    "negotiation_id":"<negotiation-id>"
   }
 }
 ```
 
-The executions are negotiating until every participant commits the offer.
-Poll `get_execution_status` for each returned `ExecRef` when the harness needs
-to display this progress. A Session exists only after activation; active
-statuses from every Host must contain the same `session_id`.
+Retain each returned `execution` reference. The executions remain negotiating
+until every participant commits the exact offer. A joiner normally omits
+params and adopts the creator's immutable terms.
 
 ## Drive every Host through one client
 
-Keep one driver state per Host and advance them through the same configured MCP
-server. For each nonterminal Host:
+Keep one driver state per execution reference. For each nonterminal execution:
 
-1. `await_execution_event` with that Host's `ExecRef`.
-2. If the event is `callout`, immediately call `answer_callout` with its
-   `pending_id` and a JSON answer.
-3. If the event is `waiting`, advance another Host before polling this one
-   again.
-4. Stop advancing that Host when the event is `completed` or `failed`.
+1. Call `await_execution_event` with its retained `execution` reference.
+2. On `callout`, read `pending_id`, `name`, `prompt`, `schema`, and `context`,
+   then immediately call `answer_callout` with one matching JSON answer.
+3. On `waiting`, poll again and advance another Host's execution when one is
+   available. Waiting is an immediate polling result; this flow has no timeout
+   argument or timeout guarantee.
+4. Stop advancing after `completed` or `failed`.
 
-`await_execution_event` returns `waiting` immediately when no durable event is
-ready. This lets a harness interleave all Host drivers through one initialized
-MCP client.
-Do not wait for every Host to return a callout before answering the first one:
-a program can expose participant decisions in sequence, and protocol progress
-can depend on an earlier answer. This coordination does not create a second
-server entry, a second MCP session, or a connection assigned to a Host.
-
-The same rule applies to more than two participants. A five-party execution
-has five independent Host driver loops and one MCP server entry.
+Do not wait for every Host to produce a callout before answering the first one.
+Protocol progress may depend on that answer. The same loop applies to any
+number of participants through the one MCP endpoint.
 
 ## Verify the result
 
-Every completed event returns a Host-specific `SessionRef`. The `session_id`
-must match across the Ensemble, while the embedded Host reference identifies
-which Host's retained evidence to verify.
+Every completed event returns a Host-specific `SessionRef`. The shared
+`session_id` can match across the Ensemble, while the embedded Host reference
+identifies which retained receipt to verify:
 
-Call `verify_session` for every returned `SessionRef`. Use `light` to verify
-the signed evidence without executing Wasm, or `full` to replay the receipt
-with the exact admitted program. A successful result reports the participant
-set, shared step count, and terminal evidence.
+```json
+{
+  "session": {
+    "host":{"id":"host-01"},
+    "session_id":"<session-id>"
+  },
+  "mode":"light"
+}
+```
 
-Keep the references returned by the tools throughout this flow. arena0 has no
-seat token, implicit current Host, remote program transfer, or pre-activation
-Session.
+Call `verify_session` for each returned session. Use `light` for portable
+cryptographic checks or `full` to replay the exact admitted Wasm. Keep all
+references returned by the tools; a session id alone never silently selects a
+receipt producer.

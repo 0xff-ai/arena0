@@ -784,10 +784,11 @@ impl ScreenState {
             RunUpdate::SystemEvent { frame } => {
                 let visible = frame
                     .host
+                    .id
                     .parse::<HostName>()
                     .is_ok_and(|host| self.host_is_visible(&host));
                 let key = EventKey {
-                    host: frame.host.clone(),
+                    host: frame.host.id.clone(),
                     boot_id: frame.boot_id.clone(),
                     seq: frame.seq,
                 };
@@ -2206,11 +2207,19 @@ fn render_hosts(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
             || "-".to_owned(),
             |(agreed, total)| format!("{agreed}/{total}"),
         );
+        let user_agent = state
+            .system_events
+            .iter()
+            .rev()
+            .find(|event| event.host.id == host.host.as_str())
+            .and_then(|event| event.host.user_agent.as_deref())
+            .filter(|user_agent| !user_agent.is_empty())
+            .map_or_else(String::new, |user_agent| format!("  ua={user_agent}"));
         Row::new([
             Cell::from(marker),
             Cell::from(format!(
-                "{}  {controller}\n{lifecycle} #{step}  {agreement}",
-                host.host
+                "{}  {controller}\n{lifecycle} #{step}  {agreement}{user_agent}",
+                host.host,
             )),
         ])
         .height(2)
@@ -2405,7 +2414,10 @@ fn system_event_line(frame: &EventFrame, state: &ScreenState) -> Line<'static> {
             format!("{}  ", events::event_time(frame.ts)),
             state.palette.muted(),
         ),
-        Span::styled(format!("{:<10}", frame.host), state.palette.strong()),
+        Span::styled(
+            format!("{:<10}", events::host_label(&frame.host)),
+            state.palette.strong(),
+        ),
         Span::styled(format!("#{:04}  ", frame.seq), state.palette.muted()),
         Span::styled(kind.to_owned(), state.palette.emphasis()),
         Span::raw(detail),

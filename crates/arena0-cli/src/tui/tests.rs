@@ -1,5 +1,7 @@
 use super::*;
-use arena0_client::api::{ExecStatusState, PrivateEffectSummary, PrivateEventKind, SessionStatus};
+use arena0_client::api::{
+    ExecStatusState, HostInfo, PrivateEffectSummary, PrivateEventKind, SessionStatus,
+};
 
 fn config() -> TuiConfig {
     TuiConfig {
@@ -22,6 +24,14 @@ fn config() -> TuiConfig {
 
 fn first_host() -> HostName {
     "host-01".parse().unwrap()
+}
+
+fn event_host(id: &str) -> HostInfo {
+    HostInfo {
+        id: id.to_owned(),
+        peer_id: PeerId([0; 32]),
+        user_agent: None,
+    }
 }
 
 fn active_status() -> ExecStatus {
@@ -56,7 +66,7 @@ fn negotiation_progress_uses_only_the_selected_host_events() {
     });
     state.system_events.push(
         EventFrame::new(
-            "other",
+            event_host("other"),
             "boot",
             3,
             3,
@@ -73,7 +83,7 @@ fn negotiation_progress_uses_only_the_selected_host_events() {
     );
     state.system_events.push(
         EventFrame::new(
-            "host-01",
+            event_host("host-01"),
             "boot",
             4,
             4,
@@ -825,7 +835,7 @@ fn compare_scope_keeps_distinct_hosts_and_reconciles_hidden_events() {
     for (host, seq) in [("host-01", 1), ("host-02", 2)] {
         state.system_events.push(
             EventFrame::new(
-                host,
+                event_host(host),
                 "boot",
                 seq,
                 seq,

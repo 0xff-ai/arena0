@@ -971,7 +971,7 @@ async fn connect_hosts(
                 HostConnection {
                     host,
                     client,
-                    peer_id: info.peer_id,
+                    peer_id: info.host.peer_id,
                     abi_version: info.abi_version,
                     driver,
                 },
@@ -2578,8 +2578,11 @@ mod tests {
 
     fn daemon_info_response(name: &str, peer: PeerId, socket: &Path) -> Response {
         let info = serde_json::from_value(json!({
-            "name": name,
-            "peer_id": peer,
+            "host": {
+                "id": name,
+                "peer_id": peer,
+                "user_agent": "cli-test/1",
+            },
             "transport_key": format!("{:02x}", peer.0[0]).repeat(32),
             "version": "0.1.0",
             "abi_version": arena0_client::protocol::ABI_VERSION,

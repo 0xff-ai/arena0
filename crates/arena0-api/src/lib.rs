@@ -28,8 +28,8 @@ pub use events::{
 pub use request::{AwaitState, EnsembleSpec, IdRef, ProgramRefError, ReceiptRef, Request};
 pub use response::{
     ActivationInspection, ActivationInspectionState, ActivationParticipant, ApiError, ApiErrorCode,
-    DaemonInfo, ExecStatus, ExecStatusState, ExecutionInspection, FullVerifiedTerminal, IdInfo,
-    LightVerifiedTerminal, NextEvent, PendingCalloutStatus, PrivateCommitSummary,
+    DaemonInfo, ExecStatus, ExecStatusState, ExecutionInspection, FullVerifiedTerminal, HostInfo,
+    IdInfo, LightVerifiedTerminal, NextEvent, PendingCalloutStatus, PrivateCommitSummary,
     PrivateEffectKind, PrivateEffectSummary, PrivateEventKind, ProgramDetail, ProgramSummary,
     ReceiptListEntry, ReceiptProvenance, Response, ResponseOk, SessionProgress, SessionStatus,
     VerifiedResult,

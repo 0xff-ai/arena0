@@ -25,6 +25,9 @@ mod startup;
 mod store;
 mod system_event;
 
+#[cfg(test)]
+mod open_host_tests;
+
 pub use ensemble::{Daemon, HostConfig, McpConfig};
 pub use paths::Paths;
 pub use run::run;

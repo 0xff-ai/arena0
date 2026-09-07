@@ -114,7 +114,8 @@ mod tests {
     #[tokio::test]
     async fn execution_accept_is_independent_of_fetch_frame_wait() {
         let network = LocalNetwork::new();
-        let mut transports = LocalTransport::create_network(&network, vec![peer(1), peer(2)]);
+        let mut transports = LocalTransport::create_network(&network, vec![peer(1), peer(2)])
+            .expect("attach local transports");
         let sender = Arc::new(transports.remove(0));
         let receiver = Arc::new(transports.remove(0));
         let session = SessionHash([7; 32]);

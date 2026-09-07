@@ -381,6 +381,7 @@ dependencies = [
  "arena0-api",
  "arena0-crypto",
  "arena0-daemon",
+ "arena0-home",
  "arena0-node",
  "arena0-program",
  "arena0-protocol",

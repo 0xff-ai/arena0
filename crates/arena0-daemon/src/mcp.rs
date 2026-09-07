@@ -37,9 +37,9 @@ use crate::startup::{self, StartupStage};
 )]
 #[serde(deny_unknown_fields)]
 struct HostRef {
-    /// Daemon-local Host name, as returned by `list_hosts`.
+    /// Daemon-local Host id, as returned by `open_host` or `list_hosts`.
     #[schemars(length(min = 1))]
-    name: String,
+    id: String,
 }
 
 #[derive(
@@ -76,6 +76,23 @@ struct SessionRef {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct EmptyArgs {}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct OpenHostArg {
+    /// Omit to create a new Host; retain the returned id for reopening and retries.
+    id: Option<String>,
+    /// Caller-reported harness and version, for example claude-code/1.0.
+    #[schemars(length(min = 1, max = 256))]
+    user_agent: String,
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct OpenHostOutput {
+    host: HostRef,
+    peer_id: String,
+    user_agent: Option<String>,
+}
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -123,13 +140,13 @@ impl McpEnsemble {
                     if peer == owner_peer {
                         return Err(err(format!(
                             "explicit ensemble must not include its owner Host '{}'",
-                            owner.name
+                            owner.id
                         )));
                     }
                     if !seen.insert(peer) {
                         return Err(err(format!(
                             "explicit ensemble contains Host '{}' more than once",
-                            host.name
+                            host.id
                         )));
                     }
                     peers.push(peer);
@@ -217,6 +234,7 @@ struct VerifySessionArg {
 struct HostOutput {
     host: HostRef,
     peer_id: String,
+    user_agent: Option<String>,
     programs: usize,
     executions_active: usize,
 }
@@ -348,12 +366,12 @@ impl Arena0Mcp {
         service
             .dispatch(request)
             .await
-            .map_err(|error| err(format!("Host '{}': {error}", host.name)))
+            .map_err(|error| err(format!("Host '{}': {error}", host.id)))
     }
 
     fn participant(&self, peer_id: PeerId) -> ParticipantOutput {
         let host = self.daemon.host_name(peer_id).map(|name| HostRef {
-            name: name.to_owned(),
+            id: name.to_owned(),
         });
         ParticipantOutput {
             host,
@@ -364,6 +382,27 @@ impl Arena0Mcp {
 
 #[tool_router]
 impl Arena0Mcp {
+    #[tool(
+        description = "Open or create your Host. Supply its local id to reopen it, or omit id to generate a new Host. Retain the returned reference. user_agent records your harness/version for the monitor; it is not authentication. A repeated call without id creates another Host.",
+        output_schema = output_schema::<OpenHostOutput>(),
+        annotations(title = "Open Host", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn open_host(
+        &self,
+        Parameters(arg): Parameters<OpenHostArg>,
+    ) -> Result<Json<OpenHostOutput>, CallToolResult> {
+        let info = self
+            .daemon
+            .open_host(arg.id, arg.user_agent)
+            .await
+            .map_err(|error| err(format!("{error:#}")))?;
+        Ok(Json(OpenHostOutput {
+            host: HostRef { id: info.id },
+            peer_id: info.peer_id.to_string(),
+            user_agent: info.user_agent,
+        }))
+    }
+
     #[tool(
         description = "List every Host available through this daemon. Use the returned Host names in all other tools.",
         output_schema = output_schema::<HostListOutput>(),
@@ -377,8 +416,9 @@ impl Arena0Mcp {
         for (name, service) in self.daemon.services() {
             match service.dispatch(Request::DaemonInfo).await {
                 Ok(ResponseOk::DaemonInfo(info)) => hosts.push(HostOutput {
-                    host: HostRef { name: name.clone() },
-                    peer_id: info.peer_id.to_string(),
+                    host: HostRef { id: name.clone() },
+                    peer_id: info.host.peer_id.to_string(),
+                    user_agent: info.host.user_agent,
                     programs: info.programs,
                     executions_active: info.execs_active,
                 }),
@@ -472,15 +512,15 @@ impl Arena0Mcp {
                     return match cleanup {
                         Ok(ResponseOk::Ack) => Err(err(format!(
                             "Host '{}' returned execution id {returned_exec_id}, requested {exec_id}; the requested id was withdrawn",
-                            arg.program.host.name
+                            arg.program.host.id
                         ))),
                         Ok(other) => Err(err(format!(
                             "Host '{}' returned execution id {returned_exec_id}, requested {exec_id}; cleanup returned {other:?}",
-                            arg.program.host.name
+                            arg.program.host.id
                         ))),
                         Err(error) => Err(err(format!(
                             "Host '{}' returned execution id {returned_exec_id}, requested {exec_id}; cleanup failed: {error:?}",
-                            arg.program.host.name
+                            arg.program.host.id
                         ))),
                     };
                 }
@@ -529,7 +569,7 @@ impl Arena0Mcp {
         let next = service
             .next_ready(exec_id)
             .await
-            .map_err(|error| err(format!("Host '{}': {error}", execution.host.name)))?;
+            .map_err(|error| err(format!("Host '{}': {error}", execution.host.id)))?;
         let event = match next {
             None => ExecutionEvent::Waiting,
             Some(NextEvent::Callout {
@@ -629,7 +669,7 @@ impl Arena0Mcp {
                 Ok(ResponseOk::Status(status)) => status,
                 Ok(other) => return Err(unexpected(&other)),
                 Err(error) => {
-                    return Err(err(format!("Host '{}': {error}", arg.execution.host.name)));
+                    return Err(err(format!("Host '{}': {error}", arg.execution.host.id)));
                 }
             };
             let lifecycle = status.lifecycle();
@@ -660,7 +700,7 @@ impl Arena0Mcp {
                         _ => {
                             return Err(err(format!(
                                 "Host '{}': {action_error}",
-                                arg.execution.host.name
+                                arg.execution.host.id
                             )));
                         }
                     }
@@ -669,7 +709,7 @@ impl Arena0Mcp {
         }
         Err(err(format!(
             "Host '{}': execution lifecycle did not settle while stopping",
-            arg.execution.host.name
+            arg.execution.host.id
         )))
     }
 
@@ -730,7 +770,7 @@ impl ServerHandler for Arena0Mcp {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.instructions = Some(
-            "arena0d exposes one local Ensemble. Always begin with list_hosts and carry the \
+            "arena0d exposes one local Ensemble. Open your Host with open_host and retain its id across reconnects. Carry the \
              returned Host reference explicitly; there is no implicit current Host. \
              Choose a program with list_programs and inspect_program, start or join one execution, \
              then interleave each Host's await_execution_event calls and answer callouts immediately \
@@ -830,22 +870,30 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 fn service(daemon: &Daemon, host: &HostRef) -> Result<Arc<HostService>, CallToolResult> {
-    daemon.service(&host.name).ok_or_else(|| {
-        let available = daemon.services().keys().cloned().collect::<Vec<_>>();
+    daemon.service(&host.id).ok_or_else(|| {
+        let available = daemon
+            .services()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
         err(format!(
             "unknown Host '{}'; available Hosts: {}",
-            host.name,
+            host.id,
             available.join(", ")
         ))
     })
 }
 
 fn peer_id(daemon: &Daemon, host: &HostRef) -> Result<PeerId, CallToolResult> {
-    daemon.peer_id(&host.name).ok_or_else(|| {
-        let available = daemon.services().keys().cloned().collect::<Vec<_>>();
+    daemon.peer_id(&host.id).ok_or_else(|| {
+        let available = daemon
+            .services()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
         err(format!(
             "unknown Host '{}'; available Hosts: {}",
-            host.name,
+            host.id,
             available.join(", ")
         ))
     })
@@ -944,12 +992,15 @@ mod tests {
         }
         let mcp = McpConfig::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), None)
             .expect("test MCP config");
+        let dynamic_home = arena0_home::Home::from_root(homes[0].path().to_path_buf()).unwrap();
         TestDaemon {
             _homes: homes,
             daemon: Daemon::start(
                 hosts,
                 mcp,
                 Arc::new(WasmtimeEngine::new().expect("sandbox engine")),
+                dynamic_home,
+                true,
             )
             .await
             .expect("start daemon"),
@@ -1059,7 +1110,7 @@ mod tests {
         };
         let output = summary_output(
             &HostRef {
-                name: "host-01".into(),
+                id: "host-01".into(),
             },
             &summary,
         );
@@ -1082,7 +1133,7 @@ mod tests {
             output
                 .hosts
                 .iter()
-                .map(|host| host.host.name.as_str())
+                .map(|host| host.host.id.as_str())
                 .collect::<Vec<_>>(),
             ["alice", "bob"]
         );
@@ -1100,6 +1151,7 @@ mod tests {
             ("inspect_program", true, false, true),
             ("list_hosts", true, false, true),
             ("list_programs", true, false, true),
+            ("open_host", false, false, false),
             ("query_execution", true, false, true),
             ("start_execution", false, false, false),
             ("stop_execution", false, true, true),
@@ -1223,6 +1275,13 @@ mod tests {
     async fn one_mcp_client_drives_two_hosts_to_one_session() {
         timeout(Duration::from_secs(30), async {
             let test = test_daemon().await;
+            let supervisor = tokio::spawn(Arc::clone(&test.daemon).serve());
+            while tokio::net::UnixStream::connect(test._homes[0].path().join("arena0.sock"))
+                .await
+                .is_err()
+            {
+                tokio::task::yield_now().await;
+            }
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind MCP test listener");
@@ -1239,11 +1298,49 @@ mod tests {
                 .await
                 .expect("initialize one MCP client");
 
+            let opened_a = call_mcp_tool(
+                &client,
+                "open_host",
+                serde_json::json!({
+                    "user_agent": "claude-code/test"
+                }),
+            )
+            .await;
+            let opened_b = call_mcp_tool(
+                &client,
+                "open_host",
+                serde_json::json!({
+                    "id": "new-bob", "user_agent": "codex/test"
+                }),
+            )
+            .await;
+            let alice = opened_a["host"].clone();
+            let bob = opened_b["host"].clone();
+            assert_ne!(opened_a["peer_id"], opened_b["peer_id"]);
+            let reopened = call_mcp_tool(
+                &client,
+                "open_host",
+                serde_json::json!({
+                    "id": bob["id"], "user_agent": "codex/new"
+                }),
+            )
+            .await;
+            assert_eq!(reopened["peer_id"], opened_b["peer_id"]);
             let hosts = call_mcp_tool(&client, "list_hosts", serde_json::json!({})).await;
             let hosts = hosts["hosts"].as_array().expect("Host list");
-            assert_eq!(hosts.len(), 2);
-            let alice = hosts[0]["host"].clone();
-            let bob = hosts[1]["host"].clone();
+            assert_eq!(hosts.len(), 4);
+            let row = hosts
+                .iter()
+                .find(|row| row["host"] == bob)
+                .expect("new Host listed");
+            assert_eq!(row["user_agent"], "codex/new");
+            let service = test.daemon.service("new-bob").expect("ready Host");
+            let ResponseOk::DaemonInfo(info) = service.dispatch(Request::DaemonInfo).await.unwrap()
+            else {
+                panic!("expected Host info");
+            };
+            assert_eq!(row["peer_id"], info.host.peer_id.to_string());
+            assert_eq!(info.host.user_agent.as_deref(), Some("codex/new"));
 
             let alice_programs =
                 call_mcp_tool(&client, "list_programs", serde_json::json!({"host": alice})).await;
@@ -1331,13 +1428,13 @@ mod tests {
             let alice_verified = call_mcp_tool(
                 &client,
                 "verify_session",
-                serde_json::json!({"session": alice_session, "mode": "light"}),
+                serde_json::json!({"session": alice_session, "mode": "full"}),
             )
             .await;
             let bob_verified = call_mcp_tool(
                 &client,
                 "verify_session",
-                serde_json::json!({"session": bob_session, "mode": "light"}),
+                serde_json::json!({"session": bob_session, "mode": "full"}),
             )
             .await;
             for verified in [&alice_verified, &bob_verified] {
@@ -1358,6 +1455,10 @@ mod tests {
                 .await
                 .expect_err("aborted MCP server should report cancellation");
             test.daemon.stop().await;
+            supervisor
+                .await
+                .expect("supervisor task")
+                .expect("clean shutdown");
         })
         .await
         .expect("one-client MCP scenario exceeded 30 seconds");

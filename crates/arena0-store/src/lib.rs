@@ -67,6 +67,8 @@ const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ENVELOPE_OVERHEAD: usize = 8 + 2 + 2 + 4 + 32;
 const EXECUTION_WORKING_SET_BYTES: usize = 64 * 1024 * 1024;
+const MAX_USER_AGENT_BYTES: usize = 256;
+const USER_AGENT_COMMAND_OVERHEAD: usize = 512;
 
 /// Maximum number of private commit summaries returned by one inspection page.
 /// The durable store may contain more records; callers use the returned cursor
@@ -1176,6 +1178,18 @@ pub struct Store {
     recovery: RecoveryReport,
 }
 
+/// A process reservation for one store database path.
+///
+/// The reservation owns the store's process lock before the SQLite database
+/// is opened. This lets a daemon reserve ownership before it initializes any
+/// other per-Host state. A reservation is consumed by [`Self::open`], and
+/// dropping it releases the process lock.
+#[derive(Debug)]
+pub struct StoreReservation {
+    path: PathBuf,
+    lock: OwnerLock,
+}
+
 impl std::fmt::Debug for Store {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1382,6 +1396,13 @@ enum Command {
         limit: usize,
         reply: oneshot::Sender<Result<Vec<StoredReceipt>, StoreError>>,
     },
+    LoadUserAgent {
+        reply: oneshot::Sender<Result<Option<String>, StoreError>>,
+    },
+    SetUserAgent {
+        value: String,
+        reply: oneshot::Sender<Result<(), StoreError>>,
+    },
     Shutdown {
         reply: oneshot::Sender<Result<(), StoreError>>,
     },
@@ -1403,11 +1424,24 @@ struct QueuedCommand {
 }
 
 impl Store {
+    /// Reserve process ownership of a store database path.
+    ///
+    /// The SQLite file is not opened by this operation. The returned
+    /// reservation keeps the process lock until it is opened or dropped.
+    pub fn reserve(path: impl AsRef<Path>) -> Result<StoreReservation, StoreError> {
+        let path = path.as_ref().to_path_buf();
+        let lock = acquire_process_lock(&path)?;
+        Ok(StoreReservation { path, lock })
+    }
+
     /// Open a database, acquire its process lock, initialize its schema, and start its
     /// one blocking owner thread.
     pub fn open(config: StoreConfig) -> Result<Self, StoreError> {
         validate_config(&config)?;
-        let lock = acquire_process_lock(&config.path)?;
+        Self::reserve(&config.path)?.open(config)
+    }
+
+    fn open_reserved(config: StoreConfig, lock: OwnerLock) -> Result<Self, StoreError> {
         let (sender, receiver) = mpsc::channel(config.queue_capacity);
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         let owner_config = config.clone();
@@ -1463,6 +1497,24 @@ impl Store {
             .await
             .map_err(|_| StoreError::OwnerPanicked)??;
         Ok(())
+    }
+}
+
+impl StoreReservation {
+    /// Open the reserved database using the matching configuration.
+    ///
+    /// Consuming the reservation ensures that a failed open or path mismatch
+    /// releases the process lock instead of leaving a partially initialized
+    /// reservation alive.
+    pub fn open(self, config: StoreConfig) -> Result<Store, StoreError> {
+        let StoreReservation { path, lock } = self;
+        validate_config(&config)?;
+        if path.as_path() != config.path.as_path() {
+            return Err(StoreError::InvalidConfiguration(
+                "store reservation path does not match store configuration path",
+            ));
+        }
+        Store::open_reserved(config, lock)
     }
 }
 
@@ -1860,6 +1912,23 @@ impl StoreHandle {
             self.command_cost(256, limit, 1_024)?,
         )
         .await?;
+        response.await.map_err(|_| StoreError::ReplyDropped)?
+    }
+
+    /// Load the optional durable Host user agent.
+    pub async fn load_user_agent(&self) -> Result<Option<String>, StoreError> {
+        let (reply, response) = oneshot::channel();
+        self.send(Command::LoadUserAgent { reply }, 128).await?;
+        response.await.map_err(|_| StoreError::ReplyDropped)?
+    }
+
+    /// Persist the Host user agent in the store metadata.
+    pub async fn set_user_agent(&self, value: String) -> Result<(), StoreError> {
+        validate_user_agent(&value)?;
+        let cost = self.command_cost(value.len(), 1, USER_AGENT_COMMAND_OVERHEAD)?;
+        let (reply, response) = oneshot::channel();
+        self.send(Command::SetUserAgent { value, reply }, cost)
+            .await?;
         response.await.map_err(|_| StoreError::ReplyDropped)?
     }
 
@@ -2445,6 +2514,42 @@ fn validate_config(config: &StoreConfig) -> Result<(), StoreError> {
         ));
     }
     Ok(())
+}
+
+/// Validate a Host user agent before it is persisted or used for filesystem
+/// initialization.
+pub fn validate_user_agent(value: &str) -> Result<(), StoreError> {
+    if value.is_empty() {
+        return Err(StoreError::InvalidConfiguration(
+            "user agent must contain at least one UTF-8 byte",
+        ));
+    }
+    if value.len() > MAX_USER_AGENT_BYTES {
+        return Err(StoreError::InvalidConfiguration(
+            "user agent must be at most 256 UTF-8 bytes",
+        ));
+    }
+    if value.chars().all(char::is_whitespace) {
+        return Err(StoreError::InvalidConfiguration(
+            "user agent must contain a non-whitespace character",
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(StoreError::InvalidConfiguration(
+            "user agent must not contain control characters",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_user_agent(bytes: Vec<u8>) -> Result<String, StoreError> {
+    let value = String::from_utf8(bytes).map_err(|error| {
+        StoreError::Corruption(format!("stored user agent is not UTF-8: {error}"))
+    })?;
+    validate_user_agent(&value).map_err(|error| {
+        StoreError::Corruption(format!("stored user agent is invalid: {error}"))
+    })?;
+    Ok(value)
 }
 
 #[cfg(test)]

@@ -57,4 +57,22 @@ for binary in arena0 arena0d cargo-arena0; do
   fi
 done
 PATH="$bin_dir:$PATH" cargo arena0 --version | grep -Fx "cargo-arena0 $expected_version"
-echo "npm smoke test installed and ran arena0, arena0d, and cargo-arena0"
+
+skill_file="$smoke_root/arena0-skill.md"
+"$bin_dir/arena0" skill > "$skill_file"
+if ! cmp -s "$skill_file" "$repo_root/skills/arena0/SKILL.md"; then
+  echo "packaged arena0 skill does not match the canonical SKILL.md" >&2
+  exit 1
+fi
+skill_json_file="$smoke_root/arena0-skill.json"
+"$bin_dir/arena0" --json skill > "$skill_json_file"
+node -e '
+const fs = require("node:fs");
+const [jsonPath, markdownPath] = process.argv.slice(1);
+const value = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
+const markdown = fs.readFileSync(markdownPath, "utf8");
+if (value.name !== "arena0" || value.markdown !== markdown) {
+  throw new Error("packaged arena0 skill JSON has the wrong name or markdown");
+}
+' "$skill_json_file" "$repo_root/skills/arena0/SKILL.md"
+echo "npm smoke test installed and ran arena0, arena0d, cargo-arena0, and arena0 skill"

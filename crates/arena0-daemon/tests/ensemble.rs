@@ -69,9 +69,15 @@ async fn serves_distinct_hosts_on_distinct_sockets() {
     .expect("open node b");
     let mcp = McpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap();
     let engine = Arc::new(arena0_sandbox::WasmtimeEngine::new().expect("sandbox engine"));
-    let supervisor = Daemon::start(vec![host_a, host_b], mcp, engine)
-        .await
-        .expect("start ensemble");
+    let supervisor = Daemon::start(
+        vec![host_a, host_b],
+        mcp,
+        engine,
+        arena0_home::Home::from_root(dir_a.path().to_path_buf()).unwrap(),
+        true,
+    )
+    .await
+    .expect("start ensemble");
 
     let serving = tokio::spawn(Arc::clone(&supervisor).serve());
     wait_for_socket(&socket_a).await;
@@ -79,7 +85,7 @@ async fn serves_distinct_hosts_on_distinct_sockets() {
 
     let info_a = daemon_info(&socket_a).await;
     let info_b = daemon_info(&socket_b).await;
-    assert_ne!(info_a.peer_id, info_b.peer_id);
+    assert_ne!(info_a.host.peer_id, info_b.host.peer_id);
     assert_eq!(info_a.socket, socket_a.display().to_string());
     assert_eq!(info_b.socket, socket_b.display().to_string());
 
@@ -114,9 +120,15 @@ async fn active_identity_cannot_be_removed_over_unix_api() {
     .expect("open node b");
     let mcp = McpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap();
     let engine = Arc::new(arena0_sandbox::WasmtimeEngine::new().expect("sandbox engine"));
-    let supervisor = Daemon::start(vec![host_a, host_b], mcp, engine)
-        .await
-        .expect("start ensemble");
+    let supervisor = Daemon::start(
+        vec![host_a, host_b],
+        mcp,
+        engine,
+        arena0_home::Home::from_root(dir_a.path().to_path_buf()).unwrap(),
+        true,
+    )
+    .await
+    .expect("start ensemble");
 
     let serving = tokio::spawn(Arc::clone(&supervisor).serve());
     wait_for_socket(&socket_a).await;
@@ -135,7 +147,10 @@ async fn active_identity_cannot_be_removed_over_unix_api() {
         "unexpected error: {error}"
     );
     let info = daemon_info(&socket_a).await;
-    assert_eq!(info.peer_id, active_peer, "Host keeps its active identity");
+    assert_eq!(
+        info.host.peer_id, active_peer,
+        "Host keeps its active identity"
+    );
 
     supervisor.stop().await;
     serving
@@ -164,9 +179,15 @@ async fn unix_api_classifies_identity_and_program_input_errors() {
     .expect("open Host b");
     let mcp = McpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap();
     let engine = Arc::new(arena0_sandbox::WasmtimeEngine::new().expect("sandbox engine"));
-    let supervisor = Daemon::start(vec![host_a, host_b], mcp, engine)
-        .await
-        .expect("start daemon");
+    let supervisor = Daemon::start(
+        vec![host_a, host_b],
+        mcp,
+        engine,
+        arena0_home::Home::from_root(dir_a.path().to_path_buf()).unwrap(),
+        true,
+    )
+    .await
+    .expect("start daemon");
 
     let serving = tokio::spawn(Arc::clone(&supervisor).serve());
     wait_for_socket(&socket).await;
@@ -274,9 +295,15 @@ async fn variable_size_program_accepts_supported_explicit_ensemble() {
         .collect();
     let mcp = McpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap();
     let engine = Arc::new(arena0_sandbox::WasmtimeEngine::new().expect("sandbox engine"));
-    let supervisor = Daemon::start(hosts, mcp, engine)
-        .await
-        .expect("start three-Host daemon");
+    let supervisor = Daemon::start(
+        hosts,
+        mcp,
+        engine,
+        arena0_home::Home::from_root(dirs[0].path().to_path_buf()).unwrap(),
+        true,
+    )
+    .await
+    .expect("start three-Host daemon");
 
     let serving = tokio::spawn(Arc::clone(&supervisor).serve());
     for socket in &sockets {

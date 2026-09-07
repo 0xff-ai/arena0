@@ -8,8 +8,9 @@
 //! `exec.new` returns immediately.
 
 use std::collections::HashMap;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant as StdInstant};
 use std::{future::Future, path::PathBuf};
 
@@ -18,7 +19,7 @@ use arena0_api::{
     ActivationInspection, ActivationInspectionState, ActivationParticipant, ApiError, ApiErrorCode,
     DaemonInfo, EnsembleSpec, EventData, EventFilter, EventFrame, ExecLifecycle, ExecOrigin,
     ExecStatus, ExecStatusState, ExecutionFailureKind, ExecutionInspection, FullVerifiedTerminal,
-    LightVerifiedTerminal, NegotiationStage, NextEvent, PendingCalloutStatus,
+    HostInfo, LightVerifiedTerminal, NegotiationStage, NextEvent, PendingCalloutStatus,
     PrivateCommitSummary as ApiPrivateCommitSummary, PrivateEffectKind as ApiPrivateEffectKind,
     PrivateEffectSummary as ApiPrivateEffectSummary, PrivateEventKind as ApiPrivateEventKind,
     ProgramRefError, ReceiptRef, Request, Response, ResponseOk, SessionProgress, SessionStatus,
@@ -667,17 +668,17 @@ fn api_failure(failure: ExecutionFailureCode) -> ExecutionFailureKind {
 /// API frames before broadcast.
 #[derive(Debug, Clone)]
 pub(crate) struct Events {
-    host: String,
+    host: Arc<RwLock<HostInfo>>,
     boot_id: String,
     next_seq: Arc<AtomicU64>,
     events: broadcast::Sender<EventFrame>,
 }
 
 impl Events {
-    pub(crate) fn new(host: String) -> Self {
+    pub(crate) fn new(host: HostInfo) -> Self {
         let (events, _keepalive) = broadcast::channel(EVENT_BUS_CAP);
         Self {
-            host,
+            host: Arc::new(RwLock::new(host)),
             boot_id: hex::encode(rand::random::<[u8; 16]>()),
             next_seq: Arc::new(AtomicU64::new(1)),
             events,
@@ -724,7 +725,10 @@ impl Events {
         session_id: Option<SessionHash>,
     ) -> EventFrame {
         EventFrame::new(
-            self.host.clone(),
+            self.host
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
             self.boot_id.clone(),
             seq,
             unix_time_ms(),
@@ -740,25 +744,44 @@ impl Events {
 #[derive(Debug)]
 struct UnixSocket {
     path: PathBuf,
+    owned_inode: StdMutex<Option<(u64, u64)>>,
 }
 
 impl UnixSocket {
     fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            owned_inode: StdMutex::new(None),
+        }
     }
 
-    async fn listen<H, F>(
-        &self,
-        host: &str,
-        shutdown: &tokio::sync::Notify,
-        startup: &StartupTimeline,
-        handler: H,
-    ) -> anyhow::Result<()>
-    where
-        H: Fn(UnixStream) -> F + Clone + Send + 'static,
-        F: Future<Output = anyhow::Result<()>> + Send + 'static,
-    {
-        let _ = std::fs::remove_file(&self.path);
+    fn remove_owned_path(&self) {
+        let owned = self
+            .owned_inode
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(inode) = owned
+            && let Ok(metadata) = std::fs::symlink_metadata(&self.path)
+            && (metadata.dev(), metadata.ino()) == inode
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn bind(&self, host: &str, startup: &StartupTimeline) -> anyhow::Result<UnixListener> {
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    metadata.file_type().is_socket(),
+                    "socket path is occupied: {}",
+                    self.path.display()
+                );
+                std::fs::remove_file(&self.path).context("remove stale Host socket")?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("inspect Host socket"),
+        }
         let listener = match UnixListener::bind(&self.path) {
             Ok(listener) => listener,
             Err(error) => {
@@ -766,17 +789,35 @@ impl UnixSocket {
                 return Err(error).with_context(|| format!("bind {}", self.path.display()));
             }
         };
+        let metadata =
+            std::fs::symlink_metadata(&self.path).context("inspect bound Host socket")?;
+        *self
+            .owned_inode
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((metadata.dev(), metadata.ino()));
         if let Err(error) = std::fs::set_permissions(
             &self.path,
             std::os::unix::fs::PermissionsExt::from_mode(0o600),
         ) {
-            let _ = std::fs::remove_file(&self.path);
+            self.remove_owned_path();
             startup::host_progress(StartupStage::Failed, host, startup);
             return Err(error).with_context(|| format!("chmod 0600 {}", self.path.display()));
         }
         tracing::info!(socket = %self.path.display(), %host, "arena0d listening");
         startup::host_progress(StartupStage::HostReady, host, startup);
+        Ok(listener)
+    }
 
+    async fn listen<H, F>(
+        &self,
+        listener: UnixListener,
+        shutdown: &tokio::sync::Notify,
+        handler: H,
+    ) -> anyhow::Result<()>
+    where
+        H: Fn(UnixStream) -> F + Clone + Send + 'static,
+        F: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
         let mut connections = JoinSet::new();
         let result = loop {
             tokio::select! {
@@ -804,14 +845,14 @@ impl UnixSocket {
         connections.abort_all();
         while connections.join_next().await.is_some() {}
         drop(connections);
-        let _ = std::fs::remove_file(&self.path);
+        self.remove_owned_path();
         result
     }
 }
 
 impl Drop for UnixSocket {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        self.remove_owned_path();
     }
 }
 
@@ -1018,6 +1059,29 @@ impl HostService {
         self.peer_id
     }
 
+    pub(crate) fn socket_path(&self) -> &std::path::Path {
+        &self.paths.socket
+    }
+
+    /// One projection of identity and the latest persisted harness metadata.
+    pub(crate) fn host_info(&self) -> HostInfo {
+        self.events
+            .host
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub(crate) async fn set_user_agent(&self, user_agent: String) -> anyhow::Result<()> {
+        self.store.set_user_agent(user_agent.clone()).await?;
+        self.events
+            .host
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .user_agent = Some(user_agent);
+        Ok(())
+    }
+
     /// Start the daemon's protocol runtime and host services.
     #[cfg(test)]
     fn start(init: HostServiceInit) -> anyhow::Result<Arc<Self>> {
@@ -1064,7 +1128,11 @@ impl HostService {
             runtime_peer = runtime.peer_id,
         );
         let execs = Arc::new(ExecutionHandles::new(store.clone()));
-        let events = Events::new(name.clone());
+        let events = Events::new(HostInfo {
+            id: name.clone(),
+            peer_id,
+            user_agent: None,
+        });
         let socket = UnixSocket::new(paths.socket.clone());
 
         let tasks = JoinSet::new();
@@ -1232,24 +1300,42 @@ impl HostService {
     pub(crate) fn host_started_frame(&self) -> EventFrame {
         self.events.snapshot(EventData::HostStarted {
             version: env!("CARGO_PKG_VERSION").to_string(),
-            peer_id: self.peer_id,
             transport_key: AgentPubKey(self.peer_id.0),
             socket: self.paths.socket.display().to_string(),
             abi_version: ABI_VERSION,
         })
     }
 
-    /// Serve requests on the Unix socket until the listener errors.
-    pub(crate) async fn serve(self: Arc<Self>) -> anyhow::Result<()> {
+    /// Finish recovery and bind the listener before the supervisor publishes
+    /// a newly opened Host. No request is accepted until `serve_prepared`.
+    pub(crate) async fn prepare(self: &Arc<Self>) -> anyhow::Result<UnixListener> {
         startup::host_progress(StartupStage::HostStarting, &self.name, &self.startup);
+        let user_agent = self.store.load_user_agent().await?;
+        self.events
+            .host
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .user_agent = user_agent;
         if let Err(error) = self.resume_durable().await {
             startup::host_progress(StartupStage::Failed, &self.name, &self.startup);
             return Err(error);
         }
+        self.socket.bind(&self.name, &self.startup)
+    }
+
+    /// Relinquish the socket path before releasing the provisional store owner.
+    pub(crate) fn remove_prepared_socket(&self) {
+        self.socket.remove_owned_path();
+    }
+
+    pub(crate) async fn serve_prepared(
+        self: Arc<Self>,
+        listener: UnixListener,
+    ) -> anyhow::Result<()> {
         let daemon = Arc::clone(&self);
         let listen_result = self
             .socket
-            .listen(&self.name, &self.shutdown, &self.startup, move |stream| {
+            .listen(listener, &self.shutdown, move |stream| {
                 Arc::clone(&daemon).serve_conn(stream)
             })
             .await;
@@ -1906,8 +1992,7 @@ impl HostService {
                     })?
                     .len();
                 Ok(ResponseOk::DaemonInfo(DaemonInfo {
-                    name: self.name.clone(),
-                    peer_id: self.peer_id,
+                    host: self.host_info(),
                     transport_key: AgentPubKey(self.peer_id.0),
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     abi_version: ABI_VERSION,
@@ -3854,7 +3939,8 @@ mod tests {
         let engine = Arc::new(WasmtimeEngine::new().unwrap());
 
         let network = LocalNetwork::new();
-        let mut transports = LocalTransport::create_network(&network, vec![identity.peer_id]);
+        let mut transports =
+            LocalTransport::create_network(&network, vec![identity.peer_id]).expect("test network");
         let daemon = HostService::start(HostServiceInit {
             name: "host-01".into(),
             transport: Arc::new(transports.remove(0)),
@@ -3938,7 +4024,7 @@ mod tests {
         let started = daemon.host_started_frame();
         assert_eq!(started.kind(), "host.started");
         assert_eq!(started.seq, 0);
-        assert_eq!(started.host, "host-01");
+        assert_eq!(started.host.id, "host-01");
         assert_eq!(started.boot_id.len(), 32);
         assert!(filter.matches(&started));
         daemon.stop().await;
@@ -4050,8 +4136,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn released_socket_owner_cannot_unlink_a_replacement() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("host.sock");
+        let timeline = StartupTimeline::new(1, 0);
+        let old = UnixSocket::new(path.clone());
+        let listener = old.bind("host", &timeline).unwrap();
+        old.remove_owned_path();
+        drop(listener);
+        let replacement = UnixListener::bind(&path).unwrap();
+        drop(old);
+        assert!(UnixStream::connect(&path).await.is_ok());
+        drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn failed_socket_bind_preserves_an_unowned_path() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("host.sock");
+        std::fs::write(&path, b"occupied").unwrap();
+        let socket = UnixSocket::new(path.clone());
+        assert!(socket.bind("host", &StartupTimeline::new(1, 0)).is_err());
+        drop(socket);
+        assert_eq!(std::fs::read(&path).unwrap(), b"occupied");
+    }
+
+    #[tokio::test]
     async fn host_event_projects_to_api_once() {
-        let feed = Events::new("paired".into());
+        let feed = Events::new(HostInfo {
+            id: "paired".into(),
+            peer_id: PeerId([1; 32]),
+            user_agent: None,
+        });
         let mut api_events = feed.subscribe();
         let event = HostEvent::Created {
             source: EventSource::Execution {
@@ -4071,7 +4187,7 @@ mod tests {
         assert!(matches!(received.data, EventData::Created { .. }));
         assert_eq!(received.exec_id, Some(ExecId([0x32; 32])));
         assert_eq!(received.seq, 1);
-        assert_eq!(received.host, "paired");
+        assert_eq!(received.host.id, "paired");
         assert_eq!(received.boot_id.len(), 32);
 
         let mut lagged = feed.subscribe();
@@ -4085,12 +4201,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_metadata_is_captured_after_persistence_without_relabelling_old_frames() {
+        let (_dir, _store, daemon, peer) = test_daemon();
+        let mut frames = daemon.events.subscribe();
+        daemon.set_user_agent("claude-code/1".into()).await.unwrap();
+        daemon.events.emit(HostEvent::HostStopped {
+            reason: None,
+            uptime_secs: 1,
+        });
+        daemon.set_user_agent("codex/2".into()).await.unwrap();
+        daemon.events.emit(HostEvent::HostStopped {
+            reason: None,
+            uptime_secs: 2,
+        });
+        let first = frames.recv().await.unwrap();
+        let second = frames.recv().await.unwrap();
+        assert_eq!(first.host.peer_id, peer);
+        assert_eq!(first.host.user_agent.as_deref(), Some("claude-code/1"));
+        assert_eq!(second.host.user_agent.as_deref(), Some("codex/2"));
+        assert_eq!(second.seq, first.seq + 1);
+        assert_eq!(
+            daemon.store.load_user_agent().await.unwrap().as_deref(),
+            Some("codex/2")
+        );
+        let snapshot = daemon.host_started_frame();
+        assert_eq!(snapshot.seq, 0);
+        assert_eq!(snapshot.host, second.host);
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
     async fn daemon_info_reports_the_node_identity() {
         let (_dir, _store, daemon, peer) = test_daemon();
         match daemon.dispatch(Request::DaemonInfo).await {
             Ok(ResponseOk::DaemonInfo(info)) => {
-                assert_eq!(info.name, "host-01");
-                assert_eq!(info.peer_id, peer);
+                assert_eq!(info.host.id, "host-01");
+                assert_eq!(info.host.peer_id, peer);
                 assert_eq!(info.socket, daemon.paths.socket.display().to_string());
                 assert_eq!(info.programs, 0);
             }

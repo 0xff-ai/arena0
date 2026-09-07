@@ -12,7 +12,7 @@ use arena0_protocol::{
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-use crate::{ApiError, ApiErrorCode};
+use crate::{ApiError, ApiErrorCode, HostInfo};
 
 /// Why an execution record was created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,7 +62,6 @@ pub enum EventData {
     #[serde(rename = "host.started")]
     HostStarted {
         version: String,
-        peer_id: PeerId,
         transport_key: AgentPubKey,
         socket: String,
         abi_version: u32,
@@ -220,7 +219,7 @@ impl EventData {
 /// One pushed event on a subscription stream.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EventFrame {
-    pub host: String,
+    pub host: HostInfo,
     pub boot_id: String,
     pub seq: u64,
     pub ts: u64,
@@ -235,7 +234,7 @@ pub struct EventFrame {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawEventFrame {
-    host: String,
+    host: HostInfo,
     boot_id: String,
     seq: u64,
     ts: u64,
@@ -250,7 +249,7 @@ struct RawEventFrame {
 impl EventFrame {
     /// Construct a frame while enforcing its event/correlation contract.
     pub fn new(
-        host: impl Into<String>,
+        host: HostInfo,
         boot_id: impl Into<String>,
         seq: u64,
         ts: u64,
@@ -259,7 +258,7 @@ impl EventFrame {
         session_id: Option<SessionHash>,
     ) -> Result<Self, ApiError> {
         let frame = Self {
-            host: host.into(),
+            host,
             boot_id: boot_id.into(),
             seq,
             ts,
@@ -496,12 +495,29 @@ mod tests {
         SessionHash([byte; 32])
     }
 
+    fn host_info(id: &str) -> HostInfo {
+        HostInfo {
+            id: id.into(),
+            peer_id: PeerId([2; 32]),
+            user_agent: Some("test-agent/1".into()),
+        }
+    }
+
     fn frame(
         data: EventData,
         exec_id: Option<ExecId>,
         session_id: Option<SessionHash>,
     ) -> EventFrame {
-        EventFrame::new("host-01", "boot-00", 1, 2, data, exec_id, session_id).unwrap()
+        EventFrame::new(
+            host_info("host-01"),
+            "boot-00",
+            1,
+            2,
+            data,
+            exec_id,
+            session_id,
+        )
+        .unwrap()
     }
 
     fn all_frames() -> Vec<EventFrame> {
@@ -516,7 +532,6 @@ mod tests {
             frame(
                 EventData::HostStarted {
                     version: "0.1.0".into(),
-                    peer_id: peer,
                     transport_key: AgentPubKey([7; 32]),
                     socket: "/tmp/a".into(),
                     abi_version: 19,
@@ -685,7 +700,9 @@ mod tests {
             let json = serde_json::to_value(&frame).unwrap();
             assert!(json.get("kind").and_then(Value::as_str).is_some());
             assert!(json.get("data").is_some());
-            assert_eq!(json.get("host").unwrap(), "host-01");
+            assert_eq!(json["host"]["id"], "host-01");
+            assert_eq!(json["host"]["peer_id"], PeerId([2; 32]).to_string());
+            assert_eq!(json["host"]["user_agent"], "test-agent/1");
             assert_eq!(json.get("boot_id").unwrap(), "boot-00");
             let decoded: EventFrame = serde_json::from_value(json.clone()).unwrap();
             assert_eq!(decoded, frame);
@@ -728,15 +745,35 @@ mod tests {
     #[test]
     fn correlation_is_enforced_by_constructor_and_deserializer() {
         let data = EventData::NegotiationStarted { target_size: 2 };
-        assert!(EventFrame::new("n", "b", 1, 2, data.clone(), None, None).is_err());
+        assert!(EventFrame::new(host_info("n"), "b", 1, 2, data.clone(), None, None).is_err());
         assert!(
-            EventFrame::new("n", "b", 1, 2, data.clone(), Some(id(1)), Some(session(2))).is_err()
+            EventFrame::new(
+                host_info("n"),
+                "b",
+                1,
+                2,
+                data.clone(),
+                Some(id(1)),
+                Some(session(2))
+            )
+            .is_err()
         );
         let terminated = EventData::Terminated {
             reason: "runtime".into(),
             failed_class: Some(ExecutionFailureKind::Runtime),
         };
-        assert!(EventFrame::new("n", "b", 1, 2, terminated, Some(id(1)), Some(session(2))).is_ok());
+        assert!(
+            EventFrame::new(
+                host_info("n"),
+                "b",
+                1,
+                2,
+                terminated,
+                Some(id(1)),
+                Some(session(2))
+            )
+            .is_ok()
+        );
         let frame = frame(data, Some(id(1)), None);
         let mut json = serde_json::to_value(frame).unwrap();
         json["exec_id"] = Value::Null;
@@ -771,7 +808,6 @@ mod tests {
         let started_frame = frame(
             EventData::HostStarted {
                 version: "0.1.0".into(),
-                peer_id: PeerId([1; 32]),
                 transport_key: AgentPubKey([2; 32]),
                 socket: "/tmp/arena0.sock".into(),
                 abi_version: 1,

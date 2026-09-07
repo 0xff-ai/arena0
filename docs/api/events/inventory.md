@@ -1,8 +1,10 @@
 # Event inventory
 
-The local daemon publishes 21 event tags. Each `EventFrame` contains `host`,
-`boot_id`, `seq`, `ts`, `kind`, and `data`. Execution events also contain
-`exec_id`. Events emitted after the session is identified contain `session_id`.
+The local daemon publishes 21 event tags. Each `EventFrame` contains a
+self-contained emission-time `host` snapshot (`id`, `peer_id`, and optional
+`user_agent`), `boot_id`, `seq`, `ts`, `kind`, and `data`. Execution events also
+contain `exec_id`. Events emitted after the session is identified contain
+`session_id`.
 
 Public types live in `crates/arena0-api/src/events.rs`. The daemon emits each
 host occurrence once and projects it to the local event stream.
@@ -11,12 +13,13 @@ host occurrence once and projects it to the local event stream.
 
 | Tag | Data |
 |---|---|
-| `host.started` | `{version, peer_id, transport_key, socket, abi_version}` |
+| `host.started` | `{version, transport_key, socket, abi_version}` |
 | `host.stopped` | `{reason?, uptime_secs}` |
 
-`host.started` is a per-subscription snapshot. It follows the `Subscribed`
-acknowledgement, uses `seq: 0`, and bypasses the filter. `host.stopped` is a
-normal shutdown event.
+`host.started` is a per-subscription snapshot. Its envelope `host` carries the
+snapshot's `peer_id` and optional `user_agent`; those fields are not repeated
+in `data`. It follows the `Subscribed` acknowledgement, uses `seq: 0`, and
+bypasses the filter. `host.stopped` is a normal shutdown event.
 
 ## Offer events
 

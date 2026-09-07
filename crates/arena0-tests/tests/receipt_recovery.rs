@@ -132,7 +132,8 @@ async fn recover_after(cut: CrashAfter) {
             "lost recovery work at {cut:?}"
         );
         let network = LocalNetwork::new();
-        let mut transports = LocalTransport::create_network(&network, peers.clone());
+        let mut transports = LocalTransport::create_network(&network, peers.clone())
+            .expect("attach local transports");
         let transport = Arc::new(transports.remove(0));
         let identity = Arc::new(provider(7));
         let host = Host::start(Arc::clone(&identity), transport, store.handle().clone());

@@ -377,6 +377,116 @@ async fn sqlite_owner_survives_reopen() {
 }
 
 #[tokio::test]
+async fn reservation_holds_lock_before_open_and_releases_failed_open() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("store.sqlite");
+    let reservation = Store::reserve(&path).expect("reserve");
+    assert!(!path.exists(), "reservation must not open the database");
+    assert!(matches!(
+        Store::reserve(&path),
+        Err(StoreError::AlreadyOwned { .. })
+    ));
+
+    let mismatch = reservation.open(StoreConfig::new(
+        directory.path().join("different.sqlite"),
+        host(1),
+    ));
+    assert!(matches!(
+        mismatch,
+        Err(StoreError::InvalidConfiguration(message))
+            if message.contains("reservation path")
+    ));
+    let store = Store::reserve(&path)
+        .expect("path mismatch must release reservation")
+        .open(StoreConfig::new(&path, host(1)))
+        .expect("open after mismatch");
+    store.shutdown().await.expect("shutdown after mismatch");
+
+    let reservation = Store::reserve(&path).expect("reserve after open failure");
+    assert!(matches!(
+        reservation.open(StoreConfig::new(&path, host(1)).with_queue_capacity(0)),
+        Err(StoreError::InvalidConfiguration(_))
+    ));
+    let store = Store::reserve(&path)
+        .expect("failed open must release reservation")
+        .open(StoreConfig::new(&path, host(1)))
+        .expect("open after failed open");
+    store.shutdown().await.expect("shutdown after failed open");
+}
+
+#[tokio::test]
+async fn user_agent_is_optional_durable_and_validated() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("store.sqlite");
+    let config = StoreConfig::new(&path, host(1));
+    let store = Store::open(config.clone()).expect("open");
+
+    assert_eq!(store.handle().load_user_agent().await.expect("load"), None);
+    for value in [
+        String::new(),
+        "   \t".to_owned(),
+        "agent\nname".to_owned(),
+        "x".repeat(MAX_USER_AGENT_BYTES + 1),
+        "é".repeat(128 + 1),
+    ] {
+        assert!(matches!(
+            store.handle().set_user_agent(value).await,
+            Err(StoreError::InvalidConfiguration(_))
+        ));
+    }
+
+    let value = "arena0-test/1.0".to_owned();
+    store
+        .handle()
+        .set_user_agent(value.clone())
+        .await
+        .expect("set");
+    assert_eq!(
+        store.handle().load_user_agent().await.expect("load"),
+        Some(value.clone())
+    );
+    store.shutdown().await.expect("shutdown");
+
+    let reopened = Store::open(config).expect("reopen");
+    assert_eq!(
+        reopened
+            .handle()
+            .load_user_agent()
+            .await
+            .expect("load after reopen"),
+        Some(value)
+    );
+    reopened.shutdown().await.expect("shutdown reopened");
+}
+
+#[tokio::test]
+async fn corrupt_user_agent_metadata_is_rejected() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("store.sqlite");
+    let store = Store::open(StoreConfig::new(&path, host(1))).expect("open");
+    store
+        .handle()
+        .set_user_agent("valid-agent".to_owned())
+        .await
+        .expect("set");
+    store.shutdown().await.expect("shutdown");
+
+    let connection = Connection::open(&path).expect("inspect");
+    connection
+        .execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'user_agent'",
+            params![vec![0xff_u8]],
+        )
+        .expect("corrupt metadata");
+    drop(connection);
+
+    assert!(matches!(
+        Store::open(StoreConfig::new(&path, host(1))),
+        Err(StoreError::Corruption(message)) if message.contains("user agent")
+    ));
+}
+
+#[tokio::test]
 async fn execution_claim_is_exclusive_across_handles_and_released_on_drop() {
     let directory = tempfile::tempdir().expect("tempdir");
     let store = Store::open(StoreConfig::new(

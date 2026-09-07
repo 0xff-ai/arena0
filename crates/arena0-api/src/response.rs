@@ -76,13 +76,20 @@ pub enum ResponseOk {
     Subscribed,
 }
 
-/// The merged `daemon.info` response: the daemon's own identity and liveness plus
-/// the Host-level counts. One daemon is one Host, so this is the only Host
-/// summary the wire carries.
+/// Public metadata for one Host. The local id locates its namespace; the peer
+/// identity belongs to its retained keys. User agent is caller-reported metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostInfo {
+    pub id: String,
+    pub peer_id: PeerId,
+    pub user_agent: Option<String>,
+}
+
+/// The `daemon.info` response for one Host supervised by the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonInfo {
-    pub name: String,
-    pub peer_id: PeerId,
+    pub host: HostInfo,
     pub transport_key: AgentPubKey,
     pub version: String,
     pub abi_version: u32,

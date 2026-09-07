@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use arena0_protocol::PeerId;
 use thiserror::Error;
 
 /// Every failure produced by a transport operation.
@@ -33,6 +34,9 @@ pub enum TransportError {
     /// No connection exists for the given peer.
     #[error("peer not found: {0}")]
     PeerNotFound(String),
+    /// A peer identity is already attached to the local network.
+    #[error("peer already attached: {peer_id}")]
+    DuplicatePeer { peer_id: PeerId },
     /// The operation exceeded its deadline.
     #[error("timeout after {0}ms")]
     Timeout(u64),

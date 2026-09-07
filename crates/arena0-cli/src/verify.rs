@@ -99,7 +99,7 @@ pub(crate) async fn verify_hosts(
                 host,
                 HostEvidence {
                     receipt_id,
-                    peer_id: info.peer_id,
+                    peer_id: info.host.peer_id,
                     program_id,
                     session_id,
                     ensemble,
@@ -347,7 +347,7 @@ async fn enrich_offline(ctx: &Ctx, program_id: ProgramHash) -> (Option<String>, 
 
 async fn node_peer_id(ctx: &Ctx) -> Option<PeerId> {
     match ctx.client().call(&Request::DaemonInfo).await {
-        Ok(ResponseOk::DaemonInfo(i)) => Some(i.peer_id),
+        Ok(ResponseOk::DaemonInfo(i)) => Some(i.host.peer_id),
         _ => None,
     }
 }

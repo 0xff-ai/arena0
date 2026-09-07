@@ -227,7 +227,7 @@ fn render_host_inspector(
 
 fn observed_lines(lines: &mut Vec<Line<'static>>, state: &ScreenState, host: &HostName) {
     let events = state.system_events.iter().filter(|frame| {
-        frame.host == host.as_str()
+        frame.host.id == host.as_str()
             && frame.exec_id == state.host_status(host).map(|s| s.exec_id)
             && (frame.kind() == "negotiation.offer_seen"
                 || frame.kind().starts_with("exec.negotiation."))
@@ -333,14 +333,14 @@ fn participant_lines(
             .system_events
             .iter()
             .rev()
-            .filter(|frame| frame.host == host.as_str() && frame.exec_id == Some(exec_id))
+            .filter(|frame| frame.host.id == host.as_str() && frame.exec_id == Some(exec_id))
             .find_map(|frame| match &frame.data {
                 EventData::NegotiationPeers { peers, .. } => Some(peers.clone()),
                 _ => None,
             })
             .unwrap_or_default();
         for frame in state.system_events.iter().rev() {
-            if frame.host != host.as_str() || frame.exec_id != Some(exec_id) {
+            if frame.host.id != host.as_str() || frame.exec_id != Some(exec_id) {
                 continue;
             }
             if let EventData::NegotiationTicketAccepted { participant, .. } = &frame.data
@@ -357,7 +357,7 @@ fn participant_lines(
         } else {
             for peer in peers {
                 let ticket = state.system_events.iter().rev().find_map(|frame| {
-                    if frame.host != host.as_str() || frame.exec_id != Some(exec_id) {
+                    if frame.host.id != host.as_str() || frame.exec_id != Some(exec_id) {
                         return None;
                     }
                     match &frame.data {
@@ -462,7 +462,7 @@ pub(super) fn latest_ticket_progress(state: &ScreenState) -> Option<(u16, u16)> 
     let host = state.primary_host()?;
     let exec_id = state.host_status(host)?.exec_id;
     state.system_events.iter().rev().find_map(|frame| {
-        if frame.exec_id != Some(exec_id) || frame.host != host.as_str() {
+        if frame.exec_id != Some(exec_id) || frame.host.id != host.as_str() {
             return None;
         }
         match &frame.data {

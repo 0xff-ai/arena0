@@ -11,7 +11,7 @@ pub(super) fn keys(state: &ScreenState) -> Vec<EventKey> {
         .iter()
         .filter(|event| visible_event(state, event))
         .map(|event| EventKey {
-            host: event.host.clone(),
+            host: event.host.id.clone(),
             boot_id: event.boot_id.clone(),
             seq: event.seq,
         })
@@ -26,7 +26,14 @@ fn visible_event(state: &ScreenState, event: &EventFrame) -> bool {
     state
         .scoped_host_names()
         .iter()
-        .any(|host| host.as_str() == event.host)
+        .any(|host| host.as_str() == event.host.id)
+}
+
+pub(super) fn host_label(host: &arena0_client::api::HostInfo) -> String {
+    match host.user_agent.as_deref() {
+        Some(user_agent) if !user_agent.is_empty() => format!("{} ({user_agent})", host.id),
+        _ => host.id.clone(),
+    }
 }
 
 fn scoped_events(state: &ScreenState) -> Vec<&EventFrame> {
@@ -107,19 +114,19 @@ fn render_host_events(
     let events = state
         .system_events
         .iter()
-        .filter(|event| event.host == host.as_str())
+        .filter(|event| event.host.id == host.as_str())
         .collect::<Vec<_>>();
     let keys = events
         .iter()
         .map(|event| EventKey {
-            host: event.host.clone(),
+            host: event.host.id.clone(),
             boot_id: event.boot_id.clone(),
             seq: event.seq,
         })
         .collect::<Vec<_>>();
     let rows = events.iter().map(|event| {
         let key = EventKey {
-            host: event.host.clone(),
+            host: event.host.id.clone(),
             boot_id: event.boot_id.clone(),
             seq: event.seq,
         };
@@ -191,7 +198,7 @@ fn render_records(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, focuse
         let selected = state.selected_event.as_ref() == Some(key);
         Row::new([
             Cell::from(event_time(event.ts)),
-            Cell::from(event.host.clone()),
+            Cell::from(host_label(&event.host)),
             Cell::from(format!("{}", event.seq)),
             Cell::from(event.kind()),
             Cell::from(event_summary(event)),
@@ -250,7 +257,7 @@ fn render_inspector(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, focu
     };
     let Some(event) = state.system_events.iter().find(|event| {
         visible_event(state, event)
-            && event.host == key.host
+            && event.host.id == key.host
             && event.boot_id == key.boot_id
             && event.seq == key.seq
     }) else {
@@ -264,7 +271,7 @@ fn render_inspector(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, focu
     };
     let mut lines = vec![
         Line::styled(
-            format!("{}  {}", event.kind(), event.host),
+            format!("{}  {}", event.kind(), host_label(&event.host)),
             state.palette.strong(),
         ),
         Line::styled(
@@ -317,11 +324,12 @@ fn render_inspector(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, focu
 
 pub(super) fn event_summary(event: &EventFrame) -> String {
     match &event.data {
-        EventData::HostStarted {
-            peer_id,
-            abi_version,
-            ..
-        } => format!("peer {}  ABI {}", peer_id.fmt_short(), abi_version),
+        EventData::HostStarted { abi_version, .. } => format!(
+            "peer {}  ua {}  ABI {}",
+            event.host.peer_id.fmt_short(),
+            event.host.user_agent.as_deref().unwrap_or("(none)"),
+            abi_version
+        ),
         EventData::HostStopped {
             reason,
             uptime_secs,

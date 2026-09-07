@@ -210,10 +210,18 @@ pub(crate) fn render_frame(
         EventData::SessionEnded { terminal } => render_terminal(terminal, p),
         EventData::Lagged { skipped } => p.yellow(&format!("lagged: dropped {skipped} frames")),
     };
-    let host = if event.host.is_empty() {
+    let host = if event.host.id.is_empty() {
         String::new()
     } else {
-        format!("{}  ", p.dim(&format!("[{}]", event.host)))
+        let identity = event.host.peer_id.fmt_short();
+        let user_agent = event.host.user_agent.as_deref().unwrap_or("(none)");
+        format!(
+            "{}  ",
+            p.dim(&format!(
+                "[{} peer={} ua={}]",
+                event.host.id, identity, user_agent
+            ))
+        )
     };
     format!("{ts}  {host}{body}")
 }

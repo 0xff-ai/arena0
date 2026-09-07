@@ -123,6 +123,11 @@ pub struct Home {
 }
 
 impl Home {
+    /// Resolve an explicit home without reading or changing process environment.
+    pub fn from_root(root: PathBuf) -> Result<Self, HomeError> {
+        Self::from_environment(Some(root.into_os_string()), None, None, None)
+    }
+
     /// Resolve the arena0 home from the current process environment.
     ///
     /// `ARENA0_HOME` wins over `HOME`. Without `ARENA0_HOME`, the root is

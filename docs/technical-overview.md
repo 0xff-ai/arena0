@@ -178,7 +178,7 @@ Content addressing binds an execution to exact Wasm bytes. The execution profile
 
 ## Persistence and recovery
 
-Each Host owns one SQLite database and one blocking database-owner thread. Cloneable handles submit bounded operations to that owner. A non-cloneable `ExecutionStore` grants exclusive mutation authority for one execution.
+Each Host owns one SQLite database and one blocking database-owner thread. The daemon reserves the store before opening or creating signing keys. The same store owns the latest agent software label (`user_agent`), separate from protocol state. Cloneable handles submit bounded operations to that owner. A non-cloneable `ExecutionStore` grants exclusive mutation authority for one execution.
 
 The pure protocol reducer returns a commit plan rather than performing I/O. The store applies the plan with a version compare-and-set. One SQLite transaction writes the execution aggregate, trace or private records, timers, outbox effects, and the applied inbox status.
 
@@ -191,6 +191,8 @@ Recovery validates stored state and every nested projection before it exposes th
 ## Concurrency and shutdown
 
 Long-lived state uses one clear task or resource owner. Execution actors own live execution capabilities. The store thread owns its SQLite connection. The Ensemble owns coordinated local shutdown. The daemon owns its services and child task lifecycles.
+
+MCP `open_host` adds a Host to the running Ensemble through serialized, supervised provisioning. A supplied local ID reuses its durable identity; an omitted ID creates a fresh namespace. The daemon publishes the service after recovery and socket binding. Persisted Hosts outside the startup set reopen on demand. Shutdown settles pending provisioning before releasing stores.
 
 Queues, channels, frames, blobs, guest calls, agent responses, pending work, and shutdown waits are bounded. Backpressure reaches the component that creates work instead of becoming unbounded memory growth.
 
@@ -229,6 +231,8 @@ arena0 keeps semantic and operational observations separate.
 The daemon emits stable, redacted Host lifecycle events. It projects one validated occurrence into structured `arena0::system_event` records and local API `EventFrame` values. Events describe behavior but do not drive the state machine or become receipt evidence.
 
 The opt-in `arena0::performance` target records aggregate and per-item timings. Performance fields do not enter protocol values, durable state, receipts, or semantic events.
+
+Daemon information and event frames share a Host metadata projection: local ID, cryptographic peer ID, and optional user agent. Each event captures the metadata at emission, preserving earlier labels in buffered history.
 
 The CLI, execution observatory, JSON output, and MCP tools project typed Host state. Presentation code does not own protocol or execution state.
 
