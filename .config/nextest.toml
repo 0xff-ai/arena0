@@ -19,3 +19,4 @@ test-group = 'integration'
 # CI runs show every failure instead of stopping at the first one.
 [profile.ci]
 fail-fast = false
+test-threads = 2
