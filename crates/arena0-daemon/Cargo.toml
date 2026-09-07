@@ -34,11 +34,15 @@ retry = { workspace = true }
 rmcp = { workspace = true }
 axum = { workspace = true }
 zeroize = { workspace = true }
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
 rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [lints]
 workspace = true

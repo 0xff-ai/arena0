@@ -47,13 +47,14 @@ ARENA0_CARGO_BIN="$bin_dir/cargo-arena0" ARENA0_EXAMPLE_DIR="$example_dir" \
   "$repo_root/scripts/test-packaged-sdk.sh"
 
 home="$smoke_root/home"
+socket="$home/arena0.sock"
 log="$smoke_root/serve.log"
 ARENA0_HOME="$home" "$bin_dir/arena0" serve --mcp-listen 127.0.0.1:0 \
   >"$log" 2>&1 &
 service_pid=$!
 
 for ((attempt = 0; attempt < 200; attempt++)); do
-  if [[ -S "$home/hosts/host-01/arena0.sock" && -S "$home/hosts/host-02/arena0.sock" ]]; then
+  if [[ -S "$socket" ]]; then
     break
   fi
   if ! kill -0 "$service_pid" 2>/dev/null; then
@@ -63,7 +64,7 @@ for ((attempt = 0; attempt < 200; attempt++)); do
   fi
   sleep 0.1
 done
-if [[ ! -S "$home/hosts/host-01/arena0.sock" || ! -S "$home/hosts/host-02/arena0.sock" ]]; then
+if [[ ! -S "$socket" ]]; then
   cat "$log" >&2
   echo "installed arena0 serve did not become ready within 20 seconds" >&2
   exit 1
@@ -135,9 +136,9 @@ if [[ $status -ne 0 ]]; then
 fi
 service_pid=
 
-if find "$home/hosts" -name arena0.sock -print -quit | grep -q .; then
+if [[ -S "$socket" ]]; then
   cat "$log" >&2
-  echo "installed arena0 serve left a socket behind" >&2
+  echo "installed arena0 serve left the daemon socket behind" >&2
   exit 1
 fi
 if [[ $(grep -c 'arena0d stopped' "$log") -ne 2 ]]; then

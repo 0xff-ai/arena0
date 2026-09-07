@@ -78,7 +78,9 @@ pub enum ResponseOk {
     /// connection.
     ActivitySubscribed,
     /// The complete daemon-local Host roster.
-    Hosts(Vec<DaemonInfo>),
+    Hosts(Vec<HostStatus>),
+    HostStatus(HostStatus),
+    HostOpened(HostInfo),
 }
 
 /// Public metadata for one Host. The local id locates its namespace; the peer
@@ -91,15 +93,22 @@ pub struct HostInfo {
     pub user_agent: Option<String>,
 }
 
-/// The `daemon.info` response for one Host supervised by the daemon.
+/// Process-level information for the shared daemon endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonInfo {
-    pub host: HostInfo,
-    pub transport_key: AgentPubKey,
     pub version: String,
     pub abi_version: u32,
     pub uptime_secs: u64,
     pub socket: String,
+    /// The actual bound MCP endpoint, including an assigned ephemeral port.
+    pub mcp_endpoint: String,
+}
+
+/// Current information from one Host's authoritative service and store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostStatus {
+    pub host: HostInfo,
+    pub transport_key: AgentPubKey,
     pub programs: usize,
     pub execs_active: usize,
 }

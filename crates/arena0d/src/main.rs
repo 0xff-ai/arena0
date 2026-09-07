@@ -11,7 +11,7 @@ use clap::Parser;
     name = "arena0d",
     about = "Serve one or more local arena0 Hosts",
     version,
-    after_help = "Each Host has its own state directory, identity, and Unix socket.\nThe default starts two Hosts (`host-01` and `host-02`) on one virtual local network.\nAgents connect once to the Streamable HTTP endpoint at /mcp and name a Host in\neach tool call. Set ARENA0_MCP_TOKEN to require one bearer token for the endpoint.\nPress Ctrl-C to stop the process, or run `arena0 stop --host <host>` for a\ngraceful coordinated shutdown of the local ensemble."
+    after_help = "Each Host has its own state directory and identity; the daemon owns one shared Unix socket.\nThe default starts two Hosts (`host-01` and `host-02`) on one virtual local network.\nAgents connect once to the Streamable HTTP endpoint at /mcp and name a Host in\neach tool call. Set ARENA0_MCP_TOKEN to require one bearer token for the endpoint.\nPress Ctrl-C to stop the process, or run `arena0 stop --host <host>` for a\ngraceful coordinated shutdown of the local ensemble."
 )]
 struct Args {
     /// Host names to supervise. Repeat for each participant; defaults to two

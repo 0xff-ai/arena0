@@ -27,14 +27,16 @@ pub use events::{
     EventData, EventFilter, EventFrame, ExecOrigin, ExecutionFailureKind, NegotiationStage,
     SessionTerminal,
 };
-pub use request::{AwaitState, EnsembleSpec, IdRef, ProgramRefError, ReceiptRef, Request};
+pub use request::{
+    AwaitState, EnsembleSpec, HostRequest, IdRef, ProgramRefError, ReceiptRef, Request,
+};
 pub use response::{
     ActivationInspection, ActivationInspectionState, ActivationParticipant, ApiError, ApiErrorCode,
     DaemonInfo, ExecStatus, ExecStatusState, ExecutionInspection, FullVerifiedTerminal, HostInfo,
-    IdInfo, LightVerifiedTerminal, NextEvent, PendingCalloutStatus, PrivateCommitSummary,
-    PrivateEffectKind, PrivateEffectSummary, PrivateEventKind, ProgramDetail, ProgramSummary,
-    ReceiptListEntry, ReceiptProvenance, Response, ResponseOk, SessionProgress, SessionStatus,
-    VerifiedResult,
+    HostStatus, IdInfo, LightVerifiedTerminal, NextEvent, PendingCalloutStatus,
+    PrivateCommitSummary, PrivateEffectKind, PrivateEffectSummary, PrivateEventKind, ProgramDetail,
+    ProgramSummary, ReceiptListEntry, ReceiptProvenance, Response, ResponseOk, SessionProgress,
+    SessionStatus, VerifiedResult,
 };
 
 #[cfg(test)]
@@ -43,20 +45,53 @@ mod tests {
     use arena0_program::{ParticipantCount, ProgramHash};
     use arena0_protocol::{ExecId, NegotiationId, PeerId, SessionHash};
 
+    #[test]
+    fn host_routing_is_explicit_at_the_wire_boundary() {
+        let request = Request::Host {
+            host: "alice".into(),
+            request: HostRequest::ExecNext {
+                exec_id: ExecId([7; 32]),
+            },
+        };
+        let mut json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["method"], "host.call");
+        assert_eq!(json["params"]["host"], "alice");
+        assert_eq!(
+            serde_json::from_value::<Request>(json.clone()).unwrap(),
+            request
+        );
+        json["params"].as_object_mut().unwrap().remove("host");
+        assert!(serde_json::from_value::<Request>(json).is_err());
+        assert!(
+            serde_json::from_value::<Request>(serde_json::json!({"method":"exec.list"})).is_err()
+        );
+        for request in [
+            Request::DaemonInfo,
+            Request::DaemonStop,
+            Request::HostsList,
+            Request::ActivitySubscribe,
+        ] {
+            assert_eq!(
+                serde_json::from_value::<Request>(serde_json::to_value(&request).unwrap()).unwrap(),
+                request
+            );
+        }
+    }
+
     /// Round-trip every request shape through JSON, asserting the `method` tag is
     /// the wire path.
     #[test]
     fn request_round_trips_with_path_tags() {
         let cases = [
-            (Request::IdList, "id.list"),
+            (HostRequest::IdList, "id.list"),
             (
-                Request::ExecNext {
+                HostRequest::ExecNext {
                     exec_id: ExecId([7u8; 32]),
                 },
                 "exec.next",
             ),
             (
-                Request::ExecNew {
+                HostRequest::ExecNew {
                     exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                     program: "rock-paper-scissors".into(),
                     params: Some(serde_json::json!({"rounds": 3})),
@@ -67,7 +102,7 @@ mod tests {
                 "exec.new",
             ),
             (
-                Request::ExecInspect {
+                HostRequest::ExecInspect {
                     exec_id: ExecId([9u8; 32]),
                     private_from: Some(4),
                     private_limit: 32,
@@ -75,7 +110,7 @@ mod tests {
                 "exec.inspect",
             ),
             (
-                Request::ExecSubmit {
+                HostRequest::ExecSubmit {
                     exec_id: ExecId([1u8; 32]),
                     pending_id: PendingId::new(3),
                     answer: Some(serde_json::json!("Rock")),
@@ -83,24 +118,23 @@ mod tests {
                 "exec.submit",
             ),
             (
-                Request::ExecCancelCreation {
+                HostRequest::ExecCancelCreation {
                     exec_id: ExecId([6u8; 32]),
                 },
                 "exec.cancel_creation",
             ),
             (
-                Request::ExecView {
+                HostRequest::ExecView {
                     exec: ExecId([8u8; 32]),
                     width: 80,
                     color: ColorDepth::Ansi16,
                 },
                 "exec.view",
             ),
-            (Request::DaemonInfo, "daemon.info"),
-            (Request::DaemonStop, "daemon.stop"),
-            (Request::ReceiptList, "receipt.list"),
+            (HostRequest::Info, "host.info"),
+            (HostRequest::ReceiptList, "receipt.list"),
             (
-                Request::ReceiptGet {
+                HostRequest::ReceiptGet {
                     receipt: ReceiptRef::Produced(SessionHash([9u8; 32])),
                 },
                 "receipt.get",
@@ -109,7 +143,7 @@ mod tests {
         for (req, path) in cases {
             let json = serde_json::to_value(&req).unwrap();
             assert_eq!(json["method"], path, "wire path for {req:?}");
-            let back: Request = serde_json::from_value(json).unwrap();
+            let back: HostRequest = serde_json::from_value(json).unwrap();
             assert_eq!(req, back);
         }
     }
@@ -117,7 +151,7 @@ mod tests {
     #[test]
     fn request_boundary_values_keep_string_json() {
         let exec_id = ExecId([8u8; 32]);
-        let exec_request = Request::ExecView {
+        let exec_request = HostRequest::ExecView {
             exec: exec_id,
             width: 80,
             color: ColorDepth::Ansi16,
@@ -125,11 +159,11 @@ mod tests {
         let exec_json = serde_json::to_value(&exec_request).unwrap();
         assert_eq!(exec_json["params"]["exec"], exec_id.to_string());
         assert_eq!(
-            serde_json::from_value::<Request>(exec_json).unwrap(),
+            serde_json::from_value::<HostRequest>(exec_json).unwrap(),
             exec_request
         );
 
-        let join_request = Request::ExecNew {
+        let join_request = HostRequest::ExecNew {
             exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
             program: String::new(),
             params: None,
@@ -148,12 +182,12 @@ mod tests {
             NegotiationId([2u8; 32]).to_string()
         );
         assert_eq!(
-            serde_json::from_value::<Request>(join_json).unwrap(),
+            serde_json::from_value::<HostRequest>(join_json).unwrap(),
             join_request
         );
 
         let pending_id = PendingId::new(u64::MAX);
-        let submit = Request::ExecSubmit {
+        let submit = HostRequest::ExecSubmit {
             exec_id,
             pending_id,
             answer: Some(serde_json::json!("Rock")),
@@ -161,13 +195,13 @@ mod tests {
         let submit_json = serde_json::to_value(&submit).expect("submit request JSON");
         assert_eq!(submit_json["params"]["pending_id"], pending_id.to_string());
         assert_eq!(
-            serde_json::from_value::<Request>(submit_json.clone()).unwrap(),
+            serde_json::from_value::<HostRequest>(submit_json.clone()).unwrap(),
             submit
         );
         let mut numeric_submit = submit_json;
         numeric_submit["params"]["pending_id"] = serde_json::json!(u64::MAX);
         assert!(
-            serde_json::from_value::<Request>(numeric_submit).is_err(),
+            serde_json::from_value::<HostRequest>(numeric_submit).is_err(),
             "numeric pending ids must not cross the API boundary"
         );
     }
@@ -177,7 +211,7 @@ mod tests {
         let exec_id = ExecId([1u8; 32]);
         let cases = [
             (
-                Request::ExecNew {
+                HostRequest::ExecNew {
                     exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                     program: "rock-paper-scissors".into(),
                     params: Some(serde_json::json!({})),
@@ -188,7 +222,7 @@ mod tests {
                 "params_raw",
             ),
             (
-                Request::ExecSubmit {
+                HostRequest::ExecSubmit {
                     exec_id,
                     pending_id: PendingId::new(3),
                     answer: Some(serde_json::json!({})),
@@ -196,7 +230,7 @@ mod tests {
                 "answer_raw",
             ),
             (
-                Request::ExecQuery {
+                HostRequest::ExecQuery {
                     exec_id,
                     query: Some(serde_json::json!({})),
                 },
@@ -208,7 +242,7 @@ mod tests {
             let mut json = serde_json::to_value(request).expect("request JSON");
             json["params"][raw_field] = serde_json::json!("00");
             assert!(
-                serde_json::from_value::<Request>(json).is_err(),
+                serde_json::from_value::<HostRequest>(json).is_err(),
                 "unknown raw field must not be ignored"
             );
         }

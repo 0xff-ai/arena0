@@ -63,7 +63,6 @@ pub enum EventData {
     HostStarted {
         version: String,
         transport_key: AgentPubKey,
-        socket: String,
         abi_version: u32,
     },
     #[serde(rename = "host.stopped")]
@@ -533,7 +532,6 @@ mod tests {
                 EventData::HostStarted {
                     version: "0.1.0".into(),
                     transport_key: AgentPubKey([7; 32]),
-                    socket: "/tmp/a".into(),
                     abi_version: 19,
                 },
                 None,
@@ -809,7 +807,6 @@ mod tests {
             EventData::HostStarted {
                 version: "0.1.0".into(),
                 transport_key: AgentPubKey([2; 32]),
-                socket: "/tmp/arena0.sock".into(),
                 abi_version: 1,
             },
             None,

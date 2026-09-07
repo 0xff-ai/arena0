@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use arena0_client::api::{
-    EventData, EventFilter, EventFrame, Request, ResponseOk, SessionTerminal,
+    EventData, EventFilter, EventFrame, HostRequest, ResponseOk, SessionTerminal,
 };
 use arena0_client::protocol::ProgramHash;
 
@@ -15,11 +15,11 @@ use crate::ui::Palette;
 
 /// `arena0 watch [<exec>]`.
 pub(crate) async fn watch(ctx: &Ctx, exec: Option<String>) -> anyhow::Result<()> {
-    let names = ctx.client().program_name_map().await;
+    let names = ctx.client().program_name_map(&ctx.host).await;
 
     let single_exec = match &exec {
         Some(prefix) => {
-            let exec_id = ctx.client().resolve_exec(prefix).await?;
+            let exec_id = ctx.client().resolve_exec(&ctx.host, prefix).await?;
             if !ctx.mode.is_json() {
                 let program = current_program(ctx, exec_id, &names).await;
                 println!("{}  {}", exec_id.fmt_short(), program);
@@ -29,13 +29,16 @@ pub(crate) async fn watch(ctx: &Ctx, exec: Option<String>) -> anyhow::Result<()>
         None => None,
     };
 
-    let mut sub = ctx.client().subscribe(EventFilter::default()).await?;
+    let mut sub = ctx
+        .client()
+        .subscribe(&ctx.host, EventFilter::default())
+        .await?;
     // The event stream starts at the subscription point, so a terminal event
     // that was committed before the subscription would otherwise be missed
     // forever. Re-check after subscribing: this closes the race between the
     // status lookup and the stream handshake while preserving future events.
     if let Some(exec_id) = single_exec {
-        let status = match ctx.client().call(&Request::ExecStatus { exec_id }).await? {
+        let status = match ctx.call(&HostRequest::ExecStatus { exec_id }).await? {
             ResponseOk::Status(status) => status,
             other => anyhow::bail!("unexpected response to exec.status: {other:?}"),
         };
@@ -272,7 +275,7 @@ async fn current_program(
     exec_id: arena0_client::protocol::ExecId,
     names: &HashMap<ProgramHash, String>,
 ) -> String {
-    match ctx.client().call(&Request::ExecStatus { exec_id }).await {
+    match ctx.call(&HostRequest::ExecStatus { exec_id }).await {
         Ok(ResponseOk::Status(s)) => program_label(&s.program_id, names),
         _ => "?".into(),
     }

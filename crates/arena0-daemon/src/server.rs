@@ -9,7 +9,6 @@
 
 use std::collections::HashMap;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant as StdInstant};
@@ -18,14 +17,15 @@ use std::{future::Future, path::PathBuf};
 use anyhow::Context as _;
 use arena0_api::{
     ActivationInspection, ActivationInspectionState, ActivationParticipant, ActivityData,
-    ActivityFrame, ApiError, ApiErrorCode, DaemonInfo, EnsembleSpec, EventData, EventFilter,
-    EventFrame, ExecLifecycle, ExecOrigin, ExecStatus, ExecStatusState, ExecutionFailureKind,
+    ActivityFrame, ApiError, ApiErrorCode, EnsembleSpec, EventData, EventFilter, EventFrame,
+    ExecLifecycle, ExecOrigin, ExecStatus, ExecStatusState, ExecutionFailureKind,
     ExecutionInspection, FullVerifiedTerminal, HostInfo, LightVerifiedTerminal, NegotiationStage,
     NextEvent, PendingCalloutStatus, PrivateCommitSummary as ApiPrivateCommitSummary,
     PrivateEffectKind as ApiPrivateEffectKind, PrivateEffectSummary as ApiPrivateEffectSummary,
-    PrivateEventKind as ApiPrivateEventKind, ProgramRefError, ReceiptRef, Request, Response,
-    ResponseOk, SessionProgress, SessionStatus, VerifiedResult, frame,
+    PrivateEventKind as ApiPrivateEventKind, ProgramRefError, ReceiptRef, Response, ResponseOk,
+    SessionProgress, SessionStatus, VerifiedResult, frame,
 };
+use arena0_api::{HostRequest, HostStatus};
 use arena0_crypto::{AgentPubKey, ExecutionKey, NodeKeys};
 use arena0_node::{ActivatedSession, NegotiationBook};
 use arena0_node::{
@@ -46,7 +46,7 @@ use arena0_sandbox::{AdmittedProgram, InitializeCall, Program, WasmtimeEngine};
 use arena0_transport::{NegotiationTopic, ProgramTopicEvent, Transport};
 use arena0_verify::{LightVerifiedTerminal as VerifiedLightTerminal, verify_full, verify_light};
 use retry::delay::{Exponential, jitter};
-use tokio::io::{AsyncReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex as TokioMutex, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
@@ -57,7 +57,6 @@ use crate::catalog::{CatalogError, ProgramCatalog};
 use crate::exec_manager::{
     ExecutionHandle, ExecutionHandles, NEGOTIATION_TIMEOUT, Supervisor, project_durable_next,
 };
-use crate::paths::Paths;
 use crate::schema;
 use crate::startup::{self, StartupStage, StartupTimeline};
 use crate::store::{Keystore, KeystoreError};
@@ -799,22 +798,24 @@ impl Activity {
     }
 }
 
-/// Owns the Unix listener path and every connection task spawned from it.
+/// Owns the daemon Unix listener path and every connection task spawned from it.
 #[derive(Debug)]
-struct UnixSocket {
+pub(crate) struct UnixSocket {
     path: PathBuf,
     owned_inode: StdMutex<Option<(u64, u64)>>,
+    lease: StdMutex<Option<crate::paths::FileLease>>,
 }
 
 impl UnixSocket {
-    fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf) -> Self {
         Self {
             path,
             owned_inode: StdMutex::new(None),
+            lease: StdMutex::new(None),
         }
     }
 
-    fn remove_owned_path(&self) {
+    pub(crate) fn remove_owned_path(&self) {
         let owned = self
             .owned_inode
             .lock()
@@ -826,9 +827,20 @@ impl UnixSocket {
         {
             let _ = std::fs::remove_file(&self.path);
         }
+        self.lease
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
     }
 
-    fn bind(&self, host: &str, startup: &StartupTimeline) -> anyhow::Result<UnixListener> {
+    pub(crate) fn bind(&self) -> anyhow::Result<UnixListener> {
+        crate::paths::validate_path(&self.path).context("validate daemon socket")?;
+        let parent = self.path.parent().context("daemon socket needs a parent")?;
+        crate::paths::ensure_directory(parent).context("prepare daemon socket parent")?;
+        let mut lock_path = self.path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lease = crate::paths::FileLease::acquire_path(std::path::Path::new(&lock_path))
+            .context("acquire daemon socket ownership")?;
         match std::fs::symlink_metadata(&self.path) {
             Ok(metadata) => {
                 anyhow::ensure!(
@@ -836,41 +848,48 @@ impl UnixSocket {
                     "socket path is occupied: {}",
                     self.path.display()
                 );
-                std::fs::remove_file(&self.path).context("remove stale Host socket")?;
+                match std::os::unix::net::UnixStream::connect(&self.path) {
+                    Ok(_) => anyhow::bail!("another listener owns {}", self.path.display()),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                        ) => {}
+                    Err(error) => return Err(error).context("probe existing daemon socket"),
+                }
+                std::fs::remove_file(&self.path).context("remove stale daemon socket")?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("inspect Host socket"),
+            Err(error) => return Err(error).context("inspect daemon socket"),
         }
         let listener = match UnixListener::bind(&self.path) {
             Ok(listener) => listener,
             Err(error) => {
-                startup::host_progress(StartupStage::Failed, host, startup);
                 return Err(error).with_context(|| format!("bind {}", self.path.display()));
             }
         };
         let metadata =
-            std::fs::symlink_metadata(&self.path).context("inspect bound Host socket")?;
+            std::fs::symlink_metadata(&self.path).context("inspect bound daemon socket")?;
         *self
             .owned_inode
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some((metadata.dev(), metadata.ino()));
+        *self.lease.lock().unwrap_or_else(|error| error.into_inner()) = Some(lease);
         if let Err(error) = std::fs::set_permissions(
             &self.path,
             std::os::unix::fs::PermissionsExt::from_mode(0o600),
         ) {
             self.remove_owned_path();
-            startup::host_progress(StartupStage::Failed, host, startup);
             return Err(error).with_context(|| format!("chmod 0600 {}", self.path.display()));
         }
-        tracing::info!(socket = %self.path.display(), %host, "arena0d listening");
-        startup::host_progress(StartupStage::HostReady, host, startup);
+        tracing::info!(socket = %self.path.display(), "arena0d daemon socket listening");
         Ok(listener)
     }
 
-    async fn listen<H, F>(
+    pub(crate) async fn listen<H, F>(
         &self,
         listener: UnixListener,
-        shutdown: &tokio::sync::Notify,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
         handler: H,
     ) -> anyhow::Result<()>
     where
@@ -879,6 +898,9 @@ impl UnixSocket {
     {
         let mut connections = JoinSet::new();
         let result = loop {
+            if *shutdown.borrow() {
+                break Ok(());
+            }
             tokio::select! {
                 joined = connections.join_next(), if !connections.is_empty() => {
                     if let Some(Err(error)) = joined {
@@ -897,7 +919,7 @@ impl UnixSocket {
                         }
                     });
                 }
-                _ = shutdown.notified() => break Ok(()),
+                _ = shutdown.changed() => break Ok(()),
             }
         };
 
@@ -1062,25 +1084,22 @@ async fn admit_checked(
     Ok(admitted)
 }
 
-/// The per-Host socket service.
+/// The API operation owner for one Host.
 ///
-/// [`HostService`] owns one Host's API connections, execution supervisors, and
-/// service tasks. The public [`crate::Daemon`] owns the local runtime Ensemble;
+/// [`HostService`] owns one Host's execution supervisors and service tasks.
+/// The public [`crate::Daemon`] owns API connections and the local runtime Ensemble;
 /// this type deliberately does not stop the shared runtime or transport.
 pub(crate) struct HostService {
     name: String,
     peer_id: PeerId,
     identity: Arc<NodeKeys>,
     transport: Arc<dyn Transport + Sync>,
-    paths: Paths,
     keystore: Arc<Keystore>,
     catalog: ProgramCatalog,
     store: StoreHandle,
     engine: Arc<WasmtimeEngine>,
     startup: Arc<StartupTimeline>,
     pub(crate) events: Events,
-    pub(crate) activity: Arc<Activity>,
-    host_directory: Weak<crate::ensemble::HostDirectory>,
     started: StdInstant,
     /// Protocol ingress, negotiation, and execution machinery shared with the
     /// greybox harness.
@@ -1094,36 +1113,28 @@ pub(crate) struct HostService {
     negotiations_pending: AtomicUsize,
     /// Service tasks and negotiation drives. The runtime owns its accept path.
     tasks: TokioMutex<JoinSet<()>>,
-    /// Wakes the serve loop to return after a `daemon.stop` request.
-    shutdown: tokio::sync::Notify,
-    /// Local API listener and its connection tasks.
-    socket: UnixSocket,
     /// Guards service cleanup when both `serve` and the supervisor observe a
     /// shutdown at nearly the same time.
     stopped: AtomicBool,
+    /// A provisional Host must be drained without publishing a lifecycle event.
+    published: AtomicBool,
+    host_stopped_emitted: AtomicBool,
 }
 
 /// Inputs needed to start one [`HostService`].
 pub(crate) struct HostServiceInit {
     pub(crate) name: String,
     pub(crate) transport: Arc<dyn Transport + Sync>,
-    pub(crate) paths: Paths,
     pub(crate) keystore: Arc<Keystore>,
     pub(crate) catalog: ProgramCatalog,
     pub(crate) store: StoreHandle,
     pub(crate) engine: Arc<WasmtimeEngine>,
     pub(crate) startup: Arc<StartupTimeline>,
-    pub(crate) activity: Arc<Activity>,
-    pub(crate) host_directory: Weak<crate::ensemble::HostDirectory>,
 }
 
 impl HostService {
     pub(crate) fn peer_id(&self) -> PeerId {
         self.peer_id
-    }
-
-    pub(crate) fn socket_path(&self) -> &std::path::Path {
-        &self.paths.socket
     }
 
     /// One projection of identity and the latest persisted harness metadata.
@@ -1175,14 +1186,11 @@ impl HostService {
         let HostServiceInit {
             name,
             transport,
-            paths,
             keystore,
             catalog,
             store,
             engine,
             startup,
-            activity,
-            host_directory,
         } = init;
 
         let identity = runtime.identity_keys();
@@ -1198,23 +1206,18 @@ impl HostService {
             peer_id,
             user_agent: None,
         });
-        let socket = UnixSocket::new(paths.socket.clone());
-
         let tasks = JoinSet::new();
         let this = Arc::new(Self {
             name,
             peer_id,
             identity,
             transport,
-            paths,
             keystore,
             catalog,
             store,
             engine,
             startup,
             events,
-            activity,
-            host_directory,
             started: StdInstant::now(),
             runtime,
             owns_runtime,
@@ -1222,9 +1225,9 @@ impl HostService {
             creation_states: StdMutex::new(CreationStates::default()),
             negotiations_pending: AtomicUsize::new(0),
             tasks: TokioMutex::new(tasks),
-            shutdown: tokio::sync::Notify::new(),
-            socket,
             stopped: AtomicBool::new(false),
+            published: AtomicBool::new(false),
+            host_stopped_emitted: AtomicBool::new(false),
         });
         Ok(this)
     }
@@ -1251,11 +1254,6 @@ impl HostService {
         });
     }
 
-    /// Wake the socket service so its owner can perform the canonical shutdown.
-    pub(crate) fn request_shutdown(&self) {
-        self.shutdown.notify_one();
-    }
-
     /// Stop service tasks after first draining live execution actors. The actor
     /// owns terminal persistence; this layer never writes duplicate rows.
     ///
@@ -1267,11 +1265,6 @@ impl HostService {
         if self.stopped.swap(true, Ordering::AcqRel) {
             return;
         }
-        // An external greybox caller may stop a service while `serve` is
-        // blocked in its accept loop. Keep that loop owned by the same stop
-        // request path; the supervisor also sends this notification before it
-        // drains shared services.
-        self.shutdown.notify_one();
         let active = self.execs.all_live();
         // Signal and await actors before stopping negotiation/service tasks.
         self.execs.stop().await;
@@ -1303,6 +1296,21 @@ impl HostService {
             self.runtime.stop().await;
             self.transport.close().await;
         }
+        if self.published.load(Ordering::Acquire)
+            && !self.host_stopped_emitted.swap(true, Ordering::AcqRel)
+        {
+            self.events.emit(HostEvent::HostStopped {
+                reason: Some("daemon.stop".into()),
+                uptime_secs: self.started.elapsed().as_secs(),
+            });
+        }
+        tracing::info!(host = %self.name, "arena0d Host stopped");
+    }
+
+    /// Publish the Host lifecycle after recovery and roster publication.
+    pub(crate) fn mark_published(&self) {
+        self.published.store(true, Ordering::Release);
+        startup::host_progress(StartupStage::HostReady, &self.name, &self.startup);
     }
 
     /// Clear negotiation bookkeeping and record a failed drive.
@@ -1368,14 +1376,12 @@ impl HostService {
         self.events.snapshot(EventData::HostStarted {
             version: env!("CARGO_PKG_VERSION").to_string(),
             transport_key: AgentPubKey(self.peer_id.0),
-            socket: self.paths.socket.display().to_string(),
             abi_version: ABI_VERSION,
         })
     }
 
-    /// Finish recovery and bind the listener before the supervisor publishes
-    /// a newly opened Host. No request is accepted until `serve_prepared`.
-    pub(crate) async fn prepare(self: &Arc<Self>) -> anyhow::Result<UnixListener> {
+    /// Finish recovery before the supervisor publishes this Host.
+    pub(crate) async fn prepare(self: &Arc<Self>) -> anyhow::Result<()> {
         startup::host_progress(StartupStage::HostStarting, &self.name, &self.startup);
         let user_agent = self.store.load_user_agent().await?;
         self.events
@@ -1387,32 +1393,7 @@ impl HostService {
             startup::host_progress(StartupStage::Failed, &self.name, &self.startup);
             return Err(error);
         }
-        self.socket.bind(&self.name, &self.startup)
-    }
-
-    /// Relinquish the socket path before releasing the provisional store owner.
-    pub(crate) fn remove_prepared_socket(&self) {
-        self.socket.remove_owned_path();
-    }
-
-    pub(crate) async fn serve_prepared(
-        self: Arc<Self>,
-        listener: UnixListener,
-    ) -> anyhow::Result<()> {
-        let daemon = Arc::clone(&self);
-        let listen_result = self
-            .socket
-            .listen(listener, &self.shutdown, move |stream| {
-                Arc::clone(&daemon).serve_conn(stream)
-            })
-            .await;
-        self.stop().await;
-        self.events.emit(HostEvent::HostStopped {
-            reason: Some("daemon.stop".into()),
-            uptime_secs: self.started.elapsed().as_secs(),
-        });
-        tracing::info!(host = %self.name, "arena0d stopped");
-        listen_result
+        Ok(())
     }
 
     /// Rebuild actors with unfinished protocol, proof, or delivery work from
@@ -1836,39 +1817,8 @@ impl HostService {
         Ok(())
     }
 
-    async fn serve_conn(self: Arc<Self>, stream: tokio::net::UnixStream) -> anyhow::Result<()> {
-        let (read, mut write) = stream.into_split();
-        let mut read = BufReader::new(read);
-        while let Some(req) = frame::read_frame::<_, Request>(&mut read).await? {
-            if let Request::ActivitySubscribe = req {
-                let rx = self.activity.subscribe();
-                frame::write_frame(
-                    &mut write,
-                    &Ok::<_, ApiError>(ResponseOk::ActivitySubscribed),
-                )
-                .await?;
-                self.stream_activity_unix(rx, &mut read, &mut write).await?;
-                return Ok(());
-            }
-            if let Request::EventsSubscribe { filter } = req {
-                // Register before acknowledging: events after this point cannot race
-                // between the ack and receiver creation.
-                let rx = self.events.subscribe();
-                let started = self.host_started_frame();
-                frame::write_frame(&mut write, &Ok::<_, ApiError>(ResponseOk::Subscribed)).await?;
-                frame::write_frame(&mut write, &started).await?;
-                self.stream_events_unix(filter, rx, &mut read, &mut write)
-                    .await?;
-                return Ok(());
-            }
-            let resp = self.dispatch(req).await;
-            frame::write_frame(&mut write, &resp).await?;
-        }
-        Ok(())
-    }
-
     /// Stream matching event frames on a unix connection until the client hangs up.
-    async fn stream_events_unix<R, W>(
+    pub(crate) async fn stream_events_unix<R, W>(
         &self,
         filter: EventFilter,
         mut rx: broadcast::Receiver<EventFrame>,
@@ -1914,8 +1864,8 @@ impl HostService {
     }
 
     /// Stream daemon-wide MCP activity until the client hangs up.
-    async fn stream_activity_unix<R, W>(
-        &self,
+    pub(crate) async fn stream_activity_unix<R, W>(
+        activity: &Activity,
         mut rx: broadcast::Receiver<ActivityFrame>,
         read: &mut R,
         write: &mut W,
@@ -1931,7 +1881,7 @@ impl HostService {
                 recv = rx.recv() => match recv {
                     Ok(frame_msg) => {
                         if pending_skipped > 0 {
-                            let lagged = self.activity.lagged(
+                            let lagged = activity.lagged(
                                 frame_msg.seq.saturating_sub(1),
                                 pending_skipped,
                             );
@@ -1956,30 +1906,31 @@ impl HostService {
 
     /// Dispatch one non-streaming request to its handler. The single method table
     /// both transports share.
-    pub(crate) async fn dispatch(self: &Arc<Self>, req: Request) -> Response {
+    pub(crate) async fn dispatch(self: &Arc<Self>, req: HostRequest) -> Response {
         match req {
-            Request::IdNew { label } => {
+            HostRequest::Info => self.host_status().await.map(ResponseOk::HostStatus),
+            HostRequest::IdNew { label } => {
                 let ks = Arc::clone(&self.keystore);
                 blocking(move || ks.new_identity(label))
                     .await
                     .map(ResponseOk::Id)
             }
-            Request::IdList => {
+            HostRequest::IdList => {
                 let ks = Arc::clone(&self.keystore);
                 blocking(move || ks.list()).await.map(ResponseOk::IdList)
             }
-            Request::IdShow { id } => {
+            HostRequest::IdShow { id } => {
                 let ks = Arc::clone(&self.keystore);
                 blocking(move || ks.show(&id)).await.map(ResponseOk::Id)
             }
-            Request::IdRemove { id } => {
+            HostRequest::IdRemove { id } => {
                 let ks = Arc::clone(&self.keystore);
                 blocking(move || ks.remove(&id))
                     .await
                     .map(|()| ResponseOk::Ack)
             }
 
-            Request::ProgramList => self
+            HostRequest::ProgramList => self
                 .catalog
                 .list()
                 .await
@@ -1987,7 +1938,7 @@ impl HostService {
                 .map_err(|error| {
                     ApiError::new(ApiErrorCode::Storage, format!("list programs: {error}"))
                 }),
-            Request::ProgramGet { program } => {
+            HostRequest::ProgramGet { program } => {
                 let program_id = self.resolve_program(&program).await?;
                 match self.catalog.detail(program_id).await.map_err(|error| {
                     ApiError::new(ApiErrorCode::Storage, format!("get program: {error}"))
@@ -1996,7 +1947,7 @@ impl HostService {
                     None => Err(ApiError::new(ApiErrorCode::NotFound, "no such program")),
                 }
             }
-            Request::ProgramImport { wasm } => {
+            HostRequest::ProgramImport { wasm } => {
                 let (id, _) = self
                     .catalog
                     .import(wasm, &self.engine, unix_time_ms())
@@ -2016,7 +1967,7 @@ impl HostService {
                         ApiError::new(ApiErrorCode::Internal, "imported program vanished")
                     })
             }
-            Request::ProgramRemove { program } => {
+            HostRequest::ProgramRemove { program } => {
                 let program_id = self.resolve_program(&program).await?;
                 let removed = self
                     .catalog
@@ -2032,17 +1983,17 @@ impl HostService {
                 }
             }
 
-            Request::ExecNew {
+            HostRequest::ExecNew {
                 exec_id,
                 program,
                 params,
                 ensemble,
             } => self.new_exec(exec_id, program, params, ensemble).await,
-            Request::ExecList => self.exec_statuses().await.map(ResponseOk::ExecList),
-            Request::ExecStatus { exec_id } => {
+            HostRequest::ExecList => self.exec_statuses().await.map(ResponseOk::ExecList),
+            HostRequest::ExecStatus { exec_id } => {
                 self.exec_status(exec_id).await.map(ResponseOk::Status)
             }
-            Request::ExecInspect {
+            HostRequest::ExecInspect {
                 exec_id,
                 private_from,
                 private_limit,
@@ -2050,7 +2001,7 @@ impl HostService {
                 .exec_inspect(exec_id, private_from, private_limit)
                 .await
                 .map(ResponseOk::Inspection),
-            Request::ExecAwait { exec_id, until } => {
+            HostRequest::ExecAwait { exec_id, until } => {
                 let status = self.exec_status(exec_id).await?;
                 let lifecycle = if satisfies_api(status.lifecycle(), until) {
                     status.lifecycle()
@@ -2074,57 +2025,36 @@ impl HostService {
                         .and_then(|request| request.failure().map(str::to_owned)),
                 })
             }
-            Request::ExecNext { exec_id } => self.next(exec_id).await.map(ResponseOk::Next),
-            Request::ExecSubmit {
+            HostRequest::ExecNext { exec_id } => self.next(exec_id).await.map(ResponseOk::Next),
+            HostRequest::ExecSubmit {
                 exec_id,
                 pending_id,
                 answer,
             } => self.submit(exec_id, pending_id, answer).await,
-            Request::ExecQuery { exec_id, query } => self.query(exec_id, query).await,
-            Request::ExecView { exec, width, color } => self.view(exec, width, color).await,
-            Request::ExecTrace { exec_id, from, to } => {
+            HostRequest::ExecQuery { exec_id, query } => self.query(exec_id, query).await,
+            HostRequest::ExecView { exec, width, color } => self.view(exec, width, color).await,
+            HostRequest::ExecTrace { exec_id, from, to } => {
                 self.trace(exec_id, from, to).await.map(ResponseOk::Trace)
             }
-            Request::ExecCancelCreation { exec_id } => {
+            HostRequest::ExecCancelCreation { exec_id } => {
                 self.withdraw_or_cancel_creation(exec_id).await
             }
-            Request::ExecWithdraw { exec_id } => self.withdraw_negotiation(exec_id).await,
-            Request::ExecTerminate { exec_id, reason } => match self.execs.get(&exec_id) {
+            HostRequest::ExecWithdraw { exec_id } => self.withdraw_negotiation(exec_id).await,
+            HostRequest::ExecTerminate { exec_id, reason } => match self.execs.get(&exec_id) {
                 Some(entry) => entry.terminate(reason).await.map(|()| ResponseOk::Ack),
                 None => Err(ApiError::new(ApiErrorCode::NotFound, "no such execution")),
             },
 
-            // `events.subscribe` is handled by the connection loop, not here.
-            Request::EventsSubscribe { .. } => Err(ApiError::new(
+            // `events.subscribe` is handled by the daemon connection loop, not here.
+            HostRequest::EventsSubscribe { .. } => Err(ApiError::new(
                 ApiErrorCode::BadRequest,
                 "events.subscribe must be the only method on its connection",
             )),
-            Request::ActivitySubscribe => Err(ApiError::new(
-                ApiErrorCode::BadRequest,
-                "activity.subscribe must be the only method on its connection",
-            )),
-
-            Request::DaemonInfo => self.daemon_info().await.map(ResponseOk::DaemonInfo),
-            Request::HostsList => self
-                .host_directory
-                .upgrade()
-                .ok_or_else(|| ApiError::new(ApiErrorCode::Internal, "Host directory unavailable"))?
-                .infos()
-                .await
-                .map(ResponseOk::Hosts),
-            Request::DaemonStop => {
-                // Ack first (the response is written before the connection task
-                // yields), then wake the serve loop. Its cleanup path owns the
-                // canonical Host shutdown and joins the accept tasks.
-                self.shutdown.notify_one();
-                Ok(ResponseOk::Ack)
-            }
-
-            Request::ReceiptGet { receipt } => Ok(ResponseOk::Receipt(Box::new(
+            HostRequest::ReceiptGet { receipt } => Ok(ResponseOk::Receipt(Box::new(
                 self.resolve_receipt(receipt).await?,
             ))),
-            Request::ReceiptImport { receipt } => self.import_receipt(*receipt).await,
-            Request::ReceiptList => {
+            HostRequest::ReceiptImport { receipt } => self.import_receipt(*receipt).await,
+            HostRequest::ReceiptList => {
                 let receipts = self
                     .store
                     .list_receipts(4_096)
@@ -2134,7 +2064,7 @@ impl HostService {
                     receipts.into_iter().map(receipt_list_entry).collect(),
                 ))
             }
-            Request::ReceiptVerify { receipt, full } => self.verify(receipt, full).await,
+            HostRequest::ReceiptVerify { receipt, full } => self.verify(receipt, full).await,
         }
     }
 
@@ -2291,7 +2221,7 @@ impl HostService {
             .count())
     }
 
-    pub(crate) async fn daemon_info(&self) -> Result<DaemonInfo, ApiError> {
+    pub(crate) async fn host_status(&self) -> Result<HostStatus, ApiError> {
         let programs = self
             .catalog
             .list()
@@ -2300,13 +2230,9 @@ impl HostService {
                 ApiError::new(ApiErrorCode::Storage, format!("list programs: {error}"))
             })?
             .len();
-        Ok(DaemonInfo {
+        Ok(HostStatus {
             host: self.host_info(),
             transport_key: AgentPubKey(self.peer_id.0),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            abi_version: ABI_VERSION,
-            uptime_secs: self.started.elapsed().as_secs(),
-            socket: self.paths.socket.display().to_string(),
             programs,
             execs_active: self.active_execution_count().await?,
         })
@@ -4115,14 +4041,11 @@ mod tests {
         let daemon = HostService::start(HostServiceInit {
             name: "host-01".into(),
             transport: Arc::new(transports.remove(0)),
-            paths: Paths::new(dir.path().to_path_buf(), dir.path().join("arena0.sock")),
             keystore,
             catalog,
             store: store_handle,
             engine,
             startup: Arc::new(StartupTimeline::new(1, 0)),
-            activity: Arc::new(Activity::new()),
-            host_directory: Weak::new(),
         })
         .unwrap();
         (dir, store, daemon, identity.peer_id)
@@ -4347,9 +4270,8 @@ mod tests {
     async fn released_socket_owner_cannot_unlink_a_replacement() {
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("host.sock");
-        let timeline = StartupTimeline::new(1, 0);
         let old = UnixSocket::new(path.clone());
-        let listener = old.bind("host", &timeline).unwrap();
+        let listener = old.bind().unwrap();
         old.remove_owned_path();
         drop(listener);
         let replacement = UnixListener::bind(&path).unwrap();
@@ -4359,12 +4281,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_before_listener_poll_closes_without_accepting() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("daemon.sock");
+        let socket = UnixSocket::new(path.clone());
+        let listener = socket.bind().unwrap();
+        let _queued = UnixStream::connect(&path).await.unwrap();
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        stop.send_replace(true);
+        let accepted = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&accepted);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            socket.listen(listener, stopped, move |_| {
+                observed.store(true, Ordering::Release);
+                async { Ok(()) }
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!accepted.load(Ordering::Acquire));
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn shared_socket_rejects_competing_owners_and_recovers_stale_path() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("nested/daemon.sock");
+        let owner = UnixSocket::new(path.clone());
+        let listener = owner.bind().unwrap();
+        let competing = UnixSocket::new(path.clone());
+        assert!(competing.bind().is_err());
+        assert!(UnixStream::connect(&path).await.is_ok());
+        drop(listener);
+        drop(owner);
+
+        // A listener that does not participate in the sidecar lease is also
+        // protected; only a refused, stale socket may be removed.
+        let external = UnixListener::bind(&path).unwrap();
+        assert!(competing.bind().is_err());
+        assert!(UnixStream::connect(&path).await.is_ok());
+        drop(external);
+        let recovered = competing.bind().unwrap();
+        assert!(UnixStream::connect(&path).await.is_ok());
+        drop(recovered);
+        drop(competing);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn shared_socket_rejects_symlinked_parent() {
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = home.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let socket = UnixSocket::new(link.join("daemon.sock"));
+        assert!(socket.bind().is_err());
+        assert!(!target.join("daemon.sock").exists());
+        assert!(!target.join("daemon.sock.lock").exists());
+    }
+
+    #[tokio::test]
     async fn failed_socket_bind_preserves_an_unowned_path() {
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("host.sock");
         std::fs::write(&path, b"occupied").unwrap();
         let socket = UnixSocket::new(path.clone());
-        assert!(socket.bind("host", &StartupTimeline::new(1, 0)).is_err());
+        assert!(socket.bind().is_err());
         drop(socket);
         assert_eq!(std::fs::read(&path).unwrap(), b"occupied");
     }
@@ -4439,16 +4424,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_info_reports_the_node_identity() {
+    async fn host_info_reports_the_node_identity() {
         let (_dir, _store, daemon, peer) = test_daemon();
-        match daemon.dispatch(Request::DaemonInfo).await {
-            Ok(ResponseOk::DaemonInfo(info)) => {
+        match daemon.dispatch(HostRequest::Info).await {
+            Ok(ResponseOk::HostStatus(info)) => {
                 assert_eq!(info.host.id, "host-01");
                 assert_eq!(info.host.peer_id, peer);
-                assert_eq!(info.socket, daemon.paths.socket.display().to_string());
                 assert_eq!(info.programs, 0);
             }
-            other => panic!("expected daemon.info, got {other:?}"),
+            other => panic!("expected host.info, got {other:?}"),
         }
     }
 
@@ -4459,7 +4443,7 @@ mod tests {
         let cancelling_daemon = Arc::clone(&daemon);
         let cancellation = tokio::spawn(async move {
             cancelling_daemon
-                .dispatch(Request::ExecCancelCreation { exec_id })
+                .dispatch(HostRequest::ExecCancelCreation { exec_id })
                 .await
         });
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -4483,7 +4467,7 @@ mod tests {
         .expect("cancellation registered its arrival rendezvous");
 
         let response = daemon
-            .dispatch(Request::ExecNew {
+            .dispatch(HostRequest::ExecNew {
                 exec_id,
                 program: "missing".to_owned(),
                 params: None,
@@ -4590,7 +4574,7 @@ mod tests {
             .await
             .unwrap();
 
-        match daemon.dispatch(Request::ExecStatus { exec_id }).await {
+        match daemon.dispatch(HostRequest::ExecStatus { exec_id }).await {
             Ok(ResponseOk::Status(status)) => {
                 assert_eq!(status.exec_id, exec_id);
                 assert_eq!(status.lifecycle(), ExecLifecycle::Failed);
@@ -4598,7 +4582,7 @@ mod tests {
             other => panic!("expected exec.status, got {other:?}"),
         }
         match daemon
-            .dispatch(Request::ExecInspect {
+            .dispatch(HostRequest::ExecInspect {
                 exec_id,
                 private_from: Some(0),
                 private_limit: MAX_PRIVATE_INSPECTION_RECORDS as u16,
@@ -4617,7 +4601,7 @@ mod tests {
         }
         assert!(matches!(
             daemon
-                .dispatch(Request::ExecInspect {
+                .dispatch(HostRequest::ExecInspect {
                     exec_id,
                     private_from: Some(0),
                     private_limit: (MAX_PRIVATE_INSPECTION_RECORDS + 1) as u16,
@@ -4630,7 +4614,7 @@ mod tests {
         ));
         assert!(matches!(
             daemon
-                .dispatch(Request::ExecInspect {
+                .dispatch(HostRequest::ExecInspect {
                     exec_id,
                     private_from: Some(0),
                     private_limit: 0,
@@ -4641,14 +4625,14 @@ mod tests {
                 ..
             })
         ));
-        match daemon.dispatch(Request::ExecList).await {
+        match daemon.dispatch(HostRequest::ExecList).await {
             Ok(ResponseOk::ExecList(statuses)) => {
                 assert_eq!(statuses.len(), 1);
                 assert_eq!(statuses[0].exec_id, exec_id);
             }
             other => panic!("expected exec.list, got {other:?}"),
         }
-        match daemon.dispatch(Request::ExecNext { exec_id }).await {
+        match daemon.dispatch(HostRequest::ExecNext { exec_id }).await {
             Ok(ResponseOk::Next(NextEvent::Failed { reason })) => {
                 assert_eq!(reason, "stored failure");
             }

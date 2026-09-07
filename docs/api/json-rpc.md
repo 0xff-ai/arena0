@@ -1,6 +1,8 @@
-# Local Host API
+# Local daemon API
 
-The daemon exposes one typed JSON request surface on each Host's Unix socket.
+The daemon exposes one typed JSON request surface at `$ARENA0_HOME/arena0.sock`.
+`ARENA0_SOCKET` overrides this single endpoint. Every Host operation names its
+local Host ID explicitly; identity and storage remain independent per Host.
 `arena0-api` owns the DTOs, `arena0-daemon` dispatches them, and
 `arena0-client::DaemonClient` is the shared Unix-socket client used by the CLI.
 
@@ -12,11 +14,17 @@ length. A normal connection carries one request and one response.
 values until the connection closes. `activity.subscribe` similarly sends
 `ActivitySubscribed`, followed by daemon-wide `ActivityFrame` observations.
 
-The request shape is:
+A Host request wraps the existing operation:
 
 ```json
-{"method":"exec.status","params":{"exec_id":"<64-hex>"}}
+{"method":"host.call","params":{"host":"host-01","request":{"method":"exec.status","params":{"exec_id":"<64-hex>"}}}}
 ```
+
+Daemon operations such as `{"method":"daemon.info"}` have no Host target.
+The identity, program, execution, and receipt methods below are inner
+`HostRequest` operations sent in `host.call`. An unknown or malformed Host ID
+fails without selecting a different Host or creating a namespace. Use
+`hosts.open` to provision or reopen a Host explicitly.
 
 Requests reject unknown fields. Responses are the Serde representation of:
 
@@ -196,26 +204,38 @@ both `outcome_borsh` and the replayed `outcome_json` for completion. Stopped
 results never carry an outcome field; `cause` preserves either authenticated
 unilateral evidence or a shared N-of-N stop commitment.
 
-## Host lifecycle and events
+## Daemon lifecycle and Host information
 
-| Method | Params | Success |
-|---|---|---|
-| `daemon.info` | — | `DaemonInfo` |
-| `hosts.list` | — | `Hosts`, containing `DaemonInfo` for each supervised Host |
-| `daemon.stop` | — | `Ack` |
-| `events.subscribe` | `{filter}` | `Subscribed`, then `EventFrame` stream |
-| `activity.subscribe` | — | `ActivitySubscribed`, then `ActivityFrame` stream |
+| Method | Scope | Params | Success |
+|---|---|---|---|
+| `daemon.info` | Daemon | — | `DaemonInfo` |
+| `hosts.list` | Daemon | — | `Hosts`, containing `HostStatus` entries |
+| `hosts.open` | Daemon | `{id?,user_agent}` | `HostOpened`, containing `HostInfo` |
+| `daemon.stop` | Daemon | — | `Ack` |
+| `activity.subscribe` | Daemon | — | `ActivitySubscribed`, then `ActivityFrame` stream |
+| `host.info` | Host | — | `HostStatus` |
+| `events.subscribe` | Host | `{filter}` | `Subscribed`, then `EventFrame` stream |
 
-`DaemonInfo` contains a `host` object with the selected Host's local `id`,
-`PeerId`, and optional caller `user_agent`, followed by its public identity key,
-version, ABI version, uptime, socket, program count, and active execution count.
-When one Host asks to stop, the process supervisor coordinates shutdown of the
-whole local Ensemble.
+`DaemonInfo` contains process version, ABI version, uptime, the Unix socket,
+and the actual bound `mcp_endpoint`, including an assigned ephemeral port.
+`HostStatus` contains `host` (`id`, cryptographic `peer_id`, and optional
+`user_agent`), public `transport_key`, program count, and active execution count.
+Host metadata contains no socket path.
+
+`hosts.open` uses the same serialized provisioning operation as MCP
+`open_host`. A supplied ID reopens its durable namespace; an omitted ID creates
+a fresh one. The required user agent identifies caller software and follows
+the same validation as MCP. Opening is acknowledged only after recovery and
+publication in the daemon's authoritative roster.
+
+One daemon owns each home. Its single listener serves concurrent requests and
+Host subscriptions. `daemon.stop` acknowledges before beginning coordinated
+shutdown; shutdown drains owned connection tasks, Hosts, transport, and stores.
 
 Event tags and filtering are documented in [events/README.md](events/README.md).
 
 `activity.subscribe` observes MCP calls across the complete local daemon;
-subscribe through one Host socket rather than once per Host. Each frame has
+subscribe once through the shared daemon endpoint. Each frame has
 `boot_id`, `seq`, `ts`, `kind`, and `data`. Started records carry a call ID,
 tool name, and optional Host/execution correlation. Finished records carry that call ID,
 elapsed milliseconds, and a safe result class. `Interrupted` means the server

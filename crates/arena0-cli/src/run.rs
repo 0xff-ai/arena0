@@ -3,7 +3,7 @@
 use std::io::{IsTerminal as _, Write as _};
 
 use anyhow::{Context, bail};
-use arena0_client::api::{EnsembleSpec, NextEvent, Request, ResponseOk};
+use arena0_client::api::{EnsembleSpec, HostRequest, NextEvent, ResponseOk};
 use arena0_client::protocol::{ExecId, NegotiationId, PeerId, SessionHash};
 use serde_json::Value;
 
@@ -29,7 +29,7 @@ pub(crate) fn parse_join_ensemble(values: &[String]) -> anyhow::Result<EnsembleS
 /// Prompt for local callouts and drive one existing execution to its terminal.
 pub(crate) async fn drive_loop(ctx: &Ctx, exec_id: ExecId) -> anyhow::Result<Completed> {
     loop {
-        match ctx.client().call(&Request::ExecNext { exec_id }).await? {
+        match ctx.call(&HostRequest::ExecNext { exec_id }).await? {
             ResponseOk::Next(NextEvent::Callout {
                 pending_id,
                 name,
@@ -50,13 +50,12 @@ pub(crate) async fn drive_loop(ctx: &Ctx, exec_id: ExecId) -> anyhow::Result<Com
                 let answer =
                     prompt_answer(ctx, exec_id, &name, &prompt, &context, schema.as_value())
                         .await?;
-                ctx.client()
-                    .call(&Request::ExecSubmit {
-                        exec_id,
-                        pending_id,
-                        answer: Some(answer),
-                    })
-                    .await?;
+                ctx.call(&HostRequest::ExecSubmit {
+                    exec_id,
+                    pending_id,
+                    answer: Some(answer),
+                })
+                .await?;
                 eprintln!(
                     "{}",
                     ctx.palette

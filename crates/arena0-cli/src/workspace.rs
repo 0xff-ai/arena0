@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use anyhow::{Context as _, anyhow, bail};
-use arena0_client::api::{ExecStatus, ProgramDetail, Request, ResponseOk};
+use arena0_client::api::{ExecStatus, HostRequest, ProgramDetail, ResponseOk};
 use arena0_client::proto::DaemonClient;
 use arena0_client::protocol::ProgramHash;
 use arena0_home::HostName;
@@ -61,17 +61,28 @@ const LOGO_SEGMENTS: [[f64; 4]; 29] = [
 #[derive(Debug)]
 pub(crate) struct Launch {
     pub(crate) program: String,
-    pub(crate) participants: usize,
-    pub(crate) human_control: HumanControl,
+    pub(crate) hosts: Vec<HostName>,
+    pub(crate) input_control: InputControl,
+    pub(crate) params: Option<Value>,
+    pub(crate) replay: bool,
+}
+
+/// Initial values supplied by the existing launch command or bare workspace.
+#[derive(Debug)]
+pub(crate) struct Setup {
+    pub(crate) hosts: Vec<HostName>,
+    pub(crate) fixed_hosts: bool,
+    pub(crate) bindings: Option<Vec<crate::coordinated::DriverBinding>>,
     pub(crate) params: Option<Value>,
     pub(crate) replay: bool,
 }
 
 /// Which local Hosts send their callouts to the shared human interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum HumanControl {
+pub(crate) enum InputControl {
     OneHost { host: HostName },
     AllHosts,
+    Configured(Vec<crate::coordinated::DriverBinding>),
 }
 
 #[derive(Debug)]
@@ -83,17 +94,21 @@ pub(crate) enum Exit {
 /// Load the typed catalog and execution summary used by the workspace.
 pub(crate) async fn load(
     client: &DaemonClient,
+    host: &HostName,
 ) -> anyhow::Result<(Vec<ProgramDetail>, Vec<ExecStatus>)> {
-    let programs = match client.call(&Request::ProgramList).await? {
+    let programs = match client.call_host(host, &HostRequest::ProgramList).await? {
         ResponseOk::ProgramList(programs) => programs,
         other => bail!("unexpected program.list response: {other:?}"),
     };
     let mut details = Vec::with_capacity(programs.len());
     for program in programs {
         let response = client
-            .call(&Request::ProgramGet {
-                program: program.program_hash.to_string(),
-            })
+            .call_host(
+                host,
+                &HostRequest::ProgramGet {
+                    program: program.program_hash.to_string(),
+                },
+            )
             .await
             .with_context(|| format!("load program '{}' for workspace", program.name))?;
         let ResponseOk::Program(detail) = response else {
@@ -102,7 +117,7 @@ pub(crate) async fn load(
         details.push(*detail);
     }
     details.sort_by(|left, right| left.summary.display_name.cmp(&right.summary.display_name));
-    let executions = match client.call(&Request::ExecList).await? {
+    let executions = match client.call_host(host, &HostRequest::ExecList).await? {
         ResponseOk::ExecList(executions) => executions,
         other => bail!("unexpected exec.list response: {other:?}"),
     };
@@ -113,15 +128,15 @@ pub(crate) async fn load(
 pub(crate) async fn choose(
     programs: Vec<ProgramDetail>,
     executions: Vec<ExecStatus>,
-    available_hosts: usize,
-    can_resize_hosts: bool,
+    setup: Setup,
 ) -> anyhow::Result<Exit> {
     if programs.is_empty() {
         bail!("the local program catalog is empty");
     }
     let (mut terminal, _restore) = crate::terminal::enter()?;
     let mut events = EventStream::new();
-    let mut state = State::new(programs, executions, available_hosts, can_resize_hosts);
+    let mut state = State::new(programs, executions, setup.hosts.len(), !setup.fixed_hosts);
+    state.configure(setup);
     loop {
         let area = terminal.size().context("read workspace terminal size")?;
         if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
@@ -157,10 +172,10 @@ struct State {
     executions: Vec<ExecStatus>,
     selected: usize,
     participants: usize,
-    human_control: HumanControl,
+    input_control: InputControl,
     replay: bool,
     params: HashMap<ProgramHash, String>,
-    available_hosts: usize,
+    hosts: Vec<HostName>,
     can_resize_hosts: bool,
     mode: Mode,
     error: Option<String>,
@@ -180,17 +195,44 @@ impl State {
             executions,
             selected: 0,
             participants,
-            human_control: HumanControl::OneHost {
+            input_control: InputControl::OneHost {
                 host: HostName::for_local_index(0),
             },
             replay: true,
             params: HashMap::new(),
-            available_hosts,
+            hosts: crate::local_daemon::host_names(available_hosts),
             can_resize_hosts,
             mode: Mode::Browse,
             error: None,
             palette: TuiPalette::detect(),
         }
+    }
+
+    fn configure(&mut self, setup: Setup) {
+        self.hosts = setup.hosts;
+        self.can_resize_hosts = !setup.fixed_hosts;
+        self.replay = setup.replay;
+        if let Some(params) = setup.params {
+            let text = params.to_string();
+            for program in &self.programs {
+                self.params
+                    .insert(program.summary.program_hash, text.clone());
+            }
+        }
+        self.input_control = setup.bindings.map_or_else(
+            || InputControl::OneHost {
+                host: self.host_at(0),
+            },
+            InputControl::Configured,
+        );
+        self.program_changed();
+    }
+
+    fn host_at(&self, index: usize) -> HostName {
+        self.hosts
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| HostName::for_local_index(index))
     }
 
     fn program(&self) -> &ProgramDetail {
@@ -278,12 +320,17 @@ impl State {
                     self.error = None;
                     None
                 }
-                KeyCode::Char('c') => {
-                    self.human_control = match &self.human_control {
-                        HumanControl::OneHost { .. } => HumanControl::AllHosts,
-                        HumanControl::AllHosts => HumanControl::OneHost {
-                            host: HostName::for_local_index(0),
+                KeyCode::Char('c')
+                    if !matches!(self.input_control, InputControl::Configured(_)) =>
+                {
+                    self.input_control = match &self.input_control {
+                        InputControl::OneHost { .. } => InputControl::AllHosts,
+                        InputControl::AllHosts => InputControl::OneHost {
+                            host: self.host_at(0),
                         },
+                        InputControl::Configured(_) => {
+                            unreachable!("configured bindings are fixed")
+                        }
                     };
                     self.error = None;
                     None
@@ -315,7 +362,7 @@ impl State {
 
     fn program_changed(&mut self) {
         self.participants =
-            initial_participants(self.program(), self.available_hosts, self.can_resize_hosts);
+            initial_participants(self.program(), self.hosts.len(), self.can_resize_hosts);
         self.clamp_human_host();
         self.error = None;
     }
@@ -323,8 +370,8 @@ impl State {
     fn adjust_participants(&mut self, delta: i8) {
         if !self.can_resize_hosts {
             self.error = Some(format!(
-                "the existing service owns {} Hosts; quit and stop it before changing the local Ensemble",
-                self.available_hosts
+                "the command selected {} Hosts; edit --hosts or driver bindings to change them",
+                self.hosts.len()
             ));
             return;
         }
@@ -340,24 +387,24 @@ impl State {
     }
 
     fn select_next_human_host(&mut self) {
-        let HumanControl::OneHost { host } = &self.human_control else {
+        let InputControl::OneHost { host } = &self.input_control else {
             return;
         };
         let current = (0..self.participants)
-            .position(|index| HostName::for_local_index(index) == *host)
+            .position(|index| self.host_at(index) == *host)
             .unwrap_or(0);
-        self.human_control = HumanControl::OneHost {
-            host: HostName::for_local_index((current + 1) % self.participants.max(1)),
+        self.input_control = InputControl::OneHost {
+            host: self.host_at((current + 1) % self.participants.max(1)),
         };
     }
 
     fn clamp_human_host(&mut self) {
-        let HumanControl::OneHost { host } = &self.human_control else {
+        let InputControl::OneHost { host } = &self.input_control else {
             return;
         };
-        if !(0..self.participants).any(|index| HostName::for_local_index(index) == *host) {
-            self.human_control = HumanControl::OneHost {
-                host: HostName::for_local_index(self.participants.saturating_sub(1)),
+        if !(0..self.participants).any(|index| self.host_at(index) == *host) {
+            self.input_control = InputControl::OneHost {
+                host: self.host_at(self.participants.saturating_sub(1)),
             };
         }
     }
@@ -389,9 +436,11 @@ impl State {
         let params_text = self.params_text();
         let params = self.validate_params(params_text.as_ref())?;
         Ok(Launch {
-            program: program.summary.name.clone(),
-            participants: self.participants,
-            human_control: self.human_control.clone(),
+            program: program.summary.program_hash.to_string(),
+            hosts: (0..self.participants)
+                .map(|index| self.host_at(index))
+                .collect(),
+            input_control: self.input_control.clone(),
             params,
             replay: self.replay,
         })
@@ -458,7 +507,11 @@ fn render(frame: &mut Frame<'_>, state: &State) {
             error,
         );
     }
-    let keys = if footer.width >= 104 {
+    let keys = if matches!(state.input_control, InputControl::Configured(_)) {
+        vec![Line::raw(
+            "↑↓ select    p params    r replay    Enter launch    ? help    q quit",
+        )]
+    } else if footer.width >= 104 {
         vec![Line::raw(
             "↑↓ select    +/- Hosts    c control    h Host    p params    r replay    Enter run    ? help    q quit",
         )]
@@ -574,15 +627,16 @@ fn render_catalog(frame: &mut Frame<'_>, state: &State, area: Rect) {
 
 fn render_setup(frame: &mut Frame<'_>, state: &State, area: Rect) {
     let program = state.program();
-    let control_label = match state.human_control {
-        HumanControl::OneHost { .. } => "[●] One Host    [ ] All Hosts",
-        HumanControl::AllHosts => "[ ] One Host    [●] All Hosts",
+    let control_label = match state.input_control {
+        InputControl::OneHost { .. } => "[●] One Host    [ ] All Hosts",
+        InputControl::AllHosts => "[ ] One Host    [●] All Hosts",
+        InputControl::Configured(_) => "Configured by command flags",
     };
     let mut lines = vec![
         Line::styled(
             format!(
                 "{} Hosts ready    {} known executions",
-                state.available_hosts,
+                state.hosts.len(),
                 state.executions.len()
             ),
             state.palette.muted(),
@@ -597,13 +651,18 @@ fn render_setup(frame: &mut Frame<'_>, state: &State, area: Rect) {
         labeled(state, "Version", program.summary.version.clone()),
         labeled(
             state,
+            "Program ID",
+            program.summary.program_hash.fmt_short().to_string(),
+        ),
+        labeled(
+            state,
             "Participants",
             program.summary.participants.to_string(),
         ),
         Line::default(),
         labeled(state, "Hosts", state.participants.to_string()),
         Line::default(),
-        Line::styled("HUMAN CONTROL", state.palette.emphasis()),
+        Line::styled("INPUT CONTROL", state.palette.emphasis()),
         Line::styled(control_label, state.palette.strong()),
         Line::default(),
         Line::from(vec![
@@ -612,22 +671,41 @@ fn render_setup(frame: &mut Frame<'_>, state: &State, area: Rect) {
         ]),
     ];
     for index in 0..state.participants {
-        let host = HostName::for_local_index(index);
-        let driver = match &state.human_control {
-            HumanControl::AllHosts => "YOU ANSWER",
-            HumanControl::OneHost { host: human } if *human == host => "YOU ANSWER",
-            HumanControl::OneHost { .. } => "BUILTIN sample",
+        let host = state.host_at(index);
+        let driver = match &state.input_control {
+            InputControl::AllHosts => "YOU ANSWER".to_owned(),
+            InputControl::OneHost { host: human } if *human == host => "YOU ANSWER".to_owned(),
+            InputControl::OneHost { .. } => "BUILTIN sample".to_owned(),
+            InputControl::Configured(bindings) => bindings
+                .iter()
+                .find(|binding| binding.host == host)
+                .map_or_else(
+                    || "EXTERNAL CLIENT".to_owned(),
+                    |binding| match &binding.driver {
+                        crate::coordinated::DriverSpec::External => "EXTERNAL CLIENT".to_owned(),
+                        crate::coordinated::DriverSpec::Human => "YOU ANSWER".to_owned(),
+                        crate::coordinated::DriverSpec::Builtin(strategy) => {
+                            format!("BUILTIN {strategy}")
+                        }
+                        crate::coordinated::DriverSpec::Executable(path) => {
+                            format!("AGENT {}", path.display())
+                        }
+                    },
+                ),
         };
         lines.push(labeled(state, &format!("  {host}"), driver.to_owned()));
     }
     lines.push(Line::default());
     lines.push(Line::styled(
-        match &state.human_control {
-            HumanControl::OneHost { host } => {
+        match &state.input_control {
+            InputControl::OneHost { host } => {
                 format!("You answer {host}. Other Hosts use the sample policy.")
             }
-            HumanControl::AllHosts => {
+            InputControl::AllHosts => {
                 "You answer each Host independently. Concurrent requests are queued.".to_owned()
+            }
+            InputControl::Configured(_) => {
+                "Unbound Hosts wait for an external client or monitor answer.".to_owned()
             }
         },
         state.palette.muted(),
@@ -912,18 +990,54 @@ mod tests {
         state.adjust_participants(1);
         state.adjust_participants(1);
         assert_eq!(state.participants, 4);
-        state.human_control = HumanControl::OneHost {
+        state.input_control = InputControl::OneHost {
             host: HostName::for_local_index(3),
         };
         state.adjust_participants(-1);
         assert_eq!(state.participants, 3);
         assert_eq!(
-            state.human_control,
-            HumanControl::OneHost {
+            state.input_control,
+            InputControl::OneHost {
                 host: HostName::for_local_index(2)
             }
         );
         assert!(state.launch().is_ok());
+    }
+
+    #[test]
+    fn selection_preserves_exact_program_and_explicit_launch_inputs() {
+        use crate::coordinated::{DriverBinding, DriverSpec};
+        let first = program_with_params(
+            serde_json::json!({"kind":"exact","count":2}),
+            serde_json::json!({"type":"object","properties":{"rounds":{"type":"integer"}},"required":["rounds"]}),
+        );
+        let mut second = first.clone();
+        second.summary.program_hash = ProgramHash([42; 32]);
+        let selected = second.summary.program_hash;
+        let hosts: Vec<HostName> = vec!["alice".parse().unwrap(), "bob".parse().unwrap()];
+        let bindings = vec![
+            DriverBinding::new(hosts[0].clone(), DriverSpec::Builtin("sample".into())),
+            DriverBinding::new(hosts[1].clone(), DriverSpec::External),
+        ];
+        let mut state = State::new(vec![first, second], Vec::new(), 2, false);
+        state.selected = 1;
+        state.configure(Setup {
+            hosts: hosts.clone(),
+            fixed_hosts: true,
+            bindings: Some(bindings.clone()),
+            params: Some(serde_json::json!({"rounds":4})),
+            replay: false,
+        });
+        let Some(Ok(Exit::Launch(launch))) =
+            state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("launch selection");
+        };
+        assert_eq!(launch.program, selected.to_string());
+        assert_eq!(launch.hosts, hosts);
+        assert_eq!(launch.input_control, InputControl::Configured(bindings));
+        assert_eq!(launch.params, Some(serde_json::json!({"rounds":4})));
+        assert!(!launch.replay);
     }
 
     #[test]
@@ -936,14 +1050,14 @@ mod tests {
             2,
             true,
         );
-        state.human_control = HumanControl::AllHosts;
+        state.input_control = InputControl::AllHosts;
 
         state.adjust_participants(1);
 
-        assert_eq!(state.human_control, HumanControl::AllHosts);
+        assert_eq!(state.input_control, InputControl::AllHosts);
         assert_eq!(
-            state.launch().unwrap().human_control,
-            HumanControl::AllHosts
+            state.launch().unwrap().input_control,
+            InputControl::AllHosts
         );
     }
 

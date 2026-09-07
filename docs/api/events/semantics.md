@@ -1,6 +1,7 @@
 # Event delivery semantics
 
-`events.subscribe` reports live host occurrences on one local Unix socket
+`events.subscribe` reports live occurrences for the explicitly selected Host
+through the daemon's shared Unix socket
 connection. The event bus is bounded, does not replay old events, and never
 blocks the host on a subscriber.
 

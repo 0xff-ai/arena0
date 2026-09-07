@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, anyhow, bail};
 use arena0_client::answer;
 use arena0_client::api::{
-    ApiErrorCode, AwaitState, EnsembleSpec, EventData, EventFilter, NextEvent, ProgramDetail,
-    ProgramSummary, ReceiptRef, Request, ResponseOk, VerifiedResult,
+    ApiErrorCode, AwaitState, EnsembleSpec, EventData, EventFilter, HostRequest, NextEvent,
+    ProgramDetail, ProgramSummary, ReceiptRef, Request, ResponseOk, VerifiedResult,
 };
 use arena0_client::proto::{DaemonClient, Subscription};
 use arena0_client::protocol::{
@@ -861,7 +861,7 @@ impl Coordinator {
             let peer_id = participant.peer_id;
             let host = participant.host.clone();
             jobs.spawn(async move {
-                verify_one_receipt(client, session_id, peer_id, tier)
+                verify_one_receipt(host.clone(), client, session_id, peer_id, tier)
                     .await
                     .map(|evidence| (host, peer_id, evidence))
             });
@@ -904,7 +904,7 @@ async fn stop_participants(participants: &[LocalParticipant]) -> anyhow::Result<
         jobs.spawn(async move {
             let operation = async {
                 match client
-                    .call_raw(&Request::ExecCancelCreation { exec_id })
+                    .call_host_raw(&host, &HostRequest::ExecCancelCreation { exec_id })
                     .await?
                 {
                     Ok(ResponseOk::Ack) => Ok(()),
@@ -912,7 +912,10 @@ async fn stop_participants(participants: &[LocalParticipant]) -> anyhow::Result<
                         "unexpected creation-cancel response while stopping Host '{host}': {other:?}"
                     ),
                     Err(error) if error.code == ApiErrorCode::NotFound => {
-                        match client.call_raw(&Request::ExecStatus { exec_id }).await? {
+                        match client
+                            .call_host_raw(&host, &HostRequest::ExecStatus { exec_id })
+                            .await?
+                        {
                             Ok(ResponseOk::Status(status)) if status.lifecycle().is_terminal() => {
                                 Ok(())
                             }
@@ -958,24 +961,29 @@ async fn connect_hosts(
     bindings: &ValidatedBindings,
     progress: &RunProgress,
 ) -> anyhow::Result<Vec<HostConnection>> {
+    let client = DaemonClient::from_env()
+        .map_err(|error| anyhow!("resolve daemon socket from environment: {error}"))?;
+    let daemon_abi_version = match client.call(&Request::DaemonInfo).await? {
+        ResponseOk::DaemonInfo(info) => info.abi_version,
+        other => bail!("unexpected daemon.info response: {other:?}"),
+    };
     let mut jobs = JoinSet::new();
     for (index, binding) in bindings.as_slice().iter().enumerate() {
         let host = binding.host.clone();
         let driver = binding.driver.clone();
+        let client = client.clone();
         jobs.spawn(async move {
-            let client = DaemonClient::for_host(&host)
-                .map_err(|error| anyhow!("resolve socket for Host '{host}': {error}"))?;
-            let info = match client.call(&Request::DaemonInfo).await? {
-                ResponseOk::DaemonInfo(info) => info,
-                other => bail!("unexpected daemon.info response from Host '{host}': {other:?}"),
+            let info = match client.call_host(&host, &HostRequest::Info).await? {
+                ResponseOk::HostStatus(status) => status.host,
+                other => bail!("unexpected host.info response from Host '{host}': {other:?}"),
             };
             Ok::<_, anyhow::Error>((
                 index,
                 HostConnection {
                     host,
                     client,
-                    peer_id: info.host.peer_id,
-                    abi_version: info.abi_version,
+                    peer_id: info.peer_id,
+                    abi_version: daemon_abi_version,
                     driver,
                 },
             ))
@@ -1018,7 +1026,7 @@ async fn open_tui_subscriptions(
         let filter = filter.clone();
         jobs.spawn(async move {
             client
-                .subscribe(filter)
+                .subscribe(&host, filter)
                 .await
                 .with_context(|| format!("subscribe to Host '{host}' events"))
                 .map(|subscription| (index, subscription))
@@ -1056,10 +1064,12 @@ async fn resolve_program(
         let wasm = wasm.clone();
         jobs.spawn(async move {
             let response = if let Some(wasm) = wasm {
-                client.call(&Request::ProgramImport { wasm }).await
+                client
+                    .call_host(&host_name, &HostRequest::ProgramImport { wasm })
+                    .await
             } else {
                 client
-                    .call(&Request::ProgramGet { program: reference })
+                    .call_host(&host_name, &HostRequest::ProgramGet { program: reference })
                     .await
             }?;
             let ResponseOk::Program(detail) = response else {
@@ -1117,7 +1127,7 @@ async fn resolve_program(
     Ok(baseline)
 }
 
-fn wasm_reference(reference: &str) -> Option<&Path> {
+pub(crate) fn wasm_reference(reference: &str) -> Option<&Path> {
     let path = Path::new(reference);
     (path.is_file()
         || path
@@ -1159,7 +1169,8 @@ async fn create_executions(
     let peers = hosts.iter().skip(1).map(|host| host.peer_id).collect();
     let created = call_during_creation(
         &creator.client,
-        Request::ExecNew {
+        &creator.host,
+        HostRequest::ExecNew {
             exec_id: creator_exec,
             program: program_id.to_string(),
             params,
@@ -1219,6 +1230,7 @@ async fn create_executions(
             break;
         }
         let client = host.client.clone();
+        let host_name = host.host.clone();
         let creator_peer = creator.peer_id;
         let exec_id = ExecId(rand::random());
         exec_ids[index] = Some(exec_id);
@@ -1227,7 +1239,8 @@ async fn create_executions(
             let result = async {
                 let response = call_during_creation(
                     &client,
-                    Request::ExecNew {
+                    &host_name,
+                    HostRequest::ExecNew {
                         exec_id,
                         program: program_id.to_string(),
                         params: None,
@@ -1313,10 +1326,11 @@ async fn create_executions(
 
 async fn call_during_creation(
     client: &DaemonClient,
-    request: Request,
+    host: &HostName,
+    request: HostRequest,
     cancelled: &mut watch::Receiver<Option<String>>,
 ) -> anyhow::Result<ResponseOk> {
-    let call = tokio::time::timeout(CREATE_REQUEST_TIMEOUT, client.call(&request));
+    let call = tokio::time::timeout(CREATE_REQUEST_TIMEOUT, client.call_host(host, &request));
     tokio::pin!(call);
     tokio::select! {
         result = &mut call => result
@@ -1341,10 +1355,13 @@ async fn await_activation(
         let exec_id = participant.exec_id;
         jobs.spawn(async move {
             match client
-                .call(&Request::ExecAwait {
-                    exec_id,
-                    until: AwaitState::Active,
-                })
+                .call_host(
+                    &host,
+                    &HostRequest::ExecAwait {
+                        exec_id,
+                        until: AwaitState::Active,
+                    },
+                )
                 .await
                 .with_context(|| {
                     format!("wait for Host '{host}' execution {exec_id} to activate")
@@ -1364,7 +1381,7 @@ async fn await_activation(
                 other => bail!("unexpected exec.await response from Host '{host}': {other:?}"),
             }
             let ResponseOk::Status(status) = client
-                .call(&Request::ExecStatus { exec_id })
+                .call_host(&host, &HostRequest::ExecStatus { exec_id })
                 .await
                 .with_context(|| {
                     format!("read Host '{host}' execution {exec_id} after activation")
@@ -1417,10 +1434,13 @@ async fn drive_to_terminal(
         let await_terminal = async {
             loop {
                 match client
-                    .call_raw(&Request::ExecAwait {
-                        exec_id,
-                        until: AwaitState::Terminal,
-                    })
+                    .call_host_raw(
+                        &host,
+                        &HostRequest::ExecAwait {
+                            exec_id,
+                            until: AwaitState::Terminal,
+                        },
+                    )
                     .await?
                 {
                     Ok(ResponseOk::Awaited { .. }) => break,
@@ -1429,7 +1449,10 @@ async fn drive_to_terminal(
                     other => bail!("unexpected exec.await response: {other:?}"),
                 }
             }
-            match client.call(&Request::ExecNext { exec_id }).await? {
+            match client
+                .call_host(&host, &HostRequest::ExecNext { exec_id })
+                .await?
+            {
                 ResponseOk::Next(NextEvent::Completed {
                     session_id,
                     outcome,
@@ -1484,9 +1507,9 @@ async fn drive_loop(
     progress: &RunProgress,
 ) -> anyhow::Result<HostTerminal> {
     loop {
-        let request = Request::ExecNext { exec_id };
+        let request = HostRequest::ExecNext { exec_id };
         let next = tokio::select! {
-            response = client.call(&request) => response?,
+            response = client.call_host(host, &request) => response?,
             () = wait_for_cancel(cancelled) => {
                 bail!("coordinated run cancelled while driving {exec_id}")
             }
@@ -1526,11 +1549,14 @@ async fn drive_loop(
                 };
                 let submit = async {
                     match client
-                        .call_raw(&Request::ExecSubmit {
-                            exec_id,
-                            pending_id,
-                            answer: Some(answer),
-                        })
+                        .call_host_raw(
+                            host,
+                            &HostRequest::ExecSubmit {
+                                exec_id,
+                                pending_id,
+                                answer: Some(answer),
+                            },
+                        )
                         .await?
                     {
                         Ok(ResponseOk::Ack) => Ok(()),
@@ -1686,7 +1712,7 @@ async fn refresh_tui(
     exec_id: ExecId,
 ) -> anyhow::Result<()> {
     let status = match client
-        .call(&Request::ExecStatus { exec_id })
+        .call_host(host, &HostRequest::ExecStatus { exec_id })
         .await
         .with_context(|| format!("refresh TUI status for execution {exec_id}"))?
     {
@@ -1703,11 +1729,14 @@ async fn refresh_tui(
     }
 
     match client
-        .call(&Request::ExecTrace {
-            exec_id,
-            from: 0,
-            to: u64::MAX,
-        })
+        .call_host(
+            host,
+            &HostRequest::ExecTrace {
+                exec_id,
+                from: 0,
+                to: u64::MAX,
+            },
+        )
         .await
         .with_context(|| format!("refresh TUI trace for execution {exec_id}"))?
     {
@@ -1732,11 +1761,14 @@ async fn refresh_tui_inspection(
     private_from: Option<u64>,
 ) -> anyhow::Result<()> {
     match client
-        .call(&Request::ExecInspect {
-            exec_id,
-            private_from,
-            private_limit: PRIVATE_INSPECTION_LIMIT,
-        })
+        .call_host(
+            host,
+            &HostRequest::ExecInspect {
+                exec_id,
+                private_from,
+                private_limit: PRIVATE_INSPECTION_LIMIT,
+            },
+        )
         .await
         .with_context(|| format!("refresh TUI inspection for Host '{host}' execution {exec_id}"))?
     {
@@ -1820,11 +1852,14 @@ async fn refresh_tui_view(
     exec_id: ExecId,
 ) -> anyhow::Result<()> {
     match client
-        .call_raw(&Request::ExecView {
-            exec: exec_id,
-            width: tui.view_width(),
-            color: ColorDepth::Mono,
-        })
+        .call_host_raw(
+            host,
+            &HostRequest::ExecView {
+                exec: exec_id,
+                width: tui.view_width(),
+                color: ColorDepth::Mono,
+            },
+        )
         .await
         .with_context(|| format!("refresh TUI view for Host '{host}' execution {exec_id}"))?
     {
@@ -1889,6 +1924,7 @@ impl ActiveDriver {
             Self::Human(None) => {
                 progress.suspend_for_callout();
                 let answer = prompt_human(
+                    scope.host,
                     scope.client,
                     scope.exec_id,
                     callout.name,
@@ -1964,6 +2000,7 @@ async fn wait_for_cancel_reason(cancelled: &mut watch::Receiver<Option<String>>)
 }
 
 async fn prompt_human(
+    host: &HostName,
     client: &DaemonClient,
     exec_id: ExecId,
     name: &str,
@@ -1972,7 +2009,7 @@ async fn prompt_human(
     schema: &Value,
 ) -> anyhow::Result<Value> {
     let palette = crate::ui::Palette::for_stderr(crate::ui::Mode::Human);
-    if let Some(view) = fetch_human_view(client, exec_id, palette.color_depth()).await? {
+    if let Some(view) = fetch_human_view(host, client, exec_id, palette.color_depth()).await? {
         let rendered = crate::ui::render_view_summary(&view, palette);
         if !rendered.is_empty() {
             eprintln!();
@@ -1995,16 +2032,20 @@ async fn prompt_human(
 }
 
 async fn fetch_human_view(
+    host: &HostName,
     client: &DaemonClient,
     exec_id: ExecId,
     color: ColorDepth,
 ) -> anyhow::Result<Option<View>> {
     match client
-        .call_raw(&Request::ExecView {
-            exec: exec_id,
-            width: crate::ui::terminal_width(),
-            color,
-        })
+        .call_host_raw(
+            host,
+            &HostRequest::ExecView {
+                exec: exec_id,
+                width: crate::ui::terminal_width(),
+                color,
+            },
+        )
         .await?
     {
         Ok(ResponseOk::ExecView { view, .. }) => Ok(Some(view)),
@@ -2043,6 +2084,7 @@ where
 }
 
 async fn verify_one_receipt(
+    host: HostName,
     client: DaemonClient,
     session_id: SessionHash,
     peer_id: PeerId,
@@ -2051,10 +2093,13 @@ async fn verify_one_receipt(
     let mut last_error = None;
     for attempt in 0..RECEIPT_RETRY_ATTEMPTS {
         match client
-            .call_raw(&Request::ReceiptVerify {
-                receipt: ReceiptRef::Produced(session_id),
-                full: tier.is_full(),
-            })
+            .call_host_raw(
+                &host,
+                &HostRequest::ReceiptVerify {
+                    receipt: ReceiptRef::Produced(session_id),
+                    full: tier.is_full(),
+                },
+            )
             .await?
         {
             Ok(ResponseOk::Verified {
@@ -2355,8 +2400,9 @@ mod tests {
         ApiError, ExecStatus, ExecStatusState, LightVerifiedTerminal, Response, SessionStatus,
     };
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
-    use tokio::io::BufReader;
+    use tokio::io::{AsyncRead, BufReader};
     use tokio::net::UnixListener;
     use tokio::sync::oneshot;
     use tracing_subscriber::fmt::MakeWriter;
@@ -2392,6 +2438,25 @@ mod tests {
         name.parse().expect("valid Host name")
     }
 
+    async fn read_host_request<R>(read: &mut R, expected_host: &HostName) -> HostRequest
+    where
+        R: AsyncRead + Unpin,
+    {
+        let envelope = arena0_client::api::frame::read_frame::<_, Request>(read)
+            .await
+            .expect("read routed Host request")
+            .expect("Host request frame");
+        let Request::Host { host, request } = envelope else {
+            panic!("request was not routed through host.call");
+        };
+        assert_eq!(
+            host,
+            expected_host.to_string(),
+            "request targeted wrong Host"
+        );
+        request
+    }
+
     fn test_progress() -> RunProgress {
         RunProgress::new(
             crate::progress::ProgressMode::Hidden,
@@ -2412,18 +2477,17 @@ mod tests {
         let directory = tempfile::tempdir().expect("socket directory");
         let socket = directory.path().join("view.sock");
         let listener = UnixListener::bind(&socket).expect("bind scripted Host");
+        let expected_host = host("host-01");
+        let server_host = expected_host.clone();
         let exec_id = ExecId([0x11; 32]);
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept exec.view");
             let (read, mut write) = stream.into_split();
             let mut read = BufReader::new(read);
-            let request = arena0_client::api::frame::read_frame::<_, Request>(&mut read)
-                .await
-                .expect("read exec.view")
-                .expect("exec.view request");
+            let request = read_host_request(&mut read, &server_host).await;
             assert!(matches!(
                 request,
-                Request::ExecView {
+                HostRequest::ExecView {
                     exec,
                     color: ColorDepth::Mono,
                     ..
@@ -2438,10 +2502,15 @@ mod tests {
                 .expect("write exec.view");
         });
 
-        let view = fetch_human_view(&DaemonClient::new(socket), exec_id, ColorDepth::Mono)
-            .await
-            .expect("fetch program view")
-            .expect("program view");
+        let view = fetch_human_view(
+            &expected_host,
+            &DaemonClient::new(socket),
+            exec_id,
+            ColorDepth::Mono,
+        )
+        .await
+        .expect("fetch program view")
+        .expect("program view");
         assert_eq!(
             view.slots.get(&arena0_client::protocol::Slot::State),
             Some(&"score 1".to_owned())
@@ -2458,14 +2527,13 @@ mod tests {
         let directory = tempfile::tempdir().expect("socket directory");
         let socket = directory.path().join("view-error.sock");
         let listener = UnixListener::bind(&socket).expect("bind scripted Host");
+        let expected_host = host("host-01");
+        let server_host = expected_host.clone();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept exec.view");
             let (read, mut write) = stream.into_split();
             let mut read = BufReader::new(read);
-            arena0_client::api::frame::read_frame::<_, Request>(&mut read)
-                .await
-                .expect("read exec.view")
-                .expect("exec.view request");
+            let _request = read_host_request(&mut read, &server_host).await;
             let response: Response = Err(ApiError::new(
                 ApiErrorCode::Execution,
                 "view unavailable before activation",
@@ -2477,6 +2545,7 @@ mod tests {
 
         assert!(
             fetch_human_view(
+                &expected_host,
                 &DaemonClient::new(socket),
                 ExecId([0x22; 32]),
                 ColorDepth::Mono,
@@ -2566,40 +2635,107 @@ mod tests {
         }
     }
 
-    async fn serve_script(listener: UnixListener, responses: Vec<Response>) -> Vec<Request> {
+    fn adapt_script_response(request: &HostRequest, response: &mut Response) {
+        match (request, response) {
+            (
+                HostRequest::ExecNew { exec_id, .. },
+                Ok(ResponseOk::ExecCreated {
+                    exec_id: returned, ..
+                }),
+            ) if *returned == ExecId([0; 32]) => *returned = *exec_id,
+            (
+                HostRequest::ExecAwait { exec_id, .. },
+                Ok(ResponseOk::Awaited {
+                    exec_id: returned, ..
+                }),
+            ) if *returned == ExecId([0; 32]) => *returned = *exec_id,
+            (HostRequest::ExecStatus { exec_id }, Ok(ResponseOk::Status(status)))
+                if status.exec_id == ExecId([0; 32]) =>
+            {
+                status.exec_id = *exec_id
+            }
+            _ => {}
+        }
+    }
+
+    async fn serve_script(
+        listener: UnixListener,
+        expected_host: HostName,
+        responses: Vec<Response>,
+    ) -> Vec<HostRequest> {
         let mut requests = Vec::with_capacity(responses.len());
         for mut response in responses {
             let (stream, _) = listener.accept().await.expect("accept scripted request");
             let (read, mut write) = stream.into_split();
             let mut read = BufReader::new(read);
-            let request = arena0_client::api::frame::read_frame::<_, Request>(&mut read)
+            let envelope = arena0_client::api::frame::read_frame::<_, Request>(&mut read)
                 .await
                 .expect("read scripted request")
                 .expect("request frame");
-            match (&request, &mut response) {
-                (
-                    Request::ExecNew { exec_id, .. },
-                    Ok(ResponseOk::ExecCreated {
-                        exec_id: returned, ..
-                    }),
-                ) if *returned == ExecId([0; 32]) => *returned = *exec_id,
-                (
-                    Request::ExecAwait { exec_id, .. },
-                    Ok(ResponseOk::Awaited {
-                        exec_id: returned, ..
-                    }),
-                ) if *returned == ExecId([0; 32]) => *returned = *exec_id,
-                (Request::ExecStatus { exec_id }, Ok(ResponseOk::Status(status)))
-                    if status.exec_id == ExecId([0; 32]) =>
-                {
-                    status.exec_id = *exec_id
-                }
-                _ => {}
-            }
+            let Request::Host { host, request } = envelope else {
+                panic!("scripted request was not routed through host.call");
+            };
+            assert_eq!(
+                host,
+                expected_host.to_string(),
+                "request targeted wrong Host"
+            );
+            adapt_script_response(&request, &mut response);
             requests.push(request);
             arena0_client::api::frame::write_frame(&mut write, &response)
                 .await
                 .expect("write scripted response");
+        }
+        requests
+    }
+
+    async fn serve_shared_script(
+        listener: UnixListener,
+        scripts: Vec<(HostName, Vec<Response>)>,
+    ) -> Vec<(HostName, HostRequest)> {
+        let mut scripts = scripts
+            .into_iter()
+            .map(|(host, responses)| (host.to_string(), (host, responses)))
+            .collect::<BTreeMap<_, _>>();
+        let mut remaining = scripts
+            .values()
+            .map(|(_, responses)| responses.len())
+            .sum::<usize>();
+        let mut requests = Vec::with_capacity(remaining);
+        while remaining > 0 {
+            let (stream, _) = listener.accept().await.expect("accept shared request");
+            let (read, mut write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            let envelope = arena0_client::api::frame::read_frame::<_, Request>(&mut read)
+                .await
+                .expect("read shared request")
+                .expect("request frame");
+            let Request::Host {
+                host: wire_host,
+                request,
+            } = envelope
+            else {
+                panic!("shared request was not routed through host.call");
+            };
+            let Some((expected_host, responses)) = scripts.get_mut(&wire_host) else {
+                panic!("request targeted unknown Host {wire_host}");
+            };
+            assert_eq!(
+                wire_host,
+                expected_host.to_string(),
+                "request targeted the wrong Host"
+            );
+            assert!(
+                !responses.is_empty(),
+                "Host received more requests than scripted"
+            );
+            let mut response = responses.remove(0);
+            adapt_script_response(&request, &mut response);
+            requests.push((expected_host.clone(), request));
+            arena0_client::api::frame::write_frame(&mut write, &response)
+                .await
+                .expect("write shared response");
+            remaining -= 1;
         }
         requests
     }
@@ -2614,6 +2750,7 @@ mod tests {
         let pending_id = PendingId::new(17);
         let server = tokio::spawn(serve_script(
             listener,
+            host("host-01"),
             vec![
                 Ok(ResponseOk::Next(NextEvent::Callout {
                     pending_id,
@@ -2661,7 +2798,7 @@ mod tests {
         );
         let requests = server.await.unwrap();
         assert!(
-            matches!(requests.as_slice(), [Request::ExecNext { .. }, Request::ExecSubmit { pending_id: id, .. }, Request::ExecNext { .. }] if *id == pending_id)
+            matches!(requests.as_slice(), [HostRequest::ExecNext { .. }, HostRequest::ExecSubmit { pending_id: id, .. }, HostRequest::ExecNext { .. }] if *id == pending_id)
         );
     }
 
@@ -2674,6 +2811,7 @@ mod tests {
         let session_id = SessionHash([0x84; 32]);
         let server = tokio::spawn(serve_script(
             listener,
+            host("host-01"),
             vec![
                 Err(arena0_client::api::ApiError::new(
                     ApiErrorCode::Timeout,
@@ -2716,15 +2854,15 @@ mod tests {
         assert!(matches!(
             server.await.unwrap().as_slice(),
             [
-                Request::ExecAwait {
+                HostRequest::ExecAwait {
                     until: AwaitState::Terminal,
                     ..
                 },
-                Request::ExecAwait {
+                HostRequest::ExecAwait {
                     until: AwaitState::Terminal,
                     ..
                 },
-                Request::ExecNext { .. }
+                HostRequest::ExecNext { .. }
             ]
         ));
     }
@@ -2742,23 +2880,19 @@ mod tests {
         })
     }
 
-    fn daemon_info_response(name: &str, peer: PeerId, socket: &Path) -> Response {
-        let info = serde_json::from_value(json!({
+    fn host_info_response(name: &str, peer: PeerId) -> Response {
+        let status = serde_json::from_value(json!({
             "host": {
                 "id": name,
                 "peer_id": peer,
                 "user_agent": "cli-test/1",
             },
             "transport_key": format!("{:02x}", peer.0[0]).repeat(32),
-            "version": "0.1.0",
-            "abi_version": arena0_client::protocol::ABI_VERSION,
-            "uptime_secs": 1,
-            "socket": socket.display().to_string(),
             "programs": 1,
             "execs_active": 0,
         }))
-        .expect("scripted daemon info");
-        Ok(ResponseOk::DaemonInfo(info))
+        .expect("scripted Host info");
+        Ok(ResponseOk::HostStatus(status))
     }
 
     fn program_response(program_id: ProgramHash) -> Response {
@@ -2813,12 +2947,13 @@ mod tests {
         let session_id = SessionHash([0x32; 32]);
         let negotiation_id = arena0_client::protocol::NegotiationId([0x42; 32]);
         let peers = [PeerId([1; 32]), PeerId([2; 32])];
-        let mut servers = Vec::new();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).expect("bind shared daemon");
+        let client = DaemonClient::new(socket);
+        let mut scripts = Vec::new();
         let mut connections = Vec::new();
 
         for (index, name) in ["first", "second"].into_iter().enumerate() {
-            let socket = directory.path().join(format!("{name}.sock"));
-            let listener = UnixListener::bind(&socket).expect("bind scripted Host");
             let terminal = if replay {
                 VerifiedResult::Full {
                     terminal: arena0_client::api::FullVerifiedTerminal::Completed {
@@ -2834,7 +2969,7 @@ mod tests {
                 }
             };
             let responses = vec![
-                daemon_info_response(name, peers[index], &socket),
+                host_info_response(name, peers[index]),
                 program_response(program_id),
                 created_response(ExecId([0; 32]), negotiation_id),
                 Ok(ResponseOk::Awaited {
@@ -2856,15 +2991,16 @@ mod tests {
                     result: terminal,
                 }),
             ];
-            servers.push(tokio::spawn(serve_script(listener, responses)));
+            scripts.push((host(name), responses));
             connections.push(HostConnection {
                 host: host(name),
-                client: DaemonClient::new(socket),
+                client: client.clone(),
                 peer_id: peers[index],
                 abi_version: arena0_client::protocol::ABI_VERSION,
                 driver: DriverSpec::Builtin("sample".into()),
             });
         }
+        let server = tokio::spawn(serve_shared_script(listener, scripts));
 
         let progress = test_progress();
         progress
@@ -2873,10 +3009,10 @@ mod tests {
                     assert!(matches!(
                         connection
                             .client
-                            .call(&Request::DaemonInfo)
+                            .call_host(&connection.host, &HostRequest::Info)
                             .await
-                            .expect("scripted daemon info"),
-                        ResponseOk::DaemonInfo(_)
+                            .expect("scripted Host info"),
+                        ResponseOk::HostStatus(_)
                     ));
                     progress.advance();
                 }
@@ -2956,8 +3092,18 @@ mod tests {
             3
         );
         progress.terminal(RunTerminalState::Succeeded);
-        for server in servers {
-            assert_eq!(server.await.expect("scripted Host").len(), 7);
+        let requests = server.await.expect("shared daemon script");
+        assert_eq!(requests.len(), 14);
+        for name in ["first", "second"] {
+            let expected = host(name);
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|(target, _)| target == &expected)
+                    .count(),
+                7,
+                "shared script request count for Host '{name}'"
+            );
         }
         progress.observations()
     }
@@ -3007,6 +3153,7 @@ mod tests {
         let returned_exec = ExecId([0x52; 32]);
         let server = tokio::spawn(serve_script(
             listener,
+            host("creator"),
             vec![
                 created_response(returned_exec, negotiation_id),
                 Ok(ResponseOk::Ack),
@@ -3040,7 +3187,7 @@ mod tests {
         assert!(error.to_string().contains("was cleaned up"));
 
         let requests = server.await.expect("scripted Host");
-        let Request::ExecNew {
+        let HostRequest::ExecNew {
             exec_id: requested_exec,
             ..
         } = &requests[0]
@@ -3049,7 +3196,7 @@ mod tests {
         };
         assert!(matches!(
             requests[1],
-            Request::ExecCancelCreation { exec_id } if exec_id == *requested_exec
+            HostRequest::ExecCancelCreation { exec_id } if exec_id == *requested_exec
         ));
     }
 
@@ -3081,7 +3228,7 @@ mod tests {
                     Ok(ResponseOk::Ack),
                 ],
             };
-            servers.push(tokio::spawn(serve_script(listener, responses)));
+            servers.push(tokio::spawn(serve_script(listener, host(name), responses)));
             hosts.push(HostConnection {
                 host: host(name),
                 client: DaemonClient::new(socket),
@@ -3118,14 +3265,14 @@ mod tests {
         let creator_requests = servers.remove(0).await.expect("creator script task");
         let joiner_requests = servers.remove(0).await.expect("joiner script task");
         let rejected_requests = servers.remove(0).await.expect("rejected script task");
-        let Request::ExecNew {
+        let HostRequest::ExecNew {
             exec_id: creator_exec,
             ..
         } = &creator_requests[0]
         else {
             panic!("creator did not receive exec.new");
         };
-        let Request::ExecNew {
+        let HostRequest::ExecNew {
             exec_id: joiner_exec,
             ..
         } = &joiner_requests[0]
@@ -3134,13 +3281,13 @@ mod tests {
         };
         assert!(matches!(
             creator_requests[1],
-            Request::ExecCancelCreation { exec_id } if exec_id == *creator_exec
+            HostRequest::ExecCancelCreation { exec_id } if exec_id == *creator_exec
         ));
         assert!(matches!(
             joiner_requests[1],
-            Request::ExecCancelCreation { exec_id } if exec_id == *joiner_exec
+            HostRequest::ExecCancelCreation { exec_id } if exec_id == *joiner_exec
         ));
-        let Request::ExecNew {
+        let HostRequest::ExecNew {
             exec_id: rejected_exec,
             ..
         } = &rejected_requests[0]
@@ -3149,7 +3296,7 @@ mod tests {
         };
         assert!(matches!(
             rejected_requests[1],
-            Request::ExecCancelCreation { exec_id } if exec_id == *rejected_exec
+            HostRequest::ExecCancelCreation { exec_id } if exec_id == *rejected_exec
         ));
     }
 
@@ -3164,6 +3311,7 @@ mod tests {
         let joiner_listener = UnixListener::bind(&joiner_socket).expect("bind joiner");
         let creator_server = tokio::spawn(serve_script(
             creator_listener,
+            host("creator"),
             vec![
                 created_response(ExecId([0; 32]), negotiation_id),
                 Ok(ResponseOk::Ack),
@@ -3175,11 +3323,8 @@ mod tests {
             let (stream, _) = joiner_listener.accept().await.expect("accept join request");
             let (read, mut write) = stream.into_split();
             let mut read = BufReader::new(read);
-            let request = arena0_client::api::frame::read_frame::<_, Request>(&mut read)
-                .await
-                .expect("read join request")
-                .expect("join request frame");
-            let Request::ExecNew {
+            let request = read_host_request(&mut read, &host("joiner")).await;
+            let HostRequest::ExecNew {
                 exec_id: joiner_exec,
                 ..
             } = &request
@@ -3195,7 +3340,9 @@ mod tests {
             .await
             .expect("write join response");
             let mut requests = vec![request];
-            requests.extend(serve_script(joiner_listener, vec![Ok(ResponseOk::Ack)]).await);
+            requests.extend(
+                serve_script(joiner_listener, host("joiner"), vec![Ok(ResponseOk::Ack)]).await,
+            );
             requests
         });
         let hosts = vec![
@@ -3250,14 +3397,14 @@ mod tests {
 
         let creator_requests = creator_server.await.expect("creator server");
         let joiner_requests = joiner_server.await.expect("joiner server");
-        let Request::ExecNew {
+        let HostRequest::ExecNew {
             exec_id: creator_exec,
             ..
         } = &creator_requests[0]
         else {
             panic!("creator did not receive exec.new");
         };
-        let Request::ExecNew {
+        let HostRequest::ExecNew {
             exec_id: joiner_exec,
             ..
         } = &joiner_requests[0]
@@ -3266,11 +3413,11 @@ mod tests {
         };
         assert!(matches!(
             creator_requests[1],
-            Request::ExecCancelCreation { exec_id } if exec_id == *creator_exec
+            HostRequest::ExecCancelCreation { exec_id } if exec_id == *creator_exec
         ));
         assert!(matches!(
             joiner_requests[1],
-            Request::ExecCancelCreation { exec_id } if exec_id == *joiner_exec
+            HostRequest::ExecCancelCreation { exec_id } if exec_id == *joiner_exec
         ));
     }
 

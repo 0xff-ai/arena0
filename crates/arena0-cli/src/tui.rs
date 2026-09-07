@@ -322,7 +322,6 @@ pub(crate) struct MonitorExecutionKey {
 pub(crate) struct MonitorHost {
     pub(crate) host: HostName,
     pub(crate) peer_id: PeerId,
-    pub(crate) socket: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

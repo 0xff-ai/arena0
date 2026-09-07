@@ -4,8 +4,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, anyhow, bail};
-use arena0_client::api::{AwaitState, EnsembleSpec, Request, ResponseOk};
+use arena0_client::api::{AwaitState, EnsembleSpec, HostRequest, Request, ResponseOk};
 use arena0_client::proto::DaemonClient;
+use arena0_home::HostName;
 use tempfile::TempDir;
 use tokio::net::UnixStream;
 
@@ -99,8 +100,7 @@ async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Re
     let home = TempDir::new().context("create isolated arena0 home")?;
     let mcp_port = free_loopback_port();
     let mcp_address = format!("127.0.0.1:{mcp_port}");
-    let socket_a = home.path().join("hosts/host-01/arena0.sock");
-    let socket_b = home.path().join("hosts/host-02/arena0.sock");
+    let socket = home.path().join("arena0.sock");
     let child = Command::new(env!("CARGO_BIN_EXE_arena0d"))
         .env("ARENA0_HOME", home.path())
         .env("RUST_LOG", "arena0_daemon=info,warn")
@@ -120,18 +120,29 @@ async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Re
     let mut child = ChildGuard::new(child);
 
     let startup_deadline = Instant::now() + STARTUP_DEADLINE;
-    wait_for_socket(&socket_a, startup_deadline).await?;
-    wait_for_socket(&socket_b, startup_deadline).await?;
+    wait_for_socket(&socket, startup_deadline).await?;
     wait_for_mcp(mcp_port, startup_deadline).await?;
 
-    let client_a = DaemonClient::new(&socket_a);
-    let client_b = DaemonClient::new(&socket_b);
-    let info_b = client_b.call(&Request::DaemonInfo).await?;
-    let peer_b = match info_b {
-        ResponseOk::DaemonInfo(info) => info.host.peer_id,
-        other => return Err(anyhow!("unexpected host-02 info response: {other:?}")),
+    let client = DaemonClient::new(&socket);
+    let hosts = match client.call(&Request::HostsList).await? {
+        ResponseOk::Hosts(hosts) => hosts,
+        other => return Err(anyhow!("unexpected Hosts list response: {other:?}")),
     };
-    let program = match client_a.call(&Request::ProgramList).await? {
+    let host_a: HostName = "host-01".parse().unwrap();
+    let host_b: HostName = "host-02".parse().unwrap();
+    let peer_a = hosts
+        .iter()
+        .find(|status| status.host.id == host_a.as_str())
+        .ok_or_else(|| anyhow!("host-01 missing from Hosts list"))?
+        .host
+        .peer_id;
+    let peer_b = hosts
+        .iter()
+        .find(|status| status.host.id == host_b.as_str())
+        .ok_or_else(|| anyhow!("host-02 missing from Hosts list"))?
+        .host
+        .peer_id;
+    let program = match client.call_host(&host_a, &HostRequest::ProgramList).await? {
         ResponseOk::ProgramList(programs) => programs
             .into_iter()
             .find(|program| program.name == "rock-paper-scissors")
@@ -139,15 +150,18 @@ async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Re
             .ok_or_else(|| anyhow!("rock-paper-scissors was not bootstrapped"))?,
         other => return Err(anyhow!("unexpected program list response: {other:?}")),
     };
-    let created = client_a
-        .call(&Request::ExecNew {
-            exec_id: arena0_client::protocol::ExecId([line!() as u8; 32]),
-            program,
-            params: None,
-            ensemble: EnsembleSpec::Explicit {
-                peers: vec![peer_b],
+    let created = client
+        .call_host(
+            &host_a,
+            &HostRequest::ExecNew {
+                exec_id: arena0_client::protocol::ExecId([line!() as u8; 32]),
+                program,
+                params: None,
+                ensemble: EnsembleSpec::Explicit {
+                    peers: vec![peer_b],
+                },
             },
-        })
+        )
         .await?;
     let (exec_a, negotiation_id) = match created {
         ResponseOk::ExecCreated {
@@ -157,21 +171,19 @@ async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Re
         } => (exec_id, negotiation_id),
         other => return Err(anyhow!("unexpected execution response: {other:?}")),
     };
-    let info_a = client_a.call(&Request::DaemonInfo).await?;
-    let peer_a = match info_a {
-        ResponseOk::DaemonInfo(info) => info.host.peer_id,
-        other => return Err(anyhow!("unexpected host-01 info response: {other:?}")),
-    };
-    let created_b = client_b
-        .call(&Request::ExecNew {
-            exec_id: arena0_client::protocol::ExecId([line!() as u8; 32]),
-            program: "rock-paper-scissors".into(),
-            params: None,
-            ensemble: EnsembleSpec::Join {
-                creator: peer_a,
-                negotiation_id,
+    let created_b = client
+        .call_host(
+            &host_b,
+            &HostRequest::ExecNew {
+                exec_id: arena0_client::protocol::ExecId([line!() as u8; 32]),
+                program: "rock-paper-scissors".into(),
+                params: None,
+                ensemble: EnsembleSpec::Join {
+                    creator: peer_a,
+                    negotiation_id,
+                },
             },
-        })
+        )
         .await?;
     let exec_b = match created_b {
         ResponseOk::ExecCreated { exec_id, .. } => exec_id,
@@ -181,16 +193,16 @@ async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Re
             ));
         }
     };
-    let await_request_a = Request::ExecAwait {
+    let await_request_a = HostRequest::ExecAwait {
         exec_id: exec_a,
         until: AwaitState::Active,
     };
-    let await_request_b = Request::ExecAwait {
+    let await_request_b = HostRequest::ExecAwait {
         exec_id: exec_b,
         until: AwaitState::Active,
     };
-    let await_a = client_a.call(&await_request_a);
-    let await_b = client_b.call(&await_request_b);
+    let await_a = client.call_host(&host_a, &await_request_a);
+    let await_b = client.call_host(&host_b, &await_request_b);
     let (active_a, active_b) = tokio::time::timeout(Duration::from_secs(30), async {
         tokio::join!(await_a, await_b)
     })
@@ -221,8 +233,7 @@ async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Re
         elapsed < SHUTDOWN_DEADLINE,
         "shutdown took {elapsed:?}\n{stderr}"
     );
-    assert!(!socket_a.exists(), "host-01 socket survived shutdown");
-    assert!(!socket_b.exists(), "host-02 socket survived shutdown");
+    assert!(!socket.exists(), "daemon socket survived shutdown");
     assert!(
         !stderr.contains("JoinHandle polled after completion"),
         "shutdown task polled a completed JoinHandle:\n{stderr}"

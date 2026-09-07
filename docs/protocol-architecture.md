@@ -42,17 +42,19 @@ A negotiation is not a session. `NegotiationId` names work before activation;
 ```text
 arena0d process
 └── Daemon supervisor
+    ├── Unix API `$ARENA0_HOME/arena0.sock` (explicit Host refs)
     ├── MCP Streamable HTTP `/mcp` (all Hosts; explicit Host refs)
     └── arena0_node::Ensemble
-        ├── Host A ─ durable namespace A ─ Unix socket A
-        ├── Host B ─ durable namespace B ─ Unix socket B
-        └── Host N ─ durable namespace N ─ Unix socket N
+        ├── Host A ─ durable namespace A
+        ├── Host B ─ durable namespace B
+        └── Host N ─ durable namespace N
              │
              └── LocalTransport virtual network
 ```
 
 One process supervises all Hosts. Each Host owns an independent identity,
-program catalog, SQLite store, and agent-facing Unix socket. The Host's
+program catalog and SQLite store. The daemon owns the single Unix listener and
+routes Host requests to the selected service. The Host's
 execution actors own live sandbox and transport capabilities. The Ensemble owns
 only topology and coordinated shutdown. `LocalTransport` owns delivery; it
 never chooses participants, signs protocol facts, interprets program values, or
@@ -89,7 +91,7 @@ The executable dependency boundaries are strict:
 
 ```text
 arena0     -> arena0-home + arena0-client + arena0-verify (light only)
-arena0d    -> arena0-home + arena0-daemon (Unix Host APIs + Ensemble MCP)
+arena0d    -> arena0-home + arena0-daemon (multiplexed Unix API + Ensemble MCP)
 cargo-arena0 -> arena0-sandbox
 ```
 
@@ -101,7 +103,7 @@ explicit CLI `--socket` may be cwd-relative because it is a direct
 user-selected override. `arena0 --tmp` places disposable Host state below the
 stable home's `tmp/` directory while retaining its global `cache/` directory.
 The crate validates Host names and derives each Host's state directory and
-socket without accessing the filesystem. `arena0-daemon` owns filesystem
+the shared daemon socket without accessing the filesystem. `arena0-daemon` owns filesystem
 validation, directory creation, permissions, database and keystore paths, and
 process-wide cache setup.
 
@@ -549,14 +551,15 @@ not infer a stop from an empty outcome.
 `arena0d` starts `host-01` and `host-02` by default and accepts repeated
 `--host NAME` flags for explicitly named Ensembles. Command-created local
 Ensembles assign every Host a stable zero-padded sequential name: `host-01`,
-`host-02`, and so on. A Host name resolves to a distinct state directory and
-Unix socket. Missing identities and bundled programs are created idempotently
+`host-02`, and so on. A Host name resolves to a distinct state directory.
+All Hosts are addressed through the daemon's single Unix socket. Missing identities and bundled programs are created idempotently
 unless bootstrap is disabled.
 
-Each socket exposes the same typed request surface. A client chooses one Host
-with `--host` or an explicit socket. The daemon supervisor owns coordinated
-shutdown: when one Host service requests process shutdown or fails, every
-service is joined and the Ensemble is stopped exactly once.
+The Unix endpoint exposes one typed request surface. Host operations carry an
+explicit Host ID in `host.call`; daemon operations do not select a Host.
+`--host` selects a participant and `--socket` overrides the daemon endpoint.
+The daemon supervisor owns coordinated shutdown: it closes its listeners and
+connections, drains Host services, stops the Ensemble once, and closes stores.
 
 `exec.list`, `exec.status`, and immediately available `exec.next` results read
 the durable execution record. Completed, aborted, and failed executions
@@ -586,11 +589,16 @@ protocol evidence.
 The daemon serializes provisioning through a bounded queue and admits at most
 64 local Hosts independently of each execution's exact participant set. It
 reserves exclusive store ownership before accessing identity custody, restores
-durable state, and binds the socket before publishing a new Host. Failed opens
+durable state, and publishes a recovered Host in the shared routing roster. Failed opens
 release provisional resources. Shutdown rejects queued opens and settles
 in-progress provisioning before closing stores. Persisted namespaces outside
 the configured startup set reopen lazily by ID; startup does not claim every
-Host directory in the shared home.
+Host directory in the home. A daemon-wide process lock is acquired before
+opening Host stores; one live daemon owns a home and its Unix endpoint.
+Independent daemons use independent homes. The shared socket has its own
+ownership lock so endpoint overrides cannot displace another live daemon.
+Both lock files remain on disk after release; socket cleanup removes only
+the endpoint inode owned by that daemon.
 
 The CLI remains a Unix-socket client. `arena0 skill` prints the packaged,
 MCP-only agent instructions offline; `--json` wraps the same Markdown in a
@@ -601,13 +609,16 @@ API and MCP clients. Bare `arena0` on a human terminal opens a local workspace;
 installed `arena0d` child for the exact selected Host set and stop only that
 owned child when the command ends. The child still owns every Host, store,
 transport, sandbox, and runtime resource. The CLI owns only child-process
-supervision and typed socket clients. It reuses a service only when every exact
-Host is already reachable and never resizes or stops a borrowed service.
+supervision and typed socket clients. It reuses the shared endpoint and opens
+missing selected Hosts through the daemon's existing provisioning operation.
+It never stops a borrowed service.
 
-`arena0 launch` uses the same coordinated admission and receipt verification
-without opening the terminal interface. It supervises explicitly configured
+`arena0 launch <program>` uses the same coordinated admission and receipt
+verification without opening the terminal interface. Omitting the program in
+a terminal opens the existing launcher; ambiguous references offer a choice
+there. Selections carry exact program hashes into coordinated admission. It supervises explicitly configured
 local drivers; unbound Hosts wait for independent clients. `arena0 monitor`
-attaches through an existing Host socket and observes the complete daemon
+attaches through the shared daemon socket and observes the complete daemon
 Ensemble. It owns subscriptions and presentation only, and detaching never
 stops the daemon or its executions. Executions are keyed by Host and local
 execution ID; negotiation and session identities group multiparty views.

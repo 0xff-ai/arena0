@@ -1,7 +1,8 @@
 //! Client-side id-prefix resolution for exec, session, and receipt ids.
 
 use anyhow::bail;
-use arena0_api::{ReceiptRef, Request, ResponseOk};
+use arena0_api::{HostRequest, ReceiptRef, ResponseOk};
+use arena0_home::HostName;
 use arena0_protocol::{ExecId, SessionHash};
 
 use crate::proto::DaemonClient;
@@ -68,12 +69,12 @@ pub fn resolve_prefix(prefix: &str, candidates: &[String]) -> PrefixOutcome {
 
 impl DaemonClient {
     /// Resolve an exec-id prefix against the daemon's execution list.
-    pub async fn resolve_exec(&self, prefix: &str) -> anyhow::Result<ExecId> {
+    pub async fn resolve_exec(&self, host: &HostName, prefix: &str) -> anyhow::Result<ExecId> {
         // A full id parses directly, sparing a list fetch.
         if let Ok(id) = prefix.parse::<ExecId>() {
             return Ok(id);
         }
-        let ResponseOk::ExecList(list) = self.call(&Request::ExecList).await? else {
+        let ResponseOk::ExecList(list) = self.call_host(host, &HostRequest::ExecList).await? else {
             bail!("unexpected response to exec.list");
         };
         let hexes: Vec<String> = list.iter().map(|s| s.exec_id.to_string()).collect();
@@ -92,15 +93,21 @@ impl DaemonClient {
 
     /// Resolve a session-id prefix against the sessions the daemon holds receipts for
     /// (completed and imported), falling back to active executions.
-    pub async fn resolve_session(&self, prefix: &str) -> anyhow::Result<SessionHash> {
+    pub async fn resolve_session(
+        &self,
+        host: &HostName,
+        prefix: &str,
+    ) -> anyhow::Result<SessionHash> {
         if let Ok(id) = prefix.parse::<SessionHash>() {
             return Ok(id);
         }
         let mut sessions: Vec<SessionHash> = Vec::new();
-        if let ResponseOk::ReceiptList(list) = self.call(&Request::ReceiptList).await? {
+        if let ResponseOk::ReceiptList(list) =
+            self.call_host(host, &HostRequest::ReceiptList).await?
+        {
             sessions.extend(list.iter().map(|e| e.session_id));
         }
-        if let ResponseOk::ExecList(list) = self.call(&Request::ExecList).await? {
+        if let ResponseOk::ExecList(list) = self.call_host(host, &HostRequest::ExecList).await? {
             sessions.extend(list.iter().filter_map(arena0_api::ExecStatus::session_id));
         }
         sessions.sort_by_key(|s| s.0);
@@ -123,9 +130,11 @@ impl DaemonClient {
     /// matched entry (its session and producer are the verify/lookup key).
     pub async fn resolve_receipt(
         &self,
+        host: &HostName,
         prefix: &str,
     ) -> Result<arena0_api::ReceiptListEntry, ResolveError> {
-        let ResponseOk::ReceiptList(list) = self.call(&Request::ReceiptList).await? else {
+        let ResponseOk::ReceiptList(list) = self.call_host(host, &HostRequest::ReceiptList).await?
+        else {
             return Err(ResolveError::UnexpectedResponse);
         };
         let hexes: Vec<String> = list.iter().map(|e| e.receipt_id.clone()).collect();
@@ -148,10 +157,14 @@ impl DaemonClient {
     }
 
     /// Resolve a content ID first, then this Host's publication for a session.
-    pub async fn resolve_receipt_ref(&self, reference: &str) -> anyhow::Result<ReceiptRef> {
-        match self.resolve_receipt(reference).await {
+    pub async fn resolve_receipt_ref(
+        &self,
+        host: &HostName,
+        reference: &str,
+    ) -> anyhow::Result<ReceiptRef> {
+        match self.resolve_receipt(host, reference).await {
             Ok(entry) => Ok(ReceiptRef::Stored(entry.receipt_id.parse()?)),
-            Err(ResolveError::NotFound { .. }) => self.resolve_session_ref(reference).await,
+            Err(ResolveError::NotFound { .. }) => self.resolve_session_ref(host, reference).await,
             Err(error) => Err(error.into()),
         }
     }
@@ -159,9 +172,10 @@ impl DaemonClient {
     /// Resolve an ID or session to evidence this Host actually produced.
     pub async fn resolve_produced_receipt_ref(
         &self,
+        host: &HostName,
         reference: &str,
     ) -> anyhow::Result<ReceiptRef> {
-        match self.resolve_receipt(reference).await {
+        match self.resolve_receipt(host, reference).await {
             Ok(entry)
                 if matches!(
                     entry.provenance,
@@ -171,14 +185,20 @@ impl DaemonClient {
                 Ok(ReceiptRef::Produced(entry.session_id))
             }
             Ok(_) => bail!("receipt {reference} was imported but not produced by this Host"),
-            Err(ResolveError::NotFound { .. }) => self.resolve_session_ref(reference).await,
+            Err(ResolveError::NotFound { .. }) => self.resolve_session_ref(host, reference).await,
             Err(error) => Err(error.into()),
         }
     }
 
     /// Resolve this Host's own publication without selecting imported reports.
-    pub async fn resolve_session_ref(&self, reference: &str) -> anyhow::Result<ReceiptRef> {
-        Ok(ReceiptRef::Produced(self.resolve_session(reference).await?))
+    pub async fn resolve_session_ref(
+        &self,
+        host: &HostName,
+        reference: &str,
+    ) -> anyhow::Result<ReceiptRef> {
+        Ok(ReceiptRef::Produced(
+            self.resolve_session(host, reference).await?,
+        ))
     }
 }
 
@@ -221,7 +241,7 @@ mod tests {
         assert_eq!(resolve_prefix("7c1e", &cands), PrefixOutcome::Unique(0));
     }
     fn serve_responses(
-        responses: Vec<(Request, arena0_api::Response)>,
+        responses: Vec<(HostRequest, arena0_api::Response)>,
     ) -> (tempfile::TempDir, DaemonClient, tokio::task::JoinHandle<()>) {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("daemon.sock");
@@ -233,11 +253,17 @@ mod tests {
                         .await
                         .unwrap()
                         .unwrap();
-                let request: Request = arena0_api::frame::read_frame(&mut stream)
+                let request: arena0_api::Request = arena0_api::frame::read_frame(&mut stream)
                     .await
                     .unwrap()
                     .unwrap();
-                assert_eq!(request, expected);
+                assert_eq!(
+                    request,
+                    arena0_api::Request::Host {
+                        host: "host-01".into(),
+                        request: expected
+                    }
+                );
                 arena0_api::frame::write_frame(&mut stream, &response)
                     .await
                     .unwrap();
@@ -262,12 +288,12 @@ mod tests {
         let mut entry = receipt(&"ab".repeat(32));
         entry.provenance = arena0_api::ReceiptProvenance::Both;
         let (_dir, client, task) = serve_responses(vec![(
-            Request::ReceiptList,
+            HostRequest::ReceiptList,
             Ok(ResponseOk::ReceiptList(vec![entry.clone()])),
         )]);
         assert_eq!(
             client
-                .resolve_produced_receipt_ref(&entry.receipt_id)
+                .resolve_produced_receipt_ref(&HostName::default(), &entry.receipt_id)
                 .await
                 .unwrap(),
             ReceiptRef::Produced(entry.session_id)
@@ -275,12 +301,12 @@ mod tests {
         task.await.unwrap();
         entry.provenance = arena0_api::ReceiptProvenance::Imported;
         let (_dir, client, task) = serve_responses(vec![(
-            Request::ReceiptList,
+            HostRequest::ReceiptList,
             Ok(ResponseOk::ReceiptList(vec![entry.clone()])),
         )]);
         assert!(
             client
-                .resolve_produced_receipt_ref(&entry.receipt_id)
+                .resolve_produced_receipt_ref(&HostName::default(), &entry.receipt_id)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -292,13 +318,16 @@ mod tests {
     #[tokio::test]
     async fn ambiguous_receipts_do_not_fall_back_to_sessions() {
         let (_dir, client, task) = serve_responses(vec![(
-            Request::ReceiptList,
+            HostRequest::ReceiptList,
             Ok(ResponseOk::ReceiptList(vec![
                 receipt("ab01"),
                 receipt("ab02"),
             ])),
         )]);
-        let error = client.resolve_receipt_ref("ab").await.unwrap_err();
+        let error = client
+            .resolve_receipt_ref(&HostName::default(), "ab")
+            .await
+            .unwrap_err();
         assert!(matches!(
             error.downcast_ref::<ResolveError>(),
             Some(ResolveError::Ambiguous { .. })
@@ -309,13 +338,16 @@ mod tests {
     #[tokio::test]
     async fn receipt_request_errors_do_not_fall_back_to_sessions() {
         let (_dir, client, task) = serve_responses(vec![(
-            Request::ReceiptList,
+            HostRequest::ReceiptList,
             Err(arena0_api::ApiError::new(
                 arena0_api::ApiErrorCode::Storage,
                 "unavailable",
             )),
         )]);
-        let error = client.resolve_receipt_ref("ab").await.unwrap_err();
+        let error = client
+            .resolve_receipt_ref(&HostName::default(), "ab")
+            .await
+            .unwrap_err();
         assert!(matches!(
             error.downcast_ref::<ResolveError>(),
             Some(ResolveError::Request(_))
@@ -327,11 +359,11 @@ mod tests {
     async fn missing_receipt_falls_back_to_local_session() {
         let session = SessionHash([1; 32]);
         let (_dir, client, task) = serve_responses(vec![(
-            Request::ReceiptList,
+            HostRequest::ReceiptList,
             Ok(ResponseOk::ReceiptList(vec![])),
         )]);
         let key = client
-            .resolve_receipt_ref(&session.to_string())
+            .resolve_receipt_ref(&HostName::default(), &session.to_string())
             .await
             .unwrap();
         assert_eq!(key, ReceiptRef::Produced(session));
@@ -341,7 +373,10 @@ mod tests {
     async fn transport_failure_remains_a_request_error() {
         let dir = tempfile::tempdir().unwrap();
         let client = DaemonClient::new(dir.path().join("absent.sock"));
-        let error = client.resolve_receipt_ref("ab").await.unwrap_err();
+        let error = client
+            .resolve_receipt_ref(&HostName::default(), "ab")
+            .await
+            .unwrap_err();
         assert!(matches!(
             error.downcast_ref::<ResolveError>(),
             Some(ResolveError::Request(_))
@@ -352,8 +387,11 @@ mod tests {
     #[tokio::test]
     async fn unexpected_receipt_response_does_not_fall_back() {
         let (_dir, client, task) =
-            serve_responses(vec![(Request::ReceiptList, Ok(ResponseOk::Ack))]);
-        let error = client.resolve_receipt_ref("ab").await.unwrap_err();
+            serve_responses(vec![(HostRequest::ReceiptList, Ok(ResponseOk::Ack))]);
+        let error = client
+            .resolve_receipt_ref(&HostName::default(), "ab")
+            .await
+            .unwrap_err();
         assert!(matches!(
             error.downcast_ref::<ResolveError>(),
             Some(ResolveError::UnexpectedResponse)

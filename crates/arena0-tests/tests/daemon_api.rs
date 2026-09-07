@@ -4,28 +4,27 @@
 
 mod common;
 
-use std::path::Path;
 use std::time::Duration;
 
 use arena0_api::{
     AwaitState, ColorDepth, EnsembleSpec, EventData, EventFilter, EventFrame, ExecLifecycle,
-    ReceiptArtifact, Request, Response, ResponseOk,
+    HostRequest, ReceiptArtifact, Request, Response, ResponseOk,
 };
 use arena0_protocol::{ExecId, Slot};
-use common::{call, created, drive, ok, rps_wasm, two_daemons};
+use common::{HostTarget, call, call_daemon, created, daemon, drive, ok, rps_wasm};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 
 async fn next_from_either(
-    socket_a: &Path,
+    target_a: &HostTarget,
     exec_a: ExecId,
-    socket_b: &Path,
+    target_b: &HostTarget,
     exec_b: ExecId,
 ) -> (bool, Response) {
-    let request_a = Request::ExecNext { exec_id: exec_a };
-    let request_b = Request::ExecNext { exec_id: exec_b };
-    let mut next_a = Box::pin(call(socket_a, &request_a));
-    let mut next_b = Box::pin(call(socket_b, &request_b));
+    let request_a = HostRequest::ExecNext { exec_id: exec_a };
+    let request_b = HostRequest::ExecNext { exec_id: exec_b };
+    let mut next_a = Box::pin(call(target_a, &request_a));
+    let mut next_b = Box::pin(call(target_b, &request_b));
     tokio::select! {
         response = &mut next_a => (true, response),
         response = &mut next_b => (false, response),
@@ -37,11 +36,11 @@ async fn next_from_either(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_new_returns_immediately_and_await_blocks() {
     let wasm = rps_wasm();
-    let d = two_daemons(&wasm).await;
+    let d = daemon(&wasm).await;
 
     let resp_a = call(
-        &d.sock_a,
-        &Request::ExecNew {
+        &d.host_a,
+        &HostRequest::ExecNew {
             exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
@@ -68,8 +67,8 @@ async fn exec_new_returns_immediately_and_await_blocks() {
     );
 
     let resp_b = call(
-        &d.sock_b,
-        &Request::ExecNew {
+        &d.host_b,
+        &HostRequest::ExecNew {
             exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
@@ -84,8 +83,8 @@ async fn exec_new_returns_immediately_and_await_blocks() {
 
     // Await Active: resolves once the session confirms and starts (no driving needed).
     match ok(call(
-        &d.sock_a,
-        &Request::ExecAwait {
+        &d.host_a,
+        &HostRequest::ExecAwait {
             exec_id: exec_a,
             until: AwaitState::Active,
         },
@@ -99,10 +98,10 @@ async fn exec_new_returns_immediately_and_await_blocks() {
     }
 
     // Drive both to completion, then await Terminal.
-    let (_sa, _sb) = tokio::join!(drive(&d.sock_a, exec_a), drive(&d.sock_b, exec_b));
+    let (_sa, _sb) = tokio::join!(drive(&d.host_a, exec_a), drive(&d.host_b, exec_b));
     match ok(call(
-        &d.sock_a,
-        &Request::ExecAwait {
+        &d.host_a,
+        &HostRequest::ExecAwait {
             exec_id: exec_a,
             until: AwaitState::Terminal,
         },
@@ -119,7 +118,7 @@ async fn exec_new_returns_immediately_and_await_blocks() {
         other => panic!("unexpected await response: {other:?}"),
     }
 
-    match ok(call(&d.sock_a, &Request::ExecStatus { exec_id: exec_a }).await) {
+    match ok(call(&d.host_a, &HostRequest::ExecStatus { exec_id: exec_a }).await) {
         ResponseOk::Status(status) => {
             assert!(
                 status.session_id().is_some(),
@@ -142,10 +141,10 @@ async fn exec_new_returns_immediately_and_await_blocks() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn competing_callout_submissions_return_typed_conflict_and_execution_continues() {
     let wasm = rps_wasm();
-    let d = two_daemons(&wasm).await;
+    let d = daemon(&wasm).await;
     let (exec_a, negotiation_id) = match ok(call(
-        &d.sock_a,
-        &Request::ExecNew {
+        &d.host_a,
+        &HostRequest::ExecNew {
             exec_id: ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
@@ -165,8 +164,8 @@ async fn competing_callout_submissions_return_typed_conflict_and_execution_conti
     };
     let exec_b = created(
         call(
-            &d.sock_b,
-            &Request::ExecNew {
+            &d.host_b,
+            &HostRequest::ExecNew {
                 exec_id: ExecId([line!() as u8; 32]),
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
@@ -179,7 +178,13 @@ async fn competing_callout_submissions_return_typed_conflict_and_execution_conti
         .await,
     );
 
-    let pending_id = match ok(call(&d.sock_a, &Request::ExecNext { exec_id: exec_a }).await) {
+    let (is_a, next) = next_from_either(&d.host_a, exec_a, &d.host_b, exec_b).await;
+    let (target, exec_id) = if is_a {
+        (&d.host_a, exec_a)
+    } else {
+        (&d.host_b, exec_b)
+    };
+    let pending_id = match ok(next) {
         ResponseOk::Next(arena0_api::NextEvent::Callout { pending_id, .. }) => pending_id,
         ResponseOk::Next(arena0_api::NextEvent::Failed { reason }) => {
             panic!("execution failed before callout: {reason}")
@@ -187,12 +192,12 @@ async fn competing_callout_submissions_return_typed_conflict_and_execution_conti
         other => panic!("unexpected event before callout: {other:?}"),
     };
 
-    let request = Request::ExecSubmit {
-        exec_id: exec_a,
+    let request = HostRequest::ExecSubmit {
+        exec_id,
         pending_id,
         answer: Some(serde_json::json!("Rock")),
     };
-    let (left, right) = tokio::join!(call(&d.sock_a, &request), call(&d.sock_a, &request));
+    let (left, right) = tokio::join!(call(target, &request), call(target, &request));
     let responses = [left, right];
     assert_eq!(
         responses
@@ -208,8 +213,8 @@ async fn competing_callout_submissions_return_typed_conflict_and_execution_conti
         .expect("one competing answer is rejected");
     assert_eq!(conflict.code, arena0_api::ApiErrorCode::CalloutNotPending);
 
-    let (_session_a, _session_b) = tokio::join!(drive(&d.sock_a, exec_a), drive(&d.sock_b, exec_b));
-    match ok(call(&d.sock_a, &Request::ExecStatus { exec_id: exec_a }).await) {
+    let (_session_a, _session_b) = tokio::join!(drive(&d.host_a, exec_a), drive(&d.host_b, exec_b));
+    match ok(call(&d.host_a, &HostRequest::ExecStatus { exec_id: exec_a }).await) {
         ResponseOk::Status(status) => assert_eq!(status.lifecycle(), ExecLifecycle::Completed),
         other => panic!("unexpected final status: {other:?}"),
     }
@@ -221,10 +226,10 @@ async fn competing_callout_submissions_return_typed_conflict_and_execution_conti
 /// NotFound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stale_callout_after_terminal_is_typed_conflict_and_missing_exec_is_not_found() {
-    let d = two_daemons(&rps_wasm()).await;
+    let d = daemon(&rps_wasm()).await;
     let (exec_a, negotiation_id) = match ok(call(
-        &d.sock_a,
-        &Request::ExecNew {
+        &d.host_a,
+        &HostRequest::ExecNew {
             exec_id: ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
@@ -244,8 +249,8 @@ async fn stale_callout_after_terminal_is_typed_conflict_and_missing_exec_is_not_
     };
     let exec_b = created(
         call(
-            &d.sock_b,
-            &Request::ExecNew {
+            &d.host_b,
+            &HostRequest::ExecNew {
                 exec_id: ExecId([line!() as u8; 32]),
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
@@ -258,8 +263,8 @@ async fn stale_callout_after_terminal_is_typed_conflict_and_missing_exec_is_not_
         .await,
     );
 
-    let (human_socket, human_exec, final_pending) = loop {
-        let (is_a, response) = next_from_either(&d.sock_a, exec_a, &d.sock_b, exec_b).await;
+    let (human_target, human_exec, final_pending) = loop {
+        let (is_a, response) = next_from_either(&d.host_a, exec_a, &d.host_b, exec_b).await;
         let next = ok(response);
         let ResponseOk::Next(arena0_api::NextEvent::Callout {
             pending_id,
@@ -273,11 +278,11 @@ async fn stale_callout_after_terminal_is_typed_conflict_and_missing_exec_is_not_
             .get("round")
             .and_then(serde_json::Value::as_u64)
             .expect("RPS callout round");
-        let other_socket = if is_a { &d.sock_a } else { &d.sock_b };
+        let other_target = if is_a { &d.host_a } else { &d.host_b };
         let other_exec = if is_a { exec_a } else { exec_b };
         ok(call(
-            other_socket,
-            &Request::ExecSubmit {
+            other_target,
+            &HostRequest::ExecSubmit {
                 exec_id: other_exec,
                 pending_id,
                 answer: Some(serde_json::json!("Rock")),
@@ -286,11 +291,11 @@ async fn stale_callout_after_terminal_is_typed_conflict_and_missing_exec_is_not_
         .await);
 
         if round == 3 {
-            let human_socket = if is_a { &d.sock_b } else { &d.sock_a };
+            let human_target = if is_a { &d.host_b } else { &d.host_a };
             let human_exec = if is_a { exec_b } else { exec_a };
             let final_pending = match ok(call(
-                human_socket,
-                &Request::ExecNext {
+                human_target,
+                &HostRequest::ExecNext {
                     exec_id: human_exec,
                 },
             )
@@ -311,28 +316,28 @@ async fn stale_callout_after_terminal_is_typed_conflict_and_missing_exec_is_not_
                 other => panic!("unexpected final human event: {other:?}"),
             };
             ok(call(
-                human_socket,
-                &Request::ExecSubmit {
+                human_target,
+                &HostRequest::ExecSubmit {
                     exec_id: human_exec,
                     pending_id: final_pending,
                     answer: Some(serde_json::json!("Rock")),
                 },
             )
             .await);
-            break (human_socket, human_exec, final_pending);
+            break (human_target, human_exec, final_pending);
         }
     };
 
-    let await_a = Request::ExecAwait {
+    let await_a = HostRequest::ExecAwait {
         exec_id: exec_a,
         until: AwaitState::Terminal,
     };
-    let await_b = Request::ExecAwait {
+    let await_b = HostRequest::ExecAwait {
         exec_id: exec_b,
         until: AwaitState::Terminal,
     };
     let (terminal_a, terminal_b) =
-        tokio::join!(call(&d.sock_a, &await_a), call(&d.sock_b, &await_b));
+        tokio::join!(call(&d.host_a, &await_a), call(&d.host_b, &await_b));
     for terminal in [terminal_a, terminal_b] {
         match ok(terminal) {
             ResponseOk::Awaited { exec_state, .. } => {
@@ -346,8 +351,8 @@ async fn stale_callout_after_terminal_is_typed_conflict_and_missing_exec_is_not_
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let stale = call(
-        human_socket,
-        &Request::ExecSubmit {
+        human_target,
+        &HostRequest::ExecSubmit {
             exec_id: human_exec,
             pending_id: final_pending,
             answer: Some(serde_json::json!("Rock")),
@@ -358,8 +363,8 @@ async fn stale_callout_after_terminal_is_typed_conflict_and_missing_exec_is_not_
     assert_eq!(stale.code, arena0_api::ApiErrorCode::CalloutNotPending);
 
     let missing = call(
-        &d.sock_a,
-        &Request::ExecSubmit {
+        &d.host_a,
+        &HostRequest::ExecSubmit {
             exec_id: ExecId([0xFA; 32]),
             pending_id: final_pending,
             answer: Some(serde_json::json!("Rock")),
@@ -371,9 +376,9 @@ async fn stale_callout_after_terminal_is_typed_conflict_and_missing_exec_is_not_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn hosts_list_is_complete_from_one_host_socket() {
-    let d = two_daemons(&rps_wasm()).await;
-    match ok(call(&d.sock_a, &Request::HostsList).await) {
+async fn hosts_list_is_complete_from_shared_daemon_socket() {
+    let d = daemon(&rps_wasm()).await;
+    match ok(call_daemon(&d.socket, &Request::HostsList).await) {
         ResponseOk::Hosts(hosts) => {
             assert_eq!(hosts.len(), 2);
             assert_eq!(
@@ -392,11 +397,11 @@ async fn hosts_list_is_complete_from_one_host_socket() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn negotiating_ticket_can_be_withdrawn() {
     let wasm = rps_wasm();
-    let d = two_daemons(&wasm).await;
+    let d = daemon(&wasm).await;
     let exec_id = created(
         call(
-            &d.sock_a,
-            &Request::ExecNew {
+            &d.host_a,
+            &HostRequest::ExecNew {
                 exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
@@ -409,19 +414,19 @@ async fn negotiating_ticket_can_be_withdrawn() {
     );
 
     assert!(matches!(
-        call(&d.sock_a, &Request::ExecWithdraw { exec_id }).await,
+        call(&d.host_a, &HostRequest::ExecWithdraw { exec_id }).await,
         Ok(ResponseOk::Ack)
     ));
     assert!(matches!(
-        call(&d.sock_a, &Request::ExecWithdraw { exec_id }).await,
+        call(&d.host_a, &HostRequest::ExecWithdraw { exec_id }).await,
         Ok(ResponseOk::Ack)
     ));
 
-    match ok(call(&d.sock_a, &Request::ExecStatus { exec_id }).await) {
+    match ok(call(&d.host_a, &HostRequest::ExecStatus { exec_id }).await) {
         ResponseOk::Status(status) => assert_eq!(status.lifecycle(), ExecLifecycle::Failed),
         other => panic!("unexpected status after withdrawal: {other:?}"),
     }
-    match ok(call(&d.sock_a, &Request::ExecNext { exec_id }).await) {
+    match ok(call(&d.host_a, &HostRequest::ExecNext { exec_id }).await) {
         ResponseOk::Next(arena0_api::NextEvent::Failed { reason }) => {
             assert_eq!(reason, "negotiation withdrawn locally")
         }
@@ -433,11 +438,11 @@ async fn negotiating_ticket_can_be_withdrawn() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executions() {
     let wasm = rps_wasm();
-    let d = two_daemons(&wasm).await;
+    let d = daemon(&wasm).await;
 
     let (exec_a, negotiation_id) = match ok(call(
-        &d.sock_a,
-        &Request::ExecNew {
+        &d.host_a,
+        &HostRequest::ExecNew {
             exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
@@ -456,14 +461,14 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
         other => panic!("unexpected creator response: {other:?}"),
     };
     let ResponseOk::Status(status) =
-        ok(call(&d.sock_a, &Request::ExecStatus { exec_id: exec_a }).await)
+        ok(call(&d.host_a, &HostRequest::ExecStatus { exec_id: exec_a }).await)
     else {
         panic!("expected negotiating execution status");
     };
     assert_eq!(status.lifecycle(), ExecLifecycle::Negotiating);
     let negotiating = call(
-        &d.sock_a,
-        &Request::ExecView {
+        &d.host_a,
+        &HostRequest::ExecView {
             exec: exec_a,
             width: 80,
             color: ColorDepth::Ansi16,
@@ -475,8 +480,8 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
 
     let exec_b = created(
         call(
-            &d.sock_b,
-            &Request::ExecNew {
+            &d.host_b,
+            &HostRequest::ExecNew {
                 exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
@@ -490,8 +495,8 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
     );
 
     ok(call(
-        &d.sock_a,
-        &Request::ExecAwait {
+        &d.host_a,
+        &HostRequest::ExecAwait {
             exec_id: exec_a,
             until: AwaitState::Active,
         },
@@ -499,14 +504,14 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
     .await);
 
     let ResponseOk::Status(status) =
-        ok(call(&d.sock_a, &Request::ExecStatus { exec_id: exec_a }).await)
+        ok(call(&d.host_a, &HostRequest::ExecStatus { exec_id: exec_a }).await)
     else {
         panic!("expected active execution status");
     };
     assert_eq!(status.lifecycle(), ExecLifecycle::Active);
     match ok(call(
-        &d.sock_a,
-        &Request::ExecView {
+        &d.host_a,
+        &HostRequest::ExecView {
             exec: exec_a,
             width: 80,
             color: ColorDepth::Ansi16,
@@ -524,18 +529,19 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
         other => panic!("unexpected view response: {other:?}"),
     };
 
-    let (_sa, _sb) = tokio::join!(drive(&d.sock_a, exec_a), drive(&d.sock_b, exec_b));
+    let (_sa, _sb) = tokio::join!(drive(&d.host_a, exec_a), drive(&d.host_b, exec_b));
 
-    for (socket, exec_id) in [(&d.sock_a, exec_a), (&d.sock_b, exec_b)] {
-        let ResponseOk::Status(status) = ok(call(socket, &Request::ExecStatus { exec_id }).await)
+    for (socket, exec_id) in [(&d.host_a, exec_a), (&d.host_b, exec_b)] {
+        let ResponseOk::Status(status) =
+            ok(call(socket, &HostRequest::ExecStatus { exec_id }).await)
         else {
             panic!("expected completed execution status");
         };
         assert_eq!(status.lifecycle(), ExecLifecycle::Completed);
     }
     let terminal = call(
-        &d.sock_a,
-        &Request::ExecView {
+        &d.host_a,
+        &HostRequest::ExecView {
             exec: exec_a,
             width: 80,
             color: ColorDepth::Ansi16,
@@ -546,8 +552,8 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
     assert_eq!(terminal.code, arena0_api::ApiErrorCode::Execution);
 
     let missing = call(
-        &d.sock_a,
-        &Request::ExecView {
+        &d.host_a,
+        &HostRequest::ExecView {
             exec: ExecId([0xFA; 32]),
             width: 80,
             color: ColorDepth::Ansi16,
@@ -563,12 +569,12 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn events_subscribe_streams_negotiation_step_terminal() {
     let wasm = rps_wasm();
-    let d = two_daemons(&wasm).await;
+    let d = daemon(&wasm).await;
 
-    // Subscribe on daemon A (node-wide) before launching, so the Negotiating frame is
-    // captured. Collect in the background until a Terminal frame arrives.
+    // Subscribe on Host A before launching, so its Negotiating frame is captured.
+    // Collect in the background until a Terminal frame arrives.
     let collector = tokio::spawn(collect_frames_unix(
-        d.sock_a.clone(),
+        d.host_a.clone(),
         EventFilter {
             include: vec![],
             exclude: vec![],
@@ -577,8 +583,8 @@ async fn events_subscribe_streams_negotiation_step_terminal() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let (exec_a, negotiation_id) = match ok(call(
-        &d.sock_a,
-        &Request::ExecNew {
+        &d.host_a,
+        &HostRequest::ExecNew {
             exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
@@ -598,8 +604,8 @@ async fn events_subscribe_streams_negotiation_step_terminal() {
     };
     let exec_b = created(
         call(
-            &d.sock_b,
-            &Request::ExecNew {
+            &d.host_b,
+            &HostRequest::ExecNew {
                 exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
@@ -611,7 +617,7 @@ async fn events_subscribe_streams_negotiation_step_terminal() {
         )
         .await,
     );
-    let (_sa, _sb) = tokio::join!(drive(&d.sock_a, exec_a), drive(&d.sock_b, exec_b));
+    let (_sa, _sb) = tokio::join!(drive(&d.host_a, exec_a), drive(&d.host_b, exec_b));
 
     let frames = collector.await.expect("collector joined");
     assert!(
@@ -647,11 +653,12 @@ async fn events_subscribe_streams_negotiation_step_terminal() {
 }
 
 /// Subscribe on `socket` and collect frames until a Terminal arrives (or a timeout).
-async fn collect_frames_unix(socket: std::path::PathBuf, filter: EventFilter) -> Vec<EventFrame> {
-    let mut stream = UnixStream::connect(&socket).await.expect("connect");
+async fn collect_frames_unix(target: HostTarget, filter: EventFilter) -> Vec<EventFrame> {
+    let mut stream = UnixStream::connect(&target.socket).await.expect("connect");
     let (read, mut write) = stream.split();
     let mut read = BufReader::new(read);
-    arena0_api::frame::write_frame(&mut write, &Request::EventsSubscribe { filter })
+    let request = target.request(&HostRequest::EventsSubscribe { filter });
+    arena0_api::frame::write_frame(&mut write, &request)
         .await
         .expect("write subscribe");
     // The ack.
@@ -685,10 +692,10 @@ async fn collect_frames_unix(socket: std::path::PathBuf, filter: EventFilter) ->
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn receipt_id_import_idempotence_and_list() {
     let wasm = rps_wasm();
-    let d = two_daemons(&wasm).await;
+    let d = daemon(&wasm).await;
     let (exec_a, negotiation_id) = match ok(call(
-        &d.sock_a,
-        &Request::ExecNew {
+        &d.host_a,
+        &HostRequest::ExecNew {
             exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
@@ -708,8 +715,8 @@ async fn receipt_id_import_idempotence_and_list() {
     };
     let exec_b = created(
         call(
-            &d.sock_b,
-            &Request::ExecNew {
+            &d.host_b,
+            &HostRequest::ExecNew {
                 exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
@@ -721,12 +728,12 @@ async fn receipt_id_import_idempotence_and_list() {
         )
         .await,
     );
-    let (sid, _sb) = tokio::join!(drive(&d.sock_a, exec_a), drive(&d.sock_b, exec_b));
+    let (sid, _sb) = tokio::join!(drive(&d.host_a, exec_a), drive(&d.host_b, exec_b));
 
     // Fetch A's receipt and confirm the content address is stable.
     let receipt: ReceiptArtifact = match ok(call(
-        &d.sock_a,
-        &Request::ReceiptGet {
+        &d.host_a,
+        &HostRequest::ReceiptGet {
             receipt: arena0_api::ReceiptRef::Produced(sid),
         },
     )
@@ -743,7 +750,7 @@ async fn receipt_id_import_idempotence_and_list() {
     );
 
     // The other Host already produced the same canonical artifact.
-    let imported = import_one(&d.sock_b, &receipt).await;
+    let imported = import_one(&d.host_b, &receipt).await;
     assert_eq!(
         imported.provenance,
         arena0_api::ReceiptProvenance::Both,
@@ -753,8 +760,8 @@ async fn receipt_id_import_idempotence_and_list() {
     assert_eq!(imported.kind, receipt.kind());
 
     // Re-import is idempotent: still exactly one imported entry for that id.
-    let _ = import_one(&d.sock_b, &receipt).await;
-    let list = match ok(call(&d.sock_b, &Request::ReceiptList).await) {
+    let _ = import_one(&d.host_b, &receipt).await;
+    let list = match ok(call(&d.host_b, &HostRequest::ReceiptList).await) {
         ResponseOk::ReceiptList(v) => v,
         other => panic!("unexpected: {other:?}"),
     };
@@ -767,8 +774,8 @@ async fn receipt_id_import_idempotence_and_list() {
     assert_eq!(imported[0].receipt_id, rid);
     assert_eq!(imported[0].session_id, sid);
     let fetched = ok(call(
-        &d.sock_b,
-        &Request::ReceiptGet {
+        &d.host_b,
+        &HostRequest::ReceiptGet {
             receipt: arena0_api::ReceiptRef::Stored(receipt.receipt_id()),
         },
     )
@@ -779,10 +786,13 @@ async fn receipt_id_import_idempotence_and_list() {
     assert_eq!(fetched.encode().unwrap(), receipt.encode().unwrap());
 }
 
-async fn import_one(socket: &Path, receipt: &ReceiptArtifact) -> arena0_api::ReceiptListEntry {
+async fn import_one(
+    target: &HostTarget,
+    receipt: &ReceiptArtifact,
+) -> arena0_api::ReceiptListEntry {
     match ok(call(
-        socket,
-        &Request::ReceiptImport {
+        target,
+        &HostRequest::ReceiptImport {
             receipt: Box::new(receipt.clone()),
         },
     )
@@ -798,14 +808,14 @@ async fn import_one(socket: &Path, receipt: &ReceiptArtifact) -> arena0_api::Rec
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn program_handle_resolution_over_socket() {
     let wasm = rps_wasm();
-    let d = two_daemons(&wasm).await;
-    let sock = d.sock_a.as_path();
+    let d = daemon(&wasm).await;
+    let target = &d.host_a;
     let program_id = d.program_id;
 
     // By exact name.
     match ok(call(
-        sock,
-        &Request::ProgramGet {
+        target,
+        &HostRequest::ProgramGet {
             program: "rock-paper-scissors".into(),
         },
     )
@@ -817,8 +827,8 @@ async fn program_handle_resolution_over_socket() {
 
     // By full content id.
     match ok(call(
-        sock,
-        &Request::ProgramGet {
+        target,
+        &HostRequest::ProgramGet {
             program: program_id.to_string(),
         },
     )
@@ -830,12 +840,84 @@ async fn program_handle_resolution_over_socket() {
 
     // A bogus handle is a precise NotFound error.
     let err = call(
-        sock,
-        &Request::ProgramGet {
+        target,
+        &HostRequest::ProgramGet {
             program: "does-not-exist".into(),
         },
     )
     .await
     .unwrap_err();
     assert_eq!(err.code, arena0_api::ApiErrorCode::NotFound);
+}
+
+/// The one Unix endpoint routes Host operations by the explicit outer Host
+/// name. Invalid Host names return a typed error; missing required envelope
+/// fields are rejected during deserialization and close the socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_endpoint_routes_multiple_hosts_and_rejects_invalid_host_calls() {
+    let d = daemon(&rps_wasm()).await;
+
+    let info_a = match ok(call(&d.host_a, &HostRequest::Info).await) {
+        ResponseOk::HostStatus(status) => status.host,
+        other => panic!("unexpected Host A info response: {other:?}"),
+    };
+    let info_b = match ok(call(&d.host_b, &HostRequest::Info).await) {
+        ResponseOk::HostStatus(status) => status.host,
+        other => panic!("unexpected Host B info response: {other:?}"),
+    };
+    assert_eq!(info_a.id, "a");
+    assert_eq!(info_b.id, "b");
+    assert_ne!(info_a.peer_id, info_b.peer_id);
+
+    let exec_id = created(
+        call(
+            &d.host_a,
+            &HostRequest::ExecNew {
+                exec_id: ExecId([line!() as u8; 32]),
+                program: d.program_id.to_string(),
+                params: Some(serde_json::json!(null)),
+                ensemble: EnsembleSpec::Explicit {
+                    peers: vec![d.peer_b],
+                },
+            },
+        )
+        .await,
+    );
+    let wrong_host = call(&d.host_b, &HostRequest::ExecStatus { exec_id })
+        .await
+        .unwrap_err();
+    assert_eq!(wrong_host.code, arena0_api::ApiErrorCode::NotFound);
+    match ok(call(&d.host_a, &HostRequest::ExecStatus { exec_id }).await) {
+        ResponseOk::Status(status) => assert_eq!(status.lifecycle(), ExecLifecycle::Negotiating),
+        other => panic!("unexpected Host A status response: {other:?}"),
+    }
+
+    let malformed = common::call_json(
+        &d.socket,
+        &serde_json::json!({
+            "method": "host.call",
+            "params": {
+                "host": "a/b",
+                "request": {"method": "host.info"}
+            }
+        }),
+    )
+    .await;
+    match malformed {
+        Ok(Some(Err(error))) => assert_eq!(error.code, arena0_api::ApiErrorCode::BadRequest),
+        other => panic!("malformed Host name must return BadRequest: {other:?}"),
+    }
+
+    let missing_host = common::call_json(
+        &d.socket,
+        &serde_json::json!({
+            "method": "host.call",
+            "params": {"request": {"method": "host.info"}}
+        }),
+    )
+    .await;
+    assert!(
+        matches!(missing_host, Ok(None) | Err(_)),
+        "missing Host must close the malformed request: {missing_host:?}"
+    );
 }

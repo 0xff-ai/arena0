@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
 use arena0_client::api::{
-    ActivityData, ActivityResult, ApiErrorCode, ColorDepth, EventData, EventFilter, NextEvent,
-    Request, ResponseOk,
+    ActivityData, ActivityResult, ApiErrorCode, ColorDepth, EventData, EventFilter, HostRequest,
+    NextEvent, ResponseOk,
 };
 use arena0_client::program::{BorshSchemaDocument, ProgramHash};
 use arena0_client::proto::DaemonClient;
@@ -61,10 +61,6 @@ pub(crate) async fn attach(entry_client: DaemonClient, args: MonitorArgs) -> any
     let (cancel, _cancelled) = watch::channel(None::<String>);
     let (mut session, mut actions) = TuiSession::start_monitor(config, cancel);
     let handle = session.handle();
-    let clients = roster
-        .iter()
-        .map(|host| (host.host.clone(), DaemonClient::new(host.socket.clone())))
-        .collect::<BTreeMap<_, _>>();
     let mut workers = JoinSet::new();
     let observe = async {
         handle
@@ -73,16 +69,16 @@ pub(crate) async fn attach(entry_client: DaemonClient, args: MonitorArgs) -> any
             }))
             .await?;
         for host in roster {
-            let client = clients[&host.host].clone();
+            let client = entry_client.clone();
             let handle = handle.clone();
             workers.spawn(async move { host_worker(host, client, handle).await });
         }
-        workers.spawn(activity_worker(entry_client, handle.clone()));
+        workers.spawn(activity_worker(entry_client.clone(), handle.clone()));
         loop {
             tokio::select! {
                 action = actions.recv() => {
                     let Some(action) = action else { return Ok::<(), anyhow::Error>(()); };
-                    submit_action(&clients, &handle, action).await?;
+                    submit_action(&entry_client, &handle, action).await?;
                 }
                 joined = workers.join_next() => {
                     let Some(joined) = joined else { return Ok(()); };
@@ -121,7 +117,6 @@ async fn discover_hosts(
         roster.push(MonitorHost {
             host,
             peer_id: info.host.peer_id,
-            socket: info.socket,
         });
     }
     if selected.is_empty() {
@@ -167,7 +162,7 @@ async fn run_host_connection(
     message_schemas: &mut BTreeMap<ProgramHash, Option<BorshSchemaDocument>>,
 ) -> anyhow::Result<()> {
     let mut subscription = client
-        .subscribe(EventFilter::default())
+        .subscribe(&host.host, EventFilter::default())
         .await
         .with_context(|| format!("subscribe to Host '{}' events", host.host))?;
     refresh_host(host, client, handle, message_schemas).await?;
@@ -200,7 +195,7 @@ async fn refresh_host(
     handle: &TuiHandle,
     message_schemas: &mut BTreeMap<ProgramHash, Option<BorshSchemaDocument>>,
 ) -> anyhow::Result<()> {
-    let statuses = match client.call(&Request::ExecList).await? {
+    let statuses = match client.call_host(&host.host, &HostRequest::ExecList).await? {
         ResponseOk::ExecList(statuses) => statuses,
         other => bail!(
             "unexpected response to exec.list from '{}': {other:?}",
@@ -230,10 +225,11 @@ async fn refresh_execution(
         host: host.host.clone(),
         exec_id,
     };
-    let message_schema = lookup_message_schema(client, program_id, message_schemas).await;
-    let inspection = fetch_inspection(client, exec_id).await;
-    let view = fetch_view(client, exec_id, handle.view_width()).await;
-    let trace = fetch_trace(client, exec_id, status.step()).await;
+    let message_schema =
+        lookup_message_schema(client, &host.host, program_id, message_schemas).await;
+    let inspection = fetch_inspection(client, &host.host, exec_id).await;
+    let view = fetch_view(client, &host.host, exec_id, handle.view_width()).await;
+    let trace = fetch_trace(client, &host.host, exec_id, status.step()).await;
     let mut gap = None;
     let inspection = match inspection {
         Ok(value) => Some(value),
@@ -278,6 +274,7 @@ async fn refresh_execution(
 
 async fn lookup_message_schema(
     client: &DaemonClient,
+    host: &HostName,
     program_id: ProgramHash,
     cache: &mut BTreeMap<ProgramHash, Option<BorshSchemaDocument>>,
 ) -> Option<BorshSchemaDocument> {
@@ -285,9 +282,12 @@ async fn lookup_message_schema(
         return schema.clone();
     }
     let Ok(ResponseOk::Program(program)) = client
-        .call(&Request::ProgramGet {
-            program: program_id.to_string(),
-        })
+        .call_host(
+            host,
+            &HostRequest::ProgramGet {
+                program: program_id.to_string(),
+            },
+        )
         .await
     else {
         return None;
@@ -309,7 +309,7 @@ async fn fetch_pending_callout(
 ) -> anyhow::Result<()> {
     let response = tokio::time::timeout(
         Duration::from_millis(250),
-        client.call(&Request::ExecNext { exec_id }),
+        client.call_host(&host.host, &HostRequest::ExecNext { exec_id }),
     )
     .await
     .context("bounded pending callout lookup")??;
@@ -340,14 +340,18 @@ async fn fetch_pending_callout(
 
 async fn fetch_inspection(
     client: &DaemonClient,
+    host: &HostName,
     exec_id: ExecId,
 ) -> anyhow::Result<arena0_client::api::ExecutionInspection> {
     match client
-        .call(&Request::ExecInspect {
-            exec_id,
-            private_from: None,
-            private_limit: PRIVATE_INSPECTION_LIMIT,
-        })
+        .call_host(
+            host,
+            &HostRequest::ExecInspect {
+                exec_id,
+                private_from: None,
+                private_limit: PRIVATE_INSPECTION_LIMIT,
+            },
+        )
         .await?
     {
         ResponseOk::Inspection(inspection) => Ok(inspection),
@@ -357,15 +361,19 @@ async fn fetch_inspection(
 
 async fn fetch_view(
     client: &DaemonClient,
+    host: &HostName,
     exec_id: ExecId,
     width: u16,
 ) -> anyhow::Result<Option<(u64, arena0_client::protocol::View)>> {
     match client
-        .call_raw(&Request::ExecView {
-            exec: exec_id,
-            width,
-            color: ColorDepth::Mono,
-        })
+        .call_host_raw(
+            host,
+            &HostRequest::ExecView {
+                exec: exec_id,
+                width,
+                color: ColorDepth::Mono,
+            },
+        )
         .await?
     {
         Ok(ResponseOk::ExecView { step, view }) => Ok(Some((step, view))),
@@ -377,17 +385,21 @@ async fn fetch_view(
 
 async fn fetch_trace(
     client: &DaemonClient,
+    host: &HostName,
     exec_id: ExecId,
     step: Option<u64>,
 ) -> anyhow::Result<Vec<TraceEntry>> {
     let end = step.map_or(TRACE_LIMIT, |step| step.saturating_add(1));
     let from = end.saturating_sub(TRACE_LIMIT);
     match client
-        .call(&Request::ExecTrace {
-            exec_id,
-            from,
-            to: end,
-        })
+        .call_host(
+            host,
+            &HostRequest::ExecTrace {
+                exec_id,
+                from,
+                to: end,
+            },
+        )
         .await?
     {
         ResponseOk::Trace(entries) => Ok(entries),
@@ -484,7 +496,10 @@ async fn observe_event(
     } else if let Some(exec_id) = frame.exec_id {
         // The event is a freshness trigger. Refresh only this execution so a
         // busy Host with many executions does not make the selected view lag.
-        match client.call(&Request::ExecStatus { exec_id }).await {
+        match client
+            .call_host(&host.host, &HostRequest::ExecStatus { exec_id })
+            .await
+        {
             Ok(ResponseOk::Status(status)) => {
                 refresh_execution(host, client, handle, status, message_schemas).await?;
             }
@@ -674,7 +689,7 @@ async fn send_activity(handle: &TuiHandle, activity: MonitorActivity) -> anyhow:
 }
 
 async fn submit_action(
-    clients: &BTreeMap<HostName, DaemonClient>,
+    client: &DaemonClient,
     handle: &TuiHandle,
     action: MonitorAction,
 ) -> anyhow::Result<()> {
@@ -684,28 +699,28 @@ async fn submit_action(
         pending_id,
         answer,
     } = action;
-    let result = match clients.get(&host) {
-        None => MonitorSubmission::TransportUnknown(format!("Host '{host}' is not connected")),
-        Some(client) => match client
-            .call_raw(&Request::ExecSubmit {
+    let result = match client
+        .call_host_raw(
+            &host,
+            &HostRequest::ExecSubmit {
                 exec_id,
                 pending_id,
                 answer: Some(answer),
-            })
-            .await
-        {
-            Ok(Ok(ResponseOk::Ack)) => MonitorSubmission::Accepted,
-            Ok(Err(error)) if error.code == ApiErrorCode::CalloutNotPending => {
-                MonitorSubmission::CalloutNotPending(error.message)
-            }
-            Ok(Err(error)) => MonitorSubmission::Rejected(error.to_string()),
-            Ok(Ok(other)) => {
-                MonitorSubmission::Rejected(format!("unexpected exec.submit response: {other:?}"))
-            }
-            Err(error) => {
-                MonitorSubmission::TransportUnknown(format!("answer outcome unknown: {error:#}"))
-            }
-        },
+            },
+        )
+        .await
+    {
+        Ok(Ok(ResponseOk::Ack)) => MonitorSubmission::Accepted,
+        Ok(Err(error)) if error.code == ApiErrorCode::CalloutNotPending => {
+            MonitorSubmission::CalloutNotPending(error.message)
+        }
+        Ok(Err(error)) => MonitorSubmission::Rejected(error.to_string()),
+        Ok(Ok(other)) => {
+            MonitorSubmission::Rejected(format!("unexpected exec.submit response: {other:?}"))
+        }
+        Err(error) => {
+            MonitorSubmission::TransportUnknown(format!("answer outcome unknown: {error:#}"))
+        }
     };
     handle
         .update(RunUpdate::Monitor(MonitorUpdate::Submission {

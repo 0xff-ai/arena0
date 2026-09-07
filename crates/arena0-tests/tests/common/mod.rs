@@ -1,7 +1,8 @@
 //! Shared local-only harness for daemon API integration tests.
 //!
-//! Each Host owns a Unix socket, identity, registry, and receipt store. The
-//! public [`Daemon`] supervisor supplies their shared local Ensemble.
+//! One process-level [`Daemon`] owns the Unix socket and all selected Hosts.
+//! Every Host operation carries its explicit Host name in the outer wire
+//! request, so the tests exercise the same routing boundary as real clients.
 
 #![allow(dead_code, unreachable_pub)]
 
@@ -10,11 +11,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use arena0_api::{NextEvent, Request, Response, ResponseOk};
-use arena0_daemon::{Daemon, HostConfig, McpConfig, Paths};
-use arena0_home::Home;
+use arena0_api::{HostRequest, NextEvent, Request, Response, ResponseOk};
+use arena0_daemon::{Daemon, McpConfig};
+use arena0_home::{Home, HostName};
 use arena0_program::ProgramHash;
-use arena0_protocol::{PeerId, SessionHash};
+use arena0_protocol::SessionHash;
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 
@@ -28,11 +29,36 @@ pub fn cumulative_sum_wasm() -> Vec<u8> {
     arena0_tests::wasm::program_wasm("cumulative_sum")
 }
 
-/// One framed request -> one framed response on a fresh Unix connection.
-pub async fn call(socket: &Path, req: &Request) -> Response {
+/// One explicit Host target on the shared daemon endpoint.
+#[derive(Clone, Debug)]
+pub struct HostTarget {
+    pub socket: PathBuf,
+    pub name: HostName,
+}
+
+impl HostTarget {
+    pub fn request(&self, request: &HostRequest) -> Request {
+        Request::Host {
+            host: self.name.to_string(),
+            request: request.clone(),
+        }
+    }
+}
+
+/// One framed Host request -> one framed response on a fresh Unix connection.
+pub async fn call(target: &HostTarget, req: &HostRequest) -> Response {
+    call_request(&target.socket, &target.request(req)).await
+}
+
+/// One framed daemon request -> one framed response on a fresh Unix connection.
+pub async fn call_daemon(socket: &Path, req: &Request) -> Response {
+    call_request(socket, req).await
+}
+
+async fn call_request(socket: &Path, req: &Request) -> Response {
     let stream = UnixStream::connect(socket)
         .await
-        .expect("connect to daemon socket");
+        .unwrap_or_else(|error| panic!("connect to daemon socket {}: {error}", socket.display()));
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
     arena0_api::frame::write_frame(&mut write, req)
@@ -62,20 +88,20 @@ pub fn ok(resp: Response) -> ResponseOk {
 
 /// Drive a rock-paper-scissors execution to completion, answering every callout
 /// with the JSON string `"Rock"`.
-pub async fn drive(socket: &Path, exec_id: arena0_protocol::ExecId) -> SessionHash {
-    drive_script(socket, exec_id, &[]).await
+pub async fn drive(target: &HostTarget, exec_id: arena0_protocol::ExecId) -> SessionHash {
+    drive_script(target, exec_id, &[]).await
 }
 
 /// Drive one execution to completion with a deterministic answer script. An
 /// empty script answers every callout with `"Rock"`.
 pub async fn drive_script(
-    socket: &Path,
+    target: &HostTarget,
     exec_id: arena0_protocol::ExecId,
     script: &[serde_json::Value],
 ) -> SessionHash {
     let mut cursor = 0;
     loop {
-        match ok(call(socket, &Request::ExecNext { exec_id }).await) {
+        match ok(call(target, &HostRequest::ExecNext { exec_id }).await) {
             ResponseOk::Next(NextEvent::Callout { pending_id, .. }) => {
                 let answer = if script.is_empty() {
                     serde_json::json!("Rock")
@@ -87,8 +113,8 @@ pub async fn drive_script(
                 };
                 cursor += 1;
                 ok(call(
-                    socket,
-                    &Request::ExecSubmit {
+                    target,
+                    &HostRequest::ExecSubmit {
                         exec_id,
                         pending_id,
                         answer: Some(answer),
@@ -115,10 +141,23 @@ pub async fn wait_for_socket(socket: &Path) {
     panic!("daemon socket never came up: {}", socket.display());
 }
 
-pub async fn import(socket: &Path, wasm: &[u8]) -> ProgramHash {
+async fn wait_for_host(target: &HostTarget) {
+    for _ in 0..200 {
+        if matches!(
+            call(target, &HostRequest::Info).await,
+            Ok(ResponseOk::HostStatus(_))
+        ) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("Host never became ready: {}", target.name);
+}
+
+pub async fn import(target: &HostTarget, wasm: &[u8]) -> ProgramHash {
     match ok(call(
-        socket,
-        &Request::ProgramImport {
+        target,
+        &HostRequest::ProgramImport {
             wasm: wasm.to_vec(),
         },
     )
@@ -136,71 +175,70 @@ pub fn created(resp: Response) -> arena0_protocol::ExecId {
     }
 }
 
-/// Two Host services wired through one public process-level `Daemon` supervisor.
-/// Both registries contain the same imported program, so P1 admission exercises
-/// only explicit creator/join negotiation and never remote program transfer.
-pub struct TwoDaemons {
-    pub _dir_a: tempfile::TempDir,
-    pub _dir_b: tempfile::TempDir,
+/// One process-level daemon with two explicit Host targets used by the tests.
+pub struct DaemonHarness {
     pub _home: tempfile::TempDir,
-    /// The one process-level public supervisor that owns both Host services.
-    pub _supervisor: Arc<Daemon>,
-    pub peer_a: PeerId,
-    pub peer_b: PeerId,
-    pub sock_a: PathBuf,
-    pub sock_b: PathBuf,
+    pub _daemon: Arc<Daemon>,
+    pub socket: PathBuf,
+    pub host_a: HostTarget,
+    pub host_b: HostTarget,
+    pub peer_a: arena0_protocol::PeerId,
+    pub peer_b: arena0_protocol::PeerId,
     pub program_id: ProgramHash,
 }
 
-/// Boot one public [`Daemon`] supervisor with two [`HostConfig`]s, import the
-/// program into both registries, and return their sockets and identities.
-pub async fn two_daemons(wasm: &[u8]) -> TwoDaemons {
-    let dir_a = tempfile::tempdir().unwrap();
-    let dir_b = tempfile::tempdir().unwrap();
+/// Boot one daemon endpoint with two Hosts, import the program into both
+/// namespaces, and return the shared endpoint plus explicit Host targets.
+pub async fn daemon(wasm: &[u8]) -> DaemonHarness {
     let home_dir = tempfile::tempdir().unwrap();
-    let sock_a = dir_a.path().join("arena0.sock");
-    let sock_b = dir_b.path().join("arena0.sock");
-    let host_a = HostConfig::open(
-        "a",
-        Paths::new(dir_a.path().to_path_buf(), sock_a.clone()),
-        true,
-    )
-    .unwrap_or_else(|error| panic!("open host a: {error}"));
-    let host_b = HostConfig::open(
-        "b",
-        Paths::new(dir_b.path().to_path_buf(), sock_b.clone()),
-        true,
-    )
-    .unwrap_or_else(|error| panic!("open host b: {error}"));
-    let peer_a = host_a.peer_id();
-    let peer_b = host_b.peer_id();
+    let home = Home::from_root(home_dir.path().to_path_buf()).unwrap();
+    let socket = home.socket();
+    let host_a = HostName::try_from("a").unwrap();
+    let host_b = HostName::try_from("b").unwrap();
     let mcp = McpConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)), None).unwrap();
     let engine = Arc::new(arena0_sandbox::WasmtimeEngine::new().expect("sandbox engine"));
     let supervisor = Daemon::start(
-        vec![host_a, host_b],
+        vec![host_a.clone(), host_b.clone()],
         mcp,
         engine,
-        Home::from_root(home_dir.path().to_path_buf()).unwrap(),
+        home,
         true,
     )
     .await
     .unwrap_or_else(|error| panic!("start daemon supervisor: {error}"));
     tokio::spawn(Arc::clone(&supervisor).serve());
-    wait_for_socket(&sock_a).await;
-    wait_for_socket(&sock_b).await;
+    wait_for_socket(&socket).await;
 
-    let program_id = import(&sock_a, wasm).await;
-    assert_eq!(import(&sock_b, wasm).await, program_id);
+    let host_a = HostTarget {
+        socket: socket.clone(),
+        name: host_a,
+    };
+    let host_b = HostTarget {
+        socket: socket.clone(),
+        name: host_b,
+    };
+    wait_for_host(&host_a).await;
+    wait_for_host(&host_b).await;
+    let program_id = import(&host_a, wasm).await;
+    assert_eq!(import(&host_b, wasm).await, program_id);
 
-    TwoDaemons {
-        _dir_a: dir_a,
-        _dir_b: dir_b,
+    let peer_a = match ok(call(&host_a, &HostRequest::Info).await) {
+        ResponseOk::HostStatus(status) => status.host.peer_id,
+        other => panic!("unexpected host info response: {other:?}"),
+    };
+    let peer_b = match ok(call(&host_b, &HostRequest::Info).await) {
+        ResponseOk::HostStatus(status) => status.host.peer_id,
+        other => panic!("unexpected host info response: {other:?}"),
+    };
+
+    DaemonHarness {
         _home: home_dir,
-        _supervisor: supervisor,
+        _daemon: supervisor,
+        socket,
+        host_a,
+        host_b,
         peer_a,
         peer_b,
-        sock_a,
-        sock_b,
         program_id,
     }
 }

@@ -13,7 +13,7 @@ host occurrence once and projects it to the local event stream.
 
 | Tag | Data |
 |---|---|
-| `host.started` | `{version, transport_key, socket, abi_version}` |
+| `host.started` | `{version, transport_key, abi_version}` |
 | `host.stopped` | `{reason?, uptime_secs}` |
 
 `host.started` is a per-subscription snapshot. Its envelope `host` carries the

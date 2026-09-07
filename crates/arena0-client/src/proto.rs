@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow, bail};
 use arena0_api::frame;
 pub use arena0_api::{ActivityFrame, EventFrame};
-use arena0_api::{DaemonInfo, EventFilter, Request, Response, ResponseOk};
+use arena0_api::{EventFilter, HostInfo, HostRequest, HostStatus, Request, Response, ResponseOk};
 use arena0_home::{Home, HomeError, HostName};
 use arena0_program::ProgramHash;
 use tokio::io::BufReader;
@@ -56,10 +56,9 @@ impl DaemonClient {
         }
     }
 
-    /// Bind to the standard socket for `host` from the process environment.
-    pub fn for_host(host: &HostName) -> Result<Self, HomeError> {
-        let home = Home::from_env()?;
-        Ok(Self::new(home.host(host).socket()))
+    /// Bind to the one daemon endpoint from the captured process environment.
+    pub fn from_env() -> Result<Self, HomeError> {
+        Ok(Self::new(Home::from_env()?.socket()))
     }
 
     /// The socket path this client talks to.
@@ -89,20 +88,70 @@ impl DaemonClient {
         self.call_raw(req).await?.map_err(|e| anyhow!("{e}"))
     }
 
+    /// Dispatch an operation to an explicit Host through the shared endpoint.
+    pub async fn call_host_raw(
+        &self,
+        host: &HostName,
+        request: &HostRequest,
+    ) -> anyhow::Result<Response> {
+        self.call_raw(&Request::Host {
+            host: host.to_string(),
+            request: request.clone(),
+        })
+        .await
+    }
+
+    /// Dispatch a Host operation, returning its successful payload.
+    pub async fn call_host(
+        &self,
+        host: &HostName,
+        request: &HostRequest,
+    ) -> anyhow::Result<ResponseOk> {
+        self.call_host_raw(host, request)
+            .await?
+            .map_err(|error| anyhow!("{error}"))
+    }
+
+    /// Open or create one Host through the daemon's existing provisioning owner.
+    pub async fn open_host(
+        &self,
+        id: Option<String>,
+        user_agent: String,
+    ) -> anyhow::Result<HostInfo> {
+        match self.call(&Request::HostsOpen { id, user_agent }).await? {
+            ResponseOk::HostOpened(info) => Ok(info),
+            other => bail!("unexpected hosts.open response: {other:?}"),
+        }
+    }
+
     /// Whether a daemon is reachable and answering on the bound socket (`daemon.info` probe).
     pub async fn daemon_up(&self) -> bool {
-        self.call_raw(&Request::DaemonInfo).await.is_ok()
+        matches!(
+            self.call_raw(&Request::DaemonInfo).await,
+            Ok(Ok(ResponseOk::DaemonInfo(_)))
+        )
     }
 
     /// Open an `events.subscribe` stream, consuming the `Subscribed` ack.
-    pub async fn subscribe(&self, filter: EventFilter) -> anyhow::Result<Subscription> {
+    pub async fn subscribe(
+        &self,
+        host: &HostName,
+        filter: EventFilter,
+    ) -> anyhow::Result<Subscription> {
         let stream = UnixStream::connect(&self.socket)
             .await
             .with_context(|| format!("connect to daemon at {}", self.socket.display()))?;
         let (read, write) = stream.into_split();
         let mut read = BufReader::new(read);
         let mut write = write;
-        frame::write_frame(&mut write, &Request::EventsSubscribe { filter }).await?;
+        frame::write_frame(
+            &mut write,
+            &Request::Host {
+                host: host.to_string(),
+                request: HostRequest::EventsSubscribe { filter },
+            },
+        )
+        .await?;
         match frame::read_frame::<_, Response>(&mut read).await? {
             Some(Ok(ResponseOk::Subscribed)) => {}
             Some(Ok(other)) => bail!("unexpected subscribe response: {other:?}"),
@@ -136,8 +185,8 @@ impl DaemonClient {
         })
     }
 
-    /// List every Host supervised by this daemon through one Host socket.
-    pub async fn list_hosts(&self) -> anyhow::Result<Vec<DaemonInfo>> {
+    /// List every Host supervised by this daemon through the shared daemon socket.
+    pub async fn list_hosts(&self) -> anyhow::Result<Vec<HostStatus>> {
         match self.call(&Request::HostsList).await? {
             ResponseOk::Hosts(hosts) => Ok(hosts),
             other => bail!("unexpected hosts list response: {other:?}"),
@@ -147,9 +196,14 @@ impl DaemonClient {
     /// Best-effort map of `program_id -> handle name`, for rendering program names in
     /// listings that only carry the id. Empty on any error (the caller falls back to the
     /// short id).
-    pub async fn program_name_map(&self) -> std::collections::HashMap<ProgramHash, String> {
+    pub async fn program_name_map(
+        &self,
+        host: &HostName,
+    ) -> std::collections::HashMap<ProgramHash, String> {
         let mut map = std::collections::HashMap::new();
-        if let Ok(ResponseOk::ProgramList(list)) = self.call(&Request::ProgramList).await {
+        if let Ok(ResponseOk::ProgramList(list)) =
+            self.call_host(host, &HostRequest::ProgramList).await
+        {
             for s in list {
                 map.insert(s.program_hash, s.name);
             }

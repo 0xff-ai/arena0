@@ -9,7 +9,7 @@ use arena0_store::Store;
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
 
-use crate::{Daemon, HostConfig, McpConfig, Paths};
+use crate::{Daemon, McpConfig};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -27,14 +27,14 @@ impl TestDaemon {
     }
 
     async fn from_root(root: TempDir) -> Self {
-        Self::from_root_with_hosts(root, Vec::new()).await
+        Self::from_root_with_names(root, Vec::new()).await
     }
 
-    async fn from_root_with_hosts(root: TempDir, hosts: Vec<HostConfig>) -> Self {
+    async fn from_root_with_names(root: TempDir, names: Vec<HostName>) -> Self {
         let home = Home::from_root(root.path().to_path_buf()).expect("home");
         let mcp = McpConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)), None).expect("MCP config");
         let engine = Arc::new(WasmtimeEngine::new().expect("sandbox engine"));
-        let daemon = Daemon::start(hosts, mcp, engine, home.clone(), true)
+        let daemon = Daemon::start(names, mcp, engine, home.clone(), true)
             .await
             .expect("start empty daemon");
         let before_serve = daemon
@@ -109,7 +109,7 @@ async fn concurrent_supplied_id_opens_share_one_ready_peer() {
     assert_eq!(second.user_agent, Some("harness/1".to_owned()));
     assert!(test.daemon.service("shared").is_some());
     assert_eq!(test.daemon.services().len(), 1);
-    assert!(location(&test.home, "shared").socket().exists());
+    assert!(test.home.socket().exists());
 
     let _root = test.stop().await;
 }
@@ -202,21 +202,6 @@ async fn failed_provisioning_does_not_mutate_keystore_and_retry_recovers() {
         .expect("retry after releasing owner");
     assert_eq!(recovered.id, "locked");
 
-    let blocked = location(&test.home, "blocked");
-    std::fs::create_dir_all(blocked.socket()).expect("inject conflicting socket directory");
-    let blocked_result = open_until_running(&test.daemon, Some("blocked"), "harness/4").await;
-    assert!(
-        blocked_result.is_err(),
-        "a socket directory must fail provisioning"
-    );
-    assert!(test.daemon.service("blocked").is_none());
-    std::fs::remove_dir(blocked.socket()).expect("remove conflicting socket directory");
-    let retried = open_until_running(&test.daemon, Some("blocked"), "harness/4")
-        .await
-        .expect("retry after socket repair");
-    assert_eq!(retried.id, "blocked");
-    assert!(test.daemon.service("blocked").is_some());
-
     let _root = test.stop().await;
 }
 
@@ -247,8 +232,7 @@ async fn open_racing_stop_leaves_no_owner_or_socket() {
         .expect("daemon serve task should join")
         .expect("daemon serve should stop cleanly");
 
-    assert!(!location(&test.home, "ready").socket().exists());
-    assert!(!location(&test.home, "racing").socket().exists());
+    assert!(!test.home.socket().exists());
     let racing_db = racing.state_dir().join("arena0.sqlite");
     let reservation = Store::reserve(&racing_db).expect("store owner must be released");
     drop(reservation);
@@ -262,22 +246,14 @@ async fn startup_restores_initial_metadata_before_accepting_opens() {
         .expect("create initial Host");
     let root = first.stop().await;
 
-    let home = Home::from_root(root.path().to_path_buf()).expect("home");
-    let initial = location(&home, "initial");
-    let config = HostConfig::open(
-        "initial",
-        Paths::new(initial.state_dir().to_owned(), initial.socket().to_owned()),
-        true,
-    )
-    .expect("reopen initial Host config");
-    let test = TestDaemon::from_root_with_hosts(root, vec![config]).await;
+    let test = TestDaemon::from_root_with_names(root, vec!["initial".parse().unwrap()]).await;
     let reopened = open_until_running(&test.daemon, Some("initial"), "new-agent")
         .await
         .expect("existing Host open");
     assert_eq!(reopened.peer_id, old.peer_id);
     assert_eq!(reopened.user_agent, Some("new-agent".to_owned()));
     assert_eq!(test.daemon.services().len(), 1);
-    assert!(initial.socket().exists());
+    assert!(test.home.socket().exists());
     let _root = test.stop().await;
 }
 
@@ -285,25 +261,11 @@ async fn startup_restores_initial_metadata_before_accepting_opens() {
 async fn failed_initial_socket_startup_releases_all_resources_for_retry() {
     let root = tempfile::tempdir().expect("temporary daemon home");
     let home = Home::from_root(root.path().to_path_buf()).expect("home");
-    let first = location(&home, "first");
-    let second = location(&home, "second");
-    let first_config = HostConfig::open(
-        "first",
-        Paths::new(first.state_dir().to_owned(), first.socket().to_owned()),
-        true,
-    )
-    .expect("first Host config");
-    let second_config = HostConfig::open(
-        "second",
-        Paths::new(second.state_dir().to_owned(), second.socket().to_owned()),
-        true,
-    )
-    .expect("second Host config");
-    std::fs::create_dir_all(second.socket()).expect("inject startup socket conflict");
+    let socket = home.socket();
     let mcp = McpConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)), None).expect("MCP config");
     let engine = Arc::new(WasmtimeEngine::new().expect("sandbox engine"));
     let daemon = Daemon::start(
-        vec![first_config, second_config],
+        vec!["first".parse().unwrap(), "second".parse().unwrap()],
         mcp,
         engine,
         home.clone(),
@@ -311,26 +273,26 @@ async fn failed_initial_socket_startup_releases_all_resources_for_retry() {
     )
     .await
     .expect("start daemon with initial Hosts");
+    std::fs::create_dir_all(&socket).expect("inject startup socket conflict");
     let serving = tokio::spawn(Arc::clone(&daemon).serve());
     let result = tokio::time::timeout(TEST_TIMEOUT, serving)
         .await
         .expect("failed startup should finish")
         .expect("serve task should join");
     assert!(result.is_err(), "socket conflict must fail startup");
-    assert!(
-        !first.socket().exists(),
-        "prepared socket must be rolled back"
-    );
-    assert!(
-        second.socket().is_dir(),
-        "injected conflict remains for repair"
-    );
-    for location in [&first, &second] {
-        let reservation = Store::reserve(location.state_dir().join("arena0.sqlite"))
-            .expect("failed startup must release store owner");
+    assert!(socket.is_dir(), "injected conflict remains for repair");
+    for id in ["first", "second"] {
+        let reservation = Store::reserve(
+            home.host(&id.parse().unwrap())
+                .state_dir()
+                .join("arena0.sqlite"),
+        )
+        .expect("failed startup must release store owner");
         drop(reservation);
     }
-    std::fs::remove_dir(second.socket()).expect("remove startup conflict");
+    std::fs::remove_dir(&socket).expect("remove startup conflict");
+    daemon.stop().await;
+    drop(daemon);
     let retry = TestDaemon::from_root(root).await;
     let first_retry = open_until_running(&retry.daemon, Some("first"), "retry-agent")
         .await

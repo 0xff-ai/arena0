@@ -13,8 +13,6 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
-const DEFAULT_HOST_NAME: &str = "host-01";
-
 /// A daemon-local Host name that is safe to use as one path component.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct HostName(String);
@@ -114,7 +112,7 @@ pub enum HostNameError {
     PathComponent,
 }
 
-/// One captured arena0 home and its primary-Host socket override.
+/// One captured arena0 home and its daemon socket override.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Home {
     root: PathBuf,
@@ -162,18 +160,20 @@ impl Home {
         self.root.join("tmp")
     }
 
-    /// Derive the state directory and socket for one Host.
+    /// The single daemon endpoint, independent of the selected Host.
+    #[must_use]
+    pub fn socket(&self) -> PathBuf {
+        self.default_socket
+            .clone()
+            .unwrap_or_else(|| self.root.join("arena0.sock"))
+    }
+
+    /// Derive the durable state directory for one Host.
     #[must_use]
     pub fn host(&self, name: &HostName) -> HostLocation {
-        let state_dir = self.root.join("hosts").join(name.as_str());
-        let socket = if name.as_str() == DEFAULT_HOST_NAME {
-            self.default_socket
-                .clone()
-                .unwrap_or_else(|| state_dir.join("arena0.sock"))
-        } else {
-            state_dir.join("arena0.sock")
-        };
-        HostLocation { state_dir, socket }
+        HostLocation {
+            state_dir: self.root.join("hosts").join(name.as_str()),
+        }
     }
 
     fn from_environment(
@@ -234,7 +234,6 @@ impl Home {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostLocation {
     state_dir: PathBuf,
-    socket: PathBuf,
 }
 
 impl HostLocation {
@@ -242,12 +241,6 @@ impl HostLocation {
     #[must_use]
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
-    }
-
-    /// The Unix socket used by local clients.
-    #[must_use]
-    pub fn socket(&self) -> &Path {
-        &self.socket
     }
 }
 
@@ -416,22 +409,16 @@ mod tests {
             home.host(&host).state_dir(),
             Path::new("/srv/arena0/hosts/host-02")
         );
-        assert_eq!(
-            home.host(&host).socket(),
-            Path::new("/srv/arena0/hosts/host-02/arena0.sock")
-        );
+        assert_eq!(home.socket(), Path::new("/run/arena0.sock"));
     }
 
     #[test]
-    fn default_socket_override_does_not_apply_to_named_hosts() {
-        let home = home(Some("/srv/arena0"), None, Some("/run/arena0.sock"), None).unwrap();
-        assert_eq!(
-            home.host(&HostName::default()).socket(),
-            Path::new("/run/arena0.sock")
-        );
-        assert_eq!(
-            home.host(&"host-02".parse().unwrap()).socket(),
-            Path::new("/srv/arena0/hosts/host-02/arena0.sock")
+    fn one_daemon_socket_is_independent_of_host_names() {
+        let home = home(Some("/srv/arena0"), None, None, None).unwrap();
+        assert_eq!(home.socket(), Path::new("/srv/arena0/arena0.sock"));
+        assert_ne!(
+            home.host(&HostName::default()),
+            home.host(&"host-02".parse().unwrap())
         );
     }
 

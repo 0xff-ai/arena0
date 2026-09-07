@@ -1,7 +1,7 @@
 //! The public `arena0` client.
 //!
 //! This binary is deliberately a local client: it sends typed requests to one
-//! Host socket and renders the response. Persistent and command-scoped Host
+//! daemon socket with an explicit Host target and renders the response. Persistent and command-scoped Host
 //! supervision both execute `arena0d`; offline proof verification lives in
 //! `arena0-verify`.
 
@@ -21,6 +21,7 @@ mod verify;
 mod watch;
 mod workspace;
 
+use arena0_client::api::Request;
 use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -28,7 +29,7 @@ use std::process::ExitCode;
 use anyhow::{Context, anyhow, bail};
 use arena0_client::answer;
 use arena0_client::api::{
-    ApiErrorCode, AwaitState, EnsembleSpec, ExecStatus, IdRef, NextEvent, PendingId, Request,
+    ApiErrorCode, AwaitState, EnsembleSpec, ExecStatus, HostRequest, IdRef, NextEvent, PendingId,
     ResponseOk, VerifiedResult,
 };
 use arena0_client::proto::DaemonClient;
@@ -43,6 +44,7 @@ use ui::{Mode, Palette};
 #[derive(Debug)]
 pub(crate) struct Ctx {
     pub(crate) client: DaemonClient,
+    pub(crate) host: HostName,
     pub(crate) mode: Mode,
     pub(crate) palette: Palette,
 }
@@ -50,6 +52,17 @@ pub(crate) struct Ctx {
 impl Ctx {
     pub(crate) fn client(&self) -> &DaemonClient {
         &self.client
+    }
+
+    pub(crate) async fn call(&self, request: &HostRequest) -> anyhow::Result<ResponseOk> {
+        self.client.call_host(&self.host, request).await
+    }
+
+    pub(crate) async fn call_raw(
+        &self,
+        request: &HostRequest,
+    ) -> anyhow::Result<arena0_client::api::Response> {
+        self.client.call_host_raw(&self.host, request).await
     }
 
     #[must_use]
@@ -66,8 +79,7 @@ impl Ctx {
     ) -> anyhow::Result<Option<(u64, View)>> {
         let viewport = self.viewport();
         match self
-            .client()
-            .call_raw(&Request::ExecView {
+            .call_raw(&HostRequest::ExecView {
                 exec: exec_id,
                 width: viewport.width,
                 color: viewport.color,
@@ -86,14 +98,14 @@ impl Ctx {
 #[command(
     name = "arena0",
     about = "Run local Hosts, inspect executions, and verify receipts",
-    after_help = "Examples:\n  arena0\n  arena0 launch rock-paper-scissors --hosts host-01,host-02\n  arena0 monitor\n  arena0 run rock-paper-scissors --human host-01 --builtin host-02=sample\n  arena0 serve\n  arena0 verify receipt.json\n\nOn a terminal, bare `arena0` opens the local program workspace. `arena0 launch` starts a headless emulation; `arena0 monitor` attaches to its daemon. `arena0 serve` keeps Hosts running independently for API and MCP clients.",
+    after_help = "Examples:\n  arena0\n  arena0 launch rock-paper-scissors --hosts host-01,host-02\n  arena0 monitor\n  arena0 run rock-paper-scissors --human host-01 --builtin host-02=sample\n  arena0 serve\n  arena0 verify receipt.json\n\nOn a terminal, bare `arena0` opens the local program workspace. `arena0 launch` opens the launcher; adding a program starts a headless emulation; `arena0 monitor` attaches to its daemon. `arena0 serve` keeps Hosts running independently for API and MCP clients.",
     version
 )]
 struct Cli {
-    /// Socket served by one Host (default: ARENA0_SOCKET or ARENA0_HOME/hosts/host-01/arena0.sock).
+    /// Daemon socket (default: ARENA0_SOCKET or ARENA0_HOME/arena0.sock).
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
-    /// Select a named Host below ARENA0_HOME/hosts/.
+    /// Select the Host addressed by Host operations on the shared daemon socket.
     #[arg(long, global = true)]
     host: Option<HostName>,
     /// Emit machine-readable JSON on stdout.
@@ -112,10 +124,10 @@ enum Command {
     Skill,
     /// Start the persistent local Host service.
     Serve(serve::ServeArgs),
-    /// Launch a headless local emulation; attach with `arena0 monitor`.
+    /// Launch a headless emulation, or open the launcher when PROGRAM is omitted.
     Launch {
         /// Program name, id, or Wasm path.
-        program: String,
+        program: Option<String>,
         /// Participating Hosts (default: host-01,host-02). Unbound Hosts use external clients.
         #[arg(long, value_delimiter = ',', value_name = "NAME")]
         hosts: Vec<HostName>,
@@ -137,9 +149,9 @@ enum Command {
     },
     /// Observe the local daemon and optionally answer individual callouts.
     Monitor(monitor::MonitorArgs),
-    /// Show the selected Host and active executions.
+    /// Show daemon status and its Hosts; --host narrows the report.
     Status,
-    /// Ask the selected Host (and its local ensemble supervisor) to stop.
+    /// Stop the local daemon and its Hosts.
     Stop,
     /// Identity custody operations handled by the Host.
     Identity {
@@ -345,7 +357,7 @@ fn main() -> ExitCode {
     if let Err(error) = runtime.block_on(run(cli)) {
         let message = if arena0_client::proto::is_connect_error(&error) {
             format!(
-                "Host not reachable; run `arena0 serve` for a persistent local service; {error}"
+                "Daemon not reachable; run `arena0` to open the workspace or `arena0 serve` for a persistent service; {error}"
             )
         } else {
             format!("{error:#}")
@@ -443,76 +455,83 @@ fn should_use_tui(
 }
 
 async fn interactive_workspace() -> anyhow::Result<()> {
-    let initial_hosts = local_daemon::host_names(2);
-    eprintln!("preparing {} local Hosts", initial_hosts.len());
-    let daemon = local_daemon::LocalDaemon::connect_or_start(initial_hosts).await?;
-    let client = DaemonClient::for_host(
-        daemon
-            .hosts()
-            .first()
-            .expect("local daemon always owns at least one Host"),
-    );
-    let client = match client {
-        Ok(client) => client,
-        Err(error) => return finish_with_daemon(Err(error.into()), daemon).await,
-    };
-    let loaded = workspace::load(&client).await;
-    let (programs, executions) = match loaded {
-        Ok(loaded) => loaded,
-        Err(error) => return finish_with_daemon(Err(error), daemon).await,
-    };
-    let selection = workspace::choose(
-        programs,
-        executions,
-        daemon.hosts().len(),
-        daemon.is_spawned(),
+    let hosts = local_daemon::host_names(2);
+    eprintln!("preparing {} local Hosts", hosts.len());
+    let daemon = local_daemon::LocalDaemon::connect_or_start(hosts.clone()).await?;
+    choose_and_run(
+        daemon,
+        workspace::Setup {
+            hosts,
+            fixed_hosts: false,
+            bindings: None,
+            params: None,
+            replay: true,
+        },
+        None,
     )
+    .await
+}
+
+async fn choose_and_run(
+    mut daemon: local_daemon::LocalDaemon,
+    setup: workspace::Setup,
+    reference: Option<&str>,
+) -> anyhow::Result<()> {
+    let selected = async {
+        let client = DaemonClient::from_env()?;
+        let (mut programs, executions) = workspace::load(&client, &setup.hosts[0]).await?;
+        if let Some(reference) = reference {
+            let prefix = reference.to_ascii_lowercase();
+            let has_name = programs
+                .iter()
+                .any(|program| program.summary.name == reference);
+            programs.retain(|program| {
+                if has_name {
+                    program.summary.name == reference
+                } else {
+                    program
+                        .summary
+                        .program_hash
+                        .to_string()
+                        .starts_with(&prefix)
+                }
+            });
+        }
+        workspace::choose(programs, executions, setup).await
+    }
     .await;
-    let selection = match selection {
+    let selection = match selected {
         Ok(selection) => selection,
         Err(error) => return finish_with_daemon(Err(error), daemon).await,
     };
     let workspace::Exit::Launch(launch) = selection else {
         return finish_with_daemon(Ok(()), daemon).await;
     };
-
-    let daemon = if launch.participants == daemon.hosts().len() {
-        daemon
-    } else {
-        if !daemon.is_spawned() {
-            return finish_with_daemon(
-                Err(anyhow!(
-                    "the persistent local service owns {} Hosts and cannot be resized by this command",
-                    daemon.hosts().len()
-                )),
-                daemon,
-            )
-            .await;
-        }
-        daemon.shutdown().await?;
-        let hosts = local_daemon::host_names(launch.participants);
-        eprintln!("preparing {} local Hosts", hosts.len());
-        local_daemon::LocalDaemon::connect_or_start(hosts).await?
+    if let Err(error) = daemon.ensure_hosts(launch.hosts.clone()).await {
+        return finish_with_daemon(Err(error), daemon).await;
+    }
+    let bindings = match launch.input_control {
+        workspace::InputControl::Configured(bindings) => bindings,
+        control => launch
+            .hosts
+            .into_iter()
+            .map(|host| {
+                let driver = match &control {
+                    workspace::InputControl::AllHosts => coordinated::DriverSpec::Human,
+                    workspace::InputControl::OneHost { host: human } if human == &host => {
+                        coordinated::DriverSpec::Human
+                    }
+                    workspace::InputControl::OneHost { .. } => {
+                        coordinated::DriverSpec::Builtin("sample".to_owned())
+                    }
+                    workspace::InputControl::Configured(_) => {
+                        unreachable!("handled configured bindings")
+                    }
+                };
+                coordinated::DriverBinding::new(host, driver)
+            })
+            .collect(),
     };
-
-    let human_control = launch.human_control;
-    let bindings = daemon
-        .hosts()
-        .iter()
-        .cloned()
-        .map(|host| {
-            let driver = match &human_control {
-                workspace::HumanControl::AllHosts => coordinated::DriverSpec::Human,
-                workspace::HumanControl::OneHost { host: human } if human == &host => {
-                    coordinated::DriverSpec::Human
-                }
-                workspace::HumanControl::OneHost { .. } => {
-                    coordinated::DriverSpec::Builtin("sample".to_owned())
-                }
-            };
-            coordinated::DriverBinding::new(host, driver)
-        })
-        .collect();
     let result = run_with_connected_bindings(
         Mode::Human,
         launch.program,
@@ -576,6 +595,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             if socket.is_some() || host.is_some() {
                 bail!("--socket and --host do not apply to `arena0 launch`; use --hosts");
             }
+            let interactive = !mode.is_json()
+                && std::io::stdin().is_terminal()
+                && std::io::stdout().is_terminal()
+                && std::io::stderr().is_terminal();
+            if program.is_none() && !interactive {
+                bail!("a program is required outside a terminal; use `arena0 launch <program>`");
+            }
+            let fixed_hosts = !hosts.is_empty() || !builtin.is_empty() || !agent.is_empty();
+            let configured = !builtin.is_empty() || !agent.is_empty();
             let bindings = launch_bindings(hosts, builtin, agent)?;
             if bindings.len() < 2 {
                 bail!("an emulation requires at least two distinct Hosts");
@@ -592,33 +620,91 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 mcp_listen,
             )
             .await?;
+            let setup = workspace::Setup {
+                hosts: bindings
+                    .iter()
+                    .map(|binding| binding.host.clone())
+                    .collect(),
+                fixed_hosts,
+                bindings: configured.then(|| bindings.clone()),
+                params: params.clone(),
+                replay,
+            };
+            let Some(mut program) = program else {
+                return choose_and_run(daemon, setup, None).await;
+            };
+            let client = DaemonClient::from_env()?;
+            if coordinated::wasm_reference(&program).is_none() {
+                let resolved = client
+                    .call_host_raw(
+                        &bindings[0].host,
+                        &HostRequest::ProgramGet {
+                            program: program.clone(),
+                        },
+                    )
+                    .await;
+                let resolved = match resolved {
+                    Ok(Ok(ResponseOk::Program(detail))) => {
+                        Ok(detail.summary.program_hash.to_string())
+                    }
+                    Ok(Err(error)) if error.code == ApiErrorCode::Ambiguous && interactive => {
+                        return choose_and_run(
+                            daemon,
+                            workspace::Setup {
+                                bindings: Some(bindings),
+                                fixed_hosts: true,
+                                ..setup
+                            },
+                            Some(&program),
+                        )
+                        .await;
+                    }
+                    Ok(Err(error)) => Err(error.into()),
+                    Ok(Ok(other)) => Err(anyhow!("unexpected program.get response: {other:?}")),
+                    Err(error) => Err(error),
+                };
+                program = match resolved {
+                    Ok(program) => program,
+                    Err(error) => {
+                        if mode.is_json() {
+                            ui::print_json(&json!({"exec":"failed"}));
+                        }
+                        return finish_with_daemon(Err(error), daemon).await;
+                    }
+                };
+            }
             if !mode.is_json() {
-                let home = arena0_home::Home::from_env()?;
-                eprintln!(
-                    "launching headless emulation; attach with `arena0 --host {} monitor` using ARENA0_HOME={}",
-                    bindings[0].host,
-                    home.root().display()
-                );
-                if daemon.is_spawned() {
-                    eprintln!("MCP endpoint: http://{mcp_listen}/mcp");
-                } else {
-                    eprintln!("using the existing daemon and its configured MCP endpoint");
+                eprintln!("preparing headless emulation; attach with `arena0 monitor`");
+                if let Ok(ResponseOk::DaemonInfo(info)) = client.call(&Request::DaemonInfo).await {
+                    eprintln!("MCP endpoint: {}", info.mcp_endpoint);
+                }
+                if bindings
+                    .iter()
+                    .any(|binding| binding.driver == coordinated::DriverSpec::External)
+                {
+                    eprintln!("unbound Hosts wait for an external client or a monitor answer");
                 }
             }
             let result =
                 run_with_connected_bindings(mode, program, params, bindings, replay, true).await;
             return finish_with_daemon(result, daemon).await;
         }
-        Command::Monitor(args) => {
+        Command::Monitor(mut args) => {
             if json || tmp {
                 bail!("--json and --tmp do not apply to `arena0 monitor`");
             }
             if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
                 bail!("arena0 monitor requires a terminal; use `arena0 watch --json` for a stream");
             }
+            if let Some(host) = host {
+                if !args.hosts.is_empty() {
+                    bail!("use either --host or monitor --hosts to filter Hosts");
+                }
+                args.hosts.push(host);
+            }
             let client = match socket {
                 Some(socket) => DaemonClient::new(socket),
-                None => DaemonClient::for_host(&host.unwrap_or_default())?,
+                None => DaemonClient::from_env()?,
             };
             return monitor::attach(client, args).await;
         }
@@ -667,6 +753,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         return verify::verify_hosts(mode, Palette::for_mode(mode), target, hosts, replay).await;
     }
 
+    let host_selected = host.is_some();
     let host = host.unwrap_or_default();
     if let Command::Verify {
         ref target, replay, ..
@@ -678,6 +765,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             if let Some(socket) = socket {
                 let ctx = Ctx {
                     client: DaemonClient::new(socket),
+                    host,
                     mode,
                     palette,
                 };
@@ -691,13 +779,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         verify::read_receipt(Path::new(target))?;
         let client = match socket {
             Some(socket) => DaemonClient::new(socket),
-            None => match DaemonClient::for_host(&host) {
+            None => match DaemonClient::from_env() {
                 Ok(client) => client,
                 Err(_) => return verify::full_replay_requires_daemon(),
             },
         };
         let ctx = Ctx {
             client,
+            host,
             mode,
             palette,
         };
@@ -706,10 +795,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     let client = match socket {
         Some(socket) => DaemonClient::new(socket),
-        None => DaemonClient::for_host(&host)?,
+        None => DaemonClient::from_env()?,
     };
     let ctx = Ctx {
         client,
+        host,
         mode,
         palette: Palette::for_mode(mode),
     };
@@ -717,7 +807,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     match command {
         Command::Skill => unreachable!("offline skill returned before runtime setup"),
         Command::Serve(_) => unreachable!("serve returned before client construction"),
-        Command::Status => status(&ctx).await,
+        Command::Status => status(&ctx, host_selected).await,
         Command::Stop => stop(&ctx).await,
         Command::Identity { command } => identity(&ctx, command).await,
         Command::Program { command } => program(&ctx, command).await,
@@ -1013,7 +1103,7 @@ fn render_coordinated_result(
     }
 }
 
-async fn status(ctx: &Ctx) -> anyhow::Result<()> {
+async fn status(ctx: &Ctx, host_selected: bool) -> anyhow::Result<()> {
     let info = match ctx.client().call(&Request::DaemonInfo).await {
         Ok(ResponseOk::DaemonInfo(info)) => info,
         Err(error) if arena0_client::proto::is_connect_error(&error) => {
@@ -1024,7 +1114,7 @@ async fn status(ctx: &Ctx) -> anyhow::Result<()> {
                 }));
             } else {
                 println!(
-                    "Host not reachable at {}; run `arena0 serve` for a persistent local service",
+                    "Daemon not reachable at {}; run `arena0` to open the workspace or `arena0 serve` for a persistent service",
                     ctx.client.socket().display()
                 );
             }
@@ -1033,36 +1123,37 @@ async fn status(ctx: &Ctx) -> anyhow::Result<()> {
         Err(error) => return Err(error),
         Ok(other) => bail!("unexpected response to daemon.info: {other:?}"),
     };
-    let executions = match ctx.client().call(&Request::ExecList).await? {
-        ResponseOk::ExecList(list) => list,
-        other => bail!("unexpected response to exec.list: {other:?}"),
-    };
-    let active = executions
-        .iter()
-        .filter(|status| !status.lifecycle().is_terminal())
-        .count();
-
+    let mut hosts = ctx.client().list_hosts().await?;
+    if host_selected {
+        hosts.retain(|status| status.host.id == ctx.host.as_str());
+        if hosts.is_empty() {
+            bail!(
+                "Host '{}' is not open in this daemon; run `arena0 status` to list Hosts",
+                ctx.host
+            );
+        }
+    }
     if ctx.mode.is_json() {
-        ui::print_json(&json!({
-            "reachable": true,
-            "host": info.host,
-            "socket": info.socket,
-            "abi_version": info.abi_version,
-            "programs": info.programs,
-            "executions_active": active,
-            "uptime_secs": info.uptime_secs,
-        }));
+        ui::print_json(&json!({"reachable": true, "daemon": info, "hosts": hosts}));
     } else {
+        let active: usize = hosts.iter().map(|host| host.execs_active).sum();
         println!(
-            "Host {}  peer={}  ua={}  programs={}  active executions={}  uptime={}s",
-            info.host.id,
-            info.host.peer_id.fmt_short(),
-            info.host.user_agent.as_deref().unwrap_or("(none)"),
-            info.programs,
+            "Daemon running  Hosts={}  active executions={}  uptime={}s",
+            hosts.len(),
             active,
             info.uptime_secs
         );
         println!("  socket {}", info.socket);
+        println!("  MCP {}", info.mcp_endpoint);
+        for status in hosts {
+            println!(
+                "  Host {}  peer={}  programs={}  active executions={}",
+                status.host.id,
+                status.host.peer_id.fmt_short(),
+                status.programs,
+                status.execs_active
+            );
+        }
     }
     Ok(())
 }
@@ -1073,7 +1164,7 @@ async fn stop(ctx: &Ctx) -> anyhow::Result<()> {
             if ctx.mode.is_json() {
                 ui::print_json(&json!({ "ok": true }));
             } else {
-                println!("stopped Host at {}", ctx.client.socket().display());
+                println!("stopped daemon at {}", ctx.client.socket().display());
             }
             Ok(())
         }
@@ -1084,16 +1175,16 @@ async fn stop(ctx: &Ctx) -> anyhow::Result<()> {
 
 async fn identity(ctx: &Ctx, command: IdentityCommand) -> anyhow::Result<()> {
     let request = match command {
-        IdentityCommand::New { label } => Request::IdNew { label },
-        IdentityCommand::List => Request::IdList,
-        IdentityCommand::Show { id } => Request::IdShow {
+        IdentityCommand::New { label } => HostRequest::IdNew { label },
+        IdentityCommand::List => HostRequest::IdList,
+        IdentityCommand::Show { id } => HostRequest::IdShow {
             id: identity_reference(&id),
         },
-        IdentityCommand::Remove { id } => Request::IdRemove {
+        IdentityCommand::Remove { id } => HostRequest::IdRemove {
             id: identity_reference(&id),
         },
     };
-    match ctx.client().call(&request).await? {
+    match ctx.call(&request).await? {
         ResponseOk::Id(info) => {
             if ctx.mode.is_json() {
                 ui::print_json(&id_json(&info));
@@ -1160,18 +1251,14 @@ fn id_json(info: &arena0_client::api::IdInfo) -> Value {
 
 async fn program(ctx: &Ctx, command: ProgramCommand) -> anyhow::Result<()> {
     let response = match command {
-        ProgramCommand::List => ctx.client().call(&Request::ProgramList).await?,
-        ProgramCommand::Show { program } => {
-            ctx.client().call(&Request::ProgramGet { program }).await?
-        }
+        ProgramCommand::List => ctx.call(&HostRequest::ProgramList).await?,
+        ProgramCommand::Show { program } => ctx.call(&HostRequest::ProgramGet { program }).await?,
         ProgramCommand::Import { file } => {
             let wasm = std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
-            ctx.client().call(&Request::ProgramImport { wasm }).await?
+            ctx.call(&HostRequest::ProgramImport { wasm }).await?
         }
         ProgramCommand::Remove { program } => {
-            ctx.client()
-                .call(&Request::ProgramRemove { program })
-                .await?
+            ctx.call(&HostRequest::ProgramRemove { program }).await?
         }
     };
     match response {
@@ -1250,8 +1337,7 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
             let params = answer::assemble_params(&param).map_err(anyhow::Error::msg)?;
             let exec_id = ExecId(rand::random());
             let created = ctx
-                .client()
-                .call_raw(&Request::ExecNew {
+                .call_raw(&HostRequest::ExecNew {
                     exec_id,
                     program,
                     params,
@@ -1262,9 +1348,7 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
                 Ok(Ok(created)) => created,
                 Ok(Err(error)) => return Err(error.into()),
                 Err(error) => {
-                    return match ctx
-                        .client()
-                        .call(&Request::ExecCancelCreation { exec_id })
+                    return match ctx.call(&HostRequest::ExecCancelCreation { exec_id })
                         .await
                     {
                         Ok(ResponseOk::Ack) => Err(error.context(format!(
@@ -1288,9 +1372,7 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
                     queue_position,
                 } => {
                     if returned_exec_id != exec_id {
-                        return match ctx
-                            .client()
-                            .call(&Request::ExecCancelCreation { exec_id })
+                        return match ctx.call(&HostRequest::ExecCancelCreation { exec_id })
                             .await
                         {
                             Ok(ResponseOk::Ack) => Err(anyhow!(
@@ -1325,7 +1407,7 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
             }
         }
         ExecCommand::List => {
-            let ResponseOk::ExecList(list) = ctx.client().call(&Request::ExecList).await? else {
+            let ResponseOk::ExecList(list) = ctx.call(&HostRequest::ExecList).await? else {
                 bail!("unexpected response to exec.list");
             };
             if ctx.mode.is_json() {
@@ -1358,22 +1440,17 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
             }
         }
         ExecCommand::Status { exec_id } => {
-            let exec_id = ctx.client().resolve_exec(&exec_id).await?;
-            let ResponseOk::Status(status) =
-                ctx.client().call(&Request::ExecStatus { exec_id }).await?
+            let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
+            let ResponseOk::Status(status) = ctx.call(&HostRequest::ExecStatus { exec_id }).await?
             else {
                 bail!("unexpected response to exec.status");
             };
             render_exec_status(ctx, &status);
         }
         ExecCommand::Await { exec_id, until } => {
-            let exec_id = ctx.client().resolve_exec(&exec_id).await?;
+            let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
             let until = parse_await_state(&until)?;
-            match ctx
-                .client()
-                .call(&Request::ExecAwait { exec_id, until })
-                .await?
-            {
+            match ctx.call(&HostRequest::ExecAwait { exec_id, until }).await? {
                 ResponseOk::Awaited {
                     exec_id,
                     exec_state,
@@ -1396,7 +1473,7 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
             }
         }
         ExecCommand::Drive { exec_id } => {
-            let exec_id = ctx.client().resolve_exec(&exec_id).await?;
+            let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
             let completed = run::drive_loop(ctx, exec_id).await?;
             if ctx.mode.is_json() {
                 ui::print_json(&json!({
@@ -1416,8 +1493,8 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
             }
         }
         ExecCommand::Next { exec_id } => {
-            let exec_id = ctx.client().resolve_exec(&exec_id).await?;
-            match ctx.client().call(&Request::ExecNext { exec_id }).await? {
+            let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
+            match ctx.call(&HostRequest::ExecNext { exec_id }).await? {
                 ResponseOk::Next(event) => render_next(ctx, &event),
                 other => bail!("unexpected response to exec.next: {other:?}"),
             }
@@ -1427,11 +1504,10 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
             pending_id,
             answer,
         } => {
-            let exec_id = ctx.client().resolve_exec(&exec_id).await?;
+            let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
             let answer = answer.map(|answer| answer::scalar(&answer));
             match ctx
-                .client()
-                .call(&Request::ExecSubmit {
+                .call(&HostRequest::ExecSubmit {
                     exec_id,
                     pending_id,
                     answer,
@@ -1443,11 +1519,10 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
             }
         }
         ExecCommand::Query { exec_id, input } => {
-            let exec_id = ctx.client().resolve_exec(&exec_id).await?;
+            let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
             let query: Value = serde_json::from_str(&input).context("query must be valid JSON")?;
             match ctx
-                .client()
-                .call(&Request::ExecQuery {
+                .call(&HostRequest::ExecQuery {
                     exec_id,
                     query: Some(query),
                 })
@@ -1464,11 +1539,10 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
             }
         }
         ExecCommand::View { exec_id } => {
-            let exec_id = ctx.client().resolve_exec(&exec_id).await?;
+            let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
             let viewport = ctx.viewport();
             match ctx
-                .client()
-                .call(&Request::ExecView {
+                .call(&HostRequest::ExecView {
                     exec: exec_id,
                     width: viewport.width,
                     color: viewport.color,
@@ -1486,10 +1560,9 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
             }
         }
         ExecCommand::Trace { exec_id, from, to } => {
-            let exec_id = ctx.client().resolve_exec(&exec_id).await?;
+            let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
             match ctx
-                .client()
-                .call(&Request::ExecTrace { exec_id, from, to })
+                .call(&HostRequest::ExecTrace { exec_id, from, to })
                 .await?
             {
                 ResponseOk::Trace(entries) => {
@@ -1508,21 +1581,16 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
             }
         }
         ExecCommand::Withdraw { exec_id } => {
-            let exec_id = ctx.client().resolve_exec(&exec_id).await?;
-            match ctx
-                .client()
-                .call(&Request::ExecWithdraw { exec_id })
-                .await?
-            {
+            let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
+            match ctx.call(&HostRequest::ExecWithdraw { exec_id }).await? {
                 ResponseOk::Ack => print_ack(ctx),
                 other => bail!("unexpected response to exec.withdraw: {other:?}"),
             }
         }
         ExecCommand::Terminate { exec_id, reason } => {
-            let exec_id = ctx.client().resolve_exec(&exec_id).await?;
+            let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
             match ctx
-                .client()
-                .call(&Request::ExecTerminate { exec_id, reason })
+                .call(&HostRequest::ExecTerminate { exec_id, reason })
                 .await?
             {
                 ResponseOk::Ack => print_ack(ctx),
@@ -1632,9 +1700,12 @@ fn render_next(ctx: &Ctx, event: &NextEvent) {
 async fn receipt(ctx: &Ctx, command: ReceiptCommand) -> anyhow::Result<()> {
     match command {
         ReceiptCommand::Get { session, out } => {
-            let receipt = ctx.client().resolve_receipt_ref(&session).await?;
+            let receipt = ctx
+                .client()
+                .resolve_receipt_ref(&ctx.host, &session)
+                .await?;
             let ResponseOk::Receipt(receipt) =
-                ctx.client().call(&Request::ReceiptGet { receipt }).await?
+                ctx.call(&HostRequest::ReceiptGet { receipt }).await?
             else {
                 bail!("unexpected response to receipt.get");
             };
@@ -1660,8 +1731,7 @@ async fn receipt(ctx: &Ctx, command: ReceiptCommand) -> anyhow::Result<()> {
             let receipt: arena0_client::protocol::ReceiptArtifact =
                 serde_json::from_slice(&bytes).context("receipt must be valid JSON")?;
             match ctx
-                .client()
-                .call(&Request::ReceiptImport {
+                .call(&HostRequest::ReceiptImport {
                     receipt: Box::new(receipt),
                 })
                 .await?
@@ -1676,7 +1746,7 @@ async fn receipt(ctx: &Ctx, command: ReceiptCommand) -> anyhow::Result<()> {
                 other => bail!("unexpected response to receipt.import: {other:?}"),
             }
         }
-        ReceiptCommand::List => match ctx.client().call(&Request::ReceiptList).await? {
+        ReceiptCommand::List => match ctx.call(&HostRequest::ReceiptList).await? {
             ResponseOk::ReceiptList(entries) => {
                 if ctx.mode.is_json() {
                     ui::print_json(&json!({ "receipts": entries }));
@@ -1712,10 +1782,12 @@ async fn receipt(ctx: &Ctx, command: ReceiptCommand) -> anyhow::Result<()> {
             other => bail!("unexpected response to receipt.list: {other:?}"),
         },
         ReceiptCommand::Verify { session, replay } => {
-            let receipt = ctx.client().resolve_receipt_ref(&session).await?;
-            match ctx
+            let receipt = ctx
                 .client()
-                .call(&Request::ReceiptVerify {
+                .resolve_receipt_ref(&ctx.host, &session)
+                .await?;
+            match ctx
+                .call(&HostRequest::ReceiptVerify {
                     receipt,
                     full: replay,
                 })

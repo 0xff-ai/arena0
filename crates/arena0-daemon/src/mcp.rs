@@ -3,13 +3,20 @@
 //! Tool calls carry explicit Host references, so one Streamable HTTP endpoint
 //! and one bearer token can safely drive every supervised participant.
 
+use futures::{
+    FutureExt as _,
+    future::{BoxFuture, Shared},
+};
 use std::collections::BTreeSet;
+use std::future::Future as _;
+use std::io::IoSlice;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 use arena0_api::{
-    ActivityData, ActivityResult, ApiError, ApiErrorCode, EnsembleSpec, ExecStatusState, NextEvent,
-    PendingId, ProgramSummary, ReceiptRef, Request, ResponseOk, VerifiedResult,
+    ActivityData, ActivityResult, ApiError, ApiErrorCode, EnsembleSpec, ExecStatusState,
+    HostRequest, NextEvent, PendingId, ProgramSummary, ReceiptRef, ResponseOk, VerifiedResult,
 };
 use arena0_program::ParticipantCount;
 use arena0_protocol::{ExecId, PeerId, SessionHash};
@@ -28,6 +35,8 @@ use rmcp::transport::streamable_http_server::{
 };
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde_json::Value;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
 use crate::ensemble::{Daemon, McpConfig};
@@ -405,7 +414,7 @@ impl Arena0Mcp {
     async fn request(
         &self,
         host: &HostRef,
-        request: Request,
+        request: HostRequest,
     ) -> Result<ResponseOk, CallToolResult> {
         let service = service(&self.daemon, host)?;
         service
@@ -461,7 +470,7 @@ impl Arena0Mcp {
         let mut hosts = Vec::with_capacity(services.len());
         for (name, service) in services {
             let info = service
-                .daemon_info()
+                .host_status()
                 .await
                 .map_err(|error| err(format!("Host '{name}': {error}")))?;
             hosts.push(HostOutput {
@@ -484,7 +493,7 @@ impl Arena0Mcp {
         &self,
         Parameters(HostArg { host }): Parameters<HostArg>,
     ) -> Result<Json<ProgramListOutput>, CallToolResult> {
-        match self.request(&host, Request::ProgramList).await? {
+        match self.request(&host, HostRequest::ProgramList).await? {
             ResponseOk::ProgramList(programs) => Ok(Json(ProgramListOutput {
                 programs: programs
                     .iter()
@@ -507,7 +516,7 @@ impl Arena0Mcp {
         match self
             .request(
                 &program.host,
-                Request::ProgramGet {
+                HostRequest::ProgramGet {
                     program: program.program_id,
                 },
             )
@@ -535,7 +544,7 @@ impl Arena0Mcp {
         let created = self
             .request(
                 &arg.program.host,
-                Request::ExecNew {
+                HostRequest::ExecNew {
                     exec_id,
                     program: arg.program.program_id,
                     params: arg.params,
@@ -553,7 +562,10 @@ impl Arena0Mcp {
             } => {
                 if returned_exec_id != exec_id {
                     let cleanup = self
-                        .request(&arg.program.host, Request::ExecCancelCreation { exec_id })
+                        .request(
+                            &arg.program.host,
+                            HostRequest::ExecCancelCreation { exec_id },
+                        )
                         .await;
                     return match cleanup {
                         Ok(ResponseOk::Ack) => Err(err(format!(
@@ -593,7 +605,7 @@ impl Arena0Mcp {
     ) -> Result<Json<ExecutionStatusOutput>, CallToolResult> {
         let exec_id = parse(&execution.exec_id, "execution id")?;
         match self
-            .request(&execution.host, Request::ExecStatus { exec_id })
+            .request(&execution.host, HostRequest::ExecStatus { exec_id })
             .await?
         {
             ResponseOk::Status(status) => Ok(Json(status_output(&execution.host, status)?)),
@@ -658,7 +670,7 @@ impl Arena0Mcp {
         match self
             .request(
                 &arg.execution.host,
-                Request::ExecSubmit {
+                HostRequest::ExecSubmit {
                     exec_id,
                     pending_id: arg.pending_id,
                     answer: arg.answer,
@@ -684,7 +696,7 @@ impl Arena0Mcp {
         match self
             .request(
                 &arg.execution.host,
-                Request::ExecQuery {
+                HostRequest::ExecQuery {
                     exec_id,
                     query: arg.query,
                 },
@@ -711,7 +723,7 @@ impl Arena0Mcp {
             .reason
             .unwrap_or_else(|| "agent stopped execution".to_string());
         for _ in 0..4 {
-            let status = match service.dispatch(Request::ExecStatus { exec_id }).await {
+            let status = match service.dispatch(HostRequest::ExecStatus { exec_id }).await {
                 Ok(ResponseOk::Status(status)) => status,
                 Ok(other) => return Err(unexpected(&other)),
                 Err(error) => {
@@ -720,9 +732,9 @@ impl Arena0Mcp {
             };
             let lifecycle = status.lifecycle();
             let request = match status.state {
-                ExecStatusState::Negotiating { .. } => Request::ExecWithdraw { exec_id },
+                ExecStatusState::Negotiating { .. } => HostRequest::ExecWithdraw { exec_id },
                 ExecStatusState::Activating { .. } | ExecStatusState::Active { .. } => {
-                    Request::ExecTerminate {
+                    HostRequest::ExecTerminate {
                         exec_id,
                         reason: reason.clone(),
                     }
@@ -735,7 +747,7 @@ impl Arena0Mcp {
                 Ok(ResponseOk::Ack) => return Ok(Json(AckOutput { ok: true })),
                 Ok(other) => return Err(unexpected(&other)),
                 Err(action_error) => {
-                    let refreshed = service.dispatch(Request::ExecStatus { exec_id }).await;
+                    let refreshed = service.dispatch(HostRequest::ExecStatus { exec_id }).await;
                     match refreshed {
                         Ok(ResponseOk::Status(status)) if status.lifecycle().is_terminal() => {
                             return Ok(Json(AckOutput { ok: true }));
@@ -772,7 +784,7 @@ impl Arena0Mcp {
         match self
             .request(
                 &arg.session.host,
-                Request::ReceiptVerify {
+                HostRequest::ReceiptVerify {
                     receipt: ReceiptRef::Produced(session_id),
                     full: matches!(arg.mode, VerificationMode::Full),
                 },
@@ -841,7 +853,30 @@ impl ServerHandler for Arena0Mcp {
         let call = self
             .tool_router
             .call(ToolCallContext::new(self, request, context));
-        let result = call.await;
+        let mut shutdown = self.daemon.shutdown_receiver();
+        let result = if *shutdown.borrow() {
+            Err(rmcp::ErrorData::internal_error(
+                "daemon is shutting down",
+                None,
+            ))
+        } else {
+            tokio::select! {
+                result = call => result,
+                changed = shutdown.changed() => {
+                    if changed.is_ok() && *shutdown.borrow() {
+                        Err(rmcp::ErrorData::internal_error(
+                            "daemon is shutting down",
+                            None,
+                        ))
+                    } else {
+                        Err(rmcp::ErrorData::internal_error(
+                            "daemon shutdown state was unavailable",
+                            None,
+                        ))
+                    }
+                }
+            }
+        };
         let activity_result = match &result {
             Ok(result) if result.is_error != Some(true) => ActivityResult::Ok,
             Ok(result) => ActivityResult::ToolError {
@@ -873,14 +908,131 @@ impl ServerHandler for Arena0Mcp {
     }
 }
 
-pub(crate) async fn bind(config: &McpConfig) -> anyhow::Result<tokio::net::TcpListener> {
-    Ok(tokio::net::TcpListener::bind(config.listen).await?)
+pub(crate) async fn bind(config: &McpConfig) -> anyhow::Result<TcpListener> {
+    Ok(TcpListener::bind(config.listen).await?)
+}
+
+// The existing shutdown watch also interrupts incomplete HTTP headers and
+// blocked writes. Shared owns and removes each connection's wake registration.
+type ConnectionShutdown = Shared<BoxFuture<'static, ()>>;
+
+struct ShutdownTcpStream {
+    inner: TcpStream,
+    shutdown: ConnectionShutdown,
+    closed: bool,
+}
+
+impl ShutdownTcpStream {
+    fn is_closed(&mut self, context: &mut Context<'_>) -> bool {
+        if !self.closed {
+            self.closed = std::pin::Pin::new(&mut self.shutdown)
+                .poll(context)
+                .is_ready();
+        }
+        self.closed
+    }
+}
+
+impl AsyncRead for ShutdownTcpStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.is_closed(context) {
+            return Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for ShutdownTcpStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.is_closed(context) {
+            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_write(context, buffer)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffers: &[IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.is_closed(context) {
+            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(context, buffers)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
+
+struct McpListener {
+    inner: TcpListener,
+    shutdown: ConnectionShutdown,
+}
+
+impl McpListener {
+    fn new(inner: TcpListener, shutdown: ConnectionShutdown) -> Self {
+        Self { inner, shutdown }
+    }
+}
+
+impl axum::serve::Listener for McpListener {
+    type Io = ShutdownTcpStream;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.inner.accept().await {
+                Ok((stream, address)) => {
+                    return (
+                        ShutdownTcpStream {
+                            inner: stream,
+                            shutdown: self.shutdown.clone(),
+                            closed: false,
+                        },
+                        address,
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "MCP accept failed; retrying");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
 }
 
 pub(crate) async fn serve(
     daemon: Arc<Daemon>,
     config: McpConfig,
-    listener: tokio::net::TcpListener,
+    listener: TcpListener,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let startup = daemon.startup_timeline();
@@ -892,17 +1044,28 @@ pub(crate) async fn serve(
             return Err(error.into());
         }
     };
-    startup::mcp_ready(address, &startup);
     tracing::info!(endpoint = %format_args!("http://{address}/mcp"), "arena0d MCP listening");
+    let mut connection_shutdown = shutdown.clone();
+    let connection_shutdown = async move {
+        if !*connection_shutdown.borrow() {
+            let _ = connection_shutdown.changed().await;
+        }
+    }
+    .boxed()
+    .shared();
+    let listener = McpListener::new(listener, connection_shutdown);
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            let _ = shutdown.changed().await;
+            if !*shutdown.borrow() {
+                let _ = shutdown.changed().await;
+            }
         })
         .await?;
     Ok(())
 }
 
 fn router(daemon: Arc<Daemon>, bearer_token: Option<String>) -> axum::Router {
+    let shutdown = daemon.shutdown_receiver();
     let service: StreamableHttpService<Arena0Mcp, LocalSessionManager> = StreamableHttpService::new(
         move || Ok(Arena0Mcp::new(Arc::clone(&daemon))),
         Default::default(),
@@ -913,13 +1076,17 @@ fn router(daemon: Arc<Daemon>, bearer_token: Option<String>) -> axum::Router {
     );
 
     let router = axum::Router::new().nest_service("/mcp", service);
-    match bearer_token {
+    let router = match bearer_token {
         Some(token) => router.layer(middleware::from_fn_with_state(
             Arc::<str>::from(token),
             require_bearer,
         )),
         None => router,
-    }
+    };
+    router.layer(middleware::from_fn_with_state(
+        shutdown,
+        cancel_inflight_request,
+    ))
 }
 
 async fn require_bearer(
@@ -941,6 +1108,27 @@ async fn require_bearer(
             "unauthorized",
         )
             .into_response()
+    }
+}
+
+async fn cancel_inflight_request(
+    State(mut shutdown): State<watch::Receiver<bool>>,
+    request: HttpRequest,
+    next: Next,
+) -> HttpResponse {
+    if *shutdown.borrow() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "daemon is shutting down").into_response();
+    }
+    tokio::select! {
+        response = next.run(request) => response,
+        changed = shutdown.changed() => {
+            let _ = changed;
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon is shutting down",
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1096,12 +1284,11 @@ fn unexpected(other: &ResponseOk) -> CallToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arena0_api::{ActivityFrame, Response};
+    use arena0_api::{ActivityFrame, Request, Response};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::Path;
     use std::time::Duration;
 
-    use crate::{HostConfig, Paths};
     use rmcp::model::{CallToolRequestParams, ClientInfo};
     use rmcp::transport::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
@@ -1117,21 +1304,14 @@ mod tests {
     }
 
     async fn test_daemon() -> TestDaemon {
-        let mut homes = Vec::new();
-        let mut hosts = Vec::new();
-        for name in ["alice", "bob"] {
-            let home = tempfile::tempdir().expect("temporary Host home");
-            let paths = Paths::new(home.path().to_path_buf(), home.path().join("arena0.sock"));
-            hosts.push(HostConfig::open(name, paths, true).expect("open Host"));
-            homes.push(home);
-        }
+        let home = tempfile::tempdir().expect("temporary daemon home");
         let mcp = McpConfig::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), None)
             .expect("test MCP config");
-        let dynamic_home = arena0_home::Home::from_root(homes[0].path().to_path_buf()).unwrap();
+        let dynamic_home = arena0_home::Home::from_root(home.path().to_path_buf()).unwrap();
         TestDaemon {
-            _homes: homes,
+            _homes: vec![home],
             daemon: Daemon::start(
-                hosts,
+                vec!["alice".parse().unwrap(), "bob".parse().unwrap()],
                 mcp,
                 Arc::new(WasmtimeEngine::new().expect("sandbox engine")),
                 dynamic_home,
@@ -1218,6 +1398,21 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("MCP-driven executions did not activate");
+    }
+
+    async fn wait_for_mcp_address(daemon: &Daemon) -> SocketAddr {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(address) = daemon.mcp_endpoint()
+                    && address.port() != 0
+                {
+                    return address;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("MCP endpoint did not bind")
     }
 
     async fn poll_mcp_host(client: &rmcp::Peer<RoleClient>, execution: &Value) -> Option<Value> {
@@ -1423,10 +1618,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn activity_stream_correlation_survives_duplicate_mcp_request_ids() {
         let test = test_daemon().await;
-        let service = test.daemon.service("alice").expect("alice service");
         let socket = test._homes[0].path().join("arena0.sock");
-        let listener = service.prepare().await.expect("prepare Host socket");
-        let service_task = tokio::spawn(Arc::clone(&service).serve_prepared(listener));
+        let daemon_task = tokio::spawn(Arc::clone(&test.daemon).serve());
         for _ in 0..100 {
             if UnixStream::connect(&socket).await.is_ok() {
                 break;
@@ -1495,8 +1688,10 @@ mod tests {
         serving.abort();
         let _ = serving.await;
         test.daemon.stop().await;
-        service_task.abort();
-        let _ = service_task.await;
+        daemon_task
+            .await
+            .expect("daemon task joined")
+            .expect("daemon served");
     }
 
     #[tokio::test]
@@ -1620,33 +1815,20 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn occupied_mcp_port_fails_before_unix_services_start() {
-        let home_a = tempfile::tempdir().expect("temporary Host home");
-        let home_b = tempfile::tempdir().expect("temporary Host home");
-        let socket = home_a.path().join("arena0.sock");
-        let host_a = HostConfig::open(
-            "occupied-port-a",
-            Paths::new(home_a.path().to_path_buf(), socket.clone()),
-            true,
-        )
-        .expect("open Host A");
-        let host_b = HostConfig::open(
-            "occupied-port-b",
-            Paths::new(
-                home_b.path().to_path_buf(),
-                home_b.path().join("arena0.sock"),
-            ),
-            true,
-        )
-        .expect("open Host B");
+        let home = tempfile::tempdir().expect("temporary daemon home");
+        let socket = home.path().join("arena0.sock");
         let occupied = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind occupied MCP port");
         let address = occupied.local_addr().expect("occupied MCP address");
         let mcp = McpConfig::new(address, None).expect("MCP config");
         let dynamic_home =
-            arena0_home::Home::from_root(home_a.path().to_path_buf()).expect("dynamic Host home");
+            arena0_home::Home::from_root(home.path().to_path_buf()).expect("dynamic Host home");
         let daemon = Daemon::start(
-            vec![host_a, host_b],
+            vec![
+                "occupied-port-a".parse().unwrap(),
+                "occupied-port-b".parse().unwrap(),
+            ],
             mcp,
             Arc::new(WasmtimeEngine::new().expect("sandbox engine")),
             dynamic_home,
@@ -1664,6 +1846,87 @@ mod tests {
             "Unix service must not start after bind failure"
         );
         drop(occupied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_drains_a_partial_mcp_body() {
+        let test = test_daemon().await;
+        let serving = tokio::spawn(Arc::clone(&test.daemon).serve());
+        let address = wait_for_mcp_address(&test.daemon).await;
+        let mut client = TcpStream::connect(address)
+            .await
+            .expect("connect MCP endpoint");
+        client
+            .write_all(
+                format!(
+                    "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: 10000\r\nConnection: keep-alive\r\n\r\n{{}}"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write partial MCP body");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        timeout(Duration::from_secs(5), test.daemon.stop())
+            .await
+            .expect("partial MCP body blocked daemon shutdown");
+        timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("serve task did not join after partial MCP body")
+            .expect("serve task panicked")
+            .expect("serve task failed");
+    }
+
+    #[tokio::test]
+    async fn shutdown_stream_remains_closed_across_reads_and_writes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stop, mut stopped) = watch::channel(false);
+        let shutdown = async move {
+            let _ = stopped.changed().await;
+        }
+        .boxed()
+        .shared();
+        let mut listener = McpListener::new(listener, shutdown);
+        let (mut stream, _) = axum::serve::Listener::accept(&mut listener).await;
+        stop.send_replace(true);
+        let mut buffer = [0; 1];
+        assert_eq!(stream.read(&mut buffer).await.unwrap(), 0);
+        assert_eq!(
+            stream.write(b"x").await.unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(stream.read(&mut buffer).await.unwrap(), 0);
+        drop(peer);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_drains_a_partial_mcp_header() {
+        let test = test_daemon().await;
+        let serving = tokio::spawn(Arc::clone(&test.daemon).serve());
+        let address = wait_for_mcp_address(&test.daemon).await;
+        let mut client = TcpStream::connect(address)
+            .await
+            .expect("connect MCP endpoint");
+        client
+            .write_all(
+                format!("POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Length: 10000\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .expect("write partial MCP header");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        timeout(Duration::from_secs(5), test.daemon.stop())
+            .await
+            .expect("partial MCP header blocked daemon shutdown");
+        timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("serve task did not join after partial MCP header")
+            .expect("serve task panicked")
+            .expect("serve task failed");
     }
 
     struct ActivityTestSubscription {
@@ -1768,20 +2031,15 @@ mod tests {
                 .expect("new Host listed");
             assert_eq!(row["user_agent"], "codex/new");
             let service = test.daemon.service("new-bob").expect("ready Host");
-            let ResponseOk::DaemonInfo(info) = service.dispatch(Request::DaemonInfo).await.unwrap()
+            let ResponseOk::HostStatus(info) = service.dispatch(HostRequest::Info).await.unwrap()
             else {
                 panic!("expected Host info");
             };
             assert_eq!(row["peer_id"], info.host.peer_id.to_string());
             assert_eq!(info.host.user_agent.as_deref(), Some("codex/new"));
 
-            let alice_socket = test
-                .daemon
-                .service("alice")
-                .expect("initial Host")
-                .socket_path()
-                .to_path_buf();
-            match call_unix(&alice_socket, &Request::HostsList).await {
+            let daemon_socket = test._homes[0].path().join("arena0.sock");
+            match call_unix(&daemon_socket, &Request::HostsList).await {
                 Ok(ResponseOk::Hosts(hosts)) => {
                     assert_eq!(hosts.len(), 4, "Unix HostsList includes dynamic Hosts");
                     let bob_info = hosts

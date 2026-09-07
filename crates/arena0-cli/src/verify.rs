@@ -10,9 +10,9 @@ use std::path::Path;
 
 use anyhow::{Context, bail};
 use arena0_client::api::{
-    FullVerifiedTerminal as ApiFullVerifiedTerminal,
-    LightVerifiedTerminal as ApiLightVerifiedTerminal, ReceiptArtifact, ReceiptRef, Request,
-    ResponseOk, VerifiedResult,
+    FullVerifiedTerminal as ApiFullVerifiedTerminal, HostRequest,
+    LightVerifiedTerminal as ApiLightVerifiedTerminal, ReceiptArtifact, ReceiptRef, ResponseOk,
+    VerifiedResult,
 };
 use arena0_client::proto::DaemonClient;
 use arena0_client::protocol::{ABI_VERSION, PeerId, ProgramHash, SessionHash};
@@ -66,21 +66,24 @@ pub(crate) async fn verify_hosts(
     for (index, host) in hosts.iter().cloned().enumerate() {
         let target = target.to_owned();
         jobs.spawn(async move {
-            let client = DaemonClient::for_host(&host)
-                .with_context(|| format!("resolve socket for Host '{host}'"))?;
-            let info = match client.call(&Request::DaemonInfo).await? {
-                ResponseOk::DaemonInfo(info) => info,
+            let client = DaemonClient::from_env()
+                .with_context(|| format!("resolve daemon endpoint for Host '{host}'"))?;
+            let info = match client.call_host(&host, &HostRequest::Info).await? {
+                ResponseOk::HostStatus(info) => info,
                 other => bail!("unexpected daemon.info response from Host '{host}': {other:?}"),
             };
             let key = client
-                .resolve_produced_receipt_ref(&target)
+                .resolve_produced_receipt_ref(&host, &target)
                 .await
                 .with_context(|| format!("resolve receipt on Host '{host}'"))?;
             let response = client
-                .call(&Request::ReceiptVerify {
-                    receipt: key,
-                    full: replay,
-                })
+                .call_host(
+                    &host,
+                    &HostRequest::ReceiptVerify {
+                        receipt: key,
+                        full: replay,
+                    },
+                )
                 .await
                 .with_context(|| format!("verify Host receipt on Host '{host}'"))?;
             let ResponseOk::Verified {
@@ -172,10 +175,9 @@ async fn verify_resident(ctx: &Ctx, target: &str, full: bool) -> anyhow::Result<
     }
     // A receipt-id prefix resolves to its exact peer_id; a session id uses the
     // addressed daemon's peer_id.
-    let key = ctx.client().resolve_receipt_ref(target).await?;
+    let key = ctx.client().resolve_receipt_ref(&ctx.host, target).await?;
     let resp = ctx
-        .client()
-        .call(&Request::ReceiptVerify { receipt: key, full })
+        .call(&HostRequest::ReceiptVerify { receipt: key, full })
         .await?;
     let ResponseOk::Verified {
         receipt_id,
@@ -188,7 +190,7 @@ async fn verify_resident(ctx: &Ctx, target: &str, full: bool) -> anyhow::Result<
     else {
         bail!("unexpected verify response");
     };
-    let names = ctx.client().program_name_map().await;
+    let names = ctx.client().program_name_map(&ctx.host).await;
     let local_peer = node_peer_id(ctx).await;
     render(
         ctx.mode,
@@ -233,7 +235,7 @@ pub(crate) async fn verify_offline(
     verify_file_light(None, mode, palette, path).await
 }
 
-/// Explain why full replay cannot proceed without a resolvable Host socket.
+/// Explain why full replay cannot proceed without a resolvable daemon socket.
 pub(crate) fn full_replay_requires_daemon() -> anyhow::Result<()> {
     bail!(
         "full replay requires a running arena0d Host; use light verification \
@@ -289,8 +291,7 @@ async fn verify_file_light(
 /// Delegate a file's verification to a reachable daemon (it holds the wasm).
 async fn delegate_to_daemon(ctx: &Ctx, receipt: ReceiptArtifact, full: bool) -> anyhow::Result<()> {
     let resp = ctx
-        .client()
-        .call(&Request::ReceiptVerify {
+        .call(&HostRequest::ReceiptVerify {
             receipt: ReceiptRef::Inline(Box::new(receipt)),
             full,
         })
@@ -306,7 +307,7 @@ async fn delegate_to_daemon(ctx: &Ctx, receipt: ReceiptArtifact, full: bool) -> 
     else {
         bail!("unexpected verify response");
     };
-    let names = ctx.client().program_name_map().await;
+    let names = ctx.client().program_name_map(&ctx.host).await;
     let local_peer = node_peer_id(ctx).await;
     render(
         ctx.mode,
@@ -334,8 +335,7 @@ async fn enrich_offline(ctx: &Ctx, program_id: ProgramHash) -> (Option<String>, 
     let local_peer = node_peer_id(ctx).await;
     let mut name = None;
     if let Ok(ResponseOk::Program(detail)) = ctx
-        .client()
-        .call(&Request::ProgramGet {
+        .call(&HostRequest::ProgramGet {
             program: program_id.to_string(),
         })
         .await
@@ -346,8 +346,8 @@ async fn enrich_offline(ctx: &Ctx, program_id: ProgramHash) -> (Option<String>, 
 }
 
 async fn node_peer_id(ctx: &Ctx) -> Option<PeerId> {
-    match ctx.client().call(&Request::DaemonInfo).await {
-        Ok(ResponseOk::DaemonInfo(i)) => Some(i.host.peer_id),
+    match ctx.call(&HostRequest::Info).await {
+        Ok(ResponseOk::HostStatus(i)) => Some(i.host.peer_id),
         _ => None,
     }
 }

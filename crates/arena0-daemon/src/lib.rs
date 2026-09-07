@@ -1,8 +1,7 @@
 //! `arena0-daemon`: the local process supervisor. It owns one virtual runtime
 //! [`arena0_node::Ensemble`] and provisions a per-Host keystore, transport,
-//! SQLite store, execution set, and Unix socket. The process also
-//! exposes one Host-explicit MCP endpoint; operator clients continue to use
-//! the per-Host Unix sockets.
+//! SQLite store, and execution set. One daemon-owned Unix socket and one
+//! Host-explicit MCP endpoint serve every Host.
 //!
 //! The trust boundary is custody: the daemon holds the seeds and performs all
 //! signing (step attestations, BLS activation ratification, program `Sign` effects);
@@ -28,7 +27,7 @@ mod system_event;
 #[cfg(test)]
 mod open_host_tests;
 
-pub use ensemble::{Daemon, HostConfig, McpConfig};
+pub use ensemble::{Daemon, McpConfig};
 pub use paths::Paths;
 pub use run::run;
 pub use store::{Keystore, KeystoreError};

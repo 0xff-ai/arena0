@@ -418,7 +418,7 @@ pub(super) fn event_summary(event: &EventFrame) -> String {
 
 fn omitted_fields(event: &EventFrame) -> Option<&'static str> {
     match &event.data {
-        EventData::HostStarted { .. } => Some("version, transport key, socket"),
+        EventData::HostStarted { .. } => Some("version, transport key, ABI"),
         EventData::OfferSeen { .. } => Some("program ID, negotiation ID"),
         EventData::Created { .. } => Some("program ID, negotiation ID"),
         EventData::NegotiationTicketAccepted { .. } => Some("ticket hash"),

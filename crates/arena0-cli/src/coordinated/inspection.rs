@@ -77,58 +77,98 @@ mod tests {
     use super::*;
     use crate::tui::{PrivatePageRequest, RunUpdate};
     use arena0_client::api::{
-        ExecStatus, ExecStatusState, ExecutionInspection, Request, Response, ResponseOk,
+        ExecStatus, ExecStatusState, ExecutionInspection, HostRequest, Request, Response,
+        ResponseOk,
         frame::{read_frame, write_frame},
     };
     use arena0_client::protocol::ProgramHash;
     use std::cell::Cell;
-    use tokio::io::{AsyncReadExt as _, BufReader};
+    use tokio::io::{AsyncRead, AsyncReadExt as _, BufReader};
     use tokio::net::UnixListener;
+
+    async fn read_routed_request<R>(read: &mut R) -> (String, HostRequest)
+    where
+        R: AsyncRead + Unpin,
+    {
+        let envelope = read_frame::<_, Request>(read)
+            .await
+            .expect("read routed Host request")
+            .expect("Host request frame");
+        let Request::Host { host, request } = envelope else {
+            panic!("request was not routed through host.call");
+        };
+        (host, request)
+    }
 
     #[tokio::test]
     async fn stalled_host_does_not_block_other_hosts_pages_and_cancellation_closes_requests() {
         let directory = tempfile::tempdir().unwrap();
-        let socket_a = directory.path().join("a.sock");
-        let socket_b = directory.path().join("b.sock");
-        let listener_a = UnixListener::bind(&socket_a).unwrap();
-        let listener_b = UnixListener::bind(&socket_b).unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
         let host_a = HostName::for_local_index(0);
         let host_b = HostName::for_local_index(1);
         let exec_a = ExecId([1; 32]);
         let exec_b = ExecId([2; 32]);
+        let client = DaemonClient::new(socket);
         let (tui, mut updates, pages) = TuiHandle::test_channel();
         let observer = tokio::spawn(observe(
             tui,
             vec![
-                (host_a, DaemonClient::new(socket_a), exec_a),
-                (host_b.clone(), DaemonClient::new(socket_b), exec_b),
+                (host_a.clone(), client.clone(), exec_a),
+                (host_b.clone(), client, exec_b),
             ],
         ));
         let milestone = Cell::new("waiting for the first Host request");
         let started = std::time::Instant::now();
         let scenario = tokio::time::timeout(Duration::from_secs(3), async {
-            let (stream_a, _) = listener_a.accept().await.unwrap();
-            let mut stalled = BufReader::new(stream_a);
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, stalled_write) = stream.into_split();
+            let mut stalled = BufReader::new(read);
+            let (stalled_wire_host, stalled_request) = read_routed_request(&mut stalled).await;
+            let (stalled_host, stalled_exec) = if stalled_wire_host == host_a.to_string() {
+                (host_a.clone(), exec_a)
+            } else if stalled_wire_host == host_b.to_string() {
+                (host_b.clone(), exec_b)
+            } else {
+                panic!("unexpected stalled Host target {stalled_wire_host}");
+            };
             assert!(matches!(
-                read_frame::<_, Request>(&mut stalled).await.unwrap(),
-                Some(Request::ExecInspect { exec_id, private_from: None, .. }) if exec_id == exec_a
+                stalled_request,
+                HostRequest::ExecInspect { exec_id, private_from: None, .. }
+                    if exec_id == stalled_exec
             ));
             milestone.set("first Host stalled; waiting for the second Host request");
-            let (stream_b, _) = listener_b.accept().await.unwrap();
-            let (read, mut write) = stream_b.into_split();
-            let mut read = BufReader::new(read);
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut responsive_write) = stream.into_split();
+            let mut responsive = BufReader::new(read);
+            let (responsive_wire_host, responsive_request) =
+                read_routed_request(&mut responsive).await;
+            let (responsive_host, responsive_exec) = if responsive_wire_host == host_a.to_string() {
+                (host_a.clone(), exec_a)
+            } else if responsive_wire_host == host_b.to_string() {
+                (host_b.clone(), exec_b)
+            } else {
+                panic!("unexpected responsive Host target {responsive_wire_host}");
+            };
+            assert_ne!(responsive_host, stalled_host);
             assert!(matches!(
-                read_frame::<_, Request>(&mut read).await.unwrap(),
-                Some(Request::ExecInspect { exec_id, private_from: None, .. }) if exec_id == exec_b
+                responsive_request,
+                HostRequest::ExecInspect { exec_id, private_from: None, .. }
+                    if exec_id == responsive_exec
             ));
-            pages.send_replace(Some(PrivatePageRequest { host: host_b.clone(), from: Some(4) }));
-            let response = |from| -> Response {
+            pages.send_replace(Some(PrivatePageRequest {
+                host: responsive_host.clone(),
+                from: Some(4),
+            }));
+            let response = |exec_id, from| -> Response {
                 Ok(ResponseOk::Inspection(ExecutionInspection {
                     status: ExecStatus {
-                        exec_id: exec_b,
+                        exec_id,
                         negotiation_id: None,
                         program_id: ProgramHash([3; 32]),
-                        state: ExecStatusState::Negotiating { queue_position: None },
+                        state: ExecStatusState::Negotiating {
+                            queue_position: None,
+                        },
                     },
                     activation: None,
                     private_from: from,
@@ -137,39 +177,66 @@ mod tests {
                     private_next: None,
                 }))
             };
-            write_frame(&mut write, &response(0)).await.unwrap();
+            write_frame(&mut responsive_write, &response(responsive_exec, 0))
+                .await
+                .unwrap();
             milestone.set("second Host responded; waiting for its requested page");
-            let (stream_b, _) = listener_b.accept().await.unwrap();
-            let (read, mut write) = stream_b.into_split();
-            let mut read = BufReader::new(read);
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut responsive_write) = stream.into_split();
+            let mut responsive = BufReader::new(read);
+            let (wire_host, request) = read_routed_request(&mut responsive).await;
+            assert_eq!(wire_host, responsive_host.to_string());
             assert!(matches!(
-                read_frame::<_, Request>(&mut read).await.unwrap(),
-                Some(Request::ExecInspect { exec_id, private_from: Some(4), .. }) if exec_id == exec_b
+                request,
+                HostRequest::ExecInspect { exec_id, private_from: Some(4), .. }
+                    if exec_id == responsive_exec
             ));
-            write_frame(&mut write, &response(4)).await.unwrap();
+            write_frame(&mut responsive_write, &response(responsive_exec, 4))
+                .await
+                .unwrap();
             while let Some(update) = updates.recv().await {
                 if let RunUpdate::Inspection { host, inspection } = update
-                    && host == host_b && inspection.private_from == 4
+                    && host == responsive_host
+                    && inspection.private_from == 4
                 {
                     milestone.set("requested page published while first Host remains stalled");
-                    return stalled;
+                    break;
                 }
             }
-            panic!("inspection update channel closed");
-        }).await;
+            milestone.set("requested page published; waiting for a second pending request");
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, pending_write) = stream.into_split();
+            let mut pending = BufReader::new(read);
+            let (wire_host, request) = read_routed_request(&mut pending).await;
+            assert_eq!(wire_host, responsive_host.to_string());
+            assert!(matches!(
+                request,
+                HostRequest::ExecInspect { exec_id, private_from: Some(4), .. }
+                    if exec_id == responsive_exec
+            ));
+            milestone.set("one stalled and one pending Host request");
+            ((stalled, stalled_write), (pending, pending_write))
+        })
+        .await;
         observer.abort();
         assert!(observer.await.unwrap_err().is_cancelled());
-        let mut stalled = scenario.unwrap_or_else(|_| {
-            panic!(
-                "inspection deadline after {:?}; last milestone: {}",
-                started.elapsed(),
-                milestone.get()
-            )
-        });
-        let mut byte = [0];
-        let read = tokio::time::timeout(Duration::from_secs(1), stalled.read(&mut byte))
+        let ((mut stalled, _stalled_write), (mut pending, _pending_write)) = scenario
+            .unwrap_or_else(|_| {
+                panic!(
+                    "inspection deadline after {:?}; last milestone: {}",
+                    started.elapsed(),
+                    milestone.get()
+                )
+            });
+        let mut stalled_byte = [0];
+        let read = tokio::time::timeout(Duration::from_secs(1), stalled.read(&mut stalled_byte))
             .await
-            .expect("cancelled observer left a Host request open");
+            .expect("cancelled observer left the stalled Host request open");
+        assert_eq!(read.unwrap(), 0);
+        let mut pending_byte = [0];
+        let read = tokio::time::timeout(Duration::from_secs(1), pending.read(&mut pending_byte))
+            .await
+            .expect("cancelled observer left the pending Host request open");
         assert_eq!(read.unwrap(), 0);
     }
 }

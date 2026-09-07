@@ -16,12 +16,37 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::events::EventFilter;
-/// A single request frame. One request yields one [`Response`](crate::Response),
-/// except `events.subscribe`, which yields an ack then a stream of
-/// [`EventFrame`](crate::EventFrame)s until the client disconnects.
+/// One request to the daemon's shared Unix endpoint. Host operations always
+/// name their target explicitly; daemon operations do not select a Host.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "method", content = "params", deny_unknown_fields)]
 pub enum Request {
+    /// Dispatch an existing Host operation in one exact local namespace.
+    #[serde(rename = "host.call")]
+    Host { host: String, request: HostRequest },
+    #[serde(rename = "daemon.info")]
+    DaemonInfo,
+    #[serde(rename = "daemon.stop")]
+    DaemonStop,
+    #[serde(rename = "hosts.list")]
+    HostsList,
+    /// Open or create a Host through the daemon's supervised provisioning path.
+    #[serde(rename = "hosts.open")]
+    HostsOpen {
+        id: Option<String>,
+        user_agent: String,
+    },
+    #[serde(rename = "activity.subscribe")]
+    ActivitySubscribe,
+}
+
+/// An operation on the Host explicitly selected by [`Request::Host`].
+/// Event subscriptions acknowledge the request, then stream Host event frames.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "method", content = "params", deny_unknown_fields)]
+pub enum HostRequest {
+    #[serde(rename = "host.info")]
+    Info,
     // Identity / custody (CLI only; never sent by the MCP server). Seeds never
     // cross the socket: `id.new` returns only public material.
     #[serde(rename = "id.new")]
@@ -120,22 +145,6 @@ pub enum Request {
     // connection until the client hangs up.
     #[serde(rename = "events.subscribe")]
     EventsSubscribe { filter: EventFilter },
-    /// Subscribe to daemon-wide MCP tool activity. The connection becomes a
-    /// stream after the ack, just like `events.subscribe`.
-    #[serde(rename = "activity.subscribe")]
-    ActivitySubscribe,
-
-    // Local observability.
-    #[serde(rename = "daemon.info")]
-    DaemonInfo,
-    /// List every Host supervised by this daemon from any Host socket.
-    #[serde(rename = "hosts.list")]
-    HostsList,
-    /// Graceful shutdown: stop the Host, close the transport, remove the socket,
-    /// and exit the serve loop. The daemon process ends when the loop returns.
-    #[serde(rename = "daemon.stop")]
-    DaemonStop,
-
     // Receipts / verification.
     #[serde(rename = "receipt.get")]
     ReceiptGet { receipt: ReceiptRef },
@@ -213,12 +222,12 @@ impl std::fmt::Display for ProgramRefError {
             } => {
                 let list = candidates
                     .iter()
-                    .map(|id| id.fmt_short().to_string())
+                    .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(", ");
                 write!(
                     f,
-                    "'{reference}' is ambiguous; candidates: {list} — use `arena0 program list` then `program show <id>`"
+                    "'{reference}' is ambiguous; candidates: {list}; use an exact program ID"
                 )
             }
         }

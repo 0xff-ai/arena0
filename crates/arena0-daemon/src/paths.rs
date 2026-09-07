@@ -1,9 +1,55 @@
-//! Durable state and socket paths for one local Host.
+//! Durable state paths for one local Host.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use anyhow::Context as _;
 use arena0_home::{Home, HostLocation};
+use fs2::FileExt;
+
+/// Exclusive ownership of a filesystem resource. Retain lock files after
+/// release: unlinking one would let competing owners lock different inodes.
+#[derive(Debug)]
+pub(crate) struct FileLease {
+    _file: fs::File,
+}
+
+impl FileLease {
+    pub(crate) fn acquire_home(home: &Home) -> anyhow::Result<Self> {
+        ensure_directory(home.root()).context("prepare daemon home")?;
+        Self::acquire_path(&home.root().join("arena0-daemon.lock"))
+            .with_context(|| format!("acquire daemon Home {}", home.root().display()))
+    }
+
+    pub(crate) fn acquire_path(path: &Path) -> anyhow::Result<Self> {
+        validate_path(path).context("validate ownership lock")?;
+        ensure_regular_file_if_present(path, "ownership lock")?;
+        let mut options = fs::OpenOptions::new();
+        options.create(true).read(true).write(true);
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(path).context("open ownership lock")?;
+        anyhow::ensure!(
+            file.metadata()?.is_file(),
+            "ownership lock must be a regular file"
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        file.try_lock_exclusive().with_context(|| {
+            format!(
+                "another daemon may own {}; cannot acquire ownership",
+                path.display()
+            )
+        })?;
+        Ok(Self { _file: file })
+    }
+}
 
 /// Resolved on-disk locations for one daemon instance.
 #[derive(Debug, Clone)]
@@ -14,51 +60,38 @@ pub struct Paths {
     pub(crate) db_path: PathBuf,
     /// Keystore directory (seed files, mode 0600; the index).
     pub(crate) keys_dir: PathBuf,
-    /// Unix socket the daemon listens on.
-    pub(crate) socket: PathBuf,
 }
 
 impl Paths {
-    /// Derive paths from an explicit home and socket.
+    /// Derive paths from one Host state directory.
     #[must_use]
-    pub fn new(home: PathBuf, socket: PathBuf) -> Self {
+    pub fn new(home: PathBuf) -> Self {
         let db_path = home.join("arena0.sqlite");
         let keys_dir = home.join("keys");
         Self {
             state_dir: home,
             db_path,
             keys_dir,
-            socket,
         }
     }
 
     /// Add daemon-owned durable paths to a resolved Host location.
     pub(crate) fn from_location(location: &HostLocation) -> anyhow::Result<Self> {
-        let paths = Self::new(
-            location.state_dir().to_owned(),
-            location.socket().to_owned(),
-        );
+        let paths = Self::new(location.state_dir().to_owned());
         validate_path(&paths.state_dir).map_err(anyhow::Error::new)?;
-        validate_path(&paths.socket).map_err(anyhow::Error::new)?;
         Ok(paths)
     }
 
-    /// Create the Host home, keystore, and socket-parent directories. The keystore
+    /// Create the Host home and keystore directories. The keystore
     /// directory is created with mode `0700` so only the owner can read seeds.
     pub(crate) fn ensure_dirs(&self) -> std::io::Result<()> {
         validate_path(&self.state_dir)?;
         validate_path(&self.keys_dir)?;
         validate_path(&self.db_path)?;
-        validate_path(&self.socket)?;
 
         ensure_directory(&self.state_dir)?;
         create_private_dir(&self.keys_dir)?;
-        if let Some(parent) = self.socket.parent() {
-            validate_path(parent)?;
-            ensure_directory(parent)?;
-        }
         ensure_regular_file_if_present(&self.db_path, "database")?;
-        ensure_socket_if_present(&self.socket)?;
         Ok(())
     }
 }
@@ -112,7 +145,7 @@ fn invalid_path(message: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
 }
 
-fn ensure_directory(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn ensure_directory(dir: &Path) -> std::io::Result<()> {
     validate_path(dir)?;
     match fs::symlink_metadata(dir) {
         Ok(metadata) => {
@@ -167,29 +200,6 @@ fn ensure_regular_file_if_present(path: &Path, kind: &str) -> std::io::Result<()
     Ok(())
 }
 
-#[cfg(unix)]
-fn ensure_socket_if_present(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::FileTypeExt;
-
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("socket path must be a Unix socket: {}", path.display()),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn ensure_socket_if_present(_path: &Path) -> std::io::Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,10 +207,7 @@ mod tests {
     #[test]
     fn ensure_dirs_rejects_parent_components() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::new(
-            dir.path().join("home/../escaped"),
-            dir.path().join("socket"),
-        );
+        let paths = Paths::new(dir.path().join("home/../escaped"));
         let error = paths.ensure_dirs().unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
@@ -217,7 +224,7 @@ mod tests {
         std::fs::create_dir(&home).unwrap();
         symlink(&real_keys, home.join("keys")).unwrap();
 
-        let paths = Paths::new(home, dir.path().join("arena0.sock"));
+        let paths = Paths::new(home);
         assert!(paths.ensure_dirs().is_err());
     }
 }

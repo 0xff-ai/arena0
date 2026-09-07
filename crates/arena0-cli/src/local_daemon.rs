@@ -2,13 +2,13 @@
 //!
 //! The child remains `arena0d`: it owns Hosts, stores, transport, sandboxing,
 //! and shutdown. This module owns only the process it starts and never stops a
-//! daemon that was already serving the requested Host sockets.
+//! daemon that was already serving the shared endpoint.
 
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
-use arena0_client::api::Request;
+use arena0_client::api::{Request, ResponseOk};
 use arena0_client::proto::DaemonClient;
 use arena0_home::HostName;
 use tokio::process::{Child, Command};
@@ -34,7 +34,7 @@ pub(crate) struct LocalDaemon {
 }
 
 impl LocalDaemon {
-    /// Reuse a daemon serving every requested Host, or start and await one.
+    /// Reuse the shared daemon and open missing Hosts, or start and await it.
     pub(crate) async fn connect_or_start(hosts: Vec<HostName>) -> anyhow::Result<Self> {
         Self::connect_or_start_with_mcp(hosts, "127.0.0.1:0".parse().expect("loopback address"))
             .await
@@ -49,25 +49,20 @@ impl LocalDaemon {
         if hosts.is_empty() {
             bail!("a local daemon requires at least one Host");
         }
-        let clients = clients(&hosts)?;
-        let reachable = probe(&clients).await;
-        if reachable.iter().all(|ready| *ready) {
-            return Ok(Self {
-                hosts,
-                child: None,
-                stderr: None,
-            });
-        }
-        if reachable.iter().any(|ready| *ready) {
-            let ready = hosts
-                .iter()
-                .zip(&reachable)
-                .filter_map(|(host, ready)| ready.then_some(host.as_str()))
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "only part of the requested local Ensemble is reachable ({ready}); stop the existing service before changing its Host set"
-            );
+        let client = DaemonClient::from_env()?;
+        match client.call(&Request::DaemonInfo).await {
+            Ok(ResponseOk::DaemonInfo(_)) => {
+                let mut local = Self {
+                    hosts: Vec::new(),
+                    child: None,
+                    stderr: None,
+                };
+                local.ensure_hosts(hosts).await?;
+                return Ok(local);
+            }
+            Ok(other) => bail!("unexpected daemon.info response: {other:?}"),
+            Err(error) if arena0_client::proto::is_connect_error(&error) => {}
+            Err(error) => return Err(error),
         }
 
         let daemon = crate::serve::daemon_executable()?;
@@ -95,7 +90,7 @@ impl LocalDaemon {
             child: Some(child),
             stderr: Some(stderr),
         };
-        if let Err(error) = local.await_ready(&clients).await {
+        if let Err(error) = local.await_ready(&client).await {
             let cleanup = local.shutdown_spawned().await.err();
             let diagnostics = local.stderr_tail();
             let mut message = format!("{error:#}");
@@ -111,14 +106,22 @@ impl LocalDaemon {
         Ok(local)
     }
 
-    #[must_use]
-    pub(crate) fn is_spawned(&self) -> bool {
-        self.child.is_some()
-    }
-
-    #[must_use]
-    pub(crate) fn hosts(&self) -> &[HostName] {
-        &self.hosts
+    /// Select participating Hosts, opening missing namespaces through the daemon.
+    pub(crate) async fn ensure_hosts(&mut self, hosts: Vec<HostName>) -> anyhow::Result<()> {
+        let client = DaemonClient::from_env()?;
+        let available = client.list_hosts().await?;
+        for host in &hosts {
+            if !available.iter().any(|entry| entry.host.id == host.as_str()) {
+                client
+                    .open_host(
+                        Some(host.to_string()),
+                        format!("arena0/{}", env!("CARGO_PKG_VERSION")),
+                    )
+                    .await?;
+            }
+        }
+        self.hosts = hosts;
+        Ok(())
     }
 
     /// Stop and reap only a daemon started by this value.
@@ -126,11 +129,11 @@ impl LocalDaemon {
         self.shutdown_spawned().await
     }
 
-    async fn await_ready(&mut self, clients: &[DaemonClient]) -> anyhow::Result<()> {
+    async fn await_ready(&mut self, client: &DaemonClient) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + START_TIMEOUT;
         let mut interval = tokio::time::interval(PROBE_INTERVAL);
         loop {
-            if probe(clients).await.iter().all(|ready| *ready) {
+            if client.daemon_up().await {
                 return Ok(());
             }
             if let Some(status) = self
@@ -145,7 +148,7 @@ impl LocalDaemon {
             if tokio::time::Instant::now() >= deadline {
                 bail!(
                     "local Host service did not make all {} Hosts ready within {}s",
-                    clients.len(),
+                    self.hosts.len(),
                     START_TIMEOUT.as_secs()
                 );
             }
@@ -163,12 +166,26 @@ impl LocalDaemon {
         let Some(child) = self.child.as_mut() else {
             return Ok(());
         };
-        let first = self
-            .hosts
-            .first()
-            .ok_or_else(|| anyhow!("owned local daemon lost its Host set"))?;
-        let client = DaemonClient::for_host(first)?;
-        let _ = client.call(&Request::DaemonStop).await;
+        // Address the owned process directly: a competing startup may have
+        // won the shared socket while this child failed to acquire the home.
+        // Sending daemon.stop through that socket would stop the other owner.
+        if child
+            .try_wait()
+            .context("check owned daemon before shutdown")?
+            .is_none()
+            && let Some(id) = child.id()
+        {
+            let pid = libc::pid_t::try_from(id).context("convert owned daemon process id")?;
+            // SAFETY: the unreaped child owns this process ID. SIGINT is
+            // handled by arena0d's normal graceful shutdown path.
+            let result = unsafe { libc::kill(pid, libc::SIGINT) };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error).context("interrupt owned local daemon");
+                }
+            }
+        }
         let status = match tokio::time::timeout(SHUTDOWN_TIMEOUT, child.wait()).await {
             Ok(status) => status.context("reap local Host service")?,
             Err(_) => {
@@ -210,18 +227,6 @@ impl Drop for LocalDaemon {
             let _ = child.start_kill();
         }
     }
-}
-
-fn clients(hosts: &[HostName]) -> anyhow::Result<Vec<DaemonClient>> {
-    hosts
-        .iter()
-        .map(DaemonClient::for_host)
-        .collect::<Result<_, _>>()
-        .map_err(Into::into)
-}
-
-async fn probe(clients: &[DaemonClient]) -> Vec<bool> {
-    futures::future::join_all(clients.iter().map(DaemonClient::daemon_up)).await
 }
 
 #[cfg(test)]

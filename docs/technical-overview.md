@@ -23,7 +23,7 @@ Participants are the parties to the interaction. `Host` is the runtime type
 that serves a Participant; `Ensemble` groups those runtime instances. These
 implementation names are used below to explain ownership and local topology.
 
-Phase 1 runs an `Ensemble` of independent logical Hosts in one `arena0d` process. Each Host has its own identity, program catalog, SQLite store, Unix socket, execution actors, and receipts. `LocalTransport` connects the Hosts through bounded in-process channels and the real protocol codec.
+Phase 1 runs an `Ensemble` of independent logical Hosts in one `arena0d` process. The daemon owns the shared Unix API endpoint and MCP listener. Each Host has its own identity, program catalog, SQLite store, execution actors, and receipts. `LocalTransport` connects the Hosts through bounded in-process channels and the real protocol codec.
 
 ```text
 human or agent
@@ -64,13 +64,13 @@ The workspace manifests own dependency selection and exact versions. The table b
 | Content identity | BLAKE3 | Program and protocol content hashes |
 | Persistent identity | Ed25519 | Host identity, tickets, and unilateral stop reports |
 | Execution agreement | BLS12-381 MinSig through `blst` | Per-execution keys and N-of-N aggregate agreements |
-| Local Host API | Length-prefixed JSON over Unix domain sockets | Typed client access to one Host |
+| Local Host API | Length-prefixed JSON over one daemon Unix socket | Explicit routing to independent Hosts |
 | MCP API | RMCP and Axum over Streamable HTTP | One Host-explicit agent endpoint for an Ensemble |
 | Observability | `tracing` and `tracing-subscriber` | Redacted semantic events and opt-in performance records |
 | CLI | Clap, Ratatui, and Crossterm | Commands, the local workspace, and the execution observatory |
 | Build orchestration | Cargo and `just` | Program builds, workspace builds, tests, checks, docs, audits, and release artifacts |
 
-The release uses Unix domain sockets for Host APIs. The packaged targets and platform limits live in the [project README](../README.md).
+The release uses one Unix domain socket per daemon for its local API. Host requests name their target explicitly. The packaged targets and platform limits live in the [project README](../README.md).
 
 ## Dependency direction
 
@@ -196,7 +196,7 @@ Recovery validates stored state and every nested projection before it exposes th
 
 Long-lived state uses one clear task or resource owner. Execution actors own live execution capabilities. The store thread owns its SQLite connection. The Ensemble owns coordinated local shutdown. The daemon owns its services and child task lifecycles.
 
-MCP `open_host` adds a Host to the running Ensemble through serialized, supervised provisioning. A supplied local ID reuses its durable identity; an omitted ID creates a fresh namespace. The daemon publishes the service after recovery and socket binding. Persisted Hosts outside the startup set reopen on demand. Shutdown settles pending provisioning before releasing stores.
+MCP `open_host` adds a Host to the running Ensemble through serialized, supervised provisioning. A supplied local ID reuses its durable identity; an omitted ID creates a fresh namespace. The daemon publishes the service after recovery. Persisted Hosts outside the startup set reopen on demand. Shutdown settles pending provisioning before releasing stores.
 
 Queues, channels, frames, blobs, guest calls, agent responses, pending work, and shutdown waits are bounded. Backpressure reaches the component that creates work instead of becoming unbounded memory growth.
 

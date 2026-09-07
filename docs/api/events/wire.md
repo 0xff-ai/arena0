@@ -56,15 +56,16 @@ The two synthetic frame rules are fixed:
 
 ## Subscription request
 
-The request keeps the `filter` field from `Request::EventsSubscribe`:
+The existing filter is carried inside an explicitly targeted Host request:
 
 ```json
 {
-  "method": "events.subscribe",
+  "method": "host.call",
   "params": {
-    "filter": {
-      "include": ["exec.session.*", "exec.terminated"],
-      "exclude": ["exec.session.callout_answered"]
+    "host": "host-01",
+    "request": {
+      "method": "events.subscribe",
+      "params": {"filter": {"include": ["exec.*"], "exclude": []}}
     }
   }
 }
@@ -115,7 +116,6 @@ An empty or absent `include` selects all catalog tags. An empty or absent
   "data": {
     "version": "0.6.0",
     "transport_key": "a2f28686c4b4328ae4ce1c3a924d7522e2c08da862e3c2e7af5c912505eaea9a",
-    "socket": "/home/you/arena0/hosts/host-01/arena0.sock",
     "abi_version": 20
   }
 }
