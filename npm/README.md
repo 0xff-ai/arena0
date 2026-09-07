@@ -41,8 +41,6 @@ run the Rust release build but cannot package it as the published Linux target.
 `assemble.mjs <target> <binary-directory> [version]` copies the three executables
 into the platform package and syncs the version across all three `package.json`
 files (defaulting to the workspace version in `Cargo.toml`), including the main package's
-`optionalDependencies` pins. It also copies arena0's two license files and the
-generated Rust dependency notices for both the host binary and its embedded Wasm
-programs into every package. Run `just licenses` after changing Rust
-dependencies. `npm-smoke` installs the packed platform and meta packages into
-an empty prefix and runs all three commands.
+`optionalDependencies` pins. It also copies arena0's two license files into every
+package. `npm-smoke` installs the packed platform and meta packages into an empty
+prefix and runs all three commands.

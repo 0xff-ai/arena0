@@ -39,19 +39,8 @@ audit:
     cargo audit --file Cargo.lock
     cargo audit --file programs/Cargo.lock
 
-# Regenerate the dependency notices shipped with each prebuilt binary package.
-licenses:
-    cargo about generate about.hbs --manifest-path Cargo.toml --all-features --locked --offline --fail -o THIRD_PARTY_LICENSES.txt
-    cargo about generate about-programs.hbs --manifest-path programs/Cargo.toml --all-features --locked --offline --fail -o EMBEDDED_PROGRAM_LICENSES.txt
-    perl -pi -e 's/\r$//; s/[ \t]+$//' THIRD_PARTY_LICENSES.txt EMBEDDED_PROGRAM_LICENSES.txt
-    perl -0pi -e 's/\n+\z/\n/' THIRD_PARTY_LICENSES.txt EMBEDDED_PROGRAM_LICENSES.txt
-
-# Reject stale committed notices without changing the working tree.
-licenses-check:
-    ./scripts/check-licenses.sh
-
 # All local gates for a release-facing change.
-release-check: audit licenses-check check test doc build-release
+release-check: audit check test doc build-release
 
 # Start the default two-Host local Ensemble.
 dev: build-programs

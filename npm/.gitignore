@@ -10,5 +10,3 @@ arena0-*/bin/cargo-arena0.exe
 # Copied from the repository root into every package by assemble.mjs.
 */LICENSE-APACHE
 */LICENSE-MIT
-*/EMBEDDED_PROGRAM_LICENSES.txt
-*/THIRD_PARTY_LICENSES.txt

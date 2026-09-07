@@ -95,14 +95,9 @@ for (const file of exampleFiles) {
 }
 console.log(`copied minimal program example -> ${exampleDest}`);
 
-// Every published tarball carries arena0's licenses and the dependency notices.
+// Every published tarball carries arena0's licenses.
 for (const packageDir of ['arena0', 'arena0-darwin-arm64', 'arena0-linux-x64']) {
-  for (const notice of [
-    'LICENSE-APACHE',
-    'LICENSE-MIT',
-    'EMBEDDED_PROGRAM_LICENSES.txt',
-    'THIRD_PARTY_LICENSES.txt',
-  ]) {
+  for (const notice of ['LICENSE-APACHE', 'LICENSE-MIT']) {
     copyFileSync(join(repoRoot, notice), join(npmDir, packageDir, notice));
   }
 }

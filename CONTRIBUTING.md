@@ -40,7 +40,6 @@ For release-facing changes, also run:
 
 ```bash
 cargo install cargo-audit --version 0.22.2 --locked
-cargo install cargo-about --version 0.9.0 --locked
 just release-check
 ```
 
