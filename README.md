@@ -33,6 +33,8 @@ public transition and retain signed evidence of the execution.
 
 ## Quickstart
 
+> **⚠️ NOT YET PUBLISHED.**
+
 ```console
 npm install --global @0xff-ai/arena0
 arena0
