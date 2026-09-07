@@ -1,14 +1,119 @@
 # arena0
 
-arena0 runs the same content-addressed Wasm program across two or more Hosts
-and produces one independently signed receipt per Host. Each Host executes in a
+One program. N autonomous agents. One verifiable result.
+Wasm + p2p + state machines
+
+availability: runtime ✅ protocol ✅ network 🚧
+
+<!-- Suggested wording: Runs locally today. Cross-machine P2P networking is in development. -->
+
+arena0 lets agents agree on a program, run it together, and verify what happened. You can think of it as p2p co-execution, or a form of multi-party compute.
+Each participant runs the same exact deterministic Wasm program, and checks each shared state transition against the other participants. The program is content-addressed and acts like a shared state machine.
+
+Use arena0 to coordinate independent agents around shared goals, with strict rules they cannot diverge from without leaving evidence.
+Agents can use arena0 to negotiate terms, allocate work, run auctions, trace autoresearch contributions, make joint decisions, and much more.
+
+For example, an auction program defines when bids can be submitted, when they
+are revealed, and how the winner is chosen. Every agent has explicitly committed to being bound by the rules, Each participant checks the
+same public transitions. arena0 is unopinionated about identity, Moving money or holding assets requires an external
+system connected to those rules.
+
+all of this happens in p2p. arena0 offers reusable primitives for cryptography (commit-reveal, joint randomness), choreography (turn-taking), decision-making (voting). These can be composed into new programs easily.
+
+
+## Install and run
+
+This opens a terminal workspace with bundled example programs:
+
+```sh
+npm install -g @0xff-ai/arena0
+arena0
+```
+
+## arena0 programs
+
+An arena0 program is a shared state machine. It defines the rules of an interaction: who can act, what they can do, and how each action changes the shared state.
+
+Agents are bound by its rules, and must behave exactly how the program dictates. Every interaction is cryptographically authenticated via signatures and legitimized through N-of-N quorum. Divergences are captured, recorded, and can interrupt execution. At the end, all agents generate the same outcome/result, and produce an identical proof and trace of execution that anyone can verify.
+
+arena0 programs are Wasm bytecode. They can be generated on-the-fly and introspected by agents. Two or more agents can come together, negotiate some shared outcome they want to achieve, and collaborately author a program that will bind them to their own terms and will govern the behaviour. Meta-programming is also a possibility: one program can generate and spawn other programs. The possibilities are endless.
+
+## arena0 runtime
+
+The runtime executes programs in a Wasmtime sandbox with bounded memory and
+execution fuel, and a well-defined and versioned WIT interface.
+
+<< add ABI table >>
+
+Each call starts with explicit state in a fresh Wasm instance.
+Public execution can be replayed with the same program to check state changes,
+effects, fuel use, and the final outcome.
+
+## arena0 protocol
+
+<< work through the lifecycle of an execution from negotiation, session to closure, including messages exchanged >>
+
+execution, sessions, etc.
+
+<!-- Suggested wording:
+Before execution, participants agree on the exact program, its parameters, and who is
+participating. A session starts only after all participants have signed the
+same offer and the activation has been durably committed. During execution,
+every shared state transition requires all participants' signatures.
+-->
+
+
+## arena0 SDK
+
+All programs and primitives are built with the arena0 SDK, which offers an actor-oriented programming model and syntactic sugar to make the authoring experience straightforward for agents, and easily interpretable by humans.
+
+<!-- Suggested wording:
+The Rust SDK provides the building blocks for arena0 programs. Authors define
+program state, messages, and handlers; the SDK generates the code that connects
+them to the runtime. Reusable primitives handle common patterns such as
+commit-reveal, turn-taking, and voting.
+-->
+
+
+
+
+
+
+
+
+
+
+
+arena0 is written in Rust and uses Wasmtime. arena0 programs are WIT components conforming to a well-defined interface.
+
+<!-- Suggested wording:
+arena0 is written in Rust and uses Wasmtime. Programs are Wasm modules that
+implement arena0's guest interface.
+Editorial note: The current interface is a custom ABI, not WIT components.
+-->
+
+
+arena0 is made up of several components:
+
+- the arena0 runtime 
+- the arena0 
+
+Arena0 : multiple participants run the same content-addressed Wasm program under deterministic limits, agree on public state transitions, and each produce a portable signed receipt.
+
+
+The runtime and protocol are the first rollout stage. Cross-machine P2P networking is in progress and belongs to the full product vision, but is not a capability of the current public Phase 1 runtime.
+
+Arena0 makes multi-party protocols portable and independently verifiable. Its long-term ambition is neutral infrastructure for coordination and economic activity between autonomous agents: participants inspect and consent to the same exact program, co-execute it across independently operated runtimes, and retain their own evidence.
+
+arena0 runs the same content-addressed Wasm program across two or more participants
+and produces one independently signed receipt per participant. Each participant executes in a
 deterministic sandbox, agrees on every public state transition, and stops at
 the exact edge where replicas diverge.
 
 The launch release is local: one persistent service supervises an `Ensemble`
-of independent logical Hosts connected by an in-process virtual network. Each
-Host has its own identity, program catalog, SQLite store, Unix socket, and
-receipt. Running those Hosts on one machine demonstrates deterministic
+of independent logical participants connected by an in-process virtual network. Each
+participant has its own identity, program catalog, SQLite store, Unix socket, and
+receipt. Running those participants on one machine demonstrates deterministic
 agreement and proof construction; it does not provide independent machine
 custody or protection from compromise of that machine.
 
@@ -26,57 +131,46 @@ arena0 --version
 cargo arena0 --version
 ```
 
-- `arena0` opens the local workspace, coordinates runs, operates one Host, and
+- `arena0` opens the local workspace, coordinates runs, operates one participant, and
   verifies receipts.
 - `arena0d` is the persistent service process behind `arena0 serve`.
 - `cargo-arena0` builds a guest program and embeds its public metadata.
 
-Windows is not supported because Host APIs use Unix domain sockets.
+Windows is not supported because participant APIs use Unix domain sockets.
 
 ## Quick start
 
 Open the local workspace:
 
 ```console
-arena0
-```
-
-Use a disposable home when you do not want the run to retain identities,
-programs, executions, or receipts:
-
-```console
 arena0 --tmp
 ```
 
-`--tmp` creates a private temporary `ARENA0_HOME` below
-`$ARENA0_HOME/tmp/` (normally `~/.arena0/tmp/`) and removes it after every
-owned Host has stopped. Compiled Wasm remains in the global arena0 cache, so
-disposable runs do not pay cold compilation repeatedly. It cannot be combined
-with an explicit socket or `arena0 serve`.
+This starts a disposable home for testing, it does not retain identities, executions, or receipts.
 
 The workspace starts a command-scoped local service when needed. Select a
-program, choose the exact Host count, assign the human-controlled Host, edit
+program, choose the exact participant count, assign the human-controlled participant, edit
 the program parameters, and choose light verification or full receipt replay.
 Launching replaces the workspace with the focused run screen.
 
 The run screen shows:
 
-- `LOCAL`, the Host count, and `1 machine`;
+- `LOCAL`, the participant count, and `1 machine`;
 - negotiation progress, then the activated session, current step, and N-of-N
   agreement progress;
 - the program's current four-slot view: `Header`, `Agents`, `State`, and
   `StatusBar`;
 - the canonical public trace, including schema-decoded program messages when
-  available, alongside the redacted Host system-event stream;
+  available, alongside the redacted participant system-event stream;
 - the current callout and JSON input; and
 - light or full-replay progress for every producer receipt.
 
 A Session does not exist during negotiation. It is formed only after every
 participant has durably activated the same offer.
 
-For a non-interactive proof, bind each Host to a deterministic built-in and
+For a non-interactive proof, bind each participant to a deterministic built-in and
 emit one JSON result. The command starts and stops its own local service unless
-the requested Hosts are already served:
+the requested participants are already served:
 
 ```console
 arena0 --json run rock-paper-scissors \
@@ -88,37 +182,17 @@ arena0 --json run rock-paper-scissors \
 Bare `arena0` prints help when its standard streams are not terminals. Use
 `arena0 serve` when an API or MCP client needs a persistent service.
 
-## Run local agents
+## Connect a local agent
 
-Bind a human, a small built-in policy, or an executable to each selected Host:
+Coming soon:
 
-```console
-arena0 run prisoner-dilemma \
-  --agent host-01=./examples/agents/tit_for_tat.py \
-  --agent host-02=./examples/agents/grim.py \
-  --replay
-```
+- MCP
 
-An executable receives one JSONL callout at a time and returns one JSON value.
-The CLI invokes it directly without a shell and bounds its line size, response
-time, diagnostics, and shutdown. See [Run local agents](docs/run-local-agents.md)
-and the [subprocess protocol](docs/subprocess-agent-protocol.md).
+## Joining the p2p network
 
-The only built-in policies are `sample`, which covers the bundled supported
-programs, and `first-allowed`, which selects the first value allowed by a
-closed enum schema. They are demonstration policies, not general agents.
+Coming soon.
 
-## Connect an MCP harness
 
-Expose one Streamable HTTP endpoint for the complete Ensemble:
-
-```console
-arena0 serve --mcp-listen 127.0.0.1:7330
-```
-
-Configure `http://127.0.0.1:7330/mcp` once. Every Host-scoped tool call carries
-an explicit Host reference, so a harness does not open the same MCP server once
-per Host. See [Connect one harness to an Ensemble](docs/connect-over-mcp.md).
 
 ## Build a program
 
@@ -136,7 +210,7 @@ arena0 run target/wasm32-unknown-unknown/release/arena0_minimal_program.wasm \
 ```
 
 When a run names a local Wasm path, the coordinator imports those exact bytes
-into every selected local Host before admission. This is coordinated local
+into every selected local participant before admission. This is coordinated local
 import, not remote transfer or implicit acquisition. See
 [Build an arena0 program](docs/build-a-program.md).
 
@@ -153,20 +227,20 @@ the exact program and compares state hashes, effects, fuel, and terminal
 output. The replay result also includes the guest-produced JSON outcome.
 
 Re-verify every producer of a completed local session by naming its complete
-Host set:
+participant set:
 
 ```console
 arena0 verify <session-id> --hosts host-01,host-02 --replay
 ```
 
-Without `--hosts`, `arena0 verify` keeps the selected single-Host behavior.
+Without `--hosts`, `arena0 verify` keeps the selected single-participant behavior.
 
 Receipts prove agreement about the program's facts. They do not prove external
 claims such as payment, task completion, identity, or asset custody unless an
 external system separately establishes those facts.
 
-Agent-facing params, callout answers, queries, and outcomes cross the Host
-boundary as JSON. The Host treats deterministic program Borsh values as opaque
+Agent-facing params, callout answers, queries, and outcomes cross the participant
+boundary as JSON. The participant treats deterministic program Borsh values as opaque
 bytes; generated guest code owns conversion to concrete program types.
 
 See the [technical overview](docs/technical-overview.md) for the stack, system
