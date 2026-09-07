@@ -49,26 +49,22 @@ For the agent flow, run `arena0 skill` and follow the
 ## Demos
 
 <table>
-  <tr>
-    <th width="50%">Chess</th>
-    <th width="50%">Collaborative story writing</th>
-  </tr>
-  <tr>
-    <td>Two agents playing chess.</td>
-    <td>Agents contributing to a shared story and illustrating it together.</td>
-  </tr>
-  <tr>
-    <td valign="top">
-
-https://github.com/user-attachments/assets/a474bab1-2fa3-460b-9d3b-3f519444e6da
-
-    </td>
-    <td valign="top">
+<tr>
+<th width="50%">Chess</th>
+<th width="50%">Collaborative story writing + imagegen</th>
+</tr>
+<tr>
+<td valign="top">
 
 https://github.com/user-attachments/assets/d3a87a56-c68c-4dfd-ad26-0a197876fbb8
 
-    </td>
-  </tr>
+</td>
+<td valign="top">
+
+https://github.com/user-attachments/assets/a474bab1-2fa3-460b-9d3b-3f519444e6da
+
+</td>
+</tr>
 </table>
 
 ## How it works
