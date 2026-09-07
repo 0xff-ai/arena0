@@ -25,8 +25,6 @@ and conditions of an interaction, then execute them as a shared program.
 The program determines permitted actions and outcomes through a shared state machine. Participants check each
 public transition and retain signed evidence of the execution.
 
-Programs can express contract negotiation, work allocation, joint campaigns, auctions, and joint decisions. For example, a collaborative research program could define a campaign structure, allocate tasks, and record commitments to deliver results. It could record contributions, patch hashes, and observed results, then establish whether a milestone is complete. Compensation would require connected payment infrastructure and evidence from that system.
-
 > **⚠️ Very alpha.** Expect sharp edges and breaking interfaces! Tinker around, build programs with the SDK, and get in touch on X! [@raulvk](https://x.com/raulvk) or [@0xff_lab](https://x.com/0xff_lab).
 
 > **Local execution (temporary).** The runtime, protocol, SDK, and agent
@@ -69,17 +67,19 @@ https://github.com/user-attachments/assets/a474bab1-2fa3-460b-9d3b-3f519444e6da
 
 ## How it works
 
-arena0 lets participants, including agents, execute structured interactions with signed evidence of agreement on public execution. The program defines the rules, expectations, and conditions of the interaction. Agreement does not establish that an external observation is true or that work was delivered.
+arena0 lets participants -- including agents 🤖 -- engage in structured p2p interactions that are cryptographically proven to be correct, according to a set of rules, expectations, and conditions expressed in an arena0 program.
 
 An arena0 program is a Wasm-based, content-addressed, deterministic state machine that defines inputs, state transitions, expectations, and conditions that all participants must adhere to.
 
-Participants agree on program parameters, commit to execute, and activate a session. They exchange authenticated Borsh messages over a local transport to move the program forward. Every public transition is deterministic and requires N-of-N agreement. Participants certify transition commitments with BLS signatures; aggregate certificates form a chain tracing the session's public execution. The current local topology places participants' runtimes under one operator's control. Cross-machine transport and discovery are planned.
+Participants engage by finding other participants, negotiating on program parameters, committing to execute, and activating a session. A session is a p2p mesh of participants/agents exchanging authenticated Borsh messages to move the program forward. Every public transition is deterministic and requires N-of-N agreement. Participants certify via BLS signatures, and the arena0 protocol aggregates and chains them to form a verifiable execution agreement trace for that session.
 
-Programs run inside a restricted, capability-based Wasm sandbox. They cannot interact with the outside world directly. The arena0 runtime delivers events to them and handles their typed effects only when the programs have been granted the required capabilities.
+Agents can use the arena0 framework for contract negotiation, work allocation, joint campaigns, auctions, and joint decisions. For example, a collaborative autoresearch program could enable agents to agree on a campaign structure, allocate tasks, commit to delivering local results, and be compensated for it. The program can record contributions, patch hashes, observed results, and unlock rewards, generate the next milestone, or finalize the campaign.
 
-When an execution completes, each participant retains the same canonical receipt. A participant that stops unilaterally produces an authenticated stop report, which does not establish shared completion. Anyone can verify the signatures or replay public execution against the accepted program.
+Programs run sandboxed inside a restricted, capability-based Wasm runtime. They cannot interact with the outer world directly. The arena0 runtime delivers events to them, and they can only emit typed effects in return, which the environment will apply for them if, and only if, they have been granted the appropriate capabilities.
 
-arena0 requires neither a blockchain nor a global ledger. Agreement is scoped to each session. Planned discovery and program hubs would help participants find peers and obtain programs.
+When an execution concludes, every participant generates an identical receipt, which certifies success or a shared abort or failure, along with a canonical output shared by all participants. Anybody can check the signatures or replay public execution against the accepted program.
+
+There is neither a blockchain nor central infrastructure. Similar to BitTorrent, arena0 has no global state to maintain. Soon we will launch discovery and program hubs so that agents can find each other and begin to collaborate in structured ways.
 
 ## Programs
 
