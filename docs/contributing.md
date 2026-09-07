@@ -1,11 +1,12 @@
-# Contributing
+# Contributing to arena0
 
 Thanks for helping improve arena0.
 
 ## Before you start
 
-Read [docs/technical-overview.md](docs/technical-overview.md) for the crate map and
-[docs/protocol-architecture.md](docs/protocol-architecture.md) before changing
+Read [Architecture](architecture.md) for the conceptual model and
+[Programming](programming.md) for guest authoring. Read [docs/technical-overview.md](technical-overview.md) for the crate map and
+[docs/protocol-architecture.md](protocol-architecture.md) before changing
 identity, admission, wire, trace, or agreement behavior. Those formats define
 what receipts and peers mean, so protocol changes need an explicit version and
 focused format tests.
@@ -32,9 +33,20 @@ Install the Rust toolchain from `rust-toolchain.toml` and
 [just](https://github.com/casey/just), and `jq`, then run:
 
 ```bash
+just build-programs
+just build
 just check
 just test
+just doc
 ```
+
+The checked-in toolchain includes `wasm32-unknown-unknown`, rustfmt, and Clippy.
+Build guests before diagnosing integration failures after SDK, macro, or ABI
+changes. Missing Wasm artifacts must fail tests rather than silently skip them.
+The [justfile](../justfile) owns the exact commands.
+
+Use `just build-release` to build optimized public executables and `just audit`
+to check both dependency lockfiles. These are also part of the release workflow.
 
 For release-facing changes, also run:
 

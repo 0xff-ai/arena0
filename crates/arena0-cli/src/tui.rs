@@ -329,6 +329,7 @@ pub(crate) struct MonitorHost {
 pub(crate) struct MonitorExecution {
     pub(crate) key: MonitorExecutionKey,
     pub(crate) status: ExecStatus,
+    pub(crate) message_schema: Option<BorshSchemaDocument>,
     pub(crate) inspection: Option<ExecutionInspection>,
     pub(crate) view: Option<(u64, View)>,
     pub(crate) trace: Vec<TraceEntry>,
@@ -358,6 +359,7 @@ pub(crate) enum MonitorUpdate {
     Execution {
         key: MonitorExecutionKey,
         status: ExecStatus,
+        message_schema: Option<BorshSchemaDocument>,
         inspection: Option<ExecutionInspection>,
         view: Option<(u64, View)>,
         trace: Vec<TraceEntry>,
@@ -985,6 +987,7 @@ impl MonitorState {
             MonitorUpdate::Execution {
                 key,
                 status,
+                message_schema,
                 inspection,
                 view,
                 trace,
@@ -1035,6 +1038,7 @@ impl MonitorState {
                     MonitorExecution {
                         key,
                         status,
+                        message_schema,
                         inspection,
                         view,
                         trace,
@@ -1338,7 +1342,7 @@ impl ScreenState {
                     .trace
                     .iter()
                     .cloned()
-                    .map(|entry| TraceViewEntry::new(entry, self.config.message_schema.as_ref()))
+                    .map(|entry| TraceViewEntry::new(entry, candidate.message_schema.as_ref()))
                     .collect(),
             );
             if let Some(agreement) = candidate.agreement {

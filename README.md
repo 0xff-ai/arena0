@@ -1,311 +1,172 @@
-# arena0
+<p align="center">
+  <img src="docs/arena0-banner-1200.png" alt="arena0 — overlapping circular waves on warm paper with a bright green center" width="1200">
+</p>
 
-One program. N autonomous agents. One verifiable result.
-Wasm + p2p + state machines
+<p align="center">
+  <strong>Agree on a program. Run it together. Verify what happened.</strong>
+</p>
 
-availability: runtime ✅ protocol ✅ network 🚧
+<p align="center">
+  <strong>Wasm + p2p + state machines</strong>
+</p>
 
-<!-- Suggested wording: Runs locally today. Cross-machine P2P networking is in development. -->
+<p align="center">
+  <a href="#quickstart">Quickstart</a> |
+  <a href="#demos">Demos</a> |
+  <a href="#how-it-works">How it works</a> |
+  <a href="#programs">Programs</a> |
+  <a href="#roadmap">Roadmap</a> |
+  <a href="#documentation">Docs</a> |
+  <a href="docs/contributing.md">Contributing</a>
+</p>
 
-arena0 lets agents agree on a program, run it together, and verify what happened. You can think of it as p2p co-execution, or a form of multi-party compute.
-Each participant runs the same exact deterministic Wasm program, and checks each shared state transition against the other participants. The program is content-addressed and acts like a shared state machine.
+arena0 lets machines and agents express and agree on the rules, expectations,
+and conditions of an interaction, then execute them as a shared program.
+The program determines permitted actions and outcomes through a shared state machine. Participants check each
+public transition and retain signed evidence of the execution.
 
-Use arena0 to coordinate independent agents around shared goals, with strict rules they cannot diverge from without leaving evidence.
-Agents can use arena0 to negotiate terms, allocate work, run auctions, trace autoresearch contributions, make joint decisions, and much more.
+Programs can express contract negotiation, work allocation, joint campaigns, auctions, and joint decisions. For example, a collaborative research program could define a campaign structure, allocate tasks, and record commitments to deliver results. It could record contributions, patch hashes, and observed results, then establish whether a milestone is complete. Compensation would require connected payment infrastructure and evidence from that system.
 
-For example, an auction program defines when bids can be submitted, when they
-are revealed, and how the winner is chosen. Every agent has explicitly committed to being bound by the rules, Each participant checks the
-same public transitions. arena0 is unopinionated about identity, Moving money or holding assets requires an external
-system connected to those rules.
+**⚠️ Very alpha.** Expect sharp edges and breaking interfaces! Tinker around, build programs with the SDK, and get in touch on X! [@raulvk](https://x.com/raulvk) or [@0xff_lab](https://x.com/0xff_lab).
 
-all of this happens in p2p. arena0 offers reusable primitives for cryptography (commit-reveal, joint randomness), choreography (turn-taking), decision-making (voting). These can be composed into new programs easily.
+> **Local execution (temporary).** The runtime, protocol, SDK, and agent
+> interfaces are available. The p2p networking, discovery, and remote program sharing
+> parts require a bit more time.
 
-
-## Install and run
-
-This opens a terminal workspace with bundled example programs:
-
-```sh
-npm install -g @0xff-ai/arena0
-arena0
-```
-
-## arena0 programs
-
-An arena0 program is a shared state machine. It defines the rules of an interaction: who can act, what they can do, and how each action changes the shared state.
-
-Agents are bound by its rules, and must behave exactly how the program dictates. Every interaction is cryptographically authenticated via signatures and legitimized through N-of-N quorum. Divergences are captured, recorded, and can interrupt execution. At the end, all agents generate the same outcome/result, and produce an identical proof and trace of execution that anyone can verify.
-
-arena0 programs are Wasm bytecode. They can be generated on-the-fly and introspected by agents. Two or more agents can come together, negotiate some shared outcome they want to achieve, and collaborately author a program that will bind them to their own terms and will govern the behaviour. Meta-programming is also a possibility: one program can generate and spawn other programs. The possibilities are endless.
-
-## arena0 runtime
-
-The runtime executes programs in a Wasmtime sandbox with bounded memory and
-execution fuel, and a well-defined and versioned WIT interface.
-
-<< add ABI table >>
-
-Each call starts with explicit state in a fresh Wasm instance.
-Public execution can be replayed with the same program to check state changes,
-effects, fuel use, and the final outcome.
-
-## arena0 protocol
-
-<< work through the lifecycle of an execution from negotiation, session to closure, including messages exchanged >>
-
-execution, sessions, etc.
-
-<!-- Suggested wording:
-Before execution, participants agree on the exact program, its parameters, and who is
-participating. A session starts only after all participants have signed the
-same offer and the activation has been durably committed. During execution,
-every shared state transition requires all participants' signatures.
--->
-
-
-## arena0 SDK
-
-All programs and primitives are built with the arena0 SDK, which offers an actor-oriented programming model and syntactic sugar to make the authoring experience straightforward for agents, and easily interpretable by humans.
-
-<!-- Suggested wording:
-The Rust SDK provides the building blocks for arena0 programs. Authors define
-program state, messages, and handlers; the SDK generates the code that connects
-them to the runtime. Reusable primitives handle common patterns such as
-commit-reveal, turn-taking, and voting.
--->
-
-
-
-
-
-
-
-
-
-
-
-arena0 is written in Rust and uses Wasmtime. arena0 programs are WIT components conforming to a well-defined interface.
-
-<!-- Suggested wording:
-arena0 is written in Rust and uses Wasmtime. Programs are Wasm modules that
-implement arena0's guest interface.
-Editorial note: The current interface is a custom ABI, not WIT components.
--->
-
-
-arena0 is made up of several components:
-
-- the arena0 runtime 
-- the arena0 
-
-Arena0 : multiple participants run the same content-addressed Wasm program under deterministic limits, agree on public state transitions, and each produce a portable signed receipt.
-
-
-The runtime and protocol are the first rollout stage. Cross-machine P2P networking is in progress and belongs to the full product vision, but is not a capability of the current public Phase 1 runtime.
-
-Arena0 makes multi-party protocols portable and independently verifiable. Its long-term ambition is neutral infrastructure for coordination and economic activity between autonomous agents: participants inspect and consent to the same exact program, co-execute it across independently operated runtimes, and retain their own evidence.
-
-arena0 runs the same content-addressed Wasm program across two or more participants
-and produces one independently signed receipt per participant. Each participant executes in a
-deterministic sandbox, agrees on every public state transition, and stops at
-the exact edge where replicas diverge.
-
-The launch release is local: one persistent service supervises an `Ensemble`
-of independent logical participants connected by an in-process virtual network. Each
-participant has its own identity, program catalog, SQLite store, Unix socket, and
-receipt. Running those participants on one machine demonstrates deterministic
-agreement and proof construction; it does not provide independent machine
-custody or protection from compromise of that machine.
-
-arena0 is pre-1.0 and has not had an independent security audit.
-
-## Install
-
-The npm package supports macOS 14 or newer on arm64 and Linux x64 with glibc
-2.35 or newer, and installs all three commands. Alpine Linux is not a supported
-prebuilt target.
+## Quickstart
 
 ```console
 npm install --global @0xff-ai/arena0
-arena0 --version
-cargo arena0 --version
+arena0
 ```
 
-- `arena0` opens the local workspace, coordinates runs, operates one participant, and
-  verifies receipts.
-- `arena0d` is the persistent service process behind `arena0 serve`.
-- `cargo-arena0` builds a guest program and embeds its public metadata.
+Choose a program, set its parameters, and assign inputs to humans or built-in
+policies. The terminal workspace follows negotiation, execution, and verification.
 
-Windows is not supported because participant APIs use Unix domain sockets.
+For the agent flow, run `arena0 skill` and follow the
+[MCP connection instructions](docs/getting-started.md#connect-an-mcp-client).
 
-## Quick start
+## Demos
 
-Open the local workspace:
+### Chess
 
-```console
-arena0 --tmp
-```
+Two agents playing chess.
 
-This starts a disposable home for testing, it does not retain identities, executions, or receipts.
+https://github.com/user-attachments/assets/a474bab1-2fa3-460b-9d3b-3f519444e6da
 
-The workspace starts a command-scoped local service when needed. Select a
-program, choose the exact participant count, assign the human-controlled participant, edit
-the program parameters, and choose light verification or full receipt replay.
-Launching replaces the workspace with the focused run screen.
+### Collaborative story writing
 
-The run screen shows:
+Agents contributing to a shared story and illustrating it together.
 
-- `LOCAL`, the participant count, and `1 machine`;
-- negotiation progress, then the activated session, current step, and N-of-N
-  agreement progress;
-- the program's current four-slot view: `Header`, `Agents`, `State`, and
-  `StatusBar`;
-- the canonical public trace, including schema-decoded program messages when
-  available, alongside the redacted participant system-event stream;
-- the current callout and JSON input; and
-- light or full-replay progress for every producer receipt.
+https://github.com/user-attachments/assets/d3a87a56-c68c-4dfd-ad26-0a197876fbb8
 
-A Session does not exist during negotiation. It is formed only after every
-participant has durably activated the same offer.
+## How it works
 
-For a non-interactive proof, bind each participant to a deterministic built-in and
-emit one JSON result. The command starts and stops its own local service unless
-the requested participants are already served:
+arena0 lets participants, including agents, execute structured interactions with signed evidence of agreement on public execution. The program defines the rules, expectations, and conditions of the interaction. Agreement does not establish that an external observation is true or that work was delivered.
 
-```console
-arena0 --json run rock-paper-scissors \
-  --builtin host-01=sample \
-  --builtin host-02=sample \
-  --replay
-```
+An arena0 program is a Wasm-based, content-addressed, deterministic state machine that defines inputs, state transitions, expectations, and conditions that all participants must adhere to.
 
-Bare `arena0` prints help when its standard streams are not terminals. Use
-`arena0 serve` when an API or MCP client needs a persistent service.
+Participants agree on program parameters, commit to execute, and activate a session. They exchange authenticated Borsh messages over a local transport to move the program forward. Every public transition is deterministic and requires N-of-N agreement. Participants certify transition commitments with BLS signatures; aggregate certificates form a chain tracing the session's public execution. The current local topology places participants' runtimes under one operator's control. Cross-machine transport and discovery are planned.
 
-## Launch and monitor
+Programs run inside a restricted, capability-based Wasm sandbox. They cannot interact with the outside world directly. The arena0 runtime delivers events to them and handles their typed effects only when the programs have been granted the required capabilities.
 
-Launch a headless emulation and attach the observatory from another terminal:
+When an execution completes, each participant retains the same canonical receipt. A participant that stops unilaterally produces an authenticated stop report, which does not establish shared completion. Anyone can verify the signatures or replay public execution against the accepted program.
 
-```console
-arena0 launch vickrey-auction --hosts alpha,beta,gamma,delta \
-  --param item=widget --param reserve=10
-arena0 --host alpha monitor
-```
+arena0 requires neither a blockchain nor a global ledger. Agreement is scoped to each session. Planned discovery and program hubs would help participants find peers and obtain programs.
 
-`launch` stays in the foreground while the execution runs. Hosts without a
-`--builtin HOST=STRATEGY` or `--agent HOST=EXECUTABLE` binding wait for answers
-from MCP clients or the monitor. A newly started daemon exposes MCP at
-`http://127.0.0.1:7330/mcp`; choose another loopback port with `--mcp-listen`.
-A reused daemon retains its own listener configuration. Launch stops only a
-daemon it started when the command ends. Use `arena0 serve` first to retain the
-service independently of a launch.
+## Programs
 
-`monitor` discovers the Ensemble through the selected Host socket. Its overview
-shows multiple Host executions and the selected execution's full-width,
-guest-produced textual program view. Activity and public agreement details are
-available in the same observatory. Select a pending callout and press `a` to
-answer that one callout on behalf of its Host; this does not reserve input or
-take ownership of the execution. If an agent answers first, the draft is kept
-and the monitor reports that the callout is no longer pending. Quitting the
-monitor detaches without stopping the daemon or execution.
+The bundled examples cover games, auctions, and work allocation, with reusable primitives for defining your own interactions.
 
-Use `Enter` to inspect the selected execution, `4` for public agreement, and
-`6` for activity. Arrow keys move through the focused view; `Esc` returns to
-the overview. `/` toggles the selected session filter, `Space` freezes the
-display while observation continues, and `q` detaches.
+| Example programs | Primitives |
+| --- | --- |
+| **[Rock-paper-scissors](programs/rock-paper-scissors)** — simultaneous sealed choices | **[Commit-reveal](crates/arena0-primitives/src/commit_reveal.rs)** — commit a choice before disclosing it |
+| **[Vickrey auction](programs/vickrey-auction)** — sealed bids and second-price outcomes | **[Joint randomness](crates/arena0-primitives/src/joint_randomness.rs)** — combine participant contributions |
+| **[Chess](programs/chess)** — legal moves in turn order | **[Turn-taking](crates/arena0-primitives/src/turn_manager.rs)** — define who acts next |
+| **[Contract net](programs/contract-net)** — proposals and work allocation | **[Voting](crates/arena0-primitives/src/ballot.rs)** — collect ballots and apply a threshold |
+| **[Prisoner's Dilemma](programs/prisoner-dilemma)** — repeated choices and scoring | **[Proposal agreement](crates/arena0-primitives/src/agreement.rs)** — manage a proposal lifecycle |
 
-Use the same `ARENA0_HOME` in both terminals. `monitor` requires a terminal and
-does not accept `--tmp` or `--json`; `arena0 watch --json` remains available for
-Host event streams. MCP observations contain safe call metadata, not agent
-identity, prompts, answers, or result bodies. Missing activity history after
-attachment or disconnection is not reconstructed from snapshots.
+Smaller examples: [Cumulative sum](programs/cumulative-sum) · [Sequential counting](programs/sequential-count).
 
-## Connect a local agent
+## Supported today
 
-Coming soon:
+- **Programmable interactions:** define rules, expectations, conditions, and choreography in a multi-party shared state machine.
+- **Content-addressed Wasm programs:** acceptance is bound to the exact program artifact, including its metadata.
+- **Multi-party deterministic execution:** N participants execute, certify, and validate every public state transition.
+- **Capability-oriented sandboxing:** programs receive inputs and request effects through explicit interfaces. The runtime performs permitted effects; programs never execute side effects directly.
+- **Self-describing, strongly typed interfaces:** programs embed JSON and Borsh schemas describing parameters, inputs, results, and callouts. Content addressing covers this metadata. Programs own their encoding and expose views and queries for inspection.
+- **Negotiation and session activation:** participants accept exact terms, such as an auction's item, reserve price, and participant count. Signed tickets record consent to the offer. Execution starts only after every participant validates and durably commits the complete activation agreement.
+- **Signed transition chain:** participants exchange messages and certify public transitions with session-bound BLS keys. Aggregate certificates trace the session from start to end over the current local transport.
+- **Shared and local state:** participants can run private strategies (encoded in local state), as long as they abide by the shared program rules and state.
+- **Universal agreement:** the protocol requires N-of-N agreement at every public state transition, including transitions that record an application-level majority vote.
+- **Signed, replayable evidence:** completed executions produce canonical receipts; unilateral stops produce authenticated stop reports.
+- **Two verification modes:** check signed evidence without the program, or replay public execution with the exact Wasm artifact.
+- **Human and agent interfaces:** participate through interactive input, built-in policies, executable agents, or MCP.
+- **Inspectable execution:** follow program state, messages, agreement, and activity through the tracing subsystem and the TUI.
+- **Composable programs:** bundled examples and SDK primitives cover auctions, work allocation, games, commit-reveal, turn-taking, and voting.
 
-- MCP
+## Roadmap
 
-## Joining the p2p network
+Planned work and research. No release dates yet.
 
-Coming soon.
+- **P2P networking:** connect independently operated participants using Iroh, directly or through relays, with each participant controlling its own runtime and keys.
+- **Discovery and invites:** find agents looking to co-execute a particular program, or share invite locators out-of-band to invite an agent to participate in a session (e.g. RFQ, tender, etc.).
+- **Program sharing:** publish programs for others to discover, inspect, and run.
+- **Suspend, reconnect, and resume:** continue an interrupted session from its recorded state and signed history.
+- **Receipt browser:** publish, inspect, compare, export, and verify receipts in a browser.
+- **Private negotiation:** keep negotiation terms private before a session begins.
+- **Time:** let programs use a source of globally monotonic time.
+- **Agent drivers:** connect agents over HTTP or run them in containers.
+- **External evidence:** let programs check evidence of payments, identity, or completed work supplied by external systems.
+- **Contracts and escrow:** define payment and release conditions in programs, with external systems handling funds.
+- **Partial verification:** use Merkle commitments to verify a portion of the public trace without fetching the whole trace.
+- **Zero-knowledge proofs:** prove valid execution without publishing the full trace or requiring the verifier to replay it.
+- **Trusted Execution Environments:** demarcate critical sections in a program to have them run inside a TEE.
 
+## Wishlists
 
+If any of these excites you, let's chat on X: [@raulvk](https://x.com/raulvk) or [@0xff_lab](https://x.com/0xff_lab)!
 
-## Build a program
+### Programs
 
-The copyable [minimal program](examples/minimal-program) uses released crate
-versions, includes a two-replica scenario test, and fills all four program-view
-slots:
+- **Multi-task allocation:** agents bid for tasks with costs and capacity limits; the program assigns the work and asks winners to accept or decline.
+- **Prisoner's Dilemma and strategy tournaments:** compare agent strategies over repeated matches, with recorded choices, scores, and execution evidence, to assess how different models perform in practical game theory.
+- **Contract negotiation:** exchange offers and counteroffers, then record acceptance of the exact terms and version.
+- **Service agreements:** define the accepted work and conditions for completion, failure, or cancellation, using external evidence where needed.
+- **Sealed voting:** commit ballots before revealing them, count votes under an agreed threshold, and resolve ties deterministically.
+- **Governance proposals:** submit and amend proposals, with votes bound to the exact version being considered.
+- **Trades and settlement:** agree on exchange terms and use external attestations to establish whether the required transfers occurred.
+- **Escrow:** define when funds may be released or returned, with custody and transfers handled by a connected external system.
+- **Incremental data transfer:** exchange data in agreed chunks, verify each delivery, and record acknowledgements before advancing to the next chunk.
 
-```console
-cp -R "$(npm root --global)/@0xff-ai/arena0/examples/minimal-program" my-program
-cd my-program
-cargo test
-cargo arena0 build
-arena0 run target/wasm32-unknown-unknown/release/arena0_minimal_program.wasm \
-  --human host-01 --builtin host-02=sample --replay
-```
+### Primitives
 
-When a run names a local Wasm path, the coordinator imports those exact bytes
-into every selected local participant before admission. This is coordinated local
-import, not remote transfer or implicit acquisition. See
-[Build an arena0 program](docs/build-a-program.md).
+- **Offers and counteroffers:** track revisions, expiry, withdrawal, and acceptance of exact terms.
+- **Sealed ballots:** combine commit-reveal with voting so participants choose before seeing other votes.
+- **Ranked-choice voting:** collect ordered preferences and apply an agreed counting rule.
+- **Weighted voting:** assign explicit voting weights and calculate whether a proposal meets the required threshold.
+- **Round barriers:** collect the required messages before moving to the next phase.
+- **Deadlines and forfeits:** define what happens when an input is late or missing, using an agreed source of time.
+- **Chunk commitments and acknowledgements:** identify data chunks by hash, verify delivery, and track which chunks have been accepted.
+- **Merkle proofs:** verify that a value belongs to a committed dataset without disclosing the whole dataset.
+- **External attestations:** check who signed a claim, what it refers to, and whether the program accepts that signer.
+- **Secret sharing:** split a secret into shares and require a specified number of participants to reconstruct it.
 
-## What verification proves
+## Not a blockchain
 
-Every producer receipt binds the exact program hash, ordered participant set,
-activation, initial state, one aggregate agreement per shared step, fuel,
-replayable randomness, and terminal evidence.
+arena0 is not a blockchain. It does not prescribe concrete systems for real-world
+identity, reputation, value exchange, or asset custody. Programs can connect to
+external infrastructure for those concerns, including blockchains, payment
+networks, identity providers, and application services.
 
-Light verification checks the cryptographic evidence without loading Wasm. It
-returns an authenticated opaque Borsh outcome or the exact stop cause. Full
-verification first performs those checks, then replays every public call using
-the exact program and compares state hashes, effects, fuel, and terminal
-output. The replay result also includes the guest-produced JSON outcome.
+## Documentation
 
-Re-verify every producer of a completed local session by naming its complete
-participant set:
-
-```console
-arena0 verify <session-id> --hosts host-01,host-02 --replay
-```
-
-Without `--hosts`, `arena0 verify` keeps the selected single-participant behavior.
-
-Receipts prove agreement about the program's facts. They do not prove external
-claims such as payment, task completion, identity, or asset custody unless an
-external system separately establishes those facts.
-
-Agent-facing params, callout answers, queries, and outcomes cross the participant
-boundary as JSON. The participant treats deterministic program Borsh values as opaque
-bytes; generated guest code owns conversion to concrete program types.
-
-See the [technical overview](docs/technical-overview.md) for the stack, system
-shape, and ownership map. The [protocol architecture](docs/protocol-architecture.md)
-defines the normative Phase 1 lifecycle and invariants.
-
-## Develop arena0
-
-The checked-in Rust toolchain includes `wasm32-unknown-unknown`, rustfmt, and
-Clippy. The canonical checks are:
-
-```bash
-just build-programs
-just build
-just test
-just check
-just doc
-just audit
-just build-release
-```
-
-The public workspace is layered from cryptography, wire types, program ABI,
-protocol, storage, transport, sandbox, and verification through the SDK,
-runtime, API, clients, service, and three executable boundaries. The guest
-author dependency closure is limited to `arena0-crypto`, `arena0-wire`,
-`arena0-program`, `arena0-protocol`, `arena0-sdk-macros`, `arena0-sdk`, and
-`arena0-primitives`.
+- [Architecture](docs/architecture.md): programs, participants, agreement, effects, and execution evidence.
+- [Getting started](docs/getting-started.md): install, run, connect agents, monitor, and verify.
+- [Programming](docs/programming.md): SDK, state machines, primitives, schemas, and tests.
+- [Contributing](docs/contributing.md): repository setup, development checks, and change rules.
+- [Technical overview](docs/technical-overview.md): implementation structure and ownership.
+- [Protocol architecture](docs/protocol-architecture.md): normative behavior and invariants.
 
 ## License
 

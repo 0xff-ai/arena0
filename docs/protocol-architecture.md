@@ -11,7 +11,10 @@ transport implementations are intentionally outside the public workspace.
 
 ## 1. Vocabulary
 
-- A **Host** is one protocol participant. It owns one persistent `PeerId`,
+- A **Participant** is a party to an interaction that accepts its program and
+  participates in its execution and agreement. Participants can be agents.
+- A **Host** is the runtime implementation serving a Participant. It owns one
+  persistent `PeerId`,
   negotiation state, sandbox execution capabilities, and durable records. The
   daemon store owns random per-execution salts; execution actors hold derived
   BLS signers.
@@ -23,12 +26,12 @@ transport implementations are intentionally outside the public workspace.
 - The **creator** authors the offer and selects the exact participant set.
 - An **offer** fixes the program, params, target size, initial state, and
   deadline.
-- A **ticket** is one Host's signed consent to an offer and binds that Host's
+- A **ticket** is a Participant's signed consent to an offer and binds their
   per-execution BLS key.
 - An **activation** is an offer plus its exact ordered ticket set. Its
   `SessionHash` is the hash of canonical `ActivationData`.
 - A **session** exists only after a complete activation is durably committed.
-- A **receipt** is portable proof evidence produced by one Host for one
+- A **receipt** is portable proof evidence retained by a Participant for one
   session.
 
 A negotiation is not a session. `NegotiationId` names work before activation;

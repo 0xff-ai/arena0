@@ -2,7 +2,7 @@
 
 Status: current Phase 1 orientation
 
-arena0 is a Rust system for deterministic, verifiable program co-execution. Two or more Hosts run the same content-addressed Wasm program, agree on each public state transition, and retain canonical receipts or authenticated unilateral stop reports.
+arena0 is a Rust system for deterministic, verifiable program co-execution. Two or more Participants, who can be agents, run the same content-addressed Wasm program, agree on each public state transition, and retain canonical receipts or authenticated unilateral stop reports.
 
 This document explains the current system as a whole. It is not a second protocol specification. The following sources remain authoritative:
 
@@ -18,6 +18,10 @@ This document explains the current system as a whole. It is not a second protoco
 | Build and verification commands | [`justfile`](../justfile) |
 
 ## System at a glance
+
+Participants are the parties to the interaction. `Host` is the runtime type
+that serves a Participant; `Ensemble` groups those runtime instances. These
+implementation names are used below to explain ownership and local topology.
 
 Phase 1 runs an `Ensemble` of independent logical Hosts in one `arena0d` process. Each Host has its own identity, program catalog, SQLite store, Unix socket, execution actors, and receipts. `LocalTransport` connects the Hosts through bounded in-process channels and the real protocol codec.
 

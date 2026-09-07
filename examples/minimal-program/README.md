@@ -9,18 +9,17 @@ Install the arena0 toolchain, copy this directory, then run:
 ```console
 cargo test
 cargo arena0 build
-arena0 serve
 ```
 
-In another terminal, run the generated Wasm:
+Run `arena0` for the guided flow. For the agent flow, run `arena0 skill`
+and connect your harness to the MCP endpoint:
 
 ```console
-arena0 run target/wasm32-unknown-unknown/release/arena0_minimal_program.wasm \
-  --human default --builtin host-2=sample --replay
+arena0 serve --mcp-listen 127.0.0.1:7330
 ```
 
-The coordinated run imports those exact bytes into every selected local Host
-before admission. It does not transfer the program to remote machines.
+Use `http://127.0.0.1:7330/mcp` and follow the skill instructions to inspect
+programs, start or join an execution, answer inputs, and verify the result.
 
 The program exchanges public choices in participant order. It is deliberately
 small: it demonstrates program-owned DTOs, authenticated message application,

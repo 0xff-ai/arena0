@@ -12,6 +12,7 @@ use arena0_client::api::{
     ActivityData, ActivityResult, ApiErrorCode, ColorDepth, EventData, EventFilter, NextEvent,
     Request, ResponseOk,
 };
+use arena0_client::program::{BorshSchemaDocument, ProgramHash};
 use arena0_client::proto::DaemonClient;
 use arena0_client::protocol::{ExecId, TraceEntry};
 use arena0_home::HostName;
@@ -126,7 +127,6 @@ async fn discover_hosts(
     if selected.is_empty() {
         return Ok(roster);
     }
-    // ponytail: scan small daemon rosters; index names if rosters grow.
     if let Some(missing) = selected
         .iter()
         .find(|name| !roster.iter().any(|host| &host.host == *name))
@@ -142,8 +142,9 @@ async fn host_worker(
     client: DaemonClient,
     handle: TuiHandle,
 ) -> anyhow::Result<()> {
+    let mut message_schemas = BTreeMap::<ProgramHash, Option<BorshSchemaDocument>>::new();
     loop {
-        match run_host_connection(&host, &client, &handle).await {
+        match run_host_connection(&host, &client, &handle, &mut message_schemas).await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 let _ = handle
@@ -163,12 +164,13 @@ async fn run_host_connection(
     host: &MonitorHost,
     client: &DaemonClient,
     handle: &TuiHandle,
+    message_schemas: &mut BTreeMap<ProgramHash, Option<BorshSchemaDocument>>,
 ) -> anyhow::Result<()> {
     let mut subscription = client
         .subscribe(EventFilter::default())
         .await
         .with_context(|| format!("subscribe to Host '{}' events", host.host))?;
-    refresh_host(host, client, handle).await?;
+    refresh_host(host, client, handle, message_schemas).await?;
     let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
     let mut last_seq: Option<u64> = None;
     loop {
@@ -185,9 +187,9 @@ async fn run_host_connection(
                     })).await;
                 }
                 last_seq = Some(frame.seq);
-                observe_event(host, client, handle, frame).await?;
+                observe_event(host, client, handle, frame, message_schemas).await?;
             }
-            _ = ticker.tick() => refresh_host(host, client, handle).await?,
+            _ = ticker.tick() => refresh_host(host, client, handle, message_schemas).await?,
         }
     }
 }
@@ -196,6 +198,7 @@ async fn refresh_host(
     host: &MonitorHost,
     client: &DaemonClient,
     handle: &TuiHandle,
+    message_schemas: &mut BTreeMap<ProgramHash, Option<BorshSchemaDocument>>,
 ) -> anyhow::Result<()> {
     let statuses = match client.call(&Request::ExecList).await? {
         ResponseOk::ExecList(statuses) => statuses,
@@ -205,7 +208,7 @@ async fn refresh_host(
         ),
     };
     for status in statuses {
-        refresh_execution(host, client, handle, status).await?;
+        refresh_execution(host, client, handle, status, message_schemas).await?;
     }
     Ok(())
 }
@@ -218,13 +221,16 @@ async fn refresh_execution(
     client: &DaemonClient,
     handle: &TuiHandle,
     status: arena0_client::api::ExecStatus,
+    message_schemas: &mut BTreeMap<ProgramHash, Option<BorshSchemaDocument>>,
 ) -> anyhow::Result<()> {
     let has_pending = status.pending_callout().is_some();
     let exec_id = status.exec_id;
+    let program_id = status.program_id;
     let key = MonitorExecutionKey {
         host: host.host.clone(),
         exec_id,
     };
+    let message_schema = lookup_message_schema(client, program_id, message_schemas).await;
     let inspection = fetch_inspection(client, exec_id).await;
     let view = fetch_view(client, exec_id, handle.view_width()).await;
     let trace = fetch_trace(client, exec_id, status.step()).await;
@@ -255,6 +261,7 @@ async fn refresh_execution(
         .update(RunUpdate::Monitor(MonitorUpdate::Execution {
             key,
             status,
+            message_schema,
             inspection,
             view,
             trace,
@@ -267,6 +274,31 @@ async fn refresh_execution(
         let _ = fetch_pending_callout(client, host, exec_id, handle).await;
     }
     Ok(())
+}
+
+async fn lookup_message_schema(
+    client: &DaemonClient,
+    program_id: ProgramHash,
+    cache: &mut BTreeMap<ProgramHash, Option<BorshSchemaDocument>>,
+) -> Option<BorshSchemaDocument> {
+    if let Some(schema) = cache.get(&program_id) {
+        return schema.clone();
+    }
+    let Ok(ResponseOk::Program(program)) = client
+        .call(&Request::ProgramGet {
+            program: program_id.to_string(),
+        })
+        .await
+    else {
+        return None;
+    };
+    let schema = program
+        .schema
+        .messages
+        .first()
+        .map(|message| message.borsh.clone());
+    cache.insert(program_id, schema.clone());
+    schema
 }
 
 async fn fetch_pending_callout(
@@ -368,6 +400,7 @@ async fn observe_event(
     client: &DaemonClient,
     handle: &TuiHandle,
     frame: arena0_client::api::EventFrame,
+    message_schemas: &mut BTreeMap<ProgramHash, Option<BorshSchemaDocument>>,
 ) -> anyhow::Result<()> {
     let key = frame.exec_id.map(|exec_id| MonitorExecutionKey {
         host: host.host.clone(),
@@ -447,13 +480,13 @@ async fn observe_event(
                 summary,
             }))
             .await?;
-        refresh_host(host, client, handle).await?;
+        refresh_host(host, client, handle, message_schemas).await?;
     } else if let Some(exec_id) = frame.exec_id {
         // The event is a freshness trigger. Refresh only this execution so a
         // busy Host with many executions does not make the selected view lag.
         match client.call(&Request::ExecStatus { exec_id }).await {
             Ok(ResponseOk::Status(status)) => {
-                refresh_execution(host, client, handle, status).await?;
+                refresh_execution(host, client, handle, status, message_schemas).await?;
             }
             Ok(other) => {
                 mark_execution_gap(

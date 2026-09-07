@@ -1118,6 +1118,7 @@ fn monitor_keeps_same_host_executions_separate() {
                 exec_id: status.exec_id,
             },
             status,
+            message_schema: None,
             inspection: None,
             view: None,
             trace: Vec::new(),
@@ -1168,6 +1169,7 @@ fn monitor_a_opens_only_the_selected_execution_callout() {
                 exec_id: status.exec_id,
             },
             status,
+            message_schema: None,
             inspection: None,
             view: None,
             trace: Vec::new(),
@@ -1249,6 +1251,7 @@ fn monitor_enter_scrolls_detail_and_escape_returns_to_overview() {
             exec_id: status.exec_id,
         },
         status,
+        message_schema: None,
         inspection: None,
         view: None,
         trace: Vec::new(),
@@ -1299,6 +1302,7 @@ fn monitor_session_filter_and_freeze_keep_bounded_display_snapshot() {
                 exec_id: status.exec_id,
             },
             status,
+            message_schema: None,
             inspection: None,
             view: None,
             trace: Vec::new(),
@@ -1343,6 +1347,7 @@ fn monitor_session_filter_and_freeze_keep_bounded_display_snapshot() {
             exec_id: fresh.exec_id,
         },
         status: fresh,
+        message_schema: None,
         inspection: None,
         view: None,
         trace: Vec::new(),
@@ -1376,6 +1381,7 @@ fn monitor_home_then_down_moves_to_second_row_after_last_selection() {
                 exec_id: status.exec_id,
             },
             status,
+            message_schema: None,
             inspection: None,
             view: None,
             trace: Vec::new(),
@@ -1400,7 +1406,7 @@ fn monitor_home_then_down_moves_to_second_row_after_last_selection() {
 }
 
 #[test]
-fn monitor_trace_detail_selects_a_shared_session_step_and_scrolls_inspector() {
+fn monitor_trace_detail_decodes_messages_and_scrolls_inspector() {
     let (actions, _receiver) = mpsc::channel(4);
     let mut state = ScreenState::new_monitor(config(), actions);
     let status = active_status();
@@ -1414,7 +1420,7 @@ fn monitor_trace_detail_selects_a_shared_session_step_and_scrolls_inspector() {
                 from: PeerId([1; 32]),
                 position: step,
                 pre_state: arena0_client::protocol::StateHash([step as u8; 32]),
-                msg: Vec::new(),
+                msg: (step as u32).to_le_bytes().to_vec(),
             },
             effects: Vec::new(),
             pre_state: arena0_client::protocol::StateHash([step as u8; 32]),
@@ -1430,6 +1436,7 @@ fn monitor_trace_detail_selects_a_shared_session_step_and_scrolls_inspector() {
             exec_id,
         },
         status,
+        message_schema: Some(BorshSchemaDocument::for_type::<u32>()),
         inspection: None,
         view: None,
         trace,
@@ -1437,6 +1444,16 @@ fn monitor_trace_detail_selects_a_shared_session_step_and_scrolls_inspector() {
         stale: false,
         gap: None,
     }));
+    let projection = state.monitor_projection().expect("projection");
+    let message = projection
+        .host_trace(&first_host())
+        .last()
+        .and_then(|entry| entry.message.as_ref())
+        .expect("message projection");
+    assert_eq!(
+        message.as_ref().expect("decoded message"),
+        &serde_json::json!(2)
+    );
     state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     state.on_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
     state.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));

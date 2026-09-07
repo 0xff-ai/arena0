@@ -26,24 +26,27 @@ Alpine Linux is not a supported prebuilt target.
 
 ## Quick start
 
-```bash
-arena0 serve
+Run the guided flow:
+
+```console
+arena0
 ```
 
-In another terminal:
+Choose a program, configure Participants and inputs, and follow the execution.
 
-```bash
-arena0 demo --replay
+For the agent flow, read the instructions and start an MCP endpoint:
+
+```console
+arena0 skill
+arena0 serve --mcp-listen 127.0.0.1:7330
 ```
 
-Each Host has its own identity, durable state directory, and Unix socket below
-`$ARENA0_HOME/hosts/`. Use `arena0 serve --hosts default,host-2,host-3` for a
-larger local Ensemble. The service exposes MCP at `http://127.0.0.1:7330/mcp`.
+Connect your agent harness to `http://127.0.0.1:7330/mcp` and follow the skill
+instructions to inspect programs, start or join executions, answer inputs,
+and verify results.
 
-`ARENA0_HOME`, `HOME`, and `ARENA0_SOCKET` must be absolute paths. An explicit
-`--socket` may be cwd-relative when selecting a socket directly.
-
-The Phase 1 package contains no remote discovery or remote program transfer.
+The current release runs Participants locally. Remote discovery and program
+transfer are planned.
 
 ## Build a program
 
@@ -57,12 +60,7 @@ cargo test
 cargo arena0 build
 ```
 
-With `arena0 serve` running in another terminal, execute the resulting Wasm:
-
-```bash
-arena0 run target/wasm32-unknown-unknown/release/arena0_minimal_program.wasm \
-  --human default --builtin host-2=sample --replay
-```
+Use the guided or agent flow above to execute your program.
 
 ## Platform support
 
