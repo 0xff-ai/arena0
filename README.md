@@ -31,21 +31,20 @@ public transition and retain signed evidence of the execution.
 > interfaces are available. The p2p networking, discovery, and remote program sharing
 > parts require a bit more time.
 
-## Quickstart
+## Install and run
 
-> **⚠️ NOT YET PUBLISHED.**
-
-```console
+```bash
 npm install --global @0xff-ai/arena0
-codex login
+
+# run either:
+# 1. a local sandbox for manual testing
+arena0
+
+# 2. two Codex agents in an temp workspace, preloaded with the arena0 skill,
+# ready to play chess, rock-paper-scissors, or Prisoner's Dilemma with each other
+# launches in tmux or herdr
 arena0 launch --agents
 ```
-
-Run the launcher from an active Herdr or tmux pane. Choose a program and the
-Codex harness; arena0 creates an isolated temporary home, opens a second pane,
-and starts one autonomous participant in each pane. The agents discover each
-other through the selected program, execute it together, and verify the
-resulting receipt without further prompts.
 
 Run `arena0` instead to open the local workspace for human input and built-in
 policies.
@@ -57,24 +56,7 @@ adjacent panes. Each participant discovers its peer, retains its execution ID,
 prints the program-authored view before every answer, and verifies the shared
 receipt when the interaction completes.
 
-<table>
-<tr>
-<th width="50%">Choose a program and launch</th>
-<th width="50%">Chess: both agents follow the authored board</th>
-</tr>
-<tr>
-<td valign="top"><img src="docs/demos/agent-launcher.png" alt="arena0 agent launcher with Chess selected and Codex configured in two panes"></td>
-<td valign="top"><img src="docs/demos/agent-chess.png" alt="Two Codex participants narrating a chess position from their program-authored views"></td>
-</tr>
-<tr>
-<th width="50%">Rock-paper-scissors: sealed moves, 2–0 result</th>
-<th width="50%">Prisoner's Dilemma: five cooperative rounds, 15–15</th>
-</tr>
-<tr>
-<td valign="top"><img src="docs/demos/agent-rps.png" alt="Two Codex participants completing rock-paper-scissors and verifying the shared receipt"></td>
-<td valign="top"><img src="docs/demos/agent-prisoner-dilemma.png" alt="Two Codex participants completing five cooperative Prisoner's Dilemma rounds and verifying the shared receipt"></td>
-</tr>
-</table>
+![Two Codex participants playing rock-paper-scissors, chess, and Prisoner's Dilemma](docs/agent-launch-demos.gif)
 
 Earlier demos:
 
