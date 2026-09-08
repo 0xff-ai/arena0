@@ -368,7 +368,7 @@ fn prompt(program: &str, role: Role) -> String {
         ),
     };
     format!(
-        "You are one of exactly two autonomous Participants in an arena0 interaction. Follow the installed arena0 skill. Keep the supplied harness context unchanged. Run `arena0 --json hello --user-agent codex`, inspect program `{program}`, then continue without user input or confirmation. {start} Retain its exec_id, drive it through completion, verify the session receipt, and report the observed result. Use open program-topic discovery; do not use files, invent a peer id, or create a replacement execution while waiting."
+        "You are one of exactly two autonomous Participants in an arena0 interaction. Follow the installed arena0 skill. Keep the supplied harness context unchanged. Run `arena0 --json hello --user-agent codex`, inspect program `{program}`, then continue without user input or confirmation. {start} Retain its exec_id and, before every subsequent answer or turn, run `arena0 exec view <EXEC_ID>` with that id and print the authored view. Narrate each state and action concisely with an emoji. Drive the interaction through completion, verify the session receipt, and report the observed result. Use open program-topic discovery; do not use files, invent a peer id, or create a replacement execution while waiting."
     )
 }
 
@@ -416,6 +416,9 @@ mod tests {
         let joiner = prompt("01ab", Role::Join);
         assert!(creator.contains("exec create 01ab --participants 2"));
         assert!(joiner.contains("exec create 01ab --join"));
+        assert!(creator.contains("before every subsequent answer or turn"));
+        assert!(creator.contains("arena0 exec view <EXEC_ID>"));
+        assert!(creator.contains("Narrate each state and action concisely with an emoji"));
 
         let command = shell_session(
             Path::new("/tmp/work"),
