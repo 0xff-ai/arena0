@@ -19,7 +19,7 @@ use crate::{Program, SandboxError, validation};
 use entropy::Entropy;
 
 const STACK_LIMIT: usize = MAX_WASM_STACK_BYTES;
-const ADMISSION_CACHE_CAPACITY: u64 = 32;
+const PROGRAM_CACHE_CAPACITY: u64 = 32;
 
 /// The export currently being executed. Host imports use this to enforce
 /// capability-specific read/write boundaries in addition to the guest's typed
@@ -246,7 +246,7 @@ impl HostState {
 pub struct WasmtimeEngine {
     pub(crate) engine: Engine,
     pub(crate) profile: ExecutionProfile,
-    pub(crate) admitted: Cache<ProgramHash, Arc<AdmittedProgram>>,
+    pub(crate) loaded: Cache<ProgramHash, Arc<LoadedProgram>>,
     pub(crate) persistent_cache: Option<wasmtime::Cache>,
 }
 
@@ -261,7 +261,7 @@ impl std::fmt::Debug for WasmtimeEngine {
 
 /// Immutable program after metadata, exports, imports, ABI, and module
 /// compilation have all been checked.
-pub struct AdmittedProgram {
+pub struct LoadedProgram {
     pub(crate) engine: Engine,
     pub(crate) module: Module,
     pub(crate) program: Program,
@@ -269,16 +269,16 @@ pub struct AdmittedProgram {
     pub(crate) state_max_bytes: usize,
 }
 
-impl std::fmt::Debug for AdmittedProgram {
+impl std::fmt::Debug for LoadedProgram {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AdmittedProgram")
+        f.debug_struct("LoadedProgram")
             .field("hash", &self.program.hash())
             .field("profile_hash", &self.profile.hash())
             .finish()
     }
 }
 
-impl AdmittedProgram {
+impl LoadedProgram {
     pub(crate) fn validate_shared_state(
         &self,
         shared: &SharedStateBytes,

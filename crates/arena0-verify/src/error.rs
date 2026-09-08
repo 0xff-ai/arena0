@@ -55,7 +55,7 @@ pub enum VerifyError {
         /// Hash committed by the activation.
         attested: ProgramHash,
     },
-    /// The supplied Wasm is over the sandbox's admission bound.
+    /// The supplied Wasm is over the sandbox's program-size bound.
     #[error("program is {actual} bytes; maximum is {max}")]
     ProgramTooLarge { actual: usize, max: u64 },
     /// The replay sandbox rejected a fresh call.

@@ -393,8 +393,8 @@ impl Coordinator {
         );
         let connections = connected?;
         let started = Instant::now();
-        let admitted = progress
-            .during(RunStage::Admission, connections.len(), async {
+        let resolved = progress
+            .during(RunStage::ProgramResolution, connections.len(), async {
                 tokio::select! {
                     result = resolve_program(&connections, &request.program, &progress) => result,
                     reason = wait_for_cancel_reason(&mut signal_received) => {
@@ -405,18 +405,18 @@ impl Coordinator {
             })
             .await;
         record_stage(
-            "admit_program",
+            "resolve_program",
             started,
             connections.len(),
-            admitted.is_ok(),
-            admitted
+            resolved.is_ok(),
+            resolved
                 .as_ref()
                 .ok()
                 .map(|program| program.summary.program_hash),
             None,
             None,
         );
-        let program = admitted?;
+        let program = resolved?;
         let program_id = program.summary.program_hash;
         validate_participant_count(&program.summary, connections.len())?;
 
@@ -757,7 +757,7 @@ impl Coordinator {
         let agreement = compare_evidence(&receipts)?;
         if agreement.program_id != program_id {
             bail!(
-                "receipt program {} disagrees with admitted program {}",
+                "receipt program {} disagrees with selected program {}",
                 agreement.program_id,
                 program_id
             );
@@ -1084,7 +1084,7 @@ async fn resolve_program(
         .collect::<Vec<Option<ProgramDetail>>>();
     while let Some(joined) = jobs.join_next().await {
         progress.advance();
-        let (index, detail) = joined.context("program admission task failed to join")??;
+        let (index, detail) = joined.context("program resolution task failed to join")??;
         resolved[index] = Some(detail);
     }
 
@@ -3004,15 +3004,15 @@ mod tests {
                 }
             })
             .await;
-        let admitted = progress
+        let resolved = progress
             .during(
-                RunStage::Admission,
+                RunStage::ProgramResolution,
                 connections.len(),
                 resolve_program(&connections, "scripted", &progress),
             )
             .await
-            .expect("scripted admission");
-        assert_eq!(admitted.summary.program_hash, program_id);
+            .expect("scripted program resolution");
+        assert_eq!(resolved.summary.program_hash, program_id);
 
         let (_creation_cancel, mut creation_cancelled) = watch::channel(None);
         let participants = progress
@@ -3100,7 +3100,7 @@ mod tests {
             let observations = run_scripted_coordinator(replay).await;
             for stage in [
                 RunStage::Connecting,
-                RunStage::Admission,
+                RunStage::ProgramResolution,
                 RunStage::Negotiation,
                 RunStage::Activation,
                 receipt_stage,

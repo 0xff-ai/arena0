@@ -108,7 +108,7 @@ pub struct CapabilityImport {
 pub struct ImportSemantics {
     /// Wasm module name containing host imports.
     pub host_module: String,
-    /// Imports linked for every admitted program.
+    /// Imports linked for every loaded program.
     pub always_available: Vec<String>,
     /// Capability-gated import bindings.
     pub capability_imports: Vec<CapabilityImport>,

@@ -69,8 +69,8 @@ const REQUIRED_GLOBAL_EXPORTS: &[&str] = &["arena0_abi_version"];
 const GLOBAL_POINTER_THRESHOLD: u32 = 65_536;
 
 /// Validate every embedded JSON Schema document before the sandbox accepts
-/// metadata. Schemas are introspection-only; this is admission hygiene, not a
-/// serialization contract.
+/// metadata. Schemas are introspection-only; this validates program metadata,
+/// not a serialization contract.
 pub(crate) fn validate_program_definition(
     definition: &ProgramDefinition,
 ) -> Result<(), SandboxError> {

@@ -3,7 +3,7 @@
 //!
 //! One private execution actor is the only runtime owner for each
 //! [`arena0_protocol::ExecId`]. It keeps
-//! an admitted Wasm program and live transport capabilities in memory, while
+//! a loaded Wasm program and live transport capabilities in memory, while
 //! every protocol fact is loaded from and committed through its claimed
 //! [`arena0_store::ExecutionStore`].
 //! The protocol reducer and store are intentionally below this crate; this

@@ -42,7 +42,7 @@ impl ProgressMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunStage {
     Connecting,
-    Admission,
+    ProgramResolution,
     Negotiation,
     Activation,
     Execution,
@@ -54,7 +54,7 @@ impl RunStage {
     const fn label(self) -> &'static str {
         match self {
             Self::Connecting => "connecting to Hosts",
-            Self::Admission => "admitting program",
+            Self::ProgramResolution => "resolving program",
             Self::Negotiation => "negotiating execution",
             Self::Activation => "activating session",
             Self::Execution => "waiting for execution",

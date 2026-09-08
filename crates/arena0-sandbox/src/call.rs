@@ -1,7 +1,7 @@
 //! Typed inputs for fresh guest invocations.
 //!
 //! These values deliberately separate shared, local, and read-only calls.
-//! Constructing a call does not allocate a Wasmtime instance. The admitted
+//! Constructing a call does not allocate a Wasmtime instance. The loaded
 //! program creates and destroys one instance when the call is executed.
 
 use arena0_program::{

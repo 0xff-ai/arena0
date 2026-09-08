@@ -1,4 +1,4 @@
-//! Fresh-instance execution operations for admitted programs.
+//! Fresh-instance execution operations for loaded programs.
 
 use arena0_program::{
     CallStatus, InitInput, LocalInput, LocalOutput, OutcomeInput, OutcomeOutput, QueryInput,
@@ -17,7 +17,7 @@ use crate::{
     InitializedState, LocalCallResult, SandboxError, SharedCallResult,
 };
 
-impl super::AdmittedProgram {
+impl super::LoadedProgram {
     /// Execute initialization in a fresh guest instance.
     pub fn initialize(&self, call: InitializeCall) -> Result<InitializedState, SandboxError> {
         let input = call.into_input()?;
@@ -348,7 +348,7 @@ fn ensure_read_only(observations: &CallObservations, operation: &str) -> Result<
     }
 }
 
-impl super::AdmittedProgram {
+impl super::LoadedProgram {
     fn initialized_state(
         &self,
         output: arena0_program::InitializedState,
@@ -387,7 +387,7 @@ mod fresh_runtime_tests {
 
     use super::*;
     use crate::call::{LocalEvent, SharedEvent};
-    use crate::{AdmittedProgram, Program, WasmtimeEngine};
+    use crate::{LoadedProgram, Program, WasmtimeEngine};
     use arena0_program::{
         Capability, JsonBytes, JsonSchemaDocument, LocalStateBytes, ProgramDefinition,
         ProgramMetadata, ProgramSchema, QuerySchema, SharedStateBytes, StateSchema,
@@ -488,7 +488,7 @@ mod fresh_runtime_tests {
         imports: &'a str,
     }
 
-    fn module(spec: ModuleSpec<'_>) -> Arc<AdmittedProgram> {
+    fn module(spec: ModuleSpec<'_>) -> Arc<LoadedProgram> {
         let initialize_data = wat_data(spec.initialize);
         let shared_data = wat_data(spec.shared);
         let shared_second_data = wat_data(spec.shared_second);
@@ -645,7 +645,7 @@ mod fresh_runtime_tests {
         );
         let binary = wat::parse_str(wat).unwrap();
         let program = Program::embed(&binary, &definition).unwrap();
-        WasmtimeEngine::new().unwrap().admit(&program).unwrap()
+        WasmtimeEngine::new().unwrap().load(&program).unwrap()
     }
 
     fn peers() -> (PeerId, Ensemble<Committed>) {
