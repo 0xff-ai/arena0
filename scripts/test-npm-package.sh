@@ -32,8 +32,11 @@ if [[ -n "${ARENA0_NPM_PREFIX:-}" ]]; then
   smoke_root=$ARENA0_NPM_PREFIX
   mkdir -p "$smoke_root"
 else
-  smoke_root=$(mktemp -d "${TMPDIR:-/tmp}/arena0-npm-smoke.XXXXXX")
+  # Leave room for the daemon socket within the Unix socket path limit.
+  smoke_root=$(mktemp -d /tmp/arena0-npm.XXXXXX)
 fi
+# macOS /tmp and caller-provided prefixes may contain symlink ancestors.
+smoke_root=$(cd "$smoke_root" && pwd -P)
 service_pid=
 cleanup() {
   if [[ -n "$service_pid" ]]; then
