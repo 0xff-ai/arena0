@@ -598,7 +598,7 @@ impl ExecutionStatus {
                         != super::pending_id(
                             execution_id,
                             coordinate.record,
-                            coordinate.effect_index as usize,
+                            coordinate.effect_index,
                         )
                 {
                     return Err(ProtocolError::PendingCoordinateMismatch);

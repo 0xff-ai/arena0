@@ -48,6 +48,41 @@ struct PlannedFile {
     state: State,
 }
 
+impl FileSpec {
+    fn plan(self, root: &Path) -> anyhow::Result<PlannedFile> {
+        let path = root.join(self.relative);
+        let existing = read_existing(&path)?;
+        let state = match existing {
+            None => State::Missing,
+            Some(existing) if existing == self.content.as_bytes() => State::Identical,
+            Some(_) => State::Different,
+        };
+        Ok(PlannedFile {
+            spec: self,
+            path,
+            state,
+        })
+    }
+}
+
+impl PlannedFile {
+    fn create_missing(&self) -> io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.path)?;
+        if let Err(error) = output.write_all(self.spec.content.as_bytes()) {
+            drop(output);
+            let _ = fs::remove_file(&self.path);
+            return Err(error);
+        }
+        output.flush()
+    }
+}
+
 impl Target {
     fn options(&self) -> &Options {
         match self {
@@ -205,19 +240,8 @@ fn make_plan(root: &Path, target: &Target, executable: &str) -> anyhow::Result<V
     target
         .files(executable)?
         .into_iter()
-        .map(|spec| plan_generated(root, spec))
+        .map(|spec| spec.plan(root))
         .collect()
-}
-
-fn plan_generated(root: &Path, spec: FileSpec) -> anyhow::Result<PlannedFile> {
-    let path = root.join(spec.relative);
-    let existing = read_existing(&path)?;
-    let state = match existing {
-        None => State::Missing,
-        Some(existing) if existing == spec.content.as_bytes() => State::Identical,
-        Some(_) => State::Different,
-    };
-    Ok(PlannedFile { spec, path, state })
 }
 
 fn read_existing(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
@@ -262,45 +286,25 @@ fn apply(plan: &[PlannedFile]) -> anyhow::Result<()> {
     }
 
     let mut applied = 0usize;
-    for file in plan {
-        match file.state {
-            State::Identical => {}
-            State::Different => unreachable!("conflicts were rejected above"),
-            State::Missing => match create_missing(file) {
-                Ok(()) => {
-                    applied += 1;
-                    println!("Created {}", file.spec.relative);
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    bail!(
-                        "{} appeared during setup; refusing to overwrite it",
-                        file.path.display()
-                    );
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| format!("create {}", file.path.display()));
-                }
-            },
+    for file in plan.iter().filter(|file| file.state == State::Missing) {
+        match file.create_missing() {
+            Ok(()) => {
+                applied += 1;
+                println!("Created {}", file.spec.relative);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                bail!(
+                    "{} appeared during setup; refusing to overwrite it",
+                    file.path.display()
+                );
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("create {}", file.path.display()));
+            }
         }
     }
     println!("Setup complete: applied {applied} change(s).");
     Ok(())
-}
-
-fn create_missing(file: &PlannedFile) -> io::Result<()> {
-    if let Some(parent) = file.path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&file.path)?;
-    if let Err(error) = output.write_all(file.spec.content.as_bytes()) {
-        drop(output);
-        let _ = fs::remove_file(&file.path);
-        return Err(error);
-    }
-    output.flush()
 }
 
 #[cfg(test)]

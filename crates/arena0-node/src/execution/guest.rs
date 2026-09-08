@@ -201,15 +201,10 @@ impl ExecutionActor {
                 "guest signing request program does not match actor program".into(),
             ));
         }
-        let effect_index = usize::try_from(data.effect_index()).map_err(|_| {
-            ExecError::InvalidState(
-                "guest signing request effect coordinate does not fit host index".into(),
-            )
-        })?;
         let expected_pending_id = arena0_protocol::pending_id(
             self.context.exec_id,
             data.private_sequence(),
-            effect_index,
+            data.effect_index(),
         );
         if pending_id != expected_pending_id {
             return Err(ExecError::InvalidState(
@@ -633,6 +628,12 @@ impl ExecutionActor {
                         PrivateEffect::Callout { .. } | PrivateEffect::Sign { .. }
                     )
                 })
+                .map(|index| {
+                    u32::try_from(index).map_err(|_| {
+                        ExecError::InvalidState("private effect coordinate exceeds u32".into())
+                    })
+                })
+                .transpose()?
                 .and_then(|index| {
                     PendingRecord::from_effects(
                         arena0_protocol::pending_id(self.context.exec_id, sequence, index),
