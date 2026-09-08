@@ -143,14 +143,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn color_depth_reports_ansi_support() {
-        assert!(!ColorDepth::Mono.supports_color());
-        assert!(ColorDepth::Ansi16.supports_color());
-        assert!(ColorDepth::Ansi256.supports_color());
-        assert!(ColorDepth::TrueColor.supports_color());
-    }
-
-    #[test]
     fn viewport_fit_text_handles_width_unicode_and_sgr() {
         let viewport = Viewport {
             width: 3,

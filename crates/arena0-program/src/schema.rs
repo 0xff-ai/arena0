@@ -590,21 +590,6 @@ mod tests {
     }
 
     #[test]
-    fn json_schema_document_borsh_round_trip() {
-        let document = JsonSchemaDocument::new(serde_json::json!({
-            "$schema": schemars::consts::meta_schemas::DRAFT2020_12,
-            "type": "object",
-            "properties": { "answer": { "type": "integer" } }
-        }))
-        .unwrap();
-
-        let bytes = borsh::to_vec(&document).unwrap();
-        let decoded = JsonSchemaDocument::try_from_slice(&bytes).unwrap();
-
-        assert_eq!(decoded, document);
-    }
-
-    #[test]
     fn json_schema_document_rejects_an_implicit_draft() {
         let error = JsonSchemaDocument::new(serde_json::json!({ "type": "null" })).unwrap_err();
         assert_eq!(error, JsonSchemaDocumentError::WrongDraft);

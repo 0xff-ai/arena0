@@ -80,20 +80,9 @@ impl Ctx {
         &self,
         exec_id: ExecId,
     ) -> anyhow::Result<Option<(u64, View)>> {
-        let viewport = self.viewport();
-        match self
-            .call_raw(&HostRequest::ExecView {
-                exec: exec_id,
-                width: viewport.width,
-                color: viewport.color,
-            })
-            .await?
-        {
-            Ok(ResponseOk::ExecView { step, view }) => Ok(Some((step, view))),
-            Ok(other) => bail!("unexpected response to exec.view: {other:?}"),
-            Err(error) if error.code == ApiErrorCode::Execution => Ok(None),
-            Err(error) => bail!("{error}"),
-        }
+        self.client
+            .exec_view(&self.host, exec_id, self.viewport())
+            .await
     }
 }
 
@@ -101,7 +90,7 @@ impl Ctx {
 #[command(
     name = "arena0",
     about = "Run local Hosts, inspect executions, and verify receipts",
-    after_help = "Examples:\n  arena0\n  arena0 launch rock-paper-scissors --hosts host-01,host-02\n  arena0 monitor\n  arena0 run rock-paper-scissors --human host-01 --builtin host-02=sample\n  arena0 serve\n  arena0 verify receipt.json\n\nOn a terminal, bare `arena0` opens the local program workspace. `arena0 launch` opens the launcher; adding a program starts a headless emulation; `arena0 monitor` attaches to its daemon. `arena0 serve` keeps Hosts running independently for API and MCP clients.",
+    after_help = "Examples:\n  arena0\n  arena0 launch rock-paper-scissors --hosts host-01,host-02\n  arena0 monitor\n  arena0 run rock-paper-scissors --human host-01 --builtin host-02=sample\n  arena0 serve\n  arena0 verify receipt.json\n\nOn a terminal, bare `arena0` opens the local program workspace. `arena0 launch` opens the launcher; adding a program starts a headless emulation; `arena0 monitor` attaches to its daemon. `arena0 serve` keeps Hosts running independently for CLI and API clients.",
     version
 )]
 struct Cli {
@@ -137,7 +126,7 @@ enum Command {
     },
     /// Start the persistent local Host service.
     Serve(serve::ServeArgs),
-    /// Create project-local harness skill and MCP configuration files.
+    /// Install the project-local skill and harness context settings.
     Setup {
         #[command(subcommand)]
         target: setup::Target,
@@ -155,9 +144,6 @@ enum Command {
         /// Participating Hosts (default: host-01,host-02). Unbound Hosts use external clients.
         #[arg(long, value_delimiter = ',', value_name = "NAME")]
         hosts: Vec<HostName>,
-        /// MCP listener for a newly started daemon; a reused service keeps its listener.
-        #[arg(long, default_value = "127.0.0.1:7330", value_name = "ADDR")]
-        mcp_listen: std::net::SocketAddr,
         /// Bind a deterministic strategy as HOST=STRATEGY.
         #[arg(long, value_name = "HOST=STRATEGY")]
         builtin: Vec<String>,
@@ -432,13 +418,7 @@ fn dispatch_hook(cli: &Cli) -> Option<ExitCode> {
         }
         harness_hook::claude_session_start()
     })();
-    Some(match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("error: {error:#}");
-            ExitCode::FAILURE
-        }
-    })
+    Some(early_exit(result))
 }
 
 /// Dispatch the offline skill before resolving Home, installing tracing, or
@@ -473,17 +453,11 @@ fn dispatch_skill(cli: &Cli) -> Option<ExitCode> {
         Ok(())
     })();
 
-    Some(match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("error: {error:#}");
-            ExitCode::FAILURE
-        }
-    })
+    Some(early_exit(result))
 }
 
 /// Dispatch project-local setup before resolving Home, installing tracing, or
-/// creating a Tokio runtime. Setup only reads and creates files below cwd.
+/// creating a Tokio runtime. Setup reads and updates project files below cwd.
 fn dispatch_setup(cli: &Cli) -> Option<ExitCode> {
     let target = match cli.command.as_ref() {
         Some(Command::Setup { target }) => target,
@@ -495,13 +469,17 @@ fn dispatch_setup(cli: &Cli) -> Option<ExitCode> {
         }
         setup::run(target)
     })();
-    Some(match result {
+    Some(early_exit(result))
+}
+
+fn early_exit(result: anyhow::Result<()>) -> ExitCode {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error:#}");
             ExitCode::FAILURE
         }
-    })
+    }
 }
 
 fn prepare_temporary_home(enabled: bool) -> anyhow::Result<Option<tempfile::TempDir>> {
@@ -694,7 +672,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Launch {
             program,
             hosts,
-            mcp_listen,
             builtin,
             agent,
             param,
@@ -716,16 +693,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             if bindings.len() < 2 {
                 bail!("an emulation requires at least two distinct Hosts");
             }
-            if !mcp_listen.ip().is_loopback() || mcp_listen.port() == 0 {
-                bail!("--mcp-listen requires a loopback address with a nonzero port");
-            }
             let params = answer::assemble_params(&param).map_err(anyhow::Error::msg)?;
-            let daemon = local_daemon::LocalDaemon::connect_or_start_with_mcp(
+            let daemon = local_daemon::LocalDaemon::connect_or_start(
                 bindings
                     .iter()
                     .map(|binding| binding.host.clone())
                     .collect(),
-                mcp_listen,
             )
             .await?;
             let setup = workspace::Setup {
@@ -783,9 +756,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             if !mode.is_json() {
                 eprintln!("preparing headless emulation; attach with `arena0 monitor`");
-                if let Ok(ResponseOk::DaemonInfo(info)) = client.call(&Request::DaemonInfo).await {
-                    eprintln!("MCP endpoint: {}", info.mcp_endpoint);
-                }
                 if bindings
                     .iter()
                     .any(|binding| binding.driver == coordinated::DriverSpec::External)
@@ -1282,7 +1252,16 @@ async fn status(ctx: &Ctx, host_selected: bool) -> anyhow::Result<()> {
         }
     }
     if ctx.mode.is_json() {
-        ui::print_json(&json!({"reachable": true, "daemon": info, "hosts": hosts}));
+        ui::print_json(&json!({
+            "reachable": true,
+            "daemon": {
+                "version": info.version,
+                "abi_version": info.abi_version,
+                "uptime_secs": info.uptime_secs,
+                "socket": info.socket,
+            },
+            "hosts": hosts,
+        }));
     } else {
         let active: usize = hosts.iter().map(|host| host.execs_active).sum();
         println!(
@@ -1292,7 +1271,6 @@ async fn status(ctx: &Ctx, host_selected: bool) -> anyhow::Result<()> {
             info.uptime_secs
         );
         println!("  socket {}", info.socket);
-        println!("  MCP {}", info.mcp_endpoint);
         for status in hosts {
             println!(
                 "  Host {}  peer={}  programs={}  active executions={}",
@@ -2092,17 +2070,7 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["arena0", "--host", "host-01", "status"]).is_ok());
         assert!(Cli::try_parse_from(["arena0", "mcp"]).is_err());
-        assert!(
-            Cli::try_parse_from([
-                "arena0",
-                "serve",
-                "--hosts",
-                "host-01,host-02",
-                "--mcp-listen",
-                "127.0.0.1:7330",
-            ])
-            .is_ok()
-        );
+        assert!(Cli::try_parse_from(["arena0", "serve", "--hosts", "host-01,host-02",]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "arena0", "run", "program", "--human", "host-01", "--human", "host-02",

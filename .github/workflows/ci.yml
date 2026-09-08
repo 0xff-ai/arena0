@@ -30,23 +30,86 @@ jobs:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Select validation scope
+        id: scope
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          base="${BASE_SHA:-}"
+          head=$(git rev-parse HEAD)
+          scope=full
+          range_available=false
+
+          if [[ -z "$base" || -z "$head" ]]; then
+            echo "validation range is unavailable; using full scope" >&2
+          elif ! git cat-file -e "$base^{commit}" 2>/dev/null ||
+               ! git cat-file -e "$head^{commit}" 2>/dev/null; then
+            echo "validation range is not present in the checkout; using full scope" >&2
+          else
+            range_available=true
+            if selected=$(./scripts/check-affected.sh --scope "$base" "$head"); then
+              case "$selected" in
+                docs|cli|daemon|programs|full) scope=$selected ;;
+                *) echo "invalid validation scope '$selected'; using full scope" >&2 ;;
+              esac
+            else
+              echo "validation scope selection failed; using full scope" >&2
+            fi
+          fi
+
+          if [[ "$GITHUB_EVENT_NAME" == push &&
+                "$GITHUB_REF" == refs/heads/main &&
+                "$scope" != docs ]]; then
+            echo "non-documentation main push uses the full integration gate" >&2
+            scope=full
+          fi
+
+          {
+            echo "scope=$scope"
+            echo "base=$base"
+            echo "head=$head"
+            echo "range_available=$range_available"
+          } >> "$GITHUB_OUTPUT"
+          echo "validation scope: $scope" >&2
+
+      - name: Check changed-file whitespace
+        if: ${{ steps.scope.outputs.range_available == 'true' }}
+        env:
+          BASE_SHA: ${{ steps.scope.outputs.base }}
+          HEAD_SHA: ${{ steps.scope.outputs.head }}
+        run: git diff --check "$BASE_SHA" "$HEAD_SHA"
 
       # rust-toolchain.toml is the source of truth: it pins the channel, clippy,
       # rustfmt, and the wasm32 target. `rustup show` installs exactly that set.
       - name: Install toolchain
+        if: ${{ steps.scope.outputs.scope != 'docs' }}
         run: rustup show
 
       - name: Install nextest
+        if: ${{ steps.scope.outputs.scope != 'docs' }}
         uses: taiki-e/install-action@84f5ac3124727fb3d284d4d22ee9ab3654fd09a6 # v2.87.7
         with:
           tool: nextest@0.9.143
 
+      - name: Install just
+        if: ${{ steps.scope.outputs.scope != 'docs' && steps.scope.outputs.scope != 'full' }}
+        uses: taiki-e/install-action@84f5ac3124727fb3d284d4d22ee9ab3654fd09a6 # v2.87.7
+        with:
+          tool: just@1.58.0
+
       - name: Identify compiler
+        if: ${{ steps.scope.outputs.scope != 'docs' }}
         id: compiler
         shell: bash
         run: echo "identity=$(rustc -vV | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
 
       - name: Restore Rust cache
+        if: ${{ steps.scope.outputs.scope != 'docs' }}
         id: rust-cache
         continue-on-error: true
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -65,12 +128,21 @@ jobs:
             rust-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu24-dev-${{ steps.compiler.outputs.identity }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '**/.cargo/config.toml') }}-
             rust-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu24-dev-${{ steps.compiler.outputs.identity }}-
 
+      - name: Check and test focused scope
+        if: ${{ steps.scope.outputs.scope != 'docs' && steps.scope.outputs.scope != 'full' }}
+        env:
+          NEXTEST_PROFILE: ci
+          VALIDATION_SCOPE: ${{ steps.scope.outputs.scope }}
+        run: just "check-$VALIDATION_SCOPE" "test-$VALIDATION_SCOPE"
+
       - name: Format
+        if: ${{ steps.scope.outputs.scope == 'full' }}
         run: |
           cargo fmt --all --check
           cargo fmt --manifest-path programs/Cargo.toml --all --check
 
       - name: Check dependencies
+        if: ${{ steps.scope.outputs.scope == 'full' }}
         run: |
           ./scripts/check-deps.sh
           cargo test --locked -p arena0-sandbox --test engine_version
@@ -78,35 +150,44 @@ jobs:
       # cargo-arena0 builds the guest Wasm and embeds the arena0.metadata
       # section before Clippy so the daemon build has its required inputs.
       - name: Build programs (wasm32)
+        if: ${{ steps.scope.outputs.scope == 'full' }}
         run: cd programs && cargo run --manifest-path ../Cargo.toml -p cargo-arena0 -- build
 
       # Clippy runs at the project's chosen warn level (see [workspace.lints] in
       # Cargo.toml), not -D warnings. The step still fails on deny-by-default
       # correctness lints and compile errors.
       - name: Clippy
+        if: ${{ steps.scope.outputs.scope == 'full' }}
         run: |
           cargo clippy --locked --workspace --all-targets
           cargo clippy --locked --manifest-path programs/Cargo.toml --all-targets
 
       - name: Documentation
+        if: ${{ steps.scope.outputs.scope == 'full' }}
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --workspace --no-deps --all-features --lib
 
       - name: Test (host workspace)
+        if: ${{ steps.scope.outputs.scope == 'full' }}
         # The integration suites each boot several daemon/node processes; the
         # nextest `integration` test group (see .config/nextest.toml) runs them
         # a few at a time so the runner isn't oversubscribed and
         # the timing windows don't blow. Unit tests run in parallel.
         run: cargo nextest run --locked --workspace --profile ci
 
+      - name: Test (SDK and primitives doc-tests)
+        if: ${{ steps.scope.outputs.scope == 'full' }}
+        run: cargo test --locked --doc -p arena0-primitives -p arena0-sdk
+
       # programs/ is excluded from the root workspace; run its in-process unit
       # tests separately.
       - name: Test (programs)
+        if: ${{ steps.scope.outputs.scope == 'full' }}
         run: cargo nextest run --locked --manifest-path programs/Cargo.toml --profile ci
 
       - name: Save Rust cache
-        if: ${{ !cancelled() && steps.rust-cache.outputs.cache-primary-key != '' }}
+        if: ${{ !cancelled() && steps.scope.outputs.scope != 'docs' && steps.rust-cache.outputs.cache-primary-key != '' }}
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:

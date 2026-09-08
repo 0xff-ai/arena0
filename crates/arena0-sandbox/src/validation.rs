@@ -309,48 +309,89 @@ mod tests {
     use wasmtime::{Engine, Instance, Module, Store};
 
     /// A stub module exporting every required arena0 symbol, optionally omitting
-    /// one export so each required-export check stays isolated.
-    fn stub_module(
-        with_writer: bool,
-        with_outcome: bool,
-        with_view: bool,
-        valid_alloc: bool,
-    ) -> Module {
-        let alloc = if valid_alloc {
-            r#"(func (export "arena0_alloc") (param i32) (result i32) i32.const 0)"#
-        } else {
-            r#"(func (export "arena0_alloc") (result i32) i32.const 0)"#
+    /// one export or assigning one required function a deliberately invalid
+    /// signature. The fixture lists the ABI independently from the production
+    /// validation table so a missing table entry cannot make these tests pass.
+    fn stub_module(omitted: Option<&str>, invalid_signature: Option<&str>) -> Module {
+        let export = |name: &str, valid: &'static str, invalid: &'static str| -> &'static str {
+            if omitted == Some(name) {
+                ""
+            } else if invalid_signature == Some(name) {
+                invalid
+            } else {
+                valid
+            }
         };
-        let outcome = if with_outcome {
-            r#"(func (export "arena0_outcome") (param i32 i32) (result i64) i64.const 0)"#
-        } else {
+        let abi_version = if omitted == Some("arena0_abi_version") {
             ""
-        };
-        let writer = if with_writer {
-            r#"(func (export "arena0_writer") (param i32 i32) (result i64) i64.const 0)"#
         } else {
-            ""
+            r#"(global (export "arena0_abi_version") i32 (i32.const 20))"#
         };
-        let view = if with_view {
-            r#"(func (export "arena0_view") (param i32 i32) (result i64) i64.const 0)"#
-        } else {
-            ""
-        };
+        let alloc = export(
+            "arena0_alloc",
+            r#"(func (export "arena0_alloc") (param i32) (result i32) i32.const 0)"#,
+            r#"(func (export "arena0_alloc") (result i32) i32.const 0)"#,
+        );
+        let dealloc = export(
+            "arena0_dealloc",
+            r#"(func (export "arena0_dealloc") (param i32 i32))"#,
+            r#"(func (export "arena0_dealloc") (param i32))"#,
+        );
+        let initialize = export(
+            "arena0_initialize",
+            r#"(func (export "arena0_initialize") (param i32 i32) (result i64) i64.const 0)"#,
+            r#"(func (export "arena0_initialize") (param i32) (result i64) i64.const 0)"#,
+        );
+        let shared = export(
+            "arena0_shared",
+            r#"(func (export "arena0_shared") (param i32 i32) (result i64) i64.const 0)"#,
+            r#"(func (export "arena0_shared") (param i32) (result i64) i64.const 0)"#,
+        );
+        let local = export(
+            "arena0_local",
+            r#"(func (export "arena0_local") (param i32 i32) (result i64) i64.const 0)"#,
+            r#"(func (export "arena0_local") (param i32) (result i64) i64.const 0)"#,
+        );
+        let writer = export(
+            "arena0_writer",
+            r#"(func (export "arena0_writer") (param i32 i32) (result i64) i64.const 0)"#,
+            r#"(func (export "arena0_writer") (param i32) (result i64) i64.const 0)"#,
+        );
+        let outcome = export(
+            "arena0_outcome",
+            r#"(func (export "arena0_outcome") (param i32 i32) (result i64) i64.const 0)"#,
+            r#"(func (export "arena0_outcome") (param i32) (result i64) i64.const 0)"#,
+        );
+        let query = export(
+            "arena0_query",
+            r#"(func (export "arena0_query") (param i32 i32) (result i64) i64.const 0)"#,
+            r#"(func (export "arena0_query") (param i32) (result i64) i64.const 0)"#,
+        );
+        let view = export(
+            "arena0_view",
+            r#"(func (export "arena0_view") (param i32 i32) (result i64) i64.const 0)"#,
+            r#"(func (export "arena0_view") (param i32) (result i64) i64.const 0)"#,
+        );
+        let metadata = export(
+            "arena0_metadata",
+            r#"(func (export "arena0_metadata") (result i64) i64.const 0)"#,
+            r#"(func (export "arena0_metadata") (param i32) (result i64) i64.const 0)"#,
+        );
         let wat = format!(
             r#"
             (module
               (memory (export "memory") 1)
-              (global (export "arena0_abi_version") i32 (i32.const 20))
+              {abi_version}
               {alloc}
-              (func (export "arena0_dealloc") (param i32 i32))
-              (func (export "arena0_initialize") (param i32 i32) (result i64) i64.const 0)
-              (func (export "arena0_shared") (param i32 i32) (result i64) i64.const 0)
-              (func (export "arena0_local") (param i32 i32) (result i64) i64.const 0)
+              {dealloc}
+              {initialize}
+              {shared}
+              {local}
               {writer}
               {outcome}
-              (func (export "arena0_query") (param i32 i32) (result i64) i64.const 0)
+              {query}
               {view}
-              (func (export "arena0_metadata") (result i64) i64.const 0))
+              {metadata})
             "#
         );
         Module::new(&Engine::default(), wat).unwrap()
@@ -358,34 +399,52 @@ mod tests {
 
     #[test]
     fn validate_exports_accepts_full_required_set() {
-        assert!(validate_exports(&stub_module(true, true, true, true)).is_ok());
+        assert!(validate_exports(&stub_module(None, None)).is_ok());
     }
 
     #[test]
-    fn validate_exports_requires_arena0_writer() {
-        let err = validate_exports(&stub_module(false, true, true, true)).unwrap_err();
-        assert!(matches!(err, SandboxError::MissingExport(name) if name == "arena0_writer"));
+    fn validate_exports_requires_each_independent_required_export() {
+        for name in [
+            "arena0_alloc",
+            "arena0_dealloc",
+            "arena0_initialize",
+            "arena0_shared",
+            "arena0_local",
+            "arena0_writer",
+            "arena0_outcome",
+            "arena0_query",
+            "arena0_view",
+            "arena0_metadata",
+            "arena0_abi_version",
+        ] {
+            let err = validate_exports(&stub_module(Some(name), None)).unwrap_err();
+            assert!(
+                matches!(&err, SandboxError::MissingExport(actual) if actual == name),
+                "unexpected omission error for {name}: {err}"
+            );
+        }
     }
 
     #[test]
-    fn validate_exports_requires_arena0_outcome() {
-        let err = validate_exports(&stub_module(true, false, true, true)).unwrap_err();
-        assert!(matches!(err, SandboxError::MissingExport(name) if name == "arena0_outcome"));
-    }
-
-    #[test]
-    fn validate_exports_requires_arena0_view() {
-        let err = validate_exports(&stub_module(true, true, false, true)).unwrap_err();
-        assert!(matches!(err, SandboxError::MissingExport(name) if name == "arena0_view"));
-    }
-
-    #[test]
-    fn validate_exports_rejects_wrong_signature() {
-        let err = validate_exports(&stub_module(true, true, true, false)).unwrap_err();
-        assert!(matches!(
-            err,
-            SandboxError::InvalidExportSignature { name, .. } if name == "arena0_alloc"
-        ));
+    fn validate_exports_rejects_each_independent_required_function_signature() {
+        for name in [
+            "arena0_alloc",
+            "arena0_dealloc",
+            "arena0_initialize",
+            "arena0_shared",
+            "arena0_local",
+            "arena0_writer",
+            "arena0_outcome",
+            "arena0_query",
+            "arena0_view",
+            "arena0_metadata",
+        ] {
+            let err = validate_exports(&stub_module(None, Some(name))).unwrap_err();
+            assert!(
+                matches!(&err, SandboxError::InvalidExportSignature { name: actual, .. } if actual == name),
+                "unexpected signature error for {name}: {err}"
+            );
+        }
     }
 
     #[test]

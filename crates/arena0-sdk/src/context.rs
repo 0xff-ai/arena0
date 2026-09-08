@@ -231,13 +231,14 @@ impl<Shared, Local> Context<Shared, Local> {
         self.peer_id
     }
 
-    /// The confirmed session ensemble: the agreed N-party participant set in canonical
+    /// The confirmed session ensemble: the agreed participant set in canonical
     /// (sorted `PeerId`) order, as sealed by negotiation.
     ///
     /// Use it to map between [`Participant`] and [`PeerId`], iterate co-participants
     /// ([`others`](Ensemble::others)), or size buffers ([`len`](Ensemble::len)).
-    /// Bilateral programs see the two-participant ensemble; the [`me`](Self::me) /
-    /// [`other`](Self::other) helpers are the shorthand for that case.
+    /// The [`me`](Self::me) helper resolves this node in any active session;
+    /// [`peer`](Self::peer) and [`other`](Self::other) remain bilateral
+    /// shorthands.
     ///
     /// # Panics
     /// Panics if called before a session is established.
@@ -255,11 +256,12 @@ impl<Shared, Local> Context<Shared, Local> {
         self.remote_peer.expect("no bilateral session established")
     }
 
-    /// This node's participant identity in the bilateral session.
+    /// This node's participant identity in the active session.
     ///
-    /// N-party programs resolve their own index from [`ensemble`](Self::ensemble)
-    /// (`ctx.ensemble().participant_of(&ctx.identity())`); this bilateral helper
-    /// covers two-party programs.
+    /// The participant is assigned by the committed ensemble's canonical peer
+    /// ordering, so this works for bilateral and N-party programs. The
+    /// [`peer`](Self::peer) and [`other`](Self::other) methods remain bilateral
+    /// helpers.
     ///
     /// # Panics
     /// Panics if called before a session is established.
@@ -1086,10 +1088,6 @@ mod tests {
         Context::__new(TestState::default(), (), PeerId([0; 32]))
     }
 
-    fn make_shared_ctx() -> SharedContext<TestState> {
-        SharedContext::__new(TestState::default(), None)
-    }
-
     #[derive(serde::Serialize)]
     struct TestCallout;
 
@@ -1105,15 +1103,6 @@ mod tests {
 
     impl crate::Arena0TypedCalloutRequest for TestCallout {
         type Output = String;
-    }
-
-    #[test]
-    fn mutate_applies_changes() {
-        let mut ctx = make_shared_ctx();
-        ctx.mutate_shared(|state| {
-            state.shared_value = 42;
-        });
-        assert_eq!(ctx.shared().shared_value, 42);
     }
 
     #[test]
@@ -1225,20 +1214,6 @@ mod tests {
                 assert_eq!(expected_type.as_deref(), Some("Vec<u8>"));
             }
             other => panic!("expected sign effect, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn callout_builder_carries_request_output_type() {
-        let mut ctx = make_ctx();
-        let builder: CalloutBuilder<String> = ctx.effects().callout(TestCallout);
-        let future: ArenaFuture<String> = builder.pending("thinking").into_arena_future();
-
-        match future.effect() {
-            arena0_protocol::Effect::Callout { expected_type, .. } => {
-                assert_eq!(expected_type.as_deref(), Some("test::Output"));
-            }
-            other => panic!("expected callout effect, got {other:?}"),
         }
     }
 

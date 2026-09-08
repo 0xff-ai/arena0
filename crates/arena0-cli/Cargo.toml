@@ -35,6 +35,9 @@ tempfile = { workspace = true }
 unicode-width = { workspace = true }
 rand = { workspace = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

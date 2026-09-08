@@ -113,7 +113,6 @@ pub struct TestHarness<P: Program> {
     shared: P::Shared,
     local: P::Local,
     peer_id: PeerId,
-    peer: Option<PeerId>,
     /// The confirmed session ensemble, captured at `SessionStarted` so the program
     /// can read it via `ctx.ensemble()` on later steps, mirroring the runtime.
     committed_ensemble: Option<Ensemble>,
@@ -157,7 +156,6 @@ impl<P: Program> TestHarness<P> {
             shared,
             local,
             peer_id,
-            peer: None,
             committed_ensemble: None,
             step: 0,
             trace: Vec::new(),
@@ -176,7 +174,6 @@ impl<P: Program> TestHarness<P> {
             shared: P::Shared::default(),
             local: P::Local::default(),
             peer_id,
-            peer: None,
             committed_ensemble: None,
             step: 0,
             trace: Vec::new(),
@@ -274,8 +271,7 @@ impl<P: Program> TestHarness<P> {
         TraceEntry::verify_chain(trace)?;
         let mut harness = Self::with_peer_id(peer_id, params);
         for expected in trace {
-            let participant = harness.participant_for_replay_event(&expected.event);
-            let actual = harness.dispatch_replay_event(&expected.event)?;
+            let (actual, participant) = harness.dispatch_replay_event(&expected.event)?;
             let actual = actual.step();
             compare_replayed_step(expected, actual, participant)?;
         }
@@ -351,11 +347,14 @@ impl<P: Program> TestHarness<P> {
         let shared = std::mem::take(&mut self.shared);
         let local = std::mem::take(&mut self.local);
         let mut ctx = Context::__new(shared, local, self.peer_id);
-        if let Some(ref peer) = self.peer {
-            ctx.__set_participant(Participant::of(&self.peer_id, peer));
-            ctx.__set_remote_peer(*peer);
-        }
         if let Some(ref ensemble) = self.committed_ensemble {
+            let participant = ensemble
+                .participant_of(&self.peer_id)
+                .expect("local peer is not in the committed ensemble");
+            ctx.__set_participant(participant);
+            if let Some(peer) = self.peer() {
+                ctx.__set_remote_peer(*peer);
+            }
             ctx.__set_committed_ensemble(ensemble.clone());
         }
         drain_effects();
@@ -624,36 +623,26 @@ impl<P: Program> TestHarness<P> {
         }
     }
 
-    fn participant_for_replay_event(&self, event: &PublicEvent) -> Option<Participant> {
-        match event {
-            PublicEvent::SessionStarted { ensemble } => ensemble
-                .others(&self.peer_id)
-                .next()
-                .map(|peer| Participant::of(&peer, &self.peer_id)),
-            PublicEvent::MessageReceived { from: peer, .. } => {
-                Some(Participant::of(peer, &self.peer_id))
-            }
-        }
-    }
-
     fn dispatch_replay_event(
         &mut self,
         event: &PublicEvent,
-    ) -> Result<HandlerResult, DivergenceDiagnostic>
+    ) -> Result<(HandlerResult, Option<Participant>), DivergenceDiagnostic>
     where
         P::Message: BorshDeserialize + BorshSerialize,
     {
         Ok(match event.clone() {
             PublicEvent::SessionStarted { ensemble } => {
-                self.peer = ensemble.others(&self.peer_id).next();
-                self.committed_ensemble = Some(ensemble.clone());
-                let result = self.run_shared(
-                    Event::SessionStarted {
-                        ensemble: ensemble.clone(),
-                    },
-                    |ctx| P::on_session_started(ctx, &ensemble),
-                );
-                self.with_react(result)
+                if !ensemble.contains(&self.peer_id) {
+                    return Err(DivergenceDiagnostic::new_at(
+                        self.step,
+                        DivergenceKind::EventMismatch,
+                        "event.ensemble",
+                        format!("ensemble containing replay participant {}", self.peer_id),
+                        ensemble.peers(),
+                    )
+                    .with_event(event_name(event)));
+                }
+                (self.start_session(ensemble), None)
             }
             PublicEvent::MessageReceived {
                 message_id,
@@ -662,6 +651,20 @@ impl<P: Program> TestHarness<P> {
                 pre_state,
                 msg,
             } => {
+                let participant = self
+                    .committed_ensemble
+                    .as_ref()
+                    .and_then(|ensemble| ensemble.participant_of(&from))
+                    .ok_or_else(|| {
+                        DivergenceDiagnostic::new_at(
+                            self.step,
+                            DivergenceKind::EventMismatch,
+                            "event.from",
+                            "sender in the committed ensemble",
+                            from,
+                        )
+                        .with_event(event_name(event))
+                    })?;
                 let decoded: P::Message = borsh::from_slice(&msg).map_err(|err| {
                     DivergenceDiagnostic::new_at(
                         self.step,
@@ -681,21 +684,34 @@ impl<P: Program> TestHarness<P> {
                         pre_state,
                         msg,
                     },
-                    |ctx| {
-                        let from = ctx.participant_for_peer(from);
-                        P::on_message(ctx, from, decoded)
-                    },
+                    |ctx| P::on_message(ctx, participant, decoded),
                 );
-                self.with_react(result)
+                (self.with_react(result), Some(participant))
             }
         })
     }
 
-    fn session_started_with_ensemble(&mut self, ensemble: Ensemble) -> HandlerResult
+    /// Start a native harness with an explicit committed participant ensemble.
+    ///
+    /// [`Harness::session_started`](super::harness::Harness::session_started)
+    /// remains the convenient bilateral entry point. N-party program tests use
+    /// this method when the full participant set is part of the behavior under
+    /// test.
+    ///
+    /// # Panics
+    /// Panics if the ensemble does not contain this harness's local peer.
+    pub fn session_started_with_ensemble(&mut self, ensemble: Ensemble) -> HandlerResult
     where
         P::Message: BorshSerialize,
     {
-        self.peer = ensemble.others(&self.peer_id).next();
+        assert!(
+            ensemble.contains(&self.peer_id),
+            "local peer is not in the committed ensemble"
+        );
+        self.start_session(ensemble)
+    }
+
+    fn start_session(&mut self, ensemble: Ensemble) -> HandlerResult {
         self.committed_ensemble = Some(ensemble.clone());
         let result = self.run_shared(
             Event::SessionStarted {
@@ -724,7 +740,11 @@ where
     }
 
     fn peer(&self) -> Option<&PeerId> {
-        self.peer.as_ref()
+        let ensemble = self.committed_ensemble.as_ref()?;
+        if ensemble.len() != 2 {
+            return None;
+        }
+        ensemble.peers().iter().find(|peer| **peer != self.peer_id)
     }
 
     fn session_started(&mut self, peer: PeerId) -> HandlerResult {

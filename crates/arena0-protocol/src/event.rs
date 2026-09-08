@@ -9,10 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io;
 
-use crate::bounded::{
-    read_bytes as read_bounded_bytes, read_string as read_bounded_string,
-    write_bytes as serialize_bounded_bytes,
-};
+use crate::bounded::{read_bytes as read_bounded_bytes, write_bytes as serialize_bounded_bytes};
 use crate::{Ensemble, MessageId, PeerId, StateHash, TimerPayload};
 
 /// An event dispatched to a program during a single execution step.
@@ -154,7 +151,7 @@ impl<M: BorshSerialize> BorshSerialize for Event<M> {
             Self::TimerFired => BorshSerialize::serialize(&EVENT_TIMER_FIRED, writer),
             Self::TypedTimerFired { timer } => {
                 BorshSerialize::serialize(&EVENT_TYPED_TIMER_FIRED, writer)?;
-                serialize_timer(writer, timer)
+                timer.serialize_bounded(writer)
             }
             Self::Signed {
                 signature,
@@ -198,7 +195,7 @@ impl<M: BorshDeserialize> BorshDeserialize for Event<M> {
             }),
             EVENT_TIMER_FIRED => Ok(Self::TimerFired),
             EVENT_TYPED_TIMER_FIRED => Ok(Self::TypedTimerFired {
-                timer: read_bounded_timer(reader)?,
+                timer: TimerPayload::deserialize_bounded(reader)?,
             }),
             EVENT_SIGNED => Ok(Self::Signed {
                 signature: read_bounded_bytes(
@@ -467,7 +464,7 @@ impl BorshSerialize for PrivateEvent {
             Self::TimerFired => BorshSerialize::serialize(&PRIVATE_EVENT_TIMER_FIRED, writer),
             Self::TypedTimerFired { timer } => {
                 BorshSerialize::serialize(&PRIVATE_EVENT_TYPED_TIMER_FIRED, writer)?;
-                serialize_timer(writer, timer)
+                timer.serialize_bounded(writer)
             }
             Self::Signed {
                 signature,
@@ -501,7 +498,7 @@ impl BorshDeserialize for PrivateEvent {
             }),
             PRIVATE_EVENT_TIMER_FIRED => Ok(Self::TimerFired),
             PRIVATE_EVENT_TYPED_TIMER_FIRED => Ok(Self::TypedTimerFired {
-                timer: read_bounded_timer(reader)?,
+                timer: TimerPayload::deserialize_bounded(reader)?,
             }),
             PRIVATE_EVENT_SIGNED => Ok(Self::Signed {
                 signature: read_bounded_bytes(
@@ -518,36 +515,6 @@ impl BorshDeserialize for PrivateEvent {
             )),
         }
     }
-}
-
-fn serialize_timer<W: borsh::io::Write>(writer: &mut W, timer: &TimerPayload) -> io::Result<()> {
-    serialize_bounded_bytes(
-        writer,
-        timer.type_name.as_bytes(),
-        crate::execution::MAX_TERMINAL_REASON_BYTES,
-        "timer type name",
-    )?;
-    serialize_bounded_bytes(
-        writer,
-        &timer.data,
-        crate::execution::MAX_TIMER_PAYLOAD_BYTES,
-        "timer data",
-    )
-}
-
-fn read_bounded_timer<R: borsh::io::Read>(reader: &mut R) -> io::Result<TimerPayload> {
-    Ok(TimerPayload {
-        type_name: read_bounded_string(
-            reader,
-            crate::execution::MAX_TERMINAL_REASON_BYTES,
-            "timer type name",
-        )?,
-        data: read_bounded_bytes(
-            reader,
-            crate::execution::MAX_TIMER_PAYLOAD_BYTES,
-            "timer data",
-        )?,
-    })
 }
 
 #[cfg(test)]
@@ -625,5 +592,67 @@ mod tests {
         assert!(borsh::from_slice::<PublicEvent>(&[0xff]).is_err());
         assert!(borsh::from_slice::<PrivateEvent>(&[0xff]).is_err());
         assert!(borsh::from_slice::<Event<Vec<u8>>>(&[0xff]).is_err());
+    }
+
+    #[test]
+    fn typed_timer_encodings_keep_bounds_across_events_and_effects() {
+        let timer = TimerPayload {
+            type_name: "T".into(),
+            data: vec![7],
+        };
+        let event = PrivateEvent::TypedTimerFired {
+            timer: timer.clone(),
+        };
+        let event_bytes = [2, 1, 0, 0, 0, b'T', 1, 0, 0, 0, 7];
+        assert_eq!(borsh::to_vec(&event).unwrap(), event_bytes);
+        assert_eq!(PrivateEvent::try_from_slice(&event_bytes).unwrap(), event);
+
+        let effect = crate::PrivateEffect::SetTimer {
+            delay_ms: 0,
+            timer: Some(timer.clone()),
+        };
+        let mut effect_bytes = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        effect_bytes.extend_from_slice(&event_bytes[1..]);
+        assert_eq!(borsh::to_vec(&effect).unwrap(), effect_bytes);
+        assert_eq!(
+            crate::PrivateEffect::try_from_slice(&effect_bytes).unwrap(),
+            effect
+        );
+        let raw_effect = crate::Effect::SetTimer {
+            delay_ms: 0,
+            timer: Some(timer),
+        };
+        effect_bytes[0] = 4;
+        assert_eq!(borsh::to_vec(&raw_effect).unwrap(), effect_bytes);
+        assert_eq!(
+            crate::Effect::try_from_slice(&effect_bytes).unwrap(),
+            raw_effect
+        );
+
+        let oversized_name = u32::try_from(crate::execution::MAX_TERMINAL_REASON_BYTES + 1)
+            .unwrap()
+            .to_le_bytes();
+        let oversized_data = u32::try_from(crate::execution::MAX_TIMER_PAYLOAD_BYTES + 1)
+            .unwrap()
+            .to_le_bytes();
+        for payload in [
+            oversized_name.to_vec(),
+            [0u32.to_le_bytes(), oversized_data].concat(),
+        ] {
+            let mut encoded = vec![2];
+            encoded.extend_from_slice(&payload);
+            assert_eq!(
+                PrivateEvent::try_from_slice(&encoded).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            encoded = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+            encoded.extend_from_slice(&payload);
+            assert_eq!(
+                crate::PrivateEffect::try_from_slice(&encoded)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
     }
 }

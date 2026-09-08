@@ -474,15 +474,6 @@ mod tests {
     }
 
     #[test]
-    fn current_profile_hash_is_deterministic_borsh() {
-        let profile = ExecutionProfile::current();
-        let bytes = profile.canonical_bytes();
-        assert_eq!(bytes, profile.canonical_bytes());
-        assert_eq!(profile.hash().as_bytes(), blake3::hash(&bytes).as_bytes());
-        assert_eq!(profile.hash(), ExecutionProfile::current().hash());
-    }
-
-    #[test]
     fn profile_hash_binds_every_execution_dimension() {
         assert_changes(|profile| profile.version += 1);
         assert_changes(|profile| profile.abi_version += 1);

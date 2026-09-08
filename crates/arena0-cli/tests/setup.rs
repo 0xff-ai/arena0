@@ -83,6 +83,10 @@ fn setup_binds_the_real_binary_in_both_skills_and_claude_hook() {
         codex.stderr
     );
     let codex_skill_path = project.path().join(".agents/skills/arena0/SKILL.md");
+    assert!(
+        !project.path().join(".codex/config.toml").exists(),
+        "fresh Codex setup created an MCP registration file"
+    );
     let codex_skill = fs::read_to_string(&codex_skill_path).expect("Codex skill");
     assert!(!codex_skill.contains("<!-- arena0:executable -->"));
     assert!(codex_skill.contains("For every shell command below, replace only"));
@@ -113,6 +117,10 @@ fn setup_binds_the_real_binary_in_both_skills_and_claude_hook() {
     let claude_skill_path = project.path().join(".claude/skills/arena0/SKILL.md");
     let claude_skill = fs::read_to_string(&claude_skill_path).expect("Claude skill");
     assert_eq!(claude_skill, codex_skill);
+    assert!(
+        !project.path().join(".mcp.json").exists(),
+        "fresh Claude setup created an MCP registration file"
+    );
 
     let settings: Value = serde_json::from_str(
         &fs::read_to_string(project.path().join(".claude/settings.json")).expect("Claude settings"),
@@ -217,5 +225,163 @@ fn setup_binds_the_real_binary_in_both_skills_and_claude_hook() {
     assert_eq!(
         fs::read(&settings_path).expect("Claude settings after repeat"),
         settings_before
+    );
+}
+
+#[test]
+fn setup_leaves_existing_codex_config_untouched() {
+    let binaries = tempfile::tempdir().expect("temporary binary directory");
+    let binary = copy_binary(binaries.path());
+    let project = tempfile::tempdir().expect("temporary project");
+    let config_path = project.path().join(".codex/config.toml");
+    fs::create_dir_all(config_path.parent().expect("config parent")).expect("config directory");
+    let original = "answer = 'keep'\n\n[mcp_servers.arena0]\nurl = 'http://127.0.0.1:7330/mcp'\n\n[mcp_servers.other]\ncommand = 'keep-tool'\n";
+    fs::write(&config_path, original).expect("Codex config");
+
+    let applied = setup(&binary, project.path(), "codex", "--yes");
+    assert!(
+        applied.status.success(),
+        "Codex setup failed: {:?}",
+        applied.stderr
+    );
+    let stdout = String::from_utf8(applied.stdout).expect("setup output is UTF-8");
+    assert!(!stdout.contains("127.0.0.1:7330"));
+    assert!(!stdout.contains("keep-tool"));
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("Codex config after setup"),
+        original
+    );
+}
+
+#[test]
+fn setup_leaves_existing_claude_mcp_config_untouched() {
+    let binaries = tempfile::tempdir().expect("temporary binary directory");
+    let binary = copy_binary(binaries.path());
+    let project = tempfile::tempdir().expect("temporary project");
+    let config_path = project.path().join(".mcp.json");
+    let original = r#"{
+  "other": {"keep": true},
+  "mcpServers": {
+    "arena0": {"type": "http", "url": "http://127.0.0.1:7330/mcp"},
+    "other-tool": {"command": "keep-tool"}
+  }
+}
+"#;
+    fs::write(&config_path, original).expect("Claude MCP config");
+
+    let applied = setup(&binary, project.path(), "claude", "--yes");
+    assert!(
+        applied.status.success(),
+        "Claude setup failed: {:?}",
+        applied.stderr
+    );
+    let stdout = String::from_utf8(applied.stdout).expect("setup output is UTF-8");
+    assert!(!stdout.contains("127.0.0.1:7330"));
+    assert!(!stdout.contains("keep-tool"));
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("Claude MCP config after setup"),
+        original
+    );
+}
+
+#[test]
+fn setup_rejects_old_and_custom_skill_content_without_mutation() {
+    let binaries = tempfile::tempdir().expect("temporary binary directory");
+    let binary = copy_binary(binaries.path());
+    let old_project = tempfile::tempdir().expect("temporary old-skill project");
+    let old_skill_path = old_project.path().join(".agents/skills/arena0/SKILL.md");
+    fs::create_dir_all(old_skill_path.parent().expect("skill parent")).expect("skill directory");
+    let old_skill = "---\nname: arena0\n---\n\n# Participate through arena0\n\nUse MCP when the interaction needs open discovery.\n";
+    fs::write(&old_skill_path, old_skill).expect("old skill");
+
+    let old_conflict = setup(&binary, old_project.path(), "codex", "--yes");
+    assert!(
+        !old_conflict.status.success(),
+        "old skill conflict was reported as success"
+    );
+    assert_eq!(
+        fs::read_to_string(&old_skill_path).expect("old skill after conflict"),
+        old_skill
+    );
+
+    let custom_project = tempfile::tempdir().expect("temporary custom-skill project");
+    let installed = setup(&binary, custom_project.path(), "codex", "--yes");
+    assert!(
+        installed.status.success(),
+        "fresh setup failed: {installed:?}"
+    );
+    let custom_skill_path = custom_project.path().join(".agents/skills/arena0/SKILL.md");
+    let custom_skill = format!(
+        "{}\ncustom edit\n",
+        fs::read_to_string(&custom_skill_path).expect("installed skill")
+    );
+    fs::write(&custom_skill_path, &custom_skill).expect("custom skill edit");
+    let custom_conflict = setup(&binary, custom_project.path(), "codex", "--yes");
+    assert!(
+        !custom_conflict.status.success(),
+        "custom skill conflict was reported as success"
+    );
+    assert_eq!(
+        fs::read_to_string(&custom_skill_path).expect("custom skill after conflict"),
+        custom_skill
+    );
+}
+
+#[test]
+fn setup_rejects_a_conflicting_symlinked_skill_without_mutating_its_target() {
+    let binaries = tempfile::tempdir().expect("temporary binary directory");
+    let binary = copy_binary(binaries.path());
+    let project = tempfile::tempdir().expect("temporary project");
+    let skill_path = project.path().join(".agents/skills/arena0/SKILL.md");
+    fs::create_dir_all(skill_path.parent().expect("skill parent")).expect("skill directory");
+    let target = project.path().join("custom-skill.md");
+    let original = "custom skill target\n";
+    fs::write(&target, original).expect("custom skill target");
+    std::os::unix::fs::symlink(&target, &skill_path).expect("skill symlink");
+
+    let result = setup(&binary, project.path(), "codex", "--yes");
+    assert!(
+        !result.status.success(),
+        "symlinked skill conflict was reported as success"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).expect("skill target after conflict"),
+        original
+    );
+    assert!(
+        fs::symlink_metadata(&skill_path)
+            .expect("skill symlink metadata")
+            .file_type()
+            .is_symlink(),
+        "setup replaced the skill symlink"
+    );
+}
+
+#[test]
+fn setup_rejects_a_custom_claude_hook_without_creating_a_partial_setup() {
+    let binaries = tempfile::tempdir().expect("temporary binary directory");
+    let binary = copy_binary(binaries.path());
+    let project = tempfile::tempdir().expect("temporary project");
+    let settings_path = project.path().join(".claude/settings.json");
+    fs::create_dir_all(settings_path.parent().expect("settings parent"))
+        .expect("settings directory");
+    let original = "{\"hooks\":{\"SessionStart\":[]}}\n";
+    fs::write(&settings_path, original).expect("custom settings");
+
+    let result = setup(&binary, project.path(), "claude", "--yes");
+    assert!(
+        !result.status.success(),
+        "custom hook conflict was reported as success"
+    );
+    assert_eq!(
+        fs::read_to_string(&settings_path).expect("settings after conflict"),
+        original
+    );
+    assert!(
+        !project
+            .path()
+            .join(".claude/skills/arena0/SKILL.md")
+            .exists(),
+        "setup created a partial skill while the hook conflicted"
     );
 }

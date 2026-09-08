@@ -162,7 +162,6 @@ fn empty_monitor_discovers_participants_and_renders_their_views() {
             view: Some((3, View::new().state("Current board"))),
             trace: Vec::new(),
             observed_at: epoch_seconds(),
-            stale: false,
             gap: None,
         }));
     }
@@ -215,7 +214,6 @@ fn scoped_status_treats_step_divergence_and_missing_hosts_consistently() {
         status: later,
     });
     assert_eq!(state.scoped_run_state(), ScopedRunState::Mixed);
-    assert_eq!(state.scoped_status_label(), "mixed");
     assert_eq!(state.scoped_status_label(), "mixed");
 }
 
@@ -1174,7 +1172,6 @@ fn monitor_keeps_same_host_executions_separate() {
             view: None,
             trace: Vec::new(),
             observed_at: 7,
-            stale: false,
             gap: None,
         }));
     }
@@ -1205,6 +1202,184 @@ fn monitor_keeps_same_host_executions_separate() {
 }
 
 #[test]
+fn monitor_host_wide_gap_keeps_a_fresh_execution_fresh() {
+    let (actions, _receiver) = mpsc::channel(4);
+    let mut state = ScreenState::new_monitor(config(), actions);
+    let host = first_host();
+    let status = active_status();
+    let key = MonitorExecutionKey {
+        host: host.clone(),
+        exec_id: status.exec_id,
+    };
+    state.apply(RunUpdate::Monitor(MonitorUpdate::Execution {
+        key: key.clone(),
+        status,
+        inspection: None,
+        view: None,
+        trace: Vec::new(),
+        observed_at: 1,
+        gap: None,
+    }));
+    state.apply(RunUpdate::Monitor(MonitorUpdate::Gap {
+        host: Some(host.clone()),
+        exec_id: None,
+        summary: "event gap; snapshot refreshed".to_owned(),
+    }));
+
+    let monitor = state.monitor.as_ref().expect("monitor state");
+    let execution = monitor.executions.get(&key).expect("execution state");
+    assert_eq!(execution.gap, None);
+    assert_eq!(
+        monitor.connections.get(&host).map(String::as_str),
+        Some("event gap; snapshot refreshed")
+    );
+}
+
+#[test]
+fn monitor_partial_refresh_retains_values_until_a_fresh_snapshot_arrives() {
+    let (actions, _receiver) = mpsc::channel(4);
+    let mut state = ScreenState::new_monitor(config(), actions);
+    let host = first_host();
+    let initial_inspection = inspection(1, 1);
+    let initial_status = initial_inspection.status.clone();
+    let key = MonitorExecutionKey {
+        host: host.clone(),
+        exec_id: initial_status.exec_id,
+    };
+    let initial_view = Some((3, View::new().state("before")));
+    state.apply(RunUpdate::Monitor(MonitorUpdate::Execution {
+        key: key.clone(),
+        status: initial_status.clone(),
+        inspection: Some(initial_inspection.clone()),
+        view: initial_view.clone(),
+        trace: Vec::new(),
+        observed_at: 10,
+        gap: None,
+    }));
+    state.apply(RunUpdate::Monitor(MonitorUpdate::Execution {
+        key: key.clone(),
+        status: initial_status.clone(),
+        inspection: None,
+        view: None,
+        trace: Vec::new(),
+        observed_at: 20,
+        gap: Some("inspection unavailable".to_owned()),
+    }));
+
+    {
+        let monitor = state.monitor.as_ref().expect("monitor state");
+        let partial = monitor.executions.get(&key).expect("partial execution");
+        assert_eq!(partial.inspection.as_ref(), Some(&initial_inspection));
+        assert_eq!(partial.view, initial_view);
+        assert_eq!(partial.observed_at, 10);
+        assert_eq!(partial.gap.as_deref(), Some("inspection unavailable"));
+    }
+
+    state.apply(RunUpdate::Monitor(MonitorUpdate::Execution {
+        key: key.clone(),
+        status: initial_status,
+        inspection: None,
+        view: None,
+        trace: Vec::new(),
+        observed_at: 30,
+        gap: None,
+    }));
+    let monitor = state.monitor.as_ref().expect("monitor state");
+    let fresh = monitor.executions.get(&key).expect("fresh execution");
+    assert_eq!(fresh.inspection, None);
+    assert_eq!(fresh.view, None);
+    assert_eq!(fresh.trace, Vec::new());
+    assert_eq!(fresh.observed_at, 30);
+    assert_eq!(fresh.gap, None);
+}
+
+#[test]
+fn monitor_execution_and_connection_gaps_mark_their_domain() {
+    let (actions, _receiver) = mpsc::channel(4);
+    let mut state = ScreenState::new_monitor(config(), actions);
+    let host = first_host();
+    let other_host: HostName = "host-02".parse().expect("valid Host name");
+    let mut first_status = active_status();
+    first_status.exec_id = ExecId([1; 32]);
+    let mut second_status = active_status();
+    second_status.exec_id = ExecId([2; 32]);
+    let mut other_status = active_status();
+    other_status.exec_id = ExecId([3; 32]);
+
+    for (host, status) in [
+        (host.clone(), first_status.clone()),
+        (host.clone(), second_status.clone()),
+        (other_host.clone(), other_status.clone()),
+    ] {
+        state.apply(RunUpdate::Monitor(MonitorUpdate::Execution {
+            key: MonitorExecutionKey {
+                host,
+                exec_id: status.exec_id,
+            },
+            status,
+            inspection: None,
+            view: None,
+            trace: Vec::new(),
+            observed_at: 1,
+            gap: None,
+        }));
+    }
+
+    state.apply(RunUpdate::Monitor(MonitorUpdate::Gap {
+        host: Some(host.clone()),
+        exec_id: Some(first_status.exec_id),
+        summary: "execution refresh unavailable".to_owned(),
+    }));
+    {
+        let monitor = state.monitor.as_ref().expect("monitor state");
+        assert_eq!(
+            monitor.executions[&MonitorExecutionKey {
+                host: host.clone(),
+                exec_id: first_status.exec_id,
+            }]
+                .gap
+                .as_deref(),
+            Some("execution refresh unavailable")
+        );
+        assert_eq!(
+            monitor.executions[&MonitorExecutionKey {
+                host: host.clone(),
+                exec_id: second_status.exec_id,
+            }]
+                .gap,
+            None
+        );
+    }
+
+    state.apply(RunUpdate::Monitor(MonitorUpdate::Connection {
+        host: host.clone(),
+        message: "disconnected".to_owned(),
+        stale: true,
+    }));
+    let monitor = state.monitor.as_ref().expect("monitor state");
+    for exec_id in [first_status.exec_id, second_status.exec_id] {
+        assert_eq!(
+            monitor.executions[&MonitorExecutionKey {
+                host: host.clone(),
+                exec_id,
+            }]
+                .gap
+                .as_deref(),
+            Some("disconnected")
+        );
+    }
+    assert_eq!(
+        monitor.executions[&MonitorExecutionKey {
+            host: other_host,
+            exec_id: other_status.exec_id,
+        }]
+            .gap,
+        None
+    );
+    assert_eq!(monitor.connections[&host], "disconnected");
+}
+
+#[test]
 fn monitor_a_opens_only_the_selected_execution_callout() {
     let (actions, _receiver) = mpsc::channel(4);
     let mut state = ScreenState::new_monitor(config(), actions);
@@ -1224,7 +1399,6 @@ fn monitor_a_opens_only_the_selected_execution_callout() {
             view: None,
             trace: Vec::new(),
             observed_at: 1,
-            stale: false,
             gap: None,
         }));
     }
@@ -1305,7 +1479,6 @@ fn monitor_enter_scrolls_detail_and_escape_returns_to_overview() {
         view: None,
         trace: Vec::new(),
         observed_at: 1,
-        stale: false,
         gap: None,
     }));
 
@@ -1366,7 +1539,6 @@ fn monitor_session_filter_and_freeze_keep_bounded_display_snapshot() {
             view: None,
             trace: Vec::new(),
             observed_at: 1,
-            stale: false,
             gap: None,
         }));
     }
@@ -1410,7 +1582,6 @@ fn monitor_session_filter_and_freeze_keep_bounded_display_snapshot() {
         view: None,
         trace: Vec::new(),
         observed_at: 2,
-        stale: false,
         gap: None,
     }));
     assert_eq!(
@@ -1443,7 +1614,6 @@ fn monitor_home_then_down_moves_to_second_row_after_last_selection() {
             view: None,
             trace: Vec::new(),
             observed_at: 1,
-            stale: false,
             gap: None,
         }));
     }
@@ -1501,7 +1671,6 @@ fn monitor_trace_detail_decodes_messages_and_scrolls_inspector() {
         view: None,
         trace,
         observed_at: 1,
-        stale: false,
         gap: None,
     }));
     let projection = state.monitor_projection().expect("projection");
@@ -1695,7 +1864,6 @@ fn monitor_tab_reaches_the_answer_pane_and_returns_in_order() {
         view: None,
         trace: Vec::new(),
         observed_at: 1,
-        stale: false,
         gap: None,
     }));
     state.apply(RunUpdate::Monitor(MonitorUpdate::Callout {

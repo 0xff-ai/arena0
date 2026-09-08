@@ -2,7 +2,6 @@
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use arena0_home::HostName;
 use clap::Parser;
@@ -12,30 +11,19 @@ use clap::Parser;
     name = "arena0d",
     about = "Serve one or more local arena0 Hosts",
     version,
-    after_help = "Each Host has its own state directory and identity; the daemon owns one shared Unix socket.\nThe default starts two Hosts (`host-01` and `host-02`) on one virtual local network.\nAgents connect once to the Streamable HTTP endpoint at /mcp and name a Host in\neach tool call. Set ARENA0_MCP_TOKEN to require one bearer token for the endpoint.\nPress Ctrl-C to stop the process, or run `arena0 stop --host <host>` for a\ngraceful coordinated shutdown of the local ensemble."
+    after_help = "Each Host has its own state directory and identity; the daemon owns one shared Unix socket.\nThe default starts two Hosts (`host-01` and `host-02`) on one virtual local network.\nAgents use the local CLI and bind their participant with `arena0 hello`.\nPress Ctrl-C to stop the process, or run `arena0 stop` for a\ngraceful coordinated shutdown of the local ensemble."
 )]
 struct Args {
     /// Host names to supervise. Repeat for each participant; defaults to two
     /// distinct Hosts so the local bilateral path works immediately.
     #[arg(long = "host", value_name = "NAME", conflicts_with = "no_hosts")]
     hosts: Vec<HostName>,
-    /// Start with no Hosts; MCP clients can open Hosts on demand.
+    /// Start with no Hosts; clients can open Hosts on demand.
     #[arg(long, conflicts_with = "hosts")]
     no_hosts: bool,
     /// Do not mint identities or import the built-in programs on first boot.
     #[arg(long)]
     no_bootstrap: bool,
-    /// Loopback address for the MCP Streamable HTTP endpoint.
-    #[arg(long, env = "ARENA0_MCP_LISTEN", default_value = "127.0.0.1:7330")]
-    mcp_listen: SocketAddr,
-    /// Lifetime of per-Host MCP JWTs, in seconds.
-    #[arg(
-        long = "mcp-access-token-lifetime-secs",
-        env = "ARENA0_MCP_ACCESS_TOKEN_LIFETIME_SECS",
-        default_value_t = 86_400,
-        value_parser = clap::value_parser!(u64).range(1..)
-    )]
-    mcp_access_token_lifetime_secs: u64,
 }
 
 #[tokio::main]
@@ -57,23 +45,20 @@ async fn main() -> anyhow::Result<()> {
         args.hosts
     };
     let bearer_token = std::env::var("ARENA0_MCP_TOKEN").ok();
-    let mcp = arena0_daemon::McpConfig::with_access_token_lifetime(
-        args.mcp_listen,
-        bearer_token,
-        Duration::from_secs(args.mcp_access_token_lifetime_secs),
-    )?;
+    let mcp = arena0_daemon::McpConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)), bearer_token)?;
     arena0_daemon::run(names, !args.no_bootstrap, mcp).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory as _;
 
     #[test]
-    fn no_hosts_selects_an_empty_initial_topology() {
-        let args = Args::try_parse_from(["arena0d", "--no-hosts"]).expect("parse no-hosts");
-        assert!(args.no_hosts);
-        assert!(args.hosts.is_empty());
+    fn help_does_not_advertise_the_internal_adapter() {
+        let help = Args::command().render_long_help().to_string();
+        assert!(help.contains("arena0 hello"));
+        assert!(!help.to_ascii_lowercase().contains("mcp"));
     }
 
     #[test]
@@ -82,12 +67,13 @@ mod tests {
     }
 
     #[test]
-    fn token_lifetime_accepts_positive_seconds_and_rejects_zero() {
-        let args = Args::try_parse_from(["arena0d", "--mcp-access-token-lifetime-secs", "7200"])
-            .expect("parse token lifetime");
-        assert_eq!(args.mcp_access_token_lifetime_secs, 7200);
-        assert!(
-            Args::try_parse_from(["arena0d", "--mcp-access-token-lifetime-secs", "0"]).is_err()
-        );
+    fn internal_mcp_options_are_rejected() {
+        for (option, value) in [
+            ("--mcp-listen", "127.0.0.1:7330"),
+            ("--mcp-access-token-lifetime-secs", "7200"),
+        ] {
+            let error = Args::try_parse_from(["arena0d", option, value]).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
     }
 }

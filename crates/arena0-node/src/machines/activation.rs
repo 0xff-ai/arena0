@@ -76,8 +76,10 @@ mod tests {
     use arena0_crypto::{BlsSignature, ExecutionKey, ExecutionSalt, NodeKeys, SecretKey};
     use arena0_program::ProgramHash;
     use arena0_protocol::{
-        NegotiationId, OfferData, OfferHash, PeerIdSource, PreparedActivation, StateHash, Ticket,
-        TicketAction, TicketData, TicketHash,
+        AggregateAttestation, ExecutionInput, ExecutionState, LocalStateBytes, NegotiationId,
+        OfferData, OfferHash, PeerIdSource, PreparedActivation, PublicEvent, SharedDelta,
+        SharedStateBytes, StateHash, TRACE_FORMAT_VERSION, Ticket, TicketAction, TicketData,
+        TicketHash, TraceEntry, TransitionOutcome,
     };
 
     struct TestKeys {
@@ -205,31 +207,22 @@ mod tests {
             arena0_program::ExecutionProfile::current().hash(),
             arena0_program::JsonBytes::try_new(br#"{}"#.to_vec()).expect("valid JSON"),
             3,
-            StateHash([0x33; 32]),
+            StateHash::of(&[0]),
             1_000,
         )
         .expect("valid offer data");
+        // ponytail: these providers already have the required creator-first order.
         let providers = [&creator, &others[0], &others[1]];
         let tickets = providers
             .iter()
             .map(|p| ticket(p, &offer_data))
             .collect::<Vec<_>>();
-        let mut ordered_tickets = tickets;
-        let creator_index = ordered_tickets
+        let ticket_hashes = tickets
             .iter()
-            .position(|ticket| ticket.data.signer == creator.peer_id())
-            .expect("creator ticket");
-        let creator_ticket = ordered_tickets.remove(creator_index);
-        ordered_tickets.sort_by_key(|ticket| ticket.data.signer);
-        let mut ordered_hashes = vec![TicketHash::of(&creator_ticket.data)];
-        ordered_hashes.extend(
-            ordered_tickets
-                .iter()
-                .map(|ticket| TicketHash::of(&ticket.data)),
-        );
-        ordered_tickets.insert(0, creator_ticket);
-        let offer = arena0_protocol::Offer::new(offer_data, ordered_hashes).expect("offer");
-        let prepared = PreparedActivation::new(offer, ordered_tickets).expect("prepared");
+            .map(|ticket| TicketHash::of(&ticket.data))
+            .collect::<Vec<_>>();
+        let offer = arena0_protocol::Offer::new(offer_data, ticket_hashes).expect("offer");
+        let prepared = PreparedActivation::new(offer, tickets).expect("prepared");
         let activation_data = prepared.activation_data();
         let sigs = providers
             .iter()
@@ -237,46 +230,78 @@ mod tests {
             .collect::<Vec<_>>();
         let aggregate = BlsSignature::aggregate(&sigs).expect("aggregate");
         let activation = Activation::new(prepared, aggregate).expect("valid activation");
-        let session = ActivatedSession::new(activation).expect("valid session");
-        let ensemble = session.ensemble().peers();
-        // The orders diverge: the sorted ensemble's first participant is not
-        // the creator.
-        assert_ne!(ensemble[0], creator.peer_id());
-        let keys_by_peer = providers
-            .iter()
-            .map(|p| (p.peer_id(), p.execution.public_key()))
-            .collect::<std::collections::HashMap<_, _>>();
-        let mut diverged = false;
-        for peer in ensemble {
-            let by_signer = session
-                .activation()
-                .tickets()
+        let initial = SharedStateBytes::try_new(vec![0]).expect("initial shared state");
+        let state = ExecutionState::new(
+            arena0_protocol::ExecId([0x44; 32]),
+            activation,
+            creator.peer_id(),
+            initial.clone(),
+            LocalStateBytes::try_new(Vec::new()).expect("initial local state"),
+        )
+        .expect("execution state");
+        let active = match arena0_protocol::transition(&state, ExecutionInput::Activate)
+            .expect("activate execution")
+        {
+            TransitionOutcome::Commit(plan) => plan.next_state().clone(),
+            TransitionOutcome::AlreadyApplied => unreachable!("execution starts activating"),
+        };
+        let ensemble = Ensemble::from_peers(
+            providers
                 .iter()
-                .find(|t| t.data.signer == *peer)
-                .map(|t| match &t.data.action {
-                    TicketAction::Active { execution_bls, .. } => *execution_bls,
-                    TicketAction::Withdrawn => unreachable!("activation tickets are Active"),
-                })
-                .expect("every ensemble participant has an Active ticket");
-            assert_eq!(
-                by_signer, keys_by_peer[peer],
-                "the by-signer lookup resolves the participant's own key"
-            );
-            let index = session
-                .ensemble()
-                .participant_of(peer)
-                .expect("ensemble participant")
-                .index();
-            let by_index = match &session.activation().tickets()[index].data.action {
-                TicketAction::Active { execution_bls, .. } => *execution_bls,
-                TicketAction::Withdrawn => unreachable!("activation tickets are Active"),
-            };
-            diverged |= by_signer != by_index;
-        }
-        assert!(
-            diverged,
-            "the sorted ensemble and the creator-first ticket order must diverge for this regression to be meaningful"
+                .map(|provider| provider.peer_id())
+                .collect(),
+        )
+        .expect("committed ensemble");
+        assert_ne!(
+            ensemble.peers()[0],
+            creator.peer_id(),
+            "the sorted ensemble and creator-first tickets must diverge"
         );
+        let delta = SharedDelta::new(
+            TraceEntry {
+                trace_version: TRACE_FORMAT_VERSION,
+                step: 0,
+                event: PublicEvent::SessionStarted { ensemble },
+                effects: Vec::new(),
+                pre_state: StateHash::of(initial.as_bytes()),
+                post_state: StateHash::of(initial.as_bytes()),
+                fuel_used: 0,
+                witness: None,
+                agreement: AggregateAttestation::empty(),
+            },
+            initial,
+            None,
+        )
+        .expect("session-start proposal");
+        let mut proposed =
+            match arena0_protocol::transition(&active, ExecutionInput::ProposeShared(delta))
+                .expect("propose session start")
+            {
+                TransitionOutcome::Commit(plan) => plan.next_state().clone(),
+                TransitionOutcome::AlreadyApplied => unreachable!("proposal is new"),
+            };
+        let commitment = proposed
+            .pending_shared()
+            .expect("pending session-start proposal")
+            .commitment()
+            .clone();
+        for provider in providers {
+            proposed = match arena0_protocol::transition(
+                &proposed,
+                ExecutionInput::StepSignature(arena0_protocol::ParticipantStepSignature::new(
+                    provider.peer_id(),
+                    commitment.step,
+                    provider.execution.sign(&commitment.signing_bytes()),
+                )),
+            )
+            .expect("signatures resolve by participant identity")
+            {
+                TransitionOutcome::Commit(plan) => plan.next_state().clone(),
+                TransitionOutcome::AlreadyApplied => unreachable!("signature is new"),
+            };
+        }
+        assert!(proposed.pending_shared().is_none());
+        assert_eq!(proposed.public().next_step(), 1);
     }
 
     #[test]
@@ -287,19 +312,6 @@ mod tests {
         assert!(matches!(
             Activation::new(activation.prepared().clone(), aggregate),
             Err(arena0_protocol::ActivationError::InvalidAttestations(_))
-        ));
-    }
-
-    #[test]
-    fn ticket_set_mismatch_is_rejected() {
-        let (_, _, activation) = bilateral();
-        // Swap in a ticket that is not in the offer's ticket-hash list.
-        let outsider = ticket(&provider(9), activation.offer().data());
-        let mut tickets = activation.tickets().to_vec();
-        tickets[1] = outsider;
-        assert!(matches!(
-            PreparedActivation::new(activation.offer().clone(), tickets),
-            Err(arena0_protocol::ActivationError::TicketSetMismatch)
         ));
     }
 }

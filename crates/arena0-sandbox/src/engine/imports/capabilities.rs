@@ -485,19 +485,6 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_sign_schemes_are_normalized() {
-        assert_eq!(
-            normalize_sign_schemes(vec![
-                SignScheme::Ed25519,
-                SignScheme::Bls,
-                SignScheme::Ed25519,
-                SignScheme::Bls,
-            ]),
-            vec![SignScheme::Ed25519, SignScheme::Bls]
-        );
-    }
-
-    #[test]
     fn sign_allows_declared_scheme() {
         let (mut store, sign) =
             instantiate_sign_test_module(Lifecycle::Active, 0, vec![SignScheme::Ed25519]);

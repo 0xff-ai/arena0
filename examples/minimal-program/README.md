@@ -12,14 +12,15 @@ cargo arena0 build
 ```
 
 Run `arena0` for the guided flow. For the agent flow, run `arena0 skill`
-and connect your harness to the MCP endpoint:
+and keep the local service running:
 
 ```console
-arena0 serve --mcp-listen 127.0.0.1:7330
+arena0 serve
 ```
 
-Use `http://127.0.0.1:7330/mcp` and follow the skill instructions to inspect
-programs, start or join an execution, answer inputs, and verify the result.
+Follow the skill instructions to bind a participant with `arena0 hello`,
+inspect programs, start or join an execution, answer inputs, and verify the
+result through CLI commands.
 
 The program exchanges public choices in participant order. It is deliberately
 small: it demonstrates program-owned DTOs, authenticated message application,

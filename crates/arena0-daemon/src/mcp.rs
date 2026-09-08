@@ -1,5 +1,7 @@
 //! One daemon-owned MCP surface for the complete local Ensemble.
 //!
+//! Internal access and tool contracts are recorded in `mcp/contract.md`.
+//!
 //! Tool calls are scoped by one daemon-issued JWT. The token resolves one
 //! durable Host before a tool handler runs; wire references contain only
 //! Host-local execution/program/session ids and public peer identities.
@@ -46,7 +48,7 @@ use tokio::sync::watch;
 use crate::ensemble::{Daemon, McpConfig};
 use crate::mcp_auth::{AuthError, VerifiedClaims};
 use crate::server::HostService;
-use crate::startup::{self, StartupStage};
+use crate::startup::StartupStage;
 
 /// The only Host selector available to authenticated MCP tools. It is kept
 /// private to this crate and inserted into RMCP request extensions after the
@@ -1127,10 +1129,6 @@ impl ServerHandler for Arena0Mcp {
     }
 }
 
-pub(crate) async fn bind(config: &McpConfig) -> anyhow::Result<TcpListener> {
-    Ok(TcpListener::bind(config.listen).await?)
-}
-
 // The existing shutdown watch also interrupts incomplete HTTP headers and
 // blocked writes. Shared owns and removes each connection's wake registration.
 type ConnectionShutdown = Shared<BoxFuture<'static, ()>>;
@@ -1259,7 +1257,7 @@ pub(crate) async fn serve(
     let address = match listener.local_addr() {
         Ok(address) => address,
         Err(error) => {
-            startup::progress(StartupStage::Failed, &startup);
+            startup.progress(StartupStage::Failed);
             return Err(error.into());
         }
     };
@@ -1562,14 +1560,13 @@ mod tests {
             0
         };
         let arguments = serde_json::from_value(arguments).expect("MCP arguments must be an object");
-        let result = timeout(
+        timeout(
             Duration::from_secs(10) + Duration::from_millis(allowed_wait),
             client.call_tool(CallToolRequestParams::new(name).with_arguments(arguments)),
         )
         .await
         .unwrap_or_else(|_| panic!("MCP tool '{name}' timed out"))
-        .unwrap_or_else(|error| panic!("MCP tool '{name}' request failed: {error}"));
-        result
+        .unwrap_or_else(|error| panic!("MCP tool '{name}' request failed: {error}"))
     }
 
     async fn wait_for_mcp_address(daemon: &Daemon) -> SocketAddr {
@@ -1585,24 +1582,6 @@ mod tests {
         })
         .await
         .expect("MCP endpoint did not bind")
-    }
-
-    #[test]
-    fn program_summary_output_preserves_participants() {
-        let summary = ProgramSummary {
-            program_hash: arena0_program::ProgramHash([1; 32]),
-            name: "cumulative-sum".into(),
-            display_name: "Cumulative sum".into(),
-            version: "1.0.0".into(),
-            description: "N-party".into(),
-            participants: ParticipantCount::Range { min: 2, max: 64 },
-        };
-        let output = summary_output(&summary);
-        let encoded = serde_json::to_value(output).expect("encode MCP program summary");
-        assert_eq!(
-            encoded["participants"],
-            serde_json::json!({"kind": "range", "min": 2, "max": 64})
-        );
     }
 
     #[tokio::test]

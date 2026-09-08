@@ -41,8 +41,8 @@ pub struct StepSig {
 
 /// The shared per-entry message every participant signs. Byte-identical across
 /// participants and bound to the public entry itself: the canonical position,
-/// the entry content hash (event bytes, effects, witness; fuel is a
-/// per-node measurement and is excluded), the pre/post
+/// the entry content hash (event bytes, effects, deterministic fuel, and
+/// witness), the pre/post
 /// shared state hashes, and the chain link to the previous position's
 /// commitment. Signatures are therefore never interchangeable tokens: a
 /// signature names exactly one entry at exactly one position in exactly one

@@ -473,10 +473,6 @@ impl State {
             )
     }
 
-    fn validate_params(&self, input: &str) -> anyhow::Result<Option<Value>> {
-        validate_params(self.program(), input)
-    }
-
     fn launch(&mut self) -> anyhow::Result<Launch> {
         let program = self.program();
         let participants = u16::try_from(self.participants).context("too many local Hosts")?;
@@ -489,7 +485,7 @@ impl State {
             );
         }
         let params_text = self.params_text();
-        let params = self.validate_params(params_text.as_ref())?;
+        let params = validate_params(program, params_text.as_ref())?;
         Ok(Launch {
             program: program.summary.program_hash.to_string(),
             hosts: (0..self.participants)
@@ -832,7 +828,7 @@ fn render_setup(frame: &mut Frame<'_>, state: &State, area: Rect) {
 }
 
 fn render_params_editor(frame: &mut Frame<'_>, state: &State, draft: &str) {
-    let area = centered(
+    let area = crate::ui::centered(
         frame.area(),
         82,
         if state.error.is_some() { 16 } else { 15 },
@@ -892,7 +888,7 @@ fn render_params_editor(frame: &mut Frame<'_>, state: &State, draft: &str) {
 }
 
 fn render_help(frame: &mut Frame<'_>, state: &State) {
-    let area = centered(frame.area(), 76, 17);
+    let area = crate::ui::centered(frame.area(), 76, 17);
     frame.render_widget(Clear, area);
     let lines = [
         (
@@ -952,17 +948,6 @@ fn selected_style(state: &State, selected: bool) -> Style {
     } else {
         state.palette.strong()
     }
-}
-
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width.saturating_sub(2));
-    let height = height.min(area.height.saturating_sub(2));
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
 }
 
 fn initial_participants(

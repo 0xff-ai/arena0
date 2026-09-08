@@ -7,22 +7,60 @@
 mod common;
 
 use arena0_api::{
-    EnsembleSpec, FullVerifiedTerminal, HostRequest, LightVerifiedTerminal, ReceiptRef, ResponseOk,
-    VerifiedResult,
+    EnsembleSpec, EventData, EventFilter, EventFrame, FullVerifiedTerminal, HostRequest,
+    LightVerifiedTerminal, NextEvent, ReceiptRef, Response, ResponseOk, VerifiedResult,
 };
 use arena0_protocol::{NegotiationTarget, SessionHash};
+use arena0_sandbox::Program;
 use common::{HostTarget, call, created, cumulative_sum_wasm, daemon, drive, ok, rps_wasm};
+use std::time::Duration;
+use tokio::io::BufReader;
+use tokio::net::UnixStream;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_hosts_play_and_verify() {
     let wasm = rps_wasm();
     let d = daemon(&wasm).await;
+    let requested_exec_a = arena0_protocol::ExecId([0xa1; 32]);
+    let requested_exec_b = arena0_protocol::ExecId([0xb1; 32]);
+    // RPS requests input from participant zero first, independently of which
+    // Host creates the negotiation. Observe that participant before driving
+    // either side so the test cannot wait on an idle participant.
+    let (callout_host, callout_exec) = if d.peer_a < d.peer_b {
+        (&d.host_a, requested_exec_a)
+    } else {
+        (&d.host_b, requested_exec_b)
+    };
+
+    // Keep one real Host event subscription open before creation so the
+    // supervisor's session.callout projection is observed at its source.
+    let stream = UnixStream::connect(&callout_host.socket)
+        .await
+        .expect("connect to Host event stream");
+    let (read, mut event_write) = stream.into_split();
+    let mut event_read = BufReader::new(read);
+    arena0_api::frame::write_frame(
+        &mut event_write,
+        &callout_host.request(&HostRequest::EventsSubscribe {
+            filter: EventFilter {
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+        }),
+    )
+    .await
+    .expect("write event subscription");
+    let ack: Response = arena0_api::frame::read_frame(&mut event_read)
+        .await
+        .expect("read event subscription ack")
+        .expect("event subscription ack frame");
+    assert!(matches!(ack, Ok(ResponseOk::Subscribed)));
 
     // A publishes one exact negotiation, then B joins it by creator and
     // negotiation id. Params are omitted (the program takes none); the program
     // is named by its full content id.
     let req_a = HostRequest::ExecNew {
-        exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
+        exec_id: requested_exec_a,
         program: d.program_id.to_string(),
         params: Some(serde_json::json!(null)),
         ensemble: EnsembleSpec::Explicit {
@@ -41,7 +79,7 @@ async fn daemon_hosts_play_and_verify() {
         call(
             &d.host_b,
             &HostRequest::ExecNew {
-                exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
+                exec_id: requested_exec_b,
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
                 ensemble: EnsembleSpec::Join {
@@ -51,10 +89,98 @@ async fn daemon_hosts_play_and_verify() {
         )
         .await,
     );
+    assert_eq!(exec_a, requested_exec_a);
+    assert_eq!(exec_b, requested_exec_b);
+
+    // The first callout is observed through both public projections before
+    // either driver answers it. The expected metadata comes independently
+    // from the admitted RPS program; the context is the program's documented
+    // first-round request, not a value copied from either projection.
+    let next_request = HostRequest::ExecNext {
+        exec_id: callout_exec,
+    };
+    let next = call(callout_host, &next_request);
+    let event = async {
+        loop {
+            let frame = arena0_api::frame::read_frame::<_, EventFrame>(&mut event_read)
+                .await
+                .expect("read session.callout")
+                .expect("session.callout frame");
+            if let EventData::SessionCallout { .. } = &frame.data {
+                return frame;
+            }
+        }
+    };
+    let (next, event) = tokio::time::timeout(Duration::from_secs(120), async {
+        tokio::join!(next, event)
+    })
+    .await
+    .expect("timed out waiting for ExecNext and session.callout");
+    let EventFrame {
+        data: event_data,
+        exec_id: event_exec_id,
+        session_id: event_session_id,
+        ..
+    } = event;
+    match (ok(next), event_data) {
+        (
+            ResponseOk::Next(NextEvent::Callout {
+                pending_id: next_pending_id,
+                callout_index: next_callout_index,
+                name: next_name,
+                prompt: next_prompt,
+                schema: next_schema,
+                context: next_context,
+            }),
+            EventData::SessionCallout {
+                pending_id: event_pending_id,
+                callout_index: event_callout_index,
+                name: event_name,
+                prompt: event_prompt,
+                schema: event_schema,
+                context: event_context,
+            },
+        ) => {
+            let program = Program::try_from(wasm).expect("parse real RPS guest");
+            let callout = program
+                .definition()
+                .schema
+                .callouts
+                .first()
+                .expect("RPS program has a callout");
+            let expected_context = serde_json::json!({
+                "round": 1,
+                "total_rounds": 3,
+                "your_score": 0,
+                "their_score": 0,
+            });
+            assert_eq!(
+                next_pending_id, event_pending_id,
+                "ExecNext and event share pending identity"
+            );
+            assert_eq!(next_callout_index, event_callout_index);
+            assert_eq!(next_name, event_name);
+            assert_eq!(next_prompt, event_prompt);
+            assert_eq!(next_schema, event_schema);
+            assert_eq!(next_context, event_context);
+            assert_eq!(next_callout_index, 0);
+            assert_eq!(next_name, "ChooseMove");
+            assert_eq!(next_prompt, "Choose rock, paper, or scissors");
+            assert_eq!(next_schema, callout.output);
+            assert_eq!(next_context, expected_context);
+            assert_eq!(event_exec_id, Some(callout_exec));
+            assert!(
+                event_session_id.is_some(),
+                "session callout is session-scoped"
+            );
+        }
+        (next, event) => panic!("unexpected first callout projections: {next:?}, {event:?}"),
+    }
 
     // Drive both to completion with JSON answers; they must agree on the session id.
     let (sid_a, sid_b) = tokio::join!(drive(&d.host_a, exec_a), drive(&d.host_b, exec_b));
     assert_eq!(sid_a, sid_b, "both parties confirmed the same session");
+    assert_eq!(event_session_id, Some(sid_a));
 
     // Receipts are fetchable and verify at both tiers, on both Hosts, returning
     // evidence rather than a bool.

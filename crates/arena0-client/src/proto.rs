@@ -7,9 +7,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow, bail};
 use arena0_api::frame;
 pub use arena0_api::{ActivityFrame, EventFrame};
-use arena0_api::{EventFilter, HostInfo, HostRequest, HostStatus, Request, Response, ResponseOk};
+use arena0_api::{
+    ApiErrorCode, EventFilter, HostInfo, HostRequest, HostStatus, Request, Response, ResponseOk,
+};
 use arena0_home::{Home, HomeError, HostName};
 use arena0_program::ProgramHash;
+use arena0_protocol::{ExecId, View, Viewport};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -110,6 +113,36 @@ impl DaemonClient {
         self.call_host_raw(host, request)
             .await?
             .map_err(|error| anyhow!("{error}"))
+    }
+
+    /// Fetch a program-authored execution view for a terminal viewport.
+    ///
+    /// A Host can legitimately have no view while an execution is still
+    /// negotiating or otherwise has no active/terminal session. That
+    /// execution-level API error is represented as `None`; transport errors,
+    /// other API errors, and mismatched success payloads remain failures.
+    pub async fn exec_view(
+        &self,
+        host: &HostName,
+        exec: ExecId,
+        viewport: Viewport,
+    ) -> anyhow::Result<Option<(u64, View)>> {
+        match self
+            .call_host_raw(
+                host,
+                &HostRequest::ExecView {
+                    exec,
+                    width: viewport.width,
+                    color: viewport.color,
+                },
+            )
+            .await?
+        {
+            Ok(ResponseOk::ExecView { step, view }) => Ok(Some((step, view))),
+            Ok(other) => bail!("unexpected response to exec.view: {other:?}"),
+            Err(error) if error.code == ApiErrorCode::Execution => Ok(None),
+            Err(error) => bail!("{error}"),
+        }
     }
 
     /// Open or create one Host through the daemon's existing provisioning owner.

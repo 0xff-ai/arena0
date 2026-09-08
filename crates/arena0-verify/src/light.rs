@@ -49,19 +49,19 @@ pub enum LightVerifiedTerminal {
 /// Verify a bounded encoded [`ReceiptArtifact`] without loading Wasm or a
 /// sandbox.
 pub fn verify_light(receipt_bytes: &[u8]) -> Result<LightVerified, VerifyError> {
-    verify_light_inner(receipt_bytes)
+    let receipt = decode_receipt(receipt_bytes)?;
+    verify_decoded(&receipt)
 }
 
-fn verify_light_inner(receipt_bytes: &[u8]) -> Result<LightVerified, VerifyError> {
+pub(crate) fn decode_receipt(receipt_bytes: &[u8]) -> Result<ReceiptArtifact, VerifyError> {
     if receipt_bytes.len() > arena0_protocol::MAX_RECEIPT_BYTES {
         return Err(VerifyError::ReceiptTooLarge {
             actual: receipt_bytes.len(),
             max: arena0_protocol::MAX_RECEIPT_BYTES,
         });
     }
-    let receipt = ReceiptArtifact::decode(receipt_bytes)
-        .map_err(|error| VerifyError::ReceiptDecode(error.to_string()))?;
-    verify_decoded(&receipt)
+    ReceiptArtifact::decode(receipt_bytes)
+        .map_err(|error| VerifyError::ReceiptDecode(error.to_string()))
 }
 
 /// Verify a decoded receipt. The public entrypoint performs bounded decoding;
@@ -185,21 +185,15 @@ fn verify_trace(
 
         verify_event(entry, step, session_id, ensemble)?;
         verify_terminal_position(entry, step, trace_len, termination)?;
-        verify_agreement(
-            &entry.agreement,
-            step,
-            session_id,
-            participant_keys,
-            entry,
-            previous_link,
-        )?;
+        let commitment = StepCommitment::for_entry(session_id, entry, previous_link);
+        verify_agreement(&entry.agreement, participant_keys, &commitment)?;
 
         previous_state = entry.post_state;
-        let commitment = StepCommitment::for_entry(session_id, entry, previous_link);
         previous_link = commitment.link_hash();
     }
 
     let final_entry = trace.last();
+    let cursor = PublicCursor::new(trace_len, previous_state, previous_link);
     match termination {
         ReceiptTermination::Completed { terminal } => {
             let final_entry = final_entry.ok_or(VerifyError::EmptyTrace)?;
@@ -228,17 +222,6 @@ fn verify_trace(
             if !body.outcome().is_empty() {
                 return Err(VerifyError::TerminalMismatch { field: "outcome" });
             }
-            let previous_state = final_entry.map_or(
-                body.header().activation.offer().data().initial_state,
-                |entry| entry.post_state,
-            );
-            let previous_link = trace
-                .iter()
-                .enumerate()
-                .fold(CHAIN_START, |link, (_, entry)| {
-                    StepCommitment::for_entry(session_id, entry, link).link_hash()
-                });
-            let cursor = PublicCursor::new(trace_len, previous_state, previous_link);
             match cause {
                 arena0_protocol::StopCause::Authenticated(occurrence) => {
                     occurrence
@@ -444,16 +427,13 @@ fn verify_terminal_position(
 
 fn verify_agreement(
     agreement: &AggregateAttestation,
-    step: u64,
-    session_id: SessionHash,
     participant_keys: &[arena0_crypto::BlsPublicKey],
-    entry: &arena0_protocol::TraceEntry,
-    link: [u8; 32],
+    commitment: &StepCommitment,
 ) -> Result<(), VerifyError> {
+    let step = commitment.step;
     if !agreement.signers.is_full(participant_keys.len()) {
         return Err(VerifyError::MissingParticipantAgreement { step });
     }
-    let commitment = StepCommitment::for_entry(session_id, entry, link);
     agreement
         .verify_signatures(step, &commitment.signing_bytes(), participant_keys)
         .map_err(|error| VerifyError::Agreement {

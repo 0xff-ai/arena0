@@ -30,6 +30,21 @@ pub(crate) fn read_string<R: io::Read>(
     String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
+pub(crate) fn read_option_string<R: io::Read>(
+    reader: &mut R,
+    max: usize,
+    field: &'static str,
+) -> io::Result<Option<String>> {
+    match u8::deserialize_reader(reader)? {
+        0 => Ok(None),
+        1 => read_string(reader, max, field).map(Some),
+        tag => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown optional string tag {tag}"),
+        )),
+    }
+}
+
 pub(crate) fn write_bytes<W: io::Write>(
     writer: &mut W,
     bytes: &[u8],
@@ -55,4 +70,19 @@ pub(crate) fn write_string<W: io::Write>(
     field: &'static str,
 ) -> io::Result<()> {
     write_bytes(writer, value.as_bytes(), max, field)
+}
+
+pub(crate) fn write_option_string<W: io::Write>(
+    writer: &mut W,
+    value: Option<&str>,
+    max: usize,
+    field: &'static str,
+) -> io::Result<()> {
+    match value {
+        None => BorshSerialize::serialize(&0u8, writer),
+        Some(value) => {
+            BorshSerialize::serialize(&1u8, writer)?;
+            write_string(writer, value, max, field)
+        }
+    }
 }

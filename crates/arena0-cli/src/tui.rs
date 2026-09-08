@@ -246,6 +246,105 @@ impl TuiConfig {
     }
 }
 
+/// Render the bounded, redacted details shared by activity and event panes.
+///
+/// Keeping this projection at the TUI boundary means every presentation of a
+/// Host event retains terminal outcome, origin, failure, and ordering details
+/// consistently.
+pub(crate) fn event_summary(event: &EventFrame) -> String {
+    match &event.data {
+        EventData::HostStarted { abi_version, .. } => format!(
+            "peer {}  ua {}  ABI {}",
+            event.host.peer_id.fmt_short(),
+            event.host.user_agent.as_deref().unwrap_or("(none)"),
+            abi_version
+        ),
+        EventData::HostStopped {
+            reason,
+            uptime_secs,
+        } => format!(
+            "uptime {}s  {}",
+            uptime_secs,
+            reason.as_deref().unwrap_or("stopped")
+        ),
+        EventData::OfferSeen {
+            creator, offer_seq, ..
+        } => format!("creator {}  offer {}", creator.fmt_short(), offer_seq),
+        EventData::Created {
+            origin,
+            queue_position,
+            ..
+        } => format!("origin {:?}  queue {:?}", origin, queue_position),
+        EventData::Terminated {
+            reason,
+            failed_class,
+        } => format!("{}  class {:?}", reason, failed_class),
+        EventData::NegotiationStarted { target_size } => format!("target {}", target_size),
+        EventData::NegotiationOfferAccepted { creator, offer_seq } => {
+            format!("creator {}  offer {}", creator.fmt_short(), offer_seq)
+        }
+        EventData::NegotiationTicketAccepted {
+            ticket_count,
+            target_size,
+            participant,
+            ..
+        } => format!(
+            "participant {}  tickets {}/{}",
+            participant.fmt_short(),
+            ticket_count,
+            target_size
+        ),
+        EventData::NegotiationPeers { lifecycle, peers } => {
+            format!("{} peers  {:?}", peers.len(), lifecycle)
+        }
+        EventData::NegotiationPrepared { participants }
+        | EventData::NegotiationResumed { participants }
+        | EventData::NegotiationCommitted { participants } => {
+            format!("{} participants", participants)
+        }
+        EventData::NegotiationRetried {
+            attempt,
+            ticket_count,
+            sig_count,
+            target_size,
+            ..
+        } => format!(
+            "attempt {}  tickets {}/{}  agreements {}/{}",
+            attempt, ticket_count, target_size, sig_count, target_size
+        ),
+        EventData::NegotiationRejoined {} => "rejoined".to_owned(),
+        EventData::NegotiationTimedOut {
+            ticket_count,
+            sig_count,
+            target_size,
+            ..
+        } => format!(
+            "tickets {}/{}  agreements {}/{}",
+            ticket_count, target_size, sig_count, target_size
+        ),
+        EventData::SessionStarted { ensemble } => format!("{} participants", ensemble.len()),
+        EventData::SessionCallout { name, .. } => format!("callout {}", name),
+        EventData::SessionCalloutAnswered { pending_id } => {
+            format!("pending {} answered", pending_id)
+        }
+        EventData::SessionStep {
+            step,
+            fuel_used,
+            signers,
+            participants,
+            ..
+        } => format!(
+            "step {}  fuel {}  agreement {}/{}",
+            step, fuel_used, signers, participants
+        ),
+        EventData::SessionEnded { terminal } => match terminal {
+            SessionTerminal::Completed { .. } => "completed".to_owned(),
+            SessionTerminal::Aborted { step, reason } => format!("aborted at {}  {}", step, reason),
+        },
+        EventData::Lagged { skipped } => format!("{} events dropped", skipped),
+    }
+}
+
 // Monitor snapshots intentionally travel through the same bounded update
 // channel as the legacy run updates.  Boxing every snapshot field would add a
 // second allocation at the state boundary without changing ownership or
@@ -336,7 +435,6 @@ pub(crate) struct MonitorExecution {
     pub(crate) trace: Vec<TraceEntry>,
     pub(crate) agreement: Option<(u16, u16)>,
     pub(crate) observed_at: u64,
-    pub(crate) stale: bool,
     pub(crate) gap: Option<String>,
 }
 
@@ -368,7 +466,6 @@ pub(crate) enum MonitorUpdate {
         view: Option<(u64, View)>,
         trace: Vec<TraceEntry>,
         observed_at: u64,
-        stale: bool,
         gap: Option<String>,
     },
     Activity {
@@ -526,6 +623,17 @@ pub(crate) struct TuiSession {
 
 impl TuiSession {
     pub(crate) fn start(config: TuiConfig, cancel: watch::Sender<Option<String>>) -> Self {
+        Self::bootstrap(config, cancel, None)
+    }
+
+    /// Create the terminal channels and task shared by the run and monitor
+    /// frontends.  The optional action sender is the only mode-specific part
+    /// of the bootstrap; terminal restoration remains owned by `run_screen`.
+    fn bootstrap(
+        config: TuiConfig,
+        cancel: watch::Sender<Option<String>>,
+        actions: Option<mpsc::Sender<MonitorAction>>,
+    ) -> Self {
         let (updates, receiver) = mpsc::channel(UPDATE_CAPACITY);
         let (width, width_rx) = watch::channel(80);
         let (private_page, private_page_rx) = watch::channel(None);
@@ -540,7 +648,7 @@ impl TuiSession {
             width,
             private_page,
             cancel,
-            None,
+            actions,
         ));
         Self {
             handle,
@@ -555,28 +663,9 @@ impl TuiSession {
         config: TuiConfig,
         cancel: watch::Sender<Option<String>>,
     ) -> (Self, mpsc::Receiver<MonitorAction>) {
-        let (updates, receiver) = mpsc::channel(UPDATE_CAPACITY);
-        let (width, width_rx) = watch::channel(80);
-        let (private_page, private_page_rx) = watch::channel(None);
         let (actions, action_receiver) = mpsc::channel(UPDATE_CAPACITY);
-        let handle = TuiHandle {
-            updates,
-            width: width_rx,
-            private_page: private_page_rx,
-        };
-        let task = tokio::spawn(run_screen(
-            config,
-            receiver,
-            width,
-            private_page,
-            cancel,
-            Some(actions),
-        ));
         (
-            Self {
-                handle,
-                task: Some(task),
-            },
+            Self::bootstrap(config, cancel, Some(actions)),
             action_receiver,
         )
     }
@@ -985,11 +1074,11 @@ impl MonitorState {
                 view,
                 trace,
                 observed_at,
-                stale,
                 gap,
             } => {
                 let previous = self.executions.get(&key).cloned();
                 let view_missing = view.is_none();
+                let stale = gap.is_some();
                 // A stale refresh can lose one bounded endpoint independently
                 // of the others. Keep the last good value visible while the
                 // status and the gap marker make that uncertainty explicit.
@@ -1036,7 +1125,6 @@ impl MonitorState {
                         trace,
                         agreement,
                         observed_at,
-                        stale,
                         gap,
                     },
                 );
@@ -1077,7 +1165,6 @@ impl MonitorState {
                         exec_id,
                     })
                 {
-                    execution.stale = true;
                     execution.gap = Some(summary.clone());
                 }
                 if let Some(host) = host {
@@ -1170,7 +1257,6 @@ impl MonitorState {
                         .values_mut()
                         .filter(|execution| execution.key.host == host)
                     {
-                        execution.stale = true;
                         execution.gap = Some(message.clone());
                     }
                 }
@@ -2322,9 +2408,7 @@ impl ScreenState {
         if let KeyCode::Char(number) = key.code
             && let Some(view) = WorkspaceView::from_number(number)
         {
-            if monitor.display_selected_execution().is_none() {
-                return None;
-            }
+            monitor.display_selected_execution()?;
             monitor.detail = true;
             self.focus = Focus::Workspace;
             monitor.view = view;
@@ -3110,7 +3194,7 @@ fn render(frame: &mut Frame<'_>, state: &ScreenState) {
     if state.monitor.is_some() {
         render_monitor(frame, state, area);
         if state.help {
-            let overlay = centered(area, 76, 14);
+            let overlay = crate::ui::centered(area, 76, 14);
             frame.render_widget(Clear, overlay);
             frame.render_widget(
                 Paragraph::new(vec![
@@ -3159,7 +3243,7 @@ fn render(frame: &mut Frame<'_>, state: &ScreenState) {
     render_composer(frame, state, layout.composer);
 
     if state.help {
-        let overlay = centered(area, 76, 18);
+        let overlay = crate::ui::centered(area, 76, 18);
         frame.render_widget(Clear, overlay);
         frame.render_widget(
             Paragraph::new(vec![
@@ -3359,7 +3443,11 @@ fn render_monitor_table(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) 
             || "-".to_owned(),
             |(agreed, total)| format!("{agreed}/{total}"),
         );
-        let stale = if execution.stale { " STALE" } else { "" };
+        let stale = if execution.gap.is_some() {
+            " STALE"
+        } else {
+            ""
+        };
         let selected = monitor.selected.as_ref() == Some(key);
         Some(
             Row::new([
@@ -3449,11 +3537,8 @@ fn render_monitor_guest(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) 
         return;
     };
     let age = epoch_seconds().saturating_sub(execution.observed_at);
-    let freshness = if execution.stale {
-        execution.gap.as_deref().map_or_else(
-            || format!("STALE  fetched {age}s ago"),
-            |gap| format!("STALE  {gap}  fetched {age}s ago"),
-        )
+    let freshness = if let Some(gap) = execution.gap.as_deref() {
+        format!("STALE  {gap}  fetched {age}s ago")
     } else {
         format!("LIVE  fetched {age}s ago")
     };
@@ -3985,7 +4070,7 @@ fn composer_overflows(state: &ScreenState, area: Rect) -> bool {
 }
 
 fn system_event_line(frame: &EventFrame, state: &ScreenState) -> Line<'static> {
-    let detail = events::event_summary(frame);
+    let detail = event_summary(frame);
     let kind = frame.kind().strip_prefix("exec.").unwrap_or(frame.kind());
     let detail = if detail.is_empty() {
         String::new()
@@ -4245,17 +4330,6 @@ fn program_view_width(state: &ScreenState, area: Rect) -> u16 {
 fn publish_width(width: &watch::Sender<u16>, next: u16) {
     if *width.borrow() != next {
         width.send_replace(next);
-    }
-}
-
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width.saturating_sub(2));
-    let height = height.min(area.height.saturating_sub(2));
-    Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
     }
 }
 

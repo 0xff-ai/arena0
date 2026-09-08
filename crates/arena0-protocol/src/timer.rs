@@ -14,6 +14,41 @@ pub struct TimerPayload {
     pub data: Vec<u8>,
 }
 
+impl TimerPayload {
+    pub(crate) fn serialize_bounded<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        crate::bounded::write_string(
+            writer,
+            &self.type_name,
+            crate::execution::MAX_TERMINAL_REASON_BYTES,
+            "timer type name",
+        )?;
+        crate::bounded::write_bytes(
+            writer,
+            &self.data,
+            crate::execution::MAX_TIMER_PAYLOAD_BYTES,
+            "timer data",
+        )
+    }
+
+    pub(crate) fn deserialize_bounded<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        Ok(Self {
+            type_name: crate::bounded::read_string(
+                reader,
+                crate::execution::MAX_TERMINAL_REASON_BYTES,
+                "timer type name",
+            )?,
+            data: crate::bounded::read_bytes(
+                reader,
+                crate::execution::MAX_TIMER_PAYLOAD_BYTES,
+                "timer data",
+            )?,
+        })
+    }
+}
+
 /// Complete timer request emitted by a program.
 #[derive(
     Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq, Hash,

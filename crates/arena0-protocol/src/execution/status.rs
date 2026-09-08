@@ -350,6 +350,15 @@ impl TerminalProof {
 }
 
 impl StopCause {
+    /// Borrow the authenticated or shared terminal reason.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Authenticated(occurrence) => occurrence.reason(),
+            Self::Shared { reason, .. } => reason,
+        }
+    }
+
     /// Return the terminal kind when this cause is an abort/failure cause.
     #[must_use]
     pub const fn kind(&self) -> AbortKind {

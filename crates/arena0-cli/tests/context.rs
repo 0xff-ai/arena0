@@ -119,6 +119,16 @@ fn host_count(home: &Path) -> usize {
         "arena0 --json status",
     );
     assert_eq!(value["reachable"], true);
+    let daemon = value["daemon"]
+        .as_object()
+        .expect("status should contain daemon");
+    assert!(
+        daemon
+            .get("socket")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+    );
+    assert!(!daemon.contains_key("mcp_endpoint"));
     value["hosts"]
         .as_array()
         .expect("status should contain hosts")
@@ -175,7 +185,7 @@ impl DaemonGuard {
     fn start(home: &Path) -> Self {
         let mut command = base_command(arena0d_binary(), home);
         let child = command
-            .args(["--no-hosts", "--mcp-listen", "127.0.0.1:0"])
+            .arg("--no-hosts")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()

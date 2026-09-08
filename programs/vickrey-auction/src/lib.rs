@@ -576,7 +576,7 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arena0::ManagedPhase;
+    use arena0::testing::{FaultStatus, Harness, TestHarness};
     use arena0::types::{ColorDepth, Slot};
     use borsh::BorshSerialize;
 
@@ -666,43 +666,61 @@ mod tests {
         );
     }
 
+    fn bid_commit(value: u64, salt: u8) -> Message {
+        let mut protocol = CommitReveal::default();
+        protocol.set_participant_count(3).unwrap();
+        let mut local = CommitRevealLocal::default();
+        Message::Bid(
+            protocol
+                .commit_with_salt(&mut local, value, [salt; 32])
+                .unwrap(),
+        )
+    }
+
     #[test]
     fn missing_reveal_keeps_auction_pending() {
-        let values = [0, 120, 80];
-        let mut bids = CommitReveal::default();
-        bids.set_participant_count(values.len()).unwrap();
-        let mut locals: Vec<CommitRevealLocal<u64>> = values
-            .iter()
-            .map(|_| CommitRevealLocal::default())
-            .collect();
-        let commits: Vec<_> = values
-            .iter()
-            .zip(locals.iter_mut())
-            .enumerate()
-            .map(|(index, (value, local))| {
-                bids.commit_with_salt(local, *value, [index as u8; 32])
-                    .unwrap()
-            })
-            .collect();
-        for (index, commit) in commits.into_iter().enumerate() {
-            bids.handle(Participant::try_from(index).unwrap(), commit)
-                .unwrap();
-        }
-        for (index, local) in locals.iter_mut().take(2).enumerate() {
-            let reveal = bids.take_reveal(local).unwrap();
-            bids.handle(Participant::try_from(index).unwrap(), reveal)
-                .unwrap();
-        }
+        let seller = PeerId([0; 32]);
+        let first_bidder = PeerId([1; 32]);
+        let missing_bidder = PeerId([2; 32]);
+        let ensemble = Ensemble::from_peers(vec![seller, first_bidder, missing_bidder]).unwrap();
+        let mut h = TestHarness::<vickrey_auction::VickreyAuction>::with_peer_id(
+            seller,
+            Params {
+                item: "demo item".into(),
+                reserve: None,
+            },
+        );
 
-        let state = Shared {
-            phase: ManagedPhase::__new(Phase::Bidding),
-            item: "demo item".into(),
-            bids,
-            ..Shared::default()
-        };
-        assert_eq!(state.bids.phase(), commit_reveal::Phase::Revealing);
-        assert_eq!(state.bids.expected_writer(), Some(Participant::new(2)));
-        assert!(state.settlement.is_none());
+        let started = h.session_started_with_ensemble(ensemble);
+        assert!(matches!(started.fault, FaultStatus::None));
+        let seller_commit = started
+            .messages::<Message>()
+            .into_iter()
+            .find(|message| matches!(message, Message::Bid(commit_reveal::Message::Commit(_))))
+            .expect("seller commits through the actual reaction handler");
+        h.message(seller, seller_commit);
+        h.message(first_bidder, bid_commit(120, 1));
+        let committed = h.message(missing_bidder, bid_commit(80, 2));
+        let seller_reveal = committed
+            .messages::<Message>()
+            .into_iter()
+            .find(|message| matches!(message, Message::Bid(commit_reveal::Message::Reveal { .. })))
+            .expect("seller reveal is emitted by the actual reaction handler");
+        h.message(seller, seller_reveal);
+        let pending = h.message(
+            first_bidder,
+            Message::Bid(commit_reveal::Message::Reveal {
+                value: 120,
+                salt: [1; 32],
+            }),
+        );
+
+        assert!(matches!(h.shared().phase(), Phase::Bidding));
+        assert_eq!(h.shared().bids.phase(), commit_reveal::Phase::Revealing);
+        assert_eq!(h.shared().bids.expected_writer(), Some(Participant::new(2)));
+        assert!(h.shared().settlement.is_none());
+        assert!(!pending.has_session_end());
+        assert!(h.trace().iter().all(|step| !step.is_terminal()));
     }
 
     #[test]

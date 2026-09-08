@@ -225,6 +225,21 @@ impl HostState {
             callout_inputs,
         }
     }
+
+    pub(crate) fn finish_observations(
+        &mut self,
+        fuel_used: u64,
+    ) -> Result<crate::CallObservations, SandboxError> {
+        Ok(crate::CallObservations {
+            effects: std::mem::take(&mut self.effect_queue),
+            fuel_used,
+            random_draws: self
+                .entropy
+                .finish()
+                .map_err(|error| SandboxError::dispatch_failed(error.to_string()))?,
+            logs: std::mem::take(&mut self.logs),
+        })
+    }
 }
 
 /// Configured deterministic Wasmtime engine.
@@ -260,6 +275,33 @@ impl std::fmt::Debug for AdmittedProgram {
             .field("hash", &self.program.hash())
             .field("profile_hash", &self.profile.hash())
             .finish()
+    }
+}
+
+impl AdmittedProgram {
+    pub(crate) fn validate_shared_state(
+        &self,
+        shared: &SharedStateBytes,
+    ) -> Result<(), SandboxError> {
+        let shared_max = self
+            .state_max_bytes
+            .min(self.profile.limits.max_shared_state_bytes as usize);
+        if shared.len() > shared_max {
+            return Err(SandboxError::MemoryLimitExceeded(shared.len() as u64));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_state(
+        &self,
+        shared: &SharedStateBytes,
+        local: &LocalStateBytes,
+    ) -> Result<(), SandboxError> {
+        self.validate_shared_state(shared)?;
+        if local.len() > self.profile.limits.max_local_state_bytes as usize {
+            return Err(SandboxError::MemoryLimitExceeded(local.len() as u64));
+        }
+        Ok(())
     }
 }
 
@@ -317,42 +359,6 @@ pub(crate) fn instantiate_module(
         .get_memory(&mut store, "memory")
         .ok_or_else(|| SandboxError::instantiation_failed("no 'memory' export"))?;
     Ok(CallInstance { store, instance })
-}
-
-/// Drain host-owned effects and observations after a typed guest output has
-/// been decoded. State and projections stay in their call-specific ABI values.
-pub(crate) fn complete_observations(
-    state: &mut HostState,
-    fuel_used: u64,
-) -> Result<crate::CallObservations, SandboxError> {
-    Ok(crate::CallObservations {
-        effects: std::mem::take(&mut state.effect_queue),
-        fuel_used,
-        random_draws: state
-            .entropy
-            .finish()
-            .map_err(|error| SandboxError::dispatch_failed(error.to_string()))?,
-        logs: std::mem::take(&mut state.logs),
-    })
-}
-
-/// Check explicit state bytes against their domain bounds.
-pub(crate) fn validate_state_bytes(
-    shared: &SharedStateBytes,
-    local: &LocalStateBytes,
-    profile: &ExecutionProfile,
-    schema_max_bytes: Option<usize>,
-) -> Result<(), SandboxError> {
-    let shared_max = schema_max_bytes
-        .unwrap_or(usize::MAX)
-        .min(profile.limits.max_shared_state_bytes as usize);
-    if shared.len() > shared_max {
-        return Err(SandboxError::MemoryLimitExceeded(shared.len() as u64));
-    }
-    if local.len() > profile.limits.max_local_state_bytes as usize {
-        return Err(SandboxError::MemoryLimitExceeded(local.len() as u64));
-    }
-    Ok(())
 }
 
 pub(crate) fn max_output(profile: &ExecutionProfile) -> usize {

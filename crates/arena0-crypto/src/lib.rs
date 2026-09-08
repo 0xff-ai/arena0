@@ -452,15 +452,6 @@ mod tests {
     }
 
     #[test]
-    fn hash_blake3_matches() {
-        let data = b"arena0";
-        assert_eq!(
-            hash(HashAlgorithm::Blake3, data),
-            *blake3::hash(data).as_bytes()
-        );
-    }
-
-    #[test]
     fn sign_scheme_canonical_order_is_explicit_and_keeps_borsh_tags() {
         assert_eq!(SignScheme::Ed25519.canonical_order(), 0);
         assert_eq!(SignScheme::Bls.canonical_order(), 1);

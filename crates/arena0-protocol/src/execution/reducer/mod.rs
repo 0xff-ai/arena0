@@ -17,7 +17,8 @@ pub(crate) use terminal::{
     reduce_signature as reduce_terminal_signature,
 };
 
-pub(super) fn transition(
+/// Apply one pure execution input to a validated durable aggregate.
+pub fn transition(
     state: &ExecutionState,
     input: ExecutionInput,
 ) -> Result<TransitionOutcome, ProtocolError> {
