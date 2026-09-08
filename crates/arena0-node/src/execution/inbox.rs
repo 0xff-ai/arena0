@@ -81,7 +81,7 @@ impl ExecutionActor {
                     .apply_message(item.source(), frame, Some(item.inbox_id()))
                     .await?;
             }
-            ExecFrame::StepSignature { .. } => {
+            ExecFrame::StepSignature { ref commitment, .. } => {
                 let state = self.load_state().await?;
                 if state.pending_shared().is_none() {
                     // A participant can publish its signature as soon as it
@@ -94,6 +94,15 @@ impl ExecutionActor {
                     if state.status().is_terminal() {
                         self.reject_inbound(item.inbox_id()).await?;
                     }
+                    return Ok(());
+                }
+                let proposal = state.pending_shared().expect("checked above");
+                if !proposal.entry().is_terminal()
+                    && proposal.commitment().step.checked_add(1) == Some(commitment.step)
+                {
+                    // N-of-N agreement limits an honest participant to one
+                    // proposal ahead. Retain its signature until that proposal
+                    // becomes the current inbox head.
                     return Ok(());
                 }
                 let outcome = self

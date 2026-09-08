@@ -4900,7 +4900,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn recovery_visits_requests_after_more_than_4096_terminal_rows() {
+    async fn recovery_visits_unfinished_requests_after_terminal_history() {
         let (_dir, store, daemon, peer) = test_daemon();
         let (program_hash, _) = store
             .handle()
@@ -4908,7 +4908,7 @@ mod tests {
             .await
             .expect("program");
         let other = PeerId([peer.0[0].wrapping_add(1); 32]);
-        let tail = 4_097_u64;
+        let tail = 17_u64;
         let tail_id = ExecId({
             let mut bytes = [0; 32];
             bytes[..8].copy_from_slice(&tail.to_le_bytes());
