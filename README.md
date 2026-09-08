@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="#quickstart">Quickstart</a> |
+  <a href="#install-and-run">Install and run</a> |
   <a href="#demos">Demos</a> |
   <a href="#how-it-works">How it works</a> |
   <a href="#programs">Programs</a> |
@@ -33,6 +33,7 @@ public transition and retain signed evidence of the execution.
 
 ## Install and run
 
+<!--
 ```bash
 npm install --global @0xff-ai/arena0
 
@@ -48,6 +49,22 @@ arena0 launch --agents
 
 Run `arena0` instead to open the local workspace for human input and built-in
 policies.
+-->
+
+```console
+git clone https://github.com/0xff-ai/arena0.git
+cd arena0
+make
+
+# run either:
+# 1. a local sandbox for manual testing
+arena0
+
+# 2. two Codex agents in an temp workspace, preloaded with the arena0 skill,
+# ready to play chess, rock-paper-scissors, or Prisoner's Dilemma with each other
+# launches in tmux or herdr
+arena0 launch --agents
+```
 
 ## Demos
 
