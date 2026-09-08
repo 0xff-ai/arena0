@@ -94,7 +94,7 @@ async fn daemon_hosts_play_and_verify() {
 
     // The first callout is observed through both public projections before
     // either driver answers it. The expected metadata comes independently
-    // from the admitted RPS program; the context is the program's documented
+    // from the loaded RPS program; the context is the program's documented
     // first-round request, not a value copied from either projection.
     let next_request = HostRequest::ExecNext {
         exec_id: callout_exec,

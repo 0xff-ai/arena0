@@ -1,6 +1,6 @@
 //! Guest-facing calls and private/shared progress transitions.
 //!
-//! Every method here loads a fresh durable snapshot, invokes the admitted
+//! Every method here loads a fresh durable snapshot, invokes the loaded
 //! guest, and commits the resulting protocol delta through the store.
 
 use crate::context::{ExecError, SessionMessage};

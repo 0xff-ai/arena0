@@ -1,7 +1,6 @@
 //! Agent answer and `--param` assembly.
 //!
-//! Clients preserve JSON values and leave schema validation to the daemon, the
-//! boundary that owns program admission and execution.
+//! Clients preserve JSON values and leave schema validation to the daemon.
 
 use serde_json::{Map, Value};
 

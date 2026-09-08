@@ -15,8 +15,8 @@ use thiserror::Error;
 /// Maximum catalog rows materialized by one API projection.
 const PROGRAM_LIST_LIMIT: usize = 1_024;
 
-/// Errors at the program-import boundary. A malformed or inadmissible Wasm
-/// artifact is caller input; only the durable registration operation can be a
+/// Errors at the program-import boundary. A malformed or invalid Wasm artifact
+/// is caller input; only the durable registration operation can be a
 /// persistence failure.
 #[derive(Debug, Error)]
 pub(crate) enum CatalogError {
@@ -144,8 +144,10 @@ impl ProgramCatalog {
         Ok(self.detail(hash).await?.map(|detail| detail.schema))
     }
 
-    /// Admit and durably register one artifact. The engine retains compiled
-    /// code; every execution still receives a fresh guest instance.
+    /// Import and durably register one artifact. Validation occurs before
+    /// catalog registration; the engine may retain compiled code for later
+    /// execution loads, and every execution still receives a fresh guest
+    /// instance.
     pub(crate) async fn import(
         &self,
         wasm: Vec<u8>,
@@ -153,8 +155,8 @@ impl ProgramCatalog {
         now_ms: u64,
     ) -> Result<(ProgramHash, ProgramStoreOutcome), CatalogError> {
         let program = Program::try_from(wasm).map_err(CatalogError::InvalidProgram)?;
-        let _admitted = engine
-            .admit(&program)
+        let _loaded = engine
+            .load(&program)
             .map_err(CatalogError::InvalidProgram)?;
         self.store
             .register_program(program.bytes().to_vec(), now_ms)
@@ -162,8 +164,8 @@ impl ProgramCatalog {
             .map_err(CatalogError::Storage)
     }
 
-    /// Remove a program from new-admission membership while retaining bytes
-    /// needed by existing durable executions.
+    /// Remove a program from the active catalog while retaining bytes needed by
+    /// existing durable executions.
     pub(crate) async fn remove(
         &self,
         hash: ProgramHash,

@@ -338,7 +338,7 @@ Before recording the execution request, `arena0-node::Host` claims one
 exclusive `ExecutionStore` writer. Its state-changing methods require `&mut
 self`, so the type checker carries that ownership through request persistence
 and negotiation into one private `ExecutionActor` after the activation commit.
-The actor is the only live owner of the admitted guest, execution signer, and
+The actor is the only live owner of the loaded guest, execution signer, and
 transport capabilities for that `ExecId`. API handlers and supervisors send
 commands to the actor or read durable projections; they do not hold a second
 mutable execution object. The Host rejects a second live claim, and dropping
@@ -378,45 +378,49 @@ never defines execution serialization and never participates in commitments,
 receipts, or replay verification. Other program Borsh values, including receipt
 params and outcomes, remain opaque bytes to the Host.
 
-Admission validates every required guest export before import. The canonical
-list of names and signatures is `arena0_sandbox::validation::REQUIRED_FUNC_EXPORTS`, and the ABI remains
+Program import validates every required guest export before the artifact enters
+the Host's program catalog. The canonical list of names and signatures is
+`arena0_sandbox::validation::REQUIRED_FUNC_EXPORTS`, and the ABI remains
 `ABI_VERSION = 20`.
 
 The sandbox boundary has two ownership stages:
 
 ```text
-Program -> AdmittedProgram
+Program -> LoadedProgram
 ```
 
-`Program` is an immutable final Wasm artifact. Construction parses exactly one
-embedded `arena0.metadata` section, validates its public definition, and hashes
-the exact final bytes. Parsing a completed artifact never executes guest code.
+`Program` is an immutable final Wasm artifact. `LoadedProgram` is the loaded,
+compiled representation used for execution. `Program` construction parses
+exactly one embedded `arena0.metadata` section, validates its public definition,
+and hashes the exact final bytes. Parsing a completed artifact never executes
+guest code.
 Only `WasmtimeEngine::build_program` accepts section-less build output: it runs
 the guest metadata export in a disposable fuel- and memory-bounded instance,
 appends the section once, and returns a parsed `Program`.
 
-`WasmtimeEngine::admit` compiles the artifact once per engine and caches the
-immutable admission by `ProgramHash` in a bounded, concurrent cache. The daemon
+`WasmtimeEngine::load` loads, validates, and compiles an artifact for execution.
+It compiles the artifact once per engine and caches the resulting immutable
+`LoadedProgram` by `ProgramHash` in a bounded, concurrent cache. The daemon
 also configures Wasmtime's bounded disk cache below the stable arena0 cache
 directory, so compiled machine code survives process restarts and disposable
 `--tmp` homes while remaining keyed by Wasmtime's compiler configuration.
-Admission validates imports and exact export signatures and uses
-a disposable bounded instance to verify the ABI value before the artifact
-enters the Host's program catalog. `AdmittedProgram` owns the immutable compiled
-module and its execution profile. Each
+Program import also uses this method to validate imports and exact export
+signatures and to verify the ABI value in a disposable bounded instance before
+registering the artifact in the Host's program catalog. `LoadedProgram` owns
+the immutable compiled module and its execution profile. Each
 `initialize`, `apply_shared`, `apply_local`, `writer`, `query`, `view`, or
 `outcome` call creates a fresh bounded Wasm instance, passes explicit state
 bytes, and returns a complete result. No mutable guest instance survives a
 call, and no process-wide instance map exists.
 
-The daemon owns one shared `WasmtimeEngine` for validation and admission, not a
-second program catalog. Each Host must first resolve the hash from its own
-SQLite program catalog. Every execution resolves admission through the shared
-engine cache and uses fresh mutable guest state for each call.
+The daemon owns one shared `WasmtimeEngine` for program validation and execution
+loading, not a second program catalog. Each Host must first resolve the hash from
+its own SQLite program catalog. Every execution loads its imported artifact
+through the shared engine cache and uses fresh mutable guest state for each call.
 
 ## 10. Execution and agreement
 
-After `SessionStarted`, each Host's `ExecutionActor` runs the admitted program.
+After `SessionStarted`, each Host's `ExecutionActor` runs the loaded program.
 The actor loads a durable `ExecutionState` snapshot, makes one guest call in a
 fresh bounded Wasm instance, and submits the resulting protocol input to the
 SQLite store. The store's reducer is the only authority that creates the next
@@ -555,7 +559,8 @@ matching older release. Automatic migration is not provided.
 
 Full verification first performs the light checks, then loads the exact Wasm,
 checks its content hash and execution profile, and replays every public call in
-fresh admitted sandbox instances. It compares every state hash, effect list,
+fresh sandbox instances created from the loaded program. It compares every state
+hash, effect list,
 fuel count, and terminal outcome. A completed result includes both the
 authenticated `outcome_borsh` bytes and the guest-produced JSON outcome. A
 stopped result includes the same exact `StopCause` and no outcome field. The

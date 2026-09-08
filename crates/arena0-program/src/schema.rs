@@ -102,7 +102,7 @@ impl<'de> Deserialize<'de> for BorshSchemaDocument {
 /// Invalid embedded Borsh schema metadata.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BorshSchemaDocumentError {
-    /// The encoded schema exceeds arena0's admission bound.
+    /// The encoded schema exceeds arena0's Borsh schema size bound.
     #[error("Borsh schema is {actual} bytes; maximum is {max}")]
     TooLarge { actual: usize, max: usize },
     /// The schema cannot be decoded or violates Borsh's schema invariants.

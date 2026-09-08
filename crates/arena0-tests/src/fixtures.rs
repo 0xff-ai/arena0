@@ -174,12 +174,12 @@ pub async fn spawn_live_execution(
     cryptos.sort_by_key(NodeKeys::peer_id);
     let peer_ids = cryptos.iter().map(NodeKeys::peer_id).collect::<Vec<_>>();
     let program = Program::try_from(wasm.clone()).expect("program");
-    let admitted = WasmtimeEngine::new()
+    let loaded = WasmtimeEngine::new()
         .expect("sandbox engine")
-        .admit(&program)
-        .expect("admit program");
+        .load(&program)
+        .expect("load program");
     let params_json = arena0_program::JsonBytes::try_new(params.clone()).expect("JSON params");
-    let initialized = admitted
+    let initialized = loaded
         .initialize(InitializeCall::new(params_json.clone()))
         .expect("initialize program");
     let initial_state = StateHash::of(initialized.shared.as_bytes());
@@ -248,13 +248,13 @@ pub async fn spawn_live_execution(
         .commit_activation(activation.clone(), 4)
         .await
         .expect("commit activation");
-    let admitted = WasmtimeEngine::new()
+    let loaded = WasmtimeEngine::new()
         .expect("sandbox engine")
-        .admit(&program)
-        .expect("admit program for actor");
+        .load(&program)
+        .expect("load program for actor");
     let context = ExecContext::new(
         exec_id,
-        admitted,
+        loaded,
         params_json,
         activation.clone(),
         execution_key(identity.as_ref()),

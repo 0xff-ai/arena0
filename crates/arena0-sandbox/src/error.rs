@@ -43,7 +43,7 @@ pub enum SandboxError {
     /// The program wrote to the session memory region during a read-only phase.
     #[error("read-only violation: program wrote to state region during {operation}")]
     ReadOnlyViolation { operation: String },
-    /// A Wasm program exceeds the host admission bound.
+    /// A Wasm program exceeds the host program-size bound.
     #[error("program size {size} exceeds the limit of {max} bytes")]
     ProgramTooLarge { size: u64, max: u64 },
     /// A memory allocation would exceed the configured limit.

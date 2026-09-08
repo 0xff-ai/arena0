@@ -189,9 +189,9 @@ pub enum ProgramStoreOutcome {
 /// Result of unregistering one content-addressed program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgramRemoveOutcome {
-    /// New-admission membership was removed; artifact bytes remain durable.
+    /// Active catalog membership was removed; artifact bytes remain durable.
     Removed,
-    /// It was already absent from new-admission membership.
+    /// It was already absent from active catalog membership.
     AlreadyRemoved,
 }
 
@@ -350,7 +350,7 @@ impl ExecutionRequest {
         self.execution_id
     }
 
-    /// Return the admitted program content address.
+    /// Return the requested program content address.
     #[must_use]
     pub const fn program_hash(&self) -> ProgramHash {
         self.program_hash
@@ -1731,8 +1731,8 @@ impl StoreHandle {
         response.await.map_err(|_| StoreError::ReplyDropped)?
     }
 
-    /// Unregister a program from new admission while retaining its bytes for
-    /// existing durable execution recovery.
+    /// Unregister a program from the active catalog while retaining its bytes
+    /// for existing durable execution recovery.
     pub async fn remove_program(
         &self,
         hash: ProgramHash,

@@ -17,7 +17,7 @@ use arena0_protocol::{
     PrivateRecord, PublicEvent, SharedDelta, StateHash, TRACE_FORMAT_VERSION, Ticket, TicketAction,
     TicketData, TicketHash, TraceEntry, WitnessCommitment,
 };
-use arena0_sandbox::{AdmittedProgram, LocalEvent, Program, WasmtimeEngine};
+use arena0_sandbox::{LoadedProgram, LocalEvent, Program, WasmtimeEngine};
 use arena0_store::{Store, StoreConfig};
 use arena0_transport::Transport;
 use arena0_transport::local::{LocalNetwork, LocalTransport};
@@ -128,18 +128,18 @@ impl Fixture {
         }
     }
 
-    fn admitted_program(&self) -> Arc<AdmittedProgram> {
+    fn loaded_program(&self) -> Arc<LoadedProgram> {
         let program = Program::parse(self.wasm.clone()).expect("program");
         WasmtimeEngine::new()
             .expect("sandbox engine")
-            .admit(&program)
-            .expect("admitted program")
+            .load(&program)
+            .expect("loaded program")
     }
 
     fn context(&self) -> ExecContext {
         ExecContext {
             exec_id: EXEC_ID,
-            program: self.admitted_program(),
+            program: self.loaded_program(),
             params: self.params.clone(),
             activation: self.activation.clone(),
             execution_key: self.local_execution_key(),
