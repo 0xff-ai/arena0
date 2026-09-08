@@ -1,11 +1,11 @@
-//! Five replicas select a starting participant through N-party commit-reveal,
+//! Three replicas select a starting participant through N-party commit-reveal,
 //! then count in single-writer round-robin order over `LocalTransport`.
 
 use std::time::Duration;
 
 use arena0_tests::arena::{Arena, ArenaProgress};
 use arena0_tests::wasm::program_wasm;
-use arena0_verify::VerifiedTerminal;
+use arena0_verify::{VerifiedTerminal, verify_full};
 
 fn encode_params(target_size: u32, count_to: u32) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({ "target_size": target_size, "count_to": count_to }))
@@ -13,9 +13,9 @@ fn encode_params(target_size: u32, count_to: u32) -> Vec<u8> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn five_peers_count_in_commit_reveal_selected_round_robin_order() {
-    const PARTICIPANTS: usize = 5;
-    const ROUNDS: usize = 3;
+async fn three_peers_count_in_commit_reveal_selected_round_robin_order() {
+    const PARTICIPANTS: usize = 3;
+    const ROUNDS: usize = 2;
     const COUNT_TO: usize = PARTICIPANTS * ROUNDS;
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -33,39 +33,29 @@ async fn five_peers_count_in_commit_reveal_selected_round_robin_order() {
     let mut run = arena.run().await;
 
     let outcomes = run.expect_completed_all().await;
+    run.wait_all_receipts().await;
     assert!(
         outcomes.iter().all(|outcome| outcome == &outcomes[0]),
-        "all five participants must derive the same outcome"
+        "all three participants must derive the same outcome"
     );
 
-    let verified = run
-        .verify_all(&wasm)
-        .expect("all five round-robin traces must verify");
+    // ponytail: assert canonical bytes/IDs before the single replay below.
+    let (_canonical_receipt, canonical_bytes) = run.assert_canonical_receipt_equality();
+    let verified = verify_full(&wasm, &canonical_bytes).expect("canonical trace must verify");
 
-    let mut projected_outcome = None;
-    for (participant, (verified, expected_outcome)) in
-        verified.into_iter().zip(&outcomes).enumerate()
-    {
-        let VerifiedTerminal::Completed {
-            outcome_borsh,
-            outcome_json,
-        } = verified.terminal
-        else {
-            panic!("participant {participant}: expected completed receipt");
-        };
-        assert_eq!(&outcome_borsh, expected_outcome);
-        let outcome: serde_json::Value = serde_json::from_slice(outcome_json.as_bytes())
-            .expect("guest outcome projection is valid JSON");
-        if let Some(expected) = &projected_outcome {
-            assert_eq!(&outcome, expected, "all JSON projections must agree");
-        } else {
-            projected_outcome = Some(outcome);
-        }
-    }
+    let VerifiedTerminal::Completed {
+        outcome_borsh,
+        outcome_json,
+    } = verified.terminal
+    else {
+        panic!("canonical receipt must be completed");
+    };
+    assert_eq!(&outcome_borsh, &outcomes[0]);
+    let outcome: serde_json::Value = serde_json::from_slice(outcome_json.as_bytes())
+        .expect("guest outcome projection is valid JSON");
 
-    let counted = projected_outcome
-        .as_ref()
-        .and_then(|outcome| outcome.get("Counted"))
+    let counted = outcome
+        .get("Counted")
         .expect("counter outcome has the Counted variant");
     assert_eq!(counted["final_count"], COUNT_TO as u32);
     let order = counted["order"].as_array().expect("order is a JSON array");

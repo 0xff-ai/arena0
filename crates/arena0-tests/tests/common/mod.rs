@@ -12,10 +12,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arena0_api::{HostRequest, NextEvent, Request, Response, ResponseOk};
-use arena0_daemon::{Daemon, McpConfig};
+use arena0_daemon::{Daemon, Keystore, McpConfig};
 use arena0_home::{Home, HostName};
 use arena0_program::ProgramHash;
 use arena0_protocol::SessionHash;
+use arena0_store::{Store, StoreConfig};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 
@@ -187,8 +188,28 @@ pub struct DaemonHarness {
     pub program_id: ProgramHash,
 }
 
-/// Boot one daemon endpoint with two Hosts, import the program into both
-/// namespaces, and return the shared endpoint plus explicit Host targets.
+/// Seed one durable Host namespace for a daemon started with bootstrap disabled.
+/// The daemon then reopens this identity and store without importing its seven
+/// built-in programs; each test imports only the guest artifact it exercises.
+async fn seed_host(home: &Home, name: &HostName) {
+    let state_dir = home.host(name).state_dir().to_owned();
+    let keys_dir = state_dir.join("keys");
+    std::fs::create_dir_all(&keys_dir).expect("Host state directories");
+    let keystore = Keystore::open(keys_dir).expect("Host keystore");
+    let identity = keystore
+        .new_identity(Some(name.to_string()))
+        .expect("Host identity");
+    let store = Store::open(StoreConfig::new(
+        state_dir.join("arena0.sqlite"),
+        identity.peer_id,
+    ))
+    .expect("Host store");
+    store.shutdown().await.expect("Host store shutdown");
+}
+
+/// Boot one daemon endpoint with two pre-seeded Hosts, import the requested
+/// program into both namespaces, and return the shared endpoint plus explicit
+/// Host targets.
 pub async fn daemon(wasm: &[u8]) -> DaemonHarness {
     let home_dir = tempfile::tempdir().unwrap();
     let home = Home::from_root(home_dir.path().to_path_buf()).unwrap();
@@ -197,12 +218,14 @@ pub async fn daemon(wasm: &[u8]) -> DaemonHarness {
     let host_b = HostName::try_from("b").unwrap();
     let mcp = McpConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)), None).unwrap();
     let engine = Arc::new(arena0_sandbox::WasmtimeEngine::new().expect("sandbox engine"));
+    seed_host(&home, &host_a).await;
+    seed_host(&home, &host_b).await;
     let supervisor = Daemon::start(
         vec![host_a.clone(), host_b.clone()],
         mcp,
         engine,
         home,
-        true,
+        false,
     )
     .await
     .unwrap_or_else(|error| panic!("start daemon supervisor: {error}"));

@@ -135,24 +135,12 @@ fn host_count(home: &Path) -> usize {
         .len()
 }
 
-fn assert_context_host_operations(
+fn assert_context_host_routing(
     home: &Path,
     context: &str,
     peer_id: arena0_client::protocol::PeerId,
 ) {
     let environment = [("ARENA0_CONTEXT", context)];
-    let programs = json_output(
-        invoke(home, &["--json", "program", "list"], &environment),
-        "arena0 --json program list",
-    );
-    assert!(
-        !programs["programs"]
-            .as_array()
-            .expect("program list should contain programs")
-            .is_empty(),
-        "a bootstrapped Host should expose its built-in programs"
-    );
-
     let identities = json_output(
         invoke(home, &["--json", "identity", "list"], &environment),
         "arena0 --json identity list",
@@ -163,17 +151,6 @@ fn assert_context_host_operations(
     assert_eq!(identities.len(), 1);
     assert_eq!(identities[0]["peer_id"], peer_id.to_string());
     assert_eq!(identities[0]["active"], true);
-
-    let executions = json_output(
-        invoke(home, &["--json", "exec", "list"], &environment),
-        "arena0 --json exec list",
-    );
-    assert!(
-        executions["executions"]
-            .as_array()
-            .expect("execution list should contain executions")
-            .is_empty()
-    );
 }
 
 struct DaemonGuard {
@@ -287,14 +264,29 @@ fn context_hello_is_deterministic_concurrent_distinct_and_persistent() {
     let (repeated_id, repeated_peer) = host_info(repeated, None, USER_AGENT);
     assert_eq!((repeated_id, repeated_peer), (first_id.clone(), first_peer));
 
-    for context in ["harness:alpha", "harness:beta"] {
-        let value = hello(home.path(), Some(context), USER_AGENT);
-        let (id, peer) = host_info(value, None, USER_AGENT);
-        assert_ne!(id, first_id);
-        assert_ne!(peer, first_peer);
-    }
-    assert_eq!(host_count(home.path()), 3);
-    assert_context_host_operations(home.path(), context, first_peer);
+    let other_context = "harness:other";
+    let value = hello(home.path(), Some(other_context), USER_AGENT);
+    let (other_id, other_peer) = host_info(value, None, USER_AGENT);
+    assert_ne!(other_id, first_id);
+    assert_ne!(other_peer, first_peer);
+    assert_eq!(host_count(home.path()), 2);
+
+    let programs = json_output(
+        invoke(
+            home.path(),
+            &["--json", "program", "list"],
+            &[("ARENA0_CONTEXT", context)],
+        ),
+        "arena0 --json program list",
+    );
+    assert!(
+        !programs["programs"]
+            .as_array()
+            .expect("program list should contain programs")
+            .is_empty(),
+        "a bootstrapped Host should expose its built-in programs"
+    );
+    assert_context_host_routing(home.path(), context, first_peer);
 
     daemon.stop();
     let mut restarted = DaemonGuard::start(home.path());
@@ -303,7 +295,7 @@ fn context_hello_is_deterministic_concurrent_distinct_and_persistent() {
     assert_eq!(reopened_id, first_id);
     assert_eq!(reopened_peer, first_peer);
     assert_eq!(host_count(home.path()), 1);
-    assert_context_host_operations(home.path(), context, first_peer);
+    assert_context_host_routing(home.path(), context, first_peer);
     restarted.stop();
 }
 

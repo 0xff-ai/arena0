@@ -26,7 +26,6 @@ use arena0_sandbox::{InitializeCall, Program, WasmtimeEngine};
 use arena0_store::{Store, StoreConfig, StoreHandle};
 use arena0_transport::Transport;
 use arena0_transport::local::LocalTransport;
-use arena0_verify::verify_full;
 use tempfile::TempDir;
 use tokio::sync::Barrier;
 
@@ -51,7 +50,6 @@ pub enum ArenaProgress {
     SessionStarted,
     CertifiedStep { step: u64 },
     TerminalPublished,
-    ReceiptReplay { elapsed_us: u64, success: bool },
 }
 
 /// A monotonic, participant-scoped point in an [`Arena`] run.
@@ -126,17 +124,10 @@ fn progress_summary(timeline: &[TimedProgress], participant_count: usize) -> Str
         let terminal = points.iter().find_map(|point| {
             matches!(&point.progress, ArenaProgress::TerminalPublished).then_some(point.elapsed_us)
         });
-        let replay = points.iter().find_map(|point| match &point.progress {
-            ArenaProgress::ReceiptReplay {
-                elapsed_us,
-                success,
-            } => Some((*elapsed_us, *success)),
-            _ => None,
-        });
         let (last_step, last_step_at) = certified.last().copied().unzip();
         let _ = write!(
             summary,
-            "p{participant}[neg@{negotiation:?} start@{started:?} steps={count} last={last_step:?}@{last_step_at:?} terminal@{terminal:?} replay={replay:?}] ",
+            "p{participant}[neg@{negotiation:?} start@{started:?} steps={count} last={last_step:?}@{last_step_at:?} terminal@{terminal:?}] ",
             count = certified.len(),
         );
     }
@@ -849,62 +840,27 @@ impl Run {
         self.receipt(i).encode().expect("encode receipt")
     }
 
-    /// Replay-verify every participant's complete durable receipt, returning
-    /// the verified outcomes in participant order.
-    pub fn verify_all(&self, wasm: &[u8]) -> Result<Vec<arena0_verify::VerifiedOutcome>, String> {
-        let jobs = (0..self.node_count())
-            .map(|i| {
-                let receipt = self.participants[i]
-                    .receipt
-                    .as_ref()
-                    .ok_or_else(|| format!("node {i}: missing receipt"))?;
-                let bytes = receipt
-                    .encode()
-                    .map_err(|error| format!("node {i}: {error}"))?;
-                Ok((i, bytes, self.session_hash(i)))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        std::thread::scope(|scope| {
-            let mut replays = Vec::with_capacity(jobs.len());
-            for (i, bytes, expected_session) in jobs {
-                let timeline = Arc::clone(&self.timeline);
-                let timeline_started = self.timeline_started;
-                replays.push(scope.spawn(move || {
-                    let replay_started = Instant::now();
-                    let result = verify_full(wasm, &bytes)
-                        .map_err(|error| format!("node {i}: {error:?}"))
-                        .and_then(|verified| {
-                            if verified.session_id != expected_session {
-                                return Err(format!(
-                                    "node {i}: verifier returned session {}, expected {}",
-                                    verified.session_id, expected_session
-                                ));
-                            }
-                            Ok(verified)
-                        });
-                    let replay_elapsed_us =
-                        u64::try_from(replay_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-                    record_progress(
-                        &timeline,
-                        timeline_started,
-                        i,
-                        ArenaProgress::ReceiptReplay {
-                            elapsed_us: replay_elapsed_us,
-                            success: result.is_ok(),
-                        },
-                    );
-                    result
-                }));
-            }
-            replays
-                .into_iter()
-                .map(|replay| {
-                    replay
-                        .join()
-                        .map_err(|_| "full-replay worker panicked".to_owned())?
-                })
-                .collect()
-        })
+    /// Assert every participant retains the same canonical artifact bytes and
+    /// content identity, returning participant zero's artifact and its bytes
+    /// for the single replay performed by a program integration test.
+    pub fn assert_canonical_receipt_equality(&self) -> (ReceiptArtifact, Vec<u8>) {
+        let canonical = self.receipt(0);
+        let canonical_bytes = self.receipt_bytes(0);
+        let canonical_id = canonical.receipt_id();
+        for participant in 1..self.node_count() {
+            let receipt = self.receipt(participant);
+            assert_eq!(
+                self.receipt_bytes(participant),
+                canonical_bytes,
+                "participant {participant} must retain the canonical receipt bytes"
+            );
+            assert_eq!(
+                receipt.receipt_id(),
+                canonical_id,
+                "participant {participant} must retain the canonical receipt id"
+            );
+        }
+        (canonical, canonical_bytes)
     }
 
     fn drain_events(&mut self) {

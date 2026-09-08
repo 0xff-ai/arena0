@@ -959,9 +959,18 @@ fn terminal_proof_requires_certificate_then_atomic_publication() {
     let last = tampered.len() - 1;
     tampered[last] ^= 1;
     assert!(ReceiptArtifact::decode(&tampered).is_err());
-    let mut old_version = bytes;
+    let mut old_version = bytes.clone();
     old_version[0] = 1;
     assert!(ReceiptArtifact::decode(&old_version).is_err());
+
+    let mut truncated = bytes.clone();
+    truncated.pop();
+    assert!(ReceiptArtifact::decode(&truncated).is_err());
+
+    let mut trailing = bytes;
+    trailing.push(0);
+    assert!(ReceiptArtifact::decode(&trailing).is_err());
+
     let json = serde_json::to_value(&receipt).expect("json");
     assert_eq!(
         serde_json::from_value::<ReceiptArtifact>(json.clone()).expect("JSON round trip"),

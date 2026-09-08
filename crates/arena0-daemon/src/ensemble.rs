@@ -1359,15 +1359,20 @@ async fn join_server_task(
 mod construction_tests {
     use super::*;
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn over_capacity_initial_hosts_fail_before_provisioning() {
+    fn test_setup() -> (tempfile::TempDir, Home, Arc<WasmtimeEngine>, McpConfig) {
         let directory = tempfile::tempdir().unwrap();
         let home = Home::from_root(directory.path().to_owned()).unwrap();
+        let mcp = McpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        let engine = Arc::new(WasmtimeEngine::new().unwrap());
+        (directory, home, engine, mcp)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn over_capacity_initial_hosts_fail_before_provisioning() {
+        let (_directory, home, engine, mcp) = test_setup();
         let names = (0..=MAX_LOCAL_HOSTS)
             .map(HostName::for_local_index)
             .collect::<Vec<_>>();
-        let mcp = McpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap();
-        let engine = Arc::new(WasmtimeEngine::new().unwrap());
 
         let error = match Daemon::start(names.clone(), mcp, engine, home.clone(), true).await {
             Ok(_) => panic!("an over-capacity ensemble must be rejected"),
@@ -1383,11 +1388,8 @@ mod construction_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_start_releases_home_only_after_store_cleanup() {
-        let directory = tempfile::tempdir().unwrap();
-        let home = Home::from_root(directory.path().to_owned()).unwrap();
-        let engine = Arc::new(WasmtimeEngine::new().unwrap());
+        let (_directory, home, engine, mcp) = test_setup();
         let names = vec!["first".parse().unwrap(), "second".parse().unwrap()];
-        let mcp = McpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap();
         let starting = tokio::spawn(Daemon::start(
             names.clone(),
             mcp.clone(),
@@ -1427,9 +1429,43 @@ mod construction_tests {
         })
         .await
         .expect("cancelled construction retained the home lease");
-        let restarted = Daemon::start(names, mcp, engine, home, false)
-            .await
-            .expect("stores must be reusable as soon as the home lease is released");
-        restarted.stop().await;
+        for name in names {
+            let paths = Paths::from_location(&home.host(&name)).unwrap();
+            let reservation = Store::reserve(&paths.db_path)
+                .expect("stores must be reusable as soon as the home lease is released");
+            drop(reservation);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_host_open_does_not_mutate_keystore_and_retry_recovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::from_root(directory.path().to_owned()).unwrap();
+        let name: HostName = "locked".parse().unwrap();
+        let paths = Paths::from_location(&home.host(&name)).unwrap();
+        paths.ensure_dirs().unwrap();
+        let reservation = Store::reserve(&paths.db_path).expect("reserve Host ownership");
+
+        let error = HostConfig::open(name.clone(), paths.clone(), true)
+            .expect_err("an existing store owner must block Host provisioning");
+        assert!(
+            format!("{error:#}").contains("already owned"),
+            "unexpected lock error: {error:#}"
+        );
+        assert!(paths.keys_dir.is_dir(), "Host setup should create keys dir");
+        assert!(
+            std::fs::read_dir(&paths.keys_dir)
+                .expect("read keys dir")
+                .next()
+                .is_none(),
+            "ownership must be acquired before keystore mutation"
+        );
+
+        drop(reservation);
+        let config = HostConfig::open(name, paths.clone(), true)
+            .expect("retry after releasing the store owner");
+        assert_eq!(config.keystore.list().unwrap().len(), 1);
+        assert_eq!(config.store.handle().host_id(), config.peer_id());
+        config.store.shutdown().await.expect("Host store shutdown");
     }
 }

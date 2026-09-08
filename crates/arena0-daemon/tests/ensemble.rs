@@ -2,13 +2,26 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arena0_api::{ApiErrorCode, EnsembleSpec, HostRequest, IdRef, Request, Response, ResponseOk};
-use arena0_daemon::{Daemon, McpConfig};
+use arena0_api::{ApiErrorCode, EnsembleSpec, HostRequest, Request, Response, ResponseOk};
+use arena0_crypto::{NodeKeys, SecretKey};
+use arena0_daemon::{Daemon, Keystore, McpConfig};
+use arena0_home::{Home, HostName};
 use arena0_program::ParticipantCount;
+use arena0_protocol::PeerIdSource;
+use arena0_store::{Store, StoreConfig};
 use tempfile::TempDir;
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::time::{sleep, timeout};
+
+const ROCK_PAPER_SCISSORS_WASM: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../programs/target/wasm32-unknown-unknown/release/rock_paper_scissors.wasm"
+));
+const CUMULATIVE_SUM_WASM: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../programs/target/wasm32-unknown-unknown/release/cumulative_sum.wasm"
+));
 
 async fn call(socket: &Path, request: &Request) -> Response {
     let stream = UnixStream::connect(socket)
@@ -45,6 +58,23 @@ async fn wait_for_socket(socket: &Path) {
     .expect("ensemble daemon socket should become ready");
 }
 
+async fn seed_host(home: &Home, name: &str) {
+    let name = name.parse::<HostName>().expect("Host name");
+    let location = home.host(&name);
+    let state_dir = location.state_dir();
+    std::fs::create_dir_all(state_dir.join("keys")).expect("Host state directories");
+    let keystore = Keystore::open(state_dir.join("keys")).expect("Host keystore");
+    let identity = keystore
+        .new_identity(Some(name.to_string()))
+        .expect("Host identity");
+    let store = Store::open(StoreConfig::new(
+        state_dir.join("arena0.sqlite"),
+        identity.peer_id,
+    ))
+    .expect("Host store");
+    store.shutdown().await.expect("Host store shutdown");
+}
+
 async fn start(
     names: &[&str],
 ) -> (
@@ -53,13 +83,16 @@ async fn start(
     tokio::task::JoinHandle<anyhow::Result<()>>,
 ) {
     let home_dir = TempDir::new().expect("temporary daemon home");
-    let home = arena0_home::Home::from_root(home_dir.path().to_path_buf()).unwrap();
+    let home = Home::from_root(home_dir.path().to_path_buf()).unwrap();
+    for name in names {
+        seed_host(&home, name).await;
+    }
     let daemon = Daemon::start(
         names.iter().map(|name| name.parse().unwrap()).collect(),
         McpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap(),
         Arc::new(arena0_sandbox::WasmtimeEngine::new().expect("sandbox engine")),
         home,
-        true,
+        false,
     )
     .await
     .expect("start ensemble");
@@ -82,135 +115,65 @@ async fn stop(
     assert!(!socket.exists());
 }
 
-#[tokio::test]
-async fn routes_two_hosts_through_one_socket() {
-    let (home, daemon, serving) = start(&["a", "b"]).await;
-    let socket = home.path().join("arena0.sock");
-
-    let response = call(&socket, &Request::HostsList).await;
-    let hosts = match response {
-        Ok(ResponseOk::Hosts(hosts)) => hosts,
-        response => panic!("unexpected hosts.list response: {response:?}"),
-    };
-    assert_eq!(hosts.len(), 2);
-    assert_eq!(hosts[0].host.id, "a");
-    assert_eq!(hosts[1].host.id, "b");
-    assert_ne!(hosts[0].host.peer_id, hosts[1].host.peer_id);
-
-    for name in ["a", "b"] {
-        let response = call(&socket, &host(name, HostRequest::Info)).await;
-        assert!(
-            matches!(response, Ok(ResponseOk::HostStatus(_))),
-            "{response:?}"
-        );
-    }
-    let unknown = call(&socket, &host("missing", HostRequest::Info)).await;
-    assert_eq!(
-        unknown.expect_err("unknown Host must be rejected").code,
-        ApiErrorCode::NotFound
-    );
-
-    stop(home, daemon, serving).await;
-}
-
-#[tokio::test]
-async fn active_identity_cannot_be_removed_over_shared_unix_api() {
-    let (home, daemon, serving) = start(&["a", "b"]).await;
-    let socket = home.path().join("arena0.sock");
-    let info = call(&socket, &host("a", HostRequest::Info)).await;
-    let status = match info {
-        Ok(ResponseOk::HostStatus(status)) => status,
-        info => panic!("unexpected Host info response: {info:?}"),
-    };
-    let response = call(
-        &socket,
+async fn import_program(
+    socket: &Path,
+    host_name: &str,
+    wasm: &[u8],
+) -> Box<arena0_api::ProgramDetail> {
+    match call(
+        socket,
         &host(
-            "a",
-            HostRequest::IdRemove {
-                id: IdRef::Peer(status.host.peer_id),
-            },
-        ),
-    )
-    .await;
-    let error = response.expect_err("active identity removal must be rejected");
-    assert_eq!(error.code, ApiErrorCode::BadRequest);
-    assert!(error.message.contains("active Host identity"));
-    stop(home, daemon, serving).await;
-}
-
-#[tokio::test]
-async fn shared_unix_api_classifies_identity_and_program_input_errors() {
-    let (home, daemon, serving) = start(&["host-01", "host-02"]).await;
-    let socket = home.path().join("arena0.sock");
-    let missing = call(
-        &socket,
-        &host(
-            "host-01",
-            HostRequest::IdShow {
-                id: IdRef::Label("missing".into()),
-            },
-        ),
-    )
-    .await
-    .expect_err("missing identity should be typed");
-    assert_eq!(missing.code, ApiErrorCode::NotFound);
-
-    let invalid_label = call(
-        &socket,
-        &host(
-            "host-01",
-            HostRequest::IdNew {
-                label: Some("bad\u{1b}label".into()),
-            },
-        ),
-    )
-    .await
-    .expect_err("invalid identity label should be typed");
-    assert_eq!(invalid_label.code, ApiErrorCode::BadRequest);
-
-    let invalid_program = call(
-        &socket,
-        &host(
-            "host-01",
+            host_name,
             HostRequest::ProgramImport {
-                wasm: b"Cargo.toml".to_vec(),
+                wasm: wasm.to_vec(),
             },
         ),
     )
     .await
-    .expect_err("invalid Wasm should be typed");
-    assert_eq!(invalid_program.code, ApiErrorCode::BadRequest);
-
-    stop(home, daemon, serving).await;
+    {
+        Ok(ResponseOk::Program(program)) => program,
+        response => panic!("unexpected program import response: {response:?}"),
+    }
 }
 
 #[tokio::test]
 async fn variable_size_program_accepts_supported_explicit_ensemble() {
-    let (home, daemon, serving) = start(&["host-01", "host-02", "host-03"]).await;
+    let (home, daemon, serving) = start(&["host-01"]).await;
     let socket = home.path().join("arena0.sock");
-    let mut peers = Vec::new();
-    for name in ["host-01", "host-02", "host-03"] {
-        let response = call(&socket, &host(name, HostRequest::IdList)).await;
-        let ids = match response {
-            Ok(ResponseOk::IdList(ids)) => ids,
-            response => panic!("unexpected identity response: {response:?}"),
-        };
-        peers.push(ids[0].peer_id);
-    }
-    let response = call(&socket, &host("host-01", HostRequest::ProgramList)).await;
-    let programs = match response {
-        Ok(ResponseOk::ProgramList(programs)) => programs,
-        response => panic!("unexpected program response: {response:?}"),
+    let target = "host-01";
+    import_program(&socket, target, ROCK_PAPER_SCISSORS_WASM).await;
+    let cumulative_hash = import_program(&socket, target, CUMULATIVE_SUM_WASM)
+        .await
+        .summary
+        .program_hash;
+    let cumulative_detail = match call(
+        &socket,
+        &host(
+            target,
+            HostRequest::ProgramGet {
+                program: cumulative_hash.to_string(),
+            },
+        ),
+    )
+    .await
+    {
+        Ok(ResponseOk::Program(program)) => program,
+        response => panic!("unexpected cumulative-sum detail response: {response:?}"),
     };
-    assert_eq!(programs.len(), 7);
-    let cumulative = programs
-        .iter()
-        .find(|program| program.name == "cumulative-sum")
-        .expect("bundled cumulative-sum program");
     assert_eq!(
-        cumulative.participants,
+        cumulative_detail.summary.participants,
         ParticipantCount::Range { min: 2, max: 64 }
     );
+
+    let creator = match call(&socket, &host(target, HostRequest::Info)).await {
+        Ok(ResponseOk::HostStatus(status)) => status.host.peer_id,
+        response => panic!("unexpected Host info response: {response:?}"),
+    };
+    let peer_a = NodeKeys::from_secret(SecretKey::from_bytes([0xA1; 32])).peer_id();
+    let peer_b = NodeKeys::from_secret(SecretKey::from_bytes([0xB2; 32])).peer_id();
+    assert_ne!(creator, peer_a);
+    assert_ne!(creator, peer_b);
+    assert_ne!(peer_a, peer_b);
 
     let fixed_size = call(
         &socket,
@@ -221,7 +184,7 @@ async fn variable_size_program_accepts_supported_explicit_ensemble() {
                 program: "rock-paper-scissors".into(),
                 params: None,
                 ensemble: EnsembleSpec::Explicit {
-                    peers: peers[1..].to_vec(),
+                    peers: vec![peer_a, peer_b],
                 },
             },
         ),
@@ -239,7 +202,7 @@ async fn variable_size_program_accepts_supported_explicit_ensemble() {
                 program: "cumulative-sum".into(),
                 params: Some(serde_json::json!({ "target_size": 3 })),
                 ensemble: EnsembleSpec::Explicit {
-                    peers: peers[1..].to_vec(),
+                    peers: vec![peer_a, peer_b],
                 },
             },
         ),

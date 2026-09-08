@@ -1769,13 +1769,13 @@ mod tests {
     use arena0_transport::{LocalNetwork, LocalTransport, Transport};
     use tokio::time::Instant;
 
-    use super::super::NegotiationBook;
     use super::super::support::{
         DurableOutcome, NegotiationAttempt, NegotiationDriveError, NegotiationEffects,
         NegotiationStart, PersistActivationEffect, PrepareEffect, PrepareOutcome,
         RecomputeInitialStateEffect, unix_time_ms,
     };
-    use super::NegotiationDriver;
+    use super::super::{MAX_OFFERS_PER_NEGOTIATION, NegotiationBook};
+    use super::{NegotiationDriver, REOFFER_MAX_ATTEMPTS};
     use crate::router::FetchRegistry;
 
     async fn test_driver<'a>(
@@ -1934,7 +1934,9 @@ mod tests {
         driver.deadline = None;
         let params = driver.offer.data().params.clone();
         let initial_state = driver.offer.data().initial_state;
-        for seq in 1..=100 {
+        let renewal_count =
+            u64::from(REOFFER_MAX_ATTEMPTS).max(MAX_OFFERS_PER_NEGOTIATION as u64) + 1;
+        for seq in 1..=renewal_count {
             driver.try_reoffer().expect("same terms remain open");
             assert_eq!(driver.offer.data().negotiation_id, negotiation_id);
             assert_eq!(driver.offer.data().offer_seq, seq);

@@ -490,6 +490,10 @@ async fn spawned_execution_keeps_host_router_alive_after_host_arc_drop() {
         .await
         .expect("transport acknowledgement timeout")
         .expect("durable inbound acknowledgement");
+    // The router-lifetime assertion is complete. Close the remote stream
+    // before shutting down the actor so it does not wait for the live-stream
+    // grace period to expire.
+    drop(send);
 
     let pending = fixture
         .store
