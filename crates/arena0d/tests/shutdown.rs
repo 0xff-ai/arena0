@@ -184,12 +184,9 @@ async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Re
         .ok_or_else(|| anyhow!("host-01 missing from Hosts list"))?
         .host
         .peer_id;
-    let peer_b = hosts
-        .iter()
-        .find(|status| status.host.id == host_b.as_str())
-        .ok_or_else(|| anyhow!("host-02 missing from Hosts list"))?
-        .host
-        .peer_id;
+    if !hosts.iter().any(|status| status.host.id == host_b.as_str()) {
+        return Err(anyhow!("host-02 missing from Hosts list"));
+    }
     let rps = rps_wasm()?;
     import_rps(&client, &[&host_a, &host_b], &rps).await?;
     let program = "rock-paper-scissors".to_owned();

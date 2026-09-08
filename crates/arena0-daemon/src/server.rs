@@ -4651,7 +4651,7 @@ mod tests {
 
     #[tokio::test]
     async fn withdrawal_intercepts_a_caller_owned_id_before_creation() {
-        let (_dir, _store, daemon, peer) = test_daemon();
+        let (_dir, _store, daemon, _peer) = test_daemon();
         let exec_id = ExecId([0x3a; 32]);
         let cancelling_daemon = Arc::clone(&daemon);
         let cancellation = tokio::spawn(async move {
@@ -4855,13 +4855,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn recovery_visits_unfinished_requests_after_terminal_history() {
-        let (_dir, store, daemon, peer) = test_daemon();
+        let (_dir, store, daemon, _peer) = test_daemon();
         let (program_hash, _) = store
             .handle()
             .register_program(vec![1, 2, 3], 1)
             .await
             .expect("program");
-        let other = PeerId([peer.0[0].wrapping_add(1); 32]);
         let tail = 17_u64;
         let tail_id = ExecId({
             let mut bytes = [0; 32];
@@ -4925,7 +4924,6 @@ mod tests {
         let execution_id = ExecId([0xA4; 32]);
         let negotiation_id = NegotiationId([0xA5; 32]);
         let other_keys = NodeKeys::from_secret(SecretKey::from_bytes([2; 32]));
-        let other = PeerId::from_ed25519(&other_keys.ed25519_public_key());
         let producer_bls = BlsSecretKey::from_seed(&[11; 32]).expect("producer bls");
         let other_bls = BlsSecretKey::from_seed(&[12; 32]).expect("other bls");
         let offer_data = OfferData::new(
