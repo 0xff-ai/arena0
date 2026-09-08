@@ -31,7 +31,7 @@ permissions:
 jobs:
   gate:
     name: release gate
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -126,10 +126,10 @@ jobs:
       matrix:
         include:
           - target: darwin-arm64
-            os: blacksmith-6vcpu-macos-15
+            os: macos-14
             release_dir: target/optimized-release
           - target: linux-x64
-            os: blacksmith-2vcpu-ubuntu-2204
+            os: ubuntu-26.04
             release_dir: target/optimized-release
     runs-on: ${{ matrix.os }}
     steps:

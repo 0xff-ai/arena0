@@ -27,7 +27,11 @@ jobs:
   # Steps are ordered fast-fail: formatting and clippy run before the test phase.
   check:
     name: fmt + clippy + test
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # Main pushes and PRs from repository-trusted authors use the persistent runner.
+    runs-on: >-
+      ${{ (github.event_name == 'push' ||
+          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association))
+          && 'arena0-ficus' || 'ubuntu-26.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -123,10 +127,10 @@ jobs:
             !target/doc
             !target/**/incremental
             !programs/target/**/incremental
-          key: rust-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu24-dev-${{ steps.compiler.outputs.identity }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '**/.cargo/config.toml') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: rust-v1-${{ runner.environment }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.identity }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '**/.cargo/config.toml') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            rust-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu24-dev-${{ steps.compiler.outputs.identity }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '**/.cargo/config.toml') }}-
-            rust-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu24-dev-${{ steps.compiler.outputs.identity }}-
+            rust-v1-${{ runner.environment }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.identity }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '**/.cargo/config.toml') }}-
+            rust-v1-${{ runner.environment }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.identity }}-
 
       - name: Check and test focused scope
         if: ${{ steps.scope.outputs.scope != 'docs' && steps.scope.outputs.scope != 'full' }}
