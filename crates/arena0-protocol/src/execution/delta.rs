@@ -317,6 +317,12 @@ impl PrivateDelta {
 
         let mut pending_count = 0usize;
         for (effect_index, guest_effect) in self.record.effects.iter().enumerate() {
+            let effect_index =
+                u32::try_from(effect_index).map_err(|_| ProtocolError::CollectionTooLarge {
+                    kind: "private effects",
+                    actual: effect_index,
+                    max: super::MAX_PRIVATE_EFFECTS,
+                })?;
             match guest_effect {
                 PrivateEffect::Broadcast { data } => {
                     let message_id = MessageId::derive(
@@ -394,13 +400,7 @@ impl PrivateDelta {
                         state.binding.program_hash(),
                         state.execution_id(),
                         state.private.next_record,
-                        u32::try_from(effect_index).map_err(|_| {
-                            ProtocolError::CollectionTooLarge {
-                                kind: "private effects",
-                                actual: effect_index,
-                                max: super::MAX_PRIVATE_EFFECTS,
-                            }
-                        })?,
+                        effect_index,
                         *scheme,
                         data.clone(),
                     )?;
@@ -474,6 +474,8 @@ fn validate_pending_shape(
                 .iter()
                 .position(|candidate| std::ptr::eq(candidate, effect))
                 .ok_or(ProtocolError::InvalidPendingContinuation)?;
+            let effect_index = u32::try_from(effect_index)
+                .map_err(|_| ProtocolError::InvalidPendingContinuation)?;
             let expected_id = pending_id(execution_id, record.seq, effect_index);
             if pending.id != expected_id {
                 return Err(ProtocolError::InvalidPendingContinuation);
@@ -535,13 +537,13 @@ fn validate_pending_state(
 pub fn pending_id(
     execution_id: crate::ExecId,
     private_sequence: u64,
-    effect_index: usize,
+    effect_index: u32,
 ) -> PendingId {
     let bytes = borsh::to_vec(&(
         b"arena0/pending/v1",
         execution_id,
         private_sequence,
-        effect_index as u32,
+        effect_index,
     ))
     .expect("pending id preimage is serializable");
     let digest = blake3::hash(&bytes);
@@ -555,13 +557,13 @@ pub fn pending_id(
 fn derive_timer_id(
     execution_id: crate::ExecId,
     private_sequence: u64,
-    effect_index: usize,
+    effect_index: u32,
 ) -> TimerId {
     let preimage = borsh::to_vec(&(
         b"arena0/timer-coordinate/v1",
         execution_id,
         private_sequence,
-        u32::try_from(effect_index).expect("bounded private effects fit in u32"),
+        effect_index,
     ))
     .expect("timer coordinate is serializable");
     TimerId::derive(&preimage)
