@@ -5,9 +5,9 @@ use syn::{Data, DeriveInput, Error, Fields, Result};
 
 pub(crate) fn expand_arena0_local(mut input: DeriveInput) -> Result<TokenStream2> {
     let ident = &input.ident;
-    let has_borsh_serialize = has_derive(&input, "BorshSerialize");
-    let has_borsh_deserialize = has_derive(&input, "BorshDeserialize");
-    let debug_derived = has_derive(&input, "Debug");
+    let has_borsh_serialize = has_derive(&input, "BorshSerialize")?;
+    let has_borsh_deserialize = has_derive(&input, "BorshDeserialize")?;
+    let debug_derived = has_derive(&input, "Debug")?;
     let fields = match &mut input.data {
         Data::Struct(data) => match &mut data.fields {
             Fields::Named(fields) => fields,
@@ -102,20 +102,22 @@ pub(crate) fn expand_arena0_local(mut input: DeriveInput) -> Result<TokenStream2
     })
 }
 
-fn has_derive(input: &DeriveInput, name: &str) -> bool {
-    input.attrs.iter().any(|attr| {
-        attr.path().is_ident("derive")
-            && attr
-                .parse_args_with(Punctuated::<syn::Path, syn::Token![,]>::parse_terminated)
-                .map(|derives| {
-                    derives.iter().any(|path| {
-                        path.segments
-                            .last()
-                            .is_some_and(|segment| segment.ident == name)
-                    })
-                })
-                .unwrap_or(false)
-    })
+fn has_derive(input: &DeriveInput, name: &str) -> Result<bool> {
+    let mut found = false;
+    for attr in input
+        .attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("derive"))
+    {
+        let derives =
+            attr.parse_args_with(Punctuated::<syn::Path, syn::Token![,]>::parse_terminated)?;
+        found |= derives.iter().any(|path| {
+            path.segments
+                .last()
+                .is_some_and(|segment| segment.ident == name)
+        });
+    }
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -213,5 +215,18 @@ mod tests {
             assert!(expanded.contains(":: arena0 :: borsh :: BorshDeserialize"));
             assert!(expanded.contains("\"[redacted]\""));
         }
+    }
+
+    #[test]
+    fn malformed_derive_input_is_rejected() {
+        let input: DeriveInput = syn::parse_quote! {
+            #[derive(BorshSerialize)]
+            #[derive(Debug = "invalid")]
+            pub struct Local {
+                value: u32,
+            }
+        };
+
+        assert!(expand_arena0_local(input).is_err());
     }
 }
