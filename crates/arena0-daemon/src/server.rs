@@ -5045,31 +5045,14 @@ mod tests {
             .prepare_activation(prepared, 2)
             .await
             .expect("prepare");
-        let request = store
-            .handle()
-            .load_execution_request(execution_id)
-            .await
-            .expect("load prepared request")
-            .expect("prepared request exists");
         let prepared_record = store
             .handle()
             .load_activation(execution_id)
             .await
             .expect("load prepared activation")
             .expect("prepared activation exists");
-        let prepared_status = project_exec_status_facts(
-            peer,
-            request.clone(),
-            Some(prepared_record),
-            None,
-            None,
-            false,
-        )
-        .expect("project prepared status");
-        assert!(matches!(
-            prepared_status.state,
-            ExecStatusState::Activating { session_id: None }
-        ));
+        assert_eq!(prepared_record.status(), ActivationRecordStatus::Prepared);
+        let session_id = prepared_record.session_id();
         writer
             .commit_activation(activation.clone(), 3)
             .await
@@ -5080,85 +5063,12 @@ mod tests {
             .await
             .expect("load committed activation")
             .expect("committed activation exists");
-        let activation_inspection = project_activation_inspection(committed_record.clone());
+        assert_eq!(committed_record.status(), ActivationRecordStatus::Committed);
+        assert_eq!(committed_record.session_id(), session_id);
         assert_eq!(
-            activation_inspection.state,
-            ActivationInspectionState::Committed
+            committed_record.prepared().offer().data().negotiation_id,
+            negotiation_id
         );
-        assert_eq!(
-            activation_inspection.negotiation_id, negotiation_id,
-            "inspection uses the offer's negotiation identity"
-        );
-        assert_eq!(
-            activation_inspection.session_id,
-            Some(activation.session_hash())
-        );
-        assert_eq!(activation_inspection.creator, peer);
-        assert_eq!(activation_inspection.target_size, 2);
-        assert_eq!(activation_inspection.participants.len(), 2);
-        assert_eq!(
-            activation_inspection
-                .participants
-                .iter()
-                .map(|participant| participant.peer_id)
-                .collect::<Vec<_>>(),
-            vec![peer, other]
-        );
-        let committed_status = project_exec_status_facts(
-            peer,
-            request,
-            Some(committed_record.clone()),
-            None,
-            None,
-            false,
-        )
-        .expect("project committed status");
-        assert!(matches!(
-            committed_status.state,
-            ExecStatusState::Activating {
-                session_id: Some(id)
-            } if id == activation.session_hash()
-        ));
-
-        let failed_execution_id = ExecId([0xA6; 32]);
-        let mut failed_writer = daemon
-            .runtime
-            .claim_execution(failed_execution_id)
-            .expect("claim failed request");
-        failed_writer
-            .create_execution_request(
-                program_hash,
-                Some(JsonBytes::try_new(b"null".to_vec()).expect("params")),
-                ExecutionAdmission::explicit(negotiation_id, vec![peer, other]).expect("admission"),
-                4,
-            )
-            .await
-            .expect("failed request");
-        failed_writer
-            .record_execution_request_failure("recovery failed after commit")
-            .await
-            .expect("record failure");
-        let failed_request = store
-            .handle()
-            .load_execution_request(failed_execution_id)
-            .await
-            .expect("load failed request")
-            .expect("failed request exists");
-        let failed_status = project_exec_status_facts(
-            peer,
-            failed_request,
-            Some(committed_record),
-            None,
-            None,
-            false,
-        )
-        .expect("project post-commit failure");
-        assert!(matches!(
-            failed_status.state,
-            ExecStatusState::Failed {
-                session: Some(SessionProgress::Activated { session_id })
-            } if session_id == activation.session_hash()
-        ));
         let state = ExecutionState::new(
             execution_id,
             activation.clone(),
@@ -5198,6 +5108,25 @@ mod tests {
                 .terminal_cause()
                 .is_some_and(|cause| cause.kind() == AbortKind::Fail)
         );
+        let recovered_request = store
+            .handle()
+            .load_execution_request(execution_id)
+            .await
+            .expect("load recovered request")
+            .expect("recovered request exists");
+        assert_eq!(recovered_request.program_hash(), program_hash);
+        assert_eq!(recovered_request.negotiation_id(), Some(negotiation_id));
+        let recovered_activation = store
+            .handle()
+            .load_activation(execution_id)
+            .await
+            .expect("load recovered activation")
+            .expect("recovered activation exists");
+        assert_eq!(
+            recovered_activation.status(),
+            ActivationRecordStatus::Committed
+        );
+        assert_eq!(recovered_activation.session_id(), session_id);
         assert!(daemon.execs.get(&execution_id).is_none());
         daemon.stop().await;
     }

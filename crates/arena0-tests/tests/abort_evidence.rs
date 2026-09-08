@@ -121,20 +121,17 @@ async fn shared_program_stop_produces_one_canonical_receipt() {
     let mut run = arena.run().await;
     run.wait_all_terminal().await;
     run.wait_all_receipts().await;
-    let expected = run.receipt_bytes(0);
-    for i in 0..run.node_count() {
-        assert!(matches!(
-            run.receipt(i),
-            arena0_protocol::ReceiptArtifact::Receipt(_)
-        ));
-        assert_eq!(run.receipt_bytes(i), expected);
-        assert_eq!(run.receipt(i).receipt_id(), run.receipt(0).receipt_id());
-        let verified = verify_full(&wasm, &run.receipt_bytes(i)).expect("shared stop replay");
-        assert!(matches!(
-            verified.terminal,
-            arena0_verify::VerifiedTerminal::Stopped {
-                cause: arena0_protocol::StopCause::Shared { .. }
-            }
-        ));
-    }
+    // ponytail: assert canonical bytes/IDs before the single replay below.
+    let (canonical_receipt, canonical_bytes) = run.assert_canonical_receipt_equality();
+    assert!(matches!(
+        canonical_receipt,
+        arena0_protocol::ReceiptArtifact::Receipt(_)
+    ));
+    let verified = verify_full(&wasm, &canonical_bytes).expect("shared stop replay");
+    assert!(matches!(
+        verified.terminal,
+        arena0_verify::VerifiedTerminal::Stopped {
+            cause: arena0_protocol::StopCause::Shared { .. }
+        }
+    ));
 }

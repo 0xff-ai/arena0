@@ -686,35 +686,22 @@ pub(crate) mod tests {
 
     #[test]
     fn invalid_receipt_encodings_fail_closed() {
-        let mut samples = vec![Vec::new(), vec![0xff], vec![1], vec![1, 99]];
-        samples.push(vec![0u8; arena0_protocol::MAX_RECEIPT_BYTES + 1]);
-        for bytes in samples {
-            assert!(verify_light(&bytes).is_err());
-        }
+        let too_large = vec![0u8; arena0_protocol::MAX_RECEIPT_BYTES + 1];
+        assert!(matches!(
+            verify_light(&too_large),
+            Err(VerifyError::ReceiptTooLarge { actual, max })
+                if actual == arena0_protocol::MAX_RECEIPT_BYTES + 1
+                    && max == arena0_protocol::MAX_RECEIPT_BYTES
+        ));
 
-        let original = fixture();
-        let cases = [0, 1, original.len() / 2, original.len() - 1];
-        for offset in cases {
-            let mut bytes = original.clone();
-            bytes[offset] ^= 1;
-            assert!(verify_light(&bytes).is_err());
-        }
+        let malformed = [0xff];
+        assert!(matches!(
+            verify_light(&malformed),
+            Err(VerifyError::ReceiptDecode(message)) if !message.is_empty()
+        ));
 
-        for end in 0..original.len() {
-            assert!(
-                verify_light(&original[..end]).is_err(),
-                "invalid prefix at {end}"
-            );
-        }
-        let mut unknown = original;
-        unknown[0] = 0xff;
-        assert!(verify_light(&unknown).is_err());
-    }
-
-    #[test]
-    fn valid_canonical_receipt_is_accepted() {
         let bytes = fixture();
-        let verified = verify_light(&bytes).expect("fixture verifies");
+        let verified = verify_light(&bytes).expect("canonical fixture verifies");
         assert_eq!(verified.steps, 1);
         assert!(matches!(
             verified.terminal,

@@ -1,5 +1,6 @@
 use std::io::Read;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -86,14 +87,69 @@ async fn wait_for_mcp(address: SocketAddr, deadline: Instant) -> anyhow::Result<
     }
 }
 
+fn preseed_host(home: &TempDir, name: &HostName) -> anyhow::Result<()> {
+    let state = home.path().join("hosts").join(name.as_str());
+    let keys = state.join("keys");
+    std::fs::create_dir_all(&keys).with_context(|| format!("create {} keystore", name.as_str()))?;
+    let keystore = arena0_daemon::Keystore::open(keys)
+        .with_context(|| format!("open {} keystore", name.as_str()))?;
+    keystore
+        .new_identity(Some(name.to_string()))
+        .map_err(anyhow::Error::new)
+        .with_context(|| format!("seed {} identity", name.as_str()))?;
+    std::fs::File::create(state.join("arena0.sqlite"))
+        .with_context(|| format!("seed {} store", name.as_str()))?;
+    Ok(())
+}
+
+fn rps_wasm() -> anyhow::Result<Vec<u8>> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../programs/target/wasm32-unknown-unknown/release/rock_paper_scissors.wasm");
+    std::fs::read(&path).with_context(|| {
+        format!(
+            "read required rock-paper-scissors guest {}; run `just build-programs`",
+            path.display()
+        )
+    })
+}
+
+async fn import_rps(client: &DaemonClient, hosts: &[&HostName], wasm: &[u8]) -> anyhow::Result<()> {
+    for host in hosts {
+        let response = client
+            .call_host(
+                host,
+                &HostRequest::ProgramImport {
+                    wasm: wasm.to_vec(),
+                },
+            )
+            .await?;
+        let imported = match response {
+            ResponseOk::Program(program) => program,
+            other => return Err(anyhow!("unexpected program import response: {other:?}")),
+        };
+        assert_eq!(imported.summary.name, "rock-paper-scissors");
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Result<()> {
     let home = TempDir::new().context("create isolated arena0 home")?;
+    let host_a: HostName = "host-01".parse().unwrap();
+    let host_b: HostName = "host-02".parse().unwrap();
+    preseed_host(&home, &host_a)?;
+    preseed_host(&home, &host_b)?;
     let socket = home.path().join("arena0.sock");
     let child = Command::new(env!("CARGO_BIN_EXE_arena0d"))
         .env("ARENA0_HOME", home.path())
         .env("RUST_LOG", "arena0_daemon=info,warn")
-        .args(["--host", "host-01", "--host", "host-02"])
+        .args([
+            "--host",
+            host_a.as_str(),
+            "--host",
+            host_b.as_str(),
+            "--no-bootstrap",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -122,8 +178,6 @@ async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Re
         ResponseOk::Hosts(hosts) => hosts,
         other => return Err(anyhow!("unexpected Hosts list response: {other:?}")),
     };
-    let host_a: HostName = "host-01".parse().unwrap();
-    let host_b: HostName = "host-02".parse().unwrap();
     let peer_a = hosts
         .iter()
         .find(|status| status.host.id == host_a.as_str())
@@ -136,14 +190,9 @@ async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Re
         .ok_or_else(|| anyhow!("host-02 missing from Hosts list"))?
         .host
         .peer_id;
-    let program = match client.call_host(&host_a, &HostRequest::ProgramList).await? {
-        ResponseOk::ProgramList(programs) => programs
-            .into_iter()
-            .find(|program| program.name == "rock-paper-scissors")
-            .map(|program| program.name)
-            .ok_or_else(|| anyhow!("rock-paper-scissors was not bootstrapped"))?,
-        other => return Err(anyhow!("unexpected program list response: {other:?}")),
-    };
+    let rps = rps_wasm()?;
+    import_rps(&client, &[&host_a, &host_b], &rps).await?;
+    let program = "rock-paper-scissors".to_owned();
     let created = client
         .call_host(
             &host_a,

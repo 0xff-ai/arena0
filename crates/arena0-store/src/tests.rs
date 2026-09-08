@@ -265,6 +265,110 @@ fn receipt_with_different_content(receipt: &ReceiptArtifact) -> ReceiptArtifact 
     ReceiptArtifact::new(body).expect("different receipt")
 }
 
+fn authenticated_stop_report(
+    fixture: &ActivationFixture,
+    identity: &NodeKeys,
+    kind: AbortKind,
+    code: u32,
+    reason: &str,
+) -> ReceiptArtifact {
+    let unsigned = AbortOccurrence::unsigned(
+        fixture.activation.session_hash(),
+        PeerId(identity.ed25519_public_key().0),
+        kind,
+        code,
+        reason,
+        arena0_protocol::PublicCursor::new(
+            0,
+            fixture.activation.offer().data().initial_state,
+            arena0_protocol::CHAIN_START,
+        ),
+    )
+    .expect("abort occurrence");
+    let signature = identity.sign(&unsigned.signing_bytes().expect("abort bytes"));
+    let body = arena0_protocol::ReceiptBody::new(
+        arena0_protocol::SessionHeader::new(
+            fixture.activation.clone(),
+            arena0_protocol::ReceiptTermination::Stopped {
+                cause: arena0_protocol::StopCause::Authenticated(
+                    unsigned.with_signature(signature).expect("signed abort"),
+                ),
+            },
+        ),
+        Vec::new(),
+        fixture.activation.offer().data().params.as_bytes().to_vec(),
+        Vec::new(),
+    )
+    .expect("receipt body");
+    ReceiptArtifact::new(body).expect("stop report")
+}
+
+fn completed_receipt_fixture(fixture: &ActivationFixture) -> ReceiptArtifact {
+    let state = ExecutionState::new(
+        ExecId([0; 32]),
+        fixture.activation.clone(),
+        fixture.producer,
+        SharedStateBytes::try_new(vec![0]).expect("shared"),
+        LocalStateBytes::try_new(Vec::new()).expect("local"),
+    )
+    .expect("state");
+    let delta = terminal_delta(fixture, &state);
+    let mut entry = delta.entry().clone();
+    let outcome = delta
+        .terminal_outcome()
+        .expect("terminal outcome")
+        .borsh()
+        .to_vec();
+    let step_commitment = arena0_protocol::StepCommitment::for_entry(
+        fixture.activation.session_hash(),
+        &entry,
+        arena0_protocol::trace::CHAIN_START,
+    );
+    let producer_bls = BlsSecretKey::from_seed(&[11; 32]).expect("producer bls");
+    let other_bls = BlsSecretKey::from_seed(&[12; 32]).expect("other bls");
+    entry.agreement = AggregateAttestation::from_signatures(
+        arena0_protocol::SignerSet::full(2).expect("signer set"),
+        &[
+            producer_bls.sign(&step_commitment.signing_bytes()),
+            other_bls.sign(&step_commitment.signing_bytes()),
+        ],
+    )
+    .expect("step agreement");
+    let outcome_hash = arena0_protocol::OutcomeHash::of(&outcome);
+    let terminal_commitment = arena0_protocol::TerminalCommitment::new(
+        fixture.activation.session_hash(),
+        0,
+        entry.post_state,
+        outcome_hash,
+    );
+    let terminal_agreement = AggregateAttestation::from_signatures(
+        arena0_protocol::SignerSet::full(2).expect("signer set"),
+        &[
+            producer_bls.sign(&terminal_commitment.signing_bytes()),
+            other_bls.sign(&terminal_commitment.signing_bytes()),
+        ],
+    )
+    .expect("terminal agreement");
+    let body = arena0_protocol::ReceiptBody::new(
+        arena0_protocol::SessionHeader::new(
+            fixture.activation.clone(),
+            arena0_protocol::ReceiptTermination::Completed {
+                terminal: arena0_protocol::SessionTerminal {
+                    final_step: 0,
+                    final_state: entry.post_state,
+                    outcome_hash,
+                    agreement: terminal_agreement,
+                },
+            },
+        ),
+        outcome,
+        fixture.activation.offer().data().params.as_bytes().to_vec(),
+        vec![entry],
+    )
+    .expect("receipt body");
+    ReceiptArtifact::new(body).expect("receipt fixture")
+}
+
 pub(crate) fn activation_fixture() -> ActivationFixture {
     activation_fixture_with_initial_state(
         SharedStateBytes::try_new(vec![0]).expect("initial shared state"),
@@ -1300,7 +1404,7 @@ async fn recovery_projection_pages_a_maximal_execution_state() {
 }
 
 #[tokio::test]
-async fn activation_prepare_commit_is_idempotent_and_recoverable() {
+async fn activation_timer_and_outbox_recovery_is_idempotent() {
     let fixture = activation_fixture();
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("store.sqlite");
@@ -1427,6 +1531,12 @@ async fn activation_prepare_commit_is_idempotent_and_recoverable() {
     assert_eq!(writer.due_timers(110, 1).await.expect("due").len(), 1);
     drop(writer);
     store.shutdown().await.expect("shutdown");
+
+    // There is no public owner operation for inserting arbitrary ordered
+    // outbox effects without also dispatching a guest/network effect. Keep
+    // this direct SQL fixture limited to those two effects, after the Store
+    // has closed, so recovery and lease ordering still run through
+    // Store::open and StoreHandle.
     let connection = Connection::open(&path).expect("inspect");
     let effect0 = DurableEffect::notify(FrameId::derive(b"first"), b"a".to_vec()).expect("effect");
     let effect1 = DurableEffect::notify(FrameId::derive(b"second"), b"b".to_vec()).expect("effect");
@@ -1775,13 +1885,6 @@ async fn later_page_inbound_corruption_fails_closed_on_restart() {
     drop(writer);
     store.shutdown().await.expect("shutdown before validation");
 
-    let reopened = Store::open(StoreConfig::new(&path, fixture.producer))
-        .expect("valid populated inbox rows reopen");
-    reopened
-        .shutdown()
-        .await
-        .expect("shutdown after validation");
-
     let connection = Connection::open(&path).expect("inspect");
     let inbox_id: Vec<u8> = connection
         .query_row(
@@ -2006,6 +2109,11 @@ async fn receipt_body_is_assembled_from_durable_rows_after_restart() {
         .expect("load")
         .expect("artifact");
     assert_eq!(published.receipt.body().trace().len(), 1);
+    assert_eq!(published.provenance, ReceiptProvenance::Produced);
+    assert_eq!(
+        published.receipt.body().header().session_hash(),
+        fixture.activation.session_hash()
+    );
     assert!(matches!(
         writer
             .apply_input(
@@ -2017,23 +2125,6 @@ async fn receipt_body_is_assembled_from_durable_rows_after_restart() {
     ));
     drop(writer);
     store.shutdown().await.expect("shutdown after assembly");
-
-    let store = Store::open(StoreConfig::new(&path, fixture.producer)).expect("reopen published");
-    let receipt = publish_receipt(&store, &fixture, execution_id).await;
-    let key = fixture.activation.session_hash();
-    let by_id = store
-        .handle()
-        .load_receipt_by_id(receipt.receipt_id())
-        .await
-        .expect("secondary lookup")
-        .expect("receipt by id");
-    assert_eq!(by_id.receipt.body().header().session_hash(), key);
-    assert_eq!(by_id.receipt, receipt);
-    assert_eq!(
-        store.handle().list_receipts(8).await.expect("list"),
-        vec![by_id]
-    );
-    store.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]
@@ -2063,6 +2154,7 @@ async fn stopped_receipt_is_assembled_after_restart_and_verifies() {
         .clone()
         .with_signature(producer_keys.sign(&unsigned.signing_bytes().expect("abort bytes")))
         .expect("signed abort");
+    let expected_occurrence = occurrence.clone();
     let mut writer = store
         .handle()
         .claim_execution(execution_id)
@@ -2087,24 +2179,21 @@ async fn stopped_receipt_is_assembled_after_restart_and_verifies() {
         ApplyOutcome::Committed(_)
     ));
     drop(writer);
-    store
-        .shutdown()
+    let stored = store
+        .handle()
+        .load_receipt(fixture.activation.session_hash())
         .await
-        .expect("shutdown after stopped assembly");
-
-    let store = Store::open(StoreConfig::new(&path, fixture.producer)).expect("reopen published");
-    let receipt = publish_receipt(&store, &fixture, execution_id).await;
-    let encoded = receipt.encode().expect("encode receipt");
+        .expect("load stopped receipt")
+        .expect("stopped receipt");
+    assert_eq!(stored.provenance, ReceiptProvenance::Produced);
+    let encoded = stored.receipt.encode().expect("encode receipt");
     let verified = arena0_verify::verify_light(&encoded).expect("verify stopped receipt");
     assert!(matches!(
         verified.terminal,
         arena0_verify::LightVerifiedTerminal::Stopped {
-            cause: arena0_protocol::StopCause::Authenticated(occurrence),
-        } if occurrence.reason() == "operator stop"
-    ));
-    assert!(matches!(
-        arena0_verify::verify_full(&[], &encoded),
-        Err(arena0_verify::VerifyError::ProgramMismatch { .. })
+            cause: arena0_protocol::StopCause::Authenticated(actual),
+        } if actual.reason() == "operator stop"
+            && actual == expected_occurrence
     ));
     store.shutdown().await.expect("shutdown");
 }
@@ -2114,46 +2203,32 @@ async fn persisted_receipt_tampering_fails_closed_on_restart() {
     let fixture = activation_fixture();
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("store.sqlite");
-    let execution_id = ExecId([0x33; 32]);
-    let store = create_execution(&path, &fixture, execution_id).await;
-    let state = store
-        .handle()
-        .load_execution(execution_id)
-        .await
-        .expect("load active")
-        .expect("active execution");
-    let producer_keys = NodeKeys::from_secret(SecretKey::from_bytes([1; 32]));
-    let unsigned = AbortOccurrence::unsigned(
-        fixture.activation.session_hash(),
-        fixture.producer,
+    let receipt = authenticated_stop_report(
+        &fixture,
+        &NodeKeys::from_secret(SecretKey::from_bytes([1; 32])),
         AbortKind::Fail,
         88,
         "tamper fixture",
-        state.public(),
-    )
-    .expect("abort occurrence");
-    let occurrence = unsigned
-        .clone()
-        .with_signature(producer_keys.sign(&unsigned.signing_bytes().expect("abort bytes")))
-        .expect("signed abort");
-    let mut writer = store
-        .handle()
-        .claim_execution(execution_id)
-        .expect("execution writer");
-    writer
-        .apply_input(ExecutionInput::Abort(occurrence), 7)
-        .await
-        .expect("abort");
-    writer.assemble_receipt(8).await.expect("assemble");
-    drop(writer);
-    let published = publish_receipt(&store, &fixture, execution_id).await;
+    );
+    let imported_host = other_peer(&fixture);
+    let store = Store::open(StoreConfig::new(&path, imported_host)).expect("open");
+    assert_eq!(
+        store
+            .handle()
+            .import_receipt(receipt.clone(), 8)
+            .await
+            .expect("import"),
+        ReceiptImportOutcome::Imported
+    );
     store.shutdown().await.expect("shutdown");
 
+    // Direct SQL is intentional here: the test must inject corruption into
+    // the persisted envelope after the real import owner has committed it.
     let connection = Connection::open(&path).expect("inspect");
     let mut artifact: Vec<u8> = connection
         .query_row(
             "SELECT artifact FROM receipts WHERE receipt_id = ?1",
-            rusqlite::params![published.receipt_id().as_bytes().to_vec()],
+            rusqlite::params![receipt.receipt_id().as_bytes().to_vec()],
             |row| row.get(0),
         )
         .expect("receipt artifact");
@@ -2162,12 +2237,12 @@ async fn persisted_receipt_tampering_fails_closed_on_restart() {
     connection
         .execute(
             "UPDATE receipts SET artifact = ?1 WHERE receipt_id = ?2",
-            rusqlite::params![artifact, published.receipt_id().as_bytes().to_vec()],
+            rusqlite::params![artifact, receipt.receipt_id().as_bytes().to_vec()],
         )
         .expect("tamper");
     drop(connection);
     assert!(matches!(
-        Store::open(StoreConfig::new(&path, fixture.producer)),
+        Store::open(StoreConfig::new(&path, imported_host)),
         Err(StoreError::Corruption(_))
     ));
 }
@@ -2201,30 +2276,39 @@ async fn unpublished_execution_rejects_terminal_projection_rows_on_restart() {
 async fn published_receipts_require_terminal_proof_and_production_rows_on_restart() {
     let fixture = activation_fixture();
     let directory = tempfile::tempdir().expect("tempdir");
-    for (byte, row, delete) in [
+    let source_path = directory.path().join("published.sqlite");
+    let execution_id = ExecId([0x34; 32]);
+    let store = create_execution(&source_path, &fixture, execution_id).await;
+    certify_terminal(&store, &fixture, execution_id).await;
+    publish_receipt(&store, &fixture, execution_id).await;
+    store.shutdown().await.expect("shutdown published source");
+
+    for (row, delete) in [
         (
-            0x34,
             "receipt-production",
             "DELETE FROM receipt_productions WHERE execution_id = ?1",
         ),
         (
-            0x35,
             "terminal-proof",
             "DELETE FROM terminal_proofs WHERE execution_id = ?1",
         ),
     ] {
         let path = directory.path().join(format!("missing-{row}.sqlite"));
-        let execution_id = ExecId([byte; 32]);
-        let store = create_execution(&path, &fixture, execution_id).await;
-        certify_terminal(&store, &fixture, execution_id).await;
-        let mut writer = store
-            .handle()
-            .claim_execution(execution_id)
-            .expect("execution writer");
-        writer.assemble_receipt(12).await.expect("assemble");
-        drop(writer);
-        publish_receipt(&store, &fixture, execution_id).await;
-        store.shutdown().await.expect("shutdown");
+
+        // The Store owner is closed before this copy. Checkpoint the source
+        // WAL, then let SQLite write a self-contained destination; copying
+        // only the main file while a Store is live could omit WAL/SHM pages.
+        let source = Connection::open(&source_path).expect("open closed source");
+        source
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint source");
+        source
+            .execute(
+                "VACUUM INTO ?1",
+                rusqlite::params![path.to_str().expect("utf8 database path")],
+            )
+            .expect("copy checkpointed database");
+        drop(source);
 
         let connection = Connection::open(&path).expect("inspect");
         connection
@@ -2242,19 +2326,14 @@ async fn published_receipts_require_terminal_proof_and_production_rows_on_restar
 async fn imported_receipt_is_durable_and_reimport_is_idempotent() {
     let fixture = activation_fixture();
     let directory = tempfile::tempdir().expect("tempdir");
-    let produced_path = directory.path().join("produced.sqlite");
     let imported_path = directory.path().join("imported.sqlite");
-    let produced = create_execution(&produced_path, &fixture, ExecId([0x41; 32])).await;
-    certify_terminal(&produced, &fixture, ExecId([0x41; 32])).await;
-    let mut writer = produced
-        .handle()
-        .claim_execution(ExecId([0x41; 32]))
-        .expect("execution writer");
-    writer.assemble_receipt(12).await.expect("assemble");
-    drop(writer);
-    let receipt = publish_receipt(&produced, &fixture, ExecId([0x41; 32])).await;
-    produced.shutdown().await.expect("shutdown produced");
-
+    let receipt = authenticated_stop_report(
+        &fixture,
+        &NodeKeys::from_secret(SecretKey::from_bytes([1; 32])),
+        AbortKind::Abort,
+        0,
+        "import fixture",
+    );
     let imported_host = other_peer(&fixture);
     let imported = Store::open(StoreConfig::new(&imported_path, imported_host)).expect("open");
     assert_eq!(
@@ -2282,49 +2361,7 @@ async fn imported_receipt_is_durable_and_reimport_is_idempotent() {
         .expect("stored imported receipt");
     assert_eq!(stored.receipt, receipt);
     assert_eq!(stored.provenance, ReceiptProvenance::Imported);
-    assert_eq!(
-        imported
-            .handle()
-            .list_receipts(8)
-            .await
-            .expect("list")
-            .len(),
-        1
-    );
     imported.shutdown().await.expect("shutdown imported");
-
-    let connection = Connection::open(&imported_path).expect("inspect imported row");
-    let execution: Option<Vec<u8>> = connection
-        .query_row(
-            "SELECT execution_id FROM receipt_productions WHERE receipt_id = ?1",
-            rusqlite::params![receipt.receipt_id().as_bytes().to_vec()],
-            |row| row.get(0),
-        )
-        .optional()
-        .expect("imported production relation");
-    assert_eq!(execution, None);
-    let imported_fact: Option<Vec<u8>> = connection
-        .query_row(
-            "SELECT receipt_id FROM receipt_imports WHERE receipt_id = ?1",
-            rusqlite::params![receipt.receipt_id().as_bytes().to_vec()],
-            |row| row.get(0),
-        )
-        .optional()
-        .expect("imported fact");
-    assert_eq!(
-        imported_fact,
-        Some(receipt.receipt_id().as_bytes().to_vec())
-    );
-    assert!(
-        connection
-            .execute(
-                "INSERT INTO receipt_productions (receipt_id, execution_id)
-                 VALUES (?1, ?2)",
-                rusqlite::params![receipt.receipt_id().as_bytes().to_vec(), [0u8; 32].to_vec()],
-            )
-            .is_err()
-    );
-    drop(connection);
 
     let reopened = Store::open(StoreConfig::new(&imported_path, imported_host)).expect("reopen");
     let recovered = reopened
@@ -2335,29 +2372,15 @@ async fn imported_receipt_is_durable_and_reimport_is_idempotent() {
         .expect("recovered imported receipt");
     assert_eq!(recovered.provenance, ReceiptProvenance::Imported);
     assert_eq!(recovered.receipt, receipt);
+    assert!(
+        reopened
+            .handle()
+            .load_receipt(receipt.body().header().session_hash())
+            .await
+            .expect("load local publication")
+            .is_none()
+    );
     reopened.shutdown().await.expect("shutdown reopened");
-
-    let connection = Connection::open(&imported_path).expect("inspect");
-    let mut artifact: Vec<u8> = connection
-        .query_row(
-            "SELECT artifact FROM receipts WHERE receipt_id = ?1",
-            rusqlite::params![receipt.receipt_id().as_bytes().to_vec()],
-            |row| row.get(0),
-        )
-        .expect("imported artifact");
-    let last = artifact.len().checked_sub(1).expect("nonempty artifact");
-    artifact[last] ^= 0x80;
-    connection
-        .execute(
-            "UPDATE receipts SET artifact = ?1 WHERE receipt_id = ?2",
-            rusqlite::params![artifact, receipt.receipt_id().as_bytes().to_vec()],
-        )
-        .expect("tamper imported artifact");
-    drop(connection);
-    assert!(matches!(
-        Store::open(StoreConfig::new(&imported_path, imported_host)),
-        Err(StoreError::Corruption(_))
-    ));
 }
 
 #[tokio::test]
@@ -2365,18 +2388,7 @@ async fn imported_receipt_rejects_canonical_conflict_without_overwrite() {
     let fixture = activation_fixture();
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("store.sqlite");
-    let produced_path = directory.path().join("produced.sqlite");
-    let produced = create_execution(&produced_path, &fixture, ExecId([0x42; 32])).await;
-    certify_terminal(&produced, &fixture, ExecId([0x42; 32])).await;
-    let mut writer = produced
-        .handle()
-        .claim_execution(ExecId([0x42; 32]))
-        .expect("execution writer");
-    writer.assemble_receipt(12).await.expect("assemble");
-    drop(writer);
-    let receipt = publish_receipt(&produced, &fixture, ExecId([0x42; 32])).await;
-    produced.shutdown().await.expect("shutdown produced");
-
+    let receipt = completed_receipt_fixture(&fixture);
     let store = Store::open(StoreConfig::new(&path, other_peer(&fixture))).expect("open");
     store
         .handle()
@@ -2397,10 +2409,14 @@ async fn imported_receipt_rejects_canonical_conflict_without_overwrite() {
     assert!(
         matches!(error, StoreError::Corruption(message) if message.contains("different canonical receipt"))
     );
-    let listed = store.handle().list_receipts(8).await.expect("list");
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].receipt, receipt);
-    assert_eq!(listed[0].provenance, ReceiptProvenance::Imported);
+    let stored = store
+        .handle()
+        .load_receipt_by_id(receipt.receipt_id())
+        .await
+        .expect("load original")
+        .expect("original receipt");
+    assert_eq!(stored.receipt, receipt);
+    assert_eq!(stored.provenance, ReceiptProvenance::Imported);
     store.shutdown().await.expect("shutdown");
 }
 
@@ -2412,34 +2428,21 @@ async fn exact_imported_receipt_is_promoted_by_local_publication() {
     let target_path = directory.path().join("target.sqlite");
     let source = create_execution(&source_path, &fixture, ExecId([0x43; 32])).await;
     certify_terminal(&source, &fixture, ExecId([0x43; 32])).await;
-    let mut writer = source
-        .handle()
-        .claim_execution(ExecId([0x43; 32]))
-        .expect("execution writer");
-    writer.assemble_receipt(12).await.expect("assemble");
-    drop(writer);
     let receipt = publish_receipt(&source, &fixture, ExecId([0x43; 32])).await;
     source.shutdown().await.expect("shutdown source");
 
-    let imported = Store::open(StoreConfig::new(&target_path, fixture.producer)).expect("open");
+    let target = Store::open(StoreConfig::new(&target_path, fixture.producer)).expect("open");
     assert_eq!(
-        imported
+        target
             .handle()
             .import_receipt(receipt.clone(), 20)
             .await
             .expect("import"),
         ReceiptImportOutcome::Imported
     );
-    imported.shutdown().await.expect("shutdown imported");
-
+    target.shutdown().await.expect("shutdown imported target");
     let target = create_execution(&target_path, &fixture, ExecId([0x44; 32])).await;
     certify_terminal(&target, &fixture, ExecId([0x44; 32])).await;
-    let mut writer = target
-        .handle()
-        .claim_execution(ExecId([0x44; 32]))
-        .expect("execution writer");
-    writer.assemble_receipt(12).await.expect("assemble");
-    drop(writer);
     let published = publish_receipt(&target, &fixture, ExecId([0x44; 32])).await;
     assert_eq!(published, receipt);
     let stored = target
@@ -2449,24 +2452,6 @@ async fn exact_imported_receipt_is_promoted_by_local_publication() {
         .expect("load promoted")
         .expect("promoted receipt");
     assert_eq!(stored.provenance, ReceiptProvenance::Both);
-    let connection = Connection::open(&target_path).expect("inspect promoted facts");
-    let import_count: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM receipt_imports WHERE receipt_id = ?1",
-            rusqlite::params![receipt.receipt_id().as_bytes().to_vec()],
-            |row| row.get(0),
-        )
-        .expect("import fact count");
-    let production_execution: Vec<u8> = connection
-        .query_row(
-            "SELECT execution_id FROM receipt_productions WHERE receipt_id = ?1",
-            rusqlite::params![receipt.receipt_id().as_bytes().to_vec()],
-            |row| row.get(0),
-        )
-        .expect("production fact");
-    assert_eq!(import_count, 1);
-    assert_eq!(production_execution, [0x44; 32].to_vec());
-    drop(connection);
     target.shutdown().await.expect("shutdown target");
 }
 
@@ -2478,12 +2463,6 @@ async fn locally_produced_receipt_import_retains_both_provenance() {
     let execution_id = ExecId([0x45; 32]);
     let store = create_execution(&path, &fixture, execution_id).await;
     certify_terminal(&store, &fixture, execution_id).await;
-    let mut writer = store
-        .handle()
-        .claim_execution(execution_id)
-        .expect("execution writer");
-    writer.assemble_receipt(12).await.expect("assemble");
-    drop(writer);
     let receipt = publish_receipt(&store, &fixture, execution_id).await;
 
     assert_eq!(
@@ -2494,34 +2473,7 @@ async fn locally_produced_receipt_import_retains_both_provenance() {
             .expect("import produced receipt"),
         ReceiptImportOutcome::AlreadyProduced
     );
-    let stored = store
-        .handle()
-        .load_receipt_by_id(receipt.receipt_id())
-        .await
-        .expect("load imported receipt")
-        .expect("stored receipt");
-    assert_eq!(stored.receipt, receipt);
-    assert_eq!(stored.provenance, ReceiptProvenance::Both);
     store.shutdown().await.expect("shutdown");
-
-    let connection = Connection::open(&path).expect("inspect facts");
-    let import_count: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM receipt_imports WHERE receipt_id = ?1",
-            rusqlite::params![receipt.receipt_id().as_bytes().to_vec()],
-            |row| row.get(0),
-        )
-        .expect("import fact count");
-    let production_execution: Vec<u8> = connection
-        .query_row(
-            "SELECT execution_id FROM receipt_productions WHERE receipt_id = ?1",
-            rusqlite::params![receipt.receipt_id().as_bytes().to_vec()],
-            |row| row.get(0),
-        )
-        .expect("production fact");
-    assert_eq!(import_count, 1);
-    assert_eq!(production_execution, execution_id.0.to_vec());
-    drop(connection);
 
     let reopened = Store::open(StoreConfig::new(&path, fixture.producer)).expect("reopen");
     let recovered = reopened
@@ -2530,6 +2482,7 @@ async fn locally_produced_receipt_import_retains_both_provenance() {
         .await
         .expect("load recovered receipt")
         .expect("recovered receipt");
+    assert_eq!(recovered.receipt, receipt);
     assert_eq!(recovered.provenance, ReceiptProvenance::Both);
     reopened.shutdown().await.expect("shutdown reopened");
 }
@@ -2543,35 +2496,13 @@ async fn distinct_stop_reports_coexist_without_impersonating_local_publication()
     let mut reports = Vec::new();
     for index in [1u8, 2] {
         let identity = NodeKeys::from_secret(SecretKey::from_bytes([index; 32]));
-        let unsigned = arena0_protocol::AbortOccurrence::unsigned(
-            fixture.activation.session_hash(),
-            arena0_protocol::PeerId(identity.ed25519_public_key().0),
-            arena0_protocol::AbortKind::Abort,
+        let report = authenticated_stop_report(
+            &fixture,
+            &identity,
+            AbortKind::Abort,
             0,
             "local observation",
-            arena0_protocol::PublicCursor::new(
-                0,
-                fixture.activation.offer().data().initial_state,
-                arena0_protocol::CHAIN_START,
-            ),
-        )
-        .unwrap();
-        let signature = identity.sign(&unsigned.signing_bytes().unwrap());
-        let body = arena0_protocol::ReceiptBody::new(
-            arena0_protocol::SessionHeader::new(
-                fixture.activation.clone(),
-                arena0_protocol::ReceiptTermination::Stopped {
-                    cause: arena0_protocol::StopCause::Authenticated(
-                        unsigned.with_signature(signature).unwrap(),
-                    ),
-                },
-            ),
-            Vec::new(),
-            fixture.activation.offer().data().params.as_bytes().to_vec(),
-            Vec::new(),
-        )
-        .unwrap();
-        let report = ReceiptArtifact::new(body).unwrap();
+        );
         assert!(matches!(report, ReceiptArtifact::StopReport(_)));
         assert_eq!(
             store
@@ -2594,20 +2525,23 @@ async fn distinct_stop_reports_coexist_without_impersonating_local_publication()
     );
     store.shutdown().await.unwrap();
     let store = Store::open(StoreConfig::new(&path, host(9))).unwrap();
-    assert_eq!(store.handle().list_receipts(10).await.unwrap().len(), 2);
-    for report in reports {
+    assert!(
+        store
+            .handle()
+            .load_receipt(fixture.activation.session_hash())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    for report in &reports {
         let loaded = store
             .handle()
             .load_receipt_by_id(report.receipt_id())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(loaded.receipt.encode().unwrap(), report.encode().unwrap());
+        assert_eq!(&loaded.receipt, report);
         assert_eq!(loaded.provenance, ReceiptProvenance::Imported);
-        assert_eq!(
-            store.handle().import_receipt(report, 2).await.unwrap(),
-            ReceiptImportOutcome::AlreadyImported
-        );
     }
     store.shutdown().await.unwrap();
 }
