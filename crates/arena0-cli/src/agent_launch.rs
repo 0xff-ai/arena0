@@ -312,6 +312,8 @@ fn codex_session(
             "never",
             "--sandbox",
             "workspace-write",
+            "-c",
+            "sandbox_workspace_write.network_access=true",
             "--cd",
         ])
         .arg(workspace)
@@ -344,7 +346,7 @@ fn shell_session(
     };
     let marker = quote_path(marker)?;
     Ok(format!(
-        "status=1; unset ARENA0_SOCKET ARENA0_HOST CODEX_THREAD_ID; export ARENA0_HOME={home} ARENA0_CACHE_DIR={cache} ARENA0_CONTEXT={context}; cd {workspace} && codex --ask-for-approval never --sandbox workspace-write --cd {workspace} exec --skip-git-repo-check --color always {prompt}; status=$?; tmp={marker}.tmp.$$; printf '%s\\n' \"$status\" > \"$tmp\" && mv \"$tmp\" {marker} || exit 125; exit \"$status\"",
+        "status=1; unset ARENA0_SOCKET ARENA0_HOST CODEX_THREAD_ID; export ARENA0_HOME={home} ARENA0_CACHE_DIR={cache} ARENA0_CONTEXT={context}; cd {workspace} && codex --ask-for-approval never --sandbox workspace-write -c sandbox_workspace_write.network_access=true --cd {workspace} exec --skip-git-repo-check --color always {prompt}; status=$?; tmp={marker}.tmp.$$; printf '%s\\n' \"$status\" > \"$tmp\" && mv \"$tmp\" {marker} || exit 125; exit \"$status\"",
         home = quote_path(home.root())?,
         cache = quote_path(home.cache_dir())?,
         context = crate::harness_hook::shell_quote(context),
@@ -438,6 +440,7 @@ mod tests {
                 .windows(2)
                 .any(|args| args == ["exec", "--skip-git-repo-check"])
         );
+        assert!(left_args.contains(&"sandbox_workspace_write.network_access=true".into()));
 
         let command = shell_session(
             Path::new("/tmp/work"),
@@ -448,6 +451,7 @@ mod tests {
         )
         .unwrap();
         assert!(command.contains("--ask-for-approval never"));
+        assert!(command.contains("sandbox_workspace_write.network_access=true"));
         assert!(command.contains("exec --skip-git-repo-check --color always"));
         assert!(command.contains("ARENA0_CONTEXT='arena0-launch:session:right'"));
     }
