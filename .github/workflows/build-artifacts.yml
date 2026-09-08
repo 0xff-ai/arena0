@@ -68,8 +68,9 @@ jobs:
 
       - name: Build public executables
         if: matrix.target == 'darwin-arm64'
-        run: cargo build --locked --profile optimized-release \
-          -p arena0-cli -p arena0d -p cargo-arena0
+        run: |
+          cargo build --locked --profile optimized-release \
+            -p arena0-cli -p arena0d -p cargo-arena0
 
       - name: Install Zig
         if: matrix.target == 'linux-x64'
