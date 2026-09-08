@@ -31,7 +31,7 @@ const MAX_TIMER_BATCH: usize = 16;
 const MAX_INBOX_BATCH: usize = 64;
 const MAX_CAS_RETRIES: usize = 8;
 
-/// Sole live owner of one admitted guest and its external capabilities.
+/// Sole live owner of one loaded guest and its external capabilities.
 ///
 /// The actor is intentionally private: callers interact through the
 /// command and observation handles created by `spawn_execution`.

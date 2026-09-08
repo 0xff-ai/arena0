@@ -2,7 +2,7 @@
 //!
 //! The harness deliberately follows the public construction boundary: each
 //! participant has a persistent SQLite [`arena0_store::Store`], a Host-issued
-//! execution capability, an admitted immutable Wasm program, and a local
+//! execution capability, a loaded immutable Wasm program, and a local
 //! transport endpoint. There is no mutable sandbox or in-memory store mock in
 //! this test layer.
 use std::fmt::Write as _;
@@ -224,8 +224,8 @@ impl Arena {
         let creator_params = self.params.clone();
         let creator_program = WasmtimeEngine::new()
             .expect("sandbox")
-            .admit(&program)
-            .expect("admit");
+            .load(&program)
+            .expect("load");
         let initialized = creator_program
             .initialize(InitializeCall::new(
                 JsonBytes::try_new(creator_params.clone()).expect("valid creator params"),
@@ -412,11 +412,11 @@ impl Arena {
                 let recompute_initial_state = Box::new(move |params: &[u8]| {
                     let program = Program::try_from(recompute_wasm.clone())
                         .map_err(|error| error.to_string())?;
-                    let admitted = WasmtimeEngine::new()
+                    let loaded = WasmtimeEngine::new()
                         .map_err(|error| error.to_string())?
-                        .admit(&program)
+                        .load(&program)
                         .map_err(|error| error.to_string())?;
-                    let initialized = admitted
+                    let initialized = loaded
                         .initialize(InitializeCall::new(
                             JsonBytes::try_new(params.to_vec())
                                 .map_err(|error| error.to_string())?,
@@ -486,10 +486,10 @@ impl Arena {
             let node = &identities[i];
             let node_params = creator_params.clone();
             let program = Program::try_from(wasm.clone()).expect("program");
-            let admitted = WasmtimeEngine::new()
+            let loaded = WasmtimeEngine::new()
                 .expect("sandbox creation")
-                .admit(&program)
-                .expect("admit program");
+                .load(&program)
+                .expect("load program");
             let exec_id = exec_id_for(i);
             let execution_key = host
                 .execution_key(&execution_salt_for(i), &exec_id, &negotiation_id)
@@ -497,7 +497,7 @@ impl Arena {
             let (node_committed, execution_store) = negotiated.next().expect("committed execution");
             let context = ExecContext::new(
                 exec_id,
-                admitted,
+                loaded,
                 JsonBytes::try_new(node_params.clone()).expect("valid node params"),
                 node_committed.activation().clone(),
                 execution_key,

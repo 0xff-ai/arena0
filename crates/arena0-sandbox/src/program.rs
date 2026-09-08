@@ -341,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn admission_reuses_the_engine_scoped_compiled_program() {
+    fn loading_reuses_the_engine_scoped_compiled_program() {
         let engine = WasmtimeEngine::new().unwrap();
         let program = engine.build_program(&metadata_export_module()).unwrap();
         let output = SharedWriter::default();
@@ -353,8 +353,8 @@ mod tests {
 
         let (first, second) = tracing::subscriber::with_default(subscriber, || {
             (
-                engine.admit(&program).unwrap(),
-                engine.admit(&program).unwrap(),
+                engine.load(&program).unwrap(),
+                engine.load(&program).unwrap(),
             )
         });
 
@@ -402,12 +402,12 @@ mod tests {
         let cache_dir = tempfile::tempdir().unwrap();
 
         let first = WasmtimeEngine::new_persistent(cache_dir.path()).unwrap();
-        first.admit(&program).unwrap();
+        first.load(&program).unwrap();
         assert_eq!(first.persistent_cache.as_ref().unwrap().cache_misses(), 1);
         drop(first);
 
         let second = WasmtimeEngine::new_persistent(cache_dir.path()).unwrap();
-        second.admit(&program).unwrap();
+        second.load(&program).unwrap();
         assert_eq!(second.persistent_cache.as_ref().unwrap().cache_hits(), 1);
     }
 

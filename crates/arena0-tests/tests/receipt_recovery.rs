@@ -41,9 +41,9 @@ async fn recover_after(cut: CrashAfter) {
         let peers = keys.iter().map(PeerIdSource::peer_id).collect::<Vec<_>>();
         let wasm = ordering_program_wasm(false);
         let program = Program::try_from(wasm.clone()).expect("program");
-        let admitted = WasmtimeEngine::new().unwrap().admit(&program).unwrap();
+        let loaded = WasmtimeEngine::new().unwrap().load(&program).unwrap();
         let params = JsonBytes::try_new(br#"{}"#.to_vec()).unwrap();
-        let initialized = admitted
+        let initialized = loaded
             .initialize(InitializeCall::new(params.clone()))
             .unwrap();
         let exec_id = ExecId([0x73; 32]);
@@ -140,7 +140,7 @@ async fn recover_after(cut: CrashAfter) {
         let writer = host.claim_execution(exec_id).unwrap();
         let context = ExecContext::new(
             exec_id,
-            admitted,
+            loaded,
             params,
             activation,
             execution_key(&identity),

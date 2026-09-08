@@ -1,4 +1,4 @@
-//! Program loading and immutable admitted-code ownership.
+//! Program loading and immutable compiled-code ownership.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -44,7 +44,7 @@ impl super::WasmtimeEngine {
         Ok(Self {
             engine,
             profile: ExecutionProfile::current(),
-            admitted: moka::sync::Cache::new(super::ADMISSION_CACHE_CAPACITY),
+            loaded: moka::sync::Cache::new(super::PROGRAM_CACHE_CAPACITY),
             persistent_cache,
         })
     }
@@ -55,8 +55,9 @@ impl super::WasmtimeEngine {
         &self.profile
     }
 
-    /// Compile and validate a completed program artifact.
-    pub fn admit(&self, program: &Program) -> Result<Arc<super::AdmittedProgram>, SandboxError> {
+    /// Load a completed program artifact for execution, compiling and
+    /// validating it as needed.
+    pub fn load(&self, program: &Program) -> Result<Arc<super::LoadedProgram>, SandboxError> {
         let performance_enabled = tracing::enabled!(
             target: "arena0::performance",
             tracing::Level::DEBUG
@@ -70,14 +71,14 @@ impl super::WasmtimeEngine {
                     .map(wasmtime::Cache::cache_hits)
             })
             .flatten();
-        let admitted = self
-            .admitted
+        let loaded = self
+            .loaded
             .entry(program.hash())
             .or_try_insert_with(|| self.compile(program));
 
         if let (Some(started), Some(encoded_size)) = (started, encoded_size) {
             let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-            match &admitted {
+            match &loaded {
                 Ok(entry) => {
                     let persistent_hit = persistent_hits_before.is_some_and(|before| {
                         self.persistent_cache
@@ -91,7 +92,7 @@ impl super::WasmtimeEngine {
                     };
                     tracing::debug!(
                         target: "arena0::performance",
-                        operation = "program_admission",
+                        operation = "program_load",
                         version = arena0_program::ABI_VERSION,
                         encoded_size,
                         success = true,
@@ -101,22 +102,22 @@ impl super::WasmtimeEngine {
                 }
                 Err(_) => tracing::debug!(
                     target: "arena0::performance",
-                    operation = "program_admission",
+                    operation = "program_load",
                     version = arena0_program::ABI_VERSION,
                     encoded_size,
                     success = false,
-                    result_class = "admission_error",
+                    result_class = "load_error",
                     elapsed_us,
                 ),
             }
         }
 
-        admitted
+        loaded
             .map(|entry| entry.into_value())
             .map_err(Arc::unwrap_or_clone)
     }
 
-    fn compile(&self, program: &Program) -> Result<Arc<super::AdmittedProgram>, SandboxError> {
+    fn compile(&self, program: &Program) -> Result<Arc<super::LoadedProgram>, SandboxError> {
         let module = Module::new(&self.engine, program.bytes())
             .map_err(|error| SandboxError::compilation_failed(error.to_string()))?;
         validation::validate_exports(&module)?;
@@ -133,7 +134,7 @@ impl super::WasmtimeEngine {
                 random_replay: None,
             },
         )?;
-        Ok(Arc::new(super::AdmittedProgram {
+        Ok(Arc::new(super::LoadedProgram {
             engine: self.engine.clone(),
             module,
             program: program.clone(),
@@ -208,8 +209,8 @@ impl super::WasmtimeEngine {
     }
 }
 
-impl super::AdmittedProgram {
-    /// The exact parsed artifact that passed admission.
+impl super::LoadedProgram {
+    /// The exact parsed artifact used for execution.
     #[must_use]
     pub fn program(&self) -> &Program {
         &self.program

@@ -43,7 +43,7 @@ use arena0_protocol::{
     PendingId, ReceiptArtifact, SessionHash, StateHash, TerminalKind, Ticket, TicketAction,
     TicketData, TicketHash, Viewport, system_event::SystemEvent,
 };
-use arena0_sandbox::{AdmittedProgram, InitializeCall, Program, ViewCall, WasmtimeEngine};
+use arena0_sandbox::{InitializeCall, LoadedProgram, Program, ViewCall, WasmtimeEngine};
 use arena0_transport::{NegotiationTopic, ProgramTopicEvent, Transport};
 use arena0_verify::{LightVerifiedTerminal as VerifiedLightTerminal, verify_full, verify_light};
 use retry::delay::{Exponential, jitter};
@@ -351,7 +351,7 @@ fn validate_participants(participants: ParticipantCount, target_size: u16) -> Re
 /// A confirmed execution ready for the supervisor.
 struct SpawnPlan {
     params: Vec<u8>,
-    program: Arc<AdmittedProgram>,
+    program: Arc<LoadedProgram>,
     committed: ActivatedSession,
     actor_execution_key: ExecutionKey,
     execution_store: HostExecutionStore,
@@ -1023,39 +1023,39 @@ fn offer_timeout() -> ApiError {
     )
 }
 
-/// Admit one immutable program and initialize it with the exact JSON
+/// Load one imported program and initialize it with the exact JSON
 /// parameters that will be bound by negotiation.  Initialization is a typed
 /// guest call: no mutable Wasmtime instance crosses this daemon boundary.
-fn admit_and_initialize(
+fn load_and_initialize(
     program: &Program,
     engine: &WasmtimeEngine,
     params: Vec<u8>,
     context: &str,
-) -> anyhow::Result<(Arc<AdmittedProgram>, StateHash)> {
-    let admitted = engine
-        .admit(program)
-        .map_err(|error| anyhow::anyhow!("{context} admission: {error}"))?;
+) -> anyhow::Result<(Arc<LoadedProgram>, StateHash)> {
+    let loaded = engine
+        .load(program)
+        .map_err(|error| anyhow::anyhow!("{context} program load: {error}"))?;
     let params =
         JsonBytes::try_new(params).map_err(|error| anyhow::anyhow!("{context} params: {error}"))?;
-    let initialized = admitted
+    let initialized = loaded
         .initialize(InitializeCall::new(params))
         .map_err(|error| anyhow::anyhow!("{context} initialize: {error}"))?;
-    Ok((admitted, StateHash::of(initialized.shared.as_bytes())))
+    Ok((loaded, StateHash::of(initialized.shared.as_bytes())))
 }
 
-/// Admit and initialize one program in a blocking worker. Wasmtime admission
-/// and guest execution are synchronous, while request/negotiation orchestration
+/// Load and initialize one program in a blocking worker. Wasmtime loading and
+/// guest execution are synchronous, while request/negotiation orchestration
 /// remains on the async daemon runtime.
-async fn admit_for(
+async fn load_for(
     program: &Program,
     engine: Arc<WasmtimeEngine>,
     params: Vec<u8>,
     context: &str,
-) -> Result<(Arc<AdmittedProgram>, StateHash), ApiError> {
+) -> Result<(Arc<LoadedProgram>, StateHash), ApiError> {
     let program = program.clone();
     let context = context.to_owned();
     let error_context = context.clone();
-    tokio::task::spawn_blocking(move || admit_and_initialize(&program, &engine, params, &context))
+    tokio::task::spawn_blocking(move || load_and_initialize(&program, &engine, params, &context))
         .await
         .map_err(|error| {
             ApiError::new(ApiErrorCode::Internal, format!("{error_context}: {error}"))
@@ -1063,15 +1063,15 @@ async fn admit_for(
         .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))
 }
 
-/// Re-admit a committed program and verify the immutable guest's initial
+/// Load a committed program and verify the immutable guest's initial
 /// shared state against the negotiation's locked boot fact.
-async fn admit_checked(
+async fn load_checked(
     program: &Program,
     offer_data: &OfferData,
     engine: Arc<WasmtimeEngine>,
     context: &str,
-) -> Result<Arc<AdmittedProgram>, ApiError> {
-    let (admitted, initial_state) = admit_for(
+) -> Result<Arc<LoadedProgram>, ApiError> {
+    let (loaded, initial_state) = load_for(
         program,
         engine,
         offer_data.params.as_bytes().to_vec(),
@@ -1084,7 +1084,7 @@ async fn admit_checked(
             format!("{context} boot facts do not match the local runtime"),
         ));
     }
-    Ok(admitted)
+    Ok(loaded)
 }
 
 /// The API operation owner for one Host.
@@ -1667,7 +1667,7 @@ impl HostService {
                         )
                         .await;
                 };
-                let (admitted, initial_state) = match admit_for(
+                let (loaded, initial_state) = match load_for(
                     &program,
                     Arc::clone(&self.engine),
                     activation.offer().data().params.as_bytes().to_vec(),
@@ -1682,7 +1682,7 @@ impl HostService {
                                 candidate,
                                 execution_present,
                                 format!(
-                                    "committed execution cannot be admitted: {}",
+                                    "committed execution cannot load its program: {}",
                                     error.message
                                 ),
                             )
@@ -1750,7 +1750,7 @@ impl HostService {
                         &entry,
                         SpawnPlan {
                             params: activation.offer().data().params.as_bytes().to_vec(),
-                            program: admitted,
+                            program: loaded,
                             committed,
                             actor_execution_key: actor_key,
                             execution_store,
@@ -3035,8 +3035,8 @@ impl HostService {
                 let params = preferred_params.clone().ok_or_else(|| {
                     ApiError::new(ApiErrorCode::BadRequest, "create requires params")
                 })?;
-                let (_admitted, initial_state) =
-                    admit_for(&program, Arc::clone(&self.engine), params.clone(), "create").await?;
+                let (_loaded, initial_state) =
+                    load_for(&program, Arc::clone(&self.engine), params.clone(), "create").await?;
                 let issued_at = unix_time_ms();
                 // Leave the creator ticket's clock-skew and prepare margins
                 // before the first offer is deserted. That gives the driver
@@ -3214,7 +3214,7 @@ impl HostService {
             recompute_initial_state: Box::new(move |_params: &[u8]| {
                 // The creator's re-offer hook: recompute the program's
                 // initial state for the new params.
-                admit_and_initialize(&recompute_program, &engine, _params.to_vec(), "recompute")
+                load_and_initialize(&recompute_program, &engine, _params.to_vec(), "recompute")
                     .map(|(_, initial_state)| initial_state)
                     .map_err(|error| error.to_string())
             }),
@@ -3247,7 +3247,7 @@ impl HostService {
         );
 
         let offer_data = committed.activation().offer().data().clone();
-        let program = admit_checked(
+        let program = load_checked(
             &program,
             &offer_data,
             Arc::clone(&self.engine),
@@ -3509,7 +3509,7 @@ impl HostService {
             let shared = state.shared_state().clone();
             let projection = tokio::task::spawn_blocking(move || {
                 engine
-                    .admit(&program)?
+                    .load(&program)?
                     .view(ViewCall::new(shared, ensemble, viewport))
             })
             .await
@@ -4215,7 +4215,7 @@ async fn offer_is_usable_for_join(
     // Decode and initialize the offered params before binding the durable
     // target. A preference mismatch remains eligible: the creator may counter
     // it after this offer is authenticated.
-    let Ok((_, initial_state)) = admit_for(
+    let Ok((_, initial_state)) = load_for(
         program,
         engine,
         data.params.as_bytes().to_vec(),

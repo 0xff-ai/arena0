@@ -8,7 +8,7 @@ use arena0_protocol::{
     StateHash, StopCause, TraceEntry,
 };
 use arena0_sandbox::{
-    AdmittedProgram, InitializeCall, OutcomeCall, Program, SharedCall, SharedEvent, WasmtimeEngine,
+    InitializeCall, LoadedProgram, OutcomeCall, Program, SharedCall, SharedEvent, WasmtimeEngine,
     WriterCall,
 };
 
@@ -121,10 +121,10 @@ fn verify_full_inner(
     let program = Program::try_from(program_binary.to_vec())
         .map_err(|error| VerifyError::Sandbox(error.to_string()))?;
     let engine = WasmtimeEngine::new().map_err(|error| VerifyError::Sandbox(error.to_string()))?;
-    let admitted = engine
-        .admit(&program)
+    let loaded = engine
+        .load(&program)
         .map_err(|error| VerifyError::Sandbox(error.to_string()))?;
-    verify_profile(&admitted, &receipt)?;
+    verify_profile(&loaded, &receipt)?;
 
     let session = Ensemble::<Committed>::from_peers(ensemble).map_err(|error| {
         VerifyError::ReplayMismatch {
@@ -138,7 +138,7 @@ fn verify_full_inner(
             message: format!("activation params are not valid JSON: {error}"),
         }
     })?;
-    let initialized = admitted
+    let initialized = loaded
         .initialize(InitializeCall::new(params))
         .map_err(|error| VerifyError::Sandbox(error.to_string()))?;
     let trace = receipt.body().trace();
@@ -167,11 +167,11 @@ fn verify_full_inner(
     // Re-run the read-only outcome projection against the final explicit shared
     // state only for a completed proof. A stopped proof has no outcome DTO to
     // project; its exact StopCause remains the result evidence.
-    let final_shared = replay_trace(&admitted, &session, initialized.shared, trace)?;
+    let final_shared = replay_trace(&loaded, &session, initialized.shared, trace)?;
     let terminal = match terminal {
         LightVerifiedTerminal::Stopped { cause } => VerifiedTerminal::Stopped { cause },
         LightVerifiedTerminal::Completed { outcome_borsh } => {
-            let outcome = admitted
+            let outcome = loaded
                 .outcome(OutcomeCall::new(final_shared, session))
                 .map_err(|error| VerifyError::Sandbox(error.to_string()))?;
             if outcome.borsh.as_bytes() != outcome_borsh.as_slice() {
@@ -191,10 +191,7 @@ fn verify_full_inner(
     })
 }
 
-fn verify_profile(
-    admitted: &AdmittedProgram,
-    receipt: &ReceiptArtifact,
-) -> Result<(), VerifyError> {
+fn verify_profile(loaded: &LoadedProgram, receipt: &ReceiptArtifact) -> Result<(), VerifyError> {
     let attested = receipt
         .body()
         .header()
@@ -202,7 +199,7 @@ fn verify_profile(
         .offer()
         .data()
         .execution_profile;
-    let replaying = admitted.profile().hash();
+    let replaying = loaded.profile().hash();
     if attested != replaying {
         return Err(VerifyError::FingerprintMismatch {
             attested: attested.to_string(),
@@ -213,19 +210,19 @@ fn verify_profile(
 }
 
 fn replay_trace(
-    admitted: &AdmittedProgram,
+    loaded: &LoadedProgram,
     session: &Ensemble<Committed>,
     mut shared: SharedStateBytes,
     trace: &[TraceEntry],
 ) -> Result<SharedStateBytes, VerifyError> {
     for entry in trace {
-        shared = replay_entry(admitted, session, shared, entry)?;
+        shared = replay_entry(loaded, session, shared, entry)?;
     }
     Ok(shared)
 }
 
 fn replay_entry(
-    admitted: &AdmittedProgram,
+    loaded: &LoadedProgram,
     session: &Ensemble<Committed>,
     shared: SharedStateBytes,
     entry: &TraceEntry,
@@ -249,7 +246,7 @@ fn replay_entry(
             pre_state,
             msg,
         } => {
-            let writer = admitted
+            let writer = loaded
                 .writer(WriterCall::new(shared.clone(), session.clone()))
                 .map_err(|error| VerifyError::Sandbox(error.to_string()))?;
             let sender =
@@ -281,7 +278,7 @@ fn replay_entry(
             )
         }
     };
-    let result = admitted
+    let result = loaded
         .apply_shared(call)
         .map_err(|error| VerifyError::Sandbox(error.to_string()))?;
     if result.status != CallStatus::Accepted {
@@ -366,9 +363,9 @@ mod tests {
 
     /// Build a tiny real guest that accepts two public calls, ends the session
     /// on the second one, and projects a unit outcome. The test drives this
-    /// admitted program to produce its trace rather than hand-writing guest
+    /// loaded program to produce its trace rather than hand-writing guest
     /// outputs, so full verification exercises the actual replay boundary.
-    fn admitted_replay_program() -> (Vec<u8>, Arc<AdmittedProgram>) {
+    fn loaded_replay_program() -> (Vec<u8>, Arc<LoadedProgram>) {
         let unit = JsonSchemaDocument::unit();
         let definition = ProgramDefinition {
             metadata: ProgramMetadata {
@@ -459,11 +456,11 @@ mod tests {
         let program = engine.build_program(&raw).expect("embed metadata");
         let binary = program.bytes().to_vec();
         let parsed = Program::try_from(binary.clone()).expect("parse completed program");
-        let admitted = engine.admit(&parsed).expect("admit fixture");
-        (binary, admitted)
+        let loaded = engine.load(&parsed).expect("load fixture");
+        (binary, loaded)
     }
 
-    fn replay_receipt(admitted: &AdmittedProgram, stopped: bool) -> Vec<u8> {
+    fn replay_receipt(loaded: &LoadedProgram, stopped: bool) -> Vec<u8> {
         let identities = [
             NodeKeys::from_secret(SecretKey::from_bytes([1; 32])),
             NodeKeys::from_secret(SecretKey::from_bytes([2; 32])),
@@ -488,7 +485,7 @@ mod tests {
             .map(|identity| PeerId(identity.ed25519_public_key().0))
             .collect::<Vec<_>>();
         let params = arena0_program::JsonBytes::try_new(br#"null"#.to_vec()).expect("params");
-        let initialized = admitted
+        let initialized = loaded
             .initialize(InitializeCall::new(params.clone()))
             .expect("initialize");
         let initial_state = StateHash::of(initialized.shared.as_bytes());
@@ -496,8 +493,8 @@ mod tests {
             negotiation_id,
             0,
             peers[0],
-            admitted.program().hash(),
-            admitted.profile().hash(),
+            loaded.program().hash(),
+            loaded.profile().hash(),
             params.clone(),
             2,
             initial_state,
@@ -554,7 +551,7 @@ mod tests {
         .expect("activation");
         let ensemble = Ensemble::from_peers(peers.clone()).expect("ensemble");
 
-        let started = admitted
+        let started = loaded
             .apply_shared(SharedCall::session_started(
                 initialized.shared.clone(),
                 ensemble.clone(),
@@ -645,7 +642,7 @@ mod tests {
             pre_state: first_state,
             msg: message.clone(),
         };
-        let writer = admitted
+        let writer = loaded
             .writer(arena0_sandbox::WriterCall::new(
                 started.shared.clone(),
                 ensemble.clone(),
@@ -655,7 +652,7 @@ mod tests {
             writer.writer.map(|participant| participant.index()),
             Some(0)
         );
-        let finished = admitted
+        let finished = loaded
             .apply_shared(SharedCall::new(
                 started.shared,
                 ensemble.clone(),
@@ -758,9 +755,9 @@ mod tests {
     }
 
     #[test]
-    fn replay_accepts_a_receipt_from_an_admitted_program() {
-        let (program, admitted) = admitted_replay_program();
-        let receipt = replay_receipt(&admitted, false);
+    fn replay_accepts_a_receipt_from_a_loaded_program() {
+        let (program, loaded) = loaded_replay_program();
+        let receipt = replay_receipt(&loaded, false);
 
         let verified = verify_full(&program, &receipt).expect("valid replay receipt");
         assert_eq!(verified.steps, 2);
@@ -775,8 +772,8 @@ mod tests {
 
     #[test]
     fn stopped_receipt_still_requires_the_bound_program_and_replays_its_public_prefix() {
-        let (program, admitted) = admitted_replay_program();
-        let receipt = replay_receipt(&admitted, true);
+        let (program, loaded) = loaded_replay_program();
+        let receipt = replay_receipt(&loaded, true);
 
         assert!(matches!(
             verify_full(b"not the bound program", &receipt),
@@ -797,8 +794,8 @@ mod tests {
         use std::io::{self, Write};
         use std::sync::{Arc, Mutex};
 
-        let (program, admitted) = admitted_replay_program();
-        let receipt = replay_receipt(&admitted, false);
+        let (program, loaded) = loaded_replay_program();
+        let receipt = replay_receipt(&loaded, false);
         let output = SharedWriter::default();
         let subscriber = tracing_subscriber::fmt()
             .json()

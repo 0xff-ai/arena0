@@ -15,7 +15,7 @@ use arena0_protocol::{
     NegotiationTarget, PeerIdSource, PreparedActivation, ReceiptArtifact, SessionHash,
     SharedStateBytes, View,
 };
-use arena0_sandbox::AdmittedProgram;
+use arena0_sandbox::LoadedProgram;
 use arena0_store::{
     AdmissionBindingOutcome, CommitActivationOutcome, CreateExecutionOutcome,
     ExecutionRequestFailureOutcome, ExecutionRequestOutcome, ExecutionStore,
@@ -160,13 +160,13 @@ pub enum SessionMessage {
 ///
 /// The context is consumed by [`crate::Host::spawn`].  It contains no
 /// mutable protocol state: the SQLite [`ExecutionStore`] is the sole writer
-/// for that execution, while the actor owns only this admitted guest and its
+/// for that execution, while the actor owns only this loaded guest and its
 /// live external capabilities.
 pub struct ExecContext {
     /// Stable execution identity.
     pub(crate) exec_id: ExecId,
-    /// Immutable Wasm after sandbox admission.
-    pub(crate) program: Arc<AdmittedProgram>,
+    /// Immutable Wasm loaded by the sandbox.
+    pub(crate) program: Arc<LoadedProgram>,
     /// Exact agent-facing parameters bound by activation.
     pub(crate) params: JsonBytes,
     /// Cryptographically validated activation.
@@ -184,7 +184,7 @@ impl ExecContext {
     #[must_use]
     pub fn new(
         exec_id: ExecId,
-        program: Arc<AdmittedProgram>,
+        program: Arc<LoadedProgram>,
         params: JsonBytes,
         activation: Activation,
         execution_key: ExecutionKey,
@@ -339,7 +339,7 @@ impl std::fmt::Debug for ExecContext {
 /// unrelated to its Host.
 pub(crate) struct ActorContext {
     pub(crate) exec_id: ExecId,
-    pub(crate) program: Arc<AdmittedProgram>,
+    pub(crate) program: Arc<LoadedProgram>,
     pub(crate) params: JsonBytes,
     pub(crate) activation: Activation,
     pub(crate) producer: arena0_protocol::PeerId,

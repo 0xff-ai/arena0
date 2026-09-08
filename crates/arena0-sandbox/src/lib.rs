@@ -1,9 +1,10 @@
 //! Deterministic Wasm sandbox for fresh, bounded arena0 guest calls.
 //!
-//! Admission compiles immutable Wasm once. Every semantic invocation creates a
-//! fresh Wasmtime store and instance, restores explicit shared and local state
-//! bytes, calls exactly one capability-specific export, collects one atomic
-//! result, and drops the instance. No mutable guest instance crosses this API.
+//! Loading a program compiles its immutable Wasm once per engine.
+//! Every semantic invocation creates a fresh Wasmtime store and instance,
+//! restores explicit shared and local state bytes, calls exactly one
+//! capability-specific export, collects one atomic result, and drops the
+//! instance. No mutable guest instance crosses this API.
 //!
 //! The ABI exports are `arena0_initialize`, `arena0_shared`, `arena0_local`,
 //! `arena0_writer`, `arena0_query`, `arena0_view`, `arena0_outcome`, and
@@ -23,7 +24,7 @@ pub use call::{
     InitializeCall, LocalCall, LocalEvent, OutcomeCall, QueryCall, RandomReplay, RandomReplayError,
     SharedCall, SharedEvent, ViewCall, WriterCall,
 };
-pub use engine::{AdmittedProgram, WasmtimeEngine};
+pub use engine::{LoadedProgram, WasmtimeEngine};
 pub use error::SandboxError;
 
 mod program;

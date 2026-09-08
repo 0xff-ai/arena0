@@ -1,6 +1,6 @@
 //! Greybox observations over the public Host execution boundary.
 //!
-//! These tests use a real admitted Wasm guest and a real SQLite execution
+//! These tests use a real loaded Wasm guest and a real SQLite execution
 //! store. Peer frames enter through authenticated `LocalTransport` streams;
 //! assertions observe durable traces, inbox projections, and lifecycle
 //! messages rather than a mutable sandbox mock.

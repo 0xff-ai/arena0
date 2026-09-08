@@ -4,7 +4,7 @@
 //! complete activation-chain, trace, and certificate checks and
 //! has no sandbox dependency. With the `replay` feature, full verification also
 //! accepts the exact Wasm bytes and replays every public call through fresh
-//! sandbox-admitted guest calls.
+//! sandbox instances loaded from that program.
 
 mod error;
 mod light;

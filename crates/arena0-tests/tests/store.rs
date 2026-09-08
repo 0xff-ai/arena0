@@ -65,7 +65,7 @@ async fn registry_projection_is_content_addressed_and_durable() {
             .expect("list after remove")
             .is_empty()
     );
-    // Removal only removes new-admission membership. Existing bytes remain
+    // Removal only removes active catalog membership. Existing bytes remain
     // durable for recovery, which is the store's documented projection.
     assert_eq!(
         handle

@@ -1289,13 +1289,13 @@ async fn bootstrap_programs(
         let engine = Arc::clone(engine);
         let program = tokio::task::spawn_blocking(move || {
             let program = Program::try_from((*wasm).to_vec()).context("parse embedded program")?;
-            let _admitted = engine
-                .admit(&program)
-                .map_err(|error| anyhow::anyhow!("admit embedded program: {error}"))?;
+            let _loaded = engine
+                .load(&program)
+                .map_err(|error| anyhow::anyhow!("import embedded program: {error}"))?;
             Ok::<_, anyhow::Error>(program)
         })
         .await
-        .context("join embedded program admission")??;
+        .context("join embedded program import")??;
         config
             .store
             .handle()
@@ -1396,7 +1396,7 @@ mod construction_tests {
             true,
         ));
         // Observe real construction after it opens its stores, while bundled
-        // program admission is still running. No synthetic store owner stands
+        // program import is still running. No synthetic store owner stands
         // in for the operation being cancelled.
         tokio::time::timeout(Duration::from_secs(30), async {
             while !home
