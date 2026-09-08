@@ -121,7 +121,7 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, foc
     } else {
         render_records(frame, state, area, records_focused);
         if inspector && area.height >= 9 {
-            let modal = centered(area, 84, 15);
+            let modal = crate::ui::centered(area, 84, 15);
             frame.render_widget(Clear, modal);
             render_inspector(frame, state, modal, inspector_focused);
         }

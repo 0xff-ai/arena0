@@ -32,8 +32,12 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+toml_edit = "0.25.12"
 unicode-width = { workspace = true }
 rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

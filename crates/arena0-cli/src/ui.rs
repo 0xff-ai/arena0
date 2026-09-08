@@ -7,6 +7,7 @@ use std::io::IsTerminal;
 use arena0_client::protocol::{ColorDepth, Slot, View};
 use arena0_client::sanitize;
 use owo_colors::{OwoColorize, Style as OwoStyle};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style as TuiStyle};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -264,6 +265,18 @@ pub(crate) fn terminal_width() -> u16 {
         .unwrap_or(80)
 }
 
+/// Center a bounded overlay while leaving a one-cell margin where possible.
+pub(crate) fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width.saturating_sub(2));
+    let height = height.min(area.height.saturating_sub(2));
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
 /// Render every program-owned slot for command-style views.
 #[must_use]
 pub(crate) fn render_view_summary(view: &View, palette: Palette) -> String {
@@ -397,7 +410,7 @@ pub(crate) fn render_table(
     for (i, h) in headers.iter().enumerate() {
         header_cells.push(pad(&palette.dim(h), display_width(h), widths[i]));
     }
-    out.push_str(join_row(&header_cells).trim_end());
+    out.push_str(header_cells.join("  ").trim_end());
     out.push('\n');
 
     for row in rows {
@@ -406,7 +419,7 @@ pub(crate) fn render_table(
             let cell = row.get(i).map_or("", String::as_str);
             cells.push(pad(cell, display_width(cell), *w));
         }
-        out.push_str(join_row(&cells).trim_end());
+        out.push_str(cells.join("  ").trim_end());
         out.push('\n');
     }
     out
@@ -505,10 +518,6 @@ fn pad(cell: &str, visible: usize, target: usize) -> String {
         s.push_str(&" ".repeat(target - visible));
     }
     s
-}
-
-fn join_row(cells: &[String]) -> String {
-    cells.join("  ")
 }
 
 /// Print a JSON document as the single result of a `--json` invocation.

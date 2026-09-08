@@ -6,13 +6,14 @@
 //! the actor by lifecycle and effect boundary.
 
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use arena0_transport::SendHandle;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::context::{ActorContext, SessionMessage};
+use crate::unix_time_ms as now_ms;
 
 mod actor;
 mod guest;
@@ -68,14 +69,6 @@ impl Drop for InflightSend {
             task.abort();
         }
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            duration.as_millis().try_into().unwrap_or(u64::MAX)
-        })
 }
 
 pub(crate) fn truncate_reason(mut reason: String) -> String {

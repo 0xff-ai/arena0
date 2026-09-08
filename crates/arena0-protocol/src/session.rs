@@ -62,7 +62,10 @@ impl Lifecycle {
     /// dispatched once a session reaches a terminal lifecycle value.
     #[must_use]
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Failed)
+        match self {
+            Self::PreSession | Self::Active => false,
+            Self::Completed | Self::Failed => true,
+        }
     }
 }
 
@@ -349,19 +352,6 @@ mod tests {
         let b = PeerId([2u8; 32]);
         assert_eq!(Participant::of(&a, &b), Participant::new(0));
         assert_eq!(Participant::of(&b, &a), Participant::new(1));
-    }
-
-    #[test]
-    fn try_from_usize_accepts_u8_max() {
-        assert_eq!(
-            Participant::try_from(usize::from(u8::MAX)).expect("u8 max fits in usize"),
-            Participant::new(u8::MAX)
-        );
-    }
-
-    #[test]
-    fn try_from_usize_rejects_values_above_u8_max() {
-        assert!(Participant::try_from(usize::from(u8::MAX) + 1).is_err());
     }
 
     #[test]

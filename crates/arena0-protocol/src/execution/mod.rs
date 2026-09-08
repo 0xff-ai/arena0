@@ -82,6 +82,7 @@ pub use occurrence::{
 pub use outcome::TerminalOutcome;
 pub use pending::{PendingId, PendingIdParseError};
 pub use plan::{CommitPlan, PlanId, TransitionOutcome};
+pub use reducer::transition;
 pub use signing::GuestSignData;
 pub use state::{
     ExecutionState, PendingCoordinate, PrivateCommit, SharedCommit, SharedProposal,
@@ -102,14 +103,6 @@ pub(crate) use validation::{
     validate_receipt_body, validate_receipt_body_shape, validate_shared_entry,
     validate_terminal_progress, validate_trace_entry,
 };
-
-/// Apply one pure execution input to a validated durable aggregate.
-pub fn transition(
-    state: &ExecutionState,
-    input: ExecutionInput,
-) -> Result<TransitionOutcome, ProtocolError> {
-    reducer::transition(state, input)
-}
 
 #[cfg(test)]
 mod tests;

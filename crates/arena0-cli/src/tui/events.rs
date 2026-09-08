@@ -53,7 +53,7 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, foc
     if matches!(&state.host_scope, HostScope::Compare { .. }) {
         render_compare(frame, state, area, records_focused);
         if inspector && area.height >= 9 {
-            let modal = centered(area, 84, 15);
+            let modal = crate::ui::centered(area, 84, 15);
             frame.render_widget(Clear, modal);
             render_inspector(frame, state, modal, inspector_focused);
         }
@@ -70,7 +70,7 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, foc
     } else {
         render_records(frame, state, area, records_focused);
         if inspector && area.height >= 9 {
-            let modal = centered(area, 84, 15);
+            let modal = crate::ui::centered(area, 84, 15);
             frame.render_widget(Clear, modal);
             render_inspector(frame, state, modal, inspector_focused);
         }
@@ -135,7 +135,7 @@ fn render_host_events(
             Cell::from(event_time(event.ts)),
             Cell::from(event.seq.to_string()),
             Cell::from(event.kind()),
-            Cell::from(event_summary(event)),
+            Cell::from(super::event_summary(event)),
         ])
         .style(if selected {
             state.palette.strong()
@@ -201,7 +201,7 @@ fn render_records(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, focuse
             Cell::from(host_label(&event.host)),
             Cell::from(format!("{}", event.seq)),
             Cell::from(event.kind()),
-            Cell::from(event_summary(event)),
+            Cell::from(super::event_summary(event)),
         ])
         .style(if selected {
             state.palette.strong()
@@ -300,7 +300,7 @@ fn render_inspector(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, focu
         ]));
     }
     lines.push(Line::styled(
-        format!("summary  {}", event_summary(event)),
+        format!("summary  {}", super::event_summary(event)),
         state.palette.emphasis(),
     ));
     if let Some(fields) = omitted_fields(event) {
@@ -320,100 +320,6 @@ fn render_inspector(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, focu
             .block(panel(" EVENT INSPECTOR ", state, focused)),
         area,
     );
-}
-
-pub(super) fn event_summary(event: &EventFrame) -> String {
-    match &event.data {
-        EventData::HostStarted { abi_version, .. } => format!(
-            "peer {}  ua {}  ABI {}",
-            event.host.peer_id.fmt_short(),
-            event.host.user_agent.as_deref().unwrap_or("(none)"),
-            abi_version
-        ),
-        EventData::HostStopped {
-            reason,
-            uptime_secs,
-        } => format!(
-            "uptime {}s  {}",
-            uptime_secs,
-            reason.as_deref().unwrap_or("stopped")
-        ),
-        EventData::OfferSeen {
-            creator, offer_seq, ..
-        } => format!("creator {}  offer {}", creator.fmt_short(), offer_seq),
-        EventData::Created {
-            origin,
-            queue_position,
-            ..
-        } => format!("origin {:?}  queue {:?}", origin, queue_position),
-        EventData::Terminated {
-            reason,
-            failed_class,
-        } => format!("{}  class {:?}", reason, failed_class),
-        EventData::NegotiationStarted { target_size } => format!("target {}", target_size),
-        EventData::NegotiationOfferAccepted { creator, offer_seq } => {
-            format!("creator {}  offer {}", creator.fmt_short(), offer_seq)
-        }
-        EventData::NegotiationTicketAccepted {
-            ticket_count,
-            target_size,
-            participant,
-            ..
-        } => format!(
-            "participant {}  tickets {}/{}",
-            participant.fmt_short(),
-            ticket_count,
-            target_size
-        ),
-        EventData::NegotiationPeers { lifecycle, peers } => {
-            format!("{} peers  {:?}", peers.len(), lifecycle)
-        }
-        EventData::NegotiationPrepared { participants }
-        | EventData::NegotiationResumed { participants }
-        | EventData::NegotiationCommitted { participants } => {
-            format!("{} participants", participants)
-        }
-        EventData::NegotiationRetried {
-            attempt,
-            ticket_count,
-            sig_count,
-            target_size,
-            ..
-        } => format!(
-            "attempt {}  tickets {}/{}  agreements {}/{}",
-            attempt, ticket_count, target_size, sig_count, target_size
-        ),
-        EventData::NegotiationRejoined {} => "rejoined".to_owned(),
-        EventData::NegotiationTimedOut {
-            ticket_count,
-            sig_count,
-            target_size,
-            ..
-        } => format!(
-            "tickets {}/{}  agreements {}/{}",
-            ticket_count, target_size, sig_count, target_size
-        ),
-        EventData::SessionStarted { ensemble } => format!("{} participants", ensemble.len()),
-        EventData::SessionCallout { name, .. } => format!("callout {}", name),
-        EventData::SessionCalloutAnswered { pending_id } => {
-            format!("pending {} answered", pending_id)
-        }
-        EventData::SessionStep {
-            step,
-            fuel_used,
-            signers,
-            participants,
-            ..
-        } => format!(
-            "step {}  fuel {}  agreement {}/{}",
-            step, fuel_used, signers, participants
-        ),
-        EventData::SessionEnded { terminal } => match terminal {
-            SessionTerminal::Completed { .. } => "completed".to_owned(),
-            SessionTerminal::Aborted { step, reason } => format!("aborted at {}  {}", step, reason),
-        },
-        EventData::Lagged { skipped } => format!("{} events dropped", skipped),
-    }
 }
 
 fn omitted_fields(event: &EventFrame) -> Option<&'static str> {

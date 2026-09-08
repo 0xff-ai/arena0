@@ -25,11 +25,12 @@ pub(crate) struct ServeArgs {
     #[arg(long = "hosts", value_delimiter = ',', value_name = "NAME")]
     pub(crate) hosts: Vec<HostName>,
     /// Loopback address for the daemon's MCP endpoint.
-    #[arg(long = "mcp-listen", value_name = "ADDR")]
+    #[arg(long = "mcp-listen", hide = true, value_name = "ADDR")]
     pub(crate) mcp_listen: Option<SocketAddr>,
     /// Lifetime of per-Host MCP JWTs, in seconds.
     #[arg(
         long = "mcp-access-token-lifetime-secs",
+        hide = true,
         value_name = "SECONDS",
         value_parser = clap::value_parser!(u64).range(1..)
     )]

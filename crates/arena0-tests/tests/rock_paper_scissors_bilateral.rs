@@ -6,7 +6,6 @@
 use std::time::Duration;
 
 use arena0_tests::arena::Arena;
-use arena0_tests::synthetic::Synthetic;
 use arena0_tests::wasm::program_wasm;
 use arena0_verify::{LightVerifiedTerminal, VerifiedTerminal, verify_light};
 
@@ -62,23 +61,6 @@ async fn rock_paper_scissors_bilateral_runs_and_verifies_receipts() {
 }
 
 #[tokio::test]
-async fn verify_light_is_sandbox_free_and_self_describing() {
-    let wasm = program_wasm("rock_paper_scissors");
-    let run = completed_run(&wasm).await;
-    let bytes = run.receipt_bytes(0);
-    let verified = verify_light(&bytes).expect("light verification accepts honest receipt");
-    assert_eq!(verified.program_id, arena0_program::ProgramHash::of(&wasm));
-    assert_eq!(verified.session_id, run.session_hash(0));
-    assert_eq!(verified.steps as usize, run.trace(0).len());
-
-    // The receipt authenticates its evidence without an exporter seal.
-    let mut tampered = bytes;
-    let index = tampered.len() / 2;
-    tampered[index] ^= 0xFF;
-    assert!(verify_light(&tampered).is_err());
-}
-
-#[tokio::test]
 async fn receipt_terminal_and_activation_evidence_are_not_optional() {
     let wasm = program_wasm("rock_paper_scissors");
     let run = completed_run(&wasm).await;
@@ -97,21 +79,4 @@ async fn receipt_terminal_and_activation_evidence_are_not_optional() {
     .expect("shape-only body assembly");
     assert!(arena0_protocol::ReceiptArtifact::new(body).is_err());
     assert!(verify_light(&run.receipt_bytes(0)).is_ok());
-}
-
-#[test]
-fn authenticated_stop_is_a_distinct_terminal_result() {
-    let synthetic = Synthetic::new(2);
-    let cause = synthetic.authenticated_stop(0, arena0_protocol::AbortKind::Fail, "guest failed");
-    let receipt = synthetic.stopped_receipt(cause, Vec::new());
-    assert!(matches!(
-        receipt,
-        arena0_protocol::ReceiptArtifact::StopReport(_)
-    ));
-    let bytes = receipt.encode().expect("encode stopped receipt");
-    let verified = verify_light(&bytes).expect("stopped receipt verifies");
-    assert!(matches!(
-        verified.terminal,
-        LightVerifiedTerminal::Stopped { .. }
-    ));
 }

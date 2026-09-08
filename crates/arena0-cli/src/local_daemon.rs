@@ -131,7 +131,6 @@ impl LocalDaemon {
 
     async fn await_ready(&mut self, client: &DaemonClient) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + START_TIMEOUT;
-        let mut interval = tokio::time::interval(PROBE_INTERVAL);
         loop {
             if client.daemon_up().await {
                 return Ok(());
@@ -153,7 +152,7 @@ impl LocalDaemon {
                 );
             }
             tokio::select! {
-                _ = interval.tick() => {}
+                _ = tokio::time::sleep(PROBE_INTERVAL) => {}
                 signal = tokio::signal::ctrl_c() => {
                     signal.context("listen for cancellation during local Host startup")?;
                     bail!("local Host startup cancelled");
@@ -232,6 +231,17 @@ impl Drop for LocalDaemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arena0_client::api::{
+        ApiError, ApiErrorCode, DaemonInfo, Request, Response, ResponseOk,
+        frame::{read_frame, write_frame},
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::BufReader;
+    use tokio::net::UnixListener;
+    use tokio::sync::Notify;
 
     #[test]
     fn local_ensemble_names_are_stable_and_distinct() {
@@ -240,5 +250,119 @@ mod tests {
             .map(|name| name.to_string())
             .collect::<Vec<_>>();
         assert_eq!(names, ["host-01", "host-02", "host-03", "host-04"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn await_ready_delays_probe_after_slow_initial_failure() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir().expect("local daemon test directory");
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).expect("bind local daemon test socket");
+        let probe_count = Arc::new(AtomicUsize::new(0));
+        let first_probe = Arc::new(Notify::new());
+        let release_first_probe = Arc::new(Notify::new());
+        let (timestamps, mut timestamps_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(serve_probe_socket(
+            listener,
+            probe_count.clone(),
+            first_probe.clone(),
+            release_first_probe.clone(),
+            timestamps,
+        ));
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn long-lived readiness child");
+        let client = DaemonClient::new(socket);
+        let mut local = LocalDaemon {
+            hosts: vec![HostName::for_local_index(0)],
+            child: Some(child),
+            stderr: None,
+        };
+        let readiness = tokio::spawn(async move {
+            let result = local.await_ready(&client).await;
+            (result, local)
+        });
+
+        first_probe.notified().await;
+        assert_eq!(probe_count.load(Ordering::SeqCst), 1);
+        tokio::time::advance(PROBE_INTERVAL * 2).await;
+        assert_eq!(
+            probe_count.load(Ordering::SeqCst),
+            1,
+            "a slow initial probe must not trigger another probe while it is pending"
+        );
+        release_first_probe.notify_one();
+        let (_, first_response_at) = timestamps_rx
+            .recv()
+            .await
+            .ok_or_else(|| anyhow!("read first probe response timestamp"))?;
+        let (_, second_probe_at) = timestamps_rx
+            .recv()
+            .await
+            .ok_or_else(|| anyhow!("read second probe request timestamp"))?;
+        assert_eq!(probe_count.load(Ordering::SeqCst), 2);
+        assert!(
+            second_probe_at >= first_response_at + PROBE_INTERVAL,
+            "readiness retry started before a full delay after the failed probe: {:?}",
+            second_probe_at.saturating_duration_since(first_response_at)
+        );
+
+        let (result, mut local) = readiness.await.expect("readiness task should join");
+        result?;
+        if let Some(mut child) = local.child.take() {
+            child.kill().await.context("stop readiness test child")?;
+            child.wait().await.context("reap readiness test child")?;
+        }
+        server.abort();
+        assert!(
+            server
+                .await
+                .expect_err("probe server should be aborted")
+                .is_cancelled()
+        );
+        Ok(())
+    }
+
+    async fn serve_probe_socket(
+        listener: UnixListener,
+        probe_count: Arc<AtomicUsize>,
+        first_probe: Arc<Notify>,
+        release_first_probe: Arc<Notify>,
+        timestamps: tokio::sync::mpsc::UnboundedSender<(u8, tokio::time::Instant)>,
+    ) -> anyhow::Result<()> {
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let (read, mut write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            let request = read_frame::<_, Request>(&mut read)
+                .await?
+                .ok_or_else(|| anyhow!("readiness request stream closed"))?;
+            assert!(matches!(request, Request::DaemonInfo));
+            let number = probe_count.fetch_add(1, Ordering::SeqCst) + 1;
+            let response: Response = if number == 1 {
+                first_probe.notify_one();
+                release_first_probe.notified().await;
+                Err(ApiError::new(ApiErrorCode::Internal, "daemon is starting"))
+            } else {
+                Ok(ResponseOk::DaemonInfo(DaemonInfo {
+                    version: "test".to_owned(),
+                    abi_version: 1,
+                    uptime_secs: 0,
+                    socket: "test.sock".to_owned(),
+                    mcp_endpoint: "127.0.0.1:0".to_owned(),
+                }))
+            };
+            write_frame(&mut write, &response).await?;
+            if number == 1 {
+                timestamps
+                    .send((1, tokio::time::Instant::now()))
+                    .map_err(|_| anyhow!("readiness timestamp receiver closed"))?;
+            } else if number == 2 {
+                timestamps
+                    .send((2, tokio::time::Instant::now()))
+                    .map_err(|_| anyhow!("readiness timestamp receiver closed"))?;
+            }
+        }
     }
 }

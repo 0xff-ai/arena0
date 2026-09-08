@@ -13,7 +13,7 @@ use arena0_sandbox::{
 };
 
 use crate::VerifyError;
-use crate::light::{LightVerifiedTerminal, verify_decoded};
+use crate::light::{LightVerifiedTerminal, decode_receipt, verify_decoded};
 
 const PERFORMANCE_TARGET: &str = "arena0::performance";
 
@@ -91,7 +91,14 @@ fn verify_full_inner(
     receipt_bytes: &[u8],
 ) -> Result<VerifiedOutcome, VerifyError> {
     let receipt = decode_receipt(receipt_bytes)?;
-    let light = verify_decoded(&receipt)?;
+    // ponytail: consume the verified receipt fields at their only use site.
+    let crate::light::LightVerified {
+        program_id,
+        session_id,
+        ensemble,
+        steps,
+        terminal,
+    } = verify_decoded(&receipt)?;
     let program_len =
         u64::try_from(program_binary.len()).map_err(|_| VerifyError::ProgramTooLarge {
             actual: usize::MAX,
@@ -104,10 +111,10 @@ fn verify_full_inner(
         });
     }
     let loaded_hash = ProgramHash::of(program_binary);
-    if loaded_hash != light.program_id {
+    if loaded_hash != program_id {
         return Err(VerifyError::ProgramMismatch {
             loaded: loaded_hash,
-            attested: light.program_id,
+            attested: program_id,
         });
     }
 
@@ -119,7 +126,7 @@ fn verify_full_inner(
         .map_err(|error| VerifyError::Sandbox(error.to_string()))?;
     verify_profile(&admitted, &receipt)?;
 
-    let session = Ensemble::<Committed>::from_peers(light.ensemble.clone()).map_err(|error| {
+    let session = Ensemble::<Committed>::from_peers(ensemble).map_err(|error| {
         VerifyError::ReplayMismatch {
             step: 0,
             message: format!("invalid receipt ensemble: {error}"),
@@ -161,7 +168,7 @@ fn verify_full_inner(
     // state only for a completed proof. A stopped proof has no outcome DTO to
     // project; its exact StopCause remains the result evidence.
     let final_shared = replay_trace(&admitted, &session, initialized.shared, trace)?;
-    let terminal = match light.terminal {
+    let terminal = match terminal {
         LightVerifiedTerminal::Stopped { cause } => VerifiedTerminal::Stopped { cause },
         LightVerifiedTerminal::Completed { outcome_borsh } => {
             let outcome = admitted
@@ -178,21 +185,10 @@ fn verify_full_inner(
     };
 
     Ok(VerifiedOutcome {
-        session_id: light.session_id,
-        steps: light.steps,
+        session_id,
+        steps,
         terminal,
     })
-}
-
-fn decode_receipt(receipt_bytes: &[u8]) -> Result<ReceiptArtifact, VerifyError> {
-    if receipt_bytes.len() > arena0_protocol::MAX_RECEIPT_BYTES {
-        return Err(VerifyError::ReceiptTooLarge {
-            actual: receipt_bytes.len(),
-            max: arena0_protocol::MAX_RECEIPT_BYTES,
-        });
-    }
-    ReceiptArtifact::decode(receipt_bytes)
-        .map_err(|error| VerifyError::ReceiptDecode(error.to_string()))
 }
 
 fn verify_profile(
@@ -245,9 +241,7 @@ fn replay_entry(
         });
     }
     let call = match &entry.event {
-        PublicEvent::SessionStarted { .. } => {
-            SharedCall::session_started(shared.clone(), session.clone())
-        }
+        PublicEvent::SessionStarted { .. } => SharedCall::session_started(shared, session.clone()),
         PublicEvent::MessageReceived {
             message_id,
             from,
@@ -275,7 +269,7 @@ fn replay_entry(
                 });
             }
             SharedCall::new(
-                shared.clone(),
+                shared,
                 session.clone(),
                 SharedEvent::MessageReceived {
                     message_id: *message_id,

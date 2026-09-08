@@ -474,7 +474,7 @@ fn validate_pending_shape(
                 .iter()
                 .position(|candidate| std::ptr::eq(candidate, effect))
                 .ok_or(ProtocolError::InvalidPendingContinuation)?;
-            let expected_id = derive_pending_id(execution_id, record.seq, effect_index);
+            let expected_id = pending_id(execution_id, record.seq, effect_index);
             if pending.id != expected_id {
                 return Err(ProtocolError::InvalidPendingContinuation);
             }
@@ -529,7 +529,10 @@ fn validate_pending_state(
     Ok(())
 }
 
-fn derive_pending_id(
+/// Derive the only legal continuation identity for one private execution
+/// coordinate. The guest record may describe the continuation, but it cannot
+/// choose an unrelated durable id.
+pub fn pending_id(
     execution_id: crate::ExecId,
     private_sequence: u64,
     effect_index: usize,
@@ -547,17 +550,6 @@ fn derive_pending_id(
             .try_into()
             .expect("digest prefix has eight bytes"),
     ))
-}
-
-/// Derive the only legal continuation identity for one private execution
-/// coordinate. The guest record may describe the continuation, but it cannot
-/// choose an unrelated durable id.
-pub fn pending_id(
-    execution_id: crate::ExecId,
-    private_sequence: u64,
-    effect_index: usize,
-) -> PendingId {
-    derive_pending_id(execution_id, private_sequence, effect_index)
 }
 
 fn derive_timer_id(

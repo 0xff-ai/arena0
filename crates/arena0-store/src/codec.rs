@@ -184,9 +184,12 @@ pub(crate) fn inbox_identity_bytes(
     Ok(bytes)
 }
 
-pub(crate) fn derive_inbox_id(source: PeerId, stored: &StoredFrame) -> Result<InboxId, StoreError> {
+pub(crate) fn inbox_identity_digest(
+    source: PeerId,
+    stored: &StoredFrame,
+) -> Result<[u8; 32], StoreError> {
     let identity = inbox_identity_bytes(source, stored)?;
-    Ok(InboxId::from_bytes(*blake3::hash(&identity).as_bytes()))
+    Ok(*blake3::hash(&identity).as_bytes())
 }
 
 pub(crate) fn occurrence_key_bytes(key: OccurrenceKey) -> Result<Vec<u8>, StoreError> {
@@ -500,11 +503,4 @@ pub(crate) fn unix_time_ms() -> Result<u64, StoreError> {
         })?;
     u64::try_from(duration.as_millis())
         .map_err(|_| StoreError::Corruption("system clock millisecond value exceeds u64".into()))
-}
-
-pub(crate) fn short_id(peer: PeerId) -> String {
-    peer.0[..4]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()
 }

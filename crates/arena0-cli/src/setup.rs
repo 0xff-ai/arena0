@@ -1,38 +1,34 @@
 //! Project-local harness setup.
 //!
-//! Setup is deliberately a small, file-oriented operation. It plans complete
-//! file contents first, never merges an existing file, and only creates paths
-//! that are still absent when the plan is applied.
+//! Setup writes only the project-local skill (and Claude's existing lifecycle
+//! hook). Older project registrations are cleaned up in place when they are
+//! present, but a fresh setup never creates harness MCP configuration files.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
-
-const DEFAULT_MCP_ENDPOINT: &str = "http://127.0.0.1:7330/mcp";
-const EXECUTABLE_MARKER: &str = "<!-- arena0:executable -->";
+use serde_json::Value;
+use toml_edit::DocumentMut;
 
 /// A project-local harness supported by arena0 setup.
 #[derive(Debug, clap::Subcommand)]
 pub(crate) enum Target {
-    /// Configure Codex with the project-local skill and MCP server.
+    /// Install the project-local arena0 skill for Codex.
     Codex(Options),
-    /// Configure Claude Code with the project-local skill and MCP server.
+    /// Install the project-local arena0 skill and lifecycle hook for Claude Code.
     Claude(Options),
 }
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct Options {
-    /// Print the complete plan without changing any files.
+    /// Print the plan without changing any files.
     #[arg(long)]
     pub(crate) dry_run: bool,
     /// Apply the plan without asking for interactive consent.
     #[arg(long, conflicts_with = "dry_run")]
     pub(crate) yes: bool,
-    /// Streamable HTTP MCP endpoint to write to the harness configuration.
-    #[arg(long, default_value = DEFAULT_MCP_ENDPOINT, value_name = "URL")]
-    pub(crate) endpoint: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +36,7 @@ enum State {
     Missing,
     Identical,
     Different,
+    Replace,
 }
 
 #[derive(Debug)]
@@ -48,11 +45,43 @@ struct FileSpec {
     content: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileKind {
+    Generated,
+    Cleanup(CleanupKind),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupKind {
+    CodexMcp,
+    ClaudeMcp,
+}
+
+impl CleanupKind {
+    fn relative(self) -> &'static str {
+        match self {
+            Self::CodexMcp => ".codex/config.toml",
+            Self::ClaudeMcp => ".mcp.json",
+        }
+    }
+
+    fn setting(self) -> &'static str {
+        match self {
+            Self::CodexMcp => "mcp_servers.arena0",
+            Self::ClaudeMcp => "mcpServers.arena0",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PlannedFile {
     spec: FileSpec,
     path: PathBuf,
     state: State,
+    kind: FileKind,
+    /// The bytes observed while planning a replacement. They are checked again
+    /// immediately before the replacement is published.
+    original: Option<Vec<u8>>,
 }
 
 impl Target {
@@ -70,32 +99,16 @@ impl Target {
     }
 
     fn files(&self, executable: &str) -> anyhow::Result<Vec<FileSpec>> {
-        let endpoint = &self.options().endpoint;
-        let codex_config = format!("[mcp_servers.arena0]\nurl = {}\n", encoded_string(endpoint));
-        let claude_config = format!(
-            "{{\n  \"mcpServers\": {{\n    \"arena0\": {{\n      \"type\": \"http\",\n      \"url\": {}\n    }}\n  }}\n}}\n",
-            encoded_string(endpoint)
-        );
         let skill = installed_skill(executable)?;
         Ok(match self {
-            Self::Codex(_) => vec![
-                FileSpec {
-                    relative: ".agents/skills/arena0/SKILL.md",
-                    content: skill,
-                },
-                FileSpec {
-                    relative: ".codex/config.toml",
-                    content: codex_config,
-                },
-            ],
+            Self::Codex(_) => vec![FileSpec {
+                relative: ".agents/skills/arena0/SKILL.md",
+                content: skill,
+            }],
             Self::Claude(_) => vec![
                 FileSpec {
                     relative: ".claude/skills/arena0/SKILL.md",
                     content: skill,
-                },
-                FileSpec {
-                    relative: ".mcp.json",
-                    content: claude_config,
                 },
                 FileSpec {
                     relative: ".claude/settings.json",
@@ -104,13 +117,13 @@ impl Target {
             ],
         })
     }
-}
 
-/// Encode a URL for both JSON and TOML basic string literals.
-/// `serde_json` escapes are accepted by TOML for the characters a URL can
-/// contain, and this keeps the generated configuration exact on all hosts.
-fn encoded_string(value: &str) -> String {
-    serde_json::to_string(value).expect("encoding a string cannot fail")
+    fn cleanup_kind(&self) -> CleanupKind {
+        match self {
+            Self::Codex(_) => CleanupKind::CodexMcp,
+            Self::Claude(_) => CleanupKind::ClaudeMcp,
+        }
+    }
 }
 
 fn installed_skill(executable: &str) -> anyhow::Result<String> {
@@ -126,6 +139,64 @@ fn installed_skill(executable: &str) -> anyhow::Result<String> {
         );
     }
     Ok(source.replacen(EXECUTABLE_MARKER, &replacement, 1))
+}
+
+const EXECUTABLE_MARKER: &str = "<!-- arena0:executable -->";
+const LEGACY_EXECUTABLE_INTRO: &str = "For every shell command below, replace only the `arena0` executable with the quoted absolute path shown in this version check. Preserve the quoting.\n\n```sh\n";
+const LEGACY_EXECUTABLE_SUFFIX: &str = " --version\n```";
+
+/// Return true only for a complete skill generated by the previous setup
+/// template. The exact legacy prefix and suffix make edits to any other part
+/// of the skill a conflict that setup leaves in place.
+fn is_legacy_generated_skill(content: &[u8]) -> bool {
+    let Ok(content) = std::str::from_utf8(content) else {
+        return false;
+    };
+    let legacy = include_str!("setup/legacy_skill.md");
+    let Some((prefix, suffix)) = legacy.split_once(EXECUTABLE_MARKER) else {
+        return false;
+    };
+    let Some(body) = content
+        .strip_prefix(prefix)
+        .and_then(|content| content.strip_suffix(suffix))
+    else {
+        return false;
+    };
+    let Some(command) = body
+        .strip_prefix(LEGACY_EXECUTABLE_INTRO)
+        .and_then(|body| body.strip_suffix(LEGACY_EXECUTABLE_SUFFIX))
+    else {
+        return false;
+    };
+    let Some(executable) = shell_unquote(command) else {
+        return false;
+    };
+    !executable.is_empty()
+        && Path::new(&executable).is_absolute()
+        && !executable.chars().any(char::is_control)
+}
+
+fn shell_unquote(value: &str) -> Option<String> {
+    if value.len() < 2 || !value.starts_with('\'') || !value.ends_with('\'') {
+        return None;
+    }
+
+    let mut output = String::new();
+    let mut rest = &value[1..value.len() - 1];
+    while let Some(index) = rest.find("'\\''") {
+        let (plain, escaped_quote) = rest.split_at(index);
+        if plain.contains('\'') {
+            return None;
+        }
+        output.push_str(plain);
+        output.push('\'');
+        rest = &escaped_quote[4..];
+    }
+    if rest.contains('\'') {
+        return None;
+    }
+    output.push_str(rest);
+    Some(output)
 }
 
 fn claude_settings(executable: &str) -> String {
@@ -182,39 +253,39 @@ pub(crate) fn run(target: &Target) -> anyhow::Result<()> {
 fn run_in(root: &Path, target: &Target, executable: &str) -> anyhow::Result<()> {
     let name = target.name();
     let options = target.options();
-    let plan = plan(root, target, executable)?;
+    let plan = make_plan(root, target, executable)?;
     print_plan(&plan, name);
 
     if options.dry_run {
         return Ok(());
     }
 
-    let missing = plan
+    let conflicts = plan
         .iter()
-        .filter(|file| file.state == State::Missing)
+        .filter(|file| file.state == State::Different)
         .count();
-    if missing == 0 {
-        let preserved = plan
-            .iter()
-            .filter(|file| file.state == State::Different)
-            .count();
-        if preserved == 0 {
-            println!("No missing project files; existing files were left unchanged.");
-        } else {
-            eprintln!(
-                "Setup incomplete: preserved {preserved} existing file(s) that differ from the arena0 setup."
-            );
-        }
+    if conflicts != 0 {
+        bail!(
+            "setup incomplete: preserved {conflicts} existing file(s) conflict with the arena0 setup"
+        );
+    }
+
+    let changes = plan
+        .iter()
+        .filter(|file| matches!(file.state, State::Missing | State::Replace))
+        .count();
+    if changes == 0 {
+        println!("No setup changes required; existing files are ready.");
         return Ok(());
     }
 
     if !options.yes {
         if !io::stdin().is_terminal() {
             bail!(
-                "setup needs consent to create {missing} project file(s); rerun with --yes in automation"
+                "setup needs consent to apply {changes} project change(s); rerun with --yes in automation"
             );
         }
-        eprint!("Create {missing} missing project file(s)? [y/N] ");
+        eprint!("Apply {changes} project setup change(s)? [y/N] ");
         io::stderr().flush().context("flush setup prompt")?;
         let mut answer = String::new();
         io::stdin()
@@ -229,31 +300,151 @@ fn run_in(root: &Path, target: &Target, executable: &str) -> anyhow::Result<()> 
     apply(&plan)
 }
 
-fn plan(root: &Path, target: &Target, executable: &str) -> anyhow::Result<Vec<PlannedFile>> {
-    target
+fn make_plan(root: &Path, target: &Target, executable: &str) -> anyhow::Result<Vec<PlannedFile>> {
+    let mut plan = target
         .files(executable)?
         .into_iter()
-        .map(|spec| {
-            let path = root.join(spec.relative);
-            let state = match fs::read(&path) {
-                Ok(existing) if existing == spec.content.as_bytes() => State::Identical,
-                Ok(_) => State::Different,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => State::Missing,
-                Err(error) => {
-                    return Err(error).with_context(|| format!("read {}", path.display()));
-                }
-            };
-            Ok(PlannedFile { spec, path, state })
-        })
-        .collect()
+        .map(|spec| plan_generated(root, spec))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    if let Some(cleanup) = plan_cleanup(root, target.cleanup_kind())? {
+        plan.push(cleanup);
+    }
+    Ok(plan)
+}
+
+fn plan_generated(root: &Path, spec: FileSpec) -> anyhow::Result<PlannedFile> {
+    let path = root.join(spec.relative);
+    let existing = read_existing(&path)?;
+    let (state, original) = match existing {
+        None => (State::Missing, None),
+        Some(existing) if existing == spec.content.as_bytes() => (State::Identical, None),
+        Some(existing)
+            if spec.relative.ends_with("/SKILL.md") && is_legacy_generated_skill(&existing) =>
+        {
+            (State::Replace, Some(existing))
+        }
+        Some(_) => (State::Different, None),
+    };
+    Ok(PlannedFile {
+        spec,
+        path,
+        state,
+        kind: FileKind::Generated,
+        original,
+    })
+}
+
+fn plan_cleanup(root: &Path, kind: CleanupKind) -> anyhow::Result<Option<PlannedFile>> {
+    let relative = kind.relative();
+    let path = root.join(relative);
+    let Some(existing) = read_existing(&path)? else {
+        return Ok(None);
+    };
+    let Some(updated) = remove_arena0_registration(kind, &existing)? else {
+        return Ok(None);
+    };
+    Ok(Some(PlannedFile {
+        spec: FileSpec {
+            relative,
+            // Cleanup output is intentionally never printed.
+            content: updated,
+        },
+        path,
+        state: State::Replace,
+        kind: FileKind::Cleanup(kind),
+        original: Some(existing),
+    }))
+}
+
+fn read_existing(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", path.display()));
+        }
+    };
+    let file_type = metadata.file_type();
+    if !file_type.is_file() && !file_type.is_symlink() {
+        bail!("{} exists but is not a regular file", path.display());
+    }
+    fs::read(path)
+        .map(Some)
+        .with_context(|| format!("read {}", path.display()))
+}
+
+fn remove_arena0_registration(
+    kind: CleanupKind,
+    existing: &[u8],
+) -> anyhow::Result<Option<String>> {
+    match kind {
+        CleanupKind::CodexMcp => remove_codex_registration(existing),
+        CleanupKind::ClaudeMcp => remove_claude_registration(existing),
+    }
+}
+
+fn remove_codex_registration(existing: &[u8]) -> anyhow::Result<Option<String>> {
+    let source = std::str::from_utf8(existing).context("read Codex TOML configuration as UTF-8")?;
+    let mut document = source.parse::<DocumentMut>().map_err(|_| {
+        anyhow::anyhow!("invalid Codex TOML configuration; fix it before rerunning setup")
+    })?;
+    let Some(mcp_servers) = document.get_mut("mcp_servers") else {
+        return Ok(None);
+    };
+    let removed = if let Some(table) = mcp_servers.as_table_mut() {
+        table.remove("arena0").is_some()
+    } else if let Some(table) = mcp_servers
+        .as_value_mut()
+        .and_then(toml_edit::Value::as_inline_table_mut)
+    {
+        table.remove("arena0").is_some()
+    } else {
+        bail!("Codex TOML setting mcp_servers is not a table");
+    };
+    if !removed {
+        return Ok(None);
+    }
+    Ok(Some(document.to_string()))
+}
+
+fn remove_claude_registration(existing: &[u8]) -> anyhow::Result<Option<String>> {
+    let mut document: Value =
+        serde_json::from_slice(existing).context("parse Claude MCP configuration JSON")?;
+    let Some(root) = document.as_object_mut() else {
+        bail!("Claude MCP configuration JSON must contain an object");
+    };
+    let Some(mcp_servers) = root.get_mut("mcpServers") else {
+        return Ok(None);
+    };
+    let Some(mcp_servers) = mcp_servers.as_object_mut() else {
+        bail!("Claude JSON setting mcpServers is not an object");
+    };
+    if mcp_servers.remove("arena0").is_none() {
+        return Ok(None);
+    }
+    let mut content =
+        serde_json::to_string_pretty(&document).context("encode Claude MCP configuration JSON")?;
+    content.push('\n');
+    Ok(Some(content))
 }
 
 fn print_plan(plan: &[PlannedFile], target: &str) {
     println!("arena0 setup {target} plan (project-local)");
     for file in plan {
+        if let FileKind::Cleanup(kind) = file.kind {
+            println!("\n--- {} [remove arena0 registration]", file.spec.relative);
+            println!(
+                "cleanup: remove only {}; preserve all other settings",
+                kind.setting()
+            );
+            continue;
+        }
+
         let state = match file.state {
             State::Missing => "create",
             State::Identical => "unchanged",
+            State::Replace => "upgrade known generated skill",
             State::Different => {
                 eprintln!(
                     "warning: {} differs from the arena0 setup; leaving the whole file unchanged",
@@ -276,21 +467,26 @@ fn print_plan(plan: &[PlannedFile], target: &str) {
 }
 
 fn apply(plan: &[PlannedFile]) -> anyhow::Result<()> {
-    let mut created = 0usize;
-    let mut preserved = 0usize;
+    if let Some(conflict) = plan.iter().find(|file| file.state == State::Different) {
+        bail!(
+            "setup incomplete: {} differs from the arena0 setup; resolve it and rerun",
+            conflict.path.display()
+        );
+    }
+
+    let mut applied = 0usize;
     for file in plan {
         match file.state {
             State::Identical => {}
-            State::Different => preserved += 1,
+            State::Different => unreachable!("conflicts were rejected above"),
             State::Missing => match create_missing(file) {
                 Ok(()) => {
-                    created += 1;
+                    applied += 1;
                     println!("Created {}", file.spec.relative);
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    preserved += 1;
-                    eprintln!(
-                        "warning: {} appeared during setup; leaving the whole file unchanged",
+                    bail!(
+                        "{} appeared during setup; refusing to overwrite it",
                         file.path.display()
                     );
                 }
@@ -298,15 +494,19 @@ fn apply(plan: &[PlannedFile]) -> anyhow::Result<()> {
                     return Err(error).with_context(|| format!("create {}", file.path.display()));
                 }
             },
+            State::Replace => {
+                replace_existing(file)?;
+                applied += 1;
+                match file.kind {
+                    FileKind::Generated => println!("Updated {}", file.spec.relative),
+                    FileKind::Cleanup(kind) => {
+                        println!("Removed {} from {}", kind.setting(), file.spec.relative)
+                    }
+                }
+            }
         }
     }
-    if preserved == 0 {
-        println!("Setup complete: created {created} file(s); existing files were preserved.");
-    } else {
-        eprintln!(
-            "Setup incomplete: created {created} file(s); preserved {preserved} existing file(s) that differ from the arena0 setup."
-        );
-    }
+    println!("Setup complete: applied {applied} change(s).");
     Ok(())
 }
 
@@ -319,8 +519,6 @@ fn create_missing(file: &PlannedFile) -> io::Result<()> {
         .create_new(true)
         .open(&file.path)?;
     if let Err(error) = output.write_all(file.spec.content.as_bytes()) {
-        // The file is ours only after a successful write. Best-effort cleanup
-        // avoids leaving a partial generated artifact after an I/O failure.
         drop(output);
         let _ = fs::remove_file(&file.path);
         return Err(error);
@@ -328,10 +526,75 @@ fn create_missing(file: &PlannedFile) -> io::Result<()> {
     output.flush()
 }
 
+fn replace_existing(file: &PlannedFile) -> anyhow::Result<()> {
+    let expected = file
+        .original
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("replacement plan is missing its original content"))?;
+    let metadata = fs::symlink_metadata(&file.path)
+        .with_context(|| format!("inspect replacement target {}", file.path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "refusing to replace symlink {}; move it and rerun setup",
+            file.path.display()
+        );
+    }
+    if !metadata.file_type().is_file() {
+        bail!(
+            "refusing to replace {}; it is not a regular file",
+            file.path.display()
+        );
+    }
+    let current = fs::read(&file.path)
+        .with_context(|| format!("read replacement target {}", file.path.display()))?;
+    if current != expected {
+        bail!(
+            "{} changed after setup was planned; refusing to overwrite it",
+            file.path.display()
+        );
+    }
+
+    let parent = file
+        .path
+        .parent()
+        .context("replacement target has no parent")?;
+    let mut output = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("prepare replacement for {}", file.path.display()))?;
+    output
+        .write_all(file.spec.content.as_bytes())
+        .with_context(|| format!("write replacement target {}", file.path.display()))?;
+    output
+        .as_file()
+        .set_permissions(metadata.permissions())
+        .with_context(|| format!("preserve permissions for {}", file.path.display()))?;
+    output
+        .as_file()
+        .sync_all()
+        .context("flush setup replacement")?;
+
+    // Recheck after preparing the complete file. Failed writes leave the
+    // original intact, and changes observed since planning are preserved.
+    let latest = fs::symlink_metadata(&file.path)
+        .with_context(|| format!("recheck replacement target {}", file.path.display()))?;
+    if !latest.file_type().is_file() || fs::read(&file.path)? != expected {
+        bail!(
+            "{} changed after setup was planned; refusing to overwrite it",
+            file.path.display()
+        );
+    }
+    output
+        .persist(&file.path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("replace {}", file.path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
 
     const TEST_EXECUTABLE: &str = "/tmp/arena0";
 
@@ -341,62 +604,50 @@ mod tests {
         target: Target,
     }
 
+    fn target_codex() -> Target {
+        Target::Codex(Options {
+            dry_run: true,
+            yes: false,
+        })
+    }
+
+    fn target_claude() -> Target {
+        Target::Claude(Options {
+            dry_run: true,
+            yes: false,
+        })
+    }
+
     #[test]
     fn yes_and_dry_run_are_mutually_exclusive() {
         assert!(TestCli::try_parse_from(["arena0", "codex", "--yes", "--dry-run"]).is_err());
+        assert!(TestCli::try_parse_from(["arena0", "codex", "--endpoint", "http://x"]).is_err());
     }
 
     #[test]
-    fn codex_plan_contains_complete_skill_and_config() {
+    fn fresh_plan_contains_only_skill_and_existing_hook() {
         let root = tempfile::tempdir().expect("temporary project");
-        let target = Target::Codex(Options {
-            dry_run: true,
-            yes: false,
-            endpoint: DEFAULT_MCP_ENDPOINT.to_owned(),
-        });
-        let plan = plan(root.path(), &target, TEST_EXECUTABLE).expect("build setup plan");
-        assert_eq!(plan.len(), 2);
-        assert!(plan[0].spec.content.starts_with("---\nname: arena0"));
-        assert!(!plan[0].spec.content.contains(EXECUTABLE_MARKER));
-        assert!(plan[0].spec.content.contains("--version"));
-        assert!(plan[1].spec.content.contains("[mcp_servers.arena0]"));
-        assert!(!plan[1].spec.content.contains("type = \"http\""));
-        assert!(
-            plan[1]
-                .spec
-                .content
-                .contains("url = \"http://127.0.0.1:7330/mcp\"")
-        );
-        assert!(!plan[1].spec.content.contains("command"));
-        assert!(plan.iter().all(|file| file.state == State::Missing));
-    }
+        let codex = make_plan(root.path(), &target_codex(), TEST_EXECUTABLE).expect("Codex plan");
+        assert_eq!(codex.len(), 1);
+        assert_eq!(codex[0].spec.relative, ".agents/skills/arena0/SKILL.md");
+        assert_eq!(codex[0].state, State::Missing);
 
-    #[test]
-    fn endpoint_is_written_to_both_harness_configs() {
-        let root = tempfile::tempdir().expect("temporary project");
-        let endpoint = "http://127.0.0.1:7440/mcp";
-        let codex_target = Target::Codex(Options {
-            dry_run: true,
-            yes: false,
-            endpoint: endpoint.to_owned(),
-        });
-        let codex =
-            plan(root.path(), &codex_target, TEST_EXECUTABLE).expect("build Codex setup plan");
-        let claude_target = Target::Claude(Options {
-            dry_run: true,
-            yes: false,
-            endpoint: endpoint.to_owned(),
-        });
         let claude =
-            plan(root.path(), &claude_target, TEST_EXECUTABLE).expect("build Claude setup plan");
+            make_plan(root.path(), &target_claude(), TEST_EXECUTABLE).expect("Claude plan");
+        assert_eq!(claude.len(), 2);
+        assert_eq!(claude[0].spec.relative, ".claude/skills/arena0/SKILL.md");
+        assert_eq!(claude[1].spec.relative, ".claude/settings.json");
+        assert!(claude.iter().all(|file| file.state == State::Missing));
+        assert!(!claude.iter().any(|file| file.spec.relative == ".mcp.json"));
+    }
 
-        assert!(!codex[1].spec.content.contains("type = \"http\""));
-        assert!(codex[1].spec.content.contains(endpoint));
-        assert!(claude[1].spec.content.contains("\"type\": \"http\""));
-        assert!(claude[1].spec.content.contains(endpoint));
-        assert_eq!(claude[2].spec.relative, ".claude/settings.json");
-        let settings = serde_json::from_str::<serde_json::Value>(&claude[2].spec.content)
-            .expect("Claude settings JSON");
+    #[test]
+    fn settings_keep_absolute_quoted_hook_command() {
+        let root = tempfile::tempdir().expect("temporary project");
+        let claude =
+            make_plan(root.path(), &target_claude(), TEST_EXECUTABLE).expect("Claude plan");
+        let settings =
+            serde_json::from_str::<Value>(&claude[1].spec.content).expect("Claude settings JSON");
         assert_eq!(
             settings["hooks"]["SessionStart"][0]["hooks"][0]["command"],
             format!(
@@ -407,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn identical_files_are_skipped_and_differences_are_whole_file_conflicts() {
+    fn existing_files_are_idempotent_and_custom_files_are_conflicts() {
         let root = tempfile::tempdir().expect("temporary project");
         let skill = root.path().join(".agents/skills/arena0/SKILL.md");
         fs::create_dir_all(skill.parent().expect("skill parent")).expect("skill directory");
@@ -418,74 +669,142 @@ mod tests {
         .expect("skill");
         let config = root.path().join(".codex/config.toml");
         fs::create_dir_all(config.parent().expect("config parent")).expect("config directory");
-        fs::write(&config, "user-owned\n").expect("config");
+        fs::write(&config, "user-owned = true\n").expect("config");
 
-        let target = Target::Codex(Options {
-            dry_run: true,
-            yes: false,
-            endpoint: DEFAULT_MCP_ENDPOINT.to_owned(),
-        });
-        let plan = plan(root.path(), &target, TEST_EXECUTABLE).expect("build setup plan");
+        let plan = make_plan(root.path(), &target_codex(), TEST_EXECUTABLE).expect("setup plan");
         assert_eq!(plan[0].state, State::Identical);
-        assert_eq!(plan[1].state, State::Different);
-        apply(&plan).expect("apply setup plan");
+        assert_eq!(plan.len(), 1);
+        apply(&plan).expect("unchanged setup succeeds");
         assert_eq!(
             fs::read_to_string(config).expect("config contents"),
-            "user-owned\n"
+            "user-owned = true\n"
         );
     }
 
     #[test]
-    fn apply_creates_only_missing_files() {
+    fn cleanup_preserves_unrelated_codex_toml_and_mode() {
         let root = tempfile::tempdir().expect("temporary project");
-        let target = Target::Claude(Options {
-            dry_run: false,
-            yes: true,
-            endpoint: DEFAULT_MCP_ENDPOINT.to_owned(),
-        });
-        let plan = plan(root.path(), &target, TEST_EXECUTABLE).expect("build setup plan");
-        apply(&plan).expect("apply setup plan");
-        let path = root.path().join(".mcp.json");
-        assert_eq!(
-            fs::read_to_string(path).expect("MCP config"),
-            "{\n  \"mcpServers\": {\n    \"arena0\": {\n      \"type\": \"http\",\n      \"url\": \"http://127.0.0.1:7330/mcp\"\n    }\n  }\n}\n"
+        let path = root.path().join(".codex/config.toml");
+        fs::create_dir_all(path.parent().expect("config parent")).expect("config directory");
+        let original = "[other]\nanswer = 42\n\n[mcp_servers.arena0]\nurl = 'http://127.0.0.1:7330/mcp'\n\n[mcp_servers.other]\ncommand = 'kept'\n";
+        fs::write(&path, original).expect("config");
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("mode");
+        }
+
+        let plan = make_plan(root.path(), &target_codex(), TEST_EXECUTABLE).expect("setup plan");
+        let cleanup = plan
+            .iter()
+            .find(|file| file.kind == FileKind::Cleanup(CleanupKind::CodexMcp))
+            .expect("Codex cleanup");
+        assert_eq!(cleanup.state, State::Replace);
+        assert!(
+            !cleanup
+                .spec
+                .content
+                .contains("url = 'http://127.0.0.1:7330/mcp'")
         );
+        apply(&plan).expect("apply cleanup");
+        let output = fs::read_to_string(&path).expect("updated config");
+        assert!(!output.contains("mcp_servers.arena0"));
+        assert!(output.contains("answer = 42"));
+        assert!(output.contains("mcp_servers.other"));
+        #[cfg(unix)]
         assert_eq!(
-            fs::read_to_string(root.path().join(".claude/skills/arena0/SKILL.md"))
-                .expect("Claude skill"),
+            fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn cleanup_preserves_unrelated_claude_json() {
+        let root = tempfile::tempdir().expect("temporary project");
+        let path = root.path().join(".mcp.json");
+        let original = r#"{
+  "other": {"keep": true},
+  "mcpServers": {
+    "arena0": {"type": "http", "url": "http://127.0.0.1:7330/mcp"},
+    "other-tool": {"command": "kept"}
+  }
+}
+"#;
+        fs::write(&path, original).expect("config");
+        let plan = make_plan(root.path(), &target_claude(), TEST_EXECUTABLE).expect("setup plan");
+        let cleanup = plan
+            .iter()
+            .find(|file| file.kind == FileKind::Cleanup(CleanupKind::ClaudeMcp))
+            .expect("Claude cleanup");
+        assert_eq!(cleanup.state, State::Replace);
+        assert!(!cleanup.spec.content.contains("http://127.0.0.1:7330/mcp"));
+        apply(&plan).expect("apply cleanup");
+        let output: Value =
+            serde_json::from_str(&fs::read_to_string(path).expect("updated config"))
+                .expect("updated JSON");
+        assert!(output["mcpServers"]["arena0"].is_null());
+        assert_eq!(output["mcpServers"]["other-tool"]["command"], "kept");
+        assert_eq!(output["other"]["keep"], true);
+    }
+
+    #[test]
+    fn known_legacy_skill_is_upgraded_but_custom_edit_is_preserved() {
+        let root = tempfile::tempdir().expect("temporary project");
+        let path = root.path().join(".agents/skills/arena0/SKILL.md");
+        fs::create_dir_all(path.parent().expect("skill parent")).expect("skill directory");
+        let legacy = include_str!("setup/legacy_skill.md");
+        let generated = legacy.replacen(
+            EXECUTABLE_MARKER,
+            &format!(
+                "{}{} --version\n```",
+                LEGACY_EXECUTABLE_INTRO,
+                crate::harness_hook::shell_quote("/old/path/arena0")
+            ),
+            1,
+        );
+        assert!(is_legacy_generated_skill(generated.as_bytes()));
+        fs::write(&path, generated).expect("legacy skill");
+
+        let plan = make_plan(root.path(), &target_codex(), TEST_EXECUTABLE).expect("setup plan");
+        assert_eq!(plan[0].state, State::Replace);
+        apply(&plan).expect("upgrade legacy skill");
+        assert_eq!(
+            fs::read_to_string(path).expect("updated skill"),
             installed_skill(TEST_EXECUTABLE).expect("installed skill")
         );
-        assert_eq!(
-            fs::read_to_string(root.path().join(".claude/settings.json")).expect("Claude settings"),
-            claude_settings(TEST_EXECUTABLE)
-        );
-        apply(&plan).expect("repeat setup plan");
+
+        let custom = root.path().join(".agents/skills/arena0/SKILL.md");
+        let mut edited = fs::read_to_string(&custom).expect("skill");
+        edited.push_str("\ncustom edit\n");
+        fs::write(&custom, edited).expect("custom skill");
+        let repeat = make_plan(root.path(), &target_codex(), TEST_EXECUTABLE).expect("repeat plan");
+        assert_eq!(repeat[0].state, State::Different);
+        assert!(apply(&repeat).is_err());
     }
 
     #[test]
-    fn differing_claude_settings_are_preserved_with_the_exact_hook_plan() {
+    fn replacement_rejects_symlink_and_concurrent_content_change() {
         let root = tempfile::tempdir().expect("temporary project");
-        let path = root.path().join(".claude/settings.json");
-        fs::create_dir_all(path.parent().expect("settings parent")).expect("settings directory");
-        fs::write(&path, "{\"hooks\":{\"SessionStart\":[]}}\n").expect("settings");
+        let config = root.path().join(".codex/config.toml");
+        fs::create_dir_all(config.parent().expect("config parent")).expect("config directory");
+        fs::write(
+            &config,
+            "[mcp_servers.arena0]\nurl = 'http://127.0.0.1:7330/mcp'\n",
+        )
+        .expect("config");
+        let plan = make_plan(root.path(), &target_codex(), TEST_EXECUTABLE).expect("setup plan");
+        fs::write(&config, "[mcp_servers.arena0]\nurl = 'changed'\n").expect("concurrent edit");
+        assert!(apply(&plan).is_err());
 
-        let target = Target::Claude(Options {
-            dry_run: true,
-            yes: false,
-            endpoint: DEFAULT_MCP_ENDPOINT.to_owned(),
-        });
-        let plan = plan(root.path(), &target, TEST_EXECUTABLE).expect("build setup plan");
-        let settings = plan
-            .iter()
-            .find(|file| file.spec.relative == ".claude/settings.json")
-            .expect("settings plan");
-        assert_eq!(settings.state, State::Different);
-        assert_eq!(settings.spec.content, claude_settings(TEST_EXECUTABLE));
-
-        apply(&plan).expect("apply setup plan");
-        assert_eq!(
-            fs::read_to_string(path).expect("settings contents"),
-            "{\"hooks\":{\"SessionStart\":[]}}\n"
-        );
+        #[cfg(unix)]
+        {
+            let target = root.path().join("target.toml");
+            fs::write(&target, "[mcp_servers.arena0]\nurl = 'target'\n").expect("target");
+            let link = root.path().join(".codex/config.toml");
+            fs::remove_file(&link).expect("remove config");
+            std::os::unix::fs::symlink(&target, &link).expect("symlink");
+            let plan =
+                make_plan(root.path(), &target_codex(), TEST_EXECUTABLE).expect("symlink plan");
+            assert!(apply(&plan).is_err());
+        }
     }
 }

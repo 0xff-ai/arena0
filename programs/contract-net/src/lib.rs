@@ -189,7 +189,7 @@ pub mod contract_net {
     }
 
     fn initialize(ctx: &mut SharedContext, params: Params) -> Result<(), ProgramFault> {
-        validate_params(&params).map_err(|error| anyhow!(error))?;
+        params.validate().map_err(|error| anyhow!(error))?;
         ctx.mutate_shared(|state| {
             state.target_size = params.target_size;
             state.tasks = params.tasks;
@@ -268,7 +268,8 @@ pub mod contract_net {
         {
             return Err(anyhow!("offer is not due from this participant").into());
         }
-        validate_offer(&ctx.shared().tasks, &offer)
+        offer
+            .validate(&ctx.shared().tasks)
             .map_err(|error| anyhow!(error))
             .retryable()?;
         ctx.effects().broadcast(&Message::Offer(offer));
@@ -289,7 +290,7 @@ pub mod contract_net {
             Message::Offer(offer) => {
                 if ctx.shared().phase() != Phase::CollectingOffers
                     || from == COORDINATOR
-                    || validate_offer(&ctx.shared().tasks, &offer).is_err()
+                    || offer.validate(&ctx.shared().tasks).is_err()
                 {
                     return Ok(ApplyDecision::Reject);
                 }
@@ -428,65 +429,69 @@ pub mod contract_net {
     }
 }
 
-fn validate_params(params: &Params) -> Result<(), String> {
-    if !(2..=MAX_PARTICIPANTS).contains(&params.target_size) {
-        return Err(format!(
-            "target_size must be between 2 and {MAX_PARTICIPANTS}"
-        ));
-    }
-    if params.tasks.is_empty() || params.tasks.len() > MAX_TASKS {
-        return Err(format!("task count must be between 1 and {MAX_TASKS}"));
-    }
-    for (index, task) in params.tasks.iter().enumerate() {
-        validate_text("task name", &task.name)?;
-        validate_text("task capability", &task.capability)?;
-        if params.tasks[..index]
-            .iter()
-            .any(|prior| prior.name == task.name)
-        {
-            return Err(format!("duplicate task name {:?}", task.name));
-        }
-    }
-    Ok(())
-}
-
-fn validate_offer(tasks: &[Task], offer: &WorkerOffer) -> Result<(), String> {
-    if usize::from(offer.capacity) > tasks.len() {
-        return Err("worker capacity exceeds the task count".to_string());
-    }
-    if offer.capabilities.len() > MAX_TASKS {
-        return Err("worker declares too many capabilities".to_string());
-    }
-    for (index, capability) in offer.capabilities.iter().enumerate() {
-        validate_text("worker capability", capability)?;
-        if offer.capabilities[..index].contains(capability) {
-            return Err(format!("duplicate worker capability {capability:?}"));
-        }
-    }
-    if offer.bids.len() > tasks.len() {
-        return Err("worker declares too many bids".to_string());
-    }
-    for (index, bid) in offer.bids.iter().enumerate() {
-        let Some(task) = tasks.get(usize::from(bid.task)) else {
-            return Err(format!("bid references unknown task {}", bid.task));
-        };
-        if bid.cost > MAX_COST {
-            return Err(format!("bid cost exceeds {MAX_COST}"));
-        }
-        if !offer.capabilities.contains(&task.capability) {
+impl Params {
+    fn validate(&self) -> Result<(), String> {
+        if !(2..=MAX_PARTICIPANTS).contains(&self.target_size) {
             return Err(format!(
-                "bid for task {} lacks capability {:?}",
-                bid.task, task.capability
+                "target_size must be between 2 and {MAX_PARTICIPANTS}"
             ));
         }
-        if offer.bids[..index]
-            .iter()
-            .any(|prior| prior.task == bid.task)
-        {
-            return Err(format!("duplicate bid for task {}", bid.task));
+        if self.tasks.is_empty() || self.tasks.len() > MAX_TASKS {
+            return Err(format!("task count must be between 1 and {MAX_TASKS}"));
         }
+        for (index, task) in self.tasks.iter().enumerate() {
+            validate_text("task name", &task.name)?;
+            validate_text("task capability", &task.capability)?;
+            if self.tasks[..index]
+                .iter()
+                .any(|prior| prior.name == task.name)
+            {
+                return Err(format!("duplicate task name {:?}", task.name));
+            }
+        }
+        Ok(())
     }
-    Ok(())
+}
+
+impl WorkerOffer {
+    fn validate(&self, tasks: &[Task]) -> Result<(), String> {
+        if usize::from(self.capacity) > tasks.len() {
+            return Err("worker capacity exceeds the task count".to_string());
+        }
+        if self.capabilities.len() > MAX_TASKS {
+            return Err("worker declares too many capabilities".to_string());
+        }
+        for (index, capability) in self.capabilities.iter().enumerate() {
+            validate_text("worker capability", capability)?;
+            if self.capabilities[..index].contains(capability) {
+                return Err(format!("duplicate worker capability {capability:?}"));
+            }
+        }
+        if self.bids.len() > tasks.len() {
+            return Err("worker declares too many bids".to_string());
+        }
+        for (index, bid) in self.bids.iter().enumerate() {
+            let Some(task) = tasks.get(usize::from(bid.task)) else {
+                return Err(format!("bid references unknown task {}", bid.task));
+            };
+            if bid.cost > MAX_COST {
+                return Err(format!("bid cost exceeds {MAX_COST}"));
+            }
+            if !self.capabilities.contains(&task.capability) {
+                return Err(format!(
+                    "bid for task {} lacks capability {:?}",
+                    bid.task, task.capability
+                ));
+            }
+            if self.bids[..index]
+                .iter()
+                .any(|prior| prior.task == bid.task)
+            {
+                return Err(format!("duplicate bid for task {}", bid.task));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn validate_text(label: &str, value: &str) -> Result<(), String> {
@@ -543,7 +548,7 @@ fn allocate(tasks: &[Task], offers: &[Option<WorkerOffer>]) -> AssignmentPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arena0::testing::{FaultStatus, Harness};
+    use arena0::testing::{FaultStatus, Harness, TestHarness};
     use arena0::types::{ColorDepth, Slot};
 
     fn tasks() -> Vec<Task> {
@@ -620,10 +625,43 @@ mod tests {
 
     #[test]
     fn invalid_offers_are_rejected_at_input_and_message_boundaries() {
-        let tasks = tasks();
-        assert!(validate_offer(&tasks, &offer(&["design"], 1, &[(0, 4)])).is_err());
-        assert!(validate_offer(&tasks, &offer(&["rust"], 1, &[(0, 4), (0, 5)])).is_err());
-        assert!(validate_offer(&tasks, &offer(&["rust"], 4, &[(0, 4)])).is_err());
+        let params = Params {
+            target_size: 2,
+            tasks: tasks(),
+        };
+        let coordinator = PeerId([0; 32]);
+        let worker = PeerId([1; 32]);
+        let invalid = [
+            offer(&["design"], 1, &[(0, 4)]),
+            offer(&["rust"], 1, &[(0, 4), (0, 5)]),
+            offer(&["rust"], 4, &[(0, 4)]),
+        ];
+
+        // The input boundary classifies invalid local answers as retryable and
+        // does not mark the worker's offer as sent.
+        let mut input_harness = TestHarness::<ContractNet>::with_peer_id(worker, params.clone());
+        input_harness.session_started(coordinator);
+        for offer in invalid.iter().cloned() {
+            let before = input_harness.shared_hash();
+            let result = input_harness.input(Input::SubmitOffer(offer));
+            assert!(matches!(result.fault, FaultStatus::Retryable(_)));
+            assert!(!result.has_broadcast());
+            assert_eq!(input_harness.shared_hash(), before);
+            assert!(!input_harness.local().offer_sent);
+        }
+
+        // The shared message boundary rejects the same malformed offers before
+        // state mutation, trace creation, or effects.
+        let mut message_harness = TestHarness::<ContractNet>::new(params);
+        message_harness.session_started(worker);
+        for offer in invalid {
+            let before = message_harness.shared_hash();
+            let result = message_harness.message(worker, Message::Offer(offer));
+            assert!(result.rejected);
+            assert!(result.effects.is_empty());
+            assert!(result.step.is_none());
+            assert_eq!(message_harness.shared_hash(), before);
+        }
     }
 
     #[arena0::test(

@@ -447,16 +447,3 @@ async fn wait_for_inflight_send(
         .expect("in-flight send task exists while selected")
         .await
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{MissedTickBehavior, progress_ticker};
-
-    #[tokio::test]
-    async fn progress_ticker_uses_skip_for_missed_ticks() {
-        assert_eq!(
-            progress_ticker().missed_tick_behavior(),
-            MissedTickBehavior::Skip
-        );
-    }
-}

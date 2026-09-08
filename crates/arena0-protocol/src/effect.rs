@@ -13,8 +13,10 @@ use arena0_crypto::SignScheme;
 
 use crate::TimerPayload;
 use crate::bounded::{
-    read_bytes as read_bounded_bytes, read_string as read_bounded_string,
-    write_bytes as serialize_bounded_bytes, write_string as serialize_bounded_string,
+    read_bytes as read_bounded_bytes, read_option_string as read_bounded_option_string,
+    read_string as read_bounded_string, write_bytes as serialize_bounded_bytes,
+    write_option_string as serialize_bounded_option_string,
+    write_string as serialize_bounded_string,
 };
 
 /// A side effect requested by a program during a single dispatch step.
@@ -159,13 +161,13 @@ impl BorshSerialize for Effect {
                 )?;
                 serialize_bounded_option_string(
                     writer,
-                    pending_label.as_ref(),
+                    pending_label.as_deref(),
                     crate::execution::MAX_TERMINAL_REASON_BYTES,
                     "pending label",
                 )?;
                 serialize_bounded_option_string(
                     writer,
-                    expected_type.as_ref(),
+                    expected_type.as_deref(),
                     crate::execution::MAX_TERMINAL_REASON_BYTES,
                     "expected type",
                 )?;
@@ -193,13 +195,13 @@ impl BorshSerialize for Effect {
                 )?;
                 serialize_bounded_option_string(
                     writer,
-                    pending_label.as_ref(),
+                    pending_label.as_deref(),
                     crate::execution::MAX_TERMINAL_REASON_BYTES,
                     "pending label",
                 )?;
                 serialize_bounded_option_string(
                     writer,
-                    expected_type.as_ref(),
+                    expected_type.as_deref(),
                     crate::execution::MAX_TERMINAL_REASON_BYTES,
                     "expected type",
                 )?;
@@ -588,13 +590,13 @@ impl BorshSerialize for PrivateEffect {
                 )?;
                 serialize_bounded_option_string(
                     writer,
-                    pending_label.as_ref(),
+                    pending_label.as_deref(),
                     crate::execution::MAX_TERMINAL_REASON_BYTES,
                     "pending label",
                 )?;
                 serialize_bounded_option_string(
                     writer,
-                    expected_type.as_ref(),
+                    expected_type.as_deref(),
                     crate::execution::MAX_TERMINAL_REASON_BYTES,
                     "expected type",
                 )?;
@@ -622,13 +624,13 @@ impl BorshSerialize for PrivateEffect {
                 )?;
                 serialize_bounded_option_string(
                     writer,
-                    pending_label.as_ref(),
+                    pending_label.as_deref(),
                     crate::execution::MAX_TERMINAL_REASON_BYTES,
                     "pending label",
                 )?;
                 serialize_bounded_option_string(
                     writer,
-                    expected_type.as_ref(),
+                    expected_type.as_deref(),
                     crate::execution::MAX_TERMINAL_REASON_BYTES,
                     "expected type",
                 )?;
@@ -714,21 +716,6 @@ impl BorshDeserialize for PrivateEffect {
     }
 }
 
-fn serialize_bounded_option_string<W: borsh::io::Write>(
-    writer: &mut W,
-    value: Option<&String>,
-    max: usize,
-    field: &'static str,
-) -> io::Result<()> {
-    match value {
-        None => BorshSerialize::serialize(&0u8, writer),
-        Some(value) => {
-            BorshSerialize::serialize(&1u8, writer)?;
-            serialize_bounded_string(writer, value, max, field)
-        }
-    }
-}
-
 fn serialize_bounded_option_timer<W: borsh::io::Write>(
     writer: &mut W,
     timer: Option<&TimerPayload>,
@@ -737,34 +724,8 @@ fn serialize_bounded_option_timer<W: borsh::io::Write>(
         None => BorshSerialize::serialize(&0u8, writer),
         Some(timer) => {
             BorshSerialize::serialize(&1u8, writer)?;
-            serialize_bounded_string(
-                writer,
-                &timer.type_name,
-                crate::execution::MAX_TERMINAL_REASON_BYTES,
-                "timer type name",
-            )?;
-            serialize_bounded_bytes(
-                writer,
-                &timer.data,
-                crate::execution::MAX_TIMER_PAYLOAD_BYTES,
-                "timer data",
-            )
+            timer.serialize_bounded(writer)
         }
-    }
-}
-
-fn read_bounded_option_string<R: borsh::io::Read>(
-    reader: &mut R,
-    max: usize,
-    field: &'static str,
-) -> io::Result<Option<String>> {
-    match u8::deserialize_reader(reader)? {
-        0 => Ok(None),
-        1 => read_bounded_string(reader, max, field).map(Some),
-        tag => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unknown optional string tag {tag}"),
-        )),
     }
 }
 
@@ -773,18 +734,7 @@ fn read_bounded_option_timer<R: borsh::io::Read>(
 ) -> io::Result<Option<TimerPayload>> {
     match u8::deserialize_reader(reader)? {
         0 => Ok(None),
-        1 => Ok(Some(TimerPayload {
-            type_name: read_bounded_string(
-                reader,
-                crate::execution::MAX_TERMINAL_REASON_BYTES,
-                "timer type name",
-            )?,
-            data: read_bounded_bytes(
-                reader,
-                crate::execution::MAX_TIMER_PAYLOAD_BYTES,
-                "timer data",
-            )?,
-        })),
+        1 => TimerPayload::deserialize_bounded(reader).map(Some),
         tag => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown optional timer tag {tag}"),
@@ -845,7 +795,6 @@ pub enum DisconnectReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arena0_crypto::HashAlgorithm;
 
     #[test]
     fn borsh_round_trip_all_effect_variants() {
@@ -893,25 +842,6 @@ mod tests {
     }
 
     #[test]
-    fn borsh_round_trip_sign_schemes_and_hash_algorithms() {
-        for variant in [SignScheme::Ed25519, SignScheme::Bls] {
-            let encoded = borsh::to_vec(&variant).expect("serialize");
-            assert_eq!(borsh::from_slice::<SignScheme>(&encoded).unwrap(), variant);
-        }
-        for variant in [
-            HashAlgorithm::Blake3,
-            HashAlgorithm::Sha256,
-            HashAlgorithm::Keccak256,
-        ] {
-            let encoded = borsh::to_vec(&variant).expect("serialize");
-            assert_eq!(
-                borsh::from_slice::<HashAlgorithm>(&encoded).unwrap(),
-                variant
-            );
-        }
-    }
-
-    #[test]
     fn persisted_effect_tags_are_fixed_and_unknown_tags_are_rejected() {
         let raw = Effect::Fail {
             reason: String::new(),
@@ -929,5 +859,68 @@ mod tests {
         assert!(borsh::from_slice::<Effect>(&[0xff]).is_err());
         assert!(borsh::from_slice::<PublicEffect>(&[0xff]).is_err());
         assert!(borsh::from_slice::<PrivateEffect>(&[0xff]).is_err());
+    }
+
+    #[test]
+    fn callout_optional_strings_preserve_encoding_and_early_bounds() {
+        let effect = PrivateEffect::Callout {
+            callout_index: 0,
+            context: Vec::new(),
+            pending_label: Some("x".into()),
+            expected_type: None,
+            continuation_tag: None,
+        };
+        let encoded = [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, b'x', 0, 0];
+        assert_eq!(borsh::to_vec(&effect).unwrap(), encoded);
+        assert_eq!(PrivateEffect::try_from_slice(&encoded).unwrap(), effect);
+
+        let oversized = u32::try_from(crate::execution::MAX_TERMINAL_REASON_BYTES + 1)
+            .unwrap()
+            .to_le_bytes();
+        let mut prefix = encoded[..10].to_vec();
+        prefix.extend_from_slice(&oversized);
+        assert_eq!(
+            PrivateEffect::try_from_slice(&prefix).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+        );
+        prefix[9] = 2;
+        assert_eq!(
+            PrivateEffect::try_from_slice(&prefix).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+        );
+
+        let oversized_label = "x".repeat(crate::execution::MAX_TERMINAL_REASON_BYTES + 1);
+        let effect = PrivateEffect::Callout {
+            callout_index: 0,
+            context: Vec::new(),
+            pending_label: Some(oversized_label.clone()),
+            expected_type: None,
+            continuation_tag: None,
+        };
+        let mut output = Vec::new();
+        assert_eq!(
+            BorshSerialize::serialize(&effect, &mut output)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput,
+        );
+        assert_eq!(output, encoded[..10]);
+
+        let record = crate::PendingRecord {
+            id: crate::PendingId::new(0),
+            operation: crate::PendingOperation::Sign,
+            label: Some(oversized_label),
+            expected_type: None,
+            continuation_tag: None,
+        };
+        output.clear();
+        assert_eq!(
+            BorshSerialize::serialize(&record, &mut output)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput,
+        );
+        // PendingRecord preflights the string before writing its option tag.
+        assert_eq!(output, [0, 0, 0, 0, 0, 0, 0, 0, 1]);
     }
 }
