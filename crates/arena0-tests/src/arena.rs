@@ -11,17 +11,16 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arena0_crypto::{BlsSignature, ExecutionKey, ExecutionSalt, NodeKeys, SecretKey};
-use arena0_node::{ActivatedSession, ExecContext, NegotiationBook};
+use arena0_crypto::{ExecutionKey, ExecutionSalt, NodeKeys, SecretKey};
 use arena0_node::{
     DurableOutcome, ExecCommand, Host, NegotiationAttempt, NegotiationEffects, NegotiationStart,
     PrepareOutcome, SessionMessage, SpawnedExec,
 };
+use arena0_node::{ExecContext, NegotiationBook};
 use arena0_program::JsonBytes;
 use arena0_protocol::{
     EventSource, ExecId, ExecutionAdmission, NegotiationEvent, NegotiationId, OfferData, PeerId,
-    PeerIdSource, ReceiptArtifact, SessionHash, SessionHeader, SessionTermination, StateHash,
-    TraceEntry,
+    PeerIdSource, ReceiptArtifact, SessionHash, SessionTermination, StateHash, TraceEntry,
 };
 use arena0_sandbox::{InitializeCall, Program, WasmtimeEngine};
 use arena0_store::{Store, StoreConfig, StoreHandle};
@@ -477,7 +476,6 @@ impl Arena {
                 "node {i} confirmed a different session hash"
             );
         }
-        let committed = committeds[0].0.clone();
         let mut negotiated = committeds.into_iter();
 
         // The negotiation returns the same Host-bound writer capability. Move
@@ -512,8 +510,6 @@ impl Arena {
                 peer_id: node.peer_id,
                 spawned,
                 exec_id,
-                negotiation_id,
-                execution_salt: execution_salt_for(i),
                 _directory: directory,
                 _store: store,
                 store_handle,
@@ -561,7 +557,6 @@ impl Arena {
             program: wasm,
             params: creator_params,
             timeout: self.timeout,
-            committed,
             timeline_started,
             timeline,
         }
@@ -611,7 +606,6 @@ pub struct Run {
     program: Vec<u8>,
     params: Vec<u8>,
     timeout: Duration,
-    committed: ActivatedSession,
     timeline_started: Instant,
     timeline: Arc<Mutex<Vec<TimedProgress>>>,
 }
@@ -818,45 +812,6 @@ impl Run {
 
     pub fn params(&self) -> &[u8] {
         &self.params
-    }
-
-    /// Return the exact committed activation used by each Host.
-    pub fn committed_activation(&self) -> arena0_protocol::Activation {
-        self.committed.activation().clone()
-    }
-
-    /// Return participant zero's durable receipt header.
-    pub fn session_header(&self) -> SessionHeader {
-        self.participants[0]
-            .receipt
-            .as_ref()
-            .expect("participant 0 receipt")
-            .body()
-            .header()
-            .clone()
-    }
-
-    /// Attempt to construct an activation with only the selected BLS signers.
-    pub fn activation_with_activation_signers(
-        &self,
-        signer_indices: &[usize],
-    ) -> Result<arena0_protocol::Activation, arena0_protocol::ActivationError> {
-        let activation = self.committed.activation();
-        let msg = activation.activation_data().signing_bytes();
-        let sigs = signer_indices
-            .iter()
-            .map(|&i| {
-                ExecutionKey::derive(
-                    &self.participants[i].execution_salt,
-                    &self.participants[i].exec_id.0,
-                    &self.participants[i].negotiation_id.0,
-                )
-                .expect("execution key")
-                .sign(&msg)
-            })
-            .collect::<Vec<_>>();
-        let aggregate = BlsSignature::aggregate(&sigs).expect("aggregate");
-        arena0_protocol::Activation::new(activation.prepared().clone(), aggregate)
     }
 
     pub fn completed_outcome(&self, i: usize) -> Option<Vec<u8>> {
@@ -1067,8 +1022,6 @@ struct ParticipantHandle {
     peer_id: PeerId,
     spawned: SpawnedExec,
     exec_id: ExecId,
-    negotiation_id: NegotiationId,
-    execution_salt: ExecutionSalt,
     _directory: TempDir,
     _store: Store,
     store_handle: StoreHandle,

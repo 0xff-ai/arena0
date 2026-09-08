@@ -1090,54 +1090,73 @@ mod tests {
 
     #[test]
     fn input_length_prefixes_are_checked_before_allocation() {
-        let mut cases = [
-            (vec![0u8; 0], "init"),
-            (vec![0u8; 4], "shared"),
-            (vec![0u8; 4], "local"),
-            (vec![0u8; 4], "query"),
-            (vec![0u8; 4], "view"),
-            (vec![0u8; 4], "outcome"),
-        ];
-        // Each fixture has a valid fixed prefix followed by a hostile length
-        // prefix for its first variable field.
-        cases[0].0 = u32::MAX.to_le_bytes().to_vec();
-        cases[1].0 = [0u32.to_le_bytes().as_slice(), &u32::MAX.to_le_bytes(), &[]].concat();
-        cases[2].0 = [0u8; 32]
-            .into_iter()
-            .chain(0u32.to_le_bytes())
-            .chain(0u32.to_le_bytes())
-            .chain(u32::MAX.to_le_bytes())
-            .collect();
-        cases[3].0 = [0u32.to_le_bytes().as_slice(), &u32::MAX.to_le_bytes()].concat();
-        cases[4].0 = [0u32.to_le_bytes().as_slice(), &u32::MAX.to_le_bytes()].concat();
-        cases[5].0 = [0u32.to_le_bytes().as_slice(), &u32::MAX.to_le_bytes()].concat();
-
-        assert!(borsh::from_slice::<InitInput>(&cases[0].0).is_err());
-        assert!(borsh::from_slice::<SharedInput>(&cases[1].0).is_err());
-        assert!(borsh::from_slice::<LocalInput>(&cases[2].0).is_err());
-        assert!(borsh::from_slice::<QueryInput>(&cases[3].0).is_err());
-        assert!(borsh::from_slice::<ViewInput>(&cases[4].0).is_err());
-        assert!(borsh::from_slice::<OutcomeInput>(&cases[5].0).is_err());
+        let oversized = u32::MAX.to_le_bytes();
+        let session = [0u32.to_le_bytes(), oversized].concat();
+        let local_session = [vec![0; 40], oversized.to_vec()].concat();
+        // Omit the declared payload: a size error must precede a body read.
+        for (input, error) in [
+            (
+                "init",
+                borsh::from_slice::<InitInput>(&oversized).unwrap_err(),
+            ),
+            (
+                "shared",
+                borsh::from_slice::<SharedInput>(&session).unwrap_err(),
+            ),
+            (
+                "local",
+                borsh::from_slice::<LocalInput>(&local_session).unwrap_err(),
+            ),
+            (
+                "query",
+                borsh::from_slice::<QueryInput>(&session).unwrap_err(),
+            ),
+            (
+                "view",
+                borsh::from_slice::<ViewInput>(&session).unwrap_err(),
+            ),
+            (
+                "outcome",
+                borsh::from_slice::<OutcomeInput>(&session).unwrap_err(),
+            ),
+        ] {
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{input}: {error}");
+        }
     }
 
     #[test]
     fn output_length_prefixes_are_checked_before_allocation() {
-        let status = [0u8];
-        let state = 0u32.to_le_bytes();
-        let mut shared = status.to_vec();
-        shared.extend_from_slice(&u32::MAX.to_le_bytes());
-        let mut local = status.to_vec();
-        local.extend_from_slice(&u32::MAX.to_le_bytes());
-        let mut query = 0u32.to_le_bytes().to_vec();
-        query.extend_from_slice(&u32::MAX.to_le_bytes());
-        let view = u32::MAX.to_le_bytes().to_vec();
-        let mut outcome = (MAX_CALL_PAYLOAD_BYTES as u32 + 1).to_le_bytes().to_vec();
-        outcome.extend_from_slice(&state);
-
-        assert!(borsh::from_slice::<SharedOutput>(&shared).is_err());
-        assert!(borsh::from_slice::<LocalOutput>(&local).is_err());
-        assert!(borsh::from_slice::<QueryOutput>(&query).is_err());
-        assert!(borsh::from_slice::<ViewOutput>(&view).is_err());
-        assert!(borsh::from_slice::<OutcomeOutput>(&outcome).is_err());
+        let oversized = u32::MAX.to_le_bytes();
+        let state = [vec![0], oversized.to_vec()].concat();
+        let query = [0u32.to_le_bytes(), oversized].concat();
+        let outcome = (MAX_CALL_PAYLOAD_BYTES as u32 + 1).to_le_bytes();
+        for (output, error) in [
+            (
+                "shared",
+                borsh::from_slice::<SharedOutput>(&state).unwrap_err(),
+            ),
+            (
+                "local",
+                borsh::from_slice::<LocalOutput>(&state).unwrap_err(),
+            ),
+            (
+                "query",
+                borsh::from_slice::<QueryOutput>(&query).unwrap_err(),
+            ),
+            (
+                "view",
+                borsh::from_slice::<ViewOutput>(&oversized).unwrap_err(),
+            ),
+            (
+                "outcome",
+                borsh::from_slice::<OutcomeOutput>(&outcome).unwrap_err(),
+            ),
+        ] {
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "{output}: {error}"
+            );
+        }
     }
 }

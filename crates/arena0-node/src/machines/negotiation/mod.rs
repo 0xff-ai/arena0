@@ -736,83 +736,16 @@ mod tests {
     }
 
     #[test]
-    fn revision_zero_starts_a_signer() {
+    fn ticket_revisions_form_an_idempotent_monotonic_state_machine() {
         let neg = negotiation_id(1);
         let offer = offer(neg, 0, provider(1).peer_id());
         let p = provider(1);
         let mut book = registered_book(&p, &offer);
-        let t0 = active_ticket(&provider(1), &offer, 0);
-        assert_eq!(book.apply_ticket(&t0), Ok(ApplyOutcome::Inserted));
+        let v0 = active_ticket(&p, &offer, 0);
+        assert_eq!(book.apply_ticket(&v0), Ok(ApplyOutcome::Inserted));
+        assert_eq!(book.apply_ticket(&v0), Ok(ApplyOutcome::Duplicate));
         assert_eq!(book.len(neg, 0), 1);
-        assert_eq!(
-            book.current_ticket(neg, 0, provider(1).peer_id()),
-            Some(&t0)
-        );
-    }
 
-    #[test]
-    fn valid_replacement_advances_the_current_ticket() {
-        let neg = negotiation_id(1);
-        let offer = offer(neg, 0, provider(1).peer_id());
-        let p = provider(1);
-        let mut book = registered_book(&p, &offer);
-        let v0 = active_ticket(&provider(1), &offer, 0);
-        book.apply_ticket(&v0).expect("start");
-        let v1 = active_ticket(&provider(1), &offer, 1);
-        assert_eq!(book.apply_ticket(&v1), Ok(ApplyOutcome::Replaced));
-        assert_eq!(book.len(neg, 0), 1);
-        assert_eq!(
-            book.current_ticket(neg, 0, provider(1).peer_id()),
-            Some(&v1)
-        );
-    }
-
-    #[test]
-    fn exact_duplicate_is_idempotent() {
-        let neg = negotiation_id(1);
-        let offer = offer(neg, 0, provider(1).peer_id());
-        let p = provider(1);
-        let mut book = registered_book(&p, &offer);
-        let t0 = active_ticket(&provider(1), &offer, 0);
-        book.apply_ticket(&t0).expect("start");
-        assert_eq!(book.apply_ticket(&t0), Ok(ApplyOutcome::Duplicate));
-        assert_eq!(book.len(neg, 0), 1);
-    }
-
-    #[test]
-    fn lower_revision_is_stale() {
-        let neg = negotiation_id(1);
-        let offer = offer(neg, 0, provider(1).peer_id());
-        let p = provider(1);
-        let mut book = registered_book(&p, &offer);
-        let v0 = active_ticket(&provider(1), &offer, 0);
-        book.apply_ticket(&v0).expect("start");
-        let v1 = active_ticket(&provider(1), &offer, 1);
-        book.apply_ticket(&v1).expect("replace");
-        let stale = active_ticket(&provider(1), &offer, 0);
-        assert_eq!(
-            book.apply_ticket(&stale),
-            Err(ApplyError::StaleRevision {
-                revision: 0,
-                current_revision: 1
-            })
-        );
-        assert_eq!(
-            book.current_ticket(neg, 0, provider(1).peer_id()),
-            Some(&v1)
-        );
-    }
-
-    #[test]
-    fn same_revision_fork_is_inert() {
-        let neg = negotiation_id(1);
-        let offer = offer(neg, 0, provider(1).peer_id());
-        let p = provider(1);
-        let mut book = registered_book(&p, &offer);
-        let v0 = active_ticket(&provider(1), &offer, 0);
-        book.apply_ticket(&v0).expect("start");
-        // A different ticket at the same revision: the current stands.
-        let p = provider(1);
         let mut rival = active_ticket(&p, &offer, 0);
         let TicketAction::Active {
             execution_bls,
@@ -830,29 +763,29 @@ mod tests {
         };
         rival.signature = p.sign(&rival.data.signing_bytes());
         assert_eq!(book.apply_ticket(&rival), Ok(ApplyOutcome::Duplicate));
-        assert_eq!(
-            book.current_ticket(neg, 0, provider(1).peer_id()),
-            Some(&v0)
-        );
-    }
+        assert_eq!(book.current_ticket(neg, 0, p.peer_id()), Some(&v0));
 
-    #[test]
-    fn withdrawal_is_a_valid_successor_and_can_be_revoked() {
-        let neg = negotiation_id(1);
-        let creator = provider(1).peer_id();
-        let offer = offer(neg, 0, creator);
-        let p = provider(1);
-        let mut book = registered_book(&p, &offer);
-        let v0 = active_ticket(&provider(1), &offer, 0);
-        book.apply_ticket(&v0).expect("start");
-        let w1 = withdrawn_ticket(&provider(1), &offer, 1);
-        assert_eq!(book.apply_ticket(&w1), Ok(ApplyOutcome::Replaced));
+        let v1 = active_ticket(&p, &offer, 1);
+        assert_eq!(book.apply_ticket(&v1), Ok(ApplyOutcome::Replaced));
+        assert_eq!(book.len(neg, 0), 1);
+        assert_eq!(
+            book.apply_ticket(&v0),
+            Err(ApplyError::StaleRevision {
+                revision: 0,
+                current_revision: 1
+            })
+        );
+        assert_eq!(book.current_ticket(neg, 0, p.peer_id()), Some(&v1));
+
+        let w2 = withdrawn_ticket(&p, &offer, 2);
+        assert_eq!(book.apply_ticket(&w2), Ok(ApplyOutcome::Replaced));
+        assert_eq!(book.len(neg, 0), 1);
         assert!(book.ticket_set(neg, 0).is_empty());
 
-        // A later Active revision supersedes the withdrawal.
-        let v2 = active_ticket(&provider(1), &offer, 2);
-        assert_eq!(book.apply_ticket(&v2), Ok(ApplyOutcome::Replaced));
-        assert_eq!(book.ticket_set(neg, 0), vec![v2]);
+        let v3 = active_ticket(&p, &offer, 3);
+        assert_eq!(book.apply_ticket(&v3), Ok(ApplyOutcome::Replaced));
+        assert_eq!(book.len(neg, 0), 1);
+        assert_eq!(book.ticket_set(neg, 0), vec![v3]);
     }
 
     #[test]
@@ -1244,15 +1177,13 @@ mod tests {
     }
 
     #[test]
-    fn participant_cannot_issue_before_the_creator_ticket_is_applied() {
+    fn only_an_active_creator_ticket_authenticates_participant_issuance() {
         let neg = negotiation_id(1);
         let creator = provider(2);
         let participant = provider(1);
         let offer = offer(neg, 0, creator.peer_id());
         let mut book = NegotiationBook::new(&participant.identity, &participant.execution);
         book.register_offer(neg, 0, &offer).expect("offer slot");
-        // The offer is not yet authenticated: the creator's Active ticket is
-        // missing, so the participant's consent must not be issued.
         assert_eq!(
             book.issue_ticket(neg, 0, 0, TEST_ISSUED_AT_MS),
             Err(ApplyError::UnauthenticatedOffer {
@@ -1260,27 +1191,8 @@ mod tests {
                 offer_seq: 0
             })
         );
-        // The creator's Active ticket authenticates the offer.
-        let creator_ticket = active_ticket(&creator, &offer, 0);
-        book.apply_ticket(&creator_ticket).expect("creator ticket");
-        let ticket = book
-            .issue_ticket(neg, 0, 0, TEST_ISSUED_AT_MS)
-            .expect("participant issues after authentication");
-        assert_eq!(ticket.data.signer, participant.peer_id());
-        assert_eq!(book.len(neg, 0), 2);
-    }
 
-    #[test]
-    fn a_withdrawn_creator_ticket_does_not_authenticate_issuance() {
-        let neg = negotiation_id(1);
-        let creator = provider(2);
-        let participant = provider(1);
-        let offer = offer(neg, 0, creator.peer_id());
-        let mut book = NegotiationBook::new(&participant.identity, &participant.execution);
-        book.register_offer(neg, 0, &offer).expect("offer slot");
-        // The creator's Withdrawn ticket means the creator withdrew: the
-        // offer is dead, so the participant's consent must not be issued.
-        let withdrawn = withdrawn_ticket(&creator, &offer, 1);
+        let withdrawn = withdrawn_ticket(&creator, &offer, 0);
         book.apply_ticket(&withdrawn).expect("withdrawn applies");
         assert_eq!(
             book.issue_ticket(neg, 0, 0, TEST_ISSUED_AT_MS),
@@ -1289,6 +1201,14 @@ mod tests {
                 offer_seq: 0
             })
         );
+
+        let creator_ticket = active_ticket(&creator, &offer, 1);
+        book.apply_ticket(&creator_ticket).expect("creator ticket");
+        let ticket = book
+            .issue_ticket(neg, 0, 0, TEST_ISSUED_AT_MS)
+            .expect("participant issues after authentication");
+        assert_eq!(ticket.data.signer, participant.peer_id());
+        assert_eq!(book.len(neg, 0), 2);
     }
 
     #[test]

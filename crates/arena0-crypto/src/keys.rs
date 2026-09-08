@@ -246,27 +246,20 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn execution_key_is_stable_for_scope_and_changes_with_salt() {
-        let first = ExecutionKey::derive(
-            &ExecutionSalt::try_from_bytes([1; 32]).expect("non-zero test salt"),
-            &[2; 32],
-            &[3; 32],
-        )
-        .unwrap();
-        let repeated = ExecutionKey::derive(
-            &ExecutionSalt::try_from_bytes([1; 32]).expect("non-zero test salt"),
-            &[2; 32],
-            &[3; 32],
-        )
-        .unwrap();
-        let different = ExecutionKey::derive(
-            &ExecutionSalt::try_from_bytes([4; 32]).expect("non-zero test salt"),
-            &[2; 32],
-            &[3; 32],
-        )
-        .unwrap();
-
-        assert_eq!(first.public_key(), repeated.public_key());
-        assert_ne!(first.public_key(), different.public_key());
+    fn execution_key_is_stable_and_separates_each_scope_dimension() {
+        let derive = |salt, exec, negotiation| {
+            ExecutionKey::derive(
+                &ExecutionSalt::try_from_bytes([salt; 32]).expect("non-zero test salt"),
+                &[exec; 32],
+                &[negotiation; 32],
+            )
+            .unwrap()
+            .public_key()
+        };
+        let key = derive(1, 2, 3);
+        assert_eq!(key, derive(1, 2, 3));
+        for (salt, exec, negotiation) in [(4, 2, 3), (1, 4, 3), (1, 2, 4)] {
+            assert_ne!(key, derive(salt, exec, negotiation));
+        }
     }
 }

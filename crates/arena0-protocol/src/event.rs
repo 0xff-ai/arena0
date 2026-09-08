@@ -576,19 +576,10 @@ mod tests {
         };
         let private_timer = PrivateEvent::TimerFired;
         let raw_react: Event<Vec<u8>> = Event::React;
-        assert_eq!(
-            borsh::to_vec(&public_start).unwrap()[0],
-            PUBLIC_EVENT_SESSION_STARTED
-        );
-        assert_eq!(
-            borsh::to_vec(&public_message).unwrap()[0],
-            PUBLIC_EVENT_MESSAGE_RECEIVED
-        );
-        assert_eq!(
-            borsh::to_vec(&private_timer).unwrap()[0],
-            PRIVATE_EVENT_TIMER_FIRED
-        );
-        assert_eq!(borsh::to_vec(&raw_react).unwrap()[0], EVENT_REACT);
+        assert_eq!(borsh::to_vec(&public_start).unwrap()[0], 0);
+        assert_eq!(borsh::to_vec(&public_message).unwrap()[0], 1);
+        assert_eq!(borsh::to_vec(&private_timer).unwrap()[0], 1);
+        assert_eq!(borsh::to_vec(&raw_react).unwrap()[0], 6);
         assert!(borsh::from_slice::<PublicEvent>(&[0xff]).is_err());
         assert!(borsh::from_slice::<PrivateEvent>(&[0xff]).is_err());
         assert!(borsh::from_slice::<Event<Vec<u8>>>(&[0xff]).is_err());

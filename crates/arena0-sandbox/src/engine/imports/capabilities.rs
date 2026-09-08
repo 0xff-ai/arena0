@@ -485,40 +485,24 @@ mod tests {
     }
 
     #[test]
-    fn sign_allows_declared_scheme() {
-        let (mut store, sign) =
-            instantiate_sign_test_module(Lifecycle::Active, 0, vec![SignScheme::Ed25519]);
-        sign.call(&mut store, ()).unwrap();
-        assert_eq!(
-            store.data().effect_queue,
-            vec![Effect::Sign {
-                scheme: SignScheme::Ed25519,
-                data: Vec::new(),
-                pending_label: None,
-                expected_type: None,
-                continuation_tag: None,
-            }]
-        );
-    }
-
-    #[test]
-    fn sign_allows_duplicate_declared_schemes() {
-        let (mut store, sign) = instantiate_sign_test_module(
-            Lifecycle::Active,
-            0,
+    fn sign_allows_declared_schemes_regardless_of_duplicate_declarations() {
+        for declared in [
+            vec![SignScheme::Ed25519],
             vec![SignScheme::Ed25519, SignScheme::Ed25519],
-        );
-        sign.call(&mut store, ()).unwrap();
-        assert_eq!(
-            store.data().effect_queue,
-            vec![Effect::Sign {
-                scheme: SignScheme::Ed25519,
-                data: Vec::new(),
-                pending_label: None,
-                expected_type: None,
-                continuation_tag: None,
-            }]
-        );
+        ] {
+            let (mut store, sign) = instantiate_sign_test_module(Lifecycle::Active, 0, declared);
+            sign.call(&mut store, ()).unwrap();
+            assert_eq!(
+                store.data().effect_queue,
+                vec![Effect::Sign {
+                    scheme: SignScheme::Ed25519,
+                    data: Vec::new(),
+                    pending_label: None,
+                    expected_type: None,
+                    continuation_tag: None,
+                }]
+            );
+        }
     }
 
     #[test]

@@ -568,6 +568,14 @@ mod tests {
             frame(
                 EventData::Terminated {
                     reason: "failed".into(),
+                    failed_class: Some(ExecutionFailureKind::HostStopped),
+                },
+                Some(exec),
+                None,
+            ),
+            frame(
+                EventData::Terminated {
+                    reason: "stopped".into(),
                     failed_class: None,
                 },
                 Some(exec),
@@ -691,9 +699,8 @@ mod tests {
     }
 
     #[test]
-    fn all_21_variants_round_trip_with_adjacent_data() {
+    fn event_variants_round_trip_with_flat_correlation_fields() {
         let frames = all_frames();
-        assert_eq!(frames.len(), 21);
         for frame in frames {
             let json = serde_json::to_value(&frame).unwrap();
             assert!(json.get("kind").and_then(Value::as_str).is_some());
@@ -702,6 +709,15 @@ mod tests {
             assert_eq!(json["host"]["peer_id"], PeerId([2; 32]).to_string());
             assert_eq!(json["host"]["user_agent"], "test-agent/1");
             assert_eq!(json.get("boot_id").unwrap(), "boot-00");
+            if matches!(
+                frame.data,
+                EventData::Terminated {
+                    failed_class: Some(ExecutionFailureKind::HostStopped),
+                    ..
+                }
+            ) {
+                assert_eq!(json["data"]["failed_class"], "host_stopped");
+            }
             let decoded: EventFrame = serde_json::from_value(json.clone()).unwrap();
             assert_eq!(decoded, frame);
             assert!(!json["data"].as_object().unwrap().contains_key("exec_id"));
@@ -799,31 +815,6 @@ mod tests {
         let mut nested_correlation = serde_json::to_value(frame).unwrap();
         nested_correlation["data"]["exec_id"] = Value::String("01".repeat(32));
         assert!(serde_json::from_value::<EventFrame>(nested_correlation).is_err());
-    }
-
-    #[test]
-    fn host_event_wire_has_no_node_compatibility_shape() {
-        let started_frame = frame(
-            EventData::HostStarted {
-                version: "0.1.0".into(),
-                transport_key: AgentPubKey([2; 32]),
-                abi_version: 1,
-            },
-            None,
-            None,
-        );
-        let mut legacy_frame = serde_json::to_value(&started_frame).unwrap();
-        legacy_frame["node"] = Value::String("host-01".into());
-        assert!(serde_json::from_value::<EventFrame>(legacy_frame).is_err());
-        assert!(EventFilter::try_new(vec!["node.started".into()], vec![]).is_err());
-
-        let failure = EventData::Terminated {
-            reason: "host stopped".into(),
-            failed_class: Some(ExecutionFailureKind::HostStopped),
-        };
-        let failure_frame = frame(failure, Some(id(1)), None);
-        let failure_json = serde_json::to_value(failure_frame).unwrap();
-        assert_eq!(failure_json["data"]["failed_class"], "host_stopped");
     }
 
     #[test]

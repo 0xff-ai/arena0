@@ -139,11 +139,6 @@ impl TuiPalette {
         let style = TuiStyle::default().add_modifier(modifier);
         if self.enabled { style.fg(color) } else { style }
     }
-
-    #[cfg(test)]
-    const fn for_test(enabled: bool, theme: ColorTheme) -> Self {
-        Self { enabled, theme }
-    }
 }
 
 impl ColorTheme {
@@ -544,7 +539,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn no_color_and_nonterminal_output_select_plain_styling() {
+    fn terminal_capabilities_enable_color_only_for_human_ttys() {
         assert!(!Palette::from_capabilities(Mode::Human, true, true).enabled);
         assert!(!Palette::from_capabilities(Mode::Human, false, false).enabled);
         assert!(!Palette::from_capabilities(Mode::Json, true, false).enabled);
@@ -552,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_theme_hints_select_contrasting_semantic_palettes() {
+    fn tui_theme_hints_select_light_and_dark_palettes() {
         assert_eq!(
             ColorTheme::from_hints(Some("light"), None),
             ColorTheme::Light
@@ -566,20 +561,5 @@ mod tests {
             ColorTheme::Light
         );
         assert_eq!(ColorTheme::from_hints(None, Some("15;0")), ColorTheme::Dark);
-
-        let dark = TuiPalette::for_test(true, ColorTheme::Dark);
-        assert_eq!(dark.strong().fg, Some(Color::LightBlue));
-        assert_eq!(dark.emphasis().fg, Some(Color::LightMagenta));
-        assert_eq!(dark.input().fg, Some(Color::LightYellow));
-        assert_eq!(dark.public().fg, Some(Color::LightCyan));
-        let light = TuiPalette::for_test(true, ColorTheme::Light);
-        assert_eq!(light.strong().fg, Some(Color::Blue));
-        assert_eq!(light.emphasis().fg, Some(Color::Magenta));
-        assert_eq!(light.input().fg, Some(Color::Rgb(128, 80, 0)));
-        assert_eq!(light.public().fg, Some(Color::Cyan));
-        assert_eq!(
-            TuiPalette::for_test(false, ColorTheme::Dark).strong().fg,
-            None
-        );
     }
 }

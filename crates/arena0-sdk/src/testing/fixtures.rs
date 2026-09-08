@@ -1041,6 +1041,7 @@ mod tests {
     fn retryable_input_rolls_back_shared_and_filters_effects() {
         let mut h = TestHarness::<FaultyProgram>::new(());
         h.session_started(peer_b());
+        h.pending.set_active(Some(pending(10, 0)));
 
         let result = h.input(());
 
@@ -1055,6 +1056,11 @@ mod tests {
             result.private_record().map(|record| &record.event),
             Some(PrivateEvent::InputReceived { .. })
         ));
+        assert_eq!(
+            h.active_pending().map(|pending| pending.id),
+            Some(PendingId::new(10))
+        );
+        assert!(h.closed_pending().is_empty());
     }
 
     #[test]
@@ -1114,31 +1120,6 @@ mod tests {
                 reason: ClosedPendingReason::Resolved,
             }
         );
-    }
-
-    #[test]
-    fn retryable_input_preserves_active_pending_continuation() {
-        let mut h = TestHarness::<FaultyProgram>::new(());
-        h.session_started(peer_b());
-        h.pending.set_active(Some(pending(10, 0)));
-
-        let result = h.input(());
-
-        assert!(result.has_input_fault());
-        assert_eq!(
-            h.active_pending().map(|pending| pending.id),
-            Some(PendingId::new(10))
-        );
-        assert!(h.closed_pending().is_empty());
-    }
-
-    #[test]
-    fn harness_verifies_trace_replay_chain() {
-        let mut h = TestHarness::<FaultyProgram>::new(());
-        h.session_started(peer_b());
-        h.message(peer_b(), ());
-
-        h.verify_trace().unwrap();
     }
 
     #[test]

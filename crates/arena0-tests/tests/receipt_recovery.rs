@@ -208,11 +208,8 @@ async fn recover_after(cut: CrashAfter) {
 }
 
 #[tokio::test]
-async fn stopped_execution_recovers_before_receipt_assembly() {
-    recover_after(CrashAfter::Stop).await;
-}
-
-#[tokio::test]
-async fn stopped_execution_recovers_after_atomic_publication() {
-    recover_after(CrashAfter::Publication).await;
+async fn stopped_execution_recovers_across_receipt_publication_boundaries() {
+    for cut in [CrashAfter::Stop, CrashAfter::Publication] {
+        recover_after(cut).await;
+    }
 }

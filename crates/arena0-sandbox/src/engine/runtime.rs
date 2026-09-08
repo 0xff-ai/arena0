@@ -936,7 +936,7 @@ mod fresh_runtime_tests {
     }
 
     #[test]
-    fn guest_trap_discards_mutated_fresh_instance() {
+    fn guest_traps_are_reported_as_dispatch_failures() {
         let init = initialized(&[], &[]);
         let shared = shared_output(&[]);
         let local = local_output(&[]);

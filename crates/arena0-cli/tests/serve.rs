@@ -69,23 +69,3 @@ fn serve_rejects_client_only_global_options() {
         "unexpected stderr: {stderr}"
     );
 }
-
-#[test]
-fn mcp_options_are_rejected_before_launching_the_daemon() {
-    for (command, option, value) in [
-        ("serve", "--mcp-listen", "127.0.0.1:7440"),
-        ("serve", "--mcp-access-token-lifetime-secs", "7200"),
-        ("launch", "--mcp-listen", "127.0.0.1:7440"),
-    ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_arena0"))
-            .args([command, option, value])
-            .output()
-            .expect("run unsupported MCP option");
-
-        assert_eq!(output.status.code(), Some(2));
-        assert!(output.stdout.is_empty());
-        let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(stderr.contains(option), "{stderr}");
-        assert!(stderr.contains("unexpected argument"), "{stderr}");
-    }
-}

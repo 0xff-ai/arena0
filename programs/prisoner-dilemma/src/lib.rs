@@ -383,13 +383,6 @@ mod tests {
         }
     }
 
-    // -- Payoff matrix --
-
-    #[test]
-    fn payoff_cooperate_cooperate() {
-        assert_eq!(payoff(Choice::Cooperate, Choice::Cooperate), (3, 3));
-    }
-
     #[test]
     fn choice_strings_are_stable() {
         assert_eq!(Choice::Cooperate.to_string(), "cooperate");
@@ -397,43 +390,34 @@ mod tests {
     }
 
     #[test]
-    fn payoff_cooperate_defect() {
-        assert_eq!(payoff(Choice::Cooperate, Choice::Defect), (0, 5));
-    }
-
-    #[test]
-    fn payoff_defect_cooperate() {
-        assert_eq!(payoff(Choice::Defect, Choice::Cooperate), (5, 0));
-    }
-
-    #[test]
-    fn payoff_defect_defect() {
-        assert_eq!(payoff(Choice::Defect, Choice::Defect), (1, 1));
+    fn payoff_matrix_is_canonical() {
+        for (mine, theirs, expected) in [
+            (Choice::Cooperate, Choice::Cooperate, (3, 3)),
+            (Choice::Cooperate, Choice::Defect, (0, 5)),
+            (Choice::Defect, Choice::Cooperate, (5, 0)),
+            (Choice::Defect, Choice::Defect, (1, 1)),
+        ] {
+            assert_eq!(payoff(mine, theirs), expected);
+        }
     }
 
     // -- Session setup --
 
     #[arena0::test(PrisonerDilemma, ())]
-    fn session_started_sets_total_rounds_and_transitions_to_playing(h: ()) {
+    fn session_start_establishes_the_game_contract(h: ()) {
         let fx = h.session_started(local_b());
 
         assert!(matches!(fx.fault, FaultStatus::None));
         assert_eq!(h.shared().total_rounds, 5);
         assert_eq!(h.shared().phase(), Phase::Playing);
         assert_eq!(h.shared().round, 0);
-    }
-
-    #[arena0::test(PrisonerDilemma, ())]
-    fn session_started_requests_input(h: ()) {
-        let fx = h.session_started(local_b());
-
         assert!(fx.has_callout());
     }
 
     // -- Input handling --
 
     #[arena0::test(PrisonerDilemma, ())]
-    fn cooperate_input_sends_commit(h: ()) {
+    fn choice_input_sends_commit(h: ()) {
         h.session_started(local_b());
 
         let fx = h.input(Input::Choose(Choice::Cooperate));
@@ -445,15 +429,6 @@ mod tests {
             msgs[0],
             Message::CommitReveal(commit_reveal::Message::Commit(_))
         ));
-    }
-
-    #[arena0::test(PrisonerDilemma, ())]
-    fn defect_input_sends_commit(h: ()) {
-        h.session_started(local_b());
-
-        let fx = h.input(Input::Choose(Choice::Defect));
-        assert!(matches!(fx.fault, FaultStatus::None));
-        assert!(fx.has_broadcast());
     }
 
     // -- Full game --
@@ -490,42 +465,6 @@ mod tests {
         h.message(local_b(), make_reveal(theirs));
     }
 
-    #[arena0::test(PrisonerDilemma, ())]
-    fn full_game_mutual_cooperation(ha: ()) {
-        ha.session_started(local_b());
-
-        for _ in 0..5 {
-            play_round(&mut ha, Choice::Cooperate, Choice::Cooperate);
-        }
-
-        assert_eq!(ha.shared().round, 5);
-        assert_eq!(ha.shared().scores, [15, 15]);
-        assert_eq!(ha.shared().history.len(), 5);
-    }
-
-    #[arena0::test(PrisonerDilemma, ())]
-    fn full_game_mutual_defection(ha: ()) {
-        ha.session_started(local_b());
-
-        for _ in 0..5 {
-            play_round(&mut ha, Choice::Defect, Choice::Defect);
-        }
-
-        assert_eq!(ha.shared().scores, [5, 5]);
-    }
-
-    #[arena0::test(PrisonerDilemma, ())]
-    fn full_game_asymmetric_choices(ha: ()) {
-        ha.session_started(local_b());
-
-        // Local (participant 0) defects, opponent cooperates: 5/0 per round.
-        for _ in 0..5 {
-            play_round(&mut ha, Choice::Defect, Choice::Cooperate);
-        }
-
-        assert_eq!(ha.shared().scores, [25, 0]);
-    }
-
     fn assert_scenario_scores(name: &str, rounds: &[(Choice, Choice)], expected_scores: [u32; 2]) {
         let mut scenario = Scenario::<PrisonerDilemma>::named(name);
         for &(alice, bob) in rounds {
@@ -539,33 +478,34 @@ mod tests {
         pair.trace().assert_shared_aligned();
         assert_eq!(pair.alice().shared().scores, expected_scores);
         assert_eq!(pair.bob().shared().scores, expected_scores);
+        assert_eq!(
+            pair.alice().shared().round,
+            u8::try_from(rounds.len()).expect("test round count fits")
+        );
+        assert_eq!(pair.alice().shared().history.len(), rounds.len());
     }
 
     #[test]
-    fn scenario_mutual_cooperation_converges() {
-        assert_scenario_scores(
-            "mutual cooperation",
-            &[(Choice::Cooperate, Choice::Cooperate); 5],
-            [15, 15],
-        );
-    }
-
-    #[test]
-    fn scenario_mutual_defection_converges() {
-        assert_scenario_scores(
-            "mutual defection",
-            &[(Choice::Defect, Choice::Defect); 5],
-            [5, 5],
-        );
-    }
-
-    #[test]
-    fn scenario_asymmetric_choices_converge() {
-        assert_scenario_scores(
-            "asymmetric choices",
-            &[(Choice::Defect, Choice::Cooperate); 5],
-            [25, 0],
-        );
+    fn payoff_scenarios_converge_across_replicas() {
+        for (name, rounds, scores) in [
+            (
+                "mutual cooperation",
+                [(Choice::Cooperate, Choice::Cooperate); 5],
+                [15, 15],
+            ),
+            (
+                "mutual defection",
+                [(Choice::Defect, Choice::Defect); 5],
+                [5, 5],
+            ),
+            (
+                "asymmetric choices",
+                [(Choice::Defect, Choice::Cooperate); 5],
+                [25, 0],
+            ),
+        ] {
+            assert_scenario_scores(name, &rounds, scores);
+        }
     }
 
     #[arena0::test(PrisonerDilemma, ())]
@@ -631,44 +571,29 @@ mod tests {
     // -- Outcome projection --
 
     #[test]
-    fn outcome_p0_wins() {
-        let state = Shared {
-            scores: [25, 0],
-            ..Shared::default()
-        };
-        match PrisonerDilemma::outcome(&state) {
-            Outcome::Win { winner, scores } => {
-                assert_eq!(winner, Participant::new(0));
-                assert_eq!(scores, [25, 0]);
-            }
-            other => panic!("expected p0 win, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn outcome_p1_wins() {
-        let state = Shared {
-            scores: [0, 25],
-            ..Shared::default()
-        };
-        match PrisonerDilemma::outcome(&state) {
-            Outcome::Win { winner, scores } => {
-                assert_eq!(winner, Participant::new(1));
-                assert_eq!(scores, [0, 25]);
-            }
-            other => panic!("expected p1 win, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn outcome_draw() {
-        let state = Shared {
-            scores: [15, 15],
-            ..Shared::default()
-        };
-        match PrisonerDilemma::outcome(&state) {
-            Outcome::Draw { scores } => assert_eq!(scores, [15, 15]),
-            other => panic!("expected draw, got {other:?}"),
+    fn outcome_projects_scores_and_winner() {
+        for (scores, expected) in [
+            (
+                [25, 0],
+                Outcome::Win {
+                    winner: Participant::new(0),
+                    scores: [25, 0],
+                },
+            ),
+            (
+                [0, 25],
+                Outcome::Win {
+                    winner: Participant::new(1),
+                    scores: [0, 25],
+                },
+            ),
+            ([15, 15], Outcome::Draw { scores: [15, 15] }),
+        ] {
+            let state = Shared {
+                scores,
+                ..Shared::default()
+            };
+            assert_eq!(PrisonerDilemma::outcome(&state), expected);
         }
     }
 
