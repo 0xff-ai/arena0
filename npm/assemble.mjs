@@ -2,15 +2,17 @@
 // Assemble an arena0 platform package from the built public executables, and sync versions
 // across the main + platform package.json files.
 //
-//   node npm/assemble.mjs <target> <binary-directory> [version]
+//   node npm/assemble.mjs <target> <binary-directory> [version] [output-directory]
 //
 //   target       one of: darwin-arm64, linux-x64
 //   binary-directory  directory containing `arena0`, `arena0d`, and `cargo-arena0`
 //   version      optional; defaults to the workspace version in Cargo.toml
+//   output-directory  optional staging tree; defaults to this npm directory
 //
-// The release workflow runs this once per target; locally it lets you `npm pack`
-// or publish without CI. Versions propagate to the main package's
-// optionalDependencies so the pins always match.
+// release.mjs invokes this for each verified target in a temporary staging tree.
+// Versions propagate to the main package's optionalDependencies so the pins
+// always match. This script only assembles files; it does not verify provenance
+// or publish packages.
 import {
   chmodSync,
   copyFileSync,
@@ -27,12 +29,13 @@ import { fileURLToPath } from 'node:url';
 
 const TARGETS = new Set(['darwin-arm64', 'linux-x64']);
 const BINARIES = ['arena0', 'arena0d', 'cargo-arena0'];
-const npmDir = dirname(fileURLToPath(import.meta.url));
-const repoRoot = resolve(npmDir, '..');
+const sourceNpmDir = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(sourceNpmDir, '..');
 
-const [target, binaryDirectory, versionArg] = process.argv.slice(2);
+const [target, binaryDirectory, versionArg, outputDirectory] = process.argv.slice(2);
+const npmDir = outputDirectory ? resolve(outputDirectory) : sourceNpmDir;
 if (!target || !binaryDirectory) {
-  console.error('usage: node npm/assemble.mjs <target> <binary-directory> [version]');
+  console.error('usage: node npm/assemble.mjs <target> <binary-directory> [version] [output-directory]');
   process.exit(2);
 }
 if (!TARGETS.has(target)) {
@@ -68,6 +71,20 @@ if (target === 'linux-x64') {
   }
 }
 const binDir = join(npmDir, `arena0-${target}`, 'bin');
+// Release packing uses a separate staging tree. Copy authored package inputs
+// only; ignored binaries or tarballs from a previous local build must not leak in.
+if (npmDir !== sourceNpmDir) {
+  for (const packageDir of ['arena0', 'arena0-darwin-arm64', 'arena0-linux-x64']) {
+    mkdirSync(join(npmDir, packageDir), { recursive: true });
+    for (const file of ['package.json', 'README.md']) {
+      copyFileSync(join(sourceNpmDir, packageDir, file), join(npmDir, packageDir, file));
+    }
+  }
+  mkdirSync(join(npmDir, 'arena0', 'bin'), { recursive: true });
+  for (const file of ['arena0.js', 'arena0d.js', 'cargo-arena0.js', 'launch.js']) {
+    copyFileSync(join(sourceNpmDir, 'arena0', 'bin', file), join(npmDir, 'arena0', 'bin', file));
+  }
+}
 mkdirSync(binDir, { recursive: true });
 for (const binary of BINARIES) {
   const source = join(sourceDir, binary);

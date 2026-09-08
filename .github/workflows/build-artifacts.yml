@@ -1,0 +1,136 @@
+name: Build release artifacts
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            os: macos-14
+            release_dir: target/optimized-release
+          - target: linux-x64
+            os: ubuntu-26.04
+            release_dir: target/x86_64-unknown-linux-gnu/optimized-release
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # rust-toolchain.toml pins the channel and the wasm32 target the programs
+      # need; the host target is the runner's native one.
+      - name: Install toolchain
+        run: rustup show
+
+      - name: Identify compiler
+        id: compiler
+        shell: bash
+        run: echo "identity=$(rustc -vV | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Rust cache
+        id: rust-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+            target
+            programs/target
+            !target/doc
+            !target/**/incremental
+            !programs/target/**/incremental
+          key: release-zig0152-zigbuild0223-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.os }}-optimized-release-${{ steps.compiler.outputs.identity }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '**/.cargo/config.toml') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            release-zig0152-zigbuild0223-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.os }}-optimized-release-${{ steps.compiler.outputs.identity }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '**/.cargo/config.toml') }}-
+            release-zig0152-zigbuild0223-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.os }}-optimized-release-${{ steps.compiler.outputs.identity }}-
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      # cargo-arena0 builds the guest Wasm and embeds the metadata section that
+      # the daemon's build script packages into the shipped binary.
+      - name: Build programs (wasm32)
+        if: matrix.target == 'darwin-arm64'
+        run: cd programs && cargo run --manifest-path ../Cargo.toml -p cargo-arena0 -- build
+
+      - name: Build public executables
+        if: matrix.target == 'darwin-arm64'
+        run: cargo build --locked --profile optimized-release \
+          -p arena0-cli -p arena0d -p cargo-arena0
+
+      - name: Install Zig
+        if: matrix.target == 'linux-x64'
+        uses: mlugg/setup-zig@abea47f85e598557f500fa1fd2ab7464fcb39406 # v2.2.1
+        with:
+          version: 0.15.2
+
+      - name: Install Linux release tools
+        if: matrix.target == 'linux-x64'
+        uses: taiki-e/install-action@84f5ac3124727fb3d284d4d22ee9ab3654fd09a6 # v2.87.7
+        with:
+          tool: cargo-zigbuild@0.22.3, cargo-audit@0.22.2
+
+      - name: Build Linux executables (glibc 2.35)
+        if: matrix.target == 'linux-x64'
+        run: ./scripts/build-linux-release.sh
+
+      - name: Dependency advisory audit
+        if: matrix.target == 'linux-x64'
+        run: |
+          cargo audit --file Cargo.lock
+          cargo audit --file programs/Cargo.lock
+
+      - name: Stage verified executables
+        run: node scripts/stage-release.mjs "${{ matrix.target }}" "${{ matrix.release_dir }}" "dist/${{ matrix.target }}"
+
+      - name: Pack and dry-run native packages
+        run: |
+          node npm/release.mjs pack dist packed "${{ matrix.target }}"
+          ./scripts/publish-npm.sh packed --dry-run
+
+      - name: Test Linux tarballs on Ubuntu 22.04
+        if: matrix.target == 'linux-x64'
+        run: ./scripts/test-linux-package.sh packed
+
+      # Use these same tarballs for the external SDK journey, including native
+      # macOS execution. Publication later packs from the verified binaries.
+      - name: Test packed release candidate
+        env:
+          ARENA0_NPM_TARBALL_DIR: ${{ github.workspace }}/packed
+        run: ./scripts/test-release-candidate.sh
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arena0-${{ matrix.target }}
+          path: dist/${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Save Rust cache
+        if: ${{ !cancelled() && steps.rust-cache.outputs.cache-primary-key != '' }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+            target
+            programs/target
+            !target/doc
+            !target/**/incremental
+            !programs/target/**/incremental
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}

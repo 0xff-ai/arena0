@@ -13,10 +13,14 @@ build: build-programs
 build-release: build-programs
     cargo build --profile optimized-release -p arena0-cli -p arena0d -p cargo-arena0
 
+# Portable Linux artifacts from any supported Linux x64 build host.
+build-linux-release:
+    ./scripts/build-linux-release.sh
+
 # Run host and program tests (programs wasm first so integration tests do not skip).
 # The doctest line covers the crate doc-tests (incl. the arena0-sdk compile_fail
 # doctest), which `cargo nextest run` does not run by default.
-test: build-programs
+test: build-programs test-release-scripts
     cargo nextest run --workspace
     cargo test --doc -p arena0-primitives -p arena0-sdk
     cargo nextest run --manifest-path programs/Cargo.toml
@@ -89,11 +93,17 @@ npm-smoke target directory:
     node npm/assemble.mjs {{target}} {{directory}}
     ./scripts/test-npm-package.sh {{target}}
 
-# Assemble the host (darwin-arm64) platform package and `npm pack` the main package locally.
-npm-pack-local: build-release
-    node npm/assemble.mjs darwin-arm64 target/optimized-release
-    cd npm/arena0-darwin-arm64 && npm pack --dry-run
-    cd npm/arena0 && npm pack --dry-run
+# Stage, pack, dry-run publication, and test installed binaries; never publishes.
+# Build Linux with `just build-linux-release`, macOS with `just build-release`.
+npm-dry-run directory:
+    ./scripts/npm-dry-run.sh {{quote(directory)}}
+
+# Retained alias; pass the native binary directory explicitly.
+npm-pack-local directory:
+    ./scripts/npm-dry-run.sh {{quote(directory)}}
+
+test-release-scripts:
+    node --test npm/release.test.mjs scripts/resolve-release-run.test.mjs
 
 # Package the public guest-author crates, then test and build the copyable
 # example outside the repository using only the resulting package sources.
