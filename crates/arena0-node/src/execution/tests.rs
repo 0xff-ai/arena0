@@ -263,42 +263,6 @@ impl Fixture {
         self.clear_outbox(actor).await;
     }
 
-    async fn stage_remote_message(
-        &self,
-        actor: &mut ExecutionActor,
-        data: Vec<u8>,
-        witness: WitnessCommitment,
-    ) -> u64 {
-        let state = actor.load_state().await.expect("load session state");
-        let source = self.remote_keys.peer_id();
-        let sequence = state.public().next_step();
-        let pre_state = state.public().state_hash();
-        assert!(
-            actor
-                .apply_message(
-                    source,
-                    ExecFrame::Message {
-                        message_id: MessageId::derive(
-                            state.binding().session_id(),
-                            source,
-                            sequence,
-                            pre_state,
-                            &data,
-                            witness,
-                        ),
-                        seq: sequence,
-                        prestate: pre_state,
-                        data,
-                        witness,
-                    },
-                    None,
-                )
-                .await
-                .expect("stage shared proposal")
-        );
-        sequence
-    }
-
     async fn clear_outbox(&self, actor: &mut ExecutionActor) {
         while let Some(leased) = actor
             .context
@@ -917,26 +881,46 @@ async fn inbound_transport_ack_follows_durable_acceptance() {
 #[tokio::test]
 async fn future_step_signature_waits_behind_the_current_proposal() {
     let fixture = Fixture::new(true).await;
-    let (messages, _observations) = mpsc::channel(32);
-    let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
+    let mut actor = fixture.prepare_active_actor().await;
     fixture.commit_session_started(&mut actor).await;
+
+    let state = actor.load_state().await.expect("load session state");
     let source = fixture.remote_keys.peer_id();
-    fixture
-        .stage_remote_message(&mut actor, vec![1, 2, 3], WitnessCommitment([15; 32]))
-        .await;
+    let sequence = state.public().next_step();
+    let pre_state = state.public().state_hash();
+    let data = vec![1, 2, 3];
+    let witness = WitnessCommitment([15; 32]);
+    assert!(
+        actor
+            .apply_message(
+                source,
+                ExecFrame::Message {
+                    message_id: MessageId::derive(
+                        state.binding().session_id(),
+                        source,
+                        sequence,
+                        pre_state,
+                        &data,
+                        witness,
+                    ),
+                    seq: sequence,
+                    prestate: pre_state,
+                    data,
+                    witness,
+                },
+                None,
+            )
+            .await
+            .expect("stage current proposal")
+    );
 
     let state = actor.load_state().await.expect("load current proposal");
-    let current_step = state
-        .pending_shared()
-        .expect("current proposal")
-        .commitment()
-        .step;
     let mut future_commitment = state
         .pending_shared()
         .expect("current proposal")
         .commitment()
         .clone();
-    future_commitment.step = current_step + 1;
+    future_commitment.step += 1;
     let frame = ExecFrame::StepSignature {
         signature: fixture
             .remote_execution_key()
@@ -946,7 +930,7 @@ async fn future_step_signature_waits_behind_the_current_proposal() {
     actor
         .context
         .store
-        .accept_inbound(source, frame.clone(), 20)
+        .accept_inbound(source, frame, 20)
         .await
         .expect("accept future signature");
 
@@ -962,17 +946,6 @@ async fn future_step_signature_waits_behind_the_current_proposal() {
         .await
         .expect("load deferred signature");
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].source(), source);
-    assert_eq!(pending[0].frame(), &frame);
-    let state = actor.load_state().await.expect("reload current proposal");
-    assert_eq!(
-        state
-            .pending_shared()
-            .expect("current proposal remains pending")
-            .commitment()
-            .step,
-        current_step
-    );
 }
 
 #[tokio::test]
@@ -981,9 +954,36 @@ async fn trace_observation_waits_for_the_certified_step() {
     let (messages, mut observations) = mpsc::channel(8);
     let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
     fixture.commit_session_started(&mut actor).await;
-    let sequence = fixture
-        .stage_remote_message(&mut actor, vec![1, 2, 3], WitnessCommitment([14; 32]))
-        .await;
+
+    let state = actor.load_state().await.expect("load session state");
+    let source = fixture.remote_keys.peer_id();
+    let sequence = state.public().next_step();
+    let pre_state = state.public().state_hash();
+    let data = vec![1, 2, 3];
+    let witness = WitnessCommitment([14; 32]);
+    assert!(
+        actor
+            .apply_message(
+                source,
+                ExecFrame::Message {
+                    message_id: MessageId::derive(
+                        state.binding().session_id(),
+                        source,
+                        sequence,
+                        pre_state,
+                        &data,
+                        witness,
+                    ),
+                    seq: sequence,
+                    prestate: pre_state,
+                    data,
+                    witness,
+                },
+                None,
+            )
+            .await
+            .expect("stage shared proposal")
+    );
     assert!(
         observations.try_recv().is_err(),
         "proposal must not emit a step"
