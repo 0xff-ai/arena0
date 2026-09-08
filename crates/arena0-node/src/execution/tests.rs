@@ -879,6 +879,76 @@ async fn inbound_transport_ack_follows_durable_acceptance() {
 }
 
 #[tokio::test]
+async fn future_step_signature_waits_behind_the_current_proposal() {
+    let fixture = Fixture::new(true).await;
+    let mut actor = fixture.prepare_active_actor().await;
+    fixture.commit_session_started(&mut actor).await;
+
+    let state = actor.load_state().await.expect("load session state");
+    let source = fixture.remote_keys.peer_id();
+    let sequence = state.public().next_step();
+    let pre_state = state.public().state_hash();
+    let data = vec![1, 2, 3];
+    let witness = WitnessCommitment([15; 32]);
+    assert!(
+        actor
+            .apply_message(
+                source,
+                ExecFrame::Message {
+                    message_id: MessageId::derive(
+                        state.binding().session_id(),
+                        source,
+                        sequence,
+                        pre_state,
+                        &data,
+                        witness,
+                    ),
+                    seq: sequence,
+                    prestate: pre_state,
+                    data,
+                    witness,
+                },
+                None,
+            )
+            .await
+            .expect("stage current proposal")
+    );
+
+    let state = actor.load_state().await.expect("load current proposal");
+    let mut future_commitment = state
+        .pending_shared()
+        .expect("current proposal")
+        .commitment()
+        .clone();
+    future_commitment.step += 1;
+    let frame = ExecFrame::StepSignature {
+        signature: fixture
+            .remote_execution_key()
+            .sign(&future_commitment.signing_bytes()),
+        commitment: future_commitment,
+    };
+    actor
+        .context
+        .store
+        .accept_inbound(source, frame, 20)
+        .await
+        .expect("accept future signature");
+
+    actor
+        .resolve_pending_inbox()
+        .await
+        .expect("defer future signature");
+
+    let pending = fixture
+        .store
+        .handle()
+        .list_pending_inbox(EXEC_ID, 16)
+        .await
+        .expect("load deferred signature");
+    assert_eq!(pending.len(), 1);
+}
+
+#[tokio::test]
 async fn trace_observation_waits_for_the_certified_step() {
     let fixture = Fixture::new(true).await;
     let (messages, mut observations) = mpsc::channel(8);

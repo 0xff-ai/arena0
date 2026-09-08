@@ -20,9 +20,3 @@ test-group = 'integration'
 [profile.ci]
 fail-fast = false
 test-threads = 2
-
-# This recovery fixture makes 8,193 durable writes. Reserve CI capacity while
-# it runs; keep its existing 120-second timeout and full recovery assertions.
-[[profile.ci.overrides]]
-filter = 'package(=arena0-daemon) & test(=server::tests::recovery_visits_requests_after_more_than_4096_terminal_rows)'
-threads-required = "num-test-threads"
