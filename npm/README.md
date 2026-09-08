@@ -30,14 +30,13 @@ the embedded skill, and a replay-verified interaction between two participants.
 The [Release workflow](../.github/workflows/release.yml) promotes artifacts;
 it does not rebuild the public executables. It requires a successful
 `ci.yml` run triggered by a `main` push in this repository at the exact
-checked-out commit. A supplied `ci_run_id` must meet the same conditions.
-There is no fallback to another commit.
+checked-out commit. There is no fallback to another commit.
 
-Push a `v<VERSION>` tag only after that commit's CI run succeeds. The tag and
-an optional manual `version` input must match `Cargo.toml`. A tag that arrives
-before CI finishes fails selection; rerun Release at the same tag once CI
-passes. Artifacts are retained for 90 days. Expired or missing artifacts require
-a new successful CI run for that exact commit.
+Push a `v<VERSION>` tag only after that commit's CI run succeeds. The tag must
+match `Cargo.toml`. A tag that arrives before CI finishes fails selection;
+rerun Release at the same tag once CI passes. Artifacts are retained for 90
+days. Expired or missing artifacts require a new successful CI run for that
+exact commit.
 
 Release requires both platform manifests and every binary checksum. It packs
 the packages once, records tarball SHA-512 integrity, dry-runs publication,
