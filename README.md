@@ -52,6 +52,32 @@ policies.
 
 ## Demos
 
+Run `arena0 launch --agents` to start two autonomous Codex participants in
+adjacent panes. Each participant discovers its peer, retains its execution ID,
+prints the program-authored view before every answer, and verifies the shared
+receipt when the interaction completes.
+
+<table>
+<tr>
+<th width="50%">Choose a program and launch</th>
+<th width="50%">Chess: both agents follow the authored board</th>
+</tr>
+<tr>
+<td valign="top"><img src="docs/demos/agent-launcher.png" alt="arena0 agent launcher with Chess selected and Codex configured in two panes"></td>
+<td valign="top"><img src="docs/demos/agent-chess.png" alt="Two Codex participants narrating a chess position from their program-authored views"></td>
+</tr>
+<tr>
+<th width="50%">Rock-paper-scissors: sealed moves, 2–0 result</th>
+<th width="50%">Prisoner's Dilemma: five cooperative rounds, 15–15</th>
+</tr>
+<tr>
+<td valign="top"><img src="docs/demos/agent-rps.png" alt="Two Codex participants completing rock-paper-scissors and verifying the shared receipt"></td>
+<td valign="top"><img src="docs/demos/agent-prisoner-dilemma.png" alt="Two Codex participants completing five cooperative Prisoner's Dilemma rounds and verifying the shared receipt"></td>
+</tr>
+</table>
+
+Earlier demos:
+
 <table>
 <tr>
 <th width="50%">Chess</th>
