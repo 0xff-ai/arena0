@@ -239,7 +239,7 @@ pub mod chess {
 
     fn view(ctx: &SharedContext, vp: &Viewport) -> View {
         let state = ctx.shared();
-        let board = current_board(&state.fen);
+        let board = state.current_board();
         // Read-only projections receive only shared state. Render the board in
         // canonical White-first orientation rather than depending on the local
         // replica identity.
@@ -457,7 +457,7 @@ pub mod chess {
             return Ok(());
         }
         let fen = state.fen.clone();
-        let legal_moves = legal_moves_string(&fen);
+        let legal_moves = state.legal_moves_string();
         ctx.effects()
             .callout(callouts::MakeMove { fen, legal_moves })
             .pending(Pending::Thinking)
@@ -502,15 +502,31 @@ pub mod chess {
 
     fn on_query(_ctx: &SharedContext, _: ()) {}
 
-    fn current_board(fen: &str) -> Option<CozyBoard> {
-        if fen.is_empty() {
-            None
-        } else {
-            Some(fen.parse::<CozyBoard>().expect("stored FEN should parse"))
-        }
-    }
-
     impl Shared {
+        fn current_board(&self) -> Option<CozyBoard> {
+            if self.fen.is_empty() {
+                None
+            } else {
+                Some(
+                    self.fen
+                        .parse::<CozyBoard>()
+                        .expect("stored FEN should parse"),
+                )
+            }
+        }
+
+        fn legal_moves_string(&self) -> String {
+            let Some(board) = self.current_board() else {
+                return String::new();
+            };
+            let mut moves: Vec<String> = collect_legal_moves(&board)
+                .into_iter()
+                .map(|mv| format!("{}", display_uci_move(&board, mv)))
+                .collect();
+            moves.sort();
+            moves.join(", ")
+        }
+
         fn sync_from_board(&mut self, board: &CozyBoard) {
             self.fen = board.to_string();
             self.status = Status::compute(board);
@@ -532,7 +548,7 @@ pub mod chess {
             if clean.len() < 4 || clean.len() > 5 {
                 return Err(Error::InvalidFormat);
             }
-            let mut board = current_board(&self.fen).ok_or(Error::GameNotInitialized)?;
+            let mut board = self.current_board().ok_or(Error::GameNotInitialized)?;
             let mv =
                 parse_uci_move(&board, &clean).map_err(|_| Error::IllegalMove(clean.clone()))?;
             if !board.is_legal(mv) {
@@ -542,18 +558,6 @@ pub mod chess {
             board.play(mv);
             Ok((board, algebraic))
         }
-    }
-
-    fn legal_moves_string(fen: &str) -> String {
-        let Some(board) = current_board(fen) else {
-            return String::new();
-        };
-        let mut moves: Vec<String> = collect_legal_moves(&board)
-            .into_iter()
-            .map(|mv| format!("{}", display_uci_move(&board, mv)))
-            .collect();
-        moves.sort();
-        moves.join(", ")
     }
 
     fn unicode_piece(piece: CozyPiece, color: CozyColor) -> char {
@@ -713,7 +717,9 @@ mod tests {
 
     mod harness {
         use super::*;
-        use arena0::testing::{ALICE, BOB, FaultStatus, Harness, Scenario, TestHarness};
+        use arena0::testing::{
+            ALICE, BOB, FaultStatus, HandlerResult, Harness, Scenario, TestHarness,
+        };
         use arena0::types::{ColorDepth, Slot};
 
         fn peer_a() -> PeerId {
@@ -760,6 +766,30 @@ mod tests {
             let fx = h.resolve_callout::<callouts::MakeMove>(uci.to_string());
             let mv = fx.messages::<Message>().remove(0);
             h.message(h.peer_id(), mv)
+        }
+
+        fn session_end_outcome(result: &HandlerResult) -> Outcome {
+            let outcome = result
+                .step
+                .as_ref()
+                .and_then(TraceEntry::completed_outcome)
+                .expect("terminal handler result should carry a completed outcome");
+            arena0::borsh::from_slice(outcome).expect("terminal outcome must decode")
+        }
+
+        fn terminal_move(h: &mut TestHarness<Chess>, fen: &str, uci: &str) -> (Status, Outcome) {
+            h.session_started(peer_a());
+            h.shared_mut().fen = fen.to_owned();
+            let result = h.message(h.peer_id(), Message::Move(uci.to_owned()));
+            assert!(
+                result.has_session_end(),
+                "terminal move should end the session"
+            );
+            assert!(
+                h.trace().last().is_some_and(TraceEntry::is_terminal),
+                "terminal move should produce terminal trace evidence"
+            );
+            (h.shared().status, session_end_outcome(&result))
         }
 
         #[arena0::test(Chess, ())]
@@ -897,6 +927,44 @@ mod tests {
                 }
             );
             assert_eq!(state.move_history.len(), 7);
+            assert_eq!(
+                session_end_outcome(&apply),
+                Outcome::Win {
+                    winner: Participant::new(0),
+                    reason: WinReason::Checkmate,
+                }
+            );
+        }
+
+        #[test]
+        fn terminal_draws_project_real_handler_outcomes() {
+            // ponytail: keep each draw rule as data, with one real-handler check.
+            let cases = [
+                (
+                    "7k/8/4Q3/6K1/8/8/8/8 w - - 0 1",
+                    "e6f7",
+                    Status::Stalemate,
+                    DrawReason::Stalemate,
+                ),
+                (
+                    "4k3/8/8/8/8/8/4K2R/8 w - - 99 1",
+                    "h2h3",
+                    Status::DrawBy50MoveRule,
+                    DrawReason::FiftyMoveRule,
+                ),
+                (
+                    "4k3/7b/8/8/8/8/2B1K3/8 w - - 0 1",
+                    "c2h7",
+                    Status::DrawByInsufficientMaterial,
+                    DrawReason::InsufficientMaterial,
+                ),
+            ];
+            for (fen, uci, expected_status, reason) in cases {
+                assert_eq!(
+                    terminal_move(&mut TestHarness::<Chess>::new(()), fen, uci),
+                    (expected_status, Outcome::Draw { reason })
+                );
+            }
         }
 
         #[arena0::test(Chess, ())]
@@ -957,66 +1025,6 @@ mod tests {
             assert!(!snapshot.transcript.contains("InputReceived"));
             assert!(snapshot.transcript.contains("MessageReceived"));
             assert!(!snapshot.transcript.contains("Broadcast"));
-        }
-    }
-
-    #[test]
-    fn checkmate_projects_win_for_winning_participant() {
-        let white_mate = chess::Status::Checkmate {
-            winner: Color::White,
-        };
-        match outcome_for(white_mate) {
-            Outcome::Win { winner, reason } => {
-                assert_eq!(winner, Participant::new(0));
-                assert_eq!(reason, WinReason::Checkmate);
-            }
-            other => panic!("expected win, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn draws_project_their_reasons() {
-        assert!(matches!(
-            outcome_for(chess::Status::Stalemate),
-            Outcome::Draw {
-                reason: DrawReason::Stalemate
-            }
-        ));
-        assert!(matches!(
-            outcome_for(chess::Status::DrawBy50MoveRule),
-            Outcome::Draw {
-                reason: DrawReason::FiftyMoveRule
-            }
-        ));
-        assert!(matches!(
-            outcome_for(chess::Status::DrawByInsufficientMaterial),
-            Outcome::Draw {
-                reason: DrawReason::InsufficientMaterial
-            }
-        ));
-    }
-
-    // Mirror of the module-private `outcome` projection. The real export is
-    // verified end-to-end by the harness `scholars_mate` SessionEnd receipt;
-    // this pins the pure status → outcome mapping in absolute participant order.
-    fn outcome_for(status: chess::Status) -> Outcome {
-        match status {
-            chess::Status::Checkmate { winner } => Outcome::Win {
-                winner: Participant::from(winner),
-                reason: WinReason::Checkmate,
-            },
-            chess::Status::Stalemate => Outcome::Draw {
-                reason: DrawReason::Stalemate,
-            },
-            chess::Status::DrawBy50MoveRule => Outcome::Draw {
-                reason: DrawReason::FiftyMoveRule,
-            },
-            chess::Status::DrawByInsufficientMaterial => Outcome::Draw {
-                reason: DrawReason::InsufficientMaterial,
-            },
-            chess::Status::InProgress => Outcome::Draw {
-                reason: DrawReason::Stalemate,
-            },
         }
     }
 

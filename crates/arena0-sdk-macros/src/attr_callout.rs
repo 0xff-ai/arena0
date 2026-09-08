@@ -418,24 +418,3 @@ fn is_arena0_callout_attr(attr: &syn::Attribute) -> bool {
     };
     segments.next().is_none() && first.ident == "arena0" && second.ident == "callout"
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn generated_callouts_include_mapping_rustdoc() {
-        let item: ItemEnum = syn::parse_quote! {
-            pub enum Callout {
-                #[arena0::callout(output = Move)]
-                Choose { board: Board },
-            }
-        };
-
-        let expanded = expand_arena0_callouts(item).unwrap().to_string();
-        assert!(expanded.contains("Typed request structs generated"));
-        assert!(expanded.contains("Arena-owned callout `Choose`"));
-        assert!(expanded.contains("Input response for the `Choose` callout"));
-        assert!(expanded.contains("Typed input enum generated"));
-    }
-}

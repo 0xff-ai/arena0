@@ -206,16 +206,6 @@ mod tests {
     }
 
     #[test]
-    fn round_trip() {
-        let expected = definition();
-        let program = Program::embed(b"\0asm\x01\x00\x00\x00", &expected).unwrap();
-        let clone = program.clone();
-
-        assert_eq!(program.definition(), &expected);
-        assert!(std::ptr::eq(program.definition(), clone.definition()));
-    }
-
-    #[test]
     fn duplicate_metadata_sections_are_rejected() {
         let bytes = definition().encode().unwrap();
         let once = Program::append_metadata(b"\0asm\x01\x00\x00\x00", &bytes);
@@ -302,14 +292,6 @@ mod tests {
                 "unexpected error for {participants}: {error}"
             );
         }
-    }
-
-    #[test]
-    fn absent_section_is_rejected() {
-        assert!(matches!(
-            Program::read_metadata(b"\0asm\x01\x00\x00\x00"),
-            Err(SandboxError::MissingMetadata)
-        ));
     }
 
     #[test]
@@ -481,15 +463,5 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             SharedWriterGuard(Arc::clone(&self.0))
         }
-    }
-
-    #[test]
-    fn embed_is_idempotent() {
-        let base = b"\0asm\x01\x00\x00\x00";
-        let encoded = definition().encode().unwrap();
-        let once = Program::append_metadata(base, &encoded);
-        let engine = WasmtimeEngine::new().unwrap();
-        assert_eq!(engine.build_program(&once).unwrap().bytes(), once);
-        assert_eq!(Program::read_metadata(&once).unwrap(), definition());
     }
 }

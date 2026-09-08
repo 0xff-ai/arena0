@@ -169,9 +169,9 @@ fn fields_types(fields: &Fields) -> Vec<Type> {
 }
 
 /// Add generic serde bounds when the caller did not provide them.
-pub(crate) fn prepare_serde_bounds(input: &mut DeriveInput, inferred: &[Ident]) {
-    if inferred.is_empty() || has_serde_bound(input) {
-        return;
+pub(crate) fn prepare_serde_bounds(input: &mut DeriveInput, inferred: &[Ident]) -> Result<()> {
+    if inferred.is_empty() || has_serde_bound(input)? {
+        return Ok(());
     }
 
     let serde_bound: String = inferred
@@ -184,16 +184,32 @@ pub(crate) fn prepare_serde_bounds(input: &mut DeriveInput, inferred: &[Ident]) 
     input
         .attrs
         .push(syn::parse_quote!(#[serde(bound = #serde_bound)]));
+    Ok(())
 }
 
-fn has_serde_bound(input: &DeriveInput) -> bool {
-    input.attrs.iter().any(|attr| {
-        attr.path().is_ident("serde")
-            && attr
-                .parse_args::<TokenStream2>()
-                .map(|tokens| tokens.to_string().contains("bound"))
-                .unwrap_or(false)
-    })
+fn has_serde_bound(input: &DeriveInput) -> Result<bool> {
+    for attr in input
+        .attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("serde"))
+    {
+        let mut found = false;
+        attr.parse_nested_meta(|meta| {
+            found |= meta.path.is_ident("bound");
+            if meta.input.peek(Token![=]) {
+                let _: syn::Expr = meta.value()?.parse()?;
+            } else if meta.input.peek(syn::token::Paren) {
+                let content;
+                syn::parenthesized!(content in meta.input);
+                let _: TokenStream2 = content.parse()?;
+            }
+            Ok(())
+        })?;
+        if found {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -208,17 +224,48 @@ mod tests {
     }
 
     #[test]
-    fn contract_bounds_are_allowed() {
-        let attrs: Vec<Attribute> = vec![syn::parse_quote!(
-            #[serde(bound = "T: Serialize")]
-        )];
-        validate_contract_attrs(&attrs).unwrap();
-    }
-
-    #[test]
     fn shape_changing_defaults_are_rejected() {
         let attrs: Vec<Attribute> = vec![syn::parse_quote!(#[serde(default)])];
         let error = validate_contract_attrs(&attrs).unwrap_err();
         assert!(error.to_string().contains("serde attribute changes"));
+    }
+
+    #[test]
+    fn serde_crate_path_containing_bound_does_not_suppress_inferred_bounds() {
+        let mut input: DeriveInput = syn::parse_quote! {
+            #[serde(crate = "::my_bound_serde")]
+            struct Value<T> {
+                value: T,
+            }
+        };
+        let inferred = [syn::parse_str::<Ident>("T").expect("generic ident")];
+
+        prepare_serde_bounds(&mut input, &inferred).unwrap();
+
+        assert_eq!(input.attrs.len(), 2);
+        let actual = &input.attrs[1];
+        let expected: Attribute = syn::parse_quote! {
+            #[serde(bound = "T: ::arena0::serde::Serialize + ::arena0::serde::de::DeserializeOwned")]
+        };
+        assert_eq!(quote!(#actual).to_string(), quote!(#expected).to_string());
+    }
+
+    #[test]
+    fn explicit_serde_bound_forms_are_preserved_once() {
+        let attrs: [Attribute; 2] = [
+            syn::parse_quote!(#[serde(bound = "T: Serialize")]),
+            syn::parse_quote!(#[serde(bound(serialize = "T: Serialize", deserialize = "T: DeserializeOwned"))]),
+        ];
+        for attr in attrs {
+            let mut input: DeriveInput = syn::parse_quote! {
+                #attr
+                struct Value<T> { value: T }
+            };
+            validate_contract_attrs(&input.attrs).unwrap();
+            prepare_serde_bounds(&mut input, &[syn::parse_quote!(T)]).unwrap();
+            assert_eq!(input.attrs.len(), 1);
+            let actual = &input.attrs[0];
+            assert_eq!(quote!(#actual).to_string(), quote!(#attr).to_string());
+        }
     }
 }

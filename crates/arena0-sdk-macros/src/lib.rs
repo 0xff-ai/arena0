@@ -40,7 +40,7 @@ pub fn data(args: TokenStream, input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn message(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as attr_type::ProgramValueArgs);
-    match attr_type::expand_arena0_message(args, parse_macro_input!(input as DeriveInput)) {
+    match attr_type::expand_program_value(args, parse_macro_input!(input as DeriveInput)) {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }

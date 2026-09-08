@@ -23,22 +23,14 @@ fn serve_execs_the_sibling_daemon_with_exact_arguments_and_status() {
     install_script(&arena0d, "#!/bin/sh\nprintf '%s\\n' \"$@\"\nexit 23\n");
 
     let output = Command::new(arena0)
-        .args([
-            "serve",
-            "--hosts",
-            "alpha,beta",
-            "--mcp-listen",
-            "127.0.0.1:7440",
-            "--mcp-access-token-lifetime-secs",
-            "7200",
-        ])
+        .args(["serve", "--hosts", "alpha,beta"])
         .output()
         .expect("run arena0 serve");
 
     assert_eq!(output.status.code(), Some(23));
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "--host\nalpha\n--host\nbeta\n--mcp-listen\n127.0.0.1:7440\n--mcp-access-token-lifetime-secs\n7200\n"
+        "--host\nalpha\n--host\nbeta\n"
     );
 }
 
@@ -79,18 +71,21 @@ fn serve_rejects_client_only_global_options() {
 }
 
 #[test]
-fn serve_rejects_zero_token_lifetime_before_launching_the_daemon() {
-    let output = Command::new(env!("CARGO_BIN_EXE_arena0"))
-        .args(["serve", "--mcp-access-token-lifetime-secs", "0"])
-        .output()
-        .expect("run invalid token lifetime invocation");
+fn mcp_options_are_rejected_before_launching_the_daemon() {
+    for (command, option, value) in [
+        ("serve", "--mcp-listen", "127.0.0.1:7440"),
+        ("serve", "--mcp-access-token-lifetime-secs", "7200"),
+        ("launch", "--mcp-listen", "127.0.0.1:7440"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_arena0"))
+            .args([command, option, value])
+            .output()
+            .expect("run unsupported MCP option");
 
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("--mcp-access-token-lifetime-secs"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("invalid value"), "{stderr}");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(option), "{stderr}");
+        assert!(stderr.contains("unexpected argument"), "{stderr}");
+    }
 }

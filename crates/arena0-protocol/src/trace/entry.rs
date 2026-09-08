@@ -2,6 +2,7 @@
 //! metadata shared by the live dispatch path and replay verifier.
 
 use crate::PendingId;
+use crate::bounded::{read_option_string, write_option_string};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -174,8 +175,8 @@ impl BorshSerialize for PendingRecord {
     fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
         BorshSerialize::serialize(&self.id, writer)?;
         BorshSerialize::serialize(&self.operation, writer)?;
-        serialize_option_string(writer, self.label.as_ref())?;
-        serialize_option_string(writer, self.expected_type.as_ref())?;
+        serialize_pending_string(writer, self.label.as_deref())?;
+        serialize_pending_string(writer, self.expected_type.as_deref())?;
         BorshSerialize::serialize(&self.continuation_tag, writer)
     }
 }
@@ -185,60 +186,38 @@ impl BorshDeserialize for PendingRecord {
         Ok(Self {
             id: PendingId::deserialize_reader(reader)?,
             operation: PendingOperation::deserialize_reader(reader)?,
-            label: read_option_string(reader, "pending label")?,
-            expected_type: read_option_string(reader, "pending expected type")?,
+            label: read_option_string(
+                reader,
+                crate::execution::MAX_TERMINAL_REASON_BYTES,
+                "pending label",
+            )?,
+            expected_type: read_option_string(
+                reader,
+                crate::execution::MAX_TERMINAL_REASON_BYTES,
+                "pending expected type",
+            )?,
             continuation_tag: Option::<u32>::deserialize_reader(reader)?,
         })
     }
 }
 
-fn serialize_option_string<W: borsh::io::Write>(
+fn serialize_pending_string<W: borsh::io::Write>(
     writer: &mut W,
-    value: Option<&String>,
+    value: Option<&str>,
 ) -> io::Result<()> {
-    match value {
-        None => BorshSerialize::serialize(&0u8, writer),
-        Some(value) => {
-            if value.len() > crate::execution::MAX_TERMINAL_REASON_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "pending string exceeds bound",
-                ));
-            }
-            BorshSerialize::serialize(&1u8, writer)?;
-            let len = u32::try_from(value.len())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "string too long"))?;
-            BorshSerialize::serialize(&len, writer)?;
-            writer.write_all(value.as_bytes())
-        }
+    // Pending records reject an oversized field before writing its option tag.
+    if value.is_some_and(|value| value.len() > crate::execution::MAX_TERMINAL_REASON_BYTES) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "pending string exceeds bound",
+        ));
     }
-}
-
-fn read_option_string<R: borsh::io::Read>(
-    reader: &mut R,
-    field: &'static str,
-) -> io::Result<Option<String>> {
-    match u8::deserialize_reader(reader)? {
-        0 => Ok(None),
-        1 => {
-            let len = u32::deserialize_reader(reader)? as usize;
-            if len > crate::execution::MAX_TERMINAL_REASON_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{field} exceeds bound"),
-                ));
-            }
-            let mut bytes = vec![0; len];
-            reader.read_exact(&mut bytes)?;
-            String::from_utf8(bytes)
-                .map(Some)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-        }
-        tag => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unknown optional string tag {tag}"),
-        )),
-    }
+    write_option_string(
+        writer,
+        value,
+        crate::execution::MAX_TERMINAL_REASON_BYTES,
+        "pending string",
+    )
 }
 
 /// The operation whose answer resumes one durable continuation.

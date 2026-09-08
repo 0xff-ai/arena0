@@ -1,21 +1,16 @@
 //! Fresh-instance execution operations for admitted programs.
 
 use arena0_program::{
-    CallStatus, InitInput, LocalInput, LocalOutput, LocalStateBytes, OutcomeInput, OutcomeOutput,
-    QueryInput, QueryOutput, SharedInput, SharedOutput, ViewInput, ViewOutput, WriterInput,
-    WriterOutput, abi,
+    CallStatus, InitInput, LocalInput, LocalOutput, OutcomeInput, OutcomeOutput, QueryInput,
+    QueryOutput, SharedInput, SharedOutput, ViewInput, ViewOutput, WriterInput, WriterOutput, abi,
 };
 use arena0_protocol::Lifecycle;
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use super::memory::Guest;
-use super::{
-    CallInstance, CallKind, InstanceConfig, complete_observations, instantiate_module, max_output,
-    validate_state_bytes,
-};
+use super::{CallInstance, CallKind, InstanceConfig, instantiate_module, max_output};
 use crate::call::{
-    self, InitializeCall, LocalCall, OutcomeCall, QueryCall, SharedCall, SharedCallParts, ViewCall,
-    WriterCall,
+    self, InitializeCall, LocalCall, OutcomeCall, QueryCall, SharedCall, ViewCall, WriterCall,
 };
 use crate::{
     CallObservations, GuestOutcomeResult, GuestProjectionResult, GuestWriterResult,
@@ -25,7 +20,7 @@ use crate::{
 impl super::AdmittedProgram {
     /// Execute initialization in a fresh guest instance.
     pub fn initialize(&self, call: InitializeCall) -> Result<InitializedState, SandboxError> {
-        let input = call::init_input(call.params)?;
+        let input = call.into_input()?;
         let (output, observations) = self.invoke::<InitInput, arena0_program::InitializedState>(
             CallKind::Initialize,
             Lifecycle::PreSession,
@@ -33,40 +28,32 @@ impl super::AdmittedProgram {
             abi::exports::INITIALIZE,
             input,
         )?;
-        initialized_state(output, observations, &self.profile, self.state_max_bytes)
+        self.initialized_state(output, observations)
     }
 
     /// Apply one shared/public event in a fresh guest instance.
     pub fn apply_shared(&self, call: SharedCall) -> Result<SharedCallResult, SandboxError> {
-        let (shared, event, input_session, lifecycle) = match call.into_parts() {
-            SharedCallParts::SessionStarted { shared, ensemble } => (
+        let (shared, event, input_session, lifecycle) = match call {
+            SharedCall::SessionStarted { shared, ensemble } => (
                 shared,
                 arena0_protocol::Event::SessionStarted { ensemble },
                 None,
                 Lifecycle::PreSession,
             ),
-            SharedCallParts::Event {
+            SharedCall::Event {
                 shared,
                 session,
                 event,
-            } => {
-                let input_session = session.clone();
-                (
-                    shared,
-                    event.into_protocol(),
-                    Some(input_session),
-                    Lifecycle::Active,
-                )
-            }
+            } => (
+                shared,
+                event.into_protocol(),
+                Some(session),
+                Lifecycle::Active,
+            ),
         };
         let event = call::serialize(&event)?;
-        let input = call::shared_input(shared.clone(), event, input_session.as_ref())?;
-        validate_state_bytes(
-            &input.shared,
-            &empty_local()?,
-            &self.profile,
-            Some(self.state_max_bytes),
-        )?;
+        let input = call::shared_input(shared.clone(), event, input_session)?;
+        self.validate_shared_state(&input.shared)?;
         let (output, observations) = self.invoke::<SharedInput, SharedOutput>(
             CallKind::Shared,
             lifecycle,
@@ -74,11 +61,7 @@ impl super::AdmittedProgram {
             abi::exports::SHARED,
             input,
         )?;
-        if output.status == CallStatus::Rejected
-            && (!observations.effects.is_empty()
-                || !observations.random_draws.is_empty()
-                || !observations.logs.is_empty())
-        {
+        if output.status == CallStatus::Rejected && !observations.is_empty_except_fuel() {
             return Err(SandboxError::DispatchFailed(
                 "rejected shared call emitted observations".into(),
             ));
@@ -88,12 +71,7 @@ impl super::AdmittedProgram {
                 "rejected shared call changed shared state".into(),
             ));
         }
-        validate_state_bytes(
-            &output.shared,
-            &empty_local()?,
-            &self.profile,
-            Some(self.state_max_bytes),
-        )?;
+        self.validate_shared_state(&output.shared)?;
         Ok(SharedCallResult {
             status: output.status,
             shared: output.shared,
@@ -103,28 +81,19 @@ impl super::AdmittedProgram {
 
     /// Apply one local/private event in a fresh guest instance.
     pub fn apply_local(&self, call: LocalCall) -> Result<LocalCallResult, SandboxError> {
-        let event = call::serialize(&call.event.clone().into_protocol())?;
-        let shared = call.shared.clone();
-        let input = call::local_input(call.peer_id, call.shared, call.local, event, &call.session)?;
-        validate_state_bytes(
-            &input.shared,
-            &input.local,
-            &self.profile,
-            Some(self.state_max_bytes),
-        )?;
+        let (input, shared, random_replay) = call.into_input()?;
+        self.validate_state(&input.shared, &input.local)?;
         let input_local = input.local.clone();
         let (output, observations) = self.invoke::<LocalInput, LocalOutput>(
             CallKind::Local,
             Lifecycle::Active,
-            call.random_replay.as_ref().map(|replay| replay.as_slice()),
+            random_replay.as_ref().map(|replay| replay.as_slice()),
             abi::exports::LOCAL,
             input,
         )?;
         if output.status == CallStatus::Rejected {
             if output.local.as_bytes() != input_local.as_bytes()
-                || !observations.effects.is_empty()
-                || !observations.random_draws.is_empty()
-                || !observations.logs.is_empty()
+                || !observations.is_empty_except_fuel()
             {
                 return Err(SandboxError::DispatchFailed(
                     "rejected local call changed state or emitted observations".into(),
@@ -136,12 +105,7 @@ impl super::AdmittedProgram {
                 observations,
             });
         }
-        validate_state_bytes(
-            &shared,
-            &output.local,
-            &self.profile,
-            Some(self.state_max_bytes),
-        )?;
+        self.validate_state(&shared, &output.local)?;
         Ok(LocalCallResult {
             status: output.status,
             local: output.local,
@@ -152,13 +116,8 @@ impl super::AdmittedProgram {
     /// Execute one read-only query in a fresh guest instance.
     pub fn writer(&self, call: WriterCall) -> Result<GuestWriterResult, SandboxError> {
         let participant_count = call.session.len();
-        let input = call::writer_input(&call);
-        validate_state_bytes(
-            &input.shared,
-            &empty_local()?,
-            &self.profile,
-            Some(self.state_max_bytes),
-        )?;
+        let input = call.into_input();
+        self.validate_shared_state(&input.shared)?;
         let (output, observations) = self.invoke::<WriterInput, WriterOutput>(
             CallKind::Writer,
             Lifecycle::Active,
@@ -191,13 +150,8 @@ impl super::AdmittedProgram {
                     call.query_index
                 ))
             })?;
-        let input = call::query_input(call)?;
-        validate_state_bytes(
-            &input.shared,
-            &empty_local()?,
-            &self.profile,
-            Some(self.state_max_bytes),
-        )?;
+        let input = call.into_input()?;
+        self.validate_shared_state(&input.shared)?;
         let query_index = input.query_index;
         let (output, observations) = self.invoke::<QueryInput, QueryOutput>(
             CallKind::Query,
@@ -223,13 +177,8 @@ impl super::AdmittedProgram {
 
     /// Execute one read-only viewport projection in a fresh guest instance.
     pub fn view(&self, call: ViewCall) -> Result<GuestProjectionResult, SandboxError> {
-        let input = call::view_input(call)?;
-        validate_state_bytes(
-            &input.shared,
-            &empty_local()?,
-            &self.profile,
-            Some(self.state_max_bytes),
-        )?;
+        let input = call.into_input()?;
+        self.validate_shared_state(&input.shared)?;
         let (output, observations) = self.invoke::<ViewInput, ViewOutput>(
             CallKind::View,
             Lifecycle::Active,
@@ -244,13 +193,8 @@ impl super::AdmittedProgram {
 
     /// Execute the pure terminal-outcome projection in a fresh guest instance.
     pub fn outcome(&self, call: OutcomeCall) -> Result<GuestOutcomeResult, SandboxError> {
-        let input = call::outcome_input(call)?;
-        validate_state_bytes(
-            &input.shared,
-            &empty_local()?,
-            &self.profile,
-            Some(self.state_max_bytes),
-        )?;
+        let input = call.into_input()?;
+        self.validate_shared_state(&input.shared)?;
         let (output, observations) = self.invoke::<OutcomeInput, OutcomeOutput>(
             CallKind::Outcome,
             Lifecycle::Completed,
@@ -323,7 +267,7 @@ impl super::AdmittedProgram {
                 .unwrap_or(self.profile.fuel.per_call),
         );
         let output = self.decode_result::<O>(&mut instance, returned.0, returned.1)?;
-        let observations = complete_observations(instance.store.data_mut(), fuel_used)?;
+        let observations = instance.store.data_mut().finish_observations(fuel_used)?;
         Ok((output, observations))
     }
 
@@ -395,10 +339,7 @@ fn outcome_result(
 }
 
 fn ensure_read_only(observations: &CallObservations, operation: &str) -> Result<(), SandboxError> {
-    if observations.effects.is_empty()
-        && observations.random_draws.is_empty()
-        && observations.logs.is_empty()
-    {
+    if observations.is_empty_except_fuel() {
         Ok(())
     } else {
         Err(SandboxError::ReadOnlyViolation {
@@ -407,36 +348,24 @@ fn ensure_read_only(observations: &CallObservations, operation: &str) -> Result<
     }
 }
 
-fn empty_local() -> Result<LocalStateBytes, SandboxError> {
-    LocalStateBytes::try_new(Vec::new())
-        .map_err(|error| SandboxError::input_limit(error.to_string()))
-}
-
-fn initialized_state(
-    output: arena0_program::InitializedState,
-    observations: CallObservations,
-    profile: &arena0_program::ExecutionProfile,
-    state_max_bytes: usize,
-) -> Result<InitializedState, SandboxError> {
-    if !observations.effects.is_empty()
-        || !observations.random_draws.is_empty()
-        || !observations.logs.is_empty()
-    {
-        return Err(SandboxError::DispatchFailed(
-            "initialization must return state only".into(),
-        ));
+impl super::AdmittedProgram {
+    fn initialized_state(
+        &self,
+        output: arena0_program::InitializedState,
+        observations: CallObservations,
+    ) -> Result<InitializedState, SandboxError> {
+        if !observations.is_empty_except_fuel() {
+            return Err(SandboxError::DispatchFailed(
+                "initialization must return state only".into(),
+            ));
+        }
+        self.validate_state(&output.shared, &output.local)?;
+        Ok(InitializedState {
+            shared: output.shared,
+            local: output.local,
+            fuel_used: observations.fuel_used,
+        })
     }
-    validate_state_bytes(
-        &output.shared,
-        &output.local,
-        profile,
-        Some(state_max_bytes),
-    )?;
-    Ok(InitializedState {
-        shared: output.shared,
-        local: output.local,
-        fuel_used: observations.fuel_used,
-    })
 }
 
 fn validate_json_schema(
@@ -460,8 +389,8 @@ mod fresh_runtime_tests {
     use crate::call::{LocalEvent, SharedEvent};
     use crate::{AdmittedProgram, Program, WasmtimeEngine};
     use arena0_program::{
-        Capability, JsonBytes, JsonSchemaDocument, ProgramDefinition, ProgramMetadata,
-        ProgramSchema, QuerySchema, SharedStateBytes, StateSchema,
+        Capability, JsonBytes, JsonSchemaDocument, LocalStateBytes, ProgramDefinition,
+        ProgramMetadata, ProgramSchema, QuerySchema, SharedStateBytes, StateSchema,
     };
     use arena0_protocol::{Committed, Ensemble, MessageId, PeerId, StateHash};
 

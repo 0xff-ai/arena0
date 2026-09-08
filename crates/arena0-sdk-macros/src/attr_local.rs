@@ -1,12 +1,13 @@
 use proc_macro2::TokenStream as TokenStream2;
-use quote::{ToTokens, quote};
+use quote::quote;
+use syn::punctuated::Punctuated;
 use syn::{Data, DeriveInput, Error, Fields, Result};
 
 pub(crate) fn expand_arena0_local(mut input: DeriveInput) -> Result<TokenStream2> {
     let ident = &input.ident;
-    let has_borsh_serialize = derives_named(&input, "BorshSerialize");
-    let has_borsh_deserialize = derives_named(&input, "BorshDeserialize");
-    let debug_derived = derives_debug(&input);
+    let has_borsh_serialize = has_derive(&input, "BorshSerialize");
+    let has_borsh_deserialize = has_derive(&input, "BorshDeserialize");
+    let debug_derived = has_derive(&input, "Debug");
     let fields = match &mut input.data {
         Data::Struct(data) => match &mut data.fields {
             Fields::Named(fields) => fields,
@@ -25,13 +26,7 @@ pub(crate) fn expand_arena0_local(mut input: DeriveInput) -> Result<TokenStream2
         }
     };
 
-    let has_secret = fields.named.iter().any(|field| {
-        field
-            .attrs
-            .iter()
-            .any(|attr| attr.path().is_ident("secret"))
-    });
-    if has_secret && debug_derived {
+    if debug_derived {
         return Err(Error::new_spanned(
             &input,
             "#[arena0::local] generates redacted Debug; remove derive(Debug) from Local",
@@ -107,15 +102,19 @@ pub(crate) fn expand_arena0_local(mut input: DeriveInput) -> Result<TokenStream2
     })
 }
 
-fn derives_debug(input: &DeriveInput) -> bool {
+fn has_derive(input: &DeriveInput, name: &str) -> bool {
     input.attrs.iter().any(|attr| {
-        attr.path().is_ident("derive") && attr.meta.to_token_stream().to_string().contains("Debug")
-    })
-}
-
-fn derives_named(input: &DeriveInput, name: &str) -> bool {
-    input.attrs.iter().any(|attr| {
-        attr.path().is_ident("derive") && attr.meta.to_token_stream().to_string().contains(name)
+        attr.path().is_ident("derive")
+            && attr
+                .parse_args_with(Punctuated::<syn::Path, syn::Token![,]>::parse_terminated)
+                .map(|derives| {
+                    derives.iter().any(|path| {
+                        path.segments
+                            .last()
+                            .is_some_and(|segment| segment.ident == name)
+                    })
+                })
+                .unwrap_or(false)
     })
 }
 
@@ -142,16 +141,77 @@ mod tests {
     }
 
     #[test]
-    fn local_secret_fields_reject_derived_debug() {
+    fn qualified_derives_drive_expansion_without_duplicates() {
         let input: DeriveInput = syn::parse_quote! {
-            #[derive(Default, Debug)]
+            #[derive(
+                ::borsh::BorshSerialize,
+                ::borsh::BorshDeserialize
+            )]
             pub struct Local {
-                #[secret]
-                salt: [u8; 32],
+                value: u32,
             }
         };
 
-        let err = expand_arena0_local(input).unwrap_err();
-        assert!(err.to_string().contains("redacted Debug"));
+        let expanded = expand_arena0_local(input).unwrap().to_string();
+        assert_eq!(expanded.matches("BorshSerialize").count(), 1);
+        assert_eq!(expanded.matches("BorshDeserialize").count(), 1);
+    }
+
+    #[test]
+    fn debug_derives_are_rejected_for_local() {
+        let inputs: [DeriveInput; 3] = [
+            syn::parse_quote! {
+                #[derive(Default, Debug)]
+                pub struct Local {
+                    #[secret]
+                    salt: [u8; 32],
+                }
+            },
+            syn::parse_quote! {
+                #[derive(::core::fmt::Debug)]
+                pub struct Local {
+                    #[secret]
+                    salt: [u8; 32],
+                }
+            },
+            syn::parse_quote! {
+                #[derive(::core::fmt::Debug)]
+                pub struct Local {
+                    value: u32,
+                }
+            },
+        ];
+
+        for input in inputs {
+            let err = expand_arena0_local(input).unwrap_err();
+            assert!(err.to_string().contains("redacted Debug"));
+        }
+    }
+
+    #[test]
+    fn near_collision_derives_do_not_change_local_expansion() {
+        let inputs: [DeriveInput; 2] = [
+            syn::parse_quote! {
+                #[derive(DebugExtra)]
+                pub struct Local {
+                    #[secret]
+                    salt: [u8; 32],
+                }
+            },
+            syn::parse_quote! {
+                #[derive(DebugExtra, BorshSerializeExtra, BorshDeserializeExtra)]
+                pub struct Local {
+                    #[secret]
+                    salt: [u8; 32],
+                }
+            },
+        ];
+
+        for input in inputs {
+            let expanded = expand_arena0_local(input).unwrap().to_string();
+            assert!(expanded.contains(":: arena0 :: borsh :: BorshSerialize"));
+            assert!(expanded.contains(":: arena0 :: borsh :: BorshDeserialize"));
+            assert!(expanded.contains("\"[redacted]\""));
+        }
     }
 }

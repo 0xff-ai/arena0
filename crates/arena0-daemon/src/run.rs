@@ -5,14 +5,13 @@
 //! store; the daemon owns one shared Unix socket and [`arena0_node::Ensemble`]
 //! supplies their shared virtual local network.
 
-use std::collections::BTreeSet;
 use std::{future::Future, sync::Arc};
 
 use arena0_home::{Home, HostName};
 use arena0_sandbox::WasmtimeEngine;
 
 use crate::paths::wasmtime_cache_dir;
-use crate::startup::{self, StartupStage, StartupTimeline};
+use crate::startup::{StartupStage, StartupTimeline};
 use crate::{Daemon, McpConfig};
 
 /// Open every Host namespace, start their shared local Ensemble, and serve the
@@ -23,34 +22,34 @@ pub async fn run(names: Vec<HostName>, bootstrap: bool, mcp: McpConfig) -> anyho
         names.len(),
         crate::assets::PROGRAMS.len(),
     ));
-    if let Err(error) = validate_host_names(&names) {
-        startup::progress(StartupStage::Failed, &timeline);
+    if let Err(error) = crate::ensemble::validate_host_names(&names) {
+        timeline.progress(StartupStage::Failed);
         return Err(error);
     }
-    startup::progress(StartupStage::HostsProvisioning, &timeline);
+    timeline.progress(StartupStage::HostsProvisioning);
     let home = match Home::from_env() {
         Ok(home) => home,
         Err(error) => {
-            startup::progress(StartupStage::Failed, &timeline);
+            timeline.progress(StartupStage::Failed);
             return Err(error.into());
         }
     };
-    startup::progress(StartupStage::EngineInitializing, &timeline);
+    timeline.progress(StartupStage::EngineInitializing);
     let cache_dir = match wasmtime_cache_dir(&home) {
         Ok(cache_dir) => cache_dir,
         Err(error) => {
-            startup::progress(StartupStage::Failed, &timeline);
+            timeline.progress(StartupStage::Failed);
             return Err(error);
         }
     };
     let engine = match WasmtimeEngine::new_persistent(&cache_dir) {
         Ok(engine) => Arc::new(engine),
         Err(error) => {
-            startup::progress(StartupStage::Failed, &timeline);
+            timeline.progress(StartupStage::Failed);
             return Err(anyhow::anyhow!("sandbox engine: {error}"));
         }
     };
-    startup::progress(StartupStage::EngineReady, &timeline);
+    timeline.progress(StartupStage::EngineReady);
     let daemon = match Daemon::start_with_timeline(
         names,
         mcp,
@@ -63,22 +62,11 @@ pub async fn run(names: Vec<HostName>, bootstrap: bool, mcp: McpConfig) -> anyho
     {
         Ok(daemon) => daemon,
         Err(error) => {
-            startup::progress(StartupStage::Failed, &timeline);
+            timeline.progress(StartupStage::Failed);
             return Err(error);
         }
     };
     serve_until_shutdown(daemon, tokio::signal::ctrl_c()).await
-}
-
-fn validate_host_names(names: &[HostName]) -> anyhow::Result<()> {
-    let mut seen = BTreeSet::new();
-    for name in names {
-        anyhow::ensure!(
-            seen.insert(name),
-            "ensemble hosts must use distinct names; duplicate {name}"
-        );
-    }
-    Ok(())
 }
 
 async fn serve_until_shutdown(

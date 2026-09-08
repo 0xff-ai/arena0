@@ -6,7 +6,6 @@
 //! ownership to the daemon.
 
 use std::ffi::OsString;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -24,16 +23,6 @@ pub(crate) struct ServeArgs {
     /// Host names to pass to arena0d. Repeat or comma-separate the names.
     #[arg(long = "hosts", value_delimiter = ',', value_name = "NAME")]
     pub(crate) hosts: Vec<HostName>,
-    /// Loopback address for the daemon's MCP endpoint.
-    #[arg(long = "mcp-listen", value_name = "ADDR")]
-    pub(crate) mcp_listen: Option<SocketAddr>,
-    /// Lifetime of per-Host MCP JWTs, in seconds.
-    #[arg(
-        long = "mcp-access-token-lifetime-secs",
-        value_name = "SECONDS",
-        value_parser = clap::value_parser!(u64).range(1..)
-    )]
-    pub(crate) mcp_access_token_lifetime_secs: Option<u64>,
 }
 
 /// Replace this client with the installed daemon and let it own the process.
@@ -88,22 +77,10 @@ fn resolve_daemon(current_exe: &Path) -> PathBuf {
 }
 
 fn daemon_arguments(args: &ServeArgs) -> Vec<OsString> {
-    let mut translated = Vec::with_capacity(
-        args.hosts.len() * 2
-            + usize::from(args.mcp_listen.is_some()) * 2
-            + usize::from(args.mcp_access_token_lifetime_secs.is_some()) * 2,
-    );
+    let mut translated = Vec::with_capacity(args.hosts.len() * 2);
     for host in &args.hosts {
         translated.push(OsString::from("--host"));
         translated.push(OsString::from(host.as_str()));
-    }
-    if let Some(address) = args.mcp_listen {
-        translated.push(OsString::from("--mcp-listen"));
-        translated.push(OsString::from(address.to_string()));
-    }
-    if let Some(lifetime) = args.mcp_access_token_lifetime_secs {
-        translated.push(OsString::from("--mcp-access-token-lifetime-secs"));
-        translated.push(OsString::from(lifetime.to_string()));
     }
     translated
 }

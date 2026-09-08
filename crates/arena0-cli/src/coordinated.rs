@@ -520,7 +520,7 @@ impl Coordinator {
         ));
         let outcome = tokio::select! {
             biased;
-            reason = wait_for_tui_cancel(&mut user_cancelled) => RunOutcome::Cancelled(Ok(reason)),
+            reason = wait_for_cancel_reason(&mut user_cancelled) => RunOutcome::Cancelled(Ok(reason)),
             result = &mut operation => RunOutcome::Finished(result),
             reason = wait_for_cancel_reason(&mut signal_received) => {
                 RunOutcome::Cancelled(Ok(reason))
@@ -1608,21 +1608,81 @@ struct TuiEventSource {
     subscription: Subscription,
 }
 
+impl TuiEventSource {
+    async fn observe(mut self, tui: &TuiHandle) -> anyhow::Result<()> {
+        loop {
+            let frame = self
+                .subscription
+                .next()
+                .await?
+                .ok_or_else(|| anyhow!("run TUI event stream closed"))?;
+            if frame.exec_id == Some(self.exec_id) {
+                let agreement = match &frame.data {
+                    EventData::SessionStep {
+                        signers,
+                        participants,
+                        ..
+                    } => Some((*signers, *participants)),
+                    _ => None,
+                };
+                let refresh_view = matches!(
+                    &frame.data,
+                    EventData::SessionStarted { .. }
+                        | EventData::SessionCallout { .. }
+                        | EventData::SessionCalloutAnswered { .. }
+                        | EventData::SessionStep { .. }
+                        | EventData::SessionEnded { .. }
+                );
+                tui.update(RunUpdate::SystemEvent { frame }).await?;
+                if let Some((signers, participants)) = agreement {
+                    tui.update(RunUpdate::Agreement {
+                        host: self.host.clone(),
+                        agreed: signers,
+                        total: participants,
+                    })
+                    .await?;
+                }
+                if refresh_view {
+                    tokio::try_join!(
+                        refresh_tui(tui, &self.host, &self.client, self.exec_id),
+                        refresh_tui_view(tui, &self.host, &self.client, self.exec_id),
+                    )?;
+                }
+            } else if matches!(
+                frame.data,
+                EventData::HostStarted { .. }
+                    | EventData::HostStopped { .. }
+                    | EventData::OfferSeen { .. }
+                    | EventData::Lagged { .. }
+            ) {
+                let refresh = matches!(&frame.data, EventData::Lagged { .. });
+                tui.update(RunUpdate::SystemEvent { frame }).await?;
+                if refresh {
+                    tokio::try_join!(
+                        refresh_tui(tui, &self.host, &self.client, self.exec_id),
+                        refresh_tui_view(tui, &self.host, &self.client, self.exec_id),
+                    )?;
+                }
+            }
+        }
+    }
+}
+
 async fn observe_tui(
     sources: Vec<TuiEventSource>,
     tui: TuiHandle,
     mut stopped: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut observers = JoinSet::new();
-    refresh_tui_hosts(&tui, &sources).await?;
     let inspection_sources = sources
         .iter()
         .map(|source| (source.host.clone(), source.client.clone(), source.exec_id))
         .collect::<Vec<_>>();
+    refresh_tui_all(&tui, &inspection_sources).await?;
     let view_sources = inspection_sources.clone();
     for source in sources {
         let events_tui = tui.clone();
-        observers.spawn(async move { observe_tui_events(source, &events_tui).await });
+        observers.spawn(async move { source.observe(&events_tui).await });
     }
     let inspection_tui = tui.clone();
     let inspection_page_sources = inspection_sources.clone();
@@ -1651,64 +1711,6 @@ async fn observe_tui(
     while observers.join_next().await.is_some() {}
     refresh_tui_inspections(&tui, &inspection_sources).await;
     Ok(())
-}
-
-async fn observe_tui_events(mut source: TuiEventSource, tui: &TuiHandle) -> anyhow::Result<()> {
-    loop {
-        let frame = source
-            .subscription
-            .next()
-            .await?
-            .ok_or_else(|| anyhow!("run TUI event stream closed"))?;
-        if frame.exec_id == Some(source.exec_id) {
-            let agreement = match &frame.data {
-                EventData::SessionStep {
-                    signers,
-                    participants,
-                    ..
-                } => Some((*signers, *participants)),
-                _ => None,
-            };
-            let refresh_view = matches!(
-                &frame.data,
-                EventData::SessionStarted { .. }
-                    | EventData::SessionCallout { .. }
-                    | EventData::SessionCalloutAnswered { .. }
-                    | EventData::SessionStep { .. }
-                    | EventData::SessionEnded { .. }
-            );
-            tui.update(RunUpdate::SystemEvent { frame }).await?;
-            if let Some((signers, participants)) = agreement {
-                tui.update(RunUpdate::Agreement {
-                    host: source.host.clone(),
-                    agreed: signers,
-                    total: participants,
-                })
-                .await?;
-            }
-            if refresh_view {
-                tokio::try_join!(
-                    refresh_tui(tui, &source.host, &source.client, source.exec_id),
-                    refresh_tui_view(tui, &source.host, &source.client, source.exec_id),
-                )?;
-            }
-        } else if matches!(
-            frame.data,
-            EventData::HostStarted { .. }
-                | EventData::HostStopped { .. }
-                | EventData::OfferSeen { .. }
-                | EventData::Lagged { .. }
-        ) {
-            let refresh = matches!(&frame.data, EventData::Lagged { .. });
-            tui.update(RunUpdate::SystemEvent { frame }).await?;
-            if refresh {
-                tokio::try_join!(
-                    refresh_tui(tui, &source.host, &source.client, source.exec_id),
-                    refresh_tui_view(tui, &source.host, &source.client, source.exec_id),
-                )?;
-            }
-        }
-    }
 }
 
 async fn refresh_tui(
@@ -1791,14 +1793,6 @@ async fn refresh_tui_inspection(
     }
 }
 
-async fn refresh_tui_hosts(tui: &TuiHandle, sources: &[TuiEventSource]) -> anyhow::Result<()> {
-    let sources = sources
-        .iter()
-        .map(|source| (source.host.clone(), source.client.clone(), source.exec_id))
-        .collect::<Vec<_>>();
-    refresh_tui_all(tui, &sources).await
-}
-
 async fn refresh_tui_all(
     tui: &TuiHandle,
     sources: &[(HostName, DaemonClient, ExecId)],
@@ -1857,32 +1851,26 @@ async fn refresh_tui_view(
     client: &DaemonClient,
     exec_id: ExecId,
 ) -> anyhow::Result<()> {
-    match client
-        .call_host_raw(
+    let Some((step, view)) = client
+        .exec_view(
             host,
-            &HostRequest::ExecView {
-                exec: exec_id,
+            exec_id,
+            arena0_client::protocol::Viewport {
                 width: tui.view_width(),
                 color: ColorDepth::Mono,
             },
         )
         .await
         .with_context(|| format!("refresh TUI view for Host '{host}' execution {exec_id}"))?
-    {
-        Ok(ResponseOk::ExecView { step, view }) => {
-            tui.update(RunUpdate::View {
-                host: host.clone(),
-                step,
-                view,
-            })
-            .await
-        }
-        Ok(other) => bail!("unexpected exec.view response while refreshing TUI: {other:?}"),
-        Err(error) if error.code == ApiErrorCode::Execution => Ok(()),
-        Err(error) => Err(anyhow!(error).context(format!(
-            "render TUI view for Host '{host}' execution {exec_id}"
-        ))),
-    }
+    else {
+        return Ok(());
+    };
+    tui.update(RunUpdate::View {
+        host: host.clone(),
+        step,
+        view,
+    })
+    .await
 }
 
 #[derive(Debug)]
@@ -1989,10 +1977,6 @@ async fn wait_for_cancel(cancelled: &mut watch::Receiver<bool>) {
     }
 }
 
-async fn wait_for_tui_cancel(cancelled: &mut watch::Receiver<Option<String>>) -> String {
-    wait_for_cancel_reason(cancelled).await
-}
-
 async fn wait_for_cancel_reason(cancelled: &mut watch::Receiver<Option<String>>) -> String {
     if let Some(reason) = cancelled.borrow().clone() {
         return reason;
@@ -2043,22 +2027,18 @@ async fn fetch_human_view(
     exec_id: ExecId,
     color: ColorDepth,
 ) -> anyhow::Result<Option<View>> {
-    match client
-        .call_host_raw(
+    client
+        .exec_view(
             host,
-            &HostRequest::ExecView {
-                exec: exec_id,
+            exec_id,
+            arena0_client::protocol::Viewport {
                 width: crate::ui::terminal_width(),
                 color,
             },
         )
-        .await?
-    {
-        Ok(ResponseOk::ExecView { view, .. }) => Ok(Some(view)),
-        Ok(other) => bail!("unexpected response to exec.view while preparing callout: {other:?}"),
-        Err(error) if error.code == ApiErrorCode::Execution => Ok(None),
-        Err(error) => Err(anyhow!(error)),
-    }
+        .await
+        .map(|view| view.map(|(_, view)| view))
+        .context("fetch execution view while preparing callout")
 }
 
 pub(crate) async fn read_validated_answer<F, Fut>(

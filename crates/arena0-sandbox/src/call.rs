@@ -163,6 +163,11 @@ impl InitializeCall {
     pub fn new(params: JsonBytes) -> Self {
         Self { params }
     }
+
+    pub(crate) fn into_input(self) -> Result<InitInput, crate::SandboxError> {
+        InitInput::try_new(self.params.into_bytes())
+            .map_err(|error| crate::SandboxError::input_limit(error.to_string()))
+    }
 }
 
 /// Apply one shared/public event against explicit state bytes.
@@ -197,37 +202,6 @@ impl SharedCall {
     #[must_use]
     pub fn session_started(shared: SharedStateBytes, ensemble: Ensemble<Committed>) -> Self {
         Self::SessionStarted { shared, ensemble }
-    }
-}
-
-pub(crate) enum SharedCallParts {
-    SessionStarted {
-        shared: SharedStateBytes,
-        ensemble: Ensemble<Committed>,
-    },
-    Event {
-        shared: SharedStateBytes,
-        session: Ensemble<Committed>,
-        event: SharedEvent,
-    },
-}
-
-impl SharedCall {
-    pub(crate) fn into_parts(self) -> SharedCallParts {
-        match self {
-            Self::SessionStarted { shared, ensemble } => {
-                SharedCallParts::SessionStarted { shared, ensemble }
-            }
-            Self::Event {
-                shared,
-                session,
-                event,
-            } => SharedCallParts::Event {
-                shared,
-                session,
-                event,
-            },
-        }
     }
 }
 
@@ -296,6 +270,17 @@ impl QueryCall {
             session,
         }
     }
+
+    pub(crate) fn into_input(self) -> Result<QueryInput, crate::SandboxError> {
+        let session = serialize(&self.session)?;
+        QueryInput::try_new(
+            self.shared,
+            session,
+            self.query_index,
+            self.query.into_bytes(),
+        )
+        .map_err(|error| crate::SandboxError::input_limit(error.to_string()))
+    }
 }
 
 /// Execute one read-only viewport projection, whose request is validated
@@ -321,6 +306,12 @@ impl ViewCall {
             session,
         }
     }
+
+    pub(crate) fn into_input(self) -> Result<ViewInput, crate::SandboxError> {
+        let session = serialize(&self.session)?;
+        ViewInput::try_new(self.shared, session, self.viewport.into_bytes())
+            .map_err(|error| crate::SandboxError::input_limit(error.to_string()))
+    }
 }
 
 /// Execute the pure terminal-outcome projection against explicit state bytes.
@@ -343,6 +334,12 @@ impl WriterCall {
     pub fn new(shared: SharedStateBytes, session: Ensemble<Committed>) -> Self {
         Self { shared, session }
     }
+
+    pub(crate) fn into_input(self) -> WriterInput {
+        WriterInput {
+            shared: self.shared,
+        }
+    }
 }
 
 impl OutcomeCall {
@@ -351,74 +348,46 @@ impl OutcomeCall {
     pub fn new(shared: SharedStateBytes, session: Ensemble<Committed>) -> Self {
         Self { shared, session }
     }
-}
 
-pub(crate) fn init_input(params: JsonBytes) -> Result<InitInput, crate::SandboxError> {
-    InitInput::try_new(params.into_bytes())
-        .map_err(|error| crate::SandboxError::input_limit(error.to_string()))
+    pub(crate) fn into_input(self) -> Result<OutcomeInput, crate::SandboxError> {
+        let session = serialize(&self.session)?;
+        OutcomeInput::try_new(self.shared, session)
+            .map_err(|error| crate::SandboxError::input_limit(error.to_string()))
+    }
 }
 
 pub(crate) fn shared_input(
     shared: SharedStateBytes,
     event: Vec<u8>,
-    session: Option<&Ensemble<Committed>>,
+    session: Option<Ensemble<Committed>>,
 ) -> Result<SharedInput, crate::SandboxError> {
-    let session = borsh::to_vec(&session.cloned()).map_err(|error| {
-        crate::SandboxError::SerializationFailed(format!("session context: {error}"))
-    })?;
+    let session = serialize(&session)?;
     SharedInput::try_new(shared, session, event)
         .map_err(|error| crate::SandboxError::input_limit(error.to_string()))
 }
 
-pub(crate) fn local_input(
-    peer_id: PeerId,
-    shared: SharedStateBytes,
-    local: LocalStateBytes,
-    event: Vec<u8>,
-    session: &Ensemble<Committed>,
-) -> Result<LocalInput, crate::SandboxError> {
-    let session = borsh::to_vec(session).map_err(|error| {
-        crate::SandboxError::SerializationFailed(format!("session context: {error}"))
-    })?;
-    LocalInput::try_new(peer_id.0, shared, local, session, event)
-        .map_err(|error| crate::SandboxError::input_limit(error.to_string()))
-}
-
-pub(crate) fn query_input(call: QueryCall) -> Result<QueryInput, crate::SandboxError> {
-    let session = borsh::to_vec(&call.session).map_err(|error| {
-        crate::SandboxError::SerializationFailed(format!("session context: {error}"))
-    })?;
-    QueryInput::try_new(
-        call.shared,
-        session,
-        call.query_index,
-        call.query.into_bytes(),
-    )
-    .map_err(|error| crate::SandboxError::input_limit(error.to_string()))
-}
-
-pub(crate) fn view_input(call: ViewCall) -> Result<ViewInput, crate::SandboxError> {
-    let session = borsh::to_vec(&call.session).map_err(|error| {
-        crate::SandboxError::SerializationFailed(format!("session context: {error}"))
-    })?;
-    ViewInput::try_new(call.shared, session, call.viewport.into_bytes())
-        .map_err(|error| crate::SandboxError::input_limit(error.to_string()))
-}
-
-pub(crate) fn outcome_input(call: OutcomeCall) -> Result<OutcomeInput, crate::SandboxError> {
-    let session = borsh::to_vec(&call.session).map_err(|error| {
-        crate::SandboxError::SerializationFailed(format!("session context: {error}"))
-    })?;
-    OutcomeInput::try_new(call.shared, session)
-        .map_err(|error| crate::SandboxError::input_limit(error.to_string()))
-}
-
-pub(crate) fn writer_input(call: &WriterCall) -> WriterInput {
-    WriterInput {
-        shared: call.shared.clone(),
+impl LocalCall {
+    pub(crate) fn into_input(
+        self,
+    ) -> Result<(LocalInput, SharedStateBytes, Option<RandomReplay>), crate::SandboxError> {
+        let Self {
+            peer_id,
+            shared,
+            local,
+            event,
+            session,
+            random_replay,
+        } = self;
+        let event = serialize(&event.into_protocol())?;
+        let session = serialize(&session)?;
+        // ponytail: clone only for the input; return the original shared state.
+        let input = LocalInput::try_new(peer_id.0, shared.clone(), local, session, event)
+            .map_err(|error| crate::SandboxError::input_limit(error.to_string()))?;
+        Ok((input, shared, random_replay))
     }
 }
 
+// ponytail: one bounded path keeps call-byte limits and faults consistent.
 pub(crate) fn serialize<T: BorshSerialize>(value: &T) -> Result<Vec<u8>, crate::SandboxError> {
     let bytes = borsh::to_vec(value)
         .map_err(|error| crate::SandboxError::SerializationFailed(error.to_string()))?;

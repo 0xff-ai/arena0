@@ -182,40 +182,24 @@ impl Database {
     pub(super) fn validate_execution_salts(&mut self) -> Result<(), StoreError> {
         let mut statement = self
             .connection
-            .prepare("SELECT execution_id, salt FROM execution_salts")?;
+            .prepare("SELECT execution_id, salt FROM execution_salts ORDER BY execution_id")?;
         let mut rows = statement.query([])?;
-        let mut values = Vec::new();
         while let Some(row) = rows.next()? {
-            values.push((
-                ExecId(array32(&row.get::<_, Vec<u8>>(0)?, "salt execution")?),
-                row.get::<_, Vec<u8>>(1)?,
-            ));
-        }
-        drop(rows);
-        drop(statement);
-        for (_execution_id, encoded) in values {
-            decode_execution_salt(&encoded)?;
+            let _execution_id = ExecId(array32(&row.get::<_, Vec<u8>>(0)?, "salt execution")?);
+            decode_execution_salt(&row.get::<_, Vec<u8>>(1)?)?;
         }
         Ok(())
     }
 
     pub(super) fn validate_programs(&mut self) -> Result<(), StoreError> {
+        let max = max_program_bytes()?;
         let mut statement = self
             .connection
-            .prepare("SELECT program_hash, wasm FROM programs")?;
+            .prepare("SELECT program_hash, wasm FROM programs ORDER BY program_hash")?;
         let mut rows = statement.query([])?;
-        let mut values = Vec::new();
         while let Some(row) = rows.next()? {
-            values.push((
-                ProgramHash(array32(&row.get::<_, Vec<u8>>(0)?, "program hash")?),
-                row.get::<_, Vec<u8>>(1)?,
-            ));
-        }
-        drop(rows);
-        drop(statement);
-        let max = max_program_bytes()?;
-        for (hash, encoded) in values {
-            let wasm = open_envelope(EnvelopeKind::Program, &encoded, max)?;
+            let hash = ProgramHash(array32(&row.get::<_, Vec<u8>>(0)?, "program hash")?);
+            let wasm = open_envelope(EnvelopeKind::Program, &row.get::<_, Vec<u8>>(1)?, max)?;
             if wasm.is_empty() || wasm.len() > max || ProgramHash::of(&wasm) != hash {
                 return Err(StoreError::Corruption(
                     "program registry row failed content validation".into(),

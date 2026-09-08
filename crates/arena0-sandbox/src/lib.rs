@@ -121,3 +121,15 @@ pub struct CallObservations {
     /// Diagnostic logs captured during the invocation.
     pub logs: Vec<(String, String)>,
 }
+
+impl CallObservations {
+    /// Whether the invocation emitted no effects, random draws, or logs.
+    ///
+    /// Fuel is deliberately excluded: it measures execution cost rather than
+    /// an observable effect of the guest call.
+    #[must_use]
+    // ponytail: keep this engine-only invariant crate-visible.
+    pub(crate) fn is_empty_except_fuel(&self) -> bool {
+        self.effects.is_empty() && self.random_draws.is_empty() && self.logs.is_empty()
+    }
+}

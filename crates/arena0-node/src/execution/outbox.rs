@@ -100,9 +100,8 @@ impl ExecutionActor {
                 });
             };
             count = count.saturating_add(1);
-            let item = leased.item.clone();
-
-            if let Some((destination, frame)) = outbound_frame(&item.effect) {
+            let item = leased.item;
+            let result = if let Some((destination, frame)) = outbound_frame(&item.effect) {
                 match self
                     .start_outbound_send(&item, leased.lease_id, destination, frame)
                     .await
@@ -117,24 +116,12 @@ impl ExecutionActor {
                             result_class: "send_started",
                         });
                     }
-                    Err(error) => {
-                        let reason = error.to_string();
-                        self.context
-                            .store
-                            .retry_outbox(item.outbox_id, leased.lease_id, now_ms(), reason)
-                            .await?;
-                        if matches!(error, OutboxDeliveryError::Retryable(_)) {
-                            return Ok(OutboxDrainSummary {
-                                count,
-                                result_class: "retry_scheduled",
-                            });
-                        }
-                        return Err(error.into_runtime());
-                    }
+                    Err(error) => Err(error),
                 }
-            }
-
-            let result = self.deliver_effect(&item.effect).await;
+            } else {
+                self.deliver_effect(&item.effect).await
+            };
+            // ponytail: remote-start and local failures use the same retry policy.
             match result {
                 Ok(()) => {
                     self.context
@@ -251,16 +238,6 @@ impl ExecutionActor {
             return Ok(());
         }
         match effect {
-            DurableEffect::SendBroadcast { destination, frame } => {
-                let wire = ExecFrame::Message {
-                    message_id: frame.message_id(),
-                    seq: frame.sequence(),
-                    prestate: frame.pre_state(),
-                    data: frame.data().to_vec(),
-                    witness: frame.witness(),
-                };
-                self.send_frame(*destination, wire).await
-            }
             DurableEffect::ApplyBroadcast { frame } => {
                 let state = self.load_state().await?;
                 let already_staged = state.pending_shared().is_some_and(|proposal| {
@@ -405,15 +382,15 @@ impl ExecutionActor {
                             })?;
                     }
                     arena0_protocol::ReceiptTermination::Stopped { cause } => {
-                        let (step, reason) = match cause {
-                            arena0_protocol::StopCause::Authenticated(occurrence) => (
-                                occurrence.coordinate().next_step(),
-                                occurrence.reason().to_owned(),
-                            ),
-                            arena0_protocol::StopCause::Shared {
-                                commitment, reason, ..
-                            } => (commitment.step, reason.clone()),
+                        let step = match cause {
+                            arena0_protocol::StopCause::Authenticated(occurrence) => {
+                                occurrence.coordinate().next_step()
+                            }
+                            arena0_protocol::StopCause::Shared { commitment, .. } => {
+                                commitment.step
+                            }
                         };
+                        let reason = cause.reason().to_owned();
                         let message = match cause.kind() {
                             arena0_protocol::AbortKind::Abort => {
                                 SessionMessage::Aborted { step, reason }
@@ -427,66 +404,20 @@ impl ExecutionActor {
                 }
                 Ok(())
             }
-            DurableEffect::SendAbort {
-                destination,
-                occurrence,
-            } => {
-                self.send_frame(
-                    *destination,
-                    ExecFrame::Abort {
-                        occurrence: occurrence.clone(),
-                    },
-                )
-                .await
-            }
             DurableEffect::RequestStepSignature { .. } => {
                 self.ensure_step_signature().await.map_err(Into::into)
-            }
-            DurableEffect::PublishStepSignature {
-                destination,
-                commitment,
-                signature,
-            } => {
-                self.send_frame(
-                    *destination,
-                    ExecFrame::StepSignature {
-                        commitment: commitment.clone(),
-                        signature: *signature,
-                    },
-                )
-                .await
             }
             DurableEffect::RequestTerminalSignature { .. } => {
                 self.ensure_terminal_signature().await.map_err(Into::into)
             }
-            DurableEffect::PublishTerminalSignature {
-                destination,
-                commitment,
-                signature,
-            } => {
-                self.send_frame(
-                    *destination,
-                    ExecFrame::End {
-                        commitment: commitment.clone(),
-                        signature: *signature,
-                    },
-                )
-                .await
-            }
+            DurableEffect::SendBroadcast { .. }
+            | DurableEffect::SendAbort { .. }
+            | DurableEffect::PublishStepSignature { .. }
+            | DurableEffect::PublishTerminalSignature { .. } => Err(ExecError::InvalidState(
+                "remote durable effect reached local dispatch".into(),
+            )
+            .into()),
         }
-    }
-
-    async fn send_frame(
-        &mut self,
-        destination: arena0_protocol::PeerId,
-        frame: ExecFrame,
-    ) -> Result<(), OutboxDeliveryError> {
-        let handle = self.send_handle(destination).await?;
-        if let Err(error) = handle.send_exec(&frame).await {
-            self.send_streams.remove(&destination);
-            return Err(classify_transport_error(error));
-        }
-        Ok(())
     }
 
     async fn send_handle(

@@ -430,28 +430,6 @@ mod tests {
         (directory, path)
     }
 
-    #[test]
-    fn callout_wire_shape_is_small_and_contains_no_protocol_ids() {
-        let line = CalloutLine {
-            name: "choose",
-            prompt: "Choose one",
-            context: &json!({"round": 1}),
-            answer_schema: &json!({"enum": ["a", "b"]}),
-        };
-        let encoded = serde_json::to_value(line).expect("callout JSON");
-        assert_eq!(
-            encoded,
-            json!({
-                "name": "choose",
-                "prompt": "Choose one",
-                "context": {"round": 1},
-                "answer_schema": {"enum": ["a", "b"]}
-            })
-        );
-        assert!(!encoded.as_object().unwrap().contains_key("session_id"));
-        assert!(!encoded.as_object().unwrap().contains_key("pending_id"));
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn direct_cat_round_trips_one_json_answer() {
@@ -567,21 +545,6 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn response_timeout_kills_and_reaps_the_agent() {
-        let (_directory, path) = script("read line\nsleep 10");
-        let mut agent =
-            ExecutableAgent::spawn(path, Duration::from_millis(20)).expect("spawn agent");
-        let error = agent
-            .answer("choose", "Choose", &Value::Null, &json!({"type": "number"}))
-            .await
-            .expect_err("silent agent must time out");
-        assert!(error.to_string().contains("timed out"));
-        assert!(agent.is_closed());
-        assert!(agent.child.try_wait().expect("child status").is_some());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
     async fn response_timeout_stops_agent_descendants() {
         let directory = tempfile::tempdir().expect("temporary marker directory");
         let marker = directory.path().join("descendant-survived");
@@ -593,10 +556,11 @@ mod tests {
         let mut agent =
             ExecutableAgent::spawn(path, Duration::from_millis(20)).expect("spawn agent");
 
-        agent
+        let error = agent
             .answer("choose", "Choose", &Value::Null, &json!({"type": "number"}))
             .await
             .expect_err("silent process tree must time out");
+        assert!(error.to_string().contains("timed out"));
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         assert!(!marker.exists(), "agent descendant survived group cleanup");

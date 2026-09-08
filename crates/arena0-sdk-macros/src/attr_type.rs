@@ -111,52 +111,12 @@ fn collect_type_params<'a>(
     }
 }
 
-/// Infer generic field bounds and add serde bounds when the caller did not
-/// provide them. The generated `ProgramValue` implementation receives the
-/// parsed explicit bounds separately.
-fn prepare(input: &mut DeriveInput) {
-    let inferred = infer_generic_field_params(input);
-    schema::prepare_serde_bounds(input, &inferred);
-}
-
 pub(crate) fn expand_program_value(
     args: ProgramValueArgs,
     mut input: DeriveInput,
 ) -> Result<TokenStream2> {
-    prepare(&mut input);
-    validate_input_attrs(&input)?;
-    let program_value_impl = schema::expand_program_value_impl_with_bounds(
-        &input.ident,
-        &input.generics,
-        schema::field_types(&input),
-        args.bound,
-    );
-
-    Ok(quote! {
-        #[derive(
-            Debug,
-            Clone,
-            PartialEq,
-            Eq,
-            ::arena0::serde::Serialize,
-            ::arena0::serde::Deserialize,
-            ::arena0::borsh::BorshSerialize,
-            ::arena0::borsh::BorshDeserialize,
-            ::arena0::borsh::BorshSchema,
-            ::arena0::schemars::JsonSchema,
-        )]
-        #[schemars(crate = "::arena0::schemars")]
-        #input
-
-        #program_value_impl
-    })
-}
-
-pub(crate) fn expand_arena0_message(
-    args: ProgramValueArgs,
-    mut input: DeriveInput,
-) -> Result<TokenStream2> {
-    prepare(&mut input);
+    let inferred = infer_generic_field_params(&input);
+    schema::prepare_serde_bounds(&mut input, &inferred)?;
     validate_input_attrs(&input)?;
     let program_value_impl = schema::expand_program_value_impl_with_bounds(
         &input.ident,
@@ -213,6 +173,7 @@ fn validate_input_attrs(input: &DeriveInput) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use syn::Item;
 
     #[test]
     fn generated_types_join_the_program_value_allowlist() {
@@ -227,6 +188,55 @@ mod tests {
             .to_string();
         assert!(expanded.contains("JsonSchema"));
         assert!(expanded.contains("ProgramValue"));
+    }
+
+    #[test]
+    fn bounded_generic_expansion_preserves_explicit_contract_bounds() {
+        let input: DeriveInput = syn::parse_quote! {
+            #[serde(bound = "T: ::arena0::serde::Serialize + ::arena0::serde::de::DeserializeOwned + ::core::fmt::Display")]
+            pub struct Value<T> {
+                value: T,
+            }
+        };
+        let args: ProgramValueArgs =
+            syn::parse_str(r#"bound = "T: ::core::marker::Copy""#).unwrap();
+        let expected_serde = &input.attrs[0];
+        let expected_serde = quote!(#expected_serde).to_string();
+        let expected_bound = &args.bound[0];
+        let expected_bound = quote!(#expected_bound).to_string();
+
+        let expanded = expand_program_value(args, input).unwrap();
+        let file: syn::File = syn::parse2(expanded).unwrap();
+        let [Item::Struct(value), Item::Impl(value_impl)] = file.items.as_slice() else {
+            panic!("expected the value and its ProgramValue implementation");
+        };
+        let serde_bounds = value
+            .attrs
+            .iter()
+            .filter(|attr| attr.path().is_ident("serde"))
+            .map(|attr| quote!(#attr).to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            serde_bounds,
+            [expected_serde],
+            "preserve the explicit bound without adding an inferred replacement"
+        );
+        assert!(value_impl.trait_.as_ref().is_some_and(|(_, path, _)| {
+            path.segments
+                .last()
+                .is_some_and(|segment| segment.ident == "ProgramValue")
+        }));
+        let where_clause = value_impl
+            .generics
+            .where_clause
+            .as_ref()
+            .expect("generated implementation bounds");
+        assert!(
+            where_clause
+                .predicates
+                .iter()
+                .any(|predicate| quote!(#predicate).to_string() == expected_bound)
+        );
     }
 
     #[test]

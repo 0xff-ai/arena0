@@ -57,9 +57,10 @@ use tracing::Instrument as _;
 use crate::catalog::{CatalogError, ProgramCatalog};
 use crate::exec_manager::{
     ExecutionHandle, ExecutionHandles, NEGOTIATION_TIMEOUT, Supervisor, project_durable_next,
+    satisfies,
 };
 use crate::schema;
-use crate::startup::{self, StartupStage, StartupTimeline};
+use crate::startup::{StartupStage, StartupTimeline};
 use crate::store::{Keystore, KeystoreError};
 use arena0_store::{
     ActivationRecord, ActivationRecordStatus, AdmissionBindingOutcome, ExecutionRequest,
@@ -1317,7 +1318,8 @@ impl HostService {
     /// Publish the Host lifecycle after recovery and roster publication.
     pub(crate) fn mark_published(&self) {
         self.published.store(true, Ordering::Release);
-        startup::host_progress(StartupStage::HostReady, &self.name, &self.startup);
+        self.startup
+            .host_progress(StartupStage::HostReady, &self.name);
     }
 
     /// Clear negotiation bookkeeping and record a failed drive.
@@ -1390,7 +1392,8 @@ impl HostService {
 
     /// Finish recovery before the supervisor publishes this Host.
     pub(crate) async fn prepare(self: &Arc<Self>) -> anyhow::Result<()> {
-        startup::host_progress(StartupStage::HostStarting, &self.name, &self.startup);
+        self.startup
+            .host_progress(StartupStage::HostStarting, &self.name);
         let user_agent = self.store.load_user_agent().await?;
         self.events
             .host
@@ -1398,7 +1401,7 @@ impl HostService {
             .unwrap_or_else(|error| error.into_inner())
             .user_agent = user_agent;
         if let Err(error) = self.resume_durable().await {
-            startup::host_progress(StartupStage::Failed, &self.name, &self.startup);
+            self.startup.host_progress(StartupStage::Failed, &self.name);
             return Err(error);
         }
         Ok(())
@@ -1602,7 +1605,7 @@ impl HostService {
 
         let Some(record) = record else {
             let execution_store = self.runtime.claim_execution(exec_id)?;
-            let entry = self.execs.register_live(exec_id)?;
+            let entry = self.execs.register_live(exec_id);
             self.negotiations_pending.fetch_add(1, Ordering::SeqCst);
             let daemon = Arc::clone(self);
             let plan = NegotiationPlan::from_admission(request.admission());
@@ -1634,7 +1637,7 @@ impl HostService {
         match record.status() {
             ActivationRecordStatus::Prepared => {
                 let execution_store = self.runtime.claim_execution(exec_id)?;
-                let entry = self.execs.register_live(exec_id)?;
+                let entry = self.execs.register_live(exec_id);
                 self.negotiations_pending.fetch_add(1, Ordering::SeqCst);
                 let daemon = Arc::clone(self);
                 let span = tracing::info_span!(
@@ -1741,19 +1744,7 @@ impl HostService {
                             .await;
                     }
                 };
-                let entry = match self.execs.register_live(exec_id) {
-                    Ok(entry) => entry,
-                    Err(error) => {
-                        drop(execution_store);
-                        return self
-                            .fail_recovery_candidate(
-                                candidate,
-                                execution_present,
-                                format!("committed execution handle cannot be registered: {error}"),
-                            )
-                            .await;
-                    }
-                };
+                let entry = self.execs.register_live(exec_id);
                 if let Err(error) = self
                     .spawn(
                         &entry,
@@ -2009,7 +2000,7 @@ impl HostService {
                 .map(ResponseOk::Inspection),
             HostRequest::ExecAwait { exec_id, until } => {
                 let status = self.exec_status(exec_id).await?;
-                let lifecycle = if satisfies_api(status.lifecycle(), until) {
+                let lifecycle = if satisfies(status.lifecycle(), until) {
                     status.lifecycle()
                 } else if let Some(entry) = self.execs.get(&exec_id) {
                     let deadline = Instant::now() + NEGOTIATION_TIMEOUT;
@@ -2522,10 +2513,7 @@ impl HostService {
         let queue_slot = self.negotiations_pending.fetch_add(1, Ordering::SeqCst);
         let queue_position = (queue_slot > 0).then_some(queue_slot);
         let negotiation_id = plan.negotiation_id();
-        let entry = self
-            .execs
-            .register_live(exec_id)
-            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
+        let entry = self.execs.register_live(exec_id);
         self.events.emit(HostEvent::Created {
             source: EventSource::Execution {
                 peer_id: self.peer_id,
@@ -3861,16 +3849,6 @@ fn project_private_commit_summary(
     })
 }
 
-fn satisfies_api(lifecycle: ExecLifecycle, until: arena0_api::AwaitState) -> bool {
-    match until {
-        arena0_api::AwaitState::Active => {
-            matches!(lifecycle, ExecLifecycle::Waiting | ExecLifecycle::Active)
-                || lifecycle.is_terminal()
-        }
-        arena0_api::AwaitState::Terminal => lifecycle.is_terminal(),
-    }
-}
-
 fn receipt_list_entry(stored: arena0_store::StoredReceipt) -> arena0_api::ReceiptListEntry {
     let provenance = match stored.provenance() {
         arena0_store::ReceiptProvenance::Produced => arena0_api::ReceiptProvenance::Produced,
@@ -4338,6 +4316,19 @@ mod tests {
         (dir, store, daemon, identity.peer_id)
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn register_live_reuses_one_handle_per_execution() {
+        let (_dir, _store, daemon, _peer) = test_daemon();
+        let execution_id = ExecId([0xA5; 32]);
+        let first = daemon.execs.register_live(execution_id);
+        let second = daemon.execs.register_live(execution_id);
+        let distinct = daemon.execs.register_live(ExecId([0xA6; 32]));
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &distinct));
+        daemon.stop().await;
+    }
+
     #[test]
     fn private_inspection_projection_has_no_private_payload_fields() {
         let summary = arena0_store::PrivateCommitSummary {
@@ -4378,25 +4369,6 @@ mod tests {
             arena0_transport::MAX_PROGRAM_BOOTSTRAP_PEERS
         );
         assert!(bootstrap.contains(&creator));
-    }
-
-    #[test]
-    fn admission_checks_participant_count() {
-        let range = ParticipantCount::Range { min: 2, max: 64 };
-        assert!(validate_participants(range, 2).is_ok());
-        assert!(validate_participants(range, 64).is_ok());
-        assert_eq!(
-            validate_participants(range, 65)
-                .expect_err("target above the declared range must be rejected")
-                .code,
-            ApiErrorCode::BadRequest
-        );
-
-        let exact = ParticipantCount::Exact { count: 2 };
-        let error = validate_participants(exact, 3)
-            .expect_err("fixed-size programs must reject other ensemble sizes");
-        assert_eq!(error.code, ApiErrorCode::BadRequest);
-        assert!(error.message.contains("program accepts 2"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

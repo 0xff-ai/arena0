@@ -236,17 +236,17 @@ unilateral evidence or a shared N-of-N stop commitment.
 | `host.info` | Host | — | `HostStatus` |
 | `events.subscribe` | Host | `{filter}` | `Subscribed`, then `EventFrame` stream |
 
-`DaemonInfo` contains process version, ABI version, uptime, the Unix socket,
-and the actual bound `mcp_endpoint`, including an assigned ephemeral port.
+The CLI projects process version, ABI version, uptime, and the Unix socket
+from `DaemonInfo`. Internal adapter endpoints are omitted from CLI output.
 `HostStatus` contains `host` (`id`, cryptographic `peer_id`, and optional
 `user_agent`), public `transport_key`, program count, and active execution count.
 Host metadata contains no socket path.
 
-`hosts.open` uses the same serialized provisioning owner as MCP
-`hello`. A supplied ID reopens its durable namespace; an omitted ID creates
-a fresh one. The required user agent identifies caller software and follows
-the same validation as MCP. Opening is acknowledged only after recovery and
-publication in the daemon's authoritative roster.
+`hosts.open` uses the daemon's serialized provisioning owner. A supplied ID
+reopens its durable namespace; an omitted ID creates a fresh one. The required
+user agent identifies caller software: it must be nonblank, contain no control
+characters, and fit within 256 UTF-8 bytes. Opening is acknowledged only after
+recovery and publication in the daemon's authoritative roster.
 
 The local CLI exposes this operation as `arena0 hello --user-agent NAME/VERSION`.
 It uses a deterministic Host name derived from `ARENA0_CONTEXT`, or from
@@ -255,7 +255,7 @@ It uses a deterministic Host name derived from `ARENA0_CONTEXT`, or from
 this Unix-socket path. Repeated calls reuse the context's durable namespace;
 ordinary CLI commands address that Host automatically without `--host`.
 See [context selection](../protocol-architecture.md#12-daemon-and-agent-api)
-for validation and precedence. MCP `hello` retains its token-based contract.
+for validation and precedence.
 
 One daemon owns each home. Its single listener serves concurrent requests and
 Host subscriptions. `daemon.stop` acknowledges before beginning coordinated
@@ -263,7 +263,7 @@ shutdown; shutdown drains owned connection tasks, Hosts, transport, and stores.
 
 Event tags and filtering are documented in [events/README.md](events/README.md).
 
-`activity.subscribe` observes MCP calls across the complete local daemon;
+`activity.subscribe` observes internal adapter calls across the complete local daemon;
 subscribe once through the shared daemon endpoint. Each frame has
 `boot_id`, `seq`, `ts`, `kind`, and `data`. Started records carry a call ID,
 tool name, and optional Host/execution correlation. Finished records carry that call ID,
@@ -275,66 +275,13 @@ result bodies appear.
 Activity is bounded and live-only. A lag record reports dropped observations;
 reconnecting cannot replay them. Frame order describes daemon observation,
 not multiparty protocol causality. Read current execution state and evidence
-through the ordinary Host methods after a gap. MCP activity remains separate
+through the ordinary Host methods after a gap. Adapter activity remains separate
 from semantic `EventFrame` values and durable receipt facts.
-
-## MCP projection
-
-`arena0d` exposes one stateless Streamable HTTP endpoint at `/mcp`.
-`hello({user_agent})` creates a Host and returns `{token,peer_id,expires_at,renew_after}`.
-Every other tool requires a top-level `token` argument; the daemon validates
-it and dispatches only to the named Host. Program, execution, and protocol
-session references contain their respective IDs, without a Host selector.
-Tokens are credentials and must not be shared between Participants. See
-[Connect an agent to arena0](../getting-started.md#configure-an-agent).
-
-`hello({token})` renews an unexpired token for the same Host. The times are UTC
-Unix seconds; the default lifetime is 24 hours. Preserve the latest token
-across reconnects and renew at `renew_after`, before `expires_at`. Old tokens
-remain valid until their own expiry. An expired or invalid token is rejected;
-the call never creates a replacement Host. Token expiry and transport closure
-do not stop executions. A lost initial `hello` response cannot be recovered
-through MCP without its credential; repeating creation allocates another Host.
-
-`ARENA0_MCP_TOKEN`, when configured, still protects the HTTP endpoint with an
-independent bearer credential. It does not replace the per-Host token. The
-adapter has no `goodbye` operation or server-side token records.
-
-The stable tool set is:
-
-- access: `hello`;
-- programs: `list_programs`, `inspect_program`;
-- execution: `start_execution`, `get_execution_status`, `list_executions`,
-  `view_execution`, `await_execution_event`, `answer_callout`, `query_execution`,
-  `stop_execution`;
-- evidence: `verify_session`.
-
-Public Participant identity is returned by `hello`. Negotiation
-withdrawal and active termination are one lifecycle-aware `stop_execution`
-operation. Params updates are unsupported because negotiation terms are
-immutable. Trace and raw receipt retrieval remain operator Unix API/CLI
-operations rather than agent tools.
-
-`await_execution_event` uses a bounded wait. A `waiting` result means that the
-wait elapsed without a callout or terminal event; it does not withdraw or
-finish the execution. Call the tool again with the retained execution reference
-to renew the wait, including while an open Join is still discovering an offer.
-
-MCP admission uses public Participant peer IDs:
-
-```json
-{"mode":"explicit","peers":["<peer-id>"]}
-{"mode":"join","target":{"creator":"<creator-peer-id>","negotiation_id":"<negotiation-id>"}}
-```
-
-Mode-specific unknown or conflicting fields are rejected before dispatch.
-Peer IDs identify protocol Participants; they do not grant access to another
-Host's tools, catalog, executions, or receipts.
 
 ## Boundary invariants
 
 1. The Host owns identity, signing, sandbox, and persistence.
-2. MCP and Unix-socket adapters dispatch into the same Host service operations.
+2. Adapters dispatch into the same Host service operations.
 3. Program values cross as typed JSON; program Borsh remains opaque to the Host.
 4. Receipt retrieval uses an exact content ID or the addressed Host's local session publication.
 5. The public socket contains no remote discovery, addressing, or transfer

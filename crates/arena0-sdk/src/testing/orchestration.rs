@@ -94,42 +94,34 @@ where
         &self.bob
     }
 
-    /// Deliver local input to one participant and queue any emitted messages.
-    pub fn input(&mut self, participant: Participant, input: P::Input) -> HandlerResult {
-        let (peer, fx) = match participant.index() {
+    fn dispatch_participant(
+        &mut self,
+        participant: Participant,
+        dispatch: impl FnOnce(&mut TestHarness<P>) -> HandlerResult,
+    ) -> HandlerResult {
+        let (peer, result) = match participant.index() {
             0 => {
                 let peer = self.alice.peer_id();
-                let fx = self.alice.input(input);
-                (peer, fx)
+                (peer, dispatch(&mut self.alice))
             }
             1 => {
                 let peer = self.bob.peer_id();
-                let fx = self.bob.input(input);
-                (peer, fx)
+                (peer, dispatch(&mut self.bob))
             }
             idx => panic!("participant {idx} is outside the bilateral pair"),
         };
-        self.queue_effects(peer, &fx.effects);
-        fx
+        self.queue_effects(peer, &result.effects);
+        result
+    }
+
+    /// Deliver local input to one participant and queue any emitted messages.
+    pub fn input(&mut self, participant: Participant, input: P::Input) -> HandlerResult {
+        self.dispatch_participant(participant, |harness| harness.input(input))
     }
 
     /// Dispatch an untyped timer event to one participant and queue any emitted messages.
     pub fn timer(&mut self, participant: Participant) -> HandlerResult {
-        let (peer, fx) = match participant.index() {
-            0 => {
-                let peer = self.alice.peer_id();
-                let fx = self.alice.timer();
-                (peer, fx)
-            }
-            1 => {
-                let peer = self.bob.peer_id();
-                let fx = self.bob.timer();
-                (peer, fx)
-            }
-            idx => panic!("participant {idx} is outside the bilateral pair"),
-        };
-        self.queue_effects(peer, &fx.effects);
-        fx
+        self.dispatch_participant(participant, TestHarness::timer)
     }
 
     /// Dispatch a typed timer event to one participant and queue any emitted messages.
@@ -146,21 +138,7 @@ where
         participant: Participant,
         payload: crate::TimerPayload,
     ) -> HandlerResult {
-        let (peer, fx) = match participant.index() {
-            0 => {
-                let peer = self.alice.peer_id();
-                let fx = self.alice.typed_timer(payload);
-                (peer, fx)
-            }
-            1 => {
-                let peer = self.bob.peer_id();
-                let fx = self.bob.typed_timer(payload);
-                (peer, fx)
-            }
-            idx => panic!("participant {idx} is outside the bilateral pair"),
-        };
-        self.queue_effects(peer, &fx.effects);
-        fx
+        self.dispatch_participant(participant, |harness| harness.typed_timer(payload))
     }
 
     /// Inject a message from one participant to the other.

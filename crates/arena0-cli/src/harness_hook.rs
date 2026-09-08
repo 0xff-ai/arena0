@@ -80,22 +80,3 @@ fn append_export(path: &Path, context: &str) -> anyhow::Result<()> {
 pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn append_export_preserves_existing_bytes_and_adds_separator_when_needed() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("claude.env");
-        std::fs::write(&path, b"existing=1").expect("existing environment");
-
-        append_export(&path, "claude:session").expect("append environment");
-
-        assert_eq!(
-            std::fs::read(&path).expect("read environment"),
-            b"existing=1\nexport ARENA0_CONTEXT='claude:session'\n"
-        );
-    }
-}

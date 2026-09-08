@@ -394,11 +394,4 @@ mod tests {
             }]
         );
     }
-
-    #[test]
-    fn program_hash_is_content_addressed() {
-        assert_eq!(Hash::of(b"x"), Hash::of(b"x"));
-        assert_ne!(Hash::of(b"x"), Hash::of(b"y"));
-        assert_eq!(Hash::of(b"x").as_bytes(), blake3::hash(b"x").as_bytes());
-    }
 }

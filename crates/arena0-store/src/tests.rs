@@ -1798,6 +1798,79 @@ async fn accepted_inbound_signature_survives_restart_and_applies_once() {
 }
 
 #[tokio::test]
+async fn later_page_inbound_corruption_fails_closed_on_restart() {
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("store.sqlite");
+    let execution_id = ExecId([0x9c; 32]);
+    let store = create_execution(&path, &fixture, execution_id).await;
+    let state = store
+        .handle()
+        .load_execution(execution_id)
+        .await
+        .expect("load execution")
+        .expect("execution");
+    let source = other_peer(&fixture);
+    let seq = state.public().next_step();
+    let prestate = state.public().state_hash();
+    let session_id = state.binding().session_id();
+    let mut writer = store
+        .handle()
+        .claim_execution(execution_id)
+        .expect("execution writer");
+    for byte in 0..65_u8 {
+        let data = vec![byte];
+        let witness = WitnessCommitment([byte; 32]);
+        let frame = ExecFrame::Message {
+            message_id: MessageId::derive(session_id, source, seq, prestate, &data, witness),
+            seq,
+            prestate,
+            data,
+            witness,
+        };
+        assert_eq!(
+            writer
+                .accept_inbound(source, frame, 8 + u64::from(byte))
+                .await
+                .expect("accept inbound frame"),
+            InboxAcceptOutcome::Accepted
+        );
+    }
+    drop(writer);
+    store.shutdown().await.expect("shutdown before validation");
+
+    let reopened = Store::open(StoreConfig::new(&path, fixture.producer))
+        .expect("valid populated inbox rows reopen");
+    reopened
+        .shutdown()
+        .await
+        .expect("shutdown after validation");
+
+    let connection = Connection::open(&path).expect("inspect");
+    let inbox_id: Vec<u8> = connection
+        .query_row(
+            "SELECT inbox_id FROM inbox
+             WHERE execution_id = ?1
+             ORDER BY inbox_id LIMIT 1 OFFSET 64",
+            params![execution_id.0.to_vec()],
+            |row| row.get(0),
+        )
+        .expect("later-page inbox row");
+    connection
+        .execute(
+            "UPDATE inbox SET frame = x'00' WHERE execution_id = ?1 AND inbox_id = ?2",
+            params![execution_id.0.to_vec(), inbox_id],
+        )
+        .expect("tamper later-page frame");
+    drop(connection);
+
+    assert!(matches!(
+        Store::open(StoreConfig::new(&path, fixture.producer)),
+        Err(StoreError::Corruption(_))
+    ));
+}
+
+#[tokio::test]
 async fn any_accepted_inbound_fact_can_be_durably_rejected() {
     let fixture = activation_fixture();
     let directory = tempfile::tempdir().expect("tempdir");

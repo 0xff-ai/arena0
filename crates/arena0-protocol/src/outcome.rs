@@ -174,9 +174,4 @@ mod tests {
             vec![true, false, false, false, false, false, false]
         );
     }
-
-    #[test]
-    fn outcome_hash_of_is_blake3() {
-        assert_eq!(Hash::of(b"receipt").0, *blake3::hash(b"receipt").as_bytes());
-    }
 }

@@ -25,6 +25,46 @@ impl StartupTimeline {
     pub(crate) fn elapsed(&self) -> Duration {
         self.started.elapsed()
     }
+
+    /// Emit one bounded aggregate startup milestone. All fields are aggregate
+    /// counts or monotonic elapsed time; Host-owned identity details stay on
+    /// the per-Host projection below.
+    pub(crate) fn progress(&self, stage: StartupStage) {
+        tracing::info!(
+            target: TRACE_TARGET,
+            operation = "startup",
+            stage = stage.as_str(),
+            host_count = self.host_count,
+            program_count = self.program_count,
+            elapsed_ms = elapsed_ms(self.elapsed()),
+            "arena0d startup progress"
+        );
+    }
+
+    /// Emit one per-Host startup milestone without exposing Host-owned identity
+    /// material or durable state.
+    pub(crate) fn host_progress(&self, stage: StartupStage, host: &str) {
+        tracing::info!(
+            target: TRACE_TARGET,
+            operation = "startup",
+            stage = stage.as_str(),
+            host,
+            elapsed_ms = elapsed_ms(self.elapsed()),
+            "arena0d Host startup progress"
+        );
+    }
+
+    /// Emit the point at which the MCP listener has bound its loopback endpoint.
+    pub(crate) fn mcp_ready(&self, address: SocketAddr) {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            operation = "startup",
+            stage = StartupStage::McpReady.as_str(),
+            endpoint = %format_args!("http://{address}/mcp"),
+            elapsed_ms = elapsed_ms(self.elapsed()),
+            "arena0d MCP ready"
+        );
+    }
 }
 
 /// One bounded startup milestone. These values are operational observations;
@@ -64,46 +104,6 @@ impl StartupStage {
     }
 }
 
-/// Emit one bounded aggregate startup milestone. All fields are aggregate
-/// counts or monotonic elapsed time; Host-owned identity details stay on the
-/// per-Host projection below.
-pub(crate) fn progress(stage: StartupStage, timeline: &StartupTimeline) {
-    tracing::info!(
-        target: TRACE_TARGET,
-        operation = "startup",
-        stage = stage.as_str(),
-        host_count = timeline.host_count,
-        program_count = timeline.program_count,
-        elapsed_ms = elapsed_ms(timeline.elapsed()),
-        "arena0d startup progress"
-    );
-}
-
-/// Emit one per-Host startup milestone without exposing Host-owned identity
-/// material or durable state.
-pub(crate) fn host_progress(stage: StartupStage, host: &str, timeline: &StartupTimeline) {
-    tracing::info!(
-        target: TRACE_TARGET,
-        operation = "startup",
-        stage = stage.as_str(),
-        host,
-        elapsed_ms = elapsed_ms(timeline.elapsed()),
-        "arena0d Host startup progress"
-    );
-}
-
-/// Emit the point at which the MCP listener has bound its loopback endpoint.
-pub(crate) fn mcp_ready(address: SocketAddr, timeline: &StartupTimeline) {
-    tracing::info!(
-        target: TRACE_TARGET,
-        operation = "startup",
-        stage = StartupStage::McpReady.as_str(),
-        endpoint = %format_args!("http://{address}/mcp"),
-        elapsed_ms = elapsed_ms(timeline.elapsed()),
-        "arena0d MCP ready"
-    );
-}
-
 fn elapsed_ms(elapsed: Duration) -> u64 {
     elapsed.as_millis().try_into().unwrap_or(u64::MAX)
 }
@@ -116,23 +116,23 @@ mod tests {
 
     use tracing_subscriber::fmt::MakeWriter;
 
-    use super::{StartupStage, StartupTimeline, host_progress, mcp_ready, progress};
+    use super::{StartupStage, StartupTimeline};
 
     #[test]
     fn progress_fields_are_structured_and_redacted() {
         let output = SharedWriter::default();
         let subscriber = tracing_subscriber::fmt()
             .json()
-            .with_max_level(tracing::Level::INFO)
+            .with_max_level(tracing::Level::DEBUG)
             .with_writer(output.clone())
             .finish();
         let timeline = StartupTimeline::new(5, 2);
 
         tracing::subscriber::with_default(subscriber, || {
-            progress(StartupStage::EngineReady, &timeline);
-            host_progress(StartupStage::HostReady, "host-01", &timeline);
-            progress(StartupStage::Failed, &timeline);
-            mcp_ready("127.0.0.1:7330".parse().expect("MCP address"), &timeline);
+            timeline.progress(StartupStage::EngineReady);
+            timeline.host_progress(StartupStage::HostReady, "host-01");
+            timeline.progress(StartupStage::Failed);
+            timeline.mcp_ready("127.0.0.1:7330".parse().expect("MCP address"));
         });
 
         let lines = output.lines();

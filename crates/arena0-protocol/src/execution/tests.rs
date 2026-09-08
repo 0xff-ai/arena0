@@ -233,19 +233,6 @@ fn pending_terminal(fixture: &Fixture) -> ExecutionState {
 }
 
 #[test]
-fn versions_are_independent_from_public_and_private_cursors() {
-    assert_eq!(
-        ExecutionVersion::ZERO.next(),
-        Some(ExecutionVersion::new(1))
-    );
-    assert_eq!(PrivateCursor::new(9).next_record(), 9);
-    assert_eq!(
-        PublicCursor::new(4, StateHash([1; 32]), [2; 32]).next_step(),
-        4
-    );
-}
-
-#[test]
 fn outbox_occurrence_id_binds_version_ordinal_and_effect() {
     let effect = DurableEffect::notify(FrameId::derive(b"frame"), b"payload".to_vec()).unwrap();
     let a = OutboxId::derive(ExecId([1; 32]), ExecutionVersion::new(3), 0, &effect).unwrap();

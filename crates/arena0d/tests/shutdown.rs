@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -62,14 +62,6 @@ impl Drop for ChildGuard {
     }
 }
 
-fn free_loopback_port() -> u16 {
-    TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .expect("reserve MCP port")
-        .local_addr()
-        .expect("read reserved MCP port")
-        .port()
-}
-
 async fn wait_for_socket(path: &std::path::Path, deadline: Instant) -> anyhow::Result<()> {
     loop {
         if Instant::now() >= deadline {
@@ -82,11 +74,10 @@ async fn wait_for_socket(path: &std::path::Path, deadline: Instant) -> anyhow::R
     }
 }
 
-async fn wait_for_mcp(port: u16, deadline: Instant) -> anyhow::Result<()> {
-    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+async fn wait_for_mcp(address: SocketAddr, deadline: Instant) -> anyhow::Result<()> {
     loop {
         if Instant::now() >= deadline {
-            bail!("timed out waiting for MCP port {port}");
+            bail!("timed out waiting for MCP at {address}");
         }
         if tokio::net::TcpStream::connect(address).await.is_ok() {
             return Ok(());
@@ -98,20 +89,11 @@ async fn wait_for_mcp(port: u16, deadline: Instant) -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Result<()> {
     let home = TempDir::new().context("create isolated arena0 home")?;
-    let mcp_port = free_loopback_port();
-    let mcp_address = format!("127.0.0.1:{mcp_port}");
     let socket = home.path().join("arena0.sock");
     let child = Command::new(env!("CARGO_BIN_EXE_arena0d"))
         .env("ARENA0_HOME", home.path())
         .env("RUST_LOG", "arena0_daemon=info,warn")
-        .args([
-            "--host",
-            "host-01",
-            "--host",
-            "host-02",
-            "--mcp-listen",
-            &mcp_address,
-        ])
+        .args(["--host", "host-01", "--host", "host-02"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -121,9 +103,21 @@ async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Re
 
     let startup_deadline = Instant::now() + STARTUP_DEADLINE;
     wait_for_socket(&socket, startup_deadline).await?;
-    wait_for_mcp(mcp_port, startup_deadline).await?;
-
     let client = DaemonClient::new(&socket);
+    let endpoint = match client.call(&Request::DaemonInfo).await? {
+        ResponseOk::DaemonInfo(info) => info.mcp_endpoint,
+        other => return Err(anyhow!("unexpected daemon info response: {other:?}")),
+    };
+    let mcp_address: SocketAddr = endpoint
+        .strip_prefix("http://")
+        .and_then(|endpoint| endpoint.strip_suffix("/mcp"))
+        .context("MCP endpoint must be an HTTP /mcp URL")?
+        .parse()
+        .context("parse bound MCP address")?;
+    assert!(mcp_address.ip().is_loopback());
+    assert_ne!(mcp_address.port(), 0);
+    wait_for_mcp(mcp_address, startup_deadline).await?;
+
     let hosts = match client.call(&Request::HostsList).await? {
         ResponseOk::Hosts(hosts) => hosts,
         other => return Err(anyhow!("unexpected Hosts list response: {other:?}")),

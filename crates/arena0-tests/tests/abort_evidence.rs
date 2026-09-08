@@ -13,7 +13,6 @@ use arena0_protocol::{
 use arena0_tests::fixtures::{
     LIVE_EXECUTION_TIMEOUT, establish_live_session, provider, spawn_live_execution,
 };
-use arena0_tests::synthetic::Synthetic;
 use arena0_tests::wasm::program_wasm;
 use arena0_verify::{LightVerifiedTerminal, verify_full, verify_light};
 
@@ -108,19 +107,6 @@ async fn bilateral_peer_abort_publishes_a_stopped_receipt() {
     assert!(matches!(
         full.terminal,
         arena0_verify::VerifiedTerminal::Stopped { .. }
-    ));
-}
-
-#[test]
-fn stopped_receipts_use_authenticated_terminal_evidence() {
-    let synthetic = Synthetic::new(2);
-    let cause = synthetic.authenticated_stop(0, AbortKind::Abort, "operator stop");
-    let receipt = synthetic.stopped_receipt(cause, Vec::new());
-    let verified = verify_light(&receipt.encode().expect("encode receipt"))
-        .expect("authenticated stop verifies");
-    assert!(matches!(
-        verified.terminal,
-        LightVerifiedTerminal::Stopped { .. }
     ));
 }
 

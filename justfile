@@ -21,6 +21,38 @@ test: build-programs
     cargo test --doc -p arena0-primitives -p arena0-sdk
     cargo nextest run --manifest-path programs/Cargo.toml
 
+# Select checks from local changes, or a committed base/head range.
+# Use `scripts/check-affected.sh --plan` to inspect the commands first.
+check-affected base="HEAD" head="":
+    ./scripts/check-affected.sh {{quote(base)}} {{quote(head)}}
+
+# CLI subprocess tests need the real sibling daemon executable.
+test-cli: build-programs
+    cargo build --locked -p arena0d
+    cargo nextest run --locked -p arena0-cli
+
+# Keep MCP admission/receipt, Unix session, and daemon process lifecycle proof.
+test-daemon: build-programs
+    cargo nextest run --locked -p arena0-daemon -p arena0d -p arena0-tests -E 'package(arena0-daemon) | package(arena0d) | (package(arena0-tests) & binary(daemon_e2e))'
+
+# Guest-native tests accompany the host suites that execute the built Wasm.
+test-programs: build-programs
+    cargo nextest run --locked -p arena0-tests
+    cargo nextest run --locked --manifest-path programs/Cargo.toml
+
+# Focus formatting and Clippy on the changed owner; shared changes use `check`.
+check-cli: build-programs
+    cargo fmt -p arena0-cli --check
+    cargo clippy --locked -p arena0-cli --all-targets
+
+check-daemon: build-programs
+    cargo fmt -p arena0-daemon -p arena0d --check
+    cargo clippy --locked -p arena0-daemon -p arena0d --all-targets
+
+check-programs: build-programs
+    cargo fmt --manifest-path programs/Cargo.toml --all --check
+    cargo clippy --locked --manifest-path programs/Cargo.toml --all-targets
+
 # Format + clippy both Cargo workspaces at the project's warn level.
 check:
     ./scripts/check-deps.sh

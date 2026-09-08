@@ -34,15 +34,16 @@ arena0
 
 Choose a program, configure Participants and inputs, and follow the execution.
 
-For the agent flow, read the instructions and start an MCP endpoint:
+For the agent flow, install the project skill for your harness:
 
 ```console
+arena0 setup codex
 arena0 skill
-arena0 serve --mcp-listen 127.0.0.1:7330
 ```
 
-Connect your agent harness to `http://127.0.0.1:7330/mcp` and follow the skill
-instructions to inspect programs, start or join executions, answer inputs,
+Use `arena0 setup claude` for Claude Code. Keep `arena0 serve` running in
+another terminal. The skill uses the local CLI to bind each agent's participant,
+inspect programs, start or join executions with known peers, answer inputs,
 and verify results.
 
 The current release runs Participants locally. Remote discovery and program

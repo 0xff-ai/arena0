@@ -370,22 +370,51 @@ impl Database {
     }
 
     pub(super) fn validate_receipts(&mut self) -> Result<(), StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT receipt_id, session_id, kind, artifact FROM receipts ORDER BY receipt_id",
-        )?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok(RawReceiptRow {
-                    receipt_id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    kind: row.get(2)?,
-                    artifact: row.get(3)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
-        for row in rows {
-            self.decode_stored_receipt(row)?;
+        let mut after: Option<ReceiptId> = None;
+        loop {
+            let ids = {
+                let mut statement = if after.is_some() {
+                    self.connection.prepare(
+                        "SELECT receipt_id FROM receipts
+                         WHERE receipt_id > ?1
+                         ORDER BY receipt_id LIMIT ?2",
+                    )?
+                } else {
+                    self.connection.prepare(
+                        "SELECT receipt_id FROM receipts
+                         ORDER BY receipt_id LIMIT ?1",
+                    )?
+                };
+                let mut rows = match after {
+                    Some(receipt_id) => statement.query(params![
+                        receipt_id.as_bytes().to_vec(),
+                        DATABASE_VALIDATION_PAGE_SIZE,
+                    ])?,
+                    None => statement.query(params![DATABASE_VALIDATION_PAGE_SIZE])?,
+                };
+                let mut ids = Vec::new();
+                while let Some(row) = rows.next()? {
+                    ids.push(ReceiptId::from_bytes(array32(
+                        &row.get::<_, Vec<u8>>(0)?,
+                        "receipt id",
+                    )?));
+                }
+                ids
+            };
+            let Some(last) = ids.last().copied() else {
+                break;
+            };
+            let full_page = ids.len() == DATABASE_VALIDATION_PAGE_SIZE as usize;
+            for receipt_id in ids {
+                let row = self.receipt_row_by_id(receipt_id)?.ok_or_else(|| {
+                    StoreError::Corruption("receipt disappeared while validating".into())
+                })?;
+                self.decode_stored_receipt(row)?;
+            }
+            if !full_page {
+                break;
+            }
+            after = Some(last);
         }
         Ok(())
     }

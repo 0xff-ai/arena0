@@ -23,14 +23,12 @@ Participants are the parties to the interaction. `Host` is the runtime type
 that serves a Participant; `Ensemble` groups those runtime instances. These
 implementation names are used below to explain ownership and local topology.
 
-Phase 1 runs an `Ensemble` of independent logical Hosts in one `arena0d` process. The daemon owns the shared Unix API endpoint and MCP listener. Each Host has its own identity, program catalog, SQLite store, execution actors, and receipts. `LocalTransport` connects the Hosts through bounded in-process channels and the real protocol codec.
+Phase 1 runs an `Ensemble` of independent logical Hosts in one `arena0d` process. The daemon owns the shared Unix API endpoint. Each Host has its own identity, program catalog, SQLite store, execution actors, and receipts. `LocalTransport` connects the Hosts through bounded in-process channels and the real protocol codec.
 
 ```text
 human or agent
     |
-    +-- arena0 CLI -----------+
-    |                         |
-    +-- Token-scoped MCP -----+--> arena0d
+    +-- arena0 CLI -------------> arena0d
                                   |
                                   +-- Ensemble
                                       |
@@ -65,7 +63,6 @@ The workspace manifests own dependency selection and exact versions. The table b
 | Persistent identity | Ed25519 | Host identity, tickets, and unilateral stop reports |
 | Execution agreement | BLS12-381 MinSig through `blst` | Per-execution keys and N-of-N aggregate agreements |
 | Local Host API | Length-prefixed JSON over one daemon Unix socket | Explicit routing to independent Hosts |
-| MCP API | RMCP and Axum over Streamable HTTP | One agent endpoint with access restricted to the Host named by a validated token |
 | Observability | `tracing` and `tracing-subscriber` | Redacted semantic events and opt-in performance records |
 | CLI | Clap, Ratatui, and Crossterm | Commands, the local workspace, and the execution observatory |
 | Build orchestration | Cargo and `just` | Program builds, workspace builds, tests, checks, docs, audits, and release artifacts |
@@ -196,7 +193,7 @@ Recovery validates stored state and every nested projection before it exposes th
 
 Long-lived state uses one clear task or resource owner. Execution actors own live execution capabilities. The store thread owns its SQLite connection. The Ensemble owns coordinated local shutdown. The daemon owns its services and child task lifecycles.
 
-MCP `hello` creates a Host through serialized, supervised provisioning and returns a signed access token. A valid token permits reopening or renewing access to that same Host; the daemon checks its cryptographic identity before publishing the service. The operator Unix API can also reopen by local ID. Persisted Hosts outside the startup set reopen on demand. Shutdown settles pending provisioning before releasing stores.
+The CLI binds each harness context to a durable Host through serialized, supervised provisioning. Repeated `arena0 hello` reopens that same Host; the daemon checks its identity before publishing the service. Persisted Hosts outside the startup set reopen on demand. Shutdown settles pending provisioning before releasing stores.
 
 Queues, channels, frames, blobs, guest calls, agent responses, pending work, and shutdown waits are bounded. Backpressure reaches the component that creates work instead of becoming unbounded memory growth.
 
@@ -206,13 +203,9 @@ Cancellation must preserve a recoverable durable boundary. A graceful shutdown s
 
 Phase 1 assumes one machine operator controls all supervised Hosts. Separate identities and stores do not defend against compromise of that machine.
 
-MCP tools resolve a signed access token to one Host. `hello` creates or renews
-that access; other tools cannot select or enumerate local Hosts. The daemon
-persists one signing key independently of Participant identity keys and keeps
-no token table. Tokens expire without stopping execution, and renewal requires
-an unexpired credential. The optional endpoint bearer token remains a separate
-access gate. These rules restrict MCP access while leaving the operator Unix
-API and monitor available to the machine operator.
+The local Unix API and monitor are operator interfaces. Harness context
+binding selects a participant for CLI commands; it is not an access boundary
+against other processes controlled by the same machine operator.
 
 Within that boundary, each Host still validates protocol facts independently. N-of-N agreement prevents the system from hiding one selected Host's disagreement inside a majority result. The same rule allows any selected Host to stop progress.
 
@@ -246,14 +239,14 @@ The opt-in `arena0::performance` target records aggregate and per-item timings. 
 
 Daemon information and event frames share a Host metadata projection: local ID, cryptographic peer ID, and optional user agent. Each event captures the metadata at emission, preserving earlier labels in buffered history.
 
-The CLI, execution observatory, JSON output, and MCP tools project typed Host state. Presentation code does not own protocol or execution state.
+The CLI, execution observatory, and JSON output project typed Host state. Presentation code does not own protocol or execution state.
 
 `arena0 launch` performs headless coordinated setup and supervises configured
 local drivers. `arena0 monitor` attaches independently to the existing daemon
 and uses the same terminal observatory for multiparty execution tables,
 guest-owned textual views, activity, and public agreement. The monitor can
 answer one pending callout through the existing Host submission boundary;
-competing stale answers receive `CalloutNotPending`. MCP activity has its own
+competing stale answers receive `CalloutNotPending`. Adapter activity has its own
 bounded operational stream, separate from semantic Host events.
 
 ## Fixed Phase 1 constraints
@@ -295,5 +288,5 @@ Release work adds documentation, security audit, package, and release-build chec
 - Read the [architecture guide](architecture.md) for the reasons behind the major boundaries.
 - Follow the [execution walkthrough](architecture.md#complete-execution-walkthrough) for one complete execution.
 - Read [Programming](programming.md) for guest authoring.
-- Read the [Local Host API](api/json-rpc.md) or [MCP guide](getting-started.md#connect-an-mcp-client) for integrations.
+- Read the [Local Host API](api/json-rpc.md) or [agent setup guide](getting-started.md#configure-an-agent) for integrations.
 - Read [Contributing](contributing.md) for change rules and required checks.

@@ -1,6 +1,21 @@
 use super::*;
 use arena0_protocol::PublicEvent;
 
+struct RawInboxRow {
+    source: Vec<u8>,
+    digest: Vec<u8>,
+    frame: Vec<u8>,
+    status: String,
+    applied_version: Option<i64>,
+    consumed_at_ms: Option<i64>,
+}
+
+struct ValidatedInboxFrame {
+    source: PeerId,
+    stored: StoredFrame,
+    frame: ExecFrame,
+}
+
 impl Database {
     pub(super) fn inbox_row(
         &mut self,
@@ -51,8 +66,9 @@ impl Database {
         let stored = canonical_frame(&frame, &state)?;
         let frame_bytes = borsh::to_vec(&stored)
             .map_err(|error| StoreError::Corruption(format!("inbox frame encode: {error}")))?;
-        let inbox_id = derive_inbox_id(frame.source, &stored)?;
-        let digest = checksum(&inbox_identity_bytes(frame.source, &stored)?);
+        let identity_digest = inbox_identity_digest(frame.source, &stored)?;
+        let inbox_id = InboxId::from_bytes(identity_digest);
+        let digest = identity_digest;
         let existing = self.connection.query_row(
             "SELECT source, digest, frame, status FROM inbox WHERE execution_id = ?1 AND inbox_id = ?2",
             params![execution_id.0.to_vec(), inbox_id.as_bytes().to_vec()],
@@ -110,33 +126,23 @@ impl Database {
         values
             .into_iter()
             .map(|(inbox_id, source, digest, encoded)| {
-                let stored: StoredFrame = decode_borsh(
-                    &open_envelope(EnvelopeKind::InboundFrame, &encoded, MAX_FRAME_BYTES)?,
-                    "inbox frame",
-                )?;
-                let frame = decode_stored_frame(&stored)?;
-                let authenticated = AuthenticatedFrame {
+                let validated = validate_inbox_frame(
+                    &state,
+                    inbox_id,
                     source,
-                    frame: frame.clone(),
-                };
-                let canonical = canonical_frame(&authenticated, &state)?;
-                let canonical_bytes = borsh::to_vec(&stored).map_err(|error| {
+                    &digest,
+                    &encoded,
+                    "pending inbox row failed identity validation",
+                )?;
+                let canonical_bytes = borsh::to_vec(&validated.stored).map_err(|error| {
                     StoreError::Corruption(format!("inbox frame encode: {error}"))
                 })?;
                 account_response(&mut response_bytes, canonical_bytes.len())?;
-                if canonical != stored
-                    || derive_inbox_id(source, &stored)? != inbox_id
-                    || checksum(&inbox_identity_bytes(source, &stored)?) != digest
-                {
-                    return Err(StoreError::Corruption(
-                        "pending inbox row failed identity validation".into(),
-                    ));
-                }
                 Ok(PendingInboxItem {
                     execution_id,
                     inbox_id,
-                    source,
-                    frame,
+                    source: validated.source,
+                    frame: validated.frame,
                 })
             })
             .collect()
@@ -303,35 +309,54 @@ impl Database {
         }
     }
 
+    fn raw_inbox_row(
+        &self,
+        execution_id: ExecId,
+        inbox_id: InboxId,
+    ) -> Result<Option<RawInboxRow>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT source, digest, frame, status, applied_version, consumed_at_ms
+                 FROM inbox WHERE execution_id = ?1 AND inbox_id = ?2",
+                params![execution_id.0.to_vec(), inbox_id.as_bytes().to_vec()],
+                |row| {
+                    Ok(RawInboxRow {
+                        source: row.get(0)?,
+                        digest: row.get(1)?,
+                        frame: row.get(2)?,
+                        status: row.get(3)?,
+                        applied_version: row.get(4)?,
+                        consumed_at_ms: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)
+    }
+
     fn load_inbox_fact(
         &mut self,
         execution_id: ExecId,
         inbox_id: InboxId,
         state: &ExecutionState,
     ) -> Result<(PeerId, StoredFrame, InboxStatus, Option<ExecutionVersion>), StoreError> {
-        let row = self.connection.query_row("SELECT source, digest, frame, status, applied_version FROM inbox WHERE execution_id = ?1 AND inbox_id = ?2", params![execution_id.0.to_vec(), inbox_id.as_bytes().to_vec()], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, String>(3)?, row.get::<_, Option<i64>>(4)?))).optional()?.ok_or(StoreError::InboxNotAccepted(inbox_id))?;
-        let source = peer_id_from_blob(&row.0, "inbox source")?;
-        let stored: StoredFrame = decode_borsh(
-            &open_envelope(EnvelopeKind::InboundFrame, &row.2, MAX_FRAME_BYTES)?,
-            "inbox frame",
+        let row = self
+            .raw_inbox_row(execution_id, inbox_id)?
+            .ok_or(StoreError::InboxNotAccepted(inbox_id))?;
+        let source = peer_id_from_blob(&row.source, "inbox source")?;
+        let validated = validate_inbox_frame(
+            state,
+            inbox_id,
+            source,
+            &row.digest,
+            &row.frame,
+            "inbox frame identity validation failed",
         )?;
-        let authenticated = AuthenticatedFrame {
-            source,
-            frame: decode_stored_frame(&stored)?,
-        };
-        if canonical_frame(&authenticated, state)? != stored
-            || derive_inbox_id(source, &stored)? != inbox_id
-            || checksum(&inbox_identity_bytes(source, &stored)?) != row.1.as_slice()
-        {
-            return Err(StoreError::Corruption(
-                "inbox frame identity validation failed".into(),
-            ));
-        }
         Ok((
-            source,
-            stored,
-            parse_inbox_status(&row.3)?,
-            row.4
+            validated.source,
+            validated.stored,
+            parse_inbox_status(&row.status)?,
+            row.applied_version
                 .map(sqlite_i64)
                 .transpose()?
                 .map(ExecutionVersion::new),
@@ -339,71 +364,127 @@ impl Database {
     }
 
     pub(super) fn validate_inbox_rows(&mut self) -> Result<(), StoreError> {
-        let mut statement = self.connection.prepare("SELECT execution_id, inbox_id, source, digest, frame, status, applied_version, consumed_at_ms FROM inbox")?;
-        let mut rows = statement.query([])?;
-        let mut values = Vec::new();
-        while let Some(row) = rows.next()? {
-            values.push((
-                ExecId(array32(&row.get::<_, Vec<u8>>(0)?, "inbox execution")?),
-                InboxId::from_bytes(array32(&row.get::<_, Vec<u8>>(1)?, "inbox id")?),
-                peer_id_from_blob(&row.get::<_, Vec<u8>>(2)?, "inbox source")?,
-                array32(&row.get::<_, Vec<u8>>(3)?, "inbox digest")?,
-                row.get::<_, Vec<u8>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<i64>>(6)?,
-                row.get::<_, Option<i64>>(7)?,
-            ));
-        }
-        drop(rows);
-        drop(statement);
-        for (execution_id, inbox_id, source, digest, encoded, status, applied, consumed) in values {
-            let state = self
-                .load_execution(execution_id)?
-                .ok_or(StoreError::ExecutionNotFound(execution_id))?;
-            let stored: StoredFrame = decode_borsh(
-                &open_envelope(EnvelopeKind::InboundFrame, &encoded, MAX_FRAME_BYTES)?,
-                "inbox frame",
-            )?;
-            let authenticated = AuthenticatedFrame {
-                source,
-                frame: decode_stored_frame(&stored)?,
+        let mut after: Option<(ExecId, InboxId)> = None;
+        loop {
+            let keys = {
+                let mut statement = if after.is_some() {
+                    self.connection.prepare(
+                        "SELECT execution_id, inbox_id FROM inbox
+                         WHERE (execution_id, inbox_id) > (?1, ?2)
+                         ORDER BY execution_id, inbox_id LIMIT ?3",
+                    )?
+                } else {
+                    self.connection.prepare(
+                        "SELECT execution_id, inbox_id FROM inbox
+                         ORDER BY execution_id, inbox_id LIMIT ?1",
+                    )?
+                };
+                let mut rows = match after {
+                    Some((execution_id, inbox_id)) => statement.query(params![
+                        execution_id.0.to_vec(),
+                        inbox_id.as_bytes().to_vec(),
+                        DATABASE_VALIDATION_PAGE_SIZE,
+                    ])?,
+                    None => statement.query(params![DATABASE_VALIDATION_PAGE_SIZE])?,
+                };
+                let mut keys = Vec::new();
+                while let Some(row) = rows.next()? {
+                    keys.push((
+                        ExecId(array32(&row.get::<_, Vec<u8>>(0)?, "inbox execution")?),
+                        InboxId::from_bytes(array32(&row.get::<_, Vec<u8>>(1)?, "inbox id")?),
+                    ));
+                }
+                keys
             };
-            if canonical_frame(&authenticated, &state)? != stored
-                || derive_inbox_id(source, &stored)? != inbox_id
-                || checksum(&inbox_identity_bytes(source, &stored)?) != digest
-            {
-                return Err(StoreError::Corruption(
-                    "inbox frame identity mismatch".into(),
-                ));
-            }
-            match parse_inbox_status(&status)? {
-                InboxStatus::Accepted if applied.is_some() || consumed.is_some() => {
+            let Some(last) = keys.last().copied() else {
+                break;
+            };
+            let full_page = keys.len() == DATABASE_VALIDATION_PAGE_SIZE as usize;
+            for (execution_id, inbox_id) in keys {
+                let state = self
+                    .load_execution(execution_id)?
+                    .ok_or(StoreError::ExecutionNotFound(execution_id))?;
+                let row = self.raw_inbox_row(execution_id, inbox_id)?.ok_or_else(|| {
+                    StoreError::Corruption("inbox row disappeared while validating".into())
+                })?;
+                let source = peer_id_from_blob(&row.source, "inbox source")?;
+                let digest = array32(&row.digest, "inbox digest")?;
+                validate_inbox_frame(
+                    &state,
+                    inbox_id,
+                    source,
+                    &digest,
+                    &row.frame,
+                    "inbox frame identity mismatch",
+                )?;
+                match parse_inbox_status(&row.status)? {
+                    InboxStatus::Accepted
+                        if row.applied_version.is_some() || row.consumed_at_ms.is_some() =>
+                    {
+                        return Err(StoreError::Corruption(
+                            "accepted inbox row has completion indexes".into(),
+                        ));
+                    }
+                    InboxStatus::Applied
+                        if row.applied_version.is_none() || row.consumed_at_ms.is_some() =>
+                    {
+                        return Err(StoreError::Corruption(
+                            "applied inbox row has invalid indexes".into(),
+                        ));
+                    }
+                    InboxStatus::Consumed
+                        if row.consumed_at_ms.is_none() || row.applied_version.is_some() =>
+                    {
+                        return Err(StoreError::Corruption(
+                            "consumed inbox row has invalid indexes".into(),
+                        ));
+                    }
+                    _ => {}
+                }
+                if let Some(version) = row.applied_version
+                    && sqlite_i64(version)? > state.version().get()
+                {
                     return Err(StoreError::Corruption(
-                        "accepted inbox row has completion indexes".into(),
+                        "inbox applied version is ahead of state".into(),
                     ));
                 }
-                InboxStatus::Applied if applied.is_none() || consumed.is_some() => {
-                    return Err(StoreError::Corruption(
-                        "applied inbox row has invalid indexes".into(),
-                    ));
-                }
-                InboxStatus::Consumed if consumed.is_none() || applied.is_some() => {
-                    return Err(StoreError::Corruption(
-                        "consumed inbox row has invalid indexes".into(),
-                    ));
-                }
-                _ => {}
             }
-            if let Some(version) = applied
-                && sqlite_i64(version)? > state.version().get()
-            {
-                return Err(StoreError::Corruption(
-                    "inbox applied version is ahead of state".into(),
-                ));
+            if !full_page {
+                break;
             }
+            after = Some(last);
         }
         Ok(())
     }
+}
+
+fn validate_inbox_frame(
+    state: &ExecutionState,
+    inbox_id: InboxId,
+    source: PeerId,
+    digest: &[u8],
+    encoded: &[u8],
+    identity_error: &'static str,
+) -> Result<ValidatedInboxFrame, StoreError> {
+    let stored: StoredFrame = decode_borsh(
+        &open_envelope(EnvelopeKind::InboundFrame, encoded, MAX_FRAME_BYTES)?,
+        "inbox frame",
+    )?;
+    let frame = decode_stored_frame(&stored)?;
+    let authenticated = AuthenticatedFrame { source, frame };
+    let canonical = canonical_frame(&authenticated, state)?;
+    if canonical != stored {
+        return Err(StoreError::Corruption(identity_error.into()));
+    }
+    let identity_digest = inbox_identity_digest(source, &stored)?;
+    if identity_digest != *inbox_id.as_bytes() || identity_digest.as_slice() != digest {
+        return Err(StoreError::Corruption(identity_error.into()));
+    }
+    Ok(ValidatedInboxFrame {
+        source,
+        stored,
+        frame: authenticated.frame,
+    })
 }
 
 fn ensure_step_commitment(

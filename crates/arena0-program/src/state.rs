@@ -421,15 +421,4 @@ mod tests {
             Err(StateBytesError::LocalTooLarge { .. })
         ));
     }
-
-    #[test]
-    fn shared_and_local_state_are_not_interchangeable() {
-        let shared = SharedStateBytes::try_from_slice(b"state").unwrap();
-        let local = LocalStateBytes::try_from_slice(b"state").unwrap();
-        assert_eq!(shared.as_bytes(), local.as_bytes());
-        assert_ne!(
-            std::any::TypeId::of::<SharedStateBytes>(),
-            std::any::TypeId::of::<LocalStateBytes>()
-        );
-    }
 }

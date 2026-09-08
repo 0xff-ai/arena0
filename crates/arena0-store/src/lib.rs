@@ -145,6 +145,25 @@ impl StoreConfig {
         self.retry_delay_ms = delay_ms;
         self
     }
+
+    fn validate(&self) -> Result<(), StoreError> {
+        if self.queue_capacity == 0 {
+            return Err(StoreError::InvalidConfiguration(
+                "queue capacity must be greater than zero",
+            ));
+        }
+        if self.queue_bytes == 0 {
+            return Err(StoreError::InvalidConfiguration(
+                "queue byte capacity must be greater than zero",
+            ));
+        }
+        if self.queue_bytes > u32::MAX as usize {
+            return Err(StoreError::InvalidConfiguration(
+                "queue byte capacity must fit a semaphore permit count",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Summary of lease recovery performed while opening or reconciling a store.
@@ -1177,6 +1196,20 @@ pub struct StoreHandle {
 ///     let _future = writer.apply_input(input, 0);
 /// }
 /// ```
+///
+/// A cloneable [`StoreHandle`] exposes read and registry capabilities only;
+/// execution mutations, including Join target binding, require the
+/// non-cloneable [`ExecutionStore`]:
+///
+/// ```compile_fail,E0624
+/// fn shared_handle_cannot_bind_join_target(
+///     handle: &arena0_store::StoreHandle,
+///     execution_id: arena0_protocol::ExecId,
+///     target: arena0_protocol::NegotiationTarget,
+/// ) {
+///     let _future = handle.bind_join_target(execution_id, target);
+/// }
+/// ```
 #[derive(Debug)]
 pub struct ExecutionStore {
     handle: StoreHandle,
@@ -1454,7 +1487,7 @@ impl Store {
     /// Open a database, acquire its process lock, initialize its schema, and start its
     /// one blocking owner thread.
     pub fn open(config: StoreConfig) -> Result<Self, StoreError> {
-        validate_config(&config)?;
+        config.validate()?;
         Self::reserve(&config.path)?.open(config)
     }
 
@@ -1463,7 +1496,7 @@ impl Store {
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         let owner_config = config.clone();
         let owner = thread::Builder::new()
-            .name(format!("arena0-store-{}", short_id(config.host_id)))
+            .name(format!("arena0-store-{}", config.host_id.fmt_short()))
             .spawn(move || owner_loop(owner_config, lock, receiver, ready_tx))
             .map_err(StoreError::Io)?;
 
@@ -1525,7 +1558,7 @@ impl StoreReservation {
     /// reservation alive.
     pub fn open(self, config: StoreConfig) -> Result<Store, StoreError> {
         let StoreReservation { path, lock } = self;
-        validate_config(&config)?;
+        config.validate()?;
         if path.as_path() != config.path.as_path() {
             return Err(StoreError::InvalidConfiguration(
                 "store reservation path does not match store configuration path",
@@ -1587,10 +1620,7 @@ impl StoreHandle {
         response.await.map_err(|_| StoreError::ReplyDropped)?
     }
 
-    /// Bind an open Join request to one exact offer before local consent is
-    /// signed. The store performs a compare-and-set: retries can observe the
-    /// same target, but they cannot replace it with another negotiation.
-    pub async fn bind_join_target(
+    async fn bind_join_target(
         &self,
         execution_id: ExecId,
         target: NegotiationTarget,
@@ -2543,25 +2573,6 @@ impl ExecutionStore {
             .await?;
         response.await.map_err(|_| StoreError::ReplyDropped)?
     }
-}
-
-fn validate_config(config: &StoreConfig) -> Result<(), StoreError> {
-    if config.queue_capacity == 0 {
-        return Err(StoreError::InvalidConfiguration(
-            "queue capacity must be greater than zero",
-        ));
-    }
-    if config.queue_bytes == 0 {
-        return Err(StoreError::InvalidConfiguration(
-            "queue byte capacity must be greater than zero",
-        ));
-    }
-    if config.queue_bytes > u32::MAX as usize {
-        return Err(StoreError::InvalidConfiguration(
-            "queue byte capacity must fit a semaphore permit count",
-        ));
-    }
-    Ok(())
 }
 
 /// Validate a Host user agent before it is persisted or used for filesystem

@@ -77,3 +77,29 @@ fn skill_rejects_host_resolution_options() {
         );
     }
 }
+
+#[test]
+fn agent_discovery_advertises_only_the_cli_path() {
+    for args in [
+        vec!["--help"],
+        vec!["launch", "--help"],
+        vec!["serve", "--help"],
+        vec!["setup", "codex", "--help"],
+        vec!["setup", "claude", "--help"],
+        vec!["skill"],
+        vec!["--json", "skill"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_arena0"))
+            .args(&args)
+            .output()
+            .expect("read agent discovery surface");
+        assert!(output.status.success(), "{args:?}: {:?}", output.stderr);
+        let stdout = String::from_utf8(output.stdout).expect("UTF-8 discovery output");
+        assert!(!stdout.is_empty());
+        assert!(
+            !stdout.to_ascii_lowercase().contains("mcp"),
+            "{args:?}: {stdout}"
+        );
+        assert!(output.stderr.is_empty(), "{args:?}: {:?}", output.stderr);
+    }
+}

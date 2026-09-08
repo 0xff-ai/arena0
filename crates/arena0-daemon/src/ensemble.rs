@@ -22,7 +22,7 @@ use arena0_protocol::{PeerId, PeerIdSource};
 use arena0_sandbox::{Program, WasmtimeEngine};
 use arena0_store::{Store, StoreConfig};
 use tokio::io::BufReader;
-use tokio::net::UnixStream;
+use tokio::net::{TcpListener, UnixStream};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -31,7 +31,7 @@ use crate::catalog::ProgramCatalog;
 use crate::mcp_auth::{AuthError, DEFAULT_ACCESS_TOKEN_LIFETIME, McpAuth, RawToken};
 use crate::paths::{FileLease as HomeLease, Paths};
 use crate::server::{Activity, HostService, HostServiceInit, UnixSocket};
-use crate::startup::{self, StartupStage, StartupTimeline};
+use crate::startup::{StartupStage, StartupTimeline};
 use crate::store::Keystore;
 
 const NEW: u8 = 0;
@@ -388,14 +388,14 @@ impl Daemon {
             McpAuth::load_or_create(&home.mcp_signing_key(), mcp.access_token_lifetime)
                 .context("load daemon MCP signing key")?,
         );
-        startup::progress(StartupStage::HostsProvisioning, &startup);
+        startup.progress(StartupStage::HostsProvisioning);
         let mut hosts = Vec::with_capacity(names.len());
         for name in names {
             let host = name.to_string();
             let paths = match Paths::from_location(&home.host(&name)) {
                 Ok(paths) => paths,
                 Err(error) => {
-                    startup::host_progress(StartupStage::Failed, &host, &startup);
+                    startup.host_progress(StartupStage::Failed, &host);
                     shutdown_host_configs(hosts).await;
                     return Err(error);
                 }
@@ -403,39 +403,16 @@ impl Daemon {
             let config = match HostConfig::open(name, paths, bootstrap_new_hosts) {
                 Ok(config) => config,
                 Err(error) => {
-                    startup::host_progress(StartupStage::Failed, &host, &startup);
+                    startup.host_progress(StartupStage::Failed, &host);
                     shutdown_host_configs(hosts).await;
                     return Err(error);
                 }
             };
-            startup::host_progress(StartupStage::HostProvisioned, &host, &startup);
+            startup.host_progress(StartupStage::HostProvisioned, &host);
             hosts.push(config);
         }
-        Self::start_configs(
-            hosts,
-            mcp,
-            engine,
-            home,
-            bootstrap_new_hosts,
-            startup,
-            lease,
-            mcp_auth,
-        )
-        .await
-    }
-
-    async fn start_configs(
-        hosts: Vec<HostConfig>,
-        mcp: McpConfig,
-        engine: Arc<WasmtimeEngine>,
-        home: Home,
-        bootstrap_new_hosts: bool,
-        startup: Arc<StartupTimeline>,
-        lease: HomeLease,
-        mcp_auth: Arc<McpAuth>,
-    ) -> anyhow::Result<Arc<Self>> {
         if hosts.iter().any(|host| host.bootstrap) {
-            startup::progress(StartupStage::ProgramsBootstrapping, &startup);
+            startup.progress(StartupStage::ProgramsBootstrapping);
         }
         for index in 0..hosts.len() {
             let result = bootstrap_programs(&hosts[index], &engine, &startup).await;
@@ -501,7 +478,7 @@ impl Daemon {
                     return Err(error);
                 }
             };
-            startup::host_progress(StartupStage::HostComposed, config.name.as_str(), &startup);
+            startup.host_progress(StartupStage::HostComposed, config.name.as_str());
             ready.insert(
                 config.name,
                 HostSlot {
@@ -600,18 +577,18 @@ impl Daemon {
             .unwrap_or_else(|error| error.into_inner())
             .take()
             .expect("first serve owns open queue");
-        let mcp_listener = match crate::mcp::bind(&self.mcp).await {
+        let mcp_listener = match TcpListener::bind(self.mcp.listen).await {
             Ok(listener) => listener,
             Err(error) => {
-                startup::progress(StartupStage::Failed, &self.startup);
+                self.startup.progress(StartupStage::Failed);
                 self.cleanup().await;
-                return Err(error);
+                return Err(error.into());
             }
         };
         let mcp_endpoint = match mcp_listener.local_addr().context("read bound MCP endpoint") {
             Ok(endpoint) => endpoint,
             Err(error) => {
-                startup::progress(StartupStage::Failed, &self.startup);
+                self.startup.progress(StartupStage::Failed);
                 self.cleanup().await;
                 return Err(error);
             }
@@ -670,7 +647,7 @@ impl Daemon {
                         // Unix listener above was bound after it. Both are
                         // ready at this publication boundary; the accept
                         // tasks are spawned immediately below.
-                        startup::mcp_ready(mcp_endpoint, &self.startup);
+                        self.startup.mcp_ready(mcp_endpoint);
                         true
                     } else {
                         false
@@ -692,7 +669,7 @@ impl Daemon {
                             })
                             .await
                     }));
-                    startup::progress(StartupStage::InitializationComplete, &self.startup);
+                    self.startup.progress(StartupStage::InitializationComplete);
                 }
             }
         }
@@ -1325,15 +1302,11 @@ async fn bootstrap_programs(
             .register_program(program.bytes().to_vec(), arena0_node::unix_time_ms())
             .await?;
     }
-    startup::host_progress(
-        StartupStage::HostProgramsReady,
-        config.name.as_str(),
-        startup,
-    );
+    startup.host_progress(StartupStage::HostProgramsReady, config.name.as_str());
     Ok(())
 }
 
-fn validate_host_names(names: &[HostName]) -> anyhow::Result<()> {
+pub(crate) fn validate_host_names(names: &[HostName]) -> anyhow::Result<()> {
     anyhow::ensure!(
         names.len() <= MAX_LOCAL_HOSTS,
         "daemon Host capacity exceeded ({MAX_LOCAL_HOSTS})"
@@ -1385,6 +1358,28 @@ async fn join_server_task(
 #[cfg(test)]
 mod construction_tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn over_capacity_initial_hosts_fail_before_provisioning() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::from_root(directory.path().to_owned()).unwrap();
+        let names = (0..=MAX_LOCAL_HOSTS)
+            .map(HostName::for_local_index)
+            .collect::<Vec<_>>();
+        let mcp = McpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        let engine = Arc::new(WasmtimeEngine::new().unwrap());
+
+        let error = match Daemon::start(names.clone(), mcp, engine, home.clone(), true).await {
+            Ok(_) => panic!("an over-capacity ensemble must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("daemon Host capacity exceeded (64)")
+        );
+        assert!(!home.host(&names[0]).state_dir().exists());
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_start_releases_home_only_after_store_cleanup() {

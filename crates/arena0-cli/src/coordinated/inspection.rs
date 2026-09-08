@@ -19,7 +19,8 @@ struct Poller {
 
 impl Poller {
     async fn run(mut self, tui: TuiHandle) {
-        let mut interval = tokio::time::interval(POLL_INTERVAL);
+        let mut interval =
+            tokio::time::interval_at(tokio::time::Instant::now() + POLL_INTERVAL, POLL_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
@@ -76,6 +77,7 @@ pub(super) async fn observe(
 mod tests {
     use super::*;
     use crate::tui::{PrivatePageRequest, RunUpdate};
+    use anyhow::{anyhow, bail};
     use arena0_client::api::{
         ExecStatus, ExecStatusState, ExecutionInspection, HostRequest, Request, Response,
         ResponseOk,
@@ -83,6 +85,10 @@ mod tests {
     };
     use arena0_client::protocol::ProgramHash;
     use std::cell::Cell;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use tokio::io::{AsyncRead, AsyncReadExt as _, BufReader};
     use tokio::net::UnixListener;
 
@@ -238,5 +244,116 @@ mod tests {
             .await
             .expect("cancelled observer left the pending Host request open");
         assert_eq!(read.unwrap(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inspection_poller_waits_before_its_first_periodic_request() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir().expect("inspection scheduling directory");
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).expect("bind inspection scheduling socket");
+        let host = HostName::for_local_index(0);
+        let exec_id = ExecId([7; 32]);
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let (timestamps, mut timestamps_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(serve_scheduling_socket(
+            listener,
+            host.to_string(),
+            exec_id,
+            request_count.clone(),
+            timestamps,
+        ));
+        let client = DaemonClient::new(socket);
+        let (tui, mut updates, _pages) = TuiHandle::test_channel();
+        refresh_tui_inspection(&tui, &host, &client, exec_id, None).await?;
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        let (initial_number, initial_request_at) = timestamps_rx
+            .recv()
+            .await
+            .ok_or_else(|| anyhow!("read initial inspection request timestamp"))?;
+        assert_eq!(initial_number, 1);
+        assert!(matches!(
+            updates.recv().await,
+            Some(RunUpdate::Inspection { host: update_host, inspection })
+                if update_host == host && inspection.private_from == 0
+        ));
+        let observer = tokio::spawn(observe(tui, vec![(host.clone(), client, exec_id)]));
+        tokio::task::yield_now().await;
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            1,
+            "the poller must not issue an immediate periodic inspection"
+        );
+        let (periodic_number, periodic_request_at) = timestamps_rx
+            .recv()
+            .await
+            .ok_or_else(|| anyhow!("read periodic inspection request timestamp"))?;
+        assert_eq!(periodic_number, 2);
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert!(
+            periodic_request_at >= initial_request_at + POLL_INTERVAL,
+            "inspection poll started before a full delay after the caller's initial fetch: {:?}",
+            periodic_request_at.saturating_duration_since(initial_request_at)
+        );
+
+        observer.abort();
+        assert!(
+            observer
+                .await
+                .expect_err("inspection observer should be aborted")
+                .is_cancelled()
+        );
+        server.abort();
+        assert!(
+            server
+                .await
+                .expect_err("inspection scheduling server should be aborted")
+                .is_cancelled()
+        );
+        Ok(())
+    }
+
+    async fn serve_scheduling_socket(
+        listener: UnixListener,
+        expected_host: String,
+        expected_exec_id: ExecId,
+        request_count: Arc<AtomicUsize>,
+        timestamps: tokio::sync::mpsc::UnboundedSender<(usize, tokio::time::Instant)>,
+    ) -> anyhow::Result<()> {
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let (read, mut write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            let (wire_host, request) = read_routed_request(&mut read).await;
+            assert_eq!(wire_host, expected_host);
+            let HostRequest::ExecInspect {
+                exec_id,
+                private_from,
+                ..
+            } = request
+            else {
+                bail!("inspection scheduling test received a non-inspection request")
+            };
+            assert_eq!(exec_id, expected_exec_id);
+            let request_number = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+            timestamps
+                .send((request_number, tokio::time::Instant::now()))
+                .map_err(|_| anyhow!("inspection timestamp receiver closed"))?;
+            let response: Response = Ok(ResponseOk::Inspection(ExecutionInspection {
+                status: ExecStatus {
+                    exec_id,
+                    negotiation_id: None,
+                    program_id: ProgramHash([7; 32]),
+                    state: ExecStatusState::Negotiating {
+                        queue_position: None,
+                    },
+                },
+                activation: None,
+                private_from: private_from.unwrap_or(0),
+                private: Vec::new(),
+                private_total: 0,
+                private_next: None,
+            }));
+            write_frame(&mut write, &response).await?;
+        }
     }
 }

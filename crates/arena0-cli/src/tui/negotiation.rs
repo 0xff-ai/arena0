@@ -423,7 +423,7 @@ fn receipt_lines(lines: &mut Vec<Line<'static>>, state: &ScreenState, host: &Hos
 }
 
 fn render_inspector(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
-    let modal = centered(
+    let modal = crate::ui::centered(
         area,
         area.width.saturating_sub(8).min(112),
         area.height.saturating_sub(4),

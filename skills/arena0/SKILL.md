@@ -1,13 +1,12 @@
 ---
 name: arena0
-description: Start or join an arena0 interaction and drive it through completion using the local CLI or MCP. Use when the user asks to play a game, run a program with other Participants, or resume and verify an arena0 execution.
+description: Start or join an arena0 interaction and drive it through completion using the local CLI. Use when the user asks to play a game, run a program with other Participants, or resume and verify an arena0 execution.
 ---
 
 # Participate through arena0
 
-Use the local arena0 CLI when a harness context and explicit peers or a known
-join target are available. Use MCP when the interaction needs open discovery.
-Choose the interface before creating your Participant. When the user asks you to play or run an interaction,
+Use the local arena0 CLI with a harness context and explicit peers or a known
+join target. When the user asks you to play or run an interaction,
 continue through completion: choose inputs and wait for other Participants
 without asking approval for each turn.
 Respect the user's conditions and requests to stop. Installing this skill does
@@ -26,9 +25,10 @@ is needed. Leave `ARENA0_CONTEXT` unset unless the harness deliberately supplies
 an independent context, since it takes precedence over the Codex thread ID.
 For Claude Code, `arena0 setup claude` configures a SessionStart hook that
 supplies `ARENA0_CONTEXT=claude:<session_id>` to subsequent Bash commands.
-Claude subagents acting as separate Participants must use MCP unless their
-harness supplies a distinct context for each subagent. Do not use the parent
-session's inherited context or token.
+Subagents acting as separate Participants need a distinct context supplied by
+their harness, such as `ARENA0_CONTEXT=harness:session:agent`. Do not use the
+parent session's inherited context for an independent Participant. If the
+harness cannot supply a distinct context, report that limitation.
 
 When the harness supplies `ARENA0_CONTEXT` or Codex supplies `CODEX_THREAD_ID`,
 call `arena0 --json hello --user-agent <harness/version>`. The CLI binds your
@@ -44,81 +44,43 @@ Drive it with `arena0 --json exec next <exec-id>`, which waits for a callout or
 terminal result. Submit each answer with `exec submit <exec-id> --pending-id
 <pending-id> --answer '<JSON>'`; answer according to the returned schema.
 Use `exec view` for public progress, `exec list` to recover known executions,
-and `exec terminate <exec-id>` when the user asks to stop. Verify the returned
+and `exec status <exec-id>` to check the lifecycle. Verify the returned
 session with
 `arena0 --json receipt verify <session-id>`; add `--replay` for full verification.
 
-Apply the progress guidance below. Stay on the same interface throughout the
-interaction: MCP `hello` creates a separate Participant. If context setup is
-missing or invalid, report it instead of selecting a shared default. The
-following tool names describe the MCP workflow.
+If context setup is missing or invalid, report it instead of selecting a shared
+default. If peers or a join target have not been provided, ask for those details;
+do not guess a peer identity or create a replacement interaction.
 
-## MCP start or resume
-
-Call `hello` with your actual harness name and version in `user_agent` to
-create your Participant. Retain `token`, `peer_id`, `expires_at`, and
-`renew_after`. The Host is the local runtime that acts for your Participant.
-Include your token as the top-level `token` argument in every program,
-execution, and verification call. It grants access to only your Host; do not
-share it or use another Participant's credential.
-
-Reconnect with the retained token. At `renew_after`, call `hello` with only
-`{"token":"<retained-token>"}` and retain the replacement. The times are UTC
-Unix seconds; renew before `expires_at`. Renewal preserves your Host and its
-executions. A disconnected client or expired token does not stop execution.
-
-If a token is invalid or expired, report the access error. Do not call `hello`
-without it to continue the same interaction: that creates another Participant.
-A lost initial `hello` response cannot be recovered through MCP without its
-token. There is no `goodbye` tool.
-
-Use `list_programs` and `inspect_program` on that Host. Retain the exact program
-reference and read its params and callout schemas. The daemon owns program
-bytes, identities, and signatures; tool inputs are JSON.
-
-Call `start_execution` once:
-
-- To start and wait for others, use `ensemble: {"mode":"create"}`. Fixed-size
-  programs infer their participant count. For a variable-size program, supply
-  `participant_count` inside `ensemble`.
-- To join an open interaction, use `ensemble: {"mode":"join"}`. This listens on
-  the program topic and joins a suitable Offer. Omitted params accept the
-  creator's terms; supply params when the user requires particular conditions.
-- To join a known negotiation, use
-  `ensemble: {"mode":"join","target":{"creator":"<creator-peer-id>","negotiation_id":"<id>"}}`.
-
-Retain the returned execution reference together with your token. An open join may
-not yet have a negotiation id. Do not start another execution because it is
-waiting. If a creation response is lost, use `list_executions` on the retained
-Host to find the request before considering another start.
+Retain the returned execution id. Do not start another execution because it is
+waiting. After an uncertain creation result, use `exec list` and `exec status`
+to inspect that execution before considering another start.
 
 ## Drive the interaction
 
-Repeat `await_execution_event` with the retained execution reference and
-`wait_ms: 20000`:
+Repeat `arena0 --json exec next <exec-id>` with the retained execution id.
+It waits for a pending callout or a terminal result:
 
-- `waiting`: continue waiting. This is a bounded wait, not a failed game or a
-  request for another user prompt.
-- `callout`: read the schema and context, choose a valid answer, then call
-  `answer_callout` with the returned `pending_id`.
-- `completed`: retain the returned session reference and verify it.
-- `failed`: report the reason and stop this execution. Do not silently create a
+- `Callout`: read the schema and context, choose a valid answer, then use
+  `exec submit <exec-id> --pending-id <pending-id> --answer '<JSON>'`.
+- `Completed`: retain the returned `session_id` and verify it.
+- `Failed`: report the reason and stop this execution. Do not silently create a
   replacement game.
 
-Once active, use `view_execution` to read the program's current state and move
-history. Use `get_execution_status` when the lifecycle is unclear.
+If a wait times out, repeat `exec next` for the same execution. Use `exec view`
+to read the program's current state and move history, and `exec status` when
+the lifecycle is unclear.
 
 Answer your available callout promptly. Never wait for all Participants to
 have callouts before answering yours.
 
-A repeated pending event is the same decision point. If `answer_callout` reports
+A repeated pending event is the same decision point. If `exec submit` reports
 `CalloutNotPending`, fetch the next event; a human or another driver may already
 have answered. After an uncertain submission result, inspect the pending event
 before retrying. Preserve all returned identities across reconnects.
 
-When the user asks to stop playing, call `stop_execution` for the requested
-execution. It withdraws during negotiation and terminates participation after
-activation.
+When the user asks to stop playing, use `exec withdraw <exec-id>` during
+negotiation or `exec terminate <exec-id>` after activation.
 
 ## Report progress
 
@@ -154,7 +116,7 @@ Example neutral wait:
 
 ## Verify completion
 
-Call `verify_session` with the exact returned session reference and
-`mode: "light"`. Use `mode: "full"` when replay verification is requested.
-Report the outcome and verification result. Your token selects whose receipt
-is being verified even when Participants share the same protocol session id.
+Run `arena0 --json receipt verify <session-id>` with the exact returned session
+id. Add `--replay` when full verification is requested. Report the outcome and
+verification result. Keep the same harness context so verification reads the
+participating Host's receipt.

@@ -13,7 +13,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use arena0_api::{ApiError, ApiErrorCode, AwaitState, ExecLifecycle, NextEvent, PendingId};
 use arena0_node::{ExecCommand, LocalTicketWithdrawal, SessionMessage, SpawnedExec};
-use arena0_program::{JsonSchemaDocument, ProgramHash, ProgramSchema};
+use arena0_program::{ProgramHash, ProgramSchema};
 use arena0_protocol::execution::ExecutionState;
 use arena0_protocol::{
     AbortKind, EventSource, ExecId, ExecutionStatus, NegotiationId, SessionHash, StopCause, Ticket,
@@ -422,7 +422,7 @@ impl ExecutionHandle {
     }
 }
 
-fn satisfies(lifecycle: ExecLifecycle, until: AwaitState) -> bool {
+pub(crate) fn satisfies(lifecycle: ExecLifecycle, until: AwaitState) -> bool {
     match until {
         AwaitState::Active => {
             matches!(lifecycle, ExecLifecycle::Waiting | ExecLifecycle::Active)
@@ -432,14 +432,23 @@ fn satisfies(lifecycle: ExecLifecycle, until: AwaitState) -> bool {
     }
 }
 
-fn stop_reason(cause: &StopCause) -> String {
-    match cause {
-        StopCause::Authenticated(occurrence) => occurrence.reason().to_owned(),
-        StopCause::Shared { reason, .. } => reason.clone(),
-    }
+/// The host-owned facts needed to project a durable callout at either output
+/// boundary. Keeping this private payload separate from [`NextEvent`] prevents
+/// the supervisor from matching a public API enum just to emit a host event.
+#[derive(Debug)]
+struct CalloutProjection {
+    pending_id: PendingId,
+    callout_index: u32,
+    name: String,
+    prompt: String,
+    schema: arena0_program::JsonSchemaDocument,
+    context: serde_json::Value,
 }
 
-fn project_callout(request: PendingRequest, schema: &ProgramSchema) -> anyhow::Result<NextEvent> {
+fn project_callout(
+    request: PendingRequest,
+    schema: &ProgramSchema,
+) -> anyhow::Result<CalloutProjection> {
     let PendingRequest::Callout {
         pending_id,
         callout_index,
@@ -453,7 +462,7 @@ fn project_callout(request: PendingRequest, schema: &ProgramSchema) -> anyhow::R
         .callouts
         .get(usize::try_from(callout_index).context("callout index overflow")?)
         .context("callout index out of range")?;
-    Ok(NextEvent::Callout {
+    Ok(CalloutProjection {
         pending_id,
         callout_index,
         name: callout.name.clone(),
@@ -474,9 +483,17 @@ pub(crate) fn project_durable_next(
         .into_iter()
         .find(|request| matches!(request, PendingRequest::Callout { .. }))
     {
-        return project_callout(request, schema).map(Some).map_err(|error| {
+        let projection = project_callout(request, schema).map_err(|error| {
             ApiError::new(ApiErrorCode::Storage, format!("project callout: {error}"))
-        });
+        })?;
+        return Ok(Some(NextEvent::Callout {
+            pending_id: projection.pending_id,
+            callout_index: projection.callout_index,
+            name: projection.name,
+            prompt: projection.prompt,
+            schema: projection.schema,
+            context: projection.context,
+        }));
     }
     match state.status() {
         ExecutionStatus::Completed { .. } => Ok(Some(NextEvent::Completed {
@@ -491,7 +508,7 @@ pub(crate) fn project_durable_next(
         })),
         ExecutionStatus::Stopped { cause } | ExecutionStatus::StoppedPublished { cause, .. } => {
             Ok(Some(NextEvent::Failed {
-                reason: stop_reason(cause),
+                reason: cause.reason().to_owned(),
             }))
         }
         ExecutionStatus::Incomplete { reason, .. } => Ok(Some(NextEvent::Failed {
@@ -532,23 +549,13 @@ impl ExecutionHandles {
 
     /// Register one live handle. Registration is idempotent for concurrent
     /// recovery scans; the first owner remains the only process-local actor.
-    pub(crate) fn register_live(&self, exec_id: ExecId) -> anyhow::Result<Arc<ExecutionHandle>> {
-        if let Some(existing) = self.execs.lock().unwrap().get(&exec_id).cloned() {
-            return Ok(existing);
-        }
-        let entry = Arc::new(ExecutionHandle::new(exec_id, self.store.clone()));
-        self.execs
-            .lock()
-            .unwrap()
-            .entry(exec_id)
-            .or_insert_with(|| Arc::clone(&entry));
-        Ok(self
-            .execs
-            .lock()
-            .unwrap()
-            .get(&exec_id)
-            .cloned()
-            .unwrap_or(entry))
+    pub(crate) fn register_live(&self, exec_id: ExecId) -> Arc<ExecutionHandle> {
+        let mut execs = self.execs.lock().unwrap();
+        Arc::clone(
+            execs
+                .entry(exec_id)
+                .or_insert_with(|| Arc::new(ExecutionHandle::new(exec_id, self.store.clone()))),
+        )
     }
 
     /// Attach a supervisor after activation has committed and the actor has
@@ -724,16 +731,24 @@ impl Supervisor {
                         })
                     });
                 if let Some(request) = request
-                    && let Ok(Some(callout)) = self.project_callout(request).await
+                    && let Ok(Some((source, projection))) = self.project_callout(request).await
                 {
+                    let CalloutProjection {
+                        pending_id,
+                        callout_index,
+                        name,
+                        prompt,
+                        schema,
+                        context,
+                    } = projection;
                     self.events.emit(HostEvent::SessionCallout {
-                        source: callout.0,
-                        pending_id: callout.1,
-                        callout_index: callout.2,
-                        name: callout.3,
-                        prompt: callout.4,
-                        schema: callout.5,
-                        context: callout.6,
+                        source,
+                        pending_id,
+                        callout_index,
+                        name,
+                        prompt,
+                        schema,
+                        context,
                     });
                 }
             }
@@ -773,7 +788,7 @@ impl Supervisor {
                         self.events.emit(HostEvent::SessionAborted {
                             source,
                             step,
-                            reason: stop_reason(cause),
+                            reason: cause.reason().to_owned(),
                             failure: if cause.kind() == AbortKind::Abort {
                                 arena0_protocol::ExecutionFailureCode::ProgramAborted
                             } else {
@@ -814,17 +829,7 @@ impl Supervisor {
     async fn project_callout(
         &mut self,
         request: PendingRequest,
-    ) -> anyhow::Result<
-        Option<(
-            EventSource,
-            PendingId,
-            u32,
-            String,
-            String,
-            JsonSchemaDocument,
-            serde_json::Value,
-        )>,
-    > {
+    ) -> anyhow::Result<Option<(EventSource, CalloutProjection)>> {
         let program_id = self.entry.program_id().await?;
         let Some(stored) = self.entry.store.load_program(program_id).await? else {
             return Ok(None);
@@ -832,26 +837,7 @@ impl Supervisor {
         let program =
             Program::try_from(stored.wasm().to_vec()).context("parse execution program")?;
         let event = project_callout(request, &program.definition().schema)?;
-        let NextEvent::Callout {
-            pending_id,
-            callout_index,
-            name,
-            prompt,
-            schema,
-            context,
-        } = event
-        else {
-            return Ok(None);
-        };
         let source = self.entry.event_source().await?;
-        Ok(Some((
-            source,
-            pending_id,
-            callout_index,
-            name,
-            prompt,
-            schema,
-            context,
-        )))
+        Ok(Some((source, event)))
     }
 }

@@ -259,7 +259,7 @@ fn render_state(frame: &mut Frame<'_>, area: Rect, view: &View, scroll: u16) {
 }
 
 fn render_inspector(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
-    let modal = centered(
+    let modal = crate::ui::centered(
         area,
         area.width.saturating_sub(6).min(120),
         area.height.saturating_sub(3),
