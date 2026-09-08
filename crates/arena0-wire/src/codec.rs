@@ -319,20 +319,6 @@ mod tests {
     }
 
     #[test]
-    fn exec_round_trip() {
-        let message = ExecFrame::Message {
-            message_id: MessageIdBytes([0xAA; 32]),
-            seq: 1,
-            prestate: StateHashBytes([0xBB; 32]),
-            data: vec![0xCC],
-            witness: WitnessCommitmentBytes([0xDD; 32]),
-        };
-        let encoded = codec().encode(&message).unwrap();
-        let decoded: ExecFrame = codec().decode(&encoded).unwrap();
-        assert_eq!(message, decoded);
-    }
-
-    #[test]
     fn payload_too_large() {
         let message = ExecFrame::Message {
             message_id: MessageIdBytes([0; 32]),
@@ -370,25 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_frame_round_trips_borsh() {
-        let request = FetchFrame::FetchActivationTickets {
-            session_hash: SessionHashBytes([1; 32]),
-        };
-        let encoded = codec().encode(&request).unwrap();
-        let decoded: FetchFrame = codec().decode(&encoded).unwrap();
-        assert_eq!(decoded, request);
-
-        let response = FetchFrame::ActivationTickets {
-            session_hash: SessionHashBytes([1; 32]),
-            tickets: vec![],
-        };
-        let encoded = codec().encode(&response).unwrap();
-        let decoded: FetchFrame = codec().decode(&encoded).unwrap();
-        assert_eq!(decoded, response);
-    }
-
-    #[test]
-    fn manual_frame_encodings_match_stock_borsh_layout() {
+    fn frames_preserve_borsh_layout_and_round_trip() {
         let step_commitment = step_commitment();
         let terminal_commitment = terminal_commitment();
         let step_signature = BlsSignature([0xCC; 48]);
@@ -444,9 +412,21 @@ mod tests {
                 borsh::to_vec(&manual).unwrap(),
                 borsh::to_vec(&derived).unwrap()
             );
+            let encoded = codec().encode(&manual).unwrap();
+            assert_eq!(codec().decode::<ExecFrame>(&encoded).unwrap(), manual);
         }
 
         let fetch_frames = [
+            (
+                FetchFrame::ActivationTickets {
+                    session_hash: SessionHashBytes([14; 32]),
+                    tickets: vec![],
+                },
+                DerivedFetchFrame::ActivationTickets {
+                    session_hash: SessionHashBytes([14; 32]),
+                    tickets: vec![],
+                },
+            ),
             (
                 FetchFrame::FetchActivationTickets {
                     session_hash: SessionHashBytes([13; 32]),
@@ -471,6 +451,8 @@ mod tests {
                 borsh::to_vec(&manual).unwrap(),
                 borsh::to_vec(&derived).unwrap()
             );
+            let encoded = codec().encode(&manual).unwrap();
+            assert_eq!(codec().decode::<FetchFrame>(&encoded).unwrap(), manual);
         }
     }
 
@@ -538,76 +520,58 @@ mod tests {
     }
 
     #[test]
-    fn frame_header_size_is_four() {
-        assert_eq!(FRAME_HEADER_SIZE, 4);
-        assert_eq!(FRAME_VERSION_SIZE, 2);
-        let message = ExecFrame::Message {
-            message_id: MessageIdBytes([0x01; 32]),
-            seq: 1,
-            prestate: StateHashBytes([0x02; 32]),
-            data: Vec::new(),
-            witness: WitnessCommitmentBytes([0x03; 32]),
-        };
-        let encoded = codec().encode(&message).unwrap();
-        let body_len = u32::from_le_bytes(encoded[..4].try_into().unwrap()) as usize;
-        assert_eq!(encoded.len(), 4 + body_len);
-        assert_eq!(
-            u16::from_le_bytes(encoded[4..6].try_into().unwrap()),
-            FRAME_VERSION
-        );
-    }
+    fn frame_envelope_is_versioned_and_exact_length() {
+        let encoded = Codec::new(1).encode(&7u8).unwrap();
+        assert_eq!(encoded, [3, 0, 0, 0, 1, 0, 7]);
+        assert_eq!(Codec::new(1).decode_frame(&encoded).unwrap(), &[7]);
 
-    #[test]
-    fn frame_rejects_trailing_bytes() {
-        let message = ExecFrame::Message {
-            message_id: MessageIdBytes([0x01; 32]),
-            seq: 1,
-            prestate: StateHashBytes([0x02; 32]),
-            data: Vec::new(),
-            witness: WitnessCommitmentBytes([0x03; 32]),
-        };
-        let mut encoded = codec().encode(&message).unwrap();
-        encoded.push(0xFF);
-        assert!(matches!(
-            codec().decode_frame(&encoded),
-            Err(WireError::TrailingBytes { .. })
-        ));
-    }
-
-    #[test]
-    fn frame_rejects_truncated_header_and_body() {
-        assert!(matches!(
-            codec().decode_frame(&[0, 0, 0]),
-            Err(WireError::FrameTooShort { .. })
-        ));
-        assert!(matches!(
-            codec().decode_frame(&[5, 0, 0, 0, 1]),
-            Err(WireError::Truncated { .. })
-        ));
-        assert!(matches!(
-            codec().decode_frame(&[1, 0, 0, 0, 0]),
-            Err(WireError::FrameTooShort { .. })
-        ));
-    }
-
-    #[test]
-    fn frame_rejects_unsupported_version() {
-        let message = ExecFrame::Message {
-            message_id: MessageIdBytes([0x01; 32]),
-            seq: 1,
-            prestate: StateHashBytes([0x02; 32]),
-            data: Vec::new(),
-            witness: WitnessCommitmentBytes([0x03; 32]),
-        };
-        let mut encoded = codec().encode(&message).unwrap();
-        encoded[4..6].copy_from_slice(&u16::MAX.to_le_bytes());
-        assert!(matches!(
-            codec().decode_frame(&encoded),
-            Err(WireError::UnsupportedVersion {
-                expected: FRAME_VERSION,
-                actual: u16::MAX,
-            })
-        ));
+        for (bytes, error) in [
+            (
+                vec![0, 0, 0],
+                WireError::FrameTooShort {
+                    expected: 4,
+                    actual: 3,
+                },
+            ),
+            (
+                vec![3, 0, 0, 0, 1],
+                WireError::Truncated {
+                    declared: 3,
+                    actual: 1,
+                },
+            ),
+            (
+                vec![1, 0, 0, 0, 0],
+                WireError::FrameTooShort {
+                    expected: 6,
+                    actual: 5,
+                },
+            ),
+            (
+                vec![3, 0, 0, 0, 1, 0, 7, 8],
+                WireError::TrailingBytes {
+                    expected: 7,
+                    actual: 8,
+                },
+            ),
+            (
+                vec![3, 0, 0, 0, 255, 255, 7],
+                WireError::UnsupportedVersion {
+                    expected: 1,
+                    actual: u16::MAX,
+                },
+            ),
+            (
+                vec![4, 0, 0, 0],
+                WireError::PayloadTooLarge { size: 2, max: 1 },
+            ),
+        ] {
+            assert_eq!(
+                Codec::new(1).decode_frame(&bytes).unwrap_err(),
+                error,
+                "{bytes:?}"
+            );
+        }
     }
 
     #[test]

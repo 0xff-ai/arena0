@@ -378,13 +378,12 @@ async fn hosts_list_is_complete_from_shared_daemon_socket() {
     match ok(call_daemon(&d.socket, &Request::HostsList).await) {
         ResponseOk::Hosts(hosts) => {
             assert_eq!(hosts.len(), 2);
-            assert_eq!(
-                hosts
-                    .iter()
-                    .map(|host| host.host.id.as_str())
-                    .collect::<Vec<_>>(),
-                ["a", "b"]
-            );
+            let mut ids = hosts
+                .iter()
+                .map(|host| host.host.id.as_str())
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            assert_eq!(ids, ["a", "b"]);
             assert_ne!(hosts[0].host.peer_id, hosts[1].host.peer_id);
         }
         other => panic!("unexpected HostsList response: {other:?}"),
@@ -741,7 +740,7 @@ async fn receipt_id_import_idempotence_and_list() {
     );
     let (sid, _sb) = tokio::join!(drive(&d.host_a, exec_a), drive(&d.host_b, exec_b));
 
-    // Fetch A's receipt and confirm the content address is stable.
+    // Fetch A's receipt and keep its content address for import checks.
     let receipt: ReceiptArtifact = match ok(call(
         &d.host_a,
         &HostRequest::ReceiptGet {
@@ -754,11 +753,6 @@ async fn receipt_id_import_idempotence_and_list() {
         other => panic!("unexpected: {other:?}"),
     };
     let rid = hex::encode(receipt.receipt_id().as_bytes());
-    assert_eq!(
-        rid,
-        hex::encode(receipt.receipt_id().as_bytes()),
-        "receipt_id is stable"
-    );
 
     // The other Host already produced the same canonical artifact.
     let imported = import_one(&d.host_b, &receipt).await;

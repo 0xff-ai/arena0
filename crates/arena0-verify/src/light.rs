@@ -685,12 +685,30 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn malformed_receipts_are_rejected_without_panicking() {
+    fn invalid_receipt_encodings_fail_closed() {
         let mut samples = vec![Vec::new(), vec![0xff], vec![1], vec![1, 99]];
         samples.push(vec![0u8; arena0_protocol::MAX_RECEIPT_BYTES + 1]);
         for bytes in samples {
             assert!(verify_light(&bytes).is_err());
         }
+
+        let original = fixture();
+        let cases = [0, 1, original.len() / 2, original.len() - 1];
+        for offset in cases {
+            let mut bytes = original.clone();
+            bytes[offset] ^= 1;
+            assert!(verify_light(&bytes).is_err());
+        }
+
+        for end in 0..original.len() {
+            assert!(
+                verify_light(&original[..end]).is_err(),
+                "invalid prefix at {end}"
+            );
+        }
+        let mut unknown = original;
+        unknown[0] = 0xff;
+        assert!(verify_light(&unknown).is_err());
     }
 
     #[test]
@@ -703,30 +721,5 @@ pub(crate) mod tests {
             LightVerifiedTerminal::Completed { outcome_borsh }
                 if outcome_borsh == vec![7, 8, 9]
         ));
-    }
-
-    #[test]
-    fn tampered_evidence_fails_closed_without_panicking() {
-        let original = fixture();
-        let cases = [0, 1, original.len() / 2, original.len() - 1];
-        for offset in cases {
-            let mut bytes = original.clone();
-            bytes[offset] ^= 1;
-            assert!(verify_light(&bytes).is_err());
-        }
-    }
-
-    #[test]
-    fn truncated_prefixes_and_unknown_version_fail_closed() {
-        let original = fixture();
-        for end in 0..original.len() {
-            assert!(
-                verify_light(&original[..end]).is_err(),
-                "invalid prefix at {end}"
-            );
-        }
-        let mut unknown = original;
-        unknown[0] = 0xff;
-        assert!(verify_light(&unknown).is_err());
     }
 }

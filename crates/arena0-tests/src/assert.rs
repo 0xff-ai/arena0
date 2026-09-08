@@ -36,12 +36,12 @@ pub async fn wait_for_entry(
     execution_id: ExecId,
     step: u64,
 ) -> Vec<TraceEntry> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + crate::fixtures::LIVE_EXECUTION_TIMEOUT;
     loop {
         let trace = store
             .read_trace(execution_id, 0, u64::MAX)
             .await
-            .unwrap_or_default();
+            .expect("read trace");
         if trace.iter().any(|e| e.step == step) {
             return trace;
         }

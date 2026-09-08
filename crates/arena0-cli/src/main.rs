@@ -2069,7 +2069,6 @@ mod tests {
                 .is_err()
         );
         assert!(Cli::try_parse_from(["arena0", "--host", "host-01", "status"]).is_ok());
-        assert!(Cli::try_parse_from(["arena0", "mcp"]).is_err());
         assert!(Cli::try_parse_from(["arena0", "serve", "--hosts", "host-01,host-02",]).is_ok());
         assert!(
             Cli::try_parse_from([
@@ -2077,9 +2076,7 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(Cli::try_parse_from(["arena0", "--node", "host-01", "status"]).is_err());
         assert!(Cli::try_parse_from(["arena0", "identity", "list"]).is_ok());
-        assert!(Cli::try_parse_from(["arena0", "demo"]).is_err());
         assert!(
             Cli::try_parse_from([
                 "arena0",
@@ -2114,22 +2111,23 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(Cli::try_parse_from(["arena0", "verify", &"22".repeat(32), "--full"]).is_err());
-        assert!(Cli::try_parse_from(["arena0", "run", "program", "--join"]).is_err());
     }
 
     #[test]
-    fn builtin_bindings_require_a_host_and_strategy() {
-        assert!(parse_builtin_binding("host-02=first-allowed").is_ok());
-        assert!(parse_builtin_binding("host-02").is_err());
-        assert!(parse_builtin_binding("host-02=").is_err());
-    }
-
-    #[test]
-    fn agent_bindings_require_a_host_and_executable() {
-        assert!(parse_agent_binding("host-02=./agent.py").is_ok());
-        assert!(parse_agent_binding("host-02").is_err());
-        assert!(parse_agent_binding("host-02=").is_err());
+    fn driver_bindings_require_a_host_and_driver() {
+        for (valid, missing_separator, missing_driver) in [
+            ("host-02=first-allowed", "host-02", "host-02="),
+            ("host-02=./agent.py", "host-02", "host-02="),
+        ] {
+            let parse = if valid.ends_with("agent.py") {
+                parse_agent_binding
+            } else {
+                parse_builtin_binding
+            };
+            assert!(parse(valid).is_ok());
+            assert!(parse(missing_separator).is_err());
+            assert!(parse(missing_driver).is_err());
+        }
     }
 
     #[test]

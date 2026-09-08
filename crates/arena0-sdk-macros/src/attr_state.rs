@@ -709,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn primitive_route_generates_routed_accessor() {
+    fn unique_routed_primitive_generates_named_and_generic_accessors() {
         let args = Arena0StateArgs {
             max: Some(syn::parse_quote!(256)),
         };
@@ -730,27 +730,9 @@ mod tests {
         assert!(expanded.contains("Message"));
         assert!(expanded.contains("__local_primitive_field_routed"));
         assert!(expanded.contains("__shared_primitive_field_routed"));
-    }
-
-    #[test]
-    fn unique_primitive_type_generates_generic_lookup() {
-        let args = Arena0StateArgs {
-            max: Some(syn::parse_quote!(256)),
-        };
-        let input: DeriveInput = syn::parse_quote! {
-            pub struct Shared {
-                phase: Phase,
-                #[primitive(route = Message::CommitReveal)]
-                commit_reveal: CommitReveal<Choice>,
-            }
-        };
-
-        let expanded = expand_arena0_state(args, input).unwrap().to_string();
         assert!(expanded.contains("HasPrimitive"));
         assert!(expanded.contains("CommitReveal < Choice >"));
         assert!(expanded.contains("type Access"));
-        assert!(expanded.contains("__local_primitive_field_routed"));
-        assert!(expanded.contains("__shared_primitive_field_routed"));
     }
 
     #[test]
@@ -829,37 +811,31 @@ mod tests {
     }
 
     #[test]
-    fn inline_private_fields_are_rejected() {
-        let args = Arena0StateArgs {
-            max: Some(syn::parse_quote!(256)),
-        };
-        let input: DeriveInput = syn::parse_quote! {
-            pub struct Shared {
-                visible: u32,
-                #[private]
-                secret: u64,
-            }
-        };
+    fn participant_local_field_attributes_are_rejected_in_shared_state() {
+        let inputs: [DeriveInput; 2] = [
+            syn::parse_quote! {
+                pub struct Shared {
+                    visible: u32,
+                    #[private]
+                    secret: u64,
+                }
+            },
+            syn::parse_quote! {
+                pub struct Shared {
+                    phase: Phase,
+                    #[secret]
+                    salt: [u8; 32],
+                }
+            },
+        ];
 
-        let error = expand_arena0_state(args, input).unwrap_err();
-        assert!(error.to_string().contains("move participant-local state"));
-    }
-
-    #[test]
-    fn secret_shared_fields_are_rejected() {
-        let args = Arena0StateArgs {
-            max: Some(syn::parse_quote!(256)),
-        };
-        let input: DeriveInput = syn::parse_quote! {
-            pub struct Shared {
-                phase: Phase,
-                #[secret]
-                salt: [u8; 32],
-            }
-        };
-
-        let err = expand_arena0_state(args, input).unwrap_err();
-        assert!(err.to_string().contains("move participant-local state"));
+        for input in inputs {
+            let args = Arena0StateArgs {
+                max: Some(syn::parse_quote!(256)),
+            };
+            let error = expand_arena0_state(args, input).unwrap_err();
+            assert!(error.to_string().contains("move participant-local state"));
+        }
     }
 
     #[test]

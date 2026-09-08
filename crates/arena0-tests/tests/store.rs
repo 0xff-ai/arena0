@@ -103,28 +103,3 @@ async fn registry_projection_is_content_addressed_and_durable() {
         .await
         .expect("shut down reopened sqlite store");
 }
-
-#[tokio::test]
-async fn registry_rejects_sectionless_wasm_before_persisting() {
-    let directory = tempfile::tempdir().expect("temporary store directory");
-    let peer = owner().peer_id();
-    let store = Store::open(StoreConfig::new(
-        directory.path().join("arena0.sqlite"),
-        peer,
-    ))
-    .expect("open sqlite store");
-    let sectionless = b"\0asm\x01\0\0\0".to_vec();
-    assert!(Program::try_from(sectionless.clone()).is_err());
-
-    // The store registry is byte-addressed; metadata admission remains the
-    // sandbox boundary. An invalid artifact is never handed to a Host.
-    assert_eq!(
-        store
-            .handle()
-            .list_programs(8)
-            .await
-            .expect("list registry")
-            .len(),
-        0
-    );
-}

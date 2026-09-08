@@ -132,45 +132,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sgr_is_preserved() {
-        let input = "a\x1b[1;31mred\x1b[0mb";
-        assert_eq!(sanitize(input), input);
-    }
-
-    #[test]
-    fn strip_ansi_removes_everything_escape_like() {
-        assert_eq!(strip_ansi("a\x1b[1;31mred\x1b[0mb"), "aredb");
-        assert_eq!(strip_ansi("\x1b[2Jx"), "x");
-        assert_eq!(strip_ansi("a\x1b]0;t\x07b"), "ab");
-        assert_eq!(strip_ansi("a\tb\n\rc\x07d"), "abcd");
-        assert_eq!(strip_ansi("a\u{9b}b"), "ab");
-    }
-
-    #[test]
-    fn non_sgr_csi_is_stripped() {
-        assert_eq!(sanitize("a\x1b[2Jb"), "ab");
-        assert_eq!(sanitize("\x1b[10;5Hx"), "x");
-    }
-
-    #[test]
-    fn osc_is_stripped() {
-        assert_eq!(sanitize("a\x1b]0;window title\x07b"), "ab");
-        assert_eq!(sanitize("a\x1b]0;t\x1b\\b"), "ab");
-    }
-
-    #[test]
-    fn c0_is_stripped_except_newline() {
-        assert_eq!(sanitize("a\tb\r\nc\x07d"), "ab\ncd");
-    }
-
-    #[test]
-    fn del_is_stripped() {
-        assert_eq!(sanitize("a\x7fb"), "ab");
-    }
-
-    #[test]
-    fn c1_is_stripped() {
-        assert_eq!(sanitize("a\u{9b}b"), "ab");
+    fn terminal_text_preserves_only_sgr_and_newlines() {
+        for (input, expected) in [
+            ("a\x1b[1;31mred\x1b[0mb", "a\x1b[1;31mred\x1b[0mb"),
+            ("a\x1b[2Jb", "ab"),
+            ("\x1b[10;5Hx", "x"),
+            ("a\x1b]0;window title\x07b", "ab"),
+            ("a\x1b]0;t\x1b\\b", "ab"),
+            ("a\tb\r\nc\x07d", "ab\ncd"),
+            ("a\x7fb", "ab"),
+            ("a\u{9b}b", "ab"),
+            ("a\x1b", "a"),
+            ("a\x1b[", "a"),
+        ] {
+            assert_eq!(sanitize(input), expected, "input: {input:?}");
+        }
     }
 
     #[test]
@@ -182,13 +158,16 @@ mod tests {
     }
 
     #[test]
-    fn trailing_escape_is_stripped() {
-        assert_eq!(sanitize("a\x1b"), "a");
-        assert_eq!(sanitize("a\x1b["), "a");
-    }
-
-    #[test]
-    fn strip_ansi_does_not_apply_the_slot_limit() {
+    fn plain_text_strips_all_controls_without_applying_the_slot_limit() {
+        for (input, expected) in [
+            ("a\x1b[1;31mred\x1b[0mb", "aredb"),
+            ("\x1b[2Jx", "x"),
+            ("a\x1b]0;t\x07b", "ab"),
+            ("a\tb\n\rc\x07d", "abcd"),
+            ("a\u{9b}b", "ab"),
+        ] {
+            assert_eq!(strip_ansi(input), expected, "input: {input:?}");
+        }
         let input = format!("{}\x1b[31mx\x1b[0m", "a".repeat(MAX_SLOT_BYTES));
         assert_eq!(strip_ansi(&input).chars().count(), MAX_SLOT_BYTES + 1);
     }

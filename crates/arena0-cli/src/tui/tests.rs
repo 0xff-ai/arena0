@@ -218,41 +218,35 @@ fn scoped_status_treats_step_divergence_and_missing_hosts_consistently() {
 }
 
 #[test]
-fn failure_update_enters_a_redacted_terminal_state() {
-    let mut state = ScreenState::new(config());
+fn terminal_updates_redact_details_and_close_interaction() {
+    for (update, lifecycle, summary) in [
+        (
+            RunUpdate::Failed {
+                summary: "run failed; owned executions were stopped".to_owned(),
+            },
+            ExecLifecycle::Failed,
+            "run failed; owned executions were stopped",
+        ),
+        (
+            RunUpdate::Stopped {
+                summary: "run stopped; Host receipts verified".to_owned(),
+            },
+            ExecLifecycle::Aborted,
+            "run stopped; Host receipts verified",
+        ),
+    ] {
+        let mut state = ScreenState::new(config());
+        state.apply(update);
 
-    state.apply(RunUpdate::Failed {
-        summary: "run failed; owned executions were stopped".to_owned(),
-    });
-
-    assert!(state.complete);
-    assert_eq!(state.lifecycle(), ExecLifecycle::Failed);
-    assert_eq!(
-        state.failure.as_deref(),
-        Some("run failed; owned executions were stopped")
-    );
-    assert!(state.callouts.is_empty());
-    assert_eq!(
-        state.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
-        Some(UiExit::Completed)
-    );
-}
-
-#[test]
-fn stop_update_enters_a_redacted_terminal_state() {
-    let mut state = ScreenState::new(config());
-
-    state.apply(RunUpdate::Stopped {
-        summary: "run stopped; Host receipts verified".to_owned(),
-    });
-
-    assert!(state.complete);
-    assert_eq!(state.lifecycle(), ExecLifecycle::Aborted);
-    assert_eq!(
-        state.failure.as_deref(),
-        Some("run stopped; Host receipts verified")
-    );
-    assert!(state.callouts.is_empty());
+        assert!(state.complete);
+        assert_eq!(state.lifecycle(), lifecycle);
+        assert_eq!(state.failure.as_deref(), Some(summary));
+        assert!(state.callouts.is_empty());
+        assert_eq!(
+            state.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(UiExit::Completed)
+        );
+    }
 }
 
 #[test]
@@ -787,18 +781,28 @@ fn all_hosts_program_summary_reports_incomplete_uniform_and_different_views() {
 #[test]
 fn view_history_is_bounded_and_navigable() {
     let mut state = ScreenState::new(config());
+    let other: HostName = "host-02".parse().unwrap();
     for step in 0..(MAX_VIEW_HISTORY as u64 + 4) {
-        state.apply(RunUpdate::View {
-            host: first_host(),
-            step,
-            view: View::new().state(format!("score {step}")),
-        });
+        for (host, label) in [(first_host(), "score"), (other.clone(), "other")] {
+            state.apply(RunUpdate::View {
+                host,
+                step,
+                view: View::new().state(format!("{label} {step}")),
+            });
+        }
     }
 
     let history = state.view_history.get(&first_host()).unwrap();
     assert_eq!(history.len(), MAX_VIEW_HISTORY);
     assert_eq!(history.front().map(|snapshot| snapshot.step), Some(4));
     assert_eq!(history.back().map(|snapshot| snapshot.step), Some(259));
+    let other_history = state.view_history.get(&other).unwrap();
+    assert_eq!(other_history.len(), MAX_VIEW_HISTORY);
+    assert_eq!(other_history.front().map(|snapshot| snapshot.step), Some(4));
+    assert_eq!(
+        other_history.back().map(|snapshot| snapshot.step),
+        Some(259)
+    );
     assert!(state.is_live_view());
 
     state.page.select(WorkspaceView::Program);
@@ -816,6 +820,7 @@ fn view_history_is_bounded_and_navigable() {
         step: 259,
         view: View::new().state("score 259 resized"),
     });
+    assert_eq!(state.view_history[&first_host()].len(), MAX_VIEW_HISTORY);
     assert_eq!(state.view_new_count, 0);
     assert_eq!(
         state
@@ -825,52 +830,12 @@ fn view_history_is_bounded_and_navigable() {
     );
     state.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
     assert!(state.is_live_view());
+    assert_eq!(
+        state.active_view().unwrap().slots[&Slot::State],
+        "score 259 resized"
+    );
     state.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
     assert!(state.is_live_view());
-}
-
-#[test]
-fn program_history_is_bounded_independently_for_each_host() {
-    let mut state = ScreenState::new(config());
-    let other: HostName = "host-02".parse().unwrap();
-    for step in 0..(MAX_VIEW_HISTORY as u64 + 8) {
-        for host in [first_host(), other.clone()] {
-            state.apply(RunUpdate::View {
-                host,
-                step,
-                view: View::new().state(format!("state {step}")),
-            });
-        }
-    }
-
-    assert_eq!(
-        state.view_history.get(&first_host()).unwrap().len(),
-        MAX_VIEW_HISTORY
-    );
-    assert_eq!(
-        state.view_history.get(&other).unwrap().len(),
-        MAX_VIEW_HISTORY
-    );
-    assert_eq!(
-        state
-            .view_history
-            .get(&first_host())
-            .unwrap()
-            .front()
-            .unwrap()
-            .step,
-        8
-    );
-    assert_eq!(
-        state
-            .view_history
-            .get(&other)
-            .unwrap()
-            .front()
-            .unwrap()
-            .step,
-        8
-    );
 }
 
 #[test]
@@ -906,31 +871,6 @@ fn compare_scope_keeps_distinct_hosts_and_reconciles_hidden_events() {
     assert_eq!(
         state.selected_event.as_ref().map(|key| key.host.as_str()),
         Some("host-01")
-    );
-}
-
-#[test]
-fn same_step_view_refresh_replaces_the_live_snapshot() {
-    let mut state = ScreenState::new(config());
-    state.apply(RunUpdate::View {
-        host: first_host(),
-        step: 4,
-        view: View::new().state("before resize"),
-    });
-    state.apply(RunUpdate::View {
-        host: first_host(),
-        step: 4,
-        view: View::new().state("after resize"),
-    });
-
-    let history = state.view_history.get(&first_host()).unwrap();
-    assert_eq!(history.len(), 1);
-    assert_eq!(history[0].step, 4);
-    assert_eq!(
-        state
-            .active_view()
-            .and_then(|view| view.slots.get(&Slot::State)),
-        Some(&"after resize".to_owned())
     );
 }
 
@@ -1430,40 +1370,6 @@ fn monitor_a_opens_only_the_selected_execution_callout() {
 }
 
 #[test]
-fn monitor_acceptance_removes_only_the_answered_key() {
-    let (actions, _receiver) = mpsc::channel(4);
-    let mut state = ScreenState::new_monitor(config(), actions);
-    let host = first_host();
-    for byte in [1_u8, 2] {
-        state.apply(RunUpdate::Monitor(MonitorUpdate::Callout {
-            host: host.clone(),
-            exec_id: ExecId([byte; 32]),
-            pending_id: PendingId::new(u64::from(byte)),
-            callout_index: 1,
-            name: "Choose".to_owned(),
-            prompt: "choose".to_owned(),
-            context: Value::Null,
-            schema: serde_json::json!({"type": "string"}),
-        }));
-    }
-    state.apply(RunUpdate::Monitor(MonitorUpdate::Submission {
-        host: host.clone(),
-        exec_id: ExecId([1; 32]),
-        pending_id: PendingId::new(1),
-        result: MonitorSubmission::Accepted,
-    }));
-    assert_eq!(state.callouts.len(), 1);
-    assert_eq!(
-        state
-            .callouts
-            .selected()
-            .expect("remaining callout")
-            .exec_id,
-        ExecId([2; 32])
-    );
-}
-
-#[test]
 fn monitor_enter_scrolls_detail_and_escape_returns_to_overview() {
     let (actions, _receiver) = mpsc::channel(4);
     let mut state = ScreenState::new_monitor(config(), actions);
@@ -1749,6 +1655,14 @@ fn monitor_submission_routes_to_exact_callout_and_closes_selected_composer() {
     }));
     assert_eq!(state.focus, Focus::Hosts);
     assert_eq!(state.callouts.len(), 1);
+    assert_eq!(
+        state
+            .callouts
+            .selected()
+            .expect("remaining callout")
+            .exec_id,
+        ExecId([2; 32])
+    );
 }
 
 #[tokio::test]

@@ -8,9 +8,10 @@ use arena0_crypto::NodeKeys;
 use arena0_protocol::{
     ExecFrame, ExecId, MessageId, NegotiationId, PeerId, StateHash, WitnessCommitment,
 };
+use arena0_tests::assert::wait_for_entry;
 use arena0_tests::fixtures::{
-    LIVE_EXECUTION_TIMEOUT, complete_pending_shared, establish_live_session, ordering_program_wasm,
-    provider, spawn_live_execution,
+    complete_pending_shared, establish_live_session, ordering_program_wasm, provider,
+    spawn_live_execution,
 };
 use arena0_transport::Transport;
 
@@ -49,25 +50,6 @@ async fn send(
         .send_exec(&frame)
         .await
         .expect("send execution frame");
-}
-
-async fn trace_len(execution: &arena0_tests::fixtures::LiveExecution, target: usize) {
-    let deadline = tokio::time::Instant::now() + LIVE_EXECUTION_TIMEOUT;
-    loop {
-        let trace = execution
-            .store_handle
-            .read_trace(execution.exec_id, 0, u64::MAX)
-            .await
-            .expect("read trace");
-        if trace.len() >= target {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for trace"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -146,12 +128,7 @@ async fn ordered_message_passes_the_public_edge() {
     )
     .await;
     complete_pending_shared(&execution, &participants).await;
-    trace_len(&execution, 2).await;
-    let trace = execution
-        .store_handle
-        .read_trace(execution.exec_id, 0, u64::MAX)
-        .await
-        .expect("read trace");
+    let trace = wait_for_entry(&execution.store_handle, execution.exec_id, 1).await;
     let message = trace.iter().find_map(|entry| match &entry.event {
         arena0_protocol::PublicEvent::MessageReceived { msg, .. } => msg.first().copied(),
         _ => None,

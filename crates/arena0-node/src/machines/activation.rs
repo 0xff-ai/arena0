@@ -185,13 +185,9 @@ mod tests {
     }
 
     #[test]
-    fn by_signer_key_lookup_survives_creator_first_order() {
-        // The ensemble is sorted by PeerId, but the activation's tickets are
-        // in frozen (creator-first) order. When the creator is not the
-        // smallest peer, the orders diverge: the execution's key lookup must
-        // resolve each participant's ticket by signer. An index-based
-        // lookup (`tickets[participant.index()]`) resolved the wrong key and
-        // every peer signature failed verification at 32-node scale.
+    fn participant_signatures_are_independent_of_activation_ticket_order() {
+        // Activation tickets are creator-first while the committed ensemble
+        // is sorted by PeerId, so execution keys are resolved by signer.
         let creator = provider(3);
         let mut others = [provider(1), provider(2)];
         others.sort_by_key(|p| p.peer_id());
@@ -211,7 +207,6 @@ mod tests {
             1_000,
         )
         .expect("valid offer data");
-        // ponytail: these providers already have the required creator-first order.
         let providers = [&creator, &others[0], &others[1]];
         let tickets = providers
             .iter()

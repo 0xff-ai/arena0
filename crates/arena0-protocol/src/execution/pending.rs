@@ -136,27 +136,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn large_ids_round_trip_as_decimal_json_strings() {
-        let id = PendingId::new(17_866_220_738_528_777_470);
-        let json = serde_json::to_value(id).expect("pending id serializes");
-        assert_eq!(json, serde_json::json!("17866220738528777470"));
-        assert_eq!(serde_json::from_value::<PendingId>(json).unwrap(), id);
-    }
-
-    #[test]
-    fn numeric_json_is_not_an_agent_pending_id() {
-        let error = serde_json::from_str::<PendingId>("17866220738528777470")
-            .expect_err("numeric pending ids must be rejected");
-        assert!(error.to_string().contains("invalid type"));
-    }
-
-    #[test]
-    fn borsh_encoding_stays_the_protocol_u64() {
-        let id = PendingId::new(u64::MAX);
-        assert_eq!(borsh::to_vec(&id).unwrap(), u64::MAX.to_le_bytes());
-        assert_eq!(
-            PendingId::try_from_slice(&u64::MAX.to_le_bytes()).unwrap(),
-            id
-        );
+    fn pending_ids_use_decimal_json_strings_and_u64_borsh_across_boundaries() {
+        for value in [0, 1, (1 << 53) - 1, 1 << 53, (1 << 53) + 1, u64::MAX] {
+            let id = PendingId::new(value);
+            let decimal = value.to_string();
+            let json = serde_json::to_value(id).unwrap();
+            assert_eq!(json, serde_json::Value::String(decimal.clone()));
+            assert_eq!(serde_json::from_value::<PendingId>(json).unwrap(), id);
+            assert!(serde_json::from_str::<PendingId>(&decimal).is_err());
+            assert_eq!(borsh::to_vec(&id).unwrap(), value.to_le_bytes());
+            assert_eq!(PendingId::try_from_slice(&value.to_le_bytes()).unwrap(), id);
+        }
+        for invalid in ["", "-1", "+1", "1.0", " 1", "18446744073709551616"] {
+            assert!(serde_json::from_value::<PendingId>(serde_json::json!(invalid)).is_err());
+        }
     }
 }

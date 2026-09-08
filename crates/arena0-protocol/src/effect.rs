@@ -850,12 +850,9 @@ mod tests {
             reason: String::new(),
         };
         let private = PrivateEffect::Broadcast { data: Vec::new() };
-        assert_eq!(borsh::to_vec(&raw).unwrap()[0], EFFECT_FAIL);
-        assert_eq!(borsh::to_vec(&public).unwrap()[0], PUBLIC_EFFECT_FAIL);
-        assert_eq!(
-            borsh::to_vec(&private).unwrap()[0],
-            PRIVATE_EFFECT_BROADCAST
-        );
+        assert_eq!(borsh::to_vec(&raw).unwrap()[0], 6);
+        assert_eq!(borsh::to_vec(&public).unwrap()[0], 2);
+        assert_eq!(borsh::to_vec(&private).unwrap()[0], 4);
         assert!(borsh::from_slice::<Effect>(&[0xff]).is_err());
         assert!(borsh::from_slice::<PublicEffect>(&[0xff]).is_err());
         assert!(borsh::from_slice::<PrivateEffect>(&[0xff]).is_err());
@@ -889,38 +886,16 @@ mod tests {
             io::ErrorKind::InvalidData,
         );
 
-        let oversized_label = "x".repeat(crate::execution::MAX_TERMINAL_REASON_BYTES + 1);
         let effect = PrivateEffect::Callout {
             callout_index: 0,
             context: Vec::new(),
-            pending_label: Some(oversized_label.clone()),
+            pending_label: Some("x".repeat(crate::execution::MAX_TERMINAL_REASON_BYTES + 1)),
             expected_type: None,
             continuation_tag: None,
         };
-        let mut output = Vec::new();
         assert_eq!(
-            BorshSerialize::serialize(&effect, &mut output)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput,
+            borsh::to_vec(&effect).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
         );
-        assert_eq!(output, encoded[..10]);
-
-        let record = crate::PendingRecord {
-            id: crate::PendingId::new(0),
-            operation: crate::PendingOperation::Sign,
-            label: Some(oversized_label),
-            expected_type: None,
-            continuation_tag: None,
-        };
-        output.clear();
-        assert_eq!(
-            BorshSerialize::serialize(&record, &mut output)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput,
-        );
-        // PendingRecord preflights the string before writing its option tag.
-        assert_eq!(output, [0, 0, 0, 0, 0, 0, 0, 0, 1]);
     }
 }

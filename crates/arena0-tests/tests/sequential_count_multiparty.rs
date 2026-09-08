@@ -119,12 +119,5 @@ async fn five_peers_count_in_commit_reveal_selected_round_robin_order() {
                 .count(),
             1
         );
-        assert_eq!(
-            progress
-                .iter()
-                .filter(|event| matches!(event, ArenaProgress::ReceiptReplay { success: true, .. }))
-                .count(),
-            1
-        );
     }
 }

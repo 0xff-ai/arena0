@@ -3451,7 +3451,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_selects_the_first_allowed_enum_value_through_a_local_ref() {
+    fn first_allowed_policy_only_answers_closed_enums() {
         let answer = deterministic_builtin_answer(
             "first-allowed",
             "ChooseAction",
@@ -3460,10 +3460,7 @@ mod tests {
         )
         .expect("enum should be answerable");
         assert_eq!(answer, json!("Rock"));
-    }
 
-    #[test]
-    fn builtin_rejects_an_open_schema_instead_of_inventing_an_answer() {
         let error = deterministic_builtin_answer(
             "first-allowed",
             "OpenAnswer",

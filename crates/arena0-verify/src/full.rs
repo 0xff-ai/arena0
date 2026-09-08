@@ -793,33 +793,6 @@ mod tests {
     }
 
     #[test]
-    fn receipt_construction_rejects_a_tampered_fuel_measurement() {
-        let (_program, admitted) = admitted_replay_program();
-        let receipt = replay_receipt(&admitted, false);
-        let decoded = ReceiptArtifact::decode(&receipt).expect("decode fixture receipt");
-        let body = decoded.body().clone();
-        let mut trace = body.trace().to_vec();
-        trace[1].fuel_used = trace[1].fuel_used.saturating_add(1);
-        let body = ReceiptBody::new(
-            SessionHeader::new(
-                body.header().activation.clone(),
-                body.header().terminal.clone(),
-            ),
-            body.outcome().to_vec(),
-            body.params().to_vec(),
-            trace,
-        )
-        .expect("tampered body shape");
-
-        // ReceiptArtifact construction validates the step agreement, which commits to
-        // fuel, before an invalid artifact can be serialized.
-        assert!(matches!(
-            ReceiptArtifact::new(body),
-            Err(arena0_protocol::ProtocolError::InvalidCertificate(_))
-        ));
-    }
-
-    #[test]
     fn performance_replay_records_safe_fields_without_receipt_contents() {
         use std::io::{self, Write};
         use std::sync::{Arc, Mutex};

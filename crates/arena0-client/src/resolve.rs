@@ -215,30 +215,26 @@ mod tests {
     }
 
     #[test]
-    fn unique_prefix_resolves() {
-        assert_eq!(resolve_prefix("a0", &ids()), PrefixOutcome::Unique(1));
-        assert_eq!(resolve_prefix("A0B3", &ids()), PrefixOutcome::Unique(1));
-    }
+    fn prefixes_resolve_case_insensitively_with_exact_match_precedence() {
+        for (prefix, expected) in [
+            ("a0", PrefixOutcome::Unique(1)),
+            ("A0B3", PrefixOutcome::Unique(1)),
+            ("7c1e", PrefixOutcome::Ambiguous(vec![0, 2])),
+            ("dead", PrefixOutcome::None),
+            ("", PrefixOutcome::None),
+        ] {
+            assert_eq!(
+                resolve_prefix(prefix, &ids()),
+                expected,
+                "prefix: {prefix:?}"
+            );
+        }
 
-    #[test]
-    fn ambiguous_prefix_lists_all() {
+        let candidates = vec!["7c1e".to_string(), "7c1e0a1b".to_string()];
         assert_eq!(
-            resolve_prefix("7c1e", &ids()),
-            PrefixOutcome::Ambiguous(vec![0, 2])
+            resolve_prefix("7c1e", &candidates),
+            PrefixOutcome::Unique(0)
         );
-    }
-
-    #[test]
-    fn no_match_reports_none() {
-        assert_eq!(resolve_prefix("dead", &ids()), PrefixOutcome::None);
-        assert_eq!(resolve_prefix("", &ids()), PrefixOutcome::None);
-    }
-
-    #[test]
-    fn exact_full_match_wins_over_prefix_ambiguity() {
-        let cands = vec!["7c1e".to_string(), "7c1e0a1b".to_string()];
-        // Exact match wins even when the same string is also a prefix.
-        assert_eq!(resolve_prefix("7c1e", &cands), PrefixOutcome::Unique(0));
     }
     fn serve_responses(
         responses: Vec<(HostRequest, arena0_api::Response)>,
@@ -316,41 +312,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ambiguous_receipts_do_not_fall_back_to_sessions() {
-        let (_dir, client, task) = serve_responses(vec![(
-            HostRequest::ReceiptList,
-            Ok(ResponseOk::ReceiptList(vec![
-                receipt("ab01"),
-                receipt("ab02"),
-            ])),
-        )]);
-        let error = client
+    async fn only_a_missing_receipt_falls_back_to_session_resolution() {
+        let responses = vec![
+            (
+                HostRequest::ReceiptList,
+                Ok(ResponseOk::ReceiptList(vec![
+                    receipt("ab01"),
+                    receipt("ab02"),
+                ])),
+            ),
+            (
+                HostRequest::ReceiptList,
+                Err(arena0_api::ApiError::new(
+                    arena0_api::ApiErrorCode::Storage,
+                    "unavailable",
+                )),
+            ),
+            (HostRequest::ReceiptList, Ok(ResponseOk::Ack)),
+        ];
+        let (_dir, client, task) = serve_responses(responses);
+
+        let ambiguous = client
             .resolve_receipt_ref(&HostName::default(), "ab")
             .await
             .unwrap_err();
         assert!(matches!(
-            error.downcast_ref::<ResolveError>(),
+            ambiguous.downcast_ref::<ResolveError>(),
             Some(ResolveError::Ambiguous { .. })
         ));
-        task.await.unwrap();
-    }
 
-    #[tokio::test]
-    async fn receipt_request_errors_do_not_fall_back_to_sessions() {
-        let (_dir, client, task) = serve_responses(vec![(
-            HostRequest::ReceiptList,
-            Err(arena0_api::ApiError::new(
-                arena0_api::ApiErrorCode::Storage,
-                "unavailable",
-            )),
-        )]);
-        let error = client
+        let request = client
             .resolve_receipt_ref(&HostName::default(), "ab")
             .await
             .unwrap_err();
         assert!(matches!(
-            error.downcast_ref::<ResolveError>(),
+            request.downcast_ref::<ResolveError>(),
             Some(ResolveError::Request(_))
+        ));
+
+        let unexpected = client
+            .resolve_receipt_ref(&HostName::default(), "ab")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            unexpected.downcast_ref::<ResolveError>(),
+            Some(ResolveError::UnexpectedResponse)
         ));
         task.await.unwrap();
     }
@@ -382,20 +388,5 @@ mod tests {
             Some(ResolveError::Request(_))
         ));
         assert!(crate::proto::is_connect_error(&error));
-    }
-
-    #[tokio::test]
-    async fn unexpected_receipt_response_does_not_fall_back() {
-        let (_dir, client, task) =
-            serve_responses(vec![(HostRequest::ReceiptList, Ok(ResponseOk::Ack))]);
-        let error = client
-            .resolve_receipt_ref(&HostName::default(), "ab")
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error.downcast_ref::<ResolveError>(),
-            Some(ResolveError::UnexpectedResponse)
-        ));
-        task.await.unwrap();
     }
 }

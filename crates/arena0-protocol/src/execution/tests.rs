@@ -233,26 +233,36 @@ fn pending_terminal(fixture: &Fixture) -> ExecutionState {
 }
 
 #[test]
-fn outbox_occurrence_id_binds_version_ordinal_and_effect() {
+fn outbox_occurrence_id_binds_execution_version_ordinal_and_effect() {
     let effect = DurableEffect::notify(FrameId::derive(b"frame"), b"payload".to_vec()).unwrap();
-    let a = OutboxId::derive(ExecId([1; 32]), ExecutionVersion::new(3), 0, &effect).unwrap();
-    let b = OutboxId::derive(ExecId([1; 32]), ExecutionVersion::new(4), 0, &effect).unwrap();
-    let c = OutboxId::derive(ExecId([1; 32]), ExecutionVersion::new(3), 1, &effect).unwrap();
-    assert_ne!(a, b);
-    assert_ne!(a, c);
+    let changed = DurableEffect::notify(FrameId::derive(b"frame"), b"other".to_vec()).unwrap();
+    let id = OutboxId::derive(ExecId([1; 32]), ExecutionVersion::new(3), 0, &effect).unwrap();
+    for (execution, version, ordinal, effect) in [
+        (ExecId([2; 32]), 3, 0, &effect),
+        (ExecId([1; 32]), 4, 0, &effect),
+        (ExecId([1; 32]), 3, 1, &effect),
+        (ExecId([1; 32]), 3, 0, &changed),
+    ] {
+        assert_ne!(
+            id,
+            OutboxId::derive(execution, ExecutionVersion::new(version), ordinal, effect).unwrap()
+        );
+    }
 }
 
 #[test]
 fn one_shot_timer_can_be_rearmed_after_cancellation() {
     let id = TimerId::derive(b"timer");
     let mut active = Vec::new();
-    for deadline in 0..128 {
+    for deadline in 0..=MAX_ACTIVE_TIMERS as u64 {
         apply_timer_mutations(
             &mut active,
             &[TimerMutation::arm(id, deadline, Vec::new()).unwrap()],
         )
         .unwrap();
+        assert_eq!(active.len(), 1);
         apply_timer_mutations(&mut active, &[TimerMutation::cancel(id)]).unwrap();
+        assert!(active.is_empty());
     }
 }
 
@@ -263,23 +273,6 @@ fn malformed_input_is_rejected_by_total_bound_before_decode() {
         ExecutionInput::decode(&bytes),
         Err(ProtocolError::EncodedTooLarge { .. })
     ));
-}
-
-#[test]
-fn initial_state_has_only_the_activating_lifecycle() {
-    let fixture = fixture();
-    let state = ExecutionState::new(
-        ExecId([0xEE; 32]),
-        fixture.activation,
-        fixture.producer,
-        SharedStateBytes::try_new(vec![0]).expect("shared state"),
-        LocalStateBytes::try_new(Vec::new()).expect("local state"),
-    )
-    .expect("initial state");
-    assert_eq!(state.lifecycle(), ExecLifecycle::Activating);
-    assert_eq!(state.version(), ExecutionVersion::ZERO);
-    assert_eq!(state.public().next_step(), 0);
-    assert_eq!(state.private().next_record(), 0);
 }
 
 #[test]
@@ -322,6 +315,10 @@ fn lifecycle_rejects_execution_before_activation() {
         LocalStateBytes::try_new(Vec::new()).expect("local state"),
     )
     .expect("initial state");
+    assert_eq!(state.lifecycle(), ExecLifecycle::Activating);
+    assert_eq!(state.version(), ExecutionVersion::ZERO);
+    assert_eq!(state.public().next_step(), 0);
+    assert_eq!(state.private().next_record(), 0);
     let error = transition(
         &state,
         ExecutionInput::ProposeShared(shared_delta(&state, Vec::new(), vec![1])),
@@ -583,12 +580,23 @@ fn shared_cursor_advances_only_after_all_valid_signatures() {
         fixture.creator_bls.sign(&commitment.signing_bytes()),
     );
     let partial = commit(
-        transition(&proposal, ExecutionInput::StepSignature(first)).expect("partial certificate"),
+        transition(&proposal, ExecutionInput::StepSignature(first.clone()))
+            .expect("partial certificate"),
     )
     .next_state()
     .clone();
     assert_eq!(partial.public(), state.public());
     assert_eq!(partial.pending_shared().unwrap().signature_count(), 1);
+    assert!(matches!(
+        transition(&partial, ExecutionInput::StepSignature(first)),
+        Ok(TransitionOutcome::AlreadyApplied)
+    ));
+    let conflicting =
+        ParticipantStepSignature::new(fixture.peers[0], commitment.step, BlsSignature([0xAB; 48]));
+    assert!(matches!(
+        transition(&partial, ExecutionInput::StepSignature(conflicting)),
+        Err(ProtocolError::ConflictingStepSignature { .. })
+    ));
     let second = ParticipantStepSignature::new(
         fixture.peers[1],
         commitment.step,
@@ -602,43 +610,6 @@ fn shared_cursor_advances_only_after_all_valid_signatures() {
     assert_eq!(full.public().next_step(), 1);
     assert_eq!(full.private().next_record(), 0);
     assert!(full.pending_shared().is_none());
-}
-
-#[test]
-fn signature_redelivery_is_no_change_but_conflicts_are_rejected() {
-    let fixture = fixture();
-    let state = active_state(&fixture);
-    let proposal = commit(
-        transition(
-            &state,
-            ExecutionInput::ProposeShared(shared_delta(&state, Vec::new(), vec![1])),
-        )
-        .expect("proposal"),
-    )
-    .next_state()
-    .clone();
-    let commitment = proposal.pending_shared().unwrap().commitment().clone();
-    let signature = ParticipantStepSignature::new(
-        fixture.peers[0],
-        commitment.step,
-        fixture.creator_bls.sign(&commitment.signing_bytes()),
-    );
-    let partial = commit(
-        transition(&proposal, ExecutionInput::StepSignature(signature.clone()))
-            .expect("first signature"),
-    )
-    .next_state()
-    .clone();
-    assert!(matches!(
-        transition(&partial, ExecutionInput::StepSignature(signature)),
-        Ok(TransitionOutcome::AlreadyApplied)
-    ));
-    let conflicting =
-        ParticipantStepSignature::new(fixture.peers[0], commitment.step, BlsSignature([0xAB; 48]));
-    assert!(matches!(
-        transition(&partial, ExecutionInput::StepSignature(conflicting)),
-        Err(ProtocolError::ConflictingStepSignature { .. })
-    ));
 }
 
 #[test]
@@ -1025,7 +996,7 @@ fn terminal_progress_excludes_other_execution_inputs() {
     )
     .expect("private delta");
     assert!(matches!(
-        transition(&state, ExecutionInput::Private(private.clone())),
+        transition(&state, ExecutionInput::Private(private)),
         Err(ProtocolError::TerminalProofPending)
     ));
     assert!(matches!(
@@ -1035,14 +1006,10 @@ fn terminal_progress_excludes_other_execution_inputs() {
         ),
         Err(ProtocolError::TerminalProofPending)
     ));
-    assert!(matches!(
-        transition(&state, ExecutionInput::Private(private.clone())),
-        Err(ProtocolError::TerminalProofPending)
-    ));
 }
 
 #[test]
-fn receipt_codecs_reject_oversized_fields_and_unknown_versions_without_panicking() {
+fn receipt_codecs_reject_oversized_fields_and_unknown_versions() {
     let fixture = fixture();
     let header = SessionHeader::new(
         fixture.activation.clone(),
@@ -1122,18 +1089,14 @@ fn receipt_codecs_reject_oversized_fields_and_unknown_versions_without_panicking
     let mut hostile_outcome = vec![2u8, 2u8];
     hostile_outcome.extend(borsh::to_vec(body.header()).expect("header bytes"));
     hostile_outcome.extend_from_slice(&u32::MAX.to_le_bytes());
-    let result = std::panic::catch_unwind(|| ReceiptArtifact::decode(&hostile_outcome));
-    assert!(result.is_ok(), "hostile outcome length must not panic");
-    assert!(result.expect("panic result").is_err());
+    assert!(ReceiptArtifact::decode(&hostile_outcome).is_err());
 
     let mut hostile_trace = vec![2u8, 2u8];
     hostile_trace.extend(borsh::to_vec(body.header()).expect("header bytes"));
     hostile_trace.extend_from_slice(&0u32.to_le_bytes());
     hostile_trace.extend_from_slice(&0u32.to_le_bytes());
     hostile_trace.extend_from_slice(&u32::MAX.to_le_bytes());
-    let result = std::panic::catch_unwind(|| ReceiptArtifact::decode(&hostile_trace));
-    assert!(result.is_ok(), "hostile trace length must not panic");
-    assert!(result.expect("panic result").is_err());
+    assert!(ReceiptArtifact::decode(&hostile_trace).is_err());
 
     assert!(borsh::from_slice::<ReceiptArtifact>(&[0xff]).is_err());
 }
