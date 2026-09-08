@@ -345,13 +345,20 @@ fn shell_session(
         ))
     };
     let marker = quote_path(marker)?;
-    Ok(format!(
+    let script = format!(
         "status=1; unset ARENA0_SOCKET ARENA0_HOST CODEX_THREAD_ID; export ARENA0_HOME={home} ARENA0_CACHE_DIR={cache} ARENA0_CONTEXT={context}; cd {workspace} && codex --ask-for-approval never --sandbox workspace-write -c sandbox_workspace_write.network_access=true --cd {workspace} exec --skip-git-repo-check --color always {prompt}; status=$?; tmp={marker}.tmp.$$; printf '%s\\n' \"$status\" > \"$tmp\" && mv \"$tmp\" {marker} || exit 125; exit \"$status\"",
         home = quote_path(home.root())?,
         cache = quote_path(home.cache_dir())?,
         context = crate::harness_hook::shell_quote(context),
         workspace = quote_path(workspace)?,
         prompt = crate::harness_hook::shell_quote(prompt),
+    );
+    // Pane managers evaluate this command through the user's login shell, which
+    // may be fish or another non-POSIX shell. Keep status capture and marker
+    // publication under `sh` so both participants follow the same lifecycle.
+    Ok(format!(
+        "exec sh -c {}",
+        crate::harness_hook::shell_quote(&script)
     ))
 }
 
@@ -450,9 +457,11 @@ mod tests {
             Path::new("/tmp/done"),
         )
         .unwrap();
+        assert!(command.starts_with("exec sh -c "));
         assert!(command.contains("--ask-for-approval never"));
         assert!(command.contains("sandbox_workspace_write.network_access=true"));
         assert!(command.contains("exec --skip-git-repo-check --color always"));
-        assert!(command.contains("ARENA0_CONTEXT='arena0-launch:session:right'"));
+        assert!(command.contains("ARENA0_CONTEXT="));
+        assert!(command.contains("arena0-launch:session:right"));
     }
 }
