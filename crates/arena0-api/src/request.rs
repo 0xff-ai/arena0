@@ -171,8 +171,6 @@ pub enum EnsembleSpec {
     /// Create an offer and collect exactly this many participants, including
     /// the local Host.
     Create { participant_count: u16 },
-    /// Legacy launcher form retained while callers migrate to [`Self::Create`].
-    Explicit { peers: Vec<PeerId> },
     /// Join the first valid offer on the program topic, or one exact offer
     /// when `target` is supplied.
     Join { target: Option<NegotiationTarget> },

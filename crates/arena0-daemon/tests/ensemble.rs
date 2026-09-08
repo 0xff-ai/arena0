@@ -183,8 +183,8 @@ async fn variable_size_program_accepts_supported_explicit_ensemble() {
                 exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                 program: "rock-paper-scissors".into(),
                 params: None,
-                ensemble: EnsembleSpec::Explicit {
-                    peers: vec![peer_a, peer_b],
+                ensemble: EnsembleSpec::Create {
+                    participant_count: 2,
                 },
             },
         ),
@@ -201,8 +201,8 @@ async fn variable_size_program_accepts_supported_explicit_ensemble() {
                 exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                 program: "cumulative-sum".into(),
                 params: Some(serde_json::json!({ "target_size": 3 })),
-                ensemble: EnsembleSpec::Explicit {
-                    peers: vec![peer_a, peer_b],
+                ensemble: EnsembleSpec::Create {
+                    participant_count: 2,
                 },
             },
         ),

@@ -412,9 +412,6 @@ fn validate_local_admission(
         } => ExecutionAdmission::create(*negotiation_id, *participant_count)
             .map(|_| ())
             .map_err(|error| StoreError::InvalidAdmission(error.to_string())),
-        ExecutionAdmission::Explicit { peers, .. } if !peers.contains(&host_id) => Err(
-            StoreError::InvalidAdmission("explicit participant set omits the local Host".into()),
-        ),
         ExecutionAdmission::Join {
             target: Some(target),
         } if target.creator == host_id => Err(StoreError::InvalidAdmission(
@@ -428,11 +425,7 @@ fn validate_request_params(
     admission: &ExecutionAdmission,
     params_present: bool,
 ) -> Result<(), StoreError> {
-    if matches!(
-        admission,
-        ExecutionAdmission::Explicit { .. } | ExecutionAdmission::Create { .. }
-    ) && !params_present
-    {
+    if matches!(admission, ExecutionAdmission::Create { .. }) && !params_present {
         return Err(StoreError::InvalidAdmission(
             "creator admission requires params".into(),
         ));
@@ -454,21 +447,6 @@ fn ensure_admission_authority(
             if offer.creator != host_id || offer.target_size != *participant_count {
                 return Err(StoreError::InvalidAdmission(
                     "prepared activation changes the creator participant count".into(),
-                ));
-            }
-        }
-        ExecutionAdmission::Explicit { peers, .. } => {
-            let admitted = arena0_protocol::Ensemble::from_peers(
-                prepared
-                    .tickets()
-                    .iter()
-                    .map(|ticket| ticket.data.signer)
-                    .collect(),
-            )
-            .map_err(|error| StoreError::InvalidAdmission(error.to_string()))?;
-            if offer.creator != host_id || &admitted != peers {
-                return Err(StoreError::InvalidAdmission(
-                    "prepared activation changes the explicit participant set".into(),
                 ));
             }
         }

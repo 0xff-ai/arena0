@@ -6,6 +6,7 @@
 //! `arena0-verify`.
 
 mod agent;
+mod agent_launch;
 mod context;
 mod coordinated;
 mod harness_hook;
@@ -139,6 +140,12 @@ enum Command {
     },
     /// Launch a headless emulation, or open the launcher when PROGRAM is omitted.
     Launch {
+        /// Launch two Codex Participants in the current pane and a new right pane.
+        #[arg(
+            long,
+            conflicts_with_all = ["program", "hosts", "builtin", "agent", "param", "replay"]
+        )]
+        agents: bool,
         /// Program name, id, or Wasm path.
         program: Option<String>,
         /// Participating Hosts (default: host-01,host-02). Unbound Hosts use external clients.
@@ -273,9 +280,11 @@ enum ExecCommand {
     /// Create an execution; negotiation continues in the Host.
     Create {
         program: String,
-        #[arg(long, value_delimiter = ',')]
-        with: Vec<String>,
-        #[arg(long, value_names = ["CREATOR", "NEGOTIATION_ID"], num_args = 2)]
+        /// Total participants for an open offer; inferred for fixed-size programs.
+        #[arg(long, value_name = "COUNT", conflicts_with = "join")]
+        participants: Option<u16>,
+        /// Join any matching offer, or provide CREATOR and NEGOTIATION_ID to target one.
+        #[arg(long, value_names = ["CREATOR", "NEGOTIATION_ID"], num_args = 0..=2)]
         join: Option<Vec<String>>,
         #[arg(long, value_name = "KEY=VALUE")]
         param: Vec<String>,
@@ -363,7 +372,11 @@ fn main() -> ExitCode {
         eprintln!("error: --tmp does not apply to `arena0 hello`; context Hosts are persistent");
         return ExitCode::FAILURE;
     }
-    let _temporary_home = match prepare_temporary_home(cli.tmp) {
+    let agent_launch = matches!(
+        cli.command.as_ref(),
+        Some(Command::Launch { agents: true, .. })
+    );
+    let _temporary_home = match prepare_temporary_home(cli.tmp || agent_launch) {
         Ok(home) => home,
         Err(error) => {
             eprintln!("error: {error:#}");
@@ -669,7 +682,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             return serve::serve(args);
         }
         Command::Setup { .. } => unreachable!("setup returned before runtime setup"),
+        Command::Launch { agents: true, .. } => {
+            return run_agent_launch(socket.as_ref(), host.as_ref(), json).await;
+        }
         Command::Launch {
+            agents: false,
             program,
             hosts,
             builtin,
@@ -1015,6 +1032,17 @@ fn parse_agent_binding(value: &str) -> anyhow::Result<coordinated::DriverBinding
         host,
         coordinated::DriverSpec::Executable(PathBuf::from(executable)),
     ))
+}
+
+async fn run_agent_launch(
+    socket: Option<&PathBuf>,
+    host: Option<&HostName>,
+    json: bool,
+) -> anyhow::Result<()> {
+    if socket.is_some() || host.is_some() || json {
+        bail!("--socket, --host, and --json do not apply to `arena0 launch --agents`");
+    }
+    agent_launch::run().await
 }
 
 fn parse_builtin_binding(value: &str) -> anyhow::Result<coordinated::DriverBinding> {
@@ -1455,11 +1483,11 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
     match command {
         ExecCommand::Create {
             program,
-            with,
+            participants,
             join,
             param,
         } => {
-            let ensemble = ensemble_spec(&with, join.as_deref())?;
+            let ensemble = ensemble_spec(ctx, &program, participants, join.as_deref()).await?;
             let params = answer::assemble_params(&param).map_err(anyhow::Error::msg)?;
             let exec_id = ExecId(rand::random());
             let created = ctx
@@ -1731,23 +1759,38 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn ensemble_spec(with: &[String], join: Option<&[String]>) -> anyhow::Result<EnsembleSpec> {
-    match (with.is_empty(), join) {
-        (false, None) => Ok(EnsembleSpec::Explicit {
-            peers: with
-                .iter()
-                .map(|value| {
-                    value.parse::<PeerId>().map_err(|_| {
-                        anyhow!(
-                            "invalid peer id {value}; use the full 64-hex id from the Host identity"
-                        )
-                    })
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?,
-        }),
-        (true, Some(values)) => run::parse_join_ensemble(values),
-        _ => bail!("pass exactly one of --with <peer,...> or --join <creator> <negotiation-id>"),
+async fn ensemble_spec(
+    ctx: &Ctx,
+    program: &str,
+    participants: Option<u16>,
+    join: Option<&[String]>,
+) -> anyhow::Result<EnsembleSpec> {
+    if let Some(values) = join {
+        return run::parse_join_ensemble(values);
     }
+    let participant_count = match participants {
+        Some(count) => count,
+        None => match ctx
+            .call(&HostRequest::ProgramGet {
+                program: program.to_owned(),
+            })
+            .await?
+        {
+            ResponseOk::Program(detail) => {
+                let (min, max) = detail.summary.participants.bounds();
+                if min != max {
+                    bail!(
+                        "program '{}' accepts {} participants; pass --participants <count>",
+                        detail.summary.name,
+                        detail.summary.participants
+                    );
+                }
+                u16::from(min)
+            }
+            other => bail!("unexpected program.get response: {other:?}"),
+        },
+    };
+    Ok(EnsembleSpec::Create { participant_count })
 }
 
 fn parse_await_state(value: &str) -> anyhow::Result<AwaitState> {
@@ -2077,17 +2120,14 @@ mod tests {
             .is_ok()
         );
         assert!(Cli::try_parse_from(["arena0", "identity", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["arena0", "launch", "--agents"]).is_ok());
+        assert!(Cli::try_parse_from(["arena0", "launch", "chess", "--agents"]).is_err());
+        assert!(Cli::try_parse_from(["arena0", "launch", "--agents", "--replay"]).is_err());
         assert!(
-            Cli::try_parse_from([
-                "arena0",
-                "exec",
-                "create",
-                "program",
-                "--with",
-                &"11".repeat(32),
-            ])
-            .is_ok()
+            Cli::try_parse_from(["arena0", "exec", "create", "program", "--participants", "2",])
+                .is_ok()
         );
+        assert!(Cli::try_parse_from(["arena0", "exec", "create", "program", "--join"]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "arena0",

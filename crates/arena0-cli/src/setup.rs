@@ -186,6 +186,24 @@ pub(crate) fn run(target: &Target) -> anyhow::Result<()> {
     )
 }
 
+/// Install the embedded Codex skill into a newly-created launcher workspace.
+///
+/// Agent launch owns this directory, so it can apply the plan directly. The
+/// ordinary `setup codex` path retains its conflict checks and consent flow for
+/// user-owned projects.
+pub(crate) fn install_codex_in(root: &Path) -> anyhow::Result<()> {
+    let executable = current_executable()?;
+    let target = Target::Codex(Options {
+        dry_run: false,
+        yes: true,
+    });
+    let plan = make_plan(root, &target, &executable)?;
+    if plan.iter().any(|file| file.state == State::Different) {
+        bail!("agent launcher workspace contains a conflicting Codex skill");
+    }
+    apply(&plan)
+}
+
 fn run_in(root: &Path, target: &Target, executable: &str) -> anyhow::Result<()> {
     let name = target.name();
     let options = target.options();

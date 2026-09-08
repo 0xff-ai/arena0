@@ -200,8 +200,8 @@ async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Re
                 exec_id: arena0_client::protocol::ExecId([line!() as u8; 32]),
                 program,
                 params: None,
-                ensemble: EnsembleSpec::Explicit {
-                    peers: vec![peer_b],
+                ensemble: EnsembleSpec::Create {
+                    participant_count: 2,
                 },
             },
         )

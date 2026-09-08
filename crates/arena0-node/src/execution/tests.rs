@@ -90,8 +90,7 @@ impl Fixture {
             .create_execution_request(
                 program.hash(),
                 Some(params.clone()),
-                ExecutionAdmission::explicit(NEGOTIATION_ID, vec![local_peer, remote_peer])
-                    .expect("admission"),
+                ExecutionAdmission::create(NEGOTIATION_ID, 2).expect("admission"),
                 2,
             )
             .await

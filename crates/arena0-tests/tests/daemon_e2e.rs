@@ -127,8 +127,8 @@ async fn create_and_activate(d: &common::DaemonHarness) -> (ExecutionPair, Event
             exec_id: requested_exec_a,
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
-            ensemble: EnsembleSpec::Explicit {
-                peers: vec![d.peer_b],
+            ensemble: EnsembleSpec::Create {
+                participant_count: 2,
             },
         },
     )
@@ -693,8 +693,8 @@ async fn joiner_without_params_adopts_creator_terms() {
         exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
         program: d.program_id.to_string(),
         params: Some(serde_json::json!({ "target_size": 2, "bias": 0 })),
-        ensemble: EnsembleSpec::Explicit {
-            peers: vec![d.peer_b],
+        ensemble: EnsembleSpec::Create {
+            participant_count: 2,
         },
     };
     let (exec_a, negotiation_id) = match ok(call(&d.host_a, &req_a).await) {

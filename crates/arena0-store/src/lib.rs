@@ -2101,7 +2101,7 @@ impl ExecutionStore {
     ///
     /// Admission is the first lifecycle mutation. Requiring the already
     /// claimed writer here means request creation, negotiation, activation,
-    /// and execution all share one live ownership token. Explicit admission
+    /// and execution all share one live ownership token. Creator admission
     /// requires `Some(params)`; join admission may omit its preferred params
     /// until the creator's offer is authenticated.
     pub async fn create_execution_request(

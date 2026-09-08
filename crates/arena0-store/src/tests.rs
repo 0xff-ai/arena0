@@ -31,12 +31,6 @@ async fn create_execution(path: &Path, fixture: &ActivationFixture, execution_id
         .register_program(fixture.program.clone(), 1)
         .await
         .expect("program");
-    let peers = fixture
-        .prepared
-        .tickets()
-        .iter()
-        .map(|ticket| ticket.data.signer)
-        .collect();
     let mut writer = store
         .handle()
         .claim_execution(execution_id)
@@ -45,7 +39,7 @@ async fn create_execution(path: &Path, fixture: &ActivationFixture, execution_id
         .create_execution_request(
             program_hash,
             Some(JsonBytes::try_new(br#"{}"#.to_vec()).expect("params")),
-            ExecutionAdmission::explicit(NegotiationId([0x11; 32]), peers).expect("admission"),
+            ExecutionAdmission::create(NegotiationId([0x11; 32]), 2).expect("admission"),
             2,
         )
         .await
@@ -446,12 +440,8 @@ fn host(byte: u8) -> PeerId {
     PeerId([byte; 32])
 }
 
-fn explicit_admission(local: PeerId, negotiation_id: NegotiationId) -> ExecutionAdmission {
-    ExecutionAdmission::explicit(
-        negotiation_id,
-        vec![local, PeerId([local.0[0].wrapping_add(1); 32])],
-    )
-    .expect("explicit admission")
+fn creator_admission(negotiation_id: NegotiationId) -> ExecutionAdmission {
+    ExecutionAdmission::create(negotiation_id, 2).expect("creator admission")
 }
 
 #[tokio::test]
@@ -620,7 +610,7 @@ async fn request_is_idempotent_and_salt_is_durable() {
         .expect("program");
     let id = ExecId([7; 32]);
     let negotiation_id = NegotiationId([8; 32]);
-    let admission = explicit_admission(host(3), negotiation_id);
+    let admission = creator_admission(negotiation_id);
     let params = JsonBytes::try_new(br#"{"x":1}"#.to_vec()).expect("json");
     let mut writer = store
         .handle()
@@ -686,8 +676,7 @@ async fn persisted_zero_execution_salt_is_store_corruption() {
         .create_execution_request(
             program_hash,
             Some(JsonBytes::try_new(br#"{}"#.to_vec()).expect("params")),
-            ExecutionAdmission::explicit(NegotiationId([0x74; 32]), vec![host_id, host(4)])
-                .expect("admission"),
+            ExecutionAdmission::create(NegotiationId([0x74; 32]), 2).expect("admission"),
             2,
         )
         .await
@@ -723,7 +712,7 @@ async fn persisted_zero_execution_salt_is_store_corruption() {
 }
 
 #[tokio::test]
-async fn explicit_admission_requires_params() {
+async fn creator_admission_requires_params() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("store.sqlite");
     let store = Store::open(StoreConfig::new(&path, host(3))).expect("open");
@@ -740,12 +729,7 @@ async fn explicit_admission_requires_params() {
         .claim_execution(execution_id)
         .expect("execution writer");
     let result = writer
-        .create_execution_request(
-            hash,
-            None,
-            explicit_admission(host(3), NegotiationId([0x72; 32])),
-            2,
-        )
+        .create_execution_request(hash, None, creator_admission(NegotiationId([0x72; 32])), 2)
         .await;
     assert!(matches!(result, Err(StoreError::InvalidAdmission(_))));
     assert!(
@@ -1119,7 +1103,7 @@ async fn request_failure_is_compare_and_set() {
         .await
         .expect("program");
     let id = ExecId([2; 32]);
-    let admission = explicit_admission(host(6), NegotiationId([3; 32]));
+    let admission = creator_admission(NegotiationId([3; 32]));
     let mut writer = store
         .handle()
         .claim_execution(id)
@@ -1174,12 +1158,6 @@ async fn request_failure_cannot_compete_with_activation_authority() {
         .await
         .expect("program");
     let execution_id = ExecId([0x24; 32]);
-    let peers = fixture
-        .prepared
-        .tickets()
-        .iter()
-        .map(|ticket| ticket.data.signer)
-        .collect();
     let mut writer = store
         .handle()
         .claim_execution(execution_id)
@@ -1188,7 +1166,7 @@ async fn request_failure_cannot_compete_with_activation_authority() {
         .create_execution_request(
             program_hash,
             Some(JsonBytes::try_new(br#"{}"#.to_vec()).expect("params")),
-            ExecutionAdmission::explicit(NegotiationId([0x11; 32]), peers).expect("admission"),
+            ExecutionAdmission::create(NegotiationId([0x11; 32]), 2).expect("admission"),
             2,
         )
         .await
@@ -1278,7 +1256,7 @@ async fn recovery_projection_filters_terminal_history_before_paging() {
             .create_execution_request(
                 program_hash,
                 Some(JsonBytes::try_new(b"null".to_vec()).expect("params")),
-                explicit_admission(host_id, NegotiationId([index; 32])),
+                creator_admission(NegotiationId([index; 32])),
                 u64::from(index),
             )
             .await
@@ -1333,12 +1311,6 @@ async fn recovery_projection_pages_a_maximal_execution_state() {
         .expect("program");
 
     let execution_id = ExecId([0x7f; 32]);
-    let peers = fixture
-        .prepared
-        .tickets()
-        .iter()
-        .map(|ticket| ticket.data.signer)
-        .collect();
     let mut writer = store
         .handle()
         .claim_execution(execution_id)
@@ -1347,7 +1319,7 @@ async fn recovery_projection_pages_a_maximal_execution_state() {
         .create_execution_request(
             program_hash,
             Some(JsonBytes::try_new(br#"{}"#.to_vec()).expect("params")),
-            ExecutionAdmission::explicit(NegotiationId([0x11; 32]), peers).expect("admission"),
+            ExecutionAdmission::create(NegotiationId([0x11; 32]), 2).expect("admission"),
             2,
         )
         .await
@@ -1416,16 +1388,8 @@ async fn activation_timer_and_outbox_recovery_is_idempotent() {
         .await
         .expect("program");
     let id = ExecId([0xee; 32]);
-    let admission = ExecutionAdmission::explicit(
-        NegotiationId([0x11; 32]),
-        fixture
-            .prepared
-            .tickets()
-            .iter()
-            .map(|ticket| ticket.data.signer)
-            .collect(),
-    )
-    .expect("fixture admission");
+    let admission =
+        ExecutionAdmission::create(NegotiationId([0x11; 32]), 2).expect("fixture admission");
     let mut writer = store
         .handle()
         .claim_execution(id)
@@ -1998,27 +1962,24 @@ async fn activation_cannot_exceed_durable_admission_authority() {
         .await
         .expect("program");
 
-    let explicit_id = ExecId([0xa1; 32]);
-    let explicit = ExecutionAdmission::explicit(
-        NegotiationId([0x11; 32]),
-        vec![fixture.producer, PeerId([0xff; 32])],
-    )
-    .expect("explicit admission");
-    let mut explicit_writer = store
+    let creator_id = ExecId([0xa1; 32]);
+    let creator =
+        ExecutionAdmission::create(NegotiationId([0x11; 32]), 3).expect("creator admission");
+    let mut creator_writer = store
         .handle()
-        .claim_execution(explicit_id)
+        .claim_execution(creator_id)
         .expect("execution writer");
-    explicit_writer
+    creator_writer
         .create_execution_request(
             hash,
             Some(JsonBytes::try_new(b"{}".to_vec()).expect("json")),
-            explicit,
+            creator,
             2,
         )
         .await
         .expect("request");
     assert!(matches!(
-        explicit_writer
+        creator_writer
             .prepare_activation(fixture.prepared.clone(), 3)
             .await,
         Err(StoreError::InvalidAdmission(_))
@@ -2042,7 +2003,7 @@ async fn activation_cannot_exceed_durable_admission_authority() {
         join_writer.prepare_activation(fixture.prepared, 5).await,
         Err(StoreError::InvalidAdmission(_))
     ));
-    drop(explicit_writer);
+    drop(creator_writer);
     drop(join_writer);
     store.shutdown().await.expect("shutdown");
 }

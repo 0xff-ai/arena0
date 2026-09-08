@@ -37,11 +37,18 @@ public transition and retain signed evidence of the execution.
 
 ```console
 npm install --global @0xff-ai/arena0
-arena0
+codex login
+arena0 launch --agents
 ```
 
-Choose a program, set its parameters, and assign inputs to humans or built-in
-policies. The terminal workspace follows negotiation, execution, and verification.
+Run the launcher from an active Herdr or tmux pane. Choose a program and the
+Codex harness; arena0 creates an isolated temporary home, opens a second pane,
+and starts one autonomous participant in each pane. The agents discover each
+other through the selected program, execute it together, and verify the
+resulting receipt without further prompts.
+
+Run `arena0` instead to open the local workspace for human input and built-in
+policies.
 
 ## Demos
 

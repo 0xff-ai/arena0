@@ -5,7 +5,7 @@ use std::io;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
-use crate::{Committed, Ensemble, EnsembleError, NegotiationId, PeerId};
+use crate::{EnsembleError, NegotiationId, PeerId};
 
 const ADMISSION_VERSION: u8 = 1;
 
@@ -43,14 +43,6 @@ pub enum ExecutionAdmission {
         /// Total participant count, including the local creator.
         participant_count: u16,
     },
-    /// Legacy exact participant-set admission retained for old launchers and
-    /// durable records. New callers should use [`Self::create`].
-    Explicit {
-        /// Identity of the negotiation created for this request.
-        negotiation_id: NegotiationId,
-        /// Complete participant set, including the local creator.
-        peers: Ensemble<Committed>,
-    },
     /// Join a negotiation. `target == None` is an open join and is filled with
     /// the first valid offer the Host accepts from the program topic.
     Join {
@@ -60,17 +52,6 @@ pub enum ExecutionAdmission {
 }
 
 impl ExecutionAdmission {
-    /// Validate and canonicalize an explicit participant set.
-    pub fn explicit(
-        negotiation_id: NegotiationId,
-        peers: Vec<PeerId>,
-    ) -> Result<Self, EnsembleError> {
-        Ok(Self::Explicit {
-            negotiation_id,
-            peers: Ensemble::from_peers(peers)?,
-        })
-    }
-
     /// Construct a creator admission for an open offer.
     pub fn create(
         negotiation_id: NegotiationId,
@@ -111,9 +92,7 @@ impl ExecutionAdmission {
     #[must_use]
     pub const fn negotiation_id(&self) -> Option<NegotiationId> {
         match self {
-            Self::Create { negotiation_id, .. } | Self::Explicit { negotiation_id, .. } => {
-                Some(*negotiation_id)
-            }
+            Self::Create { negotiation_id, .. } => Some(*negotiation_id),
             Self::Join {
                 target: Some(target),
             } => Some(target.negotiation_id),
@@ -149,17 +128,7 @@ impl ExecutionAdmission {
             Self::Create {
                 participant_count, ..
             } => Some(*participant_count),
-            Self::Explicit { peers, .. } => Some(peers.peers().len() as u16),
             Self::Join { .. } => None,
-        }
-    }
-
-    /// Return the exact explicit participant set, if this request creates one.
-    #[must_use]
-    pub const fn explicit_peers(&self) -> Option<&Ensemble<Committed>> {
-        match self {
-            Self::Explicit { peers, .. } => Some(peers),
-            Self::Create { .. } | Self::Join { .. } => None,
         }
     }
 
@@ -171,7 +140,7 @@ impl ExecutionAdmission {
                 target: Some(target),
                 ..
             } => Some(target.creator),
-            Self::Create { .. } | Self::Explicit { .. } | Self::Join { target: None, .. } => None,
+            Self::Create { .. } | Self::Join { target: None, .. } => None,
         }
     }
 }
@@ -187,14 +156,6 @@ impl BorshSerialize for ExecutionAdmission {
                 BorshSerialize::serialize(&2u8, writer)?;
                 BorshSerialize::serialize(negotiation_id, writer)?;
                 BorshSerialize::serialize(participant_count, writer)
-            }
-            Self::Explicit {
-                negotiation_id,
-                peers,
-            } => {
-                BorshSerialize::serialize(&0u8, writer)?;
-                BorshSerialize::serialize(negotiation_id, writer)?;
-                BorshSerialize::serialize(peers, writer)
             }
             Self::Join {
                 target: Some(target),
@@ -221,10 +182,6 @@ impl BorshDeserialize for ExecutionAdmission {
             ));
         }
         match u8::deserialize_reader(reader)? {
-            0 => Ok(Self::Explicit {
-                negotiation_id: NegotiationId::deserialize_reader(reader)?,
-                peers: Ensemble::<Committed>::deserialize_reader(reader)?,
-            }),
             1 => {
                 let creator = PeerId::deserialize_reader(reader)?;
                 let negotiation_id = NegotiationId::deserialize_reader(reader)?;
@@ -251,20 +208,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn explicit_is_canonical_and_decode_revalidates_the_ensemble() {
-        let admission = ExecutionAdmission::explicit(
-            NegotiationId([7; 32]),
-            vec![PeerId([2; 32]), PeerId([1; 32])],
-        )
-        .expect("explicit admission");
-        assert_eq!(
-            admission.explicit_peers().expect("peers").peers(),
-            &[PeerId([1; 32]), PeerId([2; 32])]
-        );
-        let encoded = borsh::to_vec(&admission).expect("encode");
-        assert_eq!(
-            borsh::from_slice::<ExecutionAdmission>(&encoded).expect("decode"),
-            admission
+    fn retired_explicit_tag_is_rejected() {
+        let error = borsh::from_slice::<ExecutionAdmission>(&[ADMISSION_VERSION, 0])
+            .expect_err("retired explicit admission tag must stay invalid");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("unknown execution admission tag 0")
         );
     }
 

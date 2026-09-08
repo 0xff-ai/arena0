@@ -132,8 +132,7 @@ admission forms:
 
 `Create` chooses the total participant count, including the local Host. The
 daemon creates the negotiation ID and checks that the selected program accepts
-the count. The older `Explicit` form, `{"Explicit":{"peers":[...]}}`, remains
-available for launcher compatibility.
+the count.
 
 `Join` with `target: null` discovers the first usable offer on the program
 topic. A supplied target restricts discovery to that creator and negotiation.
@@ -146,8 +145,8 @@ durable binding.
 The request's `params` value is optional for a join. Without it, the Host
 accepts the creator's authenticated offer parameters. With it, the Host treats
 the value as a local preference, signs only a matching offer, and emits a
-signed counteroffer when the current offer differs. Create and Explicit
-requests validate and store offer parameters before negotiation.
+signed counteroffer when the current offer differs. Create requests validate
+and store offer parameters before negotiation.
 
 ### Agent values
 
