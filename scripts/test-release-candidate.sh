@@ -49,7 +49,7 @@ ARENA0_CARGO_BIN="$bin_dir/cargo-arena0" ARENA0_EXAMPLE_DIR="$example_dir" \
 home="$smoke_root/home"
 socket="$home/arena0.sock"
 log="$smoke_root/serve.log"
-ARENA0_HOME="$home" "$bin_dir/arena0" serve --mcp-listen 127.0.0.1:0 \
+ARENA0_HOME="$home" "$bin_dir/arena0" serve \
   >"$log" 2>&1 &
 service_pid=$!
 

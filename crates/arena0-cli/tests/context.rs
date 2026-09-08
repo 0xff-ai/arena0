@@ -185,7 +185,7 @@ impl DaemonGuard {
     fn start(home: &Path) -> Self {
         let mut command = base_command(arena0d_binary(), home);
         let child = command
-            .args(["--no-hosts", "--mcp-listen", "127.0.0.1:0"])
+            .arg("--no-hosts")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()

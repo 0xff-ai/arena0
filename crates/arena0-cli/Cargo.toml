@@ -32,7 +32,6 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
-toml_edit = "0.25.12"
 unicode-width = { workspace = true }
 rand = { workspace = true }
 

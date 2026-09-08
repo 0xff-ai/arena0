@@ -1560,14 +1560,13 @@ mod tests {
             0
         };
         let arguments = serde_json::from_value(arguments).expect("MCP arguments must be an object");
-        let result = timeout(
+        timeout(
             Duration::from_secs(10) + Duration::from_millis(allowed_wait),
             client.call_tool(CallToolRequestParams::new(name).with_arguments(arguments)),
         )
         .await
         .unwrap_or_else(|_| panic!("MCP tool '{name}' timed out"))
-        .unwrap_or_else(|error| panic!("MCP tool '{name}' request failed: {error}"));
-        result
+        .unwrap_or_else(|error| panic!("MCP tool '{name}' request failed: {error}"))
     }
 
     async fn wait_for_mcp_address(daemon: &Daemon) -> SocketAddr {

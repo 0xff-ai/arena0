@@ -9,14 +9,7 @@ fn duplicate_hosts_are_rejected_before_fresh_home_provisioning() -> anyhow::Resu
     let output = Command::new(env!("CARGO_BIN_EXE_arena0d"))
         .env("ARENA0_HOME", home.path())
         .env_remove("ARENA0_SOCKET")
-        .args([
-            "--host",
-            "same",
-            "--host",
-            "same",
-            "--mcp-listen",
-            "127.0.0.1:0",
-        ])
+        .args(["--host", "same", "--host", "same"])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()

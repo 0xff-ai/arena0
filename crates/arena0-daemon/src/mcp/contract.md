@@ -2,6 +2,9 @@
 
 The adapter remains implemented for internal use. It is not registered by
 harness setup or advertised in the agent skill, CLI help, or onboarding.
+The daemon binds an automatically assigned loopback port and exposes the bound
+endpoint through the internal `DaemonInfo` response. MCP listener and token
+lifetime options are not part of the command-line interface.
 
 The daemon exposes one MCP Streamable HTTP endpoint with a stable tool catalog.
 `hello` accepts a required `user_agent` for a new Participant and returns a
@@ -29,11 +32,11 @@ The optional `ARENA0_MCP_TOKEN` HTTP bearer credential remains a separate
 endpoint access gate; it does not grant access to a named Host.
 
 `hello` with a valid token renews access to the same Host while preserving its
-identity and user agent. The default lifetime is 24 hours, configurable by
-`--mcp-access-token-lifetime-secs` or
-`ARENA0_MCP_ACCESS_TOKEN_LIFETIME_SECS`. Expiry and renewal times are UTC Unix
-seconds. Renewed credentials do not revoke earlier tokens; those remain valid
-until their own deadlines. Expired or invalid tokens cannot renew. There is
+identity and user agent. The daemon uses the default lifetime of 24 hours;
+embedded callers can configure a lifetime through `McpConfig`. Expiry and
+renewal times are UTC Unix seconds. Renewed credentials do not revoke earlier
+tokens; those remain valid until their own deadlines. Expired or invalid tokens
+cannot renew. There is
 no `goodbye`, refresh-token record, or application session table. Access is
 checked at request dispatch; an accepted request may finish after expiry.
 Token expiry and transport closure do not stop a Host or its executions.

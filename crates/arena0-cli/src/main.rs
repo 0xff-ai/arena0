@@ -144,14 +144,6 @@ enum Command {
         /// Participating Hosts (default: host-01,host-02). Unbound Hosts use external clients.
         #[arg(long, value_delimiter = ',', value_name = "NAME")]
         hosts: Vec<HostName>,
-        /// MCP listener for a newly started daemon; a reused service keeps its listener.
-        #[arg(
-            long,
-            hide = true,
-            default_value = "127.0.0.1:7330",
-            value_name = "ADDR"
-        )]
-        mcp_listen: std::net::SocketAddr,
         /// Bind a deterministic strategy as HOST=STRATEGY.
         #[arg(long, value_name = "HOST=STRATEGY")]
         builtin: Vec<String>,
@@ -680,7 +672,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Launch {
             program,
             hosts,
-            mcp_listen,
             builtin,
             agent,
             param,
@@ -702,16 +693,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             if bindings.len() < 2 {
                 bail!("an emulation requires at least two distinct Hosts");
             }
-            if !mcp_listen.ip().is_loopback() || mcp_listen.port() == 0 {
-                bail!("--mcp-listen requires a loopback address with a nonzero port");
-            }
             let params = answer::assemble_params(&param).map_err(anyhow::Error::msg)?;
-            let daemon = local_daemon::LocalDaemon::connect_or_start_with_mcp(
+            let daemon = local_daemon::LocalDaemon::connect_or_start(
                 bindings
                     .iter()
                     .map(|binding| binding.host.clone())
                     .collect(),
-                mcp_listen,
             )
             .await?;
             let setup = workspace::Setup {
@@ -2083,17 +2070,7 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["arena0", "--host", "host-01", "status"]).is_ok());
         assert!(Cli::try_parse_from(["arena0", "mcp"]).is_err());
-        assert!(
-            Cli::try_parse_from([
-                "arena0",
-                "serve",
-                "--hosts",
-                "host-01,host-02",
-                "--mcp-listen",
-                "127.0.0.1:7330",
-            ])
-            .is_ok()
-        );
+        assert!(Cli::try_parse_from(["arena0", "serve", "--hosts", "host-01,host-02",]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "arena0", "run", "program", "--human", "host-01", "--human", "host-02",

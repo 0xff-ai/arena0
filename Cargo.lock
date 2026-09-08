@@ -156,7 +156,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "toml_edit",
  "tracing",
  "tracing-subscriber",
  "unicode-width",
@@ -3593,7 +3592,6 @@ dependencies = [
  "indexmap",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
- "toml_writer",
  "winnow 1.0.3",
 ]
 

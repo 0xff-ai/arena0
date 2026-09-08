@@ -411,29 +411,6 @@ impl Daemon {
             startup.host_progress(StartupStage::HostProvisioned, &host);
             hosts.push(config);
         }
-        Self::start_configs(
-            hosts,
-            mcp,
-            engine,
-            home,
-            bootstrap_new_hosts,
-            startup,
-            lease,
-            mcp_auth,
-        )
-        .await
-    }
-
-    async fn start_configs(
-        hosts: Vec<HostConfig>,
-        mcp: McpConfig,
-        engine: Arc<WasmtimeEngine>,
-        home: Home,
-        bootstrap_new_hosts: bool,
-        startup: Arc<StartupTimeline>,
-        lease: HomeLease,
-        mcp_auth: Arc<McpAuth>,
-    ) -> anyhow::Result<Arc<Self>> {
         if hosts.iter().any(|host| host.bootstrap) {
             startup.progress(StartupStage::ProgramsBootstrapping);
         }

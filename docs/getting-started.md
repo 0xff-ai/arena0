@@ -55,13 +55,13 @@ just build
 ./target/debug/arena0 setup codex
 ```
 
-Setup previews its changes before applying them. It creates missing files and
-updates recognized generated skills. Customized skills and conflicting harness
-hooks remain unchanged and are reported as incomplete setup.
+Setup previews its changes before applying them. It creates missing files,
+leaves matching files unchanged, and rejects conflicting skills or hooks
+before writing. Existing harness configuration remains untouched.
 The installed skill and Claude startup hook record the invoking executable's
 absolute path, so a global installation is not required. Rebuilding at the
-same path keeps the setup valid. After moving the executable, rerun setup and
-update the recorded paths. Keep configuration containing local paths untracked.
+same path keeps the setup valid. After moving the executable, update the
+recorded paths. Keep configuration containing local paths untracked.
 
 Codex supplies its thread ID to shell commands. Claude setup installs a
 SessionStart hook that supplies its session ID through `CLAUDE_ENV_FILE`.
