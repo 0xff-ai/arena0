@@ -1839,35 +1839,6 @@ mod tests {
         drop(occupied);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn shutdown_drains_a_partial_mcp_body() {
-        let test = test_daemon().await;
-        let serving = tokio::spawn(Arc::clone(&test.daemon).serve());
-        let address = wait_for_mcp_address(&test.daemon).await;
-        let mut client = TcpStream::connect(address)
-            .await
-            .expect("connect MCP endpoint");
-        client
-            .write_all(
-                format!(
-                    "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: 10000\r\nConnection: keep-alive\r\n\r\n{{}}"
-                )
-                .as_bytes(),
-            )
-            .await
-            .expect("write partial MCP body");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        timeout(Duration::from_secs(5), test.daemon.stop())
-            .await
-            .expect("partial MCP body blocked daemon shutdown");
-        timeout(Duration::from_secs(5), serving)
-            .await
-            .expect("serve task did not join after partial MCP body")
-            .expect("serve task panicked")
-            .expect("serve task failed");
-    }
-
     #[tokio::test]
     async fn shutdown_stream_remains_closed_across_reads_and_writes() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1894,30 +1865,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn shutdown_drains_a_partial_mcp_header() {
-        let test = test_daemon().await;
-        let serving = tokio::spawn(Arc::clone(&test.daemon).serve());
-        let address = wait_for_mcp_address(&test.daemon).await;
-        let mut client = TcpStream::connect(address)
-            .await
-            .expect("connect MCP endpoint");
-        client
-            .write_all(
-                format!("POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Length: 10000\r\n")
-                    .as_bytes(),
-            )
-            .await
-            .expect("write partial MCP header");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    async fn shutdown_drains_incomplete_mcp_requests() {
+        for (case, request) in [
+            (
+                "partial header",
+                "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Length: 10000\r\n",
+            ),
+            (
+                "partial body",
+                "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: 10000\r\nConnection: keep-alive\r\n\r\n{}",
+            ),
+        ] {
+            let test = test_daemon().await;
+            let serving = tokio::spawn(Arc::clone(&test.daemon).serve());
+            let address = wait_for_mcp_address(&test.daemon).await;
+            let mut client = TcpStream::connect(address)
+                .await
+                .expect("connect MCP endpoint");
+            client
+                .write_all(
+                    request
+                        .replace("{address}", &address.to_string())
+                        .as_bytes(),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("write {case}: {error}"));
+            tokio::time::sleep(Duration::from_millis(100)).await;
 
-        timeout(Duration::from_secs(5), test.daemon.stop())
-            .await
-            .expect("partial MCP header blocked daemon shutdown");
-        timeout(Duration::from_secs(5), serving)
-            .await
-            .expect("serve task did not join after partial MCP header")
-            .expect("serve task panicked")
-            .expect("serve task failed");
+            timeout(Duration::from_secs(5), test.daemon.stop())
+                .await
+                .unwrap_or_else(|_| panic!("{case} blocked daemon shutdown"));
+            timeout(Duration::from_secs(5), serving)
+                .await
+                .unwrap_or_else(|_| panic!("serve task did not join after {case}"))
+                .expect("serve task panicked")
+                .expect("serve task failed");
+        }
     }
 
     struct ActivityTestSubscription {
@@ -2250,7 +2233,8 @@ mod tests {
             assert!(created["session"].is_null());
             assert!(created["negotiation_id"].is_string());
             if !join_first {
-                // Preserve the existing regression check across the old 30s timeout.
+                // Open creator admission has no negotiation deadline at the
+                // daemon/MCP boundary and must remain joinable after 40s.
                 let started = Instant::now();
                 for _ in 0..2 {
                     let waiting = call_mcp_tool(&clients[0], "await_execution_event", serde_json::json!({

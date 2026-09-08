@@ -1105,19 +1105,8 @@ mod tests {
         type Output = String;
     }
 
-    #[test]
-    fn callout_builder_records_pending_metadata() {
-        let mut ctx = make_ctx();
-        crate::testing::drain_effects();
-
-        ctx.effects()
-            .callout(TestCallout)
-            .pending("thinking")
-            .dispatch();
-
-        let effects = crate::testing::drain_effects();
-        assert_eq!(effects.len(), 1);
-        match &effects[0] {
+    fn assert_test_callout(effect: &arena0_protocol::Effect) {
+        match effect {
             arena0_protocol::Effect::Callout {
                 callout_index,
                 pending_label,
@@ -1133,28 +1122,28 @@ mod tests {
     }
 
     #[test]
-    fn callout_builder_can_be_lowered_to_arena_future() {
+    fn callout_builders_and_futures_preserve_metadata() {
         let mut ctx = make_ctx();
+        crate::testing::drain_effects();
+
+        ctx.effects()
+            .callout(TestCallout)
+            .pending("thinking")
+            .dispatch();
+        let effects = crate::testing::drain_effects();
+        assert_eq!(effects.len(), 1);
+        assert_test_callout(&effects[0]);
 
         let future: ArenaFuture<String> = ctx
             .effects()
             .callout(TestCallout)
             .pending("thinking")
             .into_arena_future();
+        assert_test_callout(&future.effect());
 
-        match future.effect() {
-            arena0_protocol::Effect::Callout {
-                callout_index,
-                pending_label,
-                expected_type,
-                ..
-            } => {
-                assert_eq!(callout_index, 7);
-                assert_eq!(pending_label.as_deref(), Some("thinking"));
-                assert_eq!(expected_type.as_deref(), Some("test::Output"));
-            }
-            other => panic!("expected callout effect, got {other:?}"),
-        }
+        let future: ArenaFuture<String> =
+            ctx.effects().callout_typed(TestCallout).pending("thinking");
+        assert_test_callout(&future.effect());
     }
 
     #[test]
@@ -1214,20 +1203,6 @@ mod tests {
                 assert_eq!(expected_type.as_deref(), Some("Vec<u8>"));
             }
             other => panic!("expected sign effect, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn arena_future_pending_updates_captured_effect() {
-        let mut ctx = make_ctx();
-        let future: ArenaFuture<String> =
-            ctx.effects().callout_typed(TestCallout).pending("thinking");
-
-        match future.effect() {
-            arena0_protocol::Effect::Callout { pending_label, .. } => {
-                assert_eq!(pending_label.as_deref(), Some("thinking"));
-            }
-            other => panic!("expected callout effect, got {other:?}"),
         }
     }
 

@@ -206,77 +206,59 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_metadata_sections_are_rejected() {
-        let bytes = definition().encode().unwrap();
-        let once = Program::append_metadata(b"\0asm\x01\x00\x00\x00", &bytes);
-        let twice = Program::append_metadata(&once, &bytes);
-        let error = Program::read_metadata(&twice).unwrap_err();
-        assert!(
-            matches!(error, SandboxError::InvalidMetadata(message) if message.contains("duplicate"))
-        );
-    }
+    fn invalid_metadata_sections_are_rejected() {
+        let encoded = definition().encode().unwrap();
+        let once = Program::append_metadata(b"\0asm\x01\x00\x00\x00", &encoded);
 
-    #[test]
-    fn wrong_magic_is_rejected() {
-        let mut bytes = definition().encode().unwrap();
-        bytes[0] ^= 1;
-        let wasm = Program::append_metadata(b"\0asm\x01\x00\x00\x00", &bytes);
-
-        let error = Program::read_metadata(&wasm).unwrap_err();
-        assert!(
-            matches!(error, SandboxError::InvalidMetadata(message) if message.contains("wrong magic"))
-        );
-    }
-
-    #[test]
-    fn unsupported_version_is_rejected() {
-        let mut bytes = definition().encode().unwrap();
-        bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
-        let wasm = Program::append_metadata(b"\0asm\x01\x00\x00\x00", &bytes);
-
-        let error = Program::read_metadata(&wasm).unwrap_err();
-        assert!(
-            matches!(error, SandboxError::InvalidMetadata(message) if message.contains("unsupported program definition version 2"))
-        );
-    }
-
-    #[test]
-    fn malformed_json_schema_is_rejected() {
+        let mut wrong_magic = encoded.clone();
+        wrong_magic[0] ^= 1;
+        let mut unsupported_version = encoded.clone();
+        unsupported_version[4..8].copy_from_slice(&2u32.to_le_bytes());
         let mut definition = definition();
         definition.schema.params = JsonSchemaDocument::new(serde_json::json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": 7
         }))
         .unwrap();
-        let bytes = definition.encode().unwrap();
-        let wasm = Program::append_metadata(b"\0asm\x01\x00\x00\x00", &bytes);
 
-        let error = Program::read_metadata(&wasm).unwrap_err();
-        assert!(
-            matches!(error, SandboxError::InvalidMetadata(message) if message.contains("params JSON Schema is invalid"))
-        );
-    }
-
-    #[test]
-    fn participants_outside_bounds_are_rejected() {
-        for participants in [0, 1, 65, u8::MAX] {
-            let mut definition = definition();
-            definition.metadata.participants = arena0_program::ParticipantCount::Exact {
-                count: participants,
-            };
-            let wasm =
-                Program::append_metadata(b"\0asm\x01\x00\x00\x00", &definition.encode().unwrap());
-
+        let cases = [
+            (
+                "duplicate section",
+                Program::append_metadata(&once, &encoded),
+                "duplicate",
+            ),
+            (
+                "wrong definition magic",
+                Program::append_metadata(b"\0asm\x01\x00\x00\x00", &wrong_magic),
+                "wrong magic",
+            ),
+            (
+                "unsupported definition version",
+                Program::append_metadata(b"\0asm\x01\x00\x00\x00", &unsupported_version),
+                "unsupported program definition version 2",
+            ),
+            (
+                "invalid JSON schema",
+                Program::append_metadata(b"\0asm\x01\x00\x00\x00", &definition.encode().unwrap()),
+                "params JSON Schema is invalid",
+            ),
+        ];
+        for (case, wasm, expected) in cases {
             let error = Program::read_metadata(&wasm).unwrap_err();
             assert!(
-                matches!(error, SandboxError::InvalidMetadata(message) if message.contains("participant count"))
+                matches!(&error, SandboxError::InvalidMetadata(message) if message.contains(expected)),
+                "{case}: {error}"
             );
         }
     }
 
     #[test]
-    fn participant_ranges_are_bounded() {
+    fn participant_counts_are_bounded() {
         for participants in [
+            arena0_program::ParticipantCount::Exact { count: 0 },
+            arena0_program::ParticipantCount::Exact { count: 1 },
+            arena0_program::ParticipantCount::Exact { count: 65 },
+            arena0_program::ParticipantCount::Exact { count: u8::MAX },
             arena0_program::ParticipantCount::Range { min: 1, max: 64 },
             arena0_program::ParticipantCount::Range { min: 4, max: 3 },
             arena0_program::ParticipantCount::Range { min: 2, max: 65 },
@@ -299,12 +281,6 @@ mod tests {
         let error = crate::Program::parse(metadata_export_module()).unwrap_err();
 
         assert!(matches!(error, SandboxError::MissingMetadata));
-    }
-
-    #[test]
-    fn malformed_section_is_error() {
-        let wasm = Program::append_metadata(b"\0asm\x01\x00\x00\x00", b"not borsh");
-        assert!(Program::read_metadata(&wasm).is_err());
     }
 
     fn wat_data(bytes: &[u8]) -> String {

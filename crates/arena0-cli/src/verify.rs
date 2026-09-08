@@ -511,7 +511,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn path_shaped_targets_are_never_resident_references() {
+    fn path_and_resident_receipt_references_are_distinguished() {
         for target in [
             "receipt.json",
             "./receipt.json",
@@ -519,38 +519,28 @@ mod tests {
             "/tmp/receipt.json",
             "subdir/receipt",
             r"C:\\receipts\\receipt.json",
+            "receipt.bin",
+            "receipt.receipt",
+            "receipt.txt",
         ] {
-            assert!(
-                is_path_target(Path::new(target), target),
-                "expected path target: {target}"
-            );
+            assert!(is_path_target(Path::new(target), target), "path: {target}");
         }
-    }
 
-    #[test]
-    fn existing_extensionless_files_are_path_targets() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("receipt");
-        std::fs::write(&path, b"not a receipt").expect("write fixture");
-
-        assert!(is_path_target(&path, path.to_str().expect("UTF-8 path")));
-    }
-
-    #[test]
-    fn any_filename_extension_is_a_path_target() {
-        for target in ["receipt.bin", "receipt.receipt", "receipt.txt"] {
-            assert!(is_path_target(Path::new(target), target));
-        }
-    }
-
-    #[test]
-    fn bare_ids_remain_resident_references() {
         for target in [
             "a".repeat(64),
             "receipt-id".to_owned(),
             "session-id".to_owned(),
         ] {
-            assert!(!is_path_target(Path::new(&target), &target));
+            assert!(
+                !is_path_target(Path::new(&target), &target),
+                "resident reference: {target}"
+            );
         }
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("receipt");
+        std::fs::write(&path, b"not a receipt").expect("write fixture");
+
+        assert!(is_path_target(&path, path.to_str().expect("UTF-8 path")));
     }
 }

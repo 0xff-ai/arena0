@@ -55,19 +55,10 @@ mod tests {
     use clap::CommandFactory as _;
 
     #[test]
-    fn help_does_not_advertise_the_internal_adapter() {
+    fn mcp_adapter_configuration_is_not_public_cli_surface() {
         let help = Args::command().render_long_help().to_string();
         assert!(help.contains("arena0 hello"));
         assert!(!help.to_ascii_lowercase().contains("mcp"));
-    }
-
-    #[test]
-    fn no_hosts_cannot_be_combined_with_named_hosts() {
-        assert!(Args::try_parse_from(["arena0d", "--no-hosts", "--host", "host-01"]).is_err());
-    }
-
-    #[test]
-    fn internal_mcp_options_are_rejected() {
         for (option, value) in [
             ("--mcp-listen", "127.0.0.1:7330"),
             ("--mcp-access-token-lifetime-secs", "7200"),
@@ -75,5 +66,10 @@ mod tests {
             let error = Args::try_parse_from(["arena0d", option, value]).unwrap_err();
             assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
         }
+    }
+
+    #[test]
+    fn no_hosts_cannot_be_combined_with_named_hosts() {
+        assert!(Args::try_parse_from(["arena0d", "--no-hosts", "--host", "host-01"]).is_err());
     }
 }

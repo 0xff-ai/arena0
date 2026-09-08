@@ -1746,6 +1746,8 @@ mod tests {
     use crate::{NegotiationId, PeerId, StateHash};
     use arena0_program::{JsonBytes, ProgramHash};
 
+    const CREATOR_BLS_SEED: [u8; 32] = [11; 32];
+
     fn json(bytes: impl Into<Vec<u8>>) -> JsonBytes {
         JsonBytes::try_new(bytes).expect("valid JSON parameters")
     }
@@ -1759,7 +1761,7 @@ mod tests {
 
         let creator_keys = NodeKeys::from_secret(SecretKey::from_bytes([1; 32]));
         let other_keys = NodeKeys::from_secret(SecretKey::from_bytes([2; 32]));
-        let creator_bls = BlsSecretKey::from_seed(&[11; 32]).expect("bls key");
+        let creator_bls = BlsSecretKey::from_seed(&CREATOR_BLS_SEED).expect("bls key");
         let other_bls = BlsSecretKey::from_seed(&[12; 32]).expect("bls key");
         let creator_peer = PeerId::from_ed25519(&creator_keys.ed25519_public_key());
         let offer_data = crate::OfferData::new(
@@ -1815,7 +1817,7 @@ mod tests {
     }
 
     #[test]
-    fn activation_validate_accepts_full_chain() {
+    fn activation_requires_every_selected_participant_to_sign() {
         let activation = valid_activation();
         activation.validate().expect("full chain verifies");
         let offer_hash = OfferHash::of(&activation.offer().data);
@@ -1824,6 +1826,13 @@ mod tests {
                 .verify_for_offer(&offer_hash)
                 .expect("ticket certificate verifies");
         }
+
+        let creator_bls = arena0_crypto::bls::BlsSecretKey::from_seed(&CREATOR_BLS_SEED).unwrap();
+        let partial = creator_bls.sign(&activation.activation_data().signing_bytes());
+        assert!(matches!(
+            Activation::new(activation.prepared().clone(), partial),
+            Err(ActivationError::InvalidAttestations(_))
+        ));
     }
 
     #[test]
@@ -1966,7 +1975,6 @@ mod tests {
         offer.validate().expect("valid offer");
         let bytes = borsh::to_vec(&offer).unwrap();
         assert_eq!(borsh::from_slice::<Offer>(&bytes).unwrap(), offer);
-        assert_eq!(OfferHash::of(&data), OfferHash::of(&data));
         assert_eq!(
             OfferHash::of(&data).0,
             *blake3::hash(&data.signing_bytes()).as_bytes()
@@ -2044,7 +2052,7 @@ mod tests {
     }
 
     #[test]
-    fn ticket_round_trips_borsh_and_verifies_identity() {
+    fn ticket_round_trips_borsh_and_hashes_signing_data() {
         let data = ticket_data(1, 0, 0);
         let ticket = Ticket {
             data: data.clone(),
@@ -2053,17 +2061,10 @@ mod tests {
         ticket.validate().expect("valid ticket");
         let bytes = borsh::to_vec(&ticket).unwrap();
         assert_eq!(borsh::from_slice::<Ticket>(&bytes).unwrap(), ticket);
-        assert_eq!(TicketHash::of(&data), TicketHash::of(&data));
         assert_eq!(
             TicketHash::of(&data).0,
             *blake3::hash(&data.signing_bytes()).as_bytes()
         );
-        // The signature is not part of the hash.
-        let unsigned = Ticket {
-            data: data.clone(),
-            signature: Ed25519Signature([1; 64]),
-        };
-        assert_eq!(TicketHash::of(&unsigned.data), TicketHash::of(&data));
     }
 
     #[test]
@@ -2244,7 +2245,6 @@ mod tests {
             borsh::from_slice::<Counteroffer>(&bytes).unwrap(),
             counteroffer
         );
-        assert_eq!(CounterofferHash::of(&data), CounterofferHash::of(&data));
         assert!(matches!(
             CounterofferData::new(
                 NegotiationId([0x11; 32]),

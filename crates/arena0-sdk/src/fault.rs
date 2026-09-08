@@ -149,30 +149,23 @@ mod tests {
     use anyhow::anyhow;
 
     #[test]
-    fn question_mark_produces_program_fault() {
-        fn try_it() -> Result<(), ProgramFault> {
+    fn error_conversions_preserve_fault_classification() {
+        fn program_fault() -> Result<(), ProgramFault> {
             Err(anyhow!("oops"))?;
             Ok(())
         }
-        assert!(matches!(try_it(), Err(ProgramFault(_))));
-    }
-
-    #[test]
-    fn question_mark_produces_input_fault_unrecoverable() {
-        fn try_it() -> Result<(), InputFault> {
+        fn input_fault() -> Result<(), InputFault> {
             Err(anyhow!("nope"))?;
             Ok(())
         }
-        assert!(matches!(try_it(), Err(InputFault::Unrecoverable(_))));
-    }
-
-    #[test]
-    fn question_mark_produces_protocol_fault_malformed() {
-        fn try_it() -> Result<(), ProtocolFault> {
+        fn protocol_fault() -> Result<(), ProtocolFault> {
             Err(anyhow!("bad peer"))?;
             Ok(())
         }
-        assert!(matches!(try_it(), Err(ProtocolFault::Malformed(_))));
+
+        assert!(matches!(program_fault(), Err(ProgramFault(_))));
+        assert!(matches!(input_fault(), Err(InputFault::Unrecoverable(_))));
+        assert!(matches!(protocol_fault(), Err(ProtocolFault::Malformed(_))));
     }
 
     #[test]

@@ -11,9 +11,9 @@ use arena0_crypto::NodeKeys;
 use arena0_node::{SessionMessage, SpawnedExec};
 use arena0_protocol::{
     ExecFrame, ExecId, FetchActivationTickets, FetchFrame, MessageId, NegotiationId, PeerId,
-    SessionHash, StateHash, StepCommitment, TraceEntry, WitnessCommitment,
+    SessionHash, StateHash, StepCommitment, WitnessCommitment,
 };
-use arena0_store::StoreHandle;
+use arena0_tests::assert::wait_for_entry;
 use arena0_tests::fixtures::{
     LIVE_EXECUTION_TIMEOUT, LiveExecution, complete_pending_shared, establish_live_session,
     ordering_program_wasm, provider, spawn_live_execution,
@@ -36,24 +36,6 @@ async fn harness(reject_shared: bool) -> LiveExecution {
         br#"{}"#.to_vec(),
     )
     .await
-}
-
-async fn wait_for_trace_len(store: &StoreHandle, exec_id: ExecId, len: usize) -> Vec<TraceEntry> {
-    let deadline = tokio::time::Instant::now() + LIVE_EXECUTION_TIMEOUT;
-    loop {
-        let trace = store
-            .read_trace(exec_id, 0, u64::MAX)
-            .await
-            .expect("read trace");
-        if trace.len() >= len {
-            return trace;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for trace"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
 }
 
 async fn establish_session(execution: &LiveExecution) {
@@ -158,12 +140,12 @@ async fn future_message_stays_durable_until_public_head_catches_up() {
     )
     .await;
     complete_pending_shared(&execution, &cryptos()).await;
-    let _ = wait_for_trace_len(&execution.store_handle, execution.exec_id, 2).await;
+    let _ = wait_for_entry(&execution.store_handle, execution.exec_id, 1).await;
     // The first message opens a new public proposal after the initial quorum
     // is committed. Drive that quorum as well before expecting the already
     // durable future message to resolve.
     complete_pending_shared(&execution, &cryptos()).await;
-    let trace = wait_for_trace_len(&execution.store_handle, execution.exec_id, 3).await;
+    let trace = wait_for_entry(&execution.store_handle, execution.exec_id, 2).await;
     let payloads = trace
         .iter()
         .filter_map(|entry| match &entry.event {
@@ -230,7 +212,7 @@ async fn duplicate_position_does_not_replace_the_first_public_entry() {
     )
     .await;
     complete_pending_shared(&execution, &cryptos()).await;
-    let _ = wait_for_trace_len(&execution.store_handle, execution.exec_id, 2).await;
+    let _ = wait_for_entry(&execution.store_handle, execution.exec_id, 1).await;
     send_message(
         &execution,
         1,

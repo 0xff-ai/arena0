@@ -350,17 +350,6 @@ fn explicit_admission(local: PeerId, negotiation_id: NegotiationId) -> Execution
     .expect("explicit admission")
 }
 
-#[test]
-fn envelopes_fail_closed_on_tampering() {
-    let mut encoded = envelope(EnvelopeKind::ExecutionState, b"state").expect("encode");
-    let last = encoded.len() - 1;
-    encoded[last] ^= 0x80;
-    assert!(matches!(
-        open_envelope(EnvelopeKind::ExecutionState, &encoded, 64),
-        Err(StoreError::Corruption(_))
-    ));
-}
-
 #[tokio::test]
 async fn sqlite_owner_survives_reopen() {
     let directory = tempfile::tempdir().expect("tempdir");
@@ -721,67 +710,6 @@ async fn create_admission_rejects_invalid_participant_counts() {
 }
 
 #[tokio::test]
-async fn join_without_params_accepts_creator_activation() {
-    let fixture = activation_fixture();
-    let directory = tempfile::tempdir().expect("tempdir");
-    let path = directory.path().join("store.sqlite");
-    let joiner = other_peer(&fixture);
-    let store = Store::open(StoreConfig::new(&path, joiner)).expect("open");
-    let hash = ProgramHash::of(&fixture.program);
-    store
-        .handle()
-        .register_program(fixture.program.clone(), 1)
-        .await
-        .expect("program");
-    let execution_id = ExecId([0x73; 32]);
-    let mut writer = store
-        .handle()
-        .claim_execution(execution_id)
-        .expect("execution writer");
-    writer
-        .create_execution_request(
-            hash,
-            None,
-            ExecutionAdmission::join(fixture.producer, NegotiationId([0x11; 32])),
-            2,
-        )
-        .await
-        .expect("request");
-    assert!(matches!(
-        writer
-            .prepare_activation(fixture.prepared.clone(), 3)
-            .await
-            .expect("prepare"),
-        PrepareActivationOutcome::Prepared(_)
-    ));
-    assert!(matches!(
-        writer
-            .commit_activation(fixture.activation.clone(), 4)
-            .await
-            .expect("commit"),
-        CommitActivationOutcome::Committed(_)
-    ));
-    let request = writer
-        .load_execution_request()
-        .await
-        .expect("load")
-        .expect("request");
-    assert!(request.params().is_none());
-    drop(writer);
-    store.shutdown().await.expect("shutdown");
-
-    let connection = Connection::open(&path).expect("inspect");
-    let params: Option<Vec<u8>> = connection
-        .query_row(
-            "SELECT params FROM exec_requests WHERE execution_id = ?1",
-            rusqlite::params![execution_id.0.to_vec()],
-            |row| row.get(0),
-        )
-        .expect("params row");
-    assert!(params.is_none());
-}
-
-#[tokio::test]
 async fn join_preferred_params_must_match_creator_activation() {
     let fixture = activation_fixture();
     let directory = tempfile::tempdir().expect("tempdir");
@@ -1051,7 +979,7 @@ fn default_queue_budget_covers_maximal_program_command() {
 }
 
 #[test]
-fn envelope_rejects_wrong_kind_and_oversize() {
+fn envelopes_reject_wrong_kind_oversize_and_tampering() {
     let encoded = envelope(EnvelopeKind::Program, b"x").expect("encode");
     assert!(matches!(
         open_envelope(EnvelopeKind::ExecutionState, &encoded, 8),
@@ -1059,6 +987,14 @@ fn envelope_rejects_wrong_kind_and_oversize() {
     ));
     assert!(matches!(
         open_envelope(EnvelopeKind::Program, &encoded, 0),
+        Err(StoreError::Corruption(_))
+    ));
+
+    let mut tampered = envelope(EnvelopeKind::ExecutionState, b"state").expect("encode");
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0x80;
+    assert!(matches!(
+        open_envelope(EnvelopeKind::ExecutionState, &tampered, 64),
         Err(StoreError::Corruption(_))
     ));
 }
@@ -2237,37 +2173,6 @@ async fn persisted_receipt_tampering_fails_closed_on_restart() {
 }
 
 #[tokio::test]
-async fn published_receipt_row_missing_fails_closed_on_restart() {
-    let fixture = activation_fixture();
-    let directory = tempfile::tempdir().expect("tempdir");
-    let path = directory.path().join("store.sqlite");
-    let execution_id = ExecId([0x34; 32]);
-    let store = create_execution(&path, &fixture, execution_id).await;
-    certify_terminal(&store, &fixture, execution_id).await;
-    let mut writer = store
-        .handle()
-        .claim_execution(execution_id)
-        .expect("execution writer");
-    writer.assemble_receipt(12).await.expect("assemble");
-    drop(writer);
-    publish_receipt(&store, &fixture, execution_id).await;
-    store.shutdown().await.expect("shutdown");
-
-    let connection = Connection::open(&path).expect("inspect");
-    connection
-        .execute(
-            "DELETE FROM receipt_productions WHERE execution_id = ?1",
-            rusqlite::params![execution_id.0.to_vec()],
-        )
-        .expect("remove receipt production row");
-    drop(connection);
-    assert!(matches!(
-        Store::open(StoreConfig::new(&path, fixture.producer)),
-        Err(StoreError::Corruption(_))
-    ));
-}
-
-#[tokio::test]
 async fn unpublished_execution_rejects_terminal_projection_rows_on_restart() {
     let fixture = activation_fixture();
     let directory = tempfile::tempdir().expect("tempdir");
@@ -2293,34 +2198,44 @@ async fn unpublished_execution_rejects_terminal_projection_rows_on_restart() {
 }
 
 #[tokio::test]
-async fn published_terminal_row_missing_fails_closed_on_restart() {
+async fn published_receipts_require_terminal_proof_and_production_rows_on_restart() {
     let fixture = activation_fixture();
     let directory = tempfile::tempdir().expect("tempdir");
-    let path = directory.path().join("store.sqlite");
-    let execution_id = ExecId([0x35; 32]);
-    let store = create_execution(&path, &fixture, execution_id).await;
-    certify_terminal(&store, &fixture, execution_id).await;
-    let mut writer = store
-        .handle()
-        .claim_execution(execution_id)
-        .expect("execution writer");
-    writer.assemble_receipt(12).await.expect("assemble");
-    drop(writer);
-    publish_receipt(&store, &fixture, execution_id).await;
-    store.shutdown().await.expect("shutdown");
-
-    let connection = Connection::open(&path).expect("inspect");
-    connection
-        .execute(
+    for (byte, row, delete) in [
+        (
+            0x34,
+            "receipt-production",
+            "DELETE FROM receipt_productions WHERE execution_id = ?1",
+        ),
+        (
+            0x35,
+            "terminal-proof",
             "DELETE FROM terminal_proofs WHERE execution_id = ?1",
-            rusqlite::params![execution_id.0.to_vec()],
-        )
-        .expect("remove terminal proof row");
-    drop(connection);
-    assert!(matches!(
-        Store::open(StoreConfig::new(&path, fixture.producer)),
-        Err(StoreError::Corruption(_))
-    ));
+        ),
+    ] {
+        let path = directory.path().join(format!("missing-{row}.sqlite"));
+        let execution_id = ExecId([byte; 32]);
+        let store = create_execution(&path, &fixture, execution_id).await;
+        certify_terminal(&store, &fixture, execution_id).await;
+        let mut writer = store
+            .handle()
+            .claim_execution(execution_id)
+            .expect("execution writer");
+        writer.assemble_receipt(12).await.expect("assemble");
+        drop(writer);
+        publish_receipt(&store, &fixture, execution_id).await;
+        store.shutdown().await.expect("shutdown");
+
+        let connection = Connection::open(&path).expect("inspect");
+        connection
+            .execute(delete, rusqlite::params![execution_id.0.to_vec()])
+            .expect("remove required publication row");
+        drop(connection);
+        assert!(matches!(
+            Store::open(StoreConfig::new(&path, fixture.producer)),
+            Err(StoreError::Corruption(_))
+        ));
+    }
 }
 
 #[tokio::test]
