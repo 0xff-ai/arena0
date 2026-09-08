@@ -131,8 +131,11 @@ doc-markdown = "allow"
 module-name-repetitions = "allow"
 too-long-first-doc-paragraph = "allow"
 
+# Retain source locations for release backtraces without full variable/type
+# debuginfo. This also applies to optimized-release builds in CI.
+# Override locally with CARGO_PROFILE_RELEASE_DEBUG=2 for full debuginfo.
 [profile.release]
-debug = true
+debug = "line-tables-only"
 
 # Debug builds default to full debuginfo, but the Wasmtime-heavy dev graph can
 # overflow hosted runners. Line tables keep breakpoints and symbolized
@@ -169,7 +172,6 @@ opt-level = 3
 
 [profile.optimized-release]
 inherits = "release"
-debug = false
 lto = true
 debug-assertions = false
 opt-level = 3

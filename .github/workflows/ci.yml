@@ -126,7 +126,9 @@ jobs:
         run: echo "identity=$(rustc -vV | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
 
       - name: Restore Rust cache
-        if: ${{ steps.scope.outputs.scope != 'docs' }}
+        # Ficus keeps compiler outputs in its machine-local Kache store. Only
+        # ephemeral GitHub-hosted runners need the archive-backed Cargo cache.
+        if: ${{ steps.scope.outputs.scope != 'docs' && runner.environment == 'github-hosted' }}
         id: rust-cache
         continue-on-error: true
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -204,7 +206,7 @@ jobs:
         run: cargo nextest run --locked --manifest-path programs/Cargo.toml --profile ci
 
       - name: Save Rust cache
-        if: ${{ !cancelled() && steps.scope.outputs.scope != 'docs' && steps.rust-cache.outputs.cache-primary-key != '' }}
+        if: ${{ !cancelled() && runner.environment == 'github-hosted' && steps.scope.outputs.scope != 'docs' && steps.rust-cache.outputs.cache-primary-key != '' }}
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
