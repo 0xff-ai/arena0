@@ -125,10 +125,10 @@ jobs:
       matrix:
         include:
           - target: darwin-arm64
-            os: macos-14
+            os: blacksmith-6vcpu-macos-15
             release_dir: target/optimized-release
           - target: linux-x64
-            os: ubuntu-22.04
+            os: blacksmith-2vcpu-ubuntu-2204
             release_dir: target/optimized-release
     runs-on: ${{ matrix.os }}
     steps:
