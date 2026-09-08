@@ -1166,7 +1166,7 @@ async fn create_executions(
     let mut exec_ids = vec![None; hosts.len()];
     let creator_exec = ExecId(rand::random());
     exec_ids[0] = Some(creator_exec);
-    let peers = hosts.iter().skip(1).map(|host| host.peer_id).collect();
+    let participant_count = u16::try_from(hosts.len()).context("too many coordinated Hosts")?;
     let created = call_during_creation(
         &creator.client,
         &creator.host,
@@ -1174,7 +1174,7 @@ async fn create_executions(
             exec_id: creator_exec,
             program: program_id.to_string(),
             params,
-            ensemble: EnsembleSpec::Explicit { peers },
+            ensemble: EnsembleSpec::Create { participant_count },
         },
         cancelled,
     )

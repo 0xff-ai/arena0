@@ -234,8 +234,8 @@ pub async fn spawn_live_execution(
         .create_execution_request(
             program.hash(),
             Some(params_json.clone()),
-            ExecutionAdmission::explicit(negotiation_id, peer_ids.clone())
-                .expect("explicit admission"),
+            ExecutionAdmission::create(negotiation_id, peer_ids.len() as u16)
+                .expect("creator admission"),
             2,
         )
         .await

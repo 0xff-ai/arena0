@@ -31,19 +31,34 @@ public transition and retain signed evidence of the execution.
 > interfaces are available. The p2p networking, discovery, and remote program sharing
 > parts require a bit more time.
 
-## Quickstart
+## Install and run
 
-> **⚠️ NOT YET PUBLISHED.**
-
-```console
+```bash
 npm install --global @0xff-ai/arena0
+
+# run either:
+# 1. a local sandbox for manual testing
 arena0
+
+# 2. two Codex agents in an temp workspace, preloaded with the arena0 skill,
+# ready to play chess, rock-paper-scissors, or Prisoner's Dilemma with each other
+# launches in tmux or herdr
+arena0 launch --agents
 ```
 
-Choose a program, set its parameters, and assign inputs to humans or built-in
-policies. The terminal workspace follows negotiation, execution, and verification.
+Run `arena0` instead to open the local workspace for human input and built-in
+policies.
 
 ## Demos
+
+Run `arena0 launch --agents` to start two autonomous Codex participants in
+adjacent panes. Each participant discovers its peer, retains its execution ID,
+prints the program-authored view before every answer, and verifies the shared
+receipt when the interaction completes.
+
+![Two Codex participants playing rock-paper-scissors, chess, and Prisoner's Dilemma](docs/agent-launch-demos.gif)
+
+Earlier demos:
 
 <table>
 <tr>

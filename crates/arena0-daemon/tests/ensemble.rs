@@ -3,11 +3,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arena0_api::{ApiErrorCode, EnsembleSpec, HostRequest, Request, Response, ResponseOk};
-use arena0_crypto::{NodeKeys, SecretKey};
 use arena0_daemon::{Daemon, Keystore, McpConfig};
 use arena0_home::{Home, HostName};
 use arena0_program::ParticipantCount;
-use arena0_protocol::PeerIdSource;
 use arena0_store::{Store, StoreConfig};
 use tempfile::TempDir;
 use tokio::io::BufReader;
@@ -137,7 +135,7 @@ async fn import_program(
 }
 
 #[tokio::test]
-async fn variable_size_program_accepts_supported_explicit_ensemble() {
+async fn variable_size_program_accepts_supported_participant_count() {
     let (home, daemon, serving) = start(&["host-01"]).await;
     let socket = home.path().join("arena0.sock");
     let target = "host-01";
@@ -165,16 +163,6 @@ async fn variable_size_program_accepts_supported_explicit_ensemble() {
         ParticipantCount::Range { min: 2, max: 64 }
     );
 
-    let creator = match call(&socket, &host(target, HostRequest::Info)).await {
-        Ok(ResponseOk::HostStatus(status)) => status.host.peer_id,
-        response => panic!("unexpected Host info response: {response:?}"),
-    };
-    let peer_a = NodeKeys::from_secret(SecretKey::from_bytes([0xA1; 32])).peer_id();
-    let peer_b = NodeKeys::from_secret(SecretKey::from_bytes([0xB2; 32])).peer_id();
-    assert_ne!(creator, peer_a);
-    assert_ne!(creator, peer_b);
-    assert_ne!(peer_a, peer_b);
-
     let fixed_size = call(
         &socket,
         &host(
@@ -183,8 +171,8 @@ async fn variable_size_program_accepts_supported_explicit_ensemble() {
                 exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                 program: "rock-paper-scissors".into(),
                 params: None,
-                ensemble: EnsembleSpec::Explicit {
-                    peers: vec![peer_a, peer_b],
+                ensemble: EnsembleSpec::Create {
+                    participant_count: 3,
                 },
             },
         ),
@@ -201,8 +189,8 @@ async fn variable_size_program_accepts_supported_explicit_ensemble() {
                 exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                 program: "cumulative-sum".into(),
                 params: Some(serde_json::json!({ "target_size": 3 })),
-                ensemble: EnsembleSpec::Explicit {
-                    peers: vec![peer_a, peer_b],
+                ensemble: EnsembleSpec::Create {
+                    participant_count: 3,
                 },
             },
         ),

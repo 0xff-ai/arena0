@@ -9,10 +9,13 @@ use serde_json::Value;
 
 use crate::Ctx;
 
-/// Parse the exact creator and negotiation identifiers accepted by `exec create --join`.
+/// Parse an open join or the exact creator and negotiation identifiers.
 pub(crate) fn parse_join_ensemble(values: &[String]) -> anyhow::Result<EnsembleSpec> {
+    let ([] | [_, _]) = values else {
+        bail!("--join accepts either no values or <creator> <negotiation-id>");
+    };
     let [creator, negotiation_id] = values else {
-        bail!("--join requires exactly <creator> <negotiation-id>");
+        return Ok(EnsembleSpec::Join { target: None });
     };
     let creator = creator
         .parse::<PeerId>()

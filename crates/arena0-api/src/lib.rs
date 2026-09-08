@@ -95,8 +95,8 @@ mod tests {
                     exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                     program: "rock-paper-scissors".into(),
                     params: Some(serde_json::json!({"rounds": 3})),
-                    ensemble: EnsembleSpec::Explicit {
-                        peers: vec![PeerId([2u8; 32])],
+                    ensemble: EnsembleSpec::Create {
+                        participant_count: 2,
                     },
                 },
                 "exec.new",
@@ -217,8 +217,8 @@ mod tests {
                     exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                     program: "rock-paper-scissors".into(),
                     params: Some(serde_json::json!({})),
-                    ensemble: EnsembleSpec::Explicit {
-                        peers: vec![PeerId([2; 32])],
+                    ensemble: EnsembleSpec::Create {
+                        participant_count: 2,
                     },
                 },
                 "params_raw",

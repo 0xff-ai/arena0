@@ -27,7 +27,7 @@ CREATE TABLE exec_requests (
     created_order INTEGER PRIMARY KEY AUTOINCREMENT CHECK (created_order > 0),
     execution_id BLOB NOT NULL UNIQUE CHECK (length(execution_id) = 32),
     program_hash BLOB NOT NULL CHECK (length(program_hash) = 32),
-    -- Explicit requests always carry params; a join may omit its preferred
+    -- Creator requests always carry params; a join may omit its preferred
     -- params until the creator's authenticated offer is available.
     params BLOB CHECK (params IS NULL OR length(params) <= 1024),
     admission BLOB NOT NULL,

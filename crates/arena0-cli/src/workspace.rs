@@ -88,6 +88,7 @@ pub(crate) enum InputControl {
 #[derive(Debug)]
 pub(crate) enum Exit {
     Launch(Launch),
+    Agents(String),
     Quit,
 }
 
@@ -133,10 +134,27 @@ pub(crate) async fn choose(
     if programs.is_empty() {
         bail!("the local program catalog is empty");
     }
-    let (mut terminal, _restore) = crate::terminal::enter()?;
-    let mut events = EventStream::new();
     let mut state = State::new(programs, executions, setup.hosts.len(), !setup.fixed_hosts);
     state.configure(setup);
+    choose_state(state).await
+}
+
+/// Select one two-Participant program and the harness that will run both agents.
+pub(crate) async fn choose_agents(
+    programs: Vec<ProgramDetail>,
+    executions: Vec<ExecStatus>,
+) -> anyhow::Result<Exit> {
+    if programs.is_empty() {
+        bail!("the local program catalog is empty");
+    }
+    let mut state = State::new(programs, executions, 2, false);
+    state.agent_launch = true;
+    choose_state(state).await
+}
+
+async fn choose_state(mut state: State) -> anyhow::Result<Exit> {
+    let (mut terminal, _restore) = crate::terminal::enter()?;
+    let mut events = EventStream::new();
     loop {
         let area = terminal.size().context("read workspace terminal size")?;
         if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
@@ -180,6 +198,7 @@ struct State {
     params: HashMap<ProgramHash, String>,
     hosts: Vec<HostName>,
     can_resize_hosts: bool,
+    agent_launch: bool,
     mode: Mode,
     error: Option<String>,
     palette: TuiPalette,
@@ -208,6 +227,7 @@ impl State {
             params: HashMap::new(),
             hosts: crate::local_daemon::host_names(available_hosts),
             can_resize_hosts,
+            agent_launch: false,
             mode: Mode::Browse,
             error: None,
             palette: TuiPalette::detect(),
@@ -294,128 +314,145 @@ impl State {
                 }
                 None
             }
-            Mode::Browse => match key.code {
-                KeyCode::Tab | KeyCode::BackTab => {
-                    self.setup_focused = !self.setup_focused;
-                    None
-                }
-                KeyCode::Up | KeyCode::Char('k') if self.setup_focused => {
-                    self.setup_scroll = self.setup_scroll.saturating_sub(1);
-                    None
-                }
-                KeyCode::Down | KeyCode::Char('j') if self.setup_focused => {
-                    self.setup_scroll = self.setup_scroll.saturating_add(1);
-                    None
-                }
-                KeyCode::Char('u' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if self.setup_focused {
-                        self.setup_scroll = if key.code == KeyCode::Char('u') {
-                            self.setup_scroll.saturating_sub(8)
-                        } else {
-                            self.setup_scroll.saturating_add(8)
-                        };
-                    } else {
-                        self.selected = if key.code == KeyCode::Char('u') {
-                            self.selected.saturating_sub(8)
-                        } else {
-                            self.selected
-                                .saturating_add(8)
-                                .min(self.programs.len().saturating_sub(1))
-                        };
-                        self.program_changed();
-                    }
-                    None
-                }
-                KeyCode::Char('g' | 'G') => {
-                    if self.setup_focused {
-                        self.setup_scroll = if key.code == KeyCode::Char('g') {
-                            0
-                        } else {
-                            u16::MAX
-                        };
-                    } else {
-                        self.selected = if key.code == KeyCode::Char('g') {
-                            0
-                        } else {
-                            self.programs.len().saturating_sub(1)
-                        };
-                        self.program_changed();
-                    }
-                    None
-                }
-                KeyCode::Char('q') => Some(Ok(Exit::Quit)),
-                KeyCode::Char('?') => {
-                    self.mode = Mode::Help;
-                    None
-                }
-                KeyCode::Up | KeyCode::Char('k') if !self.setup_focused => {
-                    if self.selected > 0 {
-                        self.selected -= 1;
-                        self.program_changed();
-                    }
-                    None
-                }
-                KeyCode::Down | KeyCode::Char('j') if !self.setup_focused => {
-                    if self.selected + 1 < self.programs.len() {
-                        self.selected += 1;
-                        self.program_changed();
-                    }
-                    None
-                }
-                KeyCode::Char('+') | KeyCode::Char('=') => {
-                    self.adjust_participants(1);
-                    None
-                }
-                KeyCode::Char('-') => {
-                    self.adjust_participants(-1);
-                    None
-                }
-                KeyCode::Char('h') => {
-                    self.select_next_human_host();
-                    self.error = None;
-                    None
-                }
-                KeyCode::Char('c')
-                    if !matches!(self.input_control, InputControl::Configured(_)) =>
+            Mode::Browse => {
+                if self.agent_launch
+                    && matches!(
+                        key.code,
+                        KeyCode::Char('+' | '=' | '-' | 'h' | 'c' | 'r' | 'p')
+                    )
                 {
-                    self.input_control = match &self.input_control {
-                        InputControl::OneHost { .. } => InputControl::AllHosts,
-                        InputControl::AllHosts => InputControl::OneHost {
-                            host: self.host_at(0),
-                        },
-                        InputControl::Configured(_) => {
-                            unreachable!("configured bindings are fixed")
-                        }
-                    };
-                    self.error = None;
-                    None
+                    return None;
                 }
-                KeyCode::Char('r') => {
-                    self.replay = !self.replay;
-                    self.error = None;
-                    None
-                }
-                KeyCode::Char('p') => {
-                    let draft = self.params_text().into_owned();
-                    self.mode = Mode::EditParams { draft };
-                    self.error = None;
-                    None
-                }
-                KeyCode::Enter => match self.launch() {
-                    Ok(launch) => Some(Ok(Exit::Launch(launch))),
-                    Err(error) => {
-                        let draft = self.params_text().into_owned();
-                        self.mode = Mode::EditParams { draft };
-                        self.error = Some(error.to_string());
+                match key.code {
+                    KeyCode::Tab | KeyCode::BackTab => {
+                        self.setup_focused = !self.setup_focused;
                         None
                     }
-                },
-                _ => None,
-            },
+                    KeyCode::Up | KeyCode::Char('k') if self.setup_focused => {
+                        self.setup_scroll = self.setup_scroll.saturating_sub(1);
+                        None
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if self.setup_focused => {
+                        self.setup_scroll = self.setup_scroll.saturating_add(1);
+                        None
+                    }
+                    KeyCode::Char('u' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if self.setup_focused {
+                            self.setup_scroll = if key.code == KeyCode::Char('u') {
+                                self.setup_scroll.saturating_sub(8)
+                            } else {
+                                self.setup_scroll.saturating_add(8)
+                            };
+                        } else {
+                            self.selected = if key.code == KeyCode::Char('u') {
+                                self.selected.saturating_sub(8)
+                            } else {
+                                self.selected
+                                    .saturating_add(8)
+                                    .min(self.programs.len().saturating_sub(1))
+                            };
+                            self.program_changed();
+                        }
+                        None
+                    }
+                    KeyCode::Char('g' | 'G') => {
+                        if self.setup_focused {
+                            self.setup_scroll = if key.code == KeyCode::Char('g') {
+                                0
+                            } else {
+                                u16::MAX
+                            };
+                        } else {
+                            self.selected = if key.code == KeyCode::Char('g') {
+                                0
+                            } else {
+                                self.programs.len().saturating_sub(1)
+                            };
+                            self.program_changed();
+                        }
+                        None
+                    }
+                    KeyCode::Char('q') => Some(Ok(Exit::Quit)),
+                    KeyCode::Char('?') => {
+                        self.mode = Mode::Help;
+                        None
+                    }
+                    KeyCode::Up | KeyCode::Char('k') if !self.setup_focused => {
+                        if self.selected > 0 {
+                            self.selected -= 1;
+                            self.program_changed();
+                        }
+                        None
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if !self.setup_focused => {
+                        if self.selected + 1 < self.programs.len() {
+                            self.selected += 1;
+                            self.program_changed();
+                        }
+                        None
+                    }
+                    KeyCode::Char('+') | KeyCode::Char('=') => {
+                        self.adjust_participants(1);
+                        None
+                    }
+                    KeyCode::Char('-') => {
+                        self.adjust_participants(-1);
+                        None
+                    }
+                    KeyCode::Char('h') => {
+                        self.select_next_human_host();
+                        self.error = None;
+                        None
+                    }
+                    KeyCode::Char('c')
+                        if !matches!(self.input_control, InputControl::Configured(_)) =>
+                    {
+                        self.input_control = match &self.input_control {
+                            InputControl::OneHost { .. } => InputControl::AllHosts,
+                            InputControl::AllHosts => InputControl::OneHost {
+                                host: self.host_at(0),
+                            },
+                            InputControl::Configured(_) => {
+                                unreachable!("configured bindings are fixed")
+                            }
+                        };
+                        self.error = None;
+                        None
+                    }
+                    KeyCode::Char('r') => {
+                        self.replay = !self.replay;
+                        self.error = None;
+                        None
+                    }
+                    KeyCode::Char('p') => {
+                        let draft = self.params_text().into_owned();
+                        self.mode = Mode::EditParams { draft };
+                        self.error = None;
+                        None
+                    }
+                    KeyCode::Enter => match self.selection() {
+                        Ok(launch) => Some(Ok(launch)),
+                        Err(error) => {
+                            if !self.agent_launch {
+                                let draft = self.params_text().into_owned();
+                                self.mode = Mode::EditParams { draft };
+                            }
+                            self.error = Some(error.to_string());
+                            None
+                        }
+                    },
+                    _ => None,
+                }
+            }
         }
     }
 
     fn program_changed(&mut self) {
+        if self.agent_launch {
+            self.participants = 2;
+            self.error = None;
+            return;
+        }
         self.participants =
             initial_participants(self.program(), self.hosts.len(), self.can_resize_hosts);
         self.clamp_human_host();
@@ -496,6 +533,20 @@ impl State {
             replay: self.replay,
         })
     }
+
+    fn selection(&mut self) -> anyhow::Result<Exit> {
+        if !self.agent_launch {
+            return self.launch().map(Exit::Launch);
+        }
+        let program = self.program();
+        if !program.summary.participants.accepts(2) {
+            bail!(
+                "{} does not support the two Participants required by agent launch",
+                program.summary.display_name
+            );
+        }
+        Ok(Exit::Agents(program.summary.program_hash.to_string()))
+    }
 }
 
 fn render(frame: &mut Frame<'_>, state: &State) {
@@ -558,7 +609,11 @@ fn render(frame: &mut Frame<'_>, state: &State) {
             error,
         );
     }
-    let keys = if matches!(state.input_control, InputControl::Configured(_)) {
+    let keys = if state.agent_launch {
+        vec![Line::raw(
+            "↑↓ program    Tab pane    Enter launch    ? help    q quit",
+        )]
+    } else if matches!(state.input_control, InputControl::Configured(_)) {
         vec![Line::raw(
             "↑↓ move  Tab pane    p params    r replay    Enter launch    ? help    q quit",
         )]
@@ -697,6 +752,10 @@ fn render_catalog(frame: &mut Frame<'_>, state: &State, area: Rect) {
 }
 
 fn render_setup(frame: &mut Frame<'_>, state: &State, area: Rect) {
+    if state.agent_launch {
+        render_agent_setup(frame, state, area);
+        return;
+    }
     let program = state.program();
     let control_label = match state.input_control {
         InputControl::OneHost { .. } => "[●] One Host    [ ] All Hosts",
@@ -807,6 +866,61 @@ fn render_setup(frame: &mut Frame<'_>, state: &State, area: Rect) {
     } else {
         " RUN SETUP "
     };
+    render_setup_panel(frame, state, area, title, lines);
+}
+
+fn render_agent_setup(frame: &mut Frame<'_>, state: &State, area: Rect) {
+    let program = state.program();
+    let lines = vec![
+        Line::styled(
+            program.summary.display_name.clone(),
+            state.palette.emphasis(),
+        ),
+        Line::styled(program.summary.description.clone(), Style::default()),
+        Line::default(),
+        labeled(state, "Version", program.summary.version.clone()),
+        labeled(
+            state,
+            "Program ID",
+            program.summary.program_hash.fmt_short().to_string(),
+        ),
+        labeled(
+            state,
+            "Participants",
+            program.summary.participants.to_string(),
+        ),
+        Line::default(),
+        Line::styled("HARNESS", state.palette.emphasis()),
+        Line::styled("[●] Codex", state.palette.strong()),
+        Line::default(),
+        Line::styled("SESSIONS", state.palette.emphasis()),
+        labeled(state, "Current pane", "Codex".to_owned()),
+        labeled(state, "New right pane", "Codex".to_owned()),
+        Line::default(),
+        Line::styled(
+            "Two agents discover each other through the program topic.",
+            state.palette.muted(),
+        ),
+        Line::styled(
+            "Runtime state uses an isolated temporary home.",
+            state.palette.muted(),
+        ),
+    ];
+    let title = if state.setup_focused {
+        " AGENT LAUNCH  [FOCUS] "
+    } else {
+        " AGENT LAUNCH "
+    };
+    render_setup_panel(frame, state, area, title, lines);
+}
+
+fn render_setup_panel(
+    frame: &mut Frame<'_>,
+    state: &State,
+    area: Rect,
+    title: &str,
+    lines: Vec<Line<'static>>,
+) {
     let block = panel(
         title,
         if state.setup_focused {
@@ -823,8 +937,12 @@ fn render_setup(frame: &mut Frame<'_>, state: &State, area: Rect) {
         .saturating_sub(usize::from(inner.height));
     let last = u16::try_from(last).unwrap_or(u16::MAX);
     state.setup_scroll_limit.set(last);
-    let scroll = state.setup_scroll.min(last);
-    frame.render_widget(paragraph.scroll((scroll, 0)).block(block), area);
+    frame.render_widget(
+        paragraph
+            .scroll((state.setup_scroll.min(last), 0))
+            .block(block),
+        area,
+    );
 }
 
 fn render_params_editor(frame: &mut Frame<'_>, state: &State, draft: &str) {
@@ -888,33 +1006,51 @@ fn render_params_editor(frame: &mut Frame<'_>, state: &State, draft: &str) {
 }
 
 fn render_help(frame: &mut Frame<'_>, state: &State) {
-    let area = crate::ui::centered(frame.area(), 76, 17);
+    let entries: &[(&str, &str)] = if state.agent_launch {
+        &[
+            (
+                "Tab / Shift-Tab",
+                "Move focus between Programs and Agent Launch",
+            ),
+            ("↑↓ / j/k", "Select a program or scroll Agent Launch"),
+            ("Ctrl-U / Ctrl-D", "Jump up or down in the focused pane"),
+            ("g / G", "First / last position"),
+            ("Enter", "Launch two Codex Participants"),
+            ("q / Ctrl-C", "Quit and stop the isolated local service"),
+            ("? / Esc", "Close help"),
+        ]
+    } else {
+        &[
+            (
+                "Tab / Shift-Tab",
+                "Move focus between Programs and Run Setup",
+            ),
+            ("↑↓ / j/k", "Select a program or scroll Run Setup"),
+            ("Ctrl-U / Ctrl-D", "Jump up or down in the focused pane"),
+            ("g / G", "First / last position"),
+            ("+/-", "Change the exact local Host count"),
+            ("c", "Toggle One Host or All Hosts human control"),
+            ("h", "Select the human-controlled Host in One Host mode"),
+            ("p", "Edit program parameters as JSON"),
+            ("r", "Toggle light verification or full replay"),
+            ("Enter", "Launch the selected program"),
+            ("q / Ctrl-C", "Quit and stop an owned local service"),
+            ("? / Esc", "Close help"),
+        ]
+    };
+    let height = u16::try_from(entries.len().saturating_add(2)).unwrap_or(u16::MAX);
+    let area = crate::ui::centered(frame.area(), 76, height);
     frame.render_widget(Clear, area);
-    let lines = [
-        (
-            "Tab / Shift-Tab",
-            "Move focus between Programs and Run Setup",
-        ),
-        ("↑↓ / j/k", "Select a program or scroll Run Setup"),
-        ("Ctrl-U / Ctrl-D", "Jump up or down in the focused pane"),
-        ("g / G", "First / last position"),
-        ("+/-", "Change the exact local Host count"),
-        ("c", "Toggle One Host or All Hosts human control"),
-        ("h", "Select the human-controlled Host in One Host mode"),
-        ("p", "Edit program parameters as JSON"),
-        ("r", "Toggle light verification or full replay"),
-        ("Enter", "Launch the selected program"),
-        ("q / Ctrl-C", "Quit and stop an owned local service"),
-        ("? / Esc", "Close help"),
-    ]
-    .into_iter()
-    .map(|(key, description)| {
-        Line::from(vec![
-            Span::styled(format!("{key:<18}"), state.palette.strong()),
-            Span::raw(description),
-        ])
-    })
-    .collect::<Vec<_>>();
+    let lines = entries
+        .iter()
+        .copied()
+        .map(|(key, description)| {
+            Line::from(vec![
+                Span::styled(format!("{key:<18}"), state.palette.strong()),
+                Span::raw(description),
+            ])
+        })
+        .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
@@ -1235,6 +1371,58 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(&default_params(&program, 4)).unwrap(),
             serde_json::json!({"target_size": 4, "rounds": 3})
+        );
+    }
+
+    #[test]
+    fn agent_launch_selects_a_two_participant_program_and_ignores_run_controls() {
+        let selected = program(serde_json::json!({"kind":"exact","count":2}));
+        let selected_id = selected.summary.program_hash.to_string();
+        let mut state = State::new(vec![selected], Vec::new(), 2, false);
+        state.agent_launch = true;
+
+        let original_control = state.input_control.clone();
+        for key in ['+', '-', 'c', 'h', 'p', 'r'] {
+            assert!(
+                state
+                    .on_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))
+                    .is_none()
+            );
+        }
+        assert_eq!(state.participants, 2);
+        assert_eq!(state.input_control, original_control);
+        assert!(matches!(state.mode, Mode::Browse));
+        assert!(state.replay);
+
+        let Some(Ok(Exit::Agents(launch))) =
+            state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("two-participant program should launch agents");
+        };
+        assert_eq!(launch, selected_id);
+    }
+
+    #[test]
+    fn agent_launch_keeps_unsupported_programs_open_with_a_visible_error() {
+        let mut state = State::new(
+            vec![program(serde_json::json!({"kind":"exact","count":3}))],
+            Vec::new(),
+            2,
+            false,
+        );
+        state.agent_launch = true;
+
+        assert!(
+            state
+                .on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .is_none()
+        );
+        assert!(matches!(state.mode, Mode::Browse));
+        assert!(
+            state
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("two Participants"))
         );
     }
 }

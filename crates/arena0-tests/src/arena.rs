@@ -304,7 +304,7 @@ impl Arena {
             let recompute_wasm = wasm.clone();
             let mut execution_store = host.claim_execution(exec_id).expect("execution claim");
             let admission = if i == 0 {
-                ExecutionAdmission::explicit(negotiation_id, peer_ids.clone())
+                ExecutionAdmission::create(negotiation_id, n as u16)
                     .expect("valid creator admission")
             } else {
                 ExecutionAdmission::join(identities[0].peer_id, negotiation_id)

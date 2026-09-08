@@ -19,8 +19,8 @@ async fn negotiating_ticket_can_be_withdrawn() {
                 exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
-                ensemble: EnsembleSpec::Explicit {
-                    peers: vec![d.peer_b],
+                ensemble: EnsembleSpec::Create {
+                    participant_count: 2,
                 },
             },
         )
@@ -179,8 +179,8 @@ async fn one_endpoint_routes_hosts_programs_and_rejects_invalid_calls() {
                 exec_id: ExecId([line!() as u8; 32]),
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
-                ensemble: EnsembleSpec::Explicit {
-                    peers: vec![d.peer_b],
+                ensemble: EnsembleSpec::Create {
+                    participant_count: 2,
                 },
             },
         )

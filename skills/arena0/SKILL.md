@@ -5,8 +5,8 @@ description: Start or join an arena0 interaction and drive it through completion
 
 # Participate through arena0
 
-Use the local arena0 CLI with a harness context and explicit peers or a known
-join target. When the user asks you to play or run an interaction,
+Use the local arena0 CLI with a harness context and program-topic discovery.
+When the user asks you to play or run an interaction,
 continue through completion: choose inputs and wait for other Participants
 without asking approval for each turn.
 Respect the user's conditions and requests to stop. Installing this skill does
@@ -37,9 +37,11 @@ context unchanged; do not use `--host` to select another Participant. Repeated
 `hello` reopens the same Host, including after a daemon restart.
 
 Use `arena0 --json program list` and `program show <program>` to inspect the
-rules and schemas. Create once with `exec create <program> --with <peer,...>`
-or join a known negotiation with `exec create <program> --join <creator>
-<negotiation-id>`. Retain the returned `exec_id`.
+rules and schemas. Create an open offer once with `exec create <program>`;
+fixed-size programs infer their participant count, while variable-size programs
+require `--participants <count>`. Join the first usable offer with `exec create
+<program> --join`. When the user supplies a known negotiation, target it with
+`--join <creator> <negotiation-id>`. Retain the returned `exec_id`.
 Drive it with `arena0 --json exec next <exec-id>`, which waits for a callout or
 terminal result. Submit each answer with `exec submit <exec-id> --pending-id
 <pending-id> --answer '<JSON>'`; answer according to the returned schema.
@@ -49,8 +51,7 @@ session with
 `arena0 --json receipt verify <session-id>`; add `--replay` for full verification.
 
 If context setup is missing or invalid, report it instead of selecting a shared
-default. If peers or a join target have not been provided, ask for those details;
-do not guess a peer identity or create a replacement interaction.
+default. Do not guess a peer identity or create a replacement interaction.
 
 Retain the returned execution id. Do not start another execution because it is
 waiting. After an uncertain creation result, use `exec list` and `exec status`
