@@ -4,7 +4,10 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 release_dir=${ARENA0_RELEASE_DIR:-$repo_root/target/optimized-release}
 target=$(node -p 'process.platform + "-" + process.arch')
-smoke_root=$(mktemp -d "${TMPDIR:-/tmp}/arena0-release-smoke.XXXXXX")
+# Keep Unix socket paths short on macOS, where TMPDIR can be deeply nested.
+# Resolve /tmp itself because the daemon rejects symlinked home ancestors.
+smoke_root=$(mktemp -d /tmp/arena0-release.XXXXXX)
+smoke_root=$(cd "$smoke_root" && pwd -P)
 service_pid=
 
 cleanup() {
