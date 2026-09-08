@@ -22,6 +22,12 @@ rustup target add "$target"
   cd programs
   cargo run --locked --manifest-path ../Cargo.toml -p cargo-arena0 -- build
 )
+# AWS-LC prefers HOST_CC/HOST_CXX when the Rust host and target triples match,
+# even though this build targets an older glibc. Override native compiler
+# defaults only for this invocation so C objects use the same baseline as the
+# Zig linker. The configured Rust compiler wrapper remains in effect.
+HOST_CC="cargo-zigbuild zig cc -- -target x86_64-linux-gnu.2.35" \
+HOST_CXX="cargo-zigbuild zig c++ -- -target x86_64-linux-gnu.2.35" \
 cargo zigbuild --locked --profile optimized-release --target "$target.2.35" \
   -p arena0-cli -p arena0d -p cargo-arena0
 target_dir=$(cargo metadata --no-deps --format-version 1 | node -e \
