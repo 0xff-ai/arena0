@@ -27,10 +27,10 @@ jobs:
   # Steps are ordered fast-fail: formatting and clippy run before the test phase.
   check:
     name: fmt + clippy + test
-    # Main pushes and PRs from repository-trusted authors use the persistent runner.
+    # Main pushes and same-repository PRs use Ficus; fork PRs use a hosted runner.
     runs-on: >-
       ${{ (github.event_name == 'push' ||
-          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association))
+          github.event.pull_request.head.repo.full_name == github.repository)
           && 'arena0-ficus' || 'ubuntu-26.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
