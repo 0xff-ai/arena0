@@ -21,7 +21,7 @@ jobs:
             os: macos-14
             release_dir: target/optimized-release
           - target: linux-x64
-            os: ubuntu-26.04
+            os: arena0-ficus
             release_dir: target/x86_64-unknown-linux-gnu/optimized-release
     runs-on: ${{ matrix.os }}
     steps:
@@ -38,6 +38,8 @@ jobs:
         run: echo "identity=$(rustc -vV | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
 
       - name: Restore Rust cache
+        # Ficus uses its configured machine-local compiler cache.
+        if: runner.environment == 'github-hosted'
         id: rust-cache
         continue-on-error: true
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -68,8 +70,9 @@ jobs:
 
       - name: Build public executables
         if: matrix.target == 'darwin-arm64'
-        run: cargo build --locked --profile optimized-release \
-          -p arena0-cli -p arena0d -p cargo-arena0
+        run: |
+          cargo build --locked --profile optimized-release \
+            -p arena0-cli -p arena0d -p cargo-arena0
 
       - name: Install Zig
         if: matrix.target == 'linux-x64'
@@ -120,7 +123,7 @@ jobs:
           retention-days: 90
 
       - name: Save Rust cache
-        if: ${{ !cancelled() && steps.rust-cache.outputs.cache-primary-key != '' }}
+        if: ${{ !cancelled() && runner.environment == 'github-hosted' && steps.rust-cache.outputs.cache-primary-key != '' }}
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
