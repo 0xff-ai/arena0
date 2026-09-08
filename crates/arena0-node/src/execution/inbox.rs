@@ -3,7 +3,7 @@
 //! Transport readers only enqueue deliveries. This module performs the
 //! durable acceptance, frame classification, and reducer application.
 
-use arena0_protocol::ExecFrame;
+use arena0_protocol::{ExecFrame, StepCommitment};
 use arena0_store::{ApplyOutcome, InboxAcceptOutcome, PendingInboxItem, StoreError};
 use arena0_transport::{ExecDelivery, ExecDeliveryRejection};
 
@@ -81,43 +81,8 @@ impl ExecutionActor {
                     .apply_message(item.source(), frame, Some(item.inbox_id()))
                     .await?;
             }
-            ExecFrame::StepSignature { .. } => {
-                let state = self.load_state().await?;
-                if state.pending_shared().is_none() {
-                    // A participant can publish its signature as soon as it
-                    // applies a proposal. Another participant may receive
-                    // that signature before the proposal's message itself.
-                    // The inbox acceptance above is already the durable
-                    // responsibility boundary; retain the fact until the
-                    // causal proposal is present instead of consuming a
-                    // valid signature as stale.
-                    if state.status().is_terminal() {
-                        self.reject_inbound(item.inbox_id()).await?;
-                    }
-                    return Ok(());
-                }
-                let outcome = self
-                    .context
-                    .store
-                    .apply_inbound(item.inbox_id(), now_ms())
-                    .await;
-                match outcome {
-                    Ok(outcome) => {
-                        self.emit_trace_appended(&outcome).await;
-                        match outcome {
-                            ApplyOutcome::VersionMismatch { .. } => Ok(()),
-                            ApplyOutcome::Conflict(_) => self.reject_inbound(item.inbox_id()).await,
-                            ApplyOutcome::InboxAlreadyApplied { .. }
-                            | ApplyOutcome::InboxAlreadyConsumed { .. }
-                            | ApplyOutcome::AlreadyApplied
-                            | ApplyOutcome::Committed(_) => Ok(()),
-                        }
-                    }
-                    Err(StoreError::InboxInputMismatch { .. }) => {
-                        self.reject_inbound(item.inbox_id()).await
-                    }
-                    Err(error) => Err(error.into()),
-                }?;
+            ExecFrame::StepSignature { ref commitment, .. } => {
+                self.resolve_step_signature(&item, commitment).await?;
             }
             ExecFrame::End { .. } => {
                 let state = self.load_state().await?;
@@ -163,6 +128,54 @@ impl ExecutionActor {
             }
         }
         Ok(())
+    }
+
+    async fn resolve_step_signature(
+        &mut self,
+        item: &PendingInboxItem,
+        commitment: &StepCommitment,
+    ) -> Result<(), ExecError> {
+        let state = self.load_state().await?;
+        let Some(proposal) = state.pending_shared() else {
+            // A participant can publish its signature as soon as it applies a
+            // proposal. Another participant may receive that signature before
+            // the proposal's message itself. Retain the accepted fact until
+            // the causal proposal is present.
+            if state.status().is_terminal() {
+                self.reject_inbound(item.inbox_id()).await?;
+            }
+            return Ok(());
+        };
+        if !proposal.entry().is_terminal()
+            && proposal.commitment().step.checked_add(1) == Some(commitment.step)
+        {
+            // N-of-N agreement limits an honest participant to one proposal
+            // ahead. Applying that signature to the current proposal would
+            // reject and consume evidence that becomes valid at the next head.
+            return Ok(());
+        }
+        let outcome = self
+            .context
+            .store
+            .apply_inbound(item.inbox_id(), now_ms())
+            .await;
+        match outcome {
+            Ok(outcome) => {
+                self.emit_trace_appended(&outcome).await;
+                match outcome {
+                    ApplyOutcome::VersionMismatch { .. } => Ok(()),
+                    ApplyOutcome::Conflict(_) => self.reject_inbound(item.inbox_id()).await,
+                    ApplyOutcome::InboxAlreadyApplied { .. }
+                    | ApplyOutcome::InboxAlreadyConsumed { .. }
+                    | ApplyOutcome::AlreadyApplied
+                    | ApplyOutcome::Committed(_) => Ok(()),
+                }
+            }
+            Err(StoreError::InboxInputMismatch { .. }) => {
+                self.reject_inbound(item.inbox_id()).await
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn reject_inbound(&mut self, inbox_id: arena0_store::InboxId) -> Result<(), ExecError> {
