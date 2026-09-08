@@ -315,6 +315,7 @@ fn codex_session(
             "--cd",
         ])
         .arg(workspace)
+        .args(["exec", "--skip-git-repo-check", "--color", "always"])
         .arg(prompt)
         .current_dir(workspace)
         .env_remove("ARENA0_SOCKET")
@@ -343,7 +344,7 @@ fn shell_session(
     };
     let marker = quote_path(marker)?;
     Ok(format!(
-        "status=1; unset ARENA0_SOCKET ARENA0_HOST CODEX_THREAD_ID; export ARENA0_HOME={home} ARENA0_CACHE_DIR={cache} ARENA0_CONTEXT={context}; cd {workspace} && codex --ask-for-approval never --sandbox workspace-write --cd {workspace} {prompt}; status=$?; tmp={marker}.tmp.$$; printf '%s\\n' \"$status\" > \"$tmp\" && mv \"$tmp\" {marker} || exit 125; exit \"$status\"",
+        "status=1; unset ARENA0_SOCKET ARENA0_HOST CODEX_THREAD_ID; export ARENA0_HOME={home} ARENA0_CACHE_DIR={cache} ARENA0_CONTEXT={context}; cd {workspace} && codex --ask-for-approval never --sandbox workspace-write --cd {workspace} exec --skip-git-repo-check --color always {prompt}; status=$?; tmp={marker}.tmp.$$; printf '%s\\n' \"$status\" > \"$tmp\" && mv \"$tmp\" {marker} || exit 125; exit \"$status\"",
         home = quote_path(home.root())?,
         cache = quote_path(home.cache_dir())?,
         context = crate::harness_hook::shell_quote(context),
@@ -420,6 +421,24 @@ mod tests {
         assert!(creator.contains("arena0 exec view <EXEC_ID>"));
         assert!(creator.contains("Narrate each state and action concisely with an emoji"));
 
+        let left = codex_session(
+            Path::new("/tmp/work"),
+            Path::new("/tmp/home"),
+            Path::new("/tmp/cache"),
+            "arena0-launch:session:left",
+            creator,
+        );
+        let left_args = left
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(
+            left_args
+                .windows(2)
+                .any(|args| args == ["exec", "--skip-git-repo-check"])
+        );
+
         let command = shell_session(
             Path::new("/tmp/work"),
             &Home::from_root("/tmp/home".into()).unwrap(),
@@ -429,6 +448,7 @@ mod tests {
         )
         .unwrap();
         assert!(command.contains("--ask-for-approval never"));
+        assert!(command.contains("exec --skip-git-repo-check --color always"));
         assert!(command.contains("ARENA0_CONTEXT='arena0-launch:session:right'"));
     }
 }
