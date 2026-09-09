@@ -73,3 +73,28 @@ After stabilization, one integration owner runs the full gate. Workers run
 their assigned checks, and successful evidence is reused until relevant inputs
 change. See the [CI workflow](../.github/workflows/ci.yml) and
 [release workflow](../.github/workflows/release.yml) for the job wiring.
+
+## Published npm agent demos
+
+The [published npm demo workflow](../.github/workflows/npm-agent-demos.yml) runs
+only after pushes to `main`. It installs the current public
+`@0xff-ai/arena0` package into a clean Docker image, launches Chess,
+Prisoner's Dilemma, and Rock-Paper-Scissors with two autonomous Codex
+Participants, visits all six monitor views, and requires completed executions
+with matching Light-verified session receipts. The three demos run in parallel
+with low reasoning effort and fixed legal strategies, including a four-ply
+Fool's Mate for Chess. Each container has a ten-minute deadline, and the job
+retains its tmux transcripts and monitor captures as a CI artifact.
+
+Configure the `OPENAI_API_KEY` repository secret to enable the workflow. Until
+that secret exists, the job records a skip in its step summary without creating
+a credential file. To reproduce the same run locally, place the key in a
+mode-`0600` file and pass its path to the runner:
+
+```sh
+scripts/test-npm-agent-demos.sh /path/to/openai-api-key
+```
+
+The runner mounts that file read-only into each disposable container and feeds
+it to `codex login` on standard input. It defaults to the latest published
+arena0 package; set `ARENA0_NPM_VERSION` to test an exact registry version.
