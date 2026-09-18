@@ -1,6 +1,7 @@
 use super::*;
 use arena0_client::api::{
-    ExecStatusState, HostInfo, PrivateEffectSummary, PrivateEventKind, SessionStatus,
+    EffectKind, EffectSummary, EventKind, EventRecordSummary, ExecStatusState, HostInfo,
+    SessionStatus,
 };
 use std::time::Duration;
 
@@ -97,26 +98,25 @@ fn negotiation_progress_uses_only_the_selected_host_events() {
     assert_eq!(negotiation::latest_ticket_progress(&state), Some((0, 2)));
 }
 
-fn inspection(host_number: u8, sequence: u64) -> ExecutionInspection {
+fn inspection(host_number: u8, event_position: u64) -> ExecutionInspection {
     let mut status = active_status();
     status.exec_id = arena0_client::protocol::ExecId([host_number; 32]);
     ExecutionInspection {
         status,
         activation: None,
-        private_from: 0,
-        private: vec![PrivateCommitSummary {
-            sequence,
-            public_position: 2,
-            event: PrivateEventKind::InputReceived,
+        events_from: 0,
+        events: vec![EventRecordSummary {
+            event_position,
+            agreed_steps: vec![2],
+            event: EventKind::InputReceived,
             input_payload_bytes: Some(12),
-            effects: vec![PrivateEffectSummary {
-                kind: PrivateEffectKind::Broadcast,
+            effects: vec![EffectSummary {
+                kind: EffectKind::Broadcast,
                 payload_bytes: Some(8),
             }],
-            fuel_used: 7,
         }],
-        private_total: 1,
-        private_next: None,
+        events_total: 1,
+        events_next: None,
     }
 }
 
@@ -875,7 +875,7 @@ fn compare_scope_keeps_distinct_hosts_and_reconciles_hidden_events() {
 }
 
 #[test]
-fn private_crossings_are_aggregated_by_host_without_payloads() {
+fn event_records_are_aggregated_by_host_without_payloads() {
     let mut state = ScreenState::new(config());
     state.apply(RunUpdate::Inspection {
         host: "host-01".parse().expect("valid Host name"),
@@ -891,7 +891,7 @@ fn private_crossings_are_aggregated_by_host_without_payloads() {
         state
             .inspections
             .values()
-            .map(|inspection| inspection.private.len())
+            .map(|inspection| inspection.events.len())
             .sum::<usize>(),
         2
     );
@@ -899,20 +899,20 @@ fn private_crossings_are_aggregated_by_host_without_payloads() {
         state
             .inspections
             .values()
-            .map(|inspection| inspection.private_total)
+            .map(|inspection| inspection.events_total)
             .sum::<u64>(),
         2
     );
 }
 
 #[test]
-fn wasm_page_keys_request_the_selected_hosts_adjacent_private_page() {
+fn wasm_page_keys_request_the_selected_hosts_adjacent_event_page() {
     let host = first_host();
     let mut state = ScreenState::new(config());
     let mut page = inspection(1, 300);
-    page.private_from = 256;
-    page.private_total = 700;
-    page.private_next = Some(512);
+    page.events_from = 256;
+    page.events_total = 700;
+    page.events_next = Some(512);
     state.apply(RunUpdate::Inspection {
         host: host.clone(),
         inspection: Box::new(page),
@@ -921,8 +921,8 @@ fn wasm_page_keys_request_the_selected_hosts_adjacent_private_page() {
 
     state.on_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE));
     assert_eq!(
-        state.private_page_request.take(),
-        Some(PrivatePageRequest {
+        state.event_page_request.take(),
+        Some(EventPageRequest {
             host: host.clone(),
             from: Some(0),
         })
@@ -930,8 +930,8 @@ fn wasm_page_keys_request_the_selected_hosts_adjacent_private_page() {
 
     state.on_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE));
     assert_eq!(
-        state.private_page_request.take(),
-        Some(PrivatePageRequest {
+        state.event_page_request.take(),
+        Some(EventPageRequest {
             host,
             from: Some(512),
         })
@@ -939,11 +939,7 @@ fn wasm_page_keys_request_the_selected_hosts_adjacent_private_page() {
 }
 
 #[test]
-fn private_crossings_use_the_preceding_public_step_without_inventing_one() {
-    assert_eq!(wasm::private_parent_step(0), None);
-    assert_eq!(wasm::private_parent_step(1), Some(0));
-    assert_eq!(wasm::private_parent_step(2), Some(1));
-
+fn event_records_use_host_local_event_positions() {
     let mut state = ScreenState::new(config());
     state.apply(RunUpdate::Inspection {
         host: "host-01".parse().expect("valid Host name"),
@@ -952,13 +948,10 @@ fn private_crossings_use_the_preceding_public_step_without_inventing_one() {
 
     assert_eq!(
         wasm::keys(&state),
-        vec![
-            CrossingKey::Boundary { after_position: 2 },
-            CrossingKey::Private {
-                host: "host-01".parse().expect("valid Host name"),
-                sequence: 3,
-            },
-        ]
+        vec![CrossingKey::Event {
+            host: "host-01".parse().expect("valid Host name"),
+            event_position: 3,
+        },]
     );
     assert!(!wasm::keys(&state).contains(&CrossingKey::Public { step: 2 }));
 }
@@ -1075,21 +1068,18 @@ fn receipt_evidence_is_host_owned_and_progress_is_aggregate() {
     state.apply(RunUpdate::ReceiptVerified {
         host: first_host(),
         peer_id: PeerId([1; 32]),
-        tier: "peer_id",
     });
     state.apply(RunUpdate::ReceiptVerified {
         host: "host-02".parse().expect("valid Host name"),
         peer_id: PeerId([2; 32]),
-        tier: "peer_id",
     });
     state.apply(RunUpdate::VerificationProgress {
         verified: 2,
         total: 2,
-        tier: "aggregate",
     });
     assert_eq!(state.receipts.len(), 2);
     assert_eq!(state.receipts[0].host, first_host());
-    assert_eq!(state.verification_progress, Some((2, 2, "aggregate")));
+    assert_eq!(state.verification_progress, Some((2, 2)));
 }
 
 #[test]
@@ -1548,18 +1538,16 @@ fn monitor_trace_detail_decodes_messages_and_scrolls_inspector() {
         .map(|step| TraceEntry {
             trace_version: arena0_client::protocol::TRACE_FORMAT_VERSION,
             step,
-            event: PublicEvent::MessageReceived {
+            event: TraceEvent::MessageReceived {
                 message_id: arena0_client::protocol::MessageId([step as u8; 32]),
                 from: PeerId([1; 32]),
                 position: step,
                 pre_state: arena0_client::protocol::StateHash([step as u8; 32]),
                 msg: (step as u32).to_le_bytes().to_vec(),
             },
-            effects: Vec::new(),
             pre_state: arena0_client::protocol::StateHash([step as u8; 32]),
             post_state: arena0_client::protocol::StateHash([(step + 1) as u8; 32]),
-            fuel_used: 1,
-            witness: None,
+            terminal: None,
             agreement: arena0_client::protocol::AggregateAttestation::empty(),
         })
         .collect();
@@ -1596,7 +1584,7 @@ fn monitor_trace_detail_decodes_messages_and_scrolls_inspector() {
         state
             .monitor_projection()
             .expect("projection")
-            .selected_public_position,
+            .selected_step,
         Some(1)
     );
     state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1669,7 +1657,7 @@ fn monitor_submission_routes_to_exact_callout_and_closes_selected_composer() {
 async fn tui_session_join_can_be_cancelled_and_retried() {
     let (updates, _receiver) = mpsc::channel(1);
     let (_width, width_receiver) = watch::channel(80);
-    let (_private_page, private_receiver) = watch::channel(None);
+    let (_event_page, event_receiver) = watch::channel(None);
     let (done_sender, done_receiver) = oneshot::channel();
     let task = tokio::spawn(async move {
         let _ = done_receiver.await;
@@ -1679,7 +1667,7 @@ async fn tui_session_join_can_be_cancelled_and_retried() {
         handle: TuiHandle {
             updates,
             width: width_receiver,
-            private_page: private_receiver,
+            event_page: event_receiver,
         },
         task: Some(task),
     };

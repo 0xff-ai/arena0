@@ -99,6 +99,7 @@ impl Shared {
 )]
 pub mod cumulative_sum {
     use super::*;
+    use arena0::ProgramTransition;
 
     type Shared = super::Shared;
     type Local = super::Local;
@@ -117,9 +118,8 @@ pub mod cumulative_sum {
             .and_then(|index| Participant::try_from(index).ok())
     }
 
-    fn view(ctx: &SharedContext, vp: &Viewport) -> View {
-        let state = ctx.shared();
-        let participant_count = participant_count(ctx);
+    fn view(state: &Shared, ensemble: &Ensemble, vp: &Viewport) -> View {
+        let participant_count = participant_count(ensemble);
         let target = target_total(participant_count);
         let display_total = state.display_total();
 
@@ -127,7 +127,7 @@ pub mod cumulative_sum {
             .header(vp.fit_text(format!(
                 "Cumulative sum - total {display_total} of target {target}"
             )))
-            .agents(vp.fit_text(render_agents(ctx, participant_count)))
+            .agents(vp.fit_text(render_agents(state, ensemble, participant_count)))
             .state(vp.fit_text(render_state(
                 state,
                 participant_count,
@@ -145,8 +145,8 @@ pub mod cumulative_sum {
             )))
     }
 
-    fn participant_count(ctx: &SharedContext) -> usize {
-        ctx.ensemble().len()
+    fn participant_count(ensemble: &Ensemble) -> usize {
+        ensemble.len()
     }
 
     fn target_total(participant_count: usize) -> u64 {
@@ -154,9 +154,8 @@ pub mod cumulative_sum {
         (participant_count as u64).saturating_mul(1000)
     }
 
-    fn render_agents(ctx: &SharedContext, participant_count: usize) -> String {
+    fn render_agents(_state: &Shared, ensemble: &Ensemble, participant_count: usize) -> String {
         let mut agents = String::new();
-        let ensemble = ctx.ensemble();
         for idx in 0..participant_count {
             let Ok(participant) = Participant::try_from(idx) else {
                 continue;
@@ -217,7 +216,7 @@ pub mod cumulative_sum {
         }
     }
 
-    fn initialize(ctx: &mut SharedContext, params: Params) -> Result<(), ProgramFault> {
+    fn initialize(shared: &mut Shared, params: Params) -> Result<(), ProgramFault> {
         if params.target_size < 2 {
             return Err(anyhow!("cumulative-sum needs at least two participants").into());
         }
@@ -225,50 +224,53 @@ pub mod cumulative_sum {
             return Err(anyhow!("participant count must fit in u8").into());
         }
 
-        ctx.mutate_shared(|s| {
-            s.contributions = vec![None; params.target_size as usize];
-        });
+        shared.contributions = vec![None; params.target_size as usize];
         Ok(())
     }
 
     /// Position-0 boundary: size the contributions buffer to the committed
-    /// ensemble. Shared handler, so it draws no entropy and broadcasts nothing;
+    /// ensemble. The session-start handler draws no entropy and broadcasts nothing;
     /// that is `on_react`'s job.
     fn on_session_started(
-        ctx: &mut SharedContext,
+        ctx: &mut Context<Shared, Local>,
         ensemble: &arena0::Ensemble,
-    ) -> Result<Transition<Phase>, ProgramFault> {
+    ) -> Result<ProgramTransition<CumulativeSum>, ProgramFault> {
         let n = ensemble.len();
-        ctx.mutate_shared(|s| s.contributions = vec![None; n]);
+        ctx.shared_mut().contributions = vec![None; n];
         Ok(Transition::Stay)
     }
 
-    /// Local decision hook: draw this node's contribution once and broadcast it.
-    /// The value lands in shared state when the broadcast applies through
-    /// `on_message` at this node's canonical position (self-delivery included).
+    /// Local decision hook: draw this node's contribution, apply it to shared
+    /// state, and broadcast it in the same dispatch.
     /// Unique-writer rule: only the first participant with an empty slot may
     /// broadcast, so concurrent Reacts never produce sibling candidates at
     /// one position.
-    fn on_react(ctx: &mut Context) -> Result<(), ProgramFault> {
-        if ctx.shared().expected_writer() != Some(ctx.me().index()) {
-            return Ok(());
+    fn on_react(
+        ctx: &mut Context<Shared, Local>,
+    ) -> Result<ProgramTransition<CumulativeSum>, ProgramFault> {
+        let from = ctx.me();
+        if ctx.shared().expected_writer() != Some(from.index()) {
+            return Ok(Transition::Stay);
         }
         if ctx.local().sent {
-            return Ok(());
+            return Ok(Transition::Stay);
         }
         let mut buf = [0u8; 8];
         ctx.random(&mut buf);
         let value = u64::from_le_bytes(buf) % 1000;
+        let n = ctx.ensemble().len();
+        apply_contribution(ctx.shared_mut(), from, value);
+        let transition = finalize_if_ready(ctx.shared_mut(), n);
         ctx.effects().broadcast(&Message::Contribute { value });
         ctx.mutate_local(|s| s.sent = true);
-        Ok(())
+        Ok(transition)
     }
 
     fn on_message(
-        ctx: &mut SharedContext,
+        ctx: &mut Context<Shared, Local>,
         from: Participant,
         msg: Message,
-    ) -> Result<ApplyDecision<Phase>, ProtocolFault> {
+    ) -> MessageApply<CumulativeSum> {
         let Message::Contribute { value } = msg;
         // Unique-writer rule: only the expected writer's message applies;
         // anyone else is a deterministic reject (no sibling candidates).
@@ -278,35 +280,32 @@ pub mod cumulative_sum {
         let n = ctx.ensemble().len();
         // Key the contribution by the AUTHENTICATED sender, never a value the
         // message could spoof: `from` is resolved from the signed transport peer.
-        let slot = from.index();
-        ctx.mutate_shared(|s| {
-            if let Some(c) = s.contributions.get_mut(slot) {
-                *c = Some(value);
-            }
-        });
-        Ok(ApplyDecision::Accept(finalize_if_ready(ctx, n)))
+        apply_contribution(ctx.shared_mut(), from, value);
+        Ok(ApplyDecision::Accept(finalize_if_ready(
+            ctx.shared_mut(),
+            n,
+        )))
     }
 
-    fn on_query(_ctx: &SharedContext, _: ()) {}
+    fn on_query(_shared: &Shared, _: ()) {}
 
     /// Once every participant has contributed, write the agreed total to shared
     /// state and end the session.
-    fn finalize_if_ready(ctx: &mut SharedContext, n: usize) -> Transition<Phase> {
-        let count = ctx
-            .shared()
-            .contributions
-            .iter()
-            .filter(|c| c.is_some())
-            .count();
+    fn finalize_if_ready(state: &mut Shared, n: usize) -> ProgramTransition<CumulativeSum> {
+        let count = state.contributions.iter().filter(|c| c.is_some()).count();
         if count != n {
             return Transition::Stay;
         }
-        let total: u64 = ctx.shared().contributions.iter().flatten().sum();
-        ctx.mutate_shared(|s| {
-            s.total = total;
-            s.finalized = true;
-        });
+        let total: u64 = state.contributions.iter().flatten().sum();
+        state.total = total;
+        state.finalized = true;
         Transition::End
+    }
+
+    fn apply_contribution(state: &mut Shared, from: Participant, value: u64) {
+        if let Some(slot) = state.contributions.get_mut(from.index()) {
+            *slot = Some(value);
+        }
     }
 }
 
@@ -339,10 +338,10 @@ mod tests {
     fn view_renders_contributions_table_and_bar(h: ()) {
         let started = h.session_started(peer_a());
         assert!(matches!(started.fault, FaultStatus::None));
-        // Unique-writer rule: the first empty slot's participant contributes
-        // (the harness's local peer sorts to index 0).
-        let local = h.peer_id();
-        let contributed = h.message(local, Message::Contribute { value: 250 });
+        // Session start's reaction fills the local P0 slot. The remote P1
+        // contribution is then applied at the message boundary.
+        let remote = peer_a();
+        let contributed = h.message(remote, Message::Contribute { value: 250 });
         assert!(matches!(contributed.fault, FaultStatus::None));
 
         let view = h.view(Viewport {
@@ -367,8 +366,7 @@ mod tests {
     )]
     fn view_mono_contains_no_sgr(h: ()) {
         h.session_started(peer_a());
-        let local = h.peer_id();
-        h.message(local, Message::Contribute { value: 250 });
+        h.message(peer_a(), Message::Contribute { value: 250 });
 
         let view = h.view(Viewport {
             width: 80,

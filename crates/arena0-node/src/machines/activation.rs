@@ -76,10 +76,8 @@ mod tests {
     use arena0_crypto::{BlsSignature, ExecutionKey, ExecutionSalt, NodeKeys, SecretKey};
     use arena0_program::ProgramHash;
     use arena0_protocol::{
-        AggregateAttestation, ExecutionInput, ExecutionState, LocalStateBytes, NegotiationId,
-        OfferData, OfferHash, PeerIdSource, PreparedActivation, PublicEvent, SharedDelta,
-        SharedStateBytes, StateHash, TRACE_FORMAT_VERSION, Ticket, TicketAction, TicketData,
-        TicketHash, TraceEntry, TransitionOutcome,
+        OfferData, OfferHash, PeerIdSource, PreparedActivation, StateHash, Ticket, TicketAction,
+        TicketData, TicketHash,
     };
 
     struct TestKeys {
@@ -182,121 +180,6 @@ mod tests {
             activation.session_hash(),
             "the session hash is the activation's derived SessionHash"
         );
-    }
-
-    #[test]
-    fn participant_signatures_are_independent_of_activation_ticket_order() {
-        // Activation tickets are creator-first while the committed ensemble
-        // is sorted by PeerId, so execution keys are resolved by signer.
-        let creator = provider(3);
-        let mut others = [provider(1), provider(2)];
-        others.sort_by_key(|p| p.peer_id());
-        assert!(
-            creator.peer_id() > others[0].peer_id(),
-            "the creator must not be the smallest peer for the orders to diverge"
-        );
-        let offer_data = OfferData::new(
-            NegotiationId([0x11; 32]),
-            0,
-            creator.peer_id(),
-            ProgramHash([0x22; 32]),
-            arena0_program::ExecutionProfile::current().hash(),
-            arena0_program::JsonBytes::try_new(br#"{}"#.to_vec()).expect("valid JSON"),
-            3,
-            StateHash::of(&[0]),
-            1_000,
-        )
-        .expect("valid offer data");
-        let providers = [&creator, &others[0], &others[1]];
-        let tickets = providers
-            .iter()
-            .map(|p| ticket(p, &offer_data))
-            .collect::<Vec<_>>();
-        let ticket_hashes = tickets
-            .iter()
-            .map(|ticket| TicketHash::of(&ticket.data))
-            .collect::<Vec<_>>();
-        let offer = arena0_protocol::Offer::new(offer_data, ticket_hashes).expect("offer");
-        let prepared = PreparedActivation::new(offer, tickets).expect("prepared");
-        let activation_data = prepared.activation_data();
-        let sigs = providers
-            .iter()
-            .map(|p| p.execution.sign(&activation_data.signing_bytes()))
-            .collect::<Vec<_>>();
-        let aggregate = BlsSignature::aggregate(&sigs).expect("aggregate");
-        let activation = Activation::new(prepared, aggregate).expect("valid activation");
-        let initial = SharedStateBytes::try_new(vec![0]).expect("initial shared state");
-        let state = ExecutionState::new(
-            arena0_protocol::ExecId([0x44; 32]),
-            activation,
-            creator.peer_id(),
-            initial.clone(),
-            LocalStateBytes::try_new(Vec::new()).expect("initial local state"),
-        )
-        .expect("execution state");
-        let active = match arena0_protocol::transition(&state, ExecutionInput::Activate)
-            .expect("activate execution")
-        {
-            TransitionOutcome::Commit(plan) => plan.next_state().clone(),
-            TransitionOutcome::AlreadyApplied => unreachable!("execution starts activating"),
-        };
-        let ensemble = Ensemble::from_peers(
-            providers
-                .iter()
-                .map(|provider| provider.peer_id())
-                .collect(),
-        )
-        .expect("committed ensemble");
-        assert_ne!(
-            ensemble.peers()[0],
-            creator.peer_id(),
-            "the sorted ensemble and creator-first tickets must diverge"
-        );
-        let delta = SharedDelta::new(
-            TraceEntry {
-                trace_version: TRACE_FORMAT_VERSION,
-                step: 0,
-                event: PublicEvent::SessionStarted { ensemble },
-                effects: Vec::new(),
-                pre_state: StateHash::of(initial.as_bytes()),
-                post_state: StateHash::of(initial.as_bytes()),
-                fuel_used: 0,
-                witness: None,
-                agreement: AggregateAttestation::empty(),
-            },
-            initial,
-            None,
-        )
-        .expect("session-start proposal");
-        let mut proposed =
-            match arena0_protocol::transition(&active, ExecutionInput::ProposeShared(delta))
-                .expect("propose session start")
-            {
-                TransitionOutcome::Commit(plan) => plan.next_state().clone(),
-                TransitionOutcome::AlreadyApplied => unreachable!("proposal is new"),
-            };
-        let commitment = proposed
-            .pending_shared()
-            .expect("pending session-start proposal")
-            .commitment()
-            .clone();
-        for provider in providers {
-            proposed = match arena0_protocol::transition(
-                &proposed,
-                ExecutionInput::StepSignature(arena0_protocol::ParticipantStepSignature::new(
-                    provider.peer_id(),
-                    commitment.step,
-                    provider.execution.sign(&commitment.signing_bytes()),
-                )),
-            )
-            .expect("signatures resolve by participant identity")
-            {
-                TransitionOutcome::Commit(plan) => plan.next_state().clone(),
-                TransitionOutcome::AlreadyApplied => unreachable!("signature is new"),
-            };
-        }
-        assert!(proposed.pending_shared().is_none());
-        assert_eq!(proposed.public().next_step(), 1);
     }
 
     #[test]

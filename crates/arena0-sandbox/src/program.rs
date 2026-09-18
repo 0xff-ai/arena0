@@ -1,4 +1,4 @@
-//! Immutable program artifacts and their private metadata-section codec.
+//! Immutable program artifacts and their internal metadata-section codec.
 //!
 //! Completed artifacts are parse-only: building a section-less Wasm module is
 //! the only path that executes the bounded metadata export probe.
@@ -298,7 +298,7 @@ mod tests {
             r#"
             (module
               (memory (export "memory") 1)
-              (global (export "arena0_abi_version") i32 (i32.const 20))
+              (global (export "arena0_abi_version") i32 (i32.const 21))
               (data (i32.const 64) "{metadata_data}")
               (func $pack (param $ptr i32) (param $len i32) (result i64)
                 local.get $ptr
@@ -312,9 +312,9 @@ mod tests {
                 i64.or)
               (func (export "arena0_alloc") (param i32) (result i32) i32.const 2048)
               (func (export "arena0_dealloc") (param i32 i32))
+              (func (export "arena0_prepare") (result i32) i32.const 1)
               (func (export "arena0_initialize") (param i32 i32) (result i64) i64.const 0)
-              (func (export "arena0_shared") (param i32 i32) (result i64) i64.const 0)
-              (func (export "arena0_local") (param i32 i32) (result i64) i64.const 0)
+              (func (export "arena0_dispatch") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_writer") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_outcome") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_query") (param i32 i32) (result i64) i64.const 0)

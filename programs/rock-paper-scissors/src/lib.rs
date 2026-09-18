@@ -2,8 +2,7 @@ use std::fmt::Write;
 
 use arena0::prelude::*;
 use arena0_primitives::commit_reveal::{
-    self, CommitReveal, CommitRevealLocal, CommitRevealLocalFieldExt, CommitRevealLocalState,
-    CommitRevealSharedFieldExt,
+    self, CommitReveal, CommitRevealFieldExt, CommitRevealLocal, CommitRevealLocalState,
 };
 
 #[arena0::data]
@@ -150,6 +149,7 @@ impl Shared {
 )]
 pub mod rock_paper_scissors {
     use super::*;
+    use arena0::ProgramTransition;
 
     type Shared = super::Shared;
     type Local = super::Local;
@@ -182,8 +182,7 @@ pub mod rock_paper_scissors {
         state.commit_reveal.expected_writer()
     }
 
-    fn view(ctx: &SharedContext, vp: &Viewport) -> View {
-        let state = ctx.shared();
+    fn view(state: &Shared, _ensemble: &Ensemble, vp: &Viewport) -> View {
         let header = vp.fit_text(format!(
             "Rock-paper-scissors - round {} of {}",
             state.round, state.total_rounds
@@ -278,10 +277,12 @@ pub mod rock_paper_scissors {
         }
     }
 
-    /// Position-0 boundary: seed the match. Shared handler, so it issues no
+    /// Position-0 boundary: seed the match. The session-start handler issues no
     /// callout and broadcasts nothing; asking the agent for a move is `on_react`'s
     /// job. The commit-reveal primitive starts from its `Default`.
-    fn on_session_started(ctx: &mut SharedContext) -> Result<Transition<Phase>, ProgramFault> {
+    fn on_session_started(
+        ctx: &mut Context<Shared, Local>,
+    ) -> Result<ProgramTransition<RockPaperScissors>, ProgramFault> {
         ctx.mutate_shared(|s| {
             s.total_rounds = 3;
             s.round = 1;
@@ -291,17 +292,27 @@ pub mod rock_paper_scissors {
 
     /// Local decision hook. Broadcasts the owed reveal once every commit is in,
     /// otherwise asks the agent for this round's move when one is still owed.
-    fn on_react(ctx: &mut Context) -> Result<(), ProgramFault> {
+    fn on_react(
+        ctx: &mut Context<Shared, Local>,
+    ) -> Result<ProgramTransition<RockPaperScissors>, ProgramFault> {
         // Unique-writer rule: react only when this node is the participant
         // whose action is next (first missing commit, then first missing
         // reveal). An idle node never broadcasts into a position it cannot
         // win, so no sibling candidates converge on one position.
         if ctx.shared().commit_reveal.expected_writer() != Some(ctx.me()) {
-            return Ok(());
+            return Ok(Transition::Stay);
         }
         if let Some(reveal) = ctx.commit_reveal().take_reveal() {
             reveal.broadcast();
-            return Ok(());
+            if ctx.shared().commit_reveal.is_complete() {
+                let finished = apply_completed_round(ctx.shared_mut());
+                return Ok(if finished {
+                    Transition::End
+                } else {
+                    Transition::Stay
+                });
+            }
+            return Ok(Transition::Stay);
         }
         if ctx.commit_reveal().needs_commit() {
             let slot = ctx.me().index();
@@ -311,20 +322,26 @@ pub mod rock_paper_scissors {
                 .pending(Pending::ChoosingMove)
                 .dispatch();
         }
-        Ok(())
+        Ok(Transition::Stay)
     }
 
-    fn on_input(ctx: &mut Context, input: Input) -> Result<(), InputFault> {
+    fn on_input(
+        ctx: &mut Context<Shared, Local>,
+        input: Input,
+    ) -> Result<ProgramTransition<RockPaperScissors>, InputFault> {
+        if ctx.shared().commit_reveal.expected_writer() != Some(ctx.me()) {
+            return Err(anyhow!("this participant does not own the next choice").into());
+        }
         let Input::ChooseMove(choice) = input;
         ctx.commit_reveal().commit(choice)?.broadcast();
-        Ok(())
+        Ok(Transition::Stay)
     }
 
     fn on_message(
-        ctx: &mut SharedContext,
+        ctx: &mut Context<Shared, Local>,
         from: Participant,
         msg: Message,
-    ) -> Result<ApplyDecision<Phase>, ProtocolFault> {
+    ) -> MessageApply<RockPaperScissors> {
         let Message::CommitReveal(msg) = msg;
         // Unique-writer rule: only the participant whose action is next (the
         // first missing commit, then the first missing reveal) may write;
@@ -340,30 +357,8 @@ pub mod rock_paper_scissors {
         }
 
         // Score in ABSOLUTE participant order so every node computes the identical
-        // shared transition (no local-perspective slot).
-        let finished = ctx.mutate_shared(|s| {
-            if let Some(vals) = s.commit_reveal.values() {
-                let p0 = *vals[0];
-                let p1 = *vals[1];
-                if p0.beats(p1) {
-                    s.scores[0] += 1;
-                } else if p1.beats(p0) {
-                    s.scores[1] += 1;
-                }
-            }
-
-            let needed = (s.total_rounds as u32 / 2) + 1;
-            let finished =
-                s.round >= s.total_rounds || s.scores[0] >= needed || s.scores[1] >= needed;
-
-            if !finished {
-                s.round += 1;
-                s.commit_reveal
-                    .reset()
-                    .expect("completed commit-reveal round can reset");
-            }
-            finished
-        });
+        // state update (no local-perspective slot).
+        let finished = apply_completed_round(ctx.shared_mut());
 
         if finished {
             return Ok(ApplyDecision::Accept(Transition::End));
@@ -372,7 +367,35 @@ pub mod rock_paper_scissors {
         Ok(ApplyDecision::Accept(Transition::Stay))
     }
 
-    fn on_query(_ctx: &SharedContext, _: ()) {}
+    fn on_query(_shared: &Shared, _: ()) {}
+
+    /// Score a completed reveal round and either reset the protocol for another
+    /// round or leave the final reveal visible while ending the session.
+    fn apply_completed_round(state: &mut Shared) -> bool {
+        let Some(vals) = state.commit_reveal.values() else {
+            return false;
+        };
+        let p0 = *vals[0];
+        let p1 = *vals[1];
+        if p0.beats(p1) {
+            state.scores[0] += 1;
+        } else if p1.beats(p0) {
+            state.scores[1] += 1;
+        }
+
+        let needed = (state.total_rounds as u32 / 2) + 1;
+        let finished = state.round >= state.total_rounds
+            || state.scores[0] >= needed
+            || state.scores[1] >= needed;
+        if !finished {
+            state.round += 1;
+            state
+                .commit_reveal
+                .reset()
+                .expect("completed commit-reveal round can reset");
+        }
+        finished
+    }
 }
 
 #[cfg(test)]
@@ -403,9 +426,10 @@ mod tests {
         })
     }
 
-    /// Play one full round on a single native replica by hand-delivering every
-    /// broadcast, self-delivery included (the runtime does this automatically at
-    /// canonical positions). `me` chooses `mine`; the opponent chose `theirs`.
+    /// Play one full round on a single native replica. The local input applies
+    /// its own commit before broadcasting; only the opponent's commit and reveal
+    /// are delivered back to this replica. `me` chooses `mine`; the opponent
+    /// chose `theirs`.
     /// Returns the result of the reveal that completes the round.
     fn play_round<H>(h: &mut H, mine: Choice, theirs: Choice) -> arena0::testing::HandlerResult
     where
@@ -413,14 +437,13 @@ mod tests {
     {
         // Local commit (answers the pending ChooseMove callout), broadcast.
         let fx = h.resolve_callout::<callouts::ChooseMove>(mine);
-        let my_commit = fx.messages::<Message>().remove(0);
-        // Apply my own commit, then the opponent's; the second commit makes the
-        // reveal due, which `on_react` broadcasts.
-        h.message(h.peer_id(), my_commit);
+        assert_eq!(fx.messages::<Message>().len(), 1);
+        // The local commit is already applied; the opponent's commit makes the
+        // reveal due, which `on_react` applies locally and broadcasts.
         let fx = h.message(peer_a(), make_commit(theirs));
-        let my_reveal = fx.messages::<Message>().remove(0);
-        // Apply my reveal, then the opponent's; the second completes the round.
-        h.message(h.peer_id(), my_reveal);
+        assert_eq!(fx.messages::<Message>().len(), 1);
+        // The local reveal is already applied; the opponent's reveal completes
+        // the round.
         h.message(peer_a(), make_reveal(theirs))
     }
 
@@ -488,7 +511,6 @@ mod tests {
         // its callout is pending from session start. Answer it (stashes the
         // private value and broadcasts the local commit), then apply both
         // commits in writer order; the final react broadcasts the reveal.
-        let local = h.peer_id();
         let fx = h.resolve_callout::<callouts::ChooseMove>(Choice::Rock);
         let msgs = fx.messages::<Message>();
         assert_eq!(msgs.len(), 1);
@@ -497,9 +519,8 @@ mod tests {
             Message::CommitReveal(commit_reveal::Message::Commit(_))
         ));
 
-        // Apply the local commit (slot 0), then peer_a's (slot 1): the round
-        // completes and react broadcasts the owed reveal.
-        h.message(local, msgs[0].clone());
+        // The local commit is applied by the input handler; peer_a's commit
+        // completes the commit phase and react broadcasts the owed reveal.
         let fx = h.message(peer_a(), make_commit(Choice::Scissors));
         let reveals = fx.messages::<Message>();
         assert_eq!(reveals.len(), 1, "reveals: {reveals:?}");
@@ -569,8 +590,7 @@ mod tests {
         // Drive to the Revealing phase (both commits applied, reveals pending) so
         // the view renders sealed hands.
         let fx = h.resolve_callout::<callouts::ChooseMove>(Choice::Rock);
-        let my_commit = fx.messages::<Message>().remove(0);
-        h.message(h.peer_id(), my_commit);
+        assert_eq!(fx.messages::<Message>().len(), 1);
         h.message(peer_a(), make_commit(Choice::Scissors));
 
         let view = h.view(Viewport {
@@ -600,10 +620,12 @@ mod tests {
     fn bilateral_pair_scenario_converges_and_finishes() {
         let run = Scenario::<RockPaperScissors>::named("alice wins best of three")
             .input(ALICE, Input::ChooseMove(Choice::Rock))
+            .deliver_all()
             .input(BOB, Input::ChooseMove(Choice::Scissors))
             .deliver_all()
             .snapshot("round-one")
             .input(ALICE, Input::ChooseMove(Choice::Paper))
+            .deliver_all()
             .input(BOB, Input::ChooseMove(Choice::Rock))
             .deliver_all()
             .snapshot("finished")
@@ -633,10 +655,12 @@ mod tests {
             let schedule = DeliverySchedule::generated(seed, 4).without_drops();
             let pair = Scenario::<RockPaperScissors>::named(format!("generated schedule {seed}"))
                 .input(ALICE, Input::ChooseMove(Choice::Rock))
+                .deliver_all()
                 .input(BOB, Input::ChooseMove(Choice::Scissors))
                 .delivery_schedule(schedule)
                 .deliver_all()
                 .input(ALICE, Input::ChooseMove(Choice::Paper))
+                .deliver_all()
                 .input(BOB, Input::ChooseMove(Choice::Rock))
                 .deliver_all()
                 .run(());

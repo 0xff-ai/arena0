@@ -10,8 +10,8 @@ use std::time::Duration;
 use arena0_crypto::NodeKeys;
 use arena0_node::{SessionMessage, SpawnedExec};
 use arena0_protocol::{
-    ExecFrame, ExecId, FetchActivationTickets, FetchFrame, MessageId, NegotiationId, PeerId,
-    SessionHash, StateHash, StepCommitment, WitnessCommitment,
+    Event, ExecFrame, ExecId, FetchActivationTickets, FetchFrame, MessageId, NegotiationId, PeerId,
+    SessionHash, StateHash, StepCommitment,
 };
 use arena0_tests::assert::wait_for_entry;
 use arena0_tests::fixtures::{
@@ -50,14 +50,13 @@ fn message_frame(
     prestate: StateHash,
     payload: u8,
 ) -> ExecFrame {
-    let witness = WitnessCommitment([0xCD; 32]);
     let data = vec![payload];
     ExecFrame::Message {
-        message_id: MessageId::derive(session_hash, source, sequence, prestate, &data, witness),
+        message_id: MessageId::derive(session_hash, source, sequence, prestate, prestate, &data),
         seq: sequence,
         prestate,
         data,
-        witness,
+        poststate: prestate,
     }
 }
 
@@ -92,8 +91,8 @@ async fn future_message_stays_durable_until_public_head_catches_up() {
     establish_session(&execution).await;
     let source = execution.peer_ids[1];
 
-    // Public position 2 is accepted by the transport/store but cannot apply
-    // while the public cursor is at position 1.
+    // Message sequence 2 is accepted by the transport/store but cannot apply
+    // while the agreed step is still 1.
     send_message(
         &execution,
         1,
@@ -149,7 +148,7 @@ async fn future_message_stays_durable_until_public_head_catches_up() {
     let payloads = trace
         .iter()
         .filter_map(|entry| match &entry.event {
-            arena0_protocol::PublicEvent::MessageReceived { msg, .. } => msg.first().copied(),
+            Event::MessageReceived { msg, .. } => msg.first().copied(),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -234,7 +233,7 @@ async fn duplicate_position_does_not_replace_the_first_public_entry() {
     let payloads = trace
         .iter()
         .filter_map(|entry| match &entry.event {
-            arena0_protocol::PublicEvent::MessageReceived { msg, .. } => msg.first().copied(),
+            Event::MessageReceived { msg, .. } => msg.first().copied(),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -339,14 +338,12 @@ async fn participant_stream_closure_is_a_host_terminal_observation() {
         receipts[0].receipt,
         arena0_protocol::ReceiptArtifact::StopReport(_)
     ));
-    let verified = arena0_verify::verify_full(
-        &execution.wasm,
-        &receipts[0].receipt.encode().expect("receipt encoding"),
-    )
-    .expect("failed execution receipt must replay");
+    let verified =
+        arena0_verify::verify_light(&receipts[0].receipt.encode().expect("receipt encoding"))
+            .expect("failed execution receipt must verify");
     assert!(matches!(
         verified.terminal,
-        arena0_verify::VerifiedTerminal::Stopped { .. }
+        arena0_verify::LightVerifiedTerminal::Stopped { .. }
     ));
 }
 

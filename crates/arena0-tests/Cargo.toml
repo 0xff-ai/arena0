@@ -16,7 +16,7 @@ arena0-node = { path = "../arena0-node" }
 arena0-sandbox = { path = "../arena0-sandbox" }
 arena0-store = { path = "../arena0-store" }
 arena0-protocol = { path = "../arena0-protocol" }
-arena0-verify = { path = "../arena0-verify", features = ["replay"] }
+arena0-verify = { path = "../arena0-verify" }
 blake3.workspace = true
 borsh.workspace = true
 hex.workspace = true

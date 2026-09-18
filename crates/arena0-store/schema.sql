@@ -69,52 +69,35 @@ CREATE TABLE executions (
     local_state_checksum BLOB NOT NULL CHECK (length(local_state_checksum) = 32),
     version INTEGER NOT NULL CHECK (version >= 0),
     lifecycle INTEGER NOT NULL CHECK (lifecycle >= 0),
-    public_step INTEGER NOT NULL CHECK (public_step >= 0),
-    private_next_record INTEGER NOT NULL CHECK (private_next_record >= 0),
+    agreed_step INTEGER NOT NULL CHECK (agreed_step >= 0),
+    event_position INTEGER NOT NULL CHECK (event_position >= 0),
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
     updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0),
     FOREIGN KEY (execution_id) REFERENCES activation_records(execution_id)
 ) STRICT;
 
-CREATE TABLE occurrences (
+-- One immutable local dispatch record per event position. The event and
+-- effects are opaque program records; shared/local memory ownership remains
+-- in the execution aggregate or its pending proposal. Proposal and agreed
+-- step rows are the authorities for staged and committed state.
+CREATE TABLE event_records (
     execution_id BLOB NOT NULL CHECK (length(execution_id) = 32),
-    occurrence_key BLOB NOT NULL,
-    digest BLOB NOT NULL CHECK (length(digest) = 32),
-    input BLOB NOT NULL,
-    committed_version INTEGER NOT NULL CHECK (committed_version >= 0),
-    committed_at_ms INTEGER NOT NULL CHECK (committed_at_ms >= 0),
-    PRIMARY KEY (execution_id, occurrence_key),
+    event_position INTEGER NOT NULL CHECK (event_position >= 0),
+    event BLOB NOT NULL,
+    effects BLOB NOT NULL,
+    event_digest BLOB NOT NULL CHECK (length(event_digest) = 32),
+    PRIMARY KEY (execution_id, event_position),
     FOREIGN KEY (execution_id) REFERENCES executions(execution_id)
 ) STRICT;
 
-CREATE TABLE occurrence_conflicts (
-    conflict_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    execution_id BLOB NOT NULL CHECK (length(execution_id) = 32),
-    occurrence_key BLOB NOT NULL,
-    existing_digest BLOB NOT NULL CHECK (length(existing_digest) = 32),
-    incoming_digest BLOB NOT NULL CHECK (length(incoming_digest) = 32),
-    incoming_input BLOB NOT NULL,
-    observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),
-    FOREIGN KEY (execution_id) REFERENCES executions(execution_id)
-) STRICT;
-
-CREATE TABLE public_commits (
+CREATE TABLE agreed_steps (
     execution_id BLOB NOT NULL CHECK (length(execution_id) = 32),
     step INTEGER NOT NULL CHECK (step >= 0),
+    origin_event_position INTEGER NOT NULL CHECK (origin_event_position >= 0),
     version INTEGER NOT NULL CHECK (version >= 0),
     artifact BLOB NOT NULL,
     entry_hash BLOB NOT NULL CHECK (length(entry_hash) = 32),
     PRIMARY KEY (execution_id, step),
-    FOREIGN KEY (execution_id) REFERENCES executions(execution_id)
-) STRICT;
-
-CREATE TABLE private_commits (
-    execution_id BLOB NOT NULL CHECK (length(execution_id) = 32),
-    sequence INTEGER NOT NULL CHECK (sequence >= 0),
-    version INTEGER NOT NULL CHECK (version >= 0),
-    artifact BLOB NOT NULL,
-    record_digest BLOB NOT NULL CHECK (length(record_digest) = 32),
-    PRIMARY KEY (execution_id, sequence),
     FOREIGN KEY (execution_id) REFERENCES executions(execution_id)
 ) STRICT;
 
@@ -196,20 +179,27 @@ CREATE TABLE outbox (
     execution_id BLOB NOT NULL CHECK (length(execution_id) = 32),
     outbox_id BLOB NOT NULL CHECK (length(outbox_id) = 32),
     version INTEGER NOT NULL CHECK (version >= 0),
+    event_position INTEGER NOT NULL CHECK (event_position >= 0),
     ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-    effect BLOB NOT NULL,
+    destination BLOB CHECK (destination IS NULL OR length(destination) = 32),
+    payload_kind TEXT NOT NULL CHECK (payload_kind IN ('effect', 'frame')),
+    payload BLOB NOT NULL,
     attempts INTEGER NOT NULL CHECK (attempts >= 0),
-    status TEXT NOT NULL CHECK (status IN ('pending', 'leased', 'acknowledged')),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'leased', 'acknowledged', 'cancelled')),
     available_at_ms INTEGER NOT NULL CHECK (available_at_ms >= 0),
     lease_id BLOB CHECK (lease_id IS NULL OR length(lease_id) = 32),
     lease_until_ms INTEGER CHECK (lease_until_ms IS NULL OR lease_until_ms >= 0),
     last_error TEXT,
+    -- The content-addressed outbox id is the identity.  The causal columns
+    -- are indexed for deterministic leasing but are intentionally not a
+    -- UNIQUE constraint: SQLite treats NULL destinations as distinct and a
+    -- deferred successor may legitimately reuse an event coordinate.
     PRIMARY KEY (execution_id, outbox_id),
-    UNIQUE (execution_id, version, ordinal),
     FOREIGN KEY (execution_id) REFERENCES executions(execution_id),
     CHECK ((status = 'pending' AND lease_id IS NULL AND lease_until_ms IS NULL)
         OR (status = 'leased' AND lease_id IS NOT NULL AND lease_until_ms IS NOT NULL)
-        OR (status = 'acknowledged' AND lease_id IS NULL AND lease_until_ms IS NULL))
+        OR (status IN ('acknowledged', 'cancelled')
+            AND lease_id IS NULL AND lease_until_ms IS NULL))
 ) STRICT;
 
 CREATE TABLE active_timers (
@@ -225,8 +215,15 @@ CREATE TABLE active_timers (
 CREATE INDEX outbox_ready
     ON outbox (execution_id, status, available_at_ms, outbox_id);
 CREATE INDEX outbox_causal
-    ON outbox (execution_id, status, version, ordinal);
+    ON outbox (execution_id, status, event_position, version, ordinal, destination);
 CREATE INDEX outbox_leases
     ON outbox (execution_id, status, lease_until_ms);
+CREATE INDEX event_records_position
+    ON event_records (execution_id, event_position);
+CREATE INDEX agreed_steps_position
+    ON agreed_steps (execution_id, step);
+
+CREATE INDEX agreed_steps_origin
+    ON agreed_steps (execution_id, origin_event_position, step);
 CREATE INDEX active_timers_due
     ON active_timers (execution_id, deadline_ms, timer_id);

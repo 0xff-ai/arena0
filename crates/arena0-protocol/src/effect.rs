@@ -1,12 +1,11 @@
-//! Effects that programs emit in response to events.
+//! Effects emitted by a program during a session event.
 //!
-//! Each [`Effect`] variant maps to exactly one host-function import. The sandbox
-//! collects effects during a dispatch step and returns them to the runtime for
-//! execution.
+//! Effects are deliberately not partitioned by visibility or transition kind.
+//! One dispatch may mutate both state memories and emit any combination of
+//! these values; the actor decides which effects need durable delivery.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
-use std::fmt;
 use std::io;
 
 use arena0_crypto::SignScheme;
@@ -19,90 +18,40 @@ use crate::bounded::{
     write_string as serialize_bounded_string,
 };
 
-/// A side effect requested by a program during a single dispatch step.
-///
-/// Effects are pure data; the runtime decides how (and whether) to execute them
-/// after the sandbox returns. Each effect is recorded in the trace.
+/// A side effect requested by a program during one event dispatch.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
-    // -- Lifecycle --
-    /// End the current session successfully with the derived outcome.
-    SessionEnd {
-        /// Borsh-encoded typed `Outcome`, projected from final shared state.
-        /// Visible in the trace and the receipt.
-        outcome: Vec<u8>,
-    },
+    /// End the current session successfully with opaque outcome bytes.
+    SessionEnd { outcome: Vec<u8> },
     /// Abort the current session with a human-readable reason.
-    SessionAbort {
-        /// Why the session was aborted.
-        reason: String,
-    },
-
-    // -- Messaging --
-    /// Broadcast a binary payload to every participant. Messaging is
-    /// broadcast-only: the message enters every node's public trace at the
-    /// same canonical position, and the sender applies it through the same
-    /// shared handler as everyone else.
-    Broadcast {
-        /// Borsh-encoded message payload.
-        data: Vec<u8>,
-    },
-
-    // -- Callout/Input --
-    /// Call out to the controlling agent (or an external actor) for input.
+    SessionAbort { reason: String },
+    /// Broadcast an opaque program message to the session participants.
+    Broadcast { data: Vec<u8> },
+    /// Call out to the controlling agent or an external actor for input.
     Callout {
-        /// Index into the program schema's callout variants.
         callout_index: u32,
-        /// Borsh-encoded context for the callout prompt.
         context: Vec<u8>,
-        /// Optional local pending label for trace and lifecycle diagnostics.
         pending_label: Option<String>,
-        /// Optional expected output type name for typed continuation checks.
         expected_type: Option<String>,
-        /// Generated continuation tag used to restore local resume state after restart.
         continuation_tag: Option<u32>,
     },
-
-    // -- Timer --
-    /// Start a one-shot timer.
+    /// Arm a one-shot timer.
     SetTimer {
-        /// Delay before first firing, in milliseconds.
         delay_ms: u64,
-        /// Optional typed timer payload delivered when the timer fires.
-        #[serde(skip_serializing_if = "Option::is_none")]
         timer: Option<TimerPayload>,
     },
-
-    // -- Crypto --
-    /// Sign `data` with the node's key under the given scheme.
+    /// Request a host signature.
     Sign {
-        /// Signing algorithm.
         scheme: SignScheme,
-        /// Data to sign.
         data: Vec<u8>,
-        /// Optional local pending label for trace and lifecycle diagnostics.
         pending_label: Option<String>,
-        /// Expected output type name for typed continuation checks.
         expected_type: Option<String>,
-        /// Generated continuation tag used to restore local resume state after restart.
         continuation_tag: Option<u32>,
     },
-
-    // -- Control --
     /// Terminate program execution immediately with an error.
-    Fail {
-        /// Human-readable failure reason.
-        reason: String,
-    },
-    /// Signal that the last callout should be re-issued due to bad input.
-    ///
-    /// Emitted by the generated dispatch code when `on_input` returns
-    /// `InputFault::Retryable`. The runtime discards effects from this dispatch
-    /// step and re-issues the previous `Callout`.
-    RetryInput {
-        /// Human-readable reason for the retry.
-        reason: String,
-    },
+    Fail { reason: String },
+    /// Re-issue the pending callout after a retryable input fault.
+    RetryInput { reason: String },
 }
 
 const EFFECT_SESSION_END: u8 = 0;
@@ -317,405 +266,6 @@ impl BorshDeserialize for Effect {
     }
 }
 
-/// An effect that may be persisted in a public trace entry.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub enum PublicEffect {
-    /// End successfully with opaque outcome bytes.
-    SessionEnd { outcome: Vec<u8> },
-    /// Abort with a bounded human-readable reason.
-    SessionAbort { reason: String },
-    /// Fail the execution with a bounded reason.
-    Fail { reason: String },
-}
-
-/// An effect that may be persisted in a private trace record.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub enum PrivateEffect {
-    /// Broadcast opaque message bytes. The private witness is committed on the
-    /// resulting public message entry, so broadcasts belong to the private
-    /// decision record rather than the shared trace entry.
-    Broadcast { data: Vec<u8> },
-    /// Request an agent callout.
-    Callout {
-        callout_index: u32,
-        context: Vec<u8>,
-        pending_label: Option<String>,
-        expected_type: Option<String>,
-        continuation_tag: Option<u32>,
-    },
-    /// Arm a one-shot timer.
-    SetTimer {
-        delay_ms: u64,
-        timer: Option<TimerPayload>,
-    },
-    /// Request a host signature.
-    Sign {
-        scheme: SignScheme,
-        data: Vec<u8>,
-        pending_label: Option<String>,
-        expected_type: Option<String>,
-        continuation_tag: Option<u32>,
-    },
-    /// Retry the current callout.
-    RetryInput { reason: String },
-}
-
-/// Error returned when a raw guest effect is placed in the wrong persisted
-/// trace class.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EffectClassError {
-    /// The raw value is not a public effect.
-    NotPublic,
-    /// The raw value is not a private effect.
-    NotPrivate,
-}
-
-impl fmt::Display for EffectClassError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::NotPublic => "effect is not legal in a public trace",
-            Self::NotPrivate => "effect is not legal in a private trace",
-        })
-    }
-}
-
-impl std::error::Error for EffectClassError {}
-
-impl TryFrom<Effect> for PublicEffect {
-    type Error = EffectClassError;
-
-    fn try_from(effect: Effect) -> Result<Self, Self::Error> {
-        match effect {
-            Effect::SessionEnd { outcome } => Ok(Self::SessionEnd { outcome }),
-            Effect::SessionAbort { reason } => Ok(Self::SessionAbort { reason }),
-            Effect::Fail { reason } => Ok(Self::Fail { reason }),
-            Effect::Broadcast { .. }
-            | Effect::Callout { .. }
-            | Effect::SetTimer { .. }
-            | Effect::Sign { .. }
-            | Effect::RetryInput { .. } => Err(EffectClassError::NotPublic),
-        }
-    }
-}
-
-impl TryFrom<Effect> for PrivateEffect {
-    type Error = EffectClassError;
-
-    fn try_from(effect: Effect) -> Result<Self, Self::Error> {
-        match effect {
-            Effect::Broadcast { data } => Ok(Self::Broadcast { data }),
-            Effect::Callout {
-                callout_index,
-                context,
-                pending_label,
-                expected_type,
-                continuation_tag,
-            } => Ok(Self::Callout {
-                callout_index,
-                context,
-                pending_label,
-                expected_type,
-                continuation_tag,
-            }),
-            Effect::SetTimer { delay_ms, timer } => Ok(Self::SetTimer { delay_ms, timer }),
-            Effect::Sign {
-                scheme,
-                data,
-                pending_label,
-                expected_type,
-                continuation_tag,
-            } => Ok(Self::Sign {
-                scheme,
-                data,
-                pending_label,
-                expected_type,
-                continuation_tag,
-            }),
-            Effect::RetryInput { reason } => Ok(Self::RetryInput { reason }),
-            Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. } => {
-                Err(EffectClassError::NotPrivate)
-            }
-        }
-    }
-}
-
-impl From<PublicEffect> for Effect {
-    fn from(effect: PublicEffect) -> Self {
-        match effect {
-            PublicEffect::SessionEnd { outcome } => Self::SessionEnd { outcome },
-            PublicEffect::SessionAbort { reason } => Self::SessionAbort { reason },
-            PublicEffect::Fail { reason } => Self::Fail { reason },
-        }
-    }
-}
-
-impl From<PrivateEffect> for Effect {
-    fn from(effect: PrivateEffect) -> Self {
-        match effect {
-            PrivateEffect::Broadcast { data } => Self::Broadcast { data },
-            PrivateEffect::Callout {
-                callout_index,
-                context,
-                pending_label,
-                expected_type,
-                continuation_tag,
-            } => Self::Callout {
-                callout_index,
-                context,
-                pending_label,
-                expected_type,
-                continuation_tag,
-            },
-            PrivateEffect::SetTimer { delay_ms, timer } => Self::SetTimer { delay_ms, timer },
-            PrivateEffect::Sign {
-                scheme,
-                data,
-                pending_label,
-                expected_type,
-                continuation_tag,
-            } => Self::Sign {
-                scheme,
-                data,
-                pending_label,
-                expected_type,
-                continuation_tag,
-            },
-            PrivateEffect::RetryInput { reason } => Self::RetryInput { reason },
-        }
-    }
-}
-
-const PUBLIC_EFFECT_SESSION_END: u8 = 0;
-const PUBLIC_EFFECT_SESSION_ABORT: u8 = 1;
-const PUBLIC_EFFECT_FAIL: u8 = 2;
-
-impl BorshSerialize for PublicEffect {
-    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        match self {
-            Self::SessionEnd { outcome } => {
-                BorshSerialize::serialize(&PUBLIC_EFFECT_SESSION_END, writer)?;
-                serialize_bounded_bytes(
-                    writer,
-                    outcome,
-                    crate::execution::MAX_TERMINAL_OUTCOME_BYTES,
-                    "terminal outcome",
-                )
-            }
-            Self::SessionAbort { reason } => {
-                BorshSerialize::serialize(&PUBLIC_EFFECT_SESSION_ABORT, writer)?;
-                serialize_bounded_string(
-                    writer,
-                    reason,
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "terminal reason",
-                )
-            }
-            Self::Fail { reason } => {
-                BorshSerialize::serialize(&PUBLIC_EFFECT_FAIL, writer)?;
-                serialize_bounded_string(
-                    writer,
-                    reason,
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "failure reason",
-                )
-            }
-        }
-    }
-}
-
-impl BorshDeserialize for PublicEffect {
-    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> io::Result<Self> {
-        match u8::deserialize_reader(reader)? {
-            PUBLIC_EFFECT_SESSION_END => Ok(Self::SessionEnd {
-                outcome: read_bounded_bytes(
-                    reader,
-                    crate::execution::MAX_TERMINAL_OUTCOME_BYTES,
-                    "terminal outcome",
-                )?,
-            }),
-            PUBLIC_EFFECT_SESSION_ABORT => Ok(Self::SessionAbort {
-                reason: read_bounded_string(
-                    reader,
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "terminal reason",
-                )?,
-            }),
-            PUBLIC_EFFECT_FAIL => Ok(Self::Fail {
-                reason: read_bounded_string(
-                    reader,
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "failure reason",
-                )?,
-            }),
-            tag => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown public effect tag {tag}"),
-            )),
-        }
-    }
-}
-
-const PRIVATE_EFFECT_CALLOUT: u8 = 0;
-const PRIVATE_EFFECT_SET_TIMER: u8 = 1;
-const PRIVATE_EFFECT_SIGN: u8 = 2;
-const PRIVATE_EFFECT_RETRY_INPUT: u8 = 3;
-const PRIVATE_EFFECT_BROADCAST: u8 = 4;
-
-impl BorshSerialize for PrivateEffect {
-    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        match self {
-            Self::Broadcast { data } => {
-                BorshSerialize::serialize(&PRIVATE_EFFECT_BROADCAST, writer)?;
-                serialize_bounded_bytes(
-                    writer,
-                    data,
-                    crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
-                    "broadcast payload",
-                )
-            }
-            Self::Callout {
-                callout_index,
-                context,
-                pending_label,
-                expected_type,
-                continuation_tag,
-            } => {
-                BorshSerialize::serialize(&PRIVATE_EFFECT_CALLOUT, writer)?;
-                BorshSerialize::serialize(callout_index, writer)?;
-                serialize_bounded_bytes(
-                    writer,
-                    context,
-                    crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
-                    "callout context",
-                )?;
-                serialize_bounded_option_string(
-                    writer,
-                    pending_label.as_deref(),
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "pending label",
-                )?;
-                serialize_bounded_option_string(
-                    writer,
-                    expected_type.as_deref(),
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "expected type",
-                )?;
-                BorshSerialize::serialize(continuation_tag, writer)
-            }
-            Self::SetTimer { delay_ms, timer } => {
-                BorshSerialize::serialize(&PRIVATE_EFFECT_SET_TIMER, writer)?;
-                BorshSerialize::serialize(delay_ms, writer)?;
-                serialize_bounded_option_timer(writer, timer.as_ref())
-            }
-            Self::Sign {
-                scheme,
-                data,
-                pending_label,
-                expected_type,
-                continuation_tag,
-            } => {
-                BorshSerialize::serialize(&PRIVATE_EFFECT_SIGN, writer)?;
-                BorshSerialize::serialize(scheme, writer)?;
-                serialize_bounded_bytes(
-                    writer,
-                    data,
-                    crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
-                    "signature payload",
-                )?;
-                serialize_bounded_option_string(
-                    writer,
-                    pending_label.as_deref(),
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "pending label",
-                )?;
-                serialize_bounded_option_string(
-                    writer,
-                    expected_type.as_deref(),
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "expected type",
-                )?;
-                BorshSerialize::serialize(continuation_tag, writer)
-            }
-            Self::RetryInput { reason } => {
-                BorshSerialize::serialize(&PRIVATE_EFFECT_RETRY_INPUT, writer)?;
-                serialize_bounded_string(
-                    writer,
-                    reason,
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "retry reason",
-                )
-            }
-        }
-    }
-}
-
-impl BorshDeserialize for PrivateEffect {
-    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> io::Result<Self> {
-        match u8::deserialize_reader(reader)? {
-            PRIVATE_EFFECT_BROADCAST => Ok(Self::Broadcast {
-                data: read_bounded_bytes(
-                    reader,
-                    crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
-                    "broadcast payload",
-                )?,
-            }),
-            PRIVATE_EFFECT_CALLOUT => Ok(Self::Callout {
-                callout_index: u32::deserialize_reader(reader)?,
-                context: read_bounded_bytes(
-                    reader,
-                    crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
-                    "callout context",
-                )?,
-                pending_label: read_bounded_option_string(
-                    reader,
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "pending label",
-                )?,
-                expected_type: read_bounded_option_string(
-                    reader,
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "expected type",
-                )?,
-                continuation_tag: Option::<u32>::deserialize_reader(reader)?,
-            }),
-            PRIVATE_EFFECT_SET_TIMER => Ok(Self::SetTimer {
-                delay_ms: u64::deserialize_reader(reader)?,
-                timer: read_bounded_option_timer(reader)?,
-            }),
-            PRIVATE_EFFECT_SIGN => Ok(Self::Sign {
-                scheme: SignScheme::deserialize_reader(reader)?,
-                data: read_bounded_bytes(
-                    reader,
-                    crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
-                    "signature payload",
-                )?,
-                pending_label: read_bounded_option_string(
-                    reader,
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "pending label",
-                )?,
-                expected_type: read_bounded_option_string(
-                    reader,
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "expected type",
-                )?,
-                continuation_tag: Option::<u32>::deserialize_reader(reader)?,
-            }),
-            PRIVATE_EFFECT_RETRY_INPUT => Ok(Self::RetryInput {
-                reason: read_bounded_string(
-                    reader,
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "retry reason",
-                )?,
-            }),
-            tag => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown private effect tag {tag}"),
-            )),
-        }
-    }
-}
-
 fn serialize_bounded_option_timer<W: borsh::io::Write>(
     writer: &mut W,
     timer: Option<&TimerPayload>,
@@ -756,13 +306,9 @@ fn read_bounded_option_timer<R: borsh::io::Read>(
     Hash,
 )]
 pub enum LogLevel {
-    /// Verbose debugging information.
     Debug,
-    /// Normal operational messages.
     Info,
-    /// Potential issues worth attention.
     Warn,
-    /// Errors that may affect correctness.
     Error,
 }
 
@@ -780,15 +326,10 @@ pub enum LogLevel {
     Hash,
 )]
 pub enum DisconnectReason {
-    /// Clean shutdown initiated by either side.
     Normal,
-    /// No response within the configured timeout.
     Timeout,
-    /// Wire protocol violation.
     ProtocolError,
-    /// Underlying transport connection dropped.
     ConnectionLost,
-    /// Peer was explicitly removed by the program or operator.
     Kicked,
 }
 
@@ -798,7 +339,7 @@ mod tests {
 
     #[test]
     fn borsh_round_trip_all_effect_variants() {
-        let variants: Vec<Effect> = vec![
+        let variants = vec![
             Effect::SessionEnd {
                 outcome: vec![0xFF],
             },
@@ -827,75 +368,45 @@ mod tests {
                 continuation_tag: None,
             },
             Effect::Fail {
-                reason: "something went wrong".into(),
+                reason: "failed".into(),
             },
             Effect::RetryInput {
                 reason: "bad input".into(),
             },
         ];
 
-        for variant in &variants {
-            let encoded = borsh::to_vec(variant).expect("serialize");
-            let decoded: Effect = borsh::from_slice(&encoded).expect("deserialize");
-            assert_eq!(*variant, decoded);
+        for effect in variants {
+            let encoded = borsh::to_vec(&effect).expect("serialize");
+            assert_eq!(
+                borsh::from_slice::<Effect>(&encoded).expect("deserialize"),
+                effect
+            );
         }
     }
 
     #[test]
-    fn persisted_effect_tags_are_fixed_and_unknown_tags_are_rejected() {
-        let raw = Effect::Fail {
-            reason: String::new(),
-        };
-        let public = PublicEffect::Fail {
-            reason: String::new(),
-        };
-        let private = PrivateEffect::Broadcast { data: Vec::new() };
-        assert_eq!(borsh::to_vec(&raw).unwrap()[0], 6);
-        assert_eq!(borsh::to_vec(&public).unwrap()[0], 2);
-        assert_eq!(borsh::to_vec(&private).unwrap()[0], 4);
+    fn unknown_effect_tags_are_rejected() {
         assert!(borsh::from_slice::<Effect>(&[0xff]).is_err());
-        assert!(borsh::from_slice::<PublicEffect>(&[0xff]).is_err());
-        assert!(borsh::from_slice::<PrivateEffect>(&[0xff]).is_err());
     }
 
     #[test]
-    fn callout_optional_strings_preserve_encoding_and_early_bounds() {
-        let effect = PrivateEffect::Callout {
+    fn callout_optional_strings_are_bounded() {
+        let effect = Effect::Callout {
             callout_index: 0,
             context: Vec::new(),
             pending_label: Some("x".into()),
             expected_type: None,
             continuation_tag: None,
         };
-        let encoded = [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, b'x', 0, 0];
-        assert_eq!(borsh::to_vec(&effect).unwrap(), encoded);
-        assert_eq!(PrivateEffect::try_from_slice(&encoded).unwrap(), effect);
-
-        let oversized = u32::try_from(crate::execution::MAX_TERMINAL_REASON_BYTES + 1)
-            .unwrap()
-            .to_le_bytes();
-        let mut prefix = encoded[..10].to_vec();
-        prefix.extend_from_slice(&oversized);
-        assert_eq!(
-            PrivateEffect::try_from_slice(&prefix).unwrap_err().kind(),
-            io::ErrorKind::InvalidData,
-        );
-        prefix[9] = 2;
-        assert_eq!(
-            PrivateEffect::try_from_slice(&prefix).unwrap_err().kind(),
-            io::ErrorKind::InvalidData,
-        );
-
-        let effect = PrivateEffect::Callout {
+        let encoded = borsh::to_vec(&effect).expect("serialize");
+        assert_eq!(Effect::try_from_slice(&encoded).expect("decode"), effect);
+        let oversized = Effect::Callout {
             callout_index: 0,
             context: Vec::new(),
             pending_label: Some("x".repeat(crate::execution::MAX_TERMINAL_REASON_BYTES + 1)),
             expected_type: None,
             continuation_tag: None,
         };
-        assert_eq!(
-            borsh::to_vec(&effect).unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
+        assert!(borsh::to_vec(&oversized).is_err());
     }
 }

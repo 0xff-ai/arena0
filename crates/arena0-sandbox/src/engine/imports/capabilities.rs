@@ -59,7 +59,7 @@ fn register_messaging(linker: &mut Linker<HostState>) -> Result<(), SandboxError
                         Lifecycle::Failed,
                     ],
                 )?;
-                caller.reject_non_local("broadcast")?;
+                caller.reject_read_only("broadcast")?;
                 let data = caller.read_guest_bytes(data_ptr, data_len, "broadcast:data")?;
                 caller.record_effect(Effect::Broadcast { data })
             },
@@ -79,7 +79,7 @@ fn register_input(linker: &mut Linker<HostState>) -> Result<(), SandboxError> {
              context_len: u32| {
                 caller.begin_import("request_input")?;
                 caller.reject_if_lifecycle_disallowed("request_input", &[Lifecycle::Active])?;
-                caller.reject_non_local("request_input")?;
+                caller.reject_read_only("request_input")?;
                 let context =
                     caller.read_guest_bytes(context_ptr, context_len, "request_input:context")?;
                 let continuation_tag = caller.data_mut().next_continuation_tag.take();
@@ -110,7 +110,7 @@ fn register_input(linker: &mut Linker<HostState>) -> Result<(), SandboxError> {
                     "request_input_pending",
                     &[Lifecycle::Active],
                 )?;
-                caller.reject_non_local("request_input_pending")?;
+                caller.reject_read_only("request_input_pending")?;
                 let context = caller.read_guest_bytes(
                     context_ptr,
                     context_len,
@@ -167,7 +167,7 @@ fn register_timers(linker: &mut Linker<HostState>) -> Result<(), SandboxError> {
                     "set_timer",
                     &[Lifecycle::PreSession, Lifecycle::Active],
                 )?;
-                caller.reject_non_local("set_timer")?;
+                caller.reject_read_only("set_timer")?;
                 caller.record_effect(Effect::SetTimer {
                     delay_ms,
                     timer: None,
@@ -190,7 +190,7 @@ fn register_timers(linker: &mut Linker<HostState>) -> Result<(), SandboxError> {
                     "set_typed_timer",
                     &[Lifecycle::PreSession, Lifecycle::Active],
                 )?;
-                caller.reject_non_local("set_typed_timer")?;
+                caller.reject_read_only("set_typed_timer")?;
                 let type_bytes =
                     caller.read_guest_bytes(type_ptr, type_len, "set_typed_timer:type")?;
                 let type_name = String::from_utf8(type_bytes).map_err(|e| {
@@ -219,7 +219,7 @@ fn register_sign(
             move |mut caller: Caller<'_, HostState>, scheme: u32, data_ptr: u32, data_len: u32| {
                 caller.begin_import("sign")?;
                 caller.reject_if_lifecycle_disallowed("sign", &[Lifecycle::Active])?;
-                caller.reject_non_local("sign")?;
+                caller.reject_read_only("sign")?;
                 let scheme = u32_to_sign_scheme(scheme)?;
                 reject_if_sign_scheme_disallowed("sign", scheme, &allowed_schemes_for_sign)?;
                 let data = caller.read_guest_bytes(data_ptr, data_len, "sign")?;
@@ -249,7 +249,7 @@ fn register_sign(
                   expected_len: u32| {
                 caller.begin_import("sign_pending")?;
                 caller.reject_if_lifecycle_disallowed("sign_pending", &[Lifecycle::Active])?;
-                caller.reject_non_local("sign_pending")?;
+                caller.reject_read_only("sign_pending")?;
                 let scheme = u32_to_sign_scheme(scheme)?;
                 reject_if_sign_scheme_disallowed(
                     "sign_pending",
@@ -334,7 +334,7 @@ mod tests {
         let mut store = Store::new(&engine, {
             let mut hs = HostState::new(
                 arena0_program::ExecutionProfile::current(),
-                CallKind::Local,
+                CallKind::Dispatch,
                 Lifecycle::PreSession,
                 None,
                 Vec::new(),
@@ -378,7 +378,7 @@ mod tests {
         let mut store = Store::new(&engine, {
             let mut hs = HostState::new(
                 arena0_program::ExecutionProfile::current(),
-                CallKind::Local,
+                CallKind::Dispatch,
                 Lifecycle::PreSession,
                 None,
                 Vec::new(),
@@ -425,7 +425,7 @@ mod tests {
         let mut store = Store::new(&engine, {
             let mut hs = HostState::new(
                 arena0_program::ExecutionProfile::current(),
-                CallKind::Local,
+                CallKind::Dispatch,
                 Lifecycle::PreSession,
                 None,
                 Vec::new(),

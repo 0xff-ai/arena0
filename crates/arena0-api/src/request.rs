@@ -92,17 +92,17 @@ pub enum HostRequest {
     /// Read a bounded, host-local diagnostic projection of one execution.
     ///
     /// This is intentionally separate from `exec.status`: the projection may
-    /// include durable activation facts and local private-handler summaries,
+    /// include durable activation facts and local event-record summaries,
     /// while the status shape remains stable for ordinary callers.
     #[serde(rename = "exec.inspect")]
     ExecInspect {
         exec_id: ExecId,
-        /// First private handler sequence to include. `None` selects the latest
-        /// bounded window, which is appropriate for live inspection UIs.
-        private_from: Option<u64>,
-        /// Non-zero maximum number of private handler summaries to return. The
-        /// daemon enforces its fixed upper bound before reading the store.
-        private_limit: u16,
+        /// First event position to include. `None` selects the latest bounded
+        /// window, which is appropriate for live inspection UIs.
+        events_from: Option<u64>,
+        /// Non-zero maximum number of event summaries to return. The daemon
+        /// enforces its fixed upper bound before reading the store.
+        events_limit: u16,
     },
     #[serde(rename = "exec.await")]
     ExecAwait { exec_id: ExecId, until: AwaitState },
@@ -153,7 +153,7 @@ pub enum HostRequest {
     #[serde(rename = "receipt.list")]
     ReceiptList,
     #[serde(rename = "receipt.verify")]
-    ReceiptVerify { receipt: ReceiptRef, full: bool },
+    ReceiptVerify { receipt: ReceiptRef },
 }
 
 /// The state `exec.await` blocks for: session established, or terminal.

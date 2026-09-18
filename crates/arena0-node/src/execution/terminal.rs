@@ -1,11 +1,12 @@
-//! Terminal transitions, failure recovery, and receipt proof interruption.
+//! Terminal transitions, failure recovery, and receipt publication.
 //!
-//! This module owns the durable abort and terminal-proof boundaries. Receipt
-//! publication itself remains an outbox effect handled by `outbox`.
+//! The actor signs only an authenticated abort occurrence over the current
+//! agreed cursor. The store owns the stop/proof/publication transactions; no
+//! terminal path re-enters the obsolete generic execution-input reducer.
 
 use crate::context::{ExecError, SessionMessage};
 use arena0_crypto::NodeKeys;
-use arena0_protocol::{AbortKind, AbortOccurrence, ExecutionInput, PeerIdSource, ReceiptWork};
+use arena0_protocol::{AbortKind, AbortOccurrence, PeerIdSource, ReceiptTermination, ReceiptWork};
 use arena0_store::{ApplyOutcome, ExecutionStore};
 
 use super::{ExecutionActor, MAX_CAS_RETRIES, now_ms, truncate_reason};
@@ -16,7 +17,11 @@ impl ExecutionActor {
         self.progress().await
     }
 
-    pub(super) async fn fail_terminal(&mut self, error: ExecError) {
+    /// Record an actor failure and report whether the normal actor loop should
+    /// stay alive to finish durable protocol delivery. Keeping that one loop
+    /// alive is essential: it can accept a peer's terminal frame while our own
+    /// `Abort` send is waiting for that peer's durable acknowledgement.
+    pub(super) async fn fail_terminal(&mut self, error: ExecError) -> bool {
         let reason = truncate_reason(error.to_string());
         match self.context.store.load_execution().await {
             Ok(Some(_)) => match fail_execution(
@@ -27,53 +32,59 @@ impl ExecutionActor {
             .await
             {
                 Ok(outcome) => {
-                    if let Ok(state) = self.load_state().await
-                        && !matches!(state.status().receipt_work(), ReceiptWork::Incomplete)
-                    {
-                        let _ = self.drain_outbox().await;
-                    }
-                    if matches!(outcome, FailureOutcome::Recorded) {
+                    let incomplete = self.load_state().await.is_ok_and(|state| {
+                        matches!(state.status().receipt_work(), ReceiptWork::Incomplete)
+                    });
+                    if matches!(outcome, FailureOutcome::Recorded) && incomplete {
                         let _ = self.messages.send(SessionMessage::Failed { reason }).await;
                     }
+                    // Published and assembling terminals return to `run`, whose
+                    // existing select loop owns inbound frames, outbox sends,
+                    // durable retries, and the eventual terminal observation.
+                    !incomplete
                 }
-                Err(error) => tracing::error!(
-                    exec_id = %self.context.exec_id, %error,
-                    "unable to durably record execution failure"
-                ),
+                Err(error) => {
+                    tracing::error!(
+                        exec_id = %self.context.exec_id,
+                        %error,
+                        "unable to durably record execution failure"
+                    );
+                    false
+                }
             },
-            Ok(None) => {
-                // Activation failures happen before the execution aggregate
-                // exists. Preserve the failure on the durable admission root
-                // before exposing it to the supervisor.
-                match self
-                    .context
-                    .store
-                    .record_execution_request_failure(reason.clone())
-                    .await
-                {
-                    Ok(_) => {
-                        let _ = self.messages.send(SessionMessage::Failed { reason }).await;
-                    }
-                    Err(record_error) => tracing::error!(
+            Ok(None) => match self
+                .context
+                .store
+                .record_execution_request_failure(reason.clone())
+                .await
+            {
+                Ok(_) => {
+                    let _ = self.messages.send(SessionMessage::Failed { reason }).await;
+                    false
+                }
+                Err(record_error) => {
+                    tracing::error!(
                         exec_id = %self.context.exec_id,
                         error = %record_error,
                         "unable to durably record pre-execution failure"
-                    ),
+                    );
+                    false
                 }
-            }
+            },
             Err(load_error) => {
                 tracing::error!(
                     exec_id = %self.context.exec_id,
                     error = %load_error,
                     "unable to load execution while recording failure"
                 );
+                false
             }
         }
     }
 
-    /// Commit a locally-authenticated abort/failure against the latest durable
-    /// public head. The signature is derived from that exact head, and a CAS
-    /// mismatch causes a fresh load and a fresh signed occurrence.
+    /// Commit a locally authenticated abort/failure against the latest durable
+    /// agreed cursor. A CAS mismatch causes a fresh load and a fresh signed
+    /// occurrence, so a signature never covers a stale state head.
     async fn persist_abort(
         &mut self,
         kind: AbortKind,
@@ -92,35 +103,108 @@ impl ExecutionActor {
                 kind,
                 code,
                 reason.clone(),
-                state.public(),
+                state.step_cursor(),
             )?;
             let signing_bytes = unsigned.signing_bytes()?;
             let occurrence = unsigned.with_signature(self.context.identity.sign(&signing_bytes))?;
-            match self.apply_input(ExecutionInput::Abort(occurrence)).await? {
-                ApplyOutcome::Committed(_) | ApplyOutcome::AlreadyApplied => return Ok(true),
-                ApplyOutcome::VersionMismatch { .. } => continue,
-                ApplyOutcome::Conflict(conflict) => {
-                    return Err(ExecError::InvalidState(format!(
-                        "abort conflicts with durable evidence: {conflict:?}"
-                    )));
+            let outcome = self
+                .context
+                .store
+                .stop_execution(state.version(), occurrence, None, now_ms())
+                .await;
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.restore_after_store_error().await;
+                    return Err(error.into());
                 }
-                ApplyOutcome::InboxAlreadyApplied { .. }
-                | ApplyOutcome::InboxAlreadyConsumed { .. } => {
-                    return Err(ExecError::InvalidState(
-                        "local abort unexpectedly carried inbox state".into(),
-                    ));
+            };
+            match outcome {
+                ApplyOutcome::Committed { .. }
+                | ApplyOutcome::AlreadyApplied
+                | ApplyOutcome::InboxAlreadyApplied { .. }
+                | ApplyOutcome::InboxAlreadyConsumed { .. } => return Ok(true),
+                ApplyOutcome::VersionMismatch { .. } => {
+                    self.reload_resident().await?;
                 }
             }
         }
         Err(ExecError::Unavailable(
-            "abort CAS retry limit exceeded".into(),
+            "abort compare-and-set retry limit exceeded".into(),
         ))
+    }
+
+    /// Deliver the observer-facing terminal boundary from its durable
+    /// receipt. Receipt publication used to travel through a reducer-created
+    /// outbox effect; the flat store operation persists it directly, so the
+    /// actor now owns this notification seam explicitly.
+    pub(super) async fn emit_published_terminal(&mut self) -> Result<(), ExecError> {
+        if self.terminal_emitted {
+            return Ok(());
+        }
+        let state = self.load_state().await?;
+        if !matches!(state.status().receipt_work(), ReceiptWork::Published) {
+            return Ok(());
+        }
+        let receipt_id = state.published_receipt_id().ok_or_else(|| {
+            ExecError::InvalidState("published terminal status has no receipt identity".into())
+        })?;
+        let stored = self
+            .context
+            .store
+            .load_receipt_by_id(receipt_id)
+            .await?
+            .ok_or_else(|| {
+                ExecError::InvalidState(
+                    "published terminal status has no locally produced receipt".into(),
+                )
+            })?;
+        if stored.receipt_id != receipt_id {
+            return Err(ExecError::InvalidState(
+                "published terminal status and local receipt identity differ".into(),
+            ));
+        }
+        let receipt = stored.receipt;
+        self.messages
+            .send(SessionMessage::ReceiptPublished {
+                receipt: receipt.clone(),
+            })
+            .await
+            .map_err(|_| ExecError::Unavailable("message receiver closed".into()))?;
+        let message = match receipt.body().termination() {
+            ReceiptTermination::Completed { .. } => SessionMessage::Completed {
+                result: receipt.body().outcome().to_vec(),
+                result_json: state.terminal_outcome_json().map(ToOwned::to_owned),
+            },
+            ReceiptTermination::Stopped { cause } => {
+                let step = match cause {
+                    arena0_protocol::StopCause::Authenticated(occurrence) => {
+                        occurrence.coordinate().next_step()
+                    }
+                    arena0_protocol::StopCause::Shared { commitment, .. } => commitment.step,
+                };
+                match cause.kind() {
+                    AbortKind::Abort => SessionMessage::Aborted {
+                        step,
+                        reason: cause.reason().to_owned(),
+                    },
+                    AbortKind::Fail => SessionMessage::Failed {
+                        reason: cause.reason().to_owned(),
+                    },
+                }
+            }
+        };
+        self.messages
+            .send(message)
+            .await
+            .map_err(|_| ExecError::Unavailable("message receiver closed".into()))?;
+        self.terminal_emitted = true;
+        Ok(())
     }
 }
 
-/// Complete local proof work from durable evidence even when the guest or a
-/// peer is unavailable. The store atomically publishes the evidence and retains
-/// outbox delivery in its own causal order.
+/// Complete local proof work from durable evidence. Publication is itself a
+/// direct store operation and remains idempotent across retries.
 pub(crate) async fn finalize_receipt(store: &mut ExecutionStore) -> Result<(), ExecError> {
     for _ in 0..MAX_CAS_RETRIES {
         let state = store
@@ -132,37 +216,31 @@ pub(crate) async fn finalize_receipt(store: &mut ExecutionStore) -> Result<(), E
             | ReceiptWork::CollectSignatures
             | ReceiptWork::Published
             | ReceiptWork::Incomplete => return Ok(()),
-            ReceiptWork::Assemble => match store.assemble_receipt(now_ms()).await? {
-                ApplyOutcome::Committed(_)
+            ReceiptWork::Assemble => match store.publish_terminal(state.version(), now_ms()).await?
+            {
+                ApplyOutcome::Committed { .. }
                 | ApplyOutcome::AlreadyApplied
-                | ApplyOutcome::VersionMismatch { .. } => {}
-                ApplyOutcome::Conflict(conflict) => {
-                    return Err(ExecError::InvalidState(format!(
-                        "receipt assembly conflicts with durable proof: {conflict:?}"
-                    )));
-                }
-                ApplyOutcome::InboxAlreadyApplied { .. }
-                | ApplyOutcome::InboxAlreadyConsumed { .. } => {
-                    return Err(ExecError::InvalidState(
-                        "receipt assembly unexpectedly carried inbox state".into(),
-                    ));
-                }
+                | ApplyOutcome::InboxAlreadyApplied { .. }
+                | ApplyOutcome::InboxAlreadyConsumed { .. } => return Ok(()),
+                ApplyOutcome::VersionMismatch { .. } => {}
             },
         }
     }
     Err(ExecError::Unavailable(
-        "receipt finalization CAS retry limit exceeded".into(),
+        "receipt publication compare-and-set retry limit exceeded".into(),
     ))
 }
 
-/// Whether a failure observation was committed or existing terminal evidence won.
+/// Whether a failure observation was committed or existing terminal evidence
+/// won the race.
 pub(crate) enum FailureOutcome {
     Recorded,
     TerminalPreserved,
 }
 
-/// One failure transition for both a live actor and startup recovery. The Host
-/// owns the signer; the execution store remains the sole durable writer.
+/// Record one producer-authenticated failure for a live actor or startup
+/// recovery. A terminal proof in progress cannot be replaced by an abort; it
+/// is frozen as incomplete so its partial agreement remains inspectable.
 pub(crate) async fn fail_execution(
     store: &mut ExecutionStore,
     identity: &NodeKeys,
@@ -179,7 +257,7 @@ pub(crate) async fn fail_execution(
                 "failure signer is not the execution producer".into(),
             ));
         }
-        let input = match state.status().receipt_work() {
+        match state.status().receipt_work() {
             ReceiptWork::Assemble => {
                 finalize_receipt(store).await?;
                 return Ok(FailureOutcome::TerminalPreserved);
@@ -187,7 +265,23 @@ pub(crate) async fn fail_execution(
             ReceiptWork::Published | ReceiptWork::Incomplete => {
                 return Ok(FailureOutcome::TerminalPreserved);
             }
-            ReceiptWork::CollectSignatures => ExecutionInput::InterruptTerminal(reason.clone()),
+            ReceiptWork::CollectSignatures => {
+                match store
+                    .interrupt_terminal(state.version(), reason.clone(), now_ms())
+                    .await?
+                {
+                    ApplyOutcome::Committed { .. } | ApplyOutcome::AlreadyApplied => {
+                        return Ok(FailureOutcome::Recorded);
+                    }
+                    ApplyOutcome::InboxAlreadyApplied { .. }
+                    | ApplyOutcome::InboxAlreadyConsumed { .. } => {
+                        return Err(ExecError::InvalidState(
+                            "local terminal interruption unexpectedly carried inbox state".into(),
+                        ));
+                    }
+                    ApplyOutcome::VersionMismatch { .. } => continue,
+                }
+            }
             ReceiptWork::NotTerminal => {
                 let unsigned = AbortOccurrence::unsigned(
                     state.binding().session_id(),
@@ -195,32 +289,31 @@ pub(crate) async fn fail_execution(
                     AbortKind::Fail,
                     1,
                     reason.clone(),
-                    state.public(),
+                    state.step_cursor(),
                 )?;
-                let signature = identity.sign(&unsigned.signing_bytes()?);
-                ExecutionInput::Abort(unsigned.with_signature(signature)?)
-            }
-        };
-        match store.apply_input(input, now_ms()).await? {
-            ApplyOutcome::Committed(_) | ApplyOutcome::AlreadyApplied => {
-                finalize_receipt(store).await?;
-                return Ok(FailureOutcome::Recorded);
-            }
-            ApplyOutcome::VersionMismatch { .. } => continue,
-            ApplyOutcome::Conflict(conflict) => {
-                return Err(ExecError::InvalidState(format!(
-                    "failure conflicts with durable evidence: {conflict:?}"
-                )));
-            }
-            ApplyOutcome::InboxAlreadyApplied { .. }
-            | ApplyOutcome::InboxAlreadyConsumed { .. } => {
-                return Err(ExecError::InvalidState(
-                    "failure unexpectedly carried inbox state".into(),
-                ));
+                let signing_bytes = unsigned.signing_bytes()?;
+                let occurrence = unsigned.with_signature(identity.sign(&signing_bytes))?;
+                let outcome = store
+                    .stop_execution(state.version(), occurrence, None, now_ms())
+                    .await;
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(error) => return Err(error.into()),
+                };
+                match outcome {
+                    ApplyOutcome::Committed { .. }
+                    | ApplyOutcome::AlreadyApplied
+                    | ApplyOutcome::InboxAlreadyApplied { .. }
+                    | ApplyOutcome::InboxAlreadyConsumed { .. } => {
+                        finalize_receipt(store).await?;
+                        return Ok(FailureOutcome::Recorded);
+                    }
+                    ApplyOutcome::VersionMismatch { .. } => continue,
+                }
             }
         }
     }
     Err(ExecError::Unavailable(
-        "failure CAS retry limit exceeded".into(),
+        "failure compare-and-set retry limit exceeded".into(),
     ))
 }

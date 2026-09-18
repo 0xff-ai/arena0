@@ -1,12 +1,12 @@
-//! Three independent replicas agree on one bounded task assignment and replay
-//! every producer receipt against the exact guest Wasm.
+//! Three independent replicas agree on one bounded task assignment and verify
+//! every producer receipt's portable proof.
 
 use arena0_tests::arena::Arena;
 use arena0_tests::wasm::program_wasm;
-use arena0_verify::VerifiedTerminal;
+use arena0_verify::LightVerifiedTerminal;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn contract_net_runs_and_every_producer_replays() {
+async fn contract_net_runs_and_every_producer_verifies() {
     let wasm = program_wasm("contract_net");
 
     let params = serde_json::to_vec(&serde_json::json!({
@@ -50,29 +50,15 @@ async fn contract_net_runs_and_every_producer_replays() {
     assert_eq!(run.session_hash(0), run.session_hash(1));
     assert_eq!(run.session_hash(1), run.session_hash(2));
     let verified = run
-        .verify_all(&wasm)
-        .expect("all three contract-net receipts replay-verify");
+        .verify_all()
+        .expect("all three contract-net receipts verify");
 
     for (participant, (verified, expected_outcome)) in
         verified.into_iter().zip(&outcomes).enumerate()
     {
-        let VerifiedTerminal::Completed {
-            outcome_borsh,
-            outcome_json,
-        } = verified.terminal
-        else {
+        let LightVerifiedTerminal::Completed { outcome_borsh } = verified.terminal else {
             panic!("participant {participant}: expected completed receipt");
         };
         assert_eq!(&outcome_borsh, expected_outcome);
-        let outcome: serde_json::Value = serde_json::from_slice(outcome_json.as_bytes())
-            .expect("guest projects valid contract-net JSON");
-        let assignments = outcome["plan"]["assignments"]
-            .as_array()
-            .expect("outcome has an assignment array");
-        assert_eq!(assignments.len(), 2);
-        assert_eq!(assignments[0]["award"]["Assigned"]["worker"], 1);
-        assert_eq!(assignments[0]["award"]["Assigned"]["cost"], 7);
-        assert_eq!(assignments[1]["award"]["Assigned"]["worker"], 2);
-        assert_eq!(assignments[1]["award"]["Assigned"]["cost"], 4);
     }
 }

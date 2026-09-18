@@ -9,7 +9,7 @@ publish = false
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-arena0-sdk = "=0.1.0"
+arena0-sdk = { path = "../../crates/arena0-sdk" }
 borsh = { version = "1.6", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 

@@ -1,19 +1,20 @@
 //! Trace coverage and convergence assertions shared by the orchestration
 //! framework. [`CoverageReport`] summarizes which events and effects a suite
 //! exercised, and [`PairTrace`] carries the shared-hash and replay assertions
-//! used to prove two [`BilateralPair`] replicas stayed in step.
+//! used to prove two [`BilateralPair`] replicas stayed aligned.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use arena0_protocol::{DivergenceDiagnostic, PublicEffect, PublicEvent, TraceEntry};
+use arena0_protocol::{DivergenceDiagnostic, Effect, Event};
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::{Arena0Phase, Program};
 
+use super::harness::DispatchRecord;
 use super::harness::Harness;
 use super::orchestration::BilateralPair;
 
-/// Public-trace coverage summary for scenario suites.
+/// Dispatch coverage summary for scenario suites.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CoverageReport {
     pub events: BTreeMap<String, usize>,
@@ -21,12 +22,12 @@ pub struct CoverageReport {
 }
 
 impl CoverageReport {
-    pub(super) fn from_traces(left: &[TraceEntry], right: &[TraceEntry]) -> Self {
+    pub(super) fn from_traces(left: &[DispatchRecord], right: &[DispatchRecord]) -> Self {
         let mut report = Self::default();
-        for step in left.iter().chain(right) {
-            let event = event_name(&step.event).to_string();
+        for record in left.iter().chain(right) {
+            let event = event_name(&record.event).to_string();
             *report.events.entry(event.clone()).or_insert(0) += 1;
-            for effect in &step.effects {
+            for effect in &record.effects {
                 let effect = effect_name(effect).to_string();
                 report.event_effect_pairs.insert((event.clone(), effect));
             }
@@ -34,7 +35,7 @@ impl CoverageReport {
         report
     }
 
-    /// Assert that at least one trace step covered `event`.
+    /// Assert that at least one dispatch record covered `event`.
     pub fn assert_event(&self, event: &str) {
         assert!(
             self.events.contains_key(event),
@@ -43,7 +44,7 @@ impl CoverageReport {
         );
     }
 
-    /// Assert that at least one trace step covered the event/effect pair.
+    /// Assert that at least one dispatch record covered the event/effect pair.
     pub fn assert_event_effect(&self, event: &str, effect: &str) {
         let pair = (event.to_string(), effect.to_string());
         assert!(
@@ -68,8 +69,8 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PairTrace")
-            .field("alice_steps", &self.pair.alice().trace().len())
-            .field("bob_steps", &self.pair.bob().trace().len())
+            .field("alice_event_count", &self.pair.alice().trace().len())
+            .field("bob_event_count", &self.pair.bob().trace().len())
             .finish()
     }
 }
@@ -139,12 +140,12 @@ where
     }
 }
 
-fn append_trace_summary(out: &mut String, label: &str, trace: &[TraceEntry]) {
+fn append_trace_summary(out: &mut String, label: &str, trace: &[DispatchRecord]) {
     use std::fmt::Write as _;
 
     let _ = writeln!(out, "{label}:");
-    for step in trace {
-        let effect_names = step
+    for record in trace {
+        let effect_names = record
             .effects
             .iter()
             .map(effect_name)
@@ -153,24 +154,34 @@ fn append_trace_summary(out: &mut String, label: &str, trace: &[TraceEntry]) {
         let _ = writeln!(
             out,
             "  #{} {:?} effects=[{}]",
-            step.step, step.event, effect_names
+            record.event_position, record.event, effect_names
         );
     }
 }
 
-fn effect_name(effect: &PublicEffect) -> &'static str {
+fn effect_name(effect: &Effect) -> &'static str {
     match effect {
-        PublicEffect::SessionEnd { .. } => "SessionEnd",
-        PublicEffect::SessionAbort { .. } => "SessionAbort",
-        PublicEffect::Fail { .. } => "Fail",
+        Effect::Broadcast { .. } => "Broadcast",
+        Effect::Callout { .. } => "Callout",
+        Effect::SetTimer { .. } => "SetTimer",
+        Effect::Sign { .. } => "Sign",
+        Effect::RetryInput { .. } => "RetryInput",
+        Effect::SessionEnd { .. } => "SessionEnd",
+        Effect::SessionAbort { .. } => "SessionAbort",
+        Effect::Fail { .. } => "Fail",
     }
 }
 
 /// Human-readable event name, also used by [`super::fixtures`]'s replay
 /// diagnostics.
-pub(super) fn event_name(event: &PublicEvent) -> &'static str {
+pub(super) fn event_name(event: &Event) -> &'static str {
     match event {
-        PublicEvent::SessionStarted { .. } => "SessionStarted",
-        PublicEvent::MessageReceived { .. } => "MessageReceived",
+        Event::SessionStarted { .. } => "SessionStarted",
+        Event::MessageReceived { .. } => "MessageReceived",
+        Event::InputReceived { .. } => "InputReceived",
+        Event::TimerFired => "TimerFired",
+        Event::TypedTimerFired { .. } => "TypedTimerFired",
+        Event::Signed { .. } => "Signed",
+        Event::React => "React",
     }
 }

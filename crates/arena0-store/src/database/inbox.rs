@@ -1,5 +1,4 @@
 use super::*;
-use arena0_protocol::PublicEvent;
 
 struct RawInboxRow {
     source: Vec<u8>,
@@ -17,29 +16,6 @@ struct ValidatedInboxFrame {
 }
 
 impl Database {
-    pub(super) fn inbox_row(
-        &mut self,
-        execution_id: ExecId,
-        inbox_id: InboxId,
-    ) -> Result<Option<(PeerId, InboxStatus, Option<ExecutionVersion>)>, StoreError> {
-        let row: Option<(Vec<u8>, String, Option<i64>)> = self.connection.query_row(
-            "SELECT source, status, applied_version FROM inbox WHERE execution_id = ?1 AND inbox_id = ?2",
-            params![execution_id.0.to_vec(), inbox_id.as_bytes().to_vec()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).optional()?;
-        match row {
-            Some((source, status, version)) => Ok(Some((
-                peer_id_from_blob(&source, "inbox source")?,
-                parse_inbox_status(&status)?,
-                version
-                    .map(sqlite_i64)
-                    .transpose()?
-                    .map(ExecutionVersion::new),
-            ))),
-            None => Ok(None),
-        }
-    }
-
     pub(super) fn accept_inbound(
         &mut self,
         execution_id: ExecId,
@@ -148,134 +124,6 @@ impl Database {
             .collect()
     }
 
-    pub(super) fn apply_inbound(
-        &mut self,
-        execution_id: ExecId,
-        inbox_id: InboxId,
-        now_ms: u64,
-    ) -> Result<ApplyOutcome, StoreError> {
-        self.begin()?;
-        let result = (|| {
-            let state = self
-                .load_execution_in_transaction(execution_id)?
-                .ok_or(StoreError::ExecutionNotFound(execution_id))?;
-            let (source, stored, status, applied_version) =
-                self.load_inbox_fact(execution_id, inbox_id, &state)?;
-            match status {
-                InboxStatus::Applied => Ok(ApplyOutcome::InboxAlreadyApplied {
-                    inbox_id,
-                    version: applied_version.ok_or_else(|| {
-                        StoreError::Corruption("applied inbox row has no version".into())
-                    })?,
-                }),
-                InboxStatus::Consumed => Ok(ApplyOutcome::InboxAlreadyConsumed { inbox_id }),
-                InboxStatus::Accepted => {
-                    let input = match decode_stored_frame(&stored)? {
-                        ExecFrame::StepSignature {
-                            commitment,
-                            signature,
-                        } => {
-                            ensure_step_commitment(&state, &commitment, inbox_id)?;
-                            ExecutionInput::StepSignature(ParticipantStepSignature::new(
-                                source,
-                                commitment.step,
-                                signature,
-                            ))
-                        }
-                        ExecFrame::End {
-                            commitment,
-                            signature,
-                        } => {
-                            ensure_terminal_commitment(&state, &commitment, inbox_id)?;
-                            ExecutionInput::TerminalSignature(ParticipantTerminalSignature::new(
-                                source, signature,
-                            ))
-                        }
-                        ExecFrame::Abort { occurrence } => ExecutionInput::Abort(occurrence),
-                        ExecFrame::Message { .. } => {
-                            return Err(StoreError::InboxMessageNeedsResolution(inbox_id));
-                        }
-                    };
-                    self.apply_input_in_transaction(
-                        execution_id,
-                        input,
-                        Some(InboxReference {
-                            inbox_id,
-                            source,
-                            complete_on_apply: true,
-                        }),
-                        now_ms,
-                    )
-                }
-            }
-        })();
-        match result {
-            Ok(value) => self.commit_result(value),
-            Err(error) => self.rollback_result(error),
-        }
-    }
-
-    pub(super) fn apply_inbound_message(
-        &mut self,
-        execution_id: ExecId,
-        inbox_id: InboxId,
-        delta: SharedDelta,
-        now_ms: u64,
-    ) -> Result<ApplyOutcome, StoreError> {
-        self.begin()?;
-        let result = (|| {
-            let state = self
-                .load_execution_in_transaction(execution_id)?
-                .ok_or(StoreError::ExecutionNotFound(execution_id))?;
-            let (source, stored, status, applied_version) =
-                self.load_inbox_fact(execution_id, inbox_id, &state)?;
-            let ExecFrame::Message {
-                message_id,
-                seq,
-                prestate,
-                data,
-                witness,
-            } = decode_stored_frame(&stored)?
-            else {
-                return Err(StoreError::InboxNotMessage(inbox_id));
-            };
-            match status {
-                InboxStatus::Applied => Ok(ApplyOutcome::InboxAlreadyApplied {
-                    inbox_id,
-                    version: applied_version.ok_or_else(|| {
-                        StoreError::Corruption("applied inbox row has no version".into())
-                    })?,
-                }),
-                InboxStatus::Consumed => Ok(ApplyOutcome::InboxAlreadyConsumed { inbox_id }),
-                InboxStatus::Accepted => {
-                    let entry = delta.entry();
-                    let binds = matches!(&entry.event, PublicEvent::MessageReceived { message_id: candidate_id, from, position, pre_state, msg } if *candidate_id == message_id && *from == source && *position == seq && *pre_state == prestate && msg == &data)
-                        && entry.witness == Some(witness);
-                    if !binds {
-                        return Err(StoreError::InboxInputMismatch {
-                            inbox_id,
-                            part_index: 0,
-                        });
-                    }
-                    self.apply_input_in_transaction(
-                        execution_id,
-                        ExecutionInput::ProposeShared(delta),
-                        Some(InboxReference {
-                            inbox_id,
-                            source,
-                            complete_on_apply: true,
-                        }),
-                        now_ms,
-                    )
-                }
-            }
-        })();
-        match result {
-            Ok(value) => self.commit_result(value),
-            Err(error) => self.rollback_result(error),
-        }
-    }
-
     pub(super) fn reject_inbound(
         &mut self,
         execution_id: ExecId,
@@ -334,7 +182,7 @@ impl Database {
             .map_err(StoreError::Sqlite)
     }
 
-    fn load_inbox_fact(
+    pub(super) fn load_inbox_fact(
         &mut self,
         execution_id: ExecId,
         inbox_id: InboxId,
@@ -361,6 +209,63 @@ impl Database {
                 .transpose()?
                 .map(ExecutionVersion::new),
         ))
+    }
+
+    /// Mark one accepted inbound frame as applied by the execution
+    /// transaction. The execution row and this inbox row are updated by the
+    /// same caller transaction; requiring the accepted status here prevents a
+    /// later replay from claiming a frame that has already crossed either
+    /// completion boundary.
+    pub(super) fn mark_inbox_applied(
+        &mut self,
+        execution_id: ExecId,
+        inbox_id: InboxId,
+        version: ExecutionVersion,
+    ) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE inbox SET status = 'applied', applied_version = ?1,
+                    consumed_at_ms = NULL
+             WHERE execution_id = ?2 AND inbox_id = ?3 AND status = 'accepted'",
+            params![
+                sqlite_u64(version.get())?,
+                execution_id.0.to_vec(),
+                inbox_id.as_bytes().to_vec(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Corruption(
+                "inbound applied compare-and-set failed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Mark one accepted inbound frame as consumed without applying it (for
+    /// example, a rejected message or a protocol signature whose proposal is
+    /// already terminal). Applied and consumed are mutually exclusive durable
+    /// inbox outcomes.
+    pub(super) fn mark_inbox_consumed(
+        &mut self,
+        execution_id: ExecId,
+        inbox_id: InboxId,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE inbox SET status = 'consumed', consumed_at_ms = ?1,
+                    applied_version = NULL
+             WHERE execution_id = ?2 AND inbox_id = ?3 AND status = 'accepted'",
+            params![
+                sqlite_u64(now_ms)?,
+                execution_id.0.to_vec(),
+                inbox_id.as_bytes().to_vec(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Corruption(
+                "inbound consumed compare-and-set failed".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn validate_inbox_rows(&mut self) -> Result<(), StoreError> {
@@ -485,36 +390,4 @@ fn validate_inbox_frame(
         stored,
         frame: authenticated.frame,
     })
-}
-
-fn ensure_step_commitment(
-    state: &ExecutionState,
-    commitment: &StepCommitment,
-    inbox_id: InboxId,
-) -> Result<(), StoreError> {
-    if commitment.session_id != state.binding().session_id()
-        || state
-            .pending_shared()
-            .is_none_or(|proposal| proposal.commitment() != commitment)
-    {
-        return Err(StoreError::InboxInputMismatch {
-            inbox_id,
-            part_index: 0,
-        });
-    }
-    Ok(())
-}
-
-fn ensure_terminal_commitment(
-    state: &ExecutionState,
-    commitment: &TerminalCommitment,
-    inbox_id: InboxId,
-) -> Result<(), StoreError> {
-    if state.pending_terminal() != Some(commitment) {
-        return Err(StoreError::InboxInputMismatch {
-            inbox_id,
-            part_index: 0,
-        });
-    }
-    Ok(())
 }

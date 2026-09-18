@@ -1,6 +1,6 @@
 //! M4: three in-process executions run the cumulative-sum program as an explicit
 //! local ensemble. The path exercises N-party broadcast routing, the entropy
-//! record/replay path, and the all-ensemble session-end gate; every node
+//! record path, and the all-ensemble session-end gate; every node
 //! converges on the same total and every trace verifies.
 
 use std::time::Duration;
@@ -34,5 +34,5 @@ async fn cumulative_sum_trilateral_runs_and_verifies() {
     assert_eq!(run.session_hash(0), run.session_hash(1));
     assert_eq!(run.session_hash(1), run.session_hash(2));
 
-    run.verify_all(&wasm).expect("all three traces must verify");
+    run.verify_all().expect("all three traces must verify");
 }

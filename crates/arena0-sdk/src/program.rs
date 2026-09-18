@@ -7,15 +7,14 @@ use core::convert::Infallible;
 
 use crate::{
     Arena0Callout, Arena0Phase, Arena0Query, Context, InputFault, LocalState, PhaseDecl,
-    PhasedSharedState, PrimitiveRouteSchema, ProgramFault, ProtocolFault, SharedContext,
-    SharedState, Transition,
+    PhasedSharedState, PrimitiveRouteSchema, ProgramFault, ProtocolFault, SharedState, Transition,
 };
 
 pub type ProgramTransition<P> = Transition<<P as Program>::Phase>;
 
 /// The outcome of a shared message apply: accept (with a transition) or reject.
 ///
-/// `Reject` is a deterministic non-application: the host rolls the candidate
+/// `Reject` is a deterministic non-application: the host rolls the dispatch
 /// layer back, records no trace entry, and quarantines the message. It is not
 /// a fault — faults remain fatal abort edges.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,20 +40,11 @@ pub type MessageApply<P> = Result<ApplyDecision<<P as Program>::Phase>, Protocol
 /// runtime handles transport, callout/input collection, and state verification.
 /// Programs never touch the network directly.
 ///
-/// Shared handlers receive [`SharedContext`], while local handlers receive
-/// `Context<Self::Shared, Self::Local>`. Handlers come in two classes:
-///
-/// - **Shared-event handlers** ([`on_session_started`](Self::on_session_started),
-///   [`on_message`](Self::on_message)) run identically on every node at the
-///   same public trace position, as pure functions of (shared state, event).
-///   They may mutate shared state; entropy, callouts, timers, broadcasts, and
-///   local-state access are unavailable in the type system.
-/// - **Local handlers** ([`on_react`](Self::on_react),
-///   [`on_input`](Self::on_input), timers, sign results) see a read-only
-///   shared view plus private state, may draw entropy, request callouts, and
-///   emit broadcasts. They never mutate shared state: a node's decision
-///   reaches shared state only through the message it broadcasts, which every
-///   node (the sender included) applies through the same shared handler.
+/// Every mutating event receives `Context<Self::Shared, Self::Local>`. A
+/// callback may update both state values, emit effects, and return a lifecycle
+/// transition. The Host treats the complete result atomically at the applicable
+/// agreement boundary; a fault or deterministic rejection restores both state
+/// values and discards provisional effects.
 ///
 /// Module-shell programs may await arena-owned callouts inside async handlers.
 /// The program macro lowers `ctx.effects().callout(...).await?` into generated
@@ -94,94 +84,84 @@ pub trait Program: Sized {
         + borsh::BorshDeserialize
         + 'static;
 
-    fn initialize(
-        _ctx: &mut SharedContext<Self::Shared>,
-        _params: Self::Params,
-    ) -> Result<(), ProgramFault> {
+    fn initialize(_shared: &mut Self::Shared, _params: Self::Params) -> Result<(), ProgramFault> {
         Ok(())
     }
 
     /// Derive the typed terminal outcome from final shared state.
     ///
     /// This is a pure projection: no [`Context`], no effects, no randomness, and
-    /// shared-only by signature. Because the outcome is `f(shared)` and shared
+    /// state-only by signature. Because the outcome is `f(shared)` and shared
     /// state is hash-agreed at the final step, every party computes the identical
-    /// outcome by construction, and a replaying verifier recomputes it from the
-    /// same wasm and final state. When a handler returns [`Transition::End`], the
+    /// outcome by construction, and the Host can derive it from the final shared
+    /// state. When a handler returns [`Transition::End`], the
     /// generated dispatch glue calls this, serializes the result, and emits
     /// [`Effect::SessionEnd`](crate::Effect::SessionEnd).
     fn outcome(shared: &Self::Shared) -> Self::Outcome;
 
-    /// Select the sole participant allowed to author the next public message.
+    /// Select the sole participant allowed to author the next agreed message.
     ///
     /// This is a pure function of replicated state. Returning `None` closes the
-    /// public-message boundary until another public event changes that state.
+    /// agreed-message boundary until another agreed event changes that state.
     /// The host checks this result before invoking [`Self::on_message`], so
-    /// network arrival order cannot select between sibling candidates.
+    /// network arrival order cannot select between sibling message results.
     fn writer(shared: &Self::Shared) -> Option<Participant>;
 
-    /// Shared boundary handler: applied by every node at public position 0.
-    /// A pure function of (shared state, ensemble); typically sizes shared
-    /// buffers and moves to the initial phase.
+    /// Session boundary handler. It receives the committed participant set as
+    /// explicit input and may update both state values or emit effects.
     fn on_session_started(
-        _ctx: &mut SharedContext<Self::Shared>,
+        _ctx: &mut Context<Self::Shared, Self::Local>,
         _ensemble: &Ensemble,
     ) -> Result<ProgramTransition<Self>, ProgramFault> {
         Ok(Transition::Stay)
     }
 
-    /// Local decision hook, run by the node's own runtime after every applied
-    /// public entry (the session-start boundary included) unless a callout is
-    /// already pending. Reads shared state, writes private state, draws
-    /// entropy, requests callouts, and emits broadcasts; recorded only in the
-    /// node's private trace section.
-    fn on_react(_ctx: &mut Context<Self::Shared, Self::Local>) -> Result<(), ProgramFault> {
-        Ok(())
+    /// Decision hook run by the node's runtime after an applied entry unless a
+    /// callout is already pending.
+    fn on_react(
+        _ctx: &mut Context<Self::Shared, Self::Local>,
+    ) -> Result<ProgramTransition<Self>, ProgramFault> {
+        Ok(Transition::Stay)
     }
 
-    /// Shared message handler: applied by every node at the message's canonical
-    /// public position, as a pure function of (shared state, message).
-    ///
-    /// Returns [`ApplyDecision::Accept`] to apply the message (with an optional
-    /// transition) or [`ApplyDecision::Reject`] to deterministically decline it:
-    /// a rejected apply leaves no trace entry and the host quarantines the
-    /// message. The shared context has no local-state, entropy, effects, or
-    /// node-identity access. Local state is not present in this boundary; the
-    /// host restores only the shared bytes when a candidate is rejected.
+    /// Message handler applied at the message's canonical agreed position.
+    /// Returns [`ApplyDecision::Accept`] to commit the dispatch result and transition
+    /// or [`ApplyDecision::Reject`] to decline it without a trace entry.
     fn on_message(
-        _ctx: &mut SharedContext<Self::Shared>,
+        _ctx: &mut Context<Self::Shared, Self::Local>,
         _from: Participant,
         _msg: Self::Message,
     ) -> MessageApply<Self> {
         Ok(ApplyDecision::Accept(Transition::Stay))
     }
-    /// Local handler for a callout answer. Emits broadcasts and writes private
-    /// state; shared transitions come only from the shared handlers that apply
-    /// the resulting messages.
+    /// Handler for a callout answer. It may update both state values and emit
+    /// effects; retryable faults preserve the pending input for another try.
     fn on_input(
         _ctx: &mut Context<Self::Shared, Self::Local>,
         _input: Self::Input,
-    ) -> Result<(), InputFault> {
-        Ok(())
+    ) -> Result<ProgramTransition<Self>, InputFault> {
+        Ok(Transition::Stay)
     }
     #[doc(hidden)]
     fn __arena0_on_signed(
         _ctx: &mut Context<Self::Shared, Self::Local>,
         _signature: Vec<u8>,
-    ) -> Result<(), ProgramFault> {
-        Ok(())
+    ) -> Result<ProgramTransition<Self>, ProgramFault> {
+        Ok(Transition::Stay)
     }
 
     #[doc(hidden)]
     fn __arena0_restore_continuation(_ctx: &mut Context<Self::Shared, Self::Local>, _tag: u32) {}
-    fn on_timer(_ctx: &mut Context<Self::Shared, Self::Local>) -> Result<(), ProgramFault> {
-        Ok(())
+    fn on_timer(
+        _ctx: &mut Context<Self::Shared, Self::Local>,
+    ) -> Result<ProgramTransition<Self>, ProgramFault> {
+        Ok(Transition::Stay)
     }
     #[doc(hidden)]
     fn __arena0_on_typed_timer(
         ctx: &mut Context<Self::Shared, Self::Local>,
         _timer: TimerPayload,
-    ) -> Result<(), ProgramFault> {
+    ) -> Result<ProgramTransition<Self>, ProgramFault> {
         Self::on_timer(ctx)
     }
 
@@ -235,13 +215,20 @@ pub type PhaselessTransition = Transition<Infallible>;
 pub trait ProgramQuery: Program {
     type Query: Arena0Query;
 
+    /// Evaluate a query against a shared-state snapshot and the committed
+    /// participant set supplied for this session.
     fn query(
-        ctx: &SharedContext<Self::Shared>,
+        shared: &Self::Shared,
+        ensemble: &Ensemble,
         query: Self::Query,
     ) -> <Self::Query as Arena0Query>::Response;
 }
 
 /// Read-only terminal view surface separated from transition handlers.
 pub trait ProgramView: Program {
-    fn view(ctx: &SharedContext<Self::Shared>, viewport: &Viewport) -> View;
+    /// Render a projection from replicated state, the committed participant
+    /// set, and the requested viewport. The ensemble is explicit because it
+    /// is session input rather than replicated program state; views remain
+    /// pure and cannot access local state or emit effects.
+    fn view(shared: &Self::Shared, ensemble: &Ensemble, viewport: &Viewport) -> View;
 }

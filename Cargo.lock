@@ -248,7 +248,10 @@ dependencies = [
  "arena0-store",
  "arena0-transport",
  "arena0-wire",
+ "async-trait",
  "blake3",
+ "borsh",
+ "bytes",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
@@ -321,7 +324,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
- "wasmparser 0.221.3",
+ "wasm-encoder 0.251.0",
+ "wasmparser 0.251.0",
  "wasmtime",
  "wat",
 ]
@@ -361,7 +365,6 @@ dependencies = [
  "arena0-crypto",
  "arena0-program",
  "arena0-protocol",
- "arena0-verify",
  "blake3",
  "borsh",
  "fs2",
@@ -426,12 +429,7 @@ dependencies = [
  "arena0-crypto",
  "arena0-program",
  "arena0-protocol",
- "arena0-sandbox",
- "serde_json",
  "thiserror 2.0.18",
- "tracing",
- "tracing-subscriber",
- "wat",
 ]
 
 [[package]]
@@ -1456,12 +1454,6 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "foldhash"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
-
-[[package]]
-name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
@@ -1656,23 +1648,13 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "hashbrown"
-version = "0.15.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
-dependencies = [
- "foldhash 0.1.5",
- "serde",
-]
-
-[[package]]
-name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash 0.2.0",
+ "foldhash",
 ]
 
 [[package]]
@@ -1683,7 +1665,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash 0.2.0",
+ "foldhash",
  "serde",
  "serde_core",
 ]
@@ -3995,19 +3977,6 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
-]
-
-[[package]]
-name = "wasmparser"
-version = "0.221.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d06bfa36ab3ac2be0dee563380147a5b81ba10dd8885d7fbbc9eb574be67d185"
-dependencies = [
- "bitflags",
- "hashbrown 0.15.5",
- "indexmap",
- "semver",
- "serde",
 ]
 
 [[package]]

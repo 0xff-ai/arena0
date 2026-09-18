@@ -9,7 +9,7 @@
 //! actor completes guest signing continuations without crossing the socket.
 //!
 //! Daemon state changes record one redacted system event and publish one
-//! matching local API frame through a private Host event feed.
+//! matching local API frame through a Host-local event feed.
 
 mod assets;
 mod catalog;

@@ -1,5 +1,5 @@
 //! M3: two in-process executions run prisoner's dilemma bilaterally
-//! over `LocalTransport`; the replay verifier accepts both traces.
+//! over `LocalTransport`; portable verification accepts both traces.
 
 use arena0_tests::arena::Arena;
 use arena0_tests::wasm::program_wasm;
@@ -32,5 +32,5 @@ async fn prisoner_dilemma_bilateral_runs_and_verifies() {
     );
 
     assert_eq!(run.session_hash(0), run.session_hash(1));
-    run.verify_all(&wasm).expect("both traces must verify");
+    run.verify_all().expect("both traces must verify");
 }

@@ -92,6 +92,11 @@ impl Entropy {
         self.replay = Some(draws.into());
         self.log.clear();
     }
+
+    /// Start a fresh live entropy stream for the next resident dispatch.
+    pub(crate) fn reset(&mut self) {
+        *self = Self::live();
+    }
 }
 
 #[cfg(test)]

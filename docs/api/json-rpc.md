@@ -76,7 +76,7 @@ ensemble size must fall within it.
 | `exec.new` | `{exec_id, program, params?, ensemble}` | `ExecCreated` |
 | `exec.list` | — | `ExecList` |
 | `exec.status` | `{exec_id}` | `Status` |
-| `exec.inspect` | `{exec_id}` | `Inspection` |
+| `exec.inspect` | `{exec_id, events_from?, events_limit}` | `Inspection` |
 | `exec.await` | `{exec_id, until}` | `Awaited` |
 | `exec.next` | `{exec_id}` | `Next` |
 | `exec.submit` | `{exec_id, pending_id, answer?}` | `Ack` |
@@ -112,10 +112,12 @@ receipt or stop report is durably available.
 
 `exec.inspect` is a bounded, Host-local diagnostic projection for operator
 interfaces. It returns `exec.status`, durable activation facts, participant
-peer IDs and ticket commitments, and summaries of private handler crossings.
-It never returns private payloads, replacement local state, signatures, keys,
-parameters, outcomes, or callout context. Private summaries are the latest
-store-bounded window; `private_total` reveals when older summaries are omitted.
+peer IDs and ticket commitments, and summaries of event dispatch records.
+It never returns event payloads, replacement local state, signatures, keys,
+parameters, outcomes, or callout context. Event records are the latest
+store-bounded window. The response exposes the page through `events_from`,
+`events`, `events_total`, and `events_next`; `events_total` reveals when older
+records are omitted.
 Inspection data is local diagnostic evidence, not a protocol receipt or
 semantic system-event stream.
 
@@ -178,12 +180,15 @@ custodied execution key.
 
 The Host persists an authenticated inbound execution frame before it
 acknowledges transport responsibility. The execution actor resolves the frame
-through the reducer, which commits state, trace or private records, timers, and
-outbox effects in one SQLite transaction. Outbox delivery uses leases and
-retries, and expired leases are recovered when the store opens. A pending
-callout retains its `pending_id` and guest context across a restart, so
-`exec.next` can return the same callout again. Terminal proof collection is internal; the socket exposes the terminal result
-and the authenticated portable artifact.
+through the same flat event dispatch as local inputs. A direct store method
+commits the accepted event, shared and local state images, effects, timers,
+inbox status, and outbox rows in one SQLite transaction. Protocol frame outbox
+rows are per destination; a producer does not process its own broadcast.
+Outbox delivery uses leases and retries, and expired leases are recovered when
+the store opens. A pending callout retains its `pending_id` and guest context
+across a restart, so `exec.next` can return the same callout again. Terminal
+proof collection is internal; the socket exposes the terminal result and the
+authenticated portable artifact.
 
 ## Receipts
 
@@ -192,7 +197,7 @@ and the authenticated portable artifact.
 | `receipt.get` | `{receipt}` | `Receipt` containing a `ReceiptArtifact` |
 | `receipt.import` | `{receipt}` | `ReceiptList` |
 | `receipt.list` | — | `ReceiptList` |
-| `receipt.verify` | `{receipt,full}` | `Verified` |
+| `receipt.verify` | `{receipt}` | `Verified` |
 
 `ReceiptRef` has three externally tagged JSON forms:
 
@@ -210,19 +215,17 @@ local production and import facts independently yield `Produced`, `Imported`, or
 `Both`. Each `Verified` response includes the exact verified `receipt_id`.
 
 The earlier `{key:{session_id,producer}}` API and producer-sealed JSON format are
-replaced by these references and artifacts. Receipt format and store schema are
-version 2; older evidence requires its matching older release.
+replaced by these references and artifacts. Receipt artifact and body format,
+their `ReceiptId` domain, and the store schema are version 3; older evidence and
+databases require their matching older release.
 
-Light verification returns cryptographically checked evidence without loading
-Wasm. Full verification is served by the daemon and replays the exact program.
-A completed JSON outcome is available only after full replay because the Host
-otherwise treats the receipt's Borsh outcome bytes as opaque.
-
-The `Verified` response carries a tier-specific `result`: `Light` contains a
-completed `outcome_borsh` or an exact `Stopped { cause }`, while `Full` contains
-both `outcome_borsh` and the replayed `outcome_json` for completion. Stopped
-results never carry an outcome field; `cause` preserves either authenticated
-unilateral evidence or a shared N-of-N stop commitment.
+`receipt.verify` performs portable/light verification only. It checks the
+activation binding, ordered v2 trace chain, N-of-N aggregate agreements,
+shared pre/post hashes, terminal evidence, and v3 receipt identity without
+loading or executing Wasm. The Host keeps outcome Borsh bytes opaque, so a
+completed result contains authenticated `outcome_borsh`; a stopped result
+contains no outcome and instead carries the exact `Stopped { cause }`. There is
+no second verification mode or program execution endpoint.
 
 ## Daemon lifecycle and Host information
 
@@ -273,7 +276,7 @@ an action failed or a client received no response. No arguments, answers, or
 result bodies appear.
 
 Activity is bounded and live-only. A lag record reports dropped observations;
-reconnecting cannot replay them. Frame order describes daemon observation,
+reconnecting starts at the current stream position. Frame order describes daemon observation,
 not multiparty protocol causality. Read current execution state and evidence
 through the ordinary Host methods after a gap. Adapter activity remains separate
 from semantic `EventFrame` values and durable receipt facts.

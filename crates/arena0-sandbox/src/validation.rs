@@ -4,7 +4,10 @@
 use std::collections::HashSet;
 
 use arena0_program::abi;
-use arena0_program::{JsonSchemaDocument, ProgramDefinition, ProgramMetadata};
+use arena0_program::{
+    JsonSchemaDocument, MAX_WASM_MEMORY_BYTES, MAX_WASM_STATE_MEMORY_BYTES, ProgramDefinition,
+    ProgramMetadata,
+};
 use wasmtime::{ExternType, FuncType, Module, ValType};
 
 use crate::SandboxError;
@@ -23,18 +26,14 @@ const REQUIRED_FUNC_EXPORTS: &[(&str, &[AbiType], Returns)] = &[
         &[AbiType::I32, AbiType::I32],
         Returns::None,
     ),
+    (abi::exports::PREPARE, &[], Returns::One(AbiType::I32)),
     (
         abi::exports::INITIALIZE,
         &[AbiType::I32, AbiType::I32],
         Returns::Packed,
     ),
     (
-        abi::exports::SHARED,
-        &[AbiType::I32, AbiType::I32],
-        Returns::Packed,
-    ),
-    (
-        abi::exports::LOCAL,
+        abi::exports::DISPATCH,
         &[AbiType::I32, AbiType::I32],
         Returns::Packed,
     ),
@@ -139,8 +138,7 @@ fn validate_json_schema(label: &str, document: &JsonSchemaDocument) -> Result<()
     })
 }
 
-/// Verify the module exports all required arena0 function and global symbols.
-pub(crate) fn validate_exports(module: &Module) -> Result<(), SandboxError> {
+fn validate_required_exports(module: &Module) -> Result<(), SandboxError> {
     for &(name, params, returns) in REQUIRED_FUNC_EXPORTS {
         let export = module
             .exports()
@@ -161,6 +159,116 @@ pub(crate) fn validate_exports(module: &Module) -> Result<(), SandboxError> {
         }
     }
 
+    Ok(())
+}
+
+/// Verify the raw ABI-21 module exports all required functions and work memory
+/// before the artifact finalizer adds the state memories.
+pub(crate) fn validate_raw_exports(module: &Module) -> Result<(), SandboxError> {
+    validate_required_exports(module)?;
+    let memory = module
+        .exports()
+        .find(|export| export.name() == "memory")
+        .ok_or_else(|| SandboxError::MissingExport("memory".into()))?;
+    if memory.ty().memory().is_none() {
+        return Err(SandboxError::InvalidExportSignature {
+            name: "memory".into(),
+            expected: "memory export",
+            actual: format!("{:?}", memory.ty()),
+        });
+    }
+    Ok(())
+}
+
+/// Verify the completed ABI-21 three-memory artifact and its bounded work
+/// memory maximum.
+pub(crate) fn validate_exports(
+    module: &Module,
+    profile: &arena0_program::ExecutionProfile,
+) -> Result<(), SandboxError> {
+    validate_required_exports(module)?;
+    let memory_count = module
+        .exports()
+        .filter(|export| export.ty().memory().is_some())
+        .count();
+    if memory_count != 3 {
+        return Err(SandboxError::InvalidMetadata(format!(
+            "ABI-21 requires exactly {} exported memories, got {memory_count}",
+            3
+        )));
+    }
+
+    let work = module
+        .exports()
+        .find(|export| export.name() == "memory")
+        .ok_or_else(|| SandboxError::MissingExport("memory".into()))?
+        .ty();
+    let Some(work) = work.memory() else {
+        return Err(SandboxError::InvalidExportSignature {
+            name: "memory".into(),
+            expected: "memory export",
+            actual: format!("{work:?}"),
+        });
+    };
+    let work_pages = work.minimum();
+    let max_work_bytes = profile
+        .limits
+        .max_memory_bytes
+        .min(MAX_WASM_MEMORY_BYTES as u64);
+    let Some(work_maximum) = work.maximum() else {
+        return Err(SandboxError::InvalidMetadata(
+            "work memory must declare a bounded maximum".into(),
+        ));
+    };
+    let Some(work_max_bytes) = work_maximum.checked_mul(65_536) else {
+        return Err(SandboxError::InvalidMetadata(
+            "work memory maximum overflows u64".into(),
+        ));
+    };
+    if work_pages == 0 || work_pages > work_maximum || work_max_bytes > max_work_bytes {
+        return Err(SandboxError::InvalidMetadata(
+            "work memory minimum/maximum must be bounded by profile capacity".into(),
+        ));
+    }
+    if work_max_bytes < profile.limits.min_prepared_work_memory_bytes {
+        return Err(SandboxError::InvalidMetadata(
+            "work memory maximum cannot satisfy the prepared allocator reserve".into(),
+        ));
+    }
+
+    let state_pages = (MAX_WASM_STATE_MEMORY_BYTES as u64).div_ceil(65_536);
+    for name in [abi::exports::SHARED_MEMORY, abi::exports::LOCAL_MEMORY] {
+        let export = module
+            .exports()
+            .find(|export| export.name() == name)
+            .ok_or_else(|| SandboxError::MissingExport(name.into()))?;
+        let ty = export.ty();
+        let Some(memory) = ty.memory() else {
+            return Err(SandboxError::InvalidExportSignature {
+                name: name.into(),
+                expected: "memory export",
+                actual: format!("{ty:?}"),
+            });
+        };
+        if memory.minimum() != state_pages || memory.maximum() != Some(state_pages) {
+            return Err(SandboxError::InvalidMetadata(format!(
+                "memory {name} must be fixed at {state_pages} pages"
+            )));
+        }
+    }
+    let state_bytes = state_pages
+        .checked_mul(65_536)
+        .ok_or_else(|| SandboxError::InvalidMetadata("state capacity overflows u64".into()))?;
+    let total_bytes = work_max_bytes
+        .checked_add(state_bytes.checked_mul(2).ok_or_else(|| {
+            SandboxError::InvalidMetadata("state aggregate capacity overflows u64".into())
+        })?)
+        .ok_or_else(|| SandboxError::InvalidMetadata("memory aggregate overflows u64".into()))?;
+    if total_bytes > profile.limits.max_total_memory_bytes {
+        return Err(SandboxError::InvalidMetadata(
+            "ABI-21 memory aggregate exceeds profile capacity".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -306,6 +414,7 @@ pub(crate) fn check_abi_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arena0_program::ExecutionProfile;
     use wasmtime::{Engine, Instance, Module, Store};
 
     /// A stub module exporting every required arena0 symbol, optionally omitting
@@ -325,7 +434,7 @@ mod tests {
         let abi_version = if omitted == Some("arena0_abi_version") {
             ""
         } else {
-            r#"(global (export "arena0_abi_version") i32 (i32.const 20))"#
+            r#"(global (export "arena0_abi_version") i32 (i32.const 21))"#
         };
         let alloc = export(
             "arena0_alloc",
@@ -337,20 +446,20 @@ mod tests {
             r#"(func (export "arena0_dealloc") (param i32 i32))"#,
             r#"(func (export "arena0_dealloc") (param i32))"#,
         );
+        let prepare = export(
+            "arena0_prepare",
+            r#"(func (export "arena0_prepare") (result i32) i32.const 1)"#,
+            r#"(func (export "arena0_prepare") (result i64) i64.const 1)"#,
+        );
         let initialize = export(
             "arena0_initialize",
             r#"(func (export "arena0_initialize") (param i32 i32) (result i64) i64.const 0)"#,
             r#"(func (export "arena0_initialize") (param i32) (result i64) i64.const 0)"#,
         );
-        let shared = export(
-            "arena0_shared",
-            r#"(func (export "arena0_shared") (param i32 i32) (result i64) i64.const 0)"#,
-            r#"(func (export "arena0_shared") (param i32) (result i64) i64.const 0)"#,
-        );
-        let local = export(
-            "arena0_local",
-            r#"(func (export "arena0_local") (param i32 i32) (result i64) i64.const 0)"#,
-            r#"(func (export "arena0_local") (param i32) (result i64) i64.const 0)"#,
+        let dispatch = export(
+            "arena0_dispatch",
+            r#"(func (export "arena0_dispatch") (param i32 i32) (result i64) i64.const 0)"#,
+            r#"(func (export "arena0_dispatch") (param i32) (result i64) i64.const 0)"#,
         );
         let writer = export(
             "arena0_writer",
@@ -380,13 +489,15 @@ mod tests {
         let wat = format!(
             r#"
             (module
-              (memory (export "memory") 1)
+              (memory (export "memory") 1 1024)
+              (memory (export "arena0_shared") 65 65)
+              (memory (export "arena0_local") 65 65)
               {abi_version}
               {alloc}
               {dealloc}
+              {prepare}
               {initialize}
-              {shared}
-              {local}
+              {dispatch}
               {writer}
               {outcome}
               {query}
@@ -399,7 +510,7 @@ mod tests {
 
     #[test]
     fn validate_exports_accepts_full_required_set() {
-        assert!(validate_exports(&stub_module(None, None)).is_ok());
+        assert!(validate_exports(&stub_module(None, None), &ExecutionProfile::current()).is_ok());
     }
 
     #[test]
@@ -407,9 +518,9 @@ mod tests {
         for name in [
             "arena0_alloc",
             "arena0_dealloc",
+            "arena0_prepare",
             "arena0_initialize",
-            "arena0_shared",
-            "arena0_local",
+            "arena0_dispatch",
             "arena0_writer",
             "arena0_outcome",
             "arena0_query",
@@ -417,7 +528,9 @@ mod tests {
             "arena0_metadata",
             "arena0_abi_version",
         ] {
-            let err = validate_exports(&stub_module(Some(name), None)).unwrap_err();
+            let err =
+                validate_exports(&stub_module(Some(name), None), &ExecutionProfile::current())
+                    .unwrap_err();
             assert!(
                 matches!(&err, SandboxError::MissingExport(actual) if actual == name),
                 "unexpected omission error for {name}: {err}"
@@ -430,16 +543,18 @@ mod tests {
         for name in [
             "arena0_alloc",
             "arena0_dealloc",
+            "arena0_prepare",
             "arena0_initialize",
-            "arena0_shared",
-            "arena0_local",
+            "arena0_dispatch",
             "arena0_writer",
             "arena0_outcome",
             "arena0_query",
             "arena0_view",
             "arena0_metadata",
         ] {
-            let err = validate_exports(&stub_module(None, Some(name))).unwrap_err();
+            let err =
+                validate_exports(&stub_module(None, Some(name)), &ExecutionProfile::current())
+                    .unwrap_err();
             assert!(
                 matches!(&err, SandboxError::InvalidExportSignature { name: actual, .. } if actual == name),
                 "unexpected signature error for {name}: {err}"

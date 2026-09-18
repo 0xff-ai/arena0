@@ -4,8 +4,8 @@
 //! resulting [`HandlerResult`].
 
 use arena0_protocol::{
-    AggregateAttestation, Effect, PeerId, PendingKind, PendingRecord, PrivateRecord, PublicEffect,
-    PublicEvent, StateHash, TRACE_FORMAT_VERSION, TraceEntry,
+    DivergenceDiagnostic, DivergenceKind, Effect, Event, PeerId, PendingKind, PendingRecord,
+    StateHash,
 };
 use arena0_protocol::{PendingId, PendingOperation};
 use borsh::BorshSerialize;
@@ -286,6 +286,149 @@ impl PendingLedger {
 // Effects result wrapper
 // ---------------------------------------------------------------------------
 
+/// One native dispatch record.
+///
+/// Native tests use the same flat event/effect vocabulary as the guest ABI:
+/// every accepted dispatch, including a reaction or an external answer,
+/// records its complete event and effect list in one sequence. The shared
+/// hashes remain useful convergence diagnostics; local state is intentionally
+/// not hashed because it is participant-specific.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DispatchRecord {
+    /// Zero-based native event-position sequence.
+    pub event_position: u64,
+    /// Event delivered to the program.
+    pub event: Event,
+    /// Effects emitted by this dispatch, including lifecycle and retry effects.
+    pub effects: Vec<Effect>,
+    /// Shared hash before the dispatch.
+    pub pre_state: StateHash,
+    /// Shared hash after the dispatch or rollback.
+    pub post_state: StateHash,
+    /// Continuation metadata created by this dispatch, if it suspended.
+    pub pending: Option<PendingRecord>,
+}
+
+impl DispatchRecord {
+    /// Whether this dispatch emitted a terminal lifecycle effect.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        self.effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. }
+            )
+        })
+    }
+
+    /// Verify the native event-position sequence and shared-state hash chain.
+    pub fn verify_chain(trace: &[Self]) -> Result<(), DivergenceDiagnostic> {
+        for (idx, record) in trace.iter().enumerate() {
+            let expected_event_position = idx as u64;
+            if record.event_position != expected_event_position {
+                return Err(DivergenceDiagnostic::new_at(
+                    record.event_position,
+                    DivergenceKind::StepIndexMismatch,
+                    "event_position",
+                    expected_event_position,
+                    record.event_position,
+                ));
+            }
+            if let Some(next) = trace.get(idx + 1)
+                && record.post_state != next.pre_state
+            {
+                return Err(DivergenceDiagnostic::new_at(
+                    next.event_position,
+                    DivergenceKind::ChainMismatch,
+                    "pre_state",
+                    record.post_state,
+                    next.pre_state,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Compare two native dispatch records, including effects and
+    /// continuation metadata.
+    pub fn compare_event(left: &Self, right: &Self) -> Result<(), DivergenceDiagnostic> {
+        if left.event_position != right.event_position {
+            return Err(DivergenceDiagnostic::new_at(
+                left.event_position,
+                DivergenceKind::StepIndexMismatch,
+                "event_position",
+                left.event_position,
+                right.event_position,
+            ));
+        }
+        if left.event != right.event {
+            return Err(DivergenceDiagnostic::new_at(
+                left.event_position,
+                DivergenceKind::EventMismatch,
+                "event",
+                &left.event,
+                &right.event,
+            ));
+        }
+        if left.pre_state != right.pre_state {
+            return Err(DivergenceDiagnostic::new_at(
+                left.event_position,
+                DivergenceKind::PreStateMismatch,
+                "pre_state",
+                left.pre_state,
+                right.pre_state,
+            ));
+        }
+        if left.effects != right.effects {
+            return Err(DivergenceDiagnostic::new_at(
+                left.event_position,
+                DivergenceKind::EffectMismatch,
+                "effects",
+                &left.effects,
+                &right.effects,
+            ));
+        }
+        if left.pending != right.pending {
+            return Err(DivergenceDiagnostic::new_at(
+                left.event_position,
+                DivergenceKind::EffectMismatch,
+                "pending",
+                &left.pending,
+                &right.pending,
+            ));
+        }
+        if left.post_state != right.post_state {
+            return Err(DivergenceDiagnostic::new_at(
+                left.event_position,
+                DivergenceKind::PostStateMismatch,
+                "post_state",
+                left.post_state,
+                right.post_state,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Compare two native dispatch histories for exact replay equivalence.
+    pub fn compare_traces(left: &[Self], right: &[Self]) -> Result<(), DivergenceDiagnostic> {
+        if left.len() != right.len() {
+            return Err(DivergenceDiagnostic::new_at(
+                left.len().max(right.len()) as u64,
+                DivergenceKind::StepCountMismatch,
+                "len",
+                left.len(),
+                right.len(),
+            ));
+        }
+        Self::verify_chain(left)?;
+        Self::verify_chain(right)?;
+        for (left, right) in left.iter().zip(right) {
+            Self::compare_event(left, right)?;
+        }
+        Ok(())
+    }
+}
+
 /// The effects emitted by a single handler invocation, plus the fault
 /// status if the handler returned `Err`.
 #[derive(Debug)]
@@ -293,11 +436,10 @@ pub struct HandlerResult {
     pub effects: Vec<Effect>,
     pub logs: Vec<(String, String)>,
     pub fault: FaultStatus,
-    /// Public trace entry, present only for a canonical shared event.
-    pub step: Option<TraceEntry>,
-    /// Private trace record, present only for a local handler run.
-    pub private_record: Option<PrivateRecord>,
-    /// True when a shared message apply returned `ApplyDecision::Reject`:
+    /// Flat dispatch records produced by this harness call. An agreed event
+    /// followed by its reaction therefore returns two records in order.
+    pub records: Vec<DispatchRecord>,
+    /// True when a message dispatch returned `ApplyDecision::Reject`:
     /// the state was restored and no trace entry was recorded.
     pub rejected: bool,
 }
@@ -420,45 +562,36 @@ impl HandlerResult {
         callouts.remove(0)
     }
 
-    /// Return the recorded state-machine step for this handler invocation.
+    /// Return the primary dispatch record for this handler invocation.
     ///
-    /// A harness populates this for successful dispatch plumbing. Tests that only
-    /// care about effects can continue using the convenience predicates above.
+    /// An agreed event may be followed by an explicit reaction, in which case
+    /// this returns the first record and [`Self::records`] exposes both.
     #[must_use]
-    pub fn step(&self) -> &TraceEntry {
-        self.step
-            .as_ref()
-            .expect("handler result did not include a step record")
-    }
-
-    /// Return the private record for this local handler invocation, when one
-    /// was produced.
-    #[must_use]
-    pub fn private_record(&self) -> Option<&PrivateRecord> {
-        self.private_record.as_ref()
+    pub fn record(&self) -> &DispatchRecord {
+        self.records
+            .first()
+            .expect("handler result did not include a dispatch record")
     }
 }
 
-/// Build a runtime-shaped step record for harnesses.
+/// Build a flat dispatch record for native harnesses.
 #[doc(hidden)]
 #[must_use]
-pub fn __step_record(
-    step: u64,
-    event: PublicEvent,
-    effects: Vec<PublicEffect>,
+pub fn __dispatch_record(
+    event_position: u64,
+    event: Event,
+    effects: Vec<Effect>,
     pre_state: StateHash,
     post_state: StateHash,
-) -> TraceEntry {
-    TraceEntry {
-        trace_version: TRACE_FORMAT_VERSION,
-        step,
+    pending: Option<PendingRecord>,
+) -> DispatchRecord {
+    DispatchRecord {
+        event_position,
         event,
         effects,
         pre_state,
         post_state,
-        fuel_used: 0,
-        witness: None,
-        agreement: AggregateAttestation::empty(),
+        pending,
     }
 }
 

@@ -17,7 +17,7 @@ arena0-sandbox = { path = "../arena0-sandbox" }
 arena0-transport = { path = "../arena0-transport" }
 arena0-node = { path = "../arena0-node" }
 arena0-store = { path = "../arena0-store" }
-arena0-verify = { path = "../arena0-verify", features = ["replay"] }
+arena0-verify = { path = "../arena0-verify" }
 
 rand = { workspace = true }
 tokio = { workspace = true }

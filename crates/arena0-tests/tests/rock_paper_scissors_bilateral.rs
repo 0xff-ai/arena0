@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use arena0_tests::arena::Arena;
 use arena0_tests::wasm::program_wasm;
-use arena0_verify::{LightVerifiedTerminal, VerifiedTerminal, verify_light};
+use arena0_verify::LightVerifiedTerminal;
 
 const CHOICE_ROCK: &[u8] = br#""Rock""#;
 const CHOICE_SCISSORS: &[u8] = br#""Scissors""#;
@@ -46,17 +46,15 @@ async fn rock_paper_scissors_bilateral_runs_and_verifies_receipts() {
         serde_json::to_value(run.receipt(0)).unwrap(),
         serde_json::to_value(run.receipt(1)).unwrap()
     );
-    let verified = run.verify_all(&wasm).expect("both receipts replay-verify");
+    let verified = run.verify_all().expect("both receipts verify");
 
-    for (i, full) in verified.into_iter().enumerate() {
-        let light = verify_light(&run.receipt_bytes(i)).expect("light verification");
-        assert_eq!(light.program_id, arena0_program::ProgramHash::of(&wasm));
-        assert_eq!(light.session_id, run.session_hash(i));
+    for (i, verified) in verified.into_iter().enumerate() {
+        assert_eq!(verified.program_id, arena0_program::ProgramHash::of(&wasm));
+        assert_eq!(verified.session_id, run.session_hash(i));
         assert!(matches!(
-            light.terminal,
+            verified.terminal,
             LightVerifiedTerminal::Completed { .. }
         ));
-        assert!(matches!(full.terminal, VerifiedTerminal::Completed { .. }));
     }
 
     let mut trace = run.trace(0);

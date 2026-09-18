@@ -6,15 +6,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::{PeerId, SessionHash};
 
-use super::{
-    MAX_TERMINAL_REASON_BYTES, OccurrenceDigest, ProtocolError, PublicCursor, ensure_payload,
-};
+use super::{MAX_TERMINAL_REASON_BYTES, ProtocolError, StepCursor, ensure_payload};
 
 /// Domain separator for the signed abort occurrence preimage.
 pub const ABORT_OCCURRENCE_DOMAIN: [u8; 24] = *b"arena0/abort-occurrence\0";
 const _: () = assert!(ABORT_OCCURRENCE_DOMAIN.len() == 24);
 /// Version of the portable abort occurrence contract.
 pub const ABORT_OCCURRENCE_VERSION: u16 = 1;
+
+/// Domain separator for the stable digest of an abort occurrence's signed
+/// semantic content. The Ed25519 signature itself is intentionally excluded.
+const ABORT_OCCURRENCE_DIGEST_DOMAIN: &[u8] = b"arena0/abort-occurrence-digest/v1";
 
 /// The terminal meaning authenticated by an [`AbortOccurrence`].
 ///
@@ -91,7 +93,7 @@ pub struct AbortOccurrence {
     kind: AbortKind,
     code: u32,
     reason: String,
-    coordinate: PublicCursor,
+    coordinate: StepCursor,
     signature: Ed25519Signature,
 }
 
@@ -139,7 +141,7 @@ impl BorshDeserialize for AbortOccurrence {
         let reason = String::from_utf8(reason_bytes).map_err(|error| {
             borsh::io::Error::new(borsh::io::ErrorKind::InvalidData, error.to_string())
         })?;
-        let coordinate = PublicCursor::deserialize_reader(reader)?;
+        let coordinate = StepCursor::deserialize_reader(reader)?;
         let signature = Ed25519Signature::deserialize_reader(reader)?;
         let occurrence = Self {
             domain,
@@ -168,11 +170,11 @@ struct AbortSigningPayload<'a> {
     kind: AbortKind,
     code: u32,
     reason: &'a str,
-    coordinate: &'a PublicCursor,
+    coordinate: &'a StepCursor,
 }
 
 impl AbortOccurrence {
-    /// Construct one signed occurrence.  The reducer additionally checks that
+    /// Construct one signed occurrence. The actor additionally checks that
     /// `sender` is an activation participant before accepting it.
     pub fn new(
         session_id: SessionHash,
@@ -180,7 +182,7 @@ impl AbortOccurrence {
         kind: AbortKind,
         code: u32,
         reason: impl Into<String>,
-        coordinate: PublicCursor,
+        coordinate: StepCursor,
         signature: Ed25519Signature,
     ) -> Result<Self, ProtocolError> {
         let occurrence = Self {
@@ -207,7 +209,7 @@ impl AbortOccurrence {
         kind: AbortKind,
         code: u32,
         reason: impl Into<String>,
-        coordinate: PublicCursor,
+        coordinate: StepCursor,
     ) -> Result<Self, ProtocolError> {
         Self::new(
             session_id,
@@ -259,7 +261,7 @@ impl AbortOccurrence {
 
     /// Borrow the exact public chain coordinate.
     #[must_use]
-    pub const fn coordinate(&self) -> &PublicCursor {
+    pub const fn coordinate(&self) -> &StepCursor {
         &self.coordinate
     }
 
@@ -286,8 +288,11 @@ impl AbortOccurrence {
 
     /// Return a stable digest of the signed semantic content (excluding the
     /// signature bytes themselves).
-    pub fn digest(&self) -> Result<OccurrenceDigest, ProtocolError> {
-        Ok(OccurrenceDigest::of(&self.signing_bytes()?))
+    pub fn digest(&self) -> Result<[u8; 32], ProtocolError> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(ABORT_OCCURRENCE_DIGEST_DOMAIN);
+        hasher.update(&self.signing_bytes()?);
+        Ok(*hasher.finalize().as_bytes())
     }
 
     /// Verify the Ed25519 signature against the sender's public identity key.
@@ -303,7 +308,7 @@ impl AbortOccurrence {
     }
 
     /// Validate shape and the session/coordinate binding.  Membership is
-    /// checked by the execution reducer because it belongs to activation.
+    /// checked by the execution actor because it belongs to activation.
     pub fn validate_for_session(&self, session: SessionHash) -> Result<(), ProtocolError> {
         self.validate_shape()?;
         if self.session_id != session {

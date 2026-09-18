@@ -36,7 +36,7 @@ pub use exec::{
     EXEC_KIND_STEP_SIGNATURE, ExecFrame, MAX_EXEC_ABORT_OCCURRENCE_BYTES, MAX_EXEC_MESSAGE_BYTES,
     MAX_EXEC_REASON_BYTES, MessageIdBytes, PROTO_EXEC, PROTO_FETCH, PeerIdBytes, SessionHashBytes,
     StateHashBytes, WireAbortCoordinate, WireAbortOccurrence, WireStepCommitment,
-    WireTerminalCommitment, WitnessCommitmentBytes,
+    WireTerminalCommitment,
 };
 pub use fetch::{
     FETCH_KIND_REQUEST, FETCH_KIND_RESPONSE, FetchFrame, MAX_FETCH_RESPONSE_BYTES,

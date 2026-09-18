@@ -269,27 +269,48 @@ impl ExecutionHandle {
                     format!("no pending {pending_id}"),
                 )
             })?;
-        let (reply, rx) = oneshot::channel();
-        self.running()?
-            .send(ExecCommand::SubmitInput {
-                pending_id,
-                callout_index,
-                data,
-                reply,
-            })
-            .await
-            .map_err(|_| ApiError::new(ApiErrorCode::Execution, "execution task gone"))?;
-        rx.await
-            .map_err(|_| ApiError::new(ApiErrorCode::Execution, "input reply dropped"))?
-            .map_err(|error| match error {
-                arena0_node::ExecError::CalloutNotPending => ApiError::new(
-                    ApiErrorCode::CalloutNotPending,
-                    format!("no pending {pending_id}"),
-                ),
-                error => ApiError::new(ApiErrorCode::Execution, format!("input rejected: {error}")),
-            })?;
-        self.changed.notify_waiters();
-        Ok(())
+        loop {
+            let (reply, rx) = oneshot::channel();
+            self.running()?
+                .send(ExecCommand::SubmitInput {
+                    pending_id,
+                    callout_index,
+                    data: data.clone(),
+                    reply,
+                })
+                .await
+                .map_err(|_| ApiError::new(ApiErrorCode::Execution, "execution task gone"))?;
+            let result = rx
+                .await
+                .map_err(|_| ApiError::new(ApiErrorCode::Execution, "input reply dropped"))?;
+            match result {
+                Ok(()) => {
+                    self.changed.notify_waiters();
+                    return Ok(());
+                }
+                Err(arena0_node::ExecError::CalloutNotPending) => {
+                    return Err(ApiError::new(
+                        ApiErrorCode::CalloutNotPending,
+                        format!("no pending {pending_id}"),
+                    ));
+                }
+                Err(arena0_node::ExecError::AgreementPending) => {
+                    // Agreement freezes guest dispatch but does not consume the
+                    // callout. Keep the request at the daemon boundary while
+                    // the actor remains free to process inbound signatures.
+                    tokio::select! {
+                        () = self.changed.notified() => {}
+                        () = tokio::time::sleep(Duration::from_millis(25)) => {}
+                    }
+                }
+                Err(error) => {
+                    return Err(ApiError::new(
+                        ApiErrorCode::Execution,
+                        format!("input rejected: {error}"),
+                    ));
+                }
+            }
+        }
     }
 
     pub(crate) async fn install_negotiation(
@@ -433,7 +454,7 @@ pub(crate) fn satisfies(lifecycle: ExecLifecycle, until: AwaitState) -> bool {
 }
 
 /// The host-owned facts needed to project a durable callout at either output
-/// boundary. Keeping this private payload separate from [`NextEvent`] prevents
+/// boundary. Keeping this host-local payload separate from [`NextEvent`] prevents
 /// the supervisor from matching a public API enum just to emit a host event.
 #[derive(Debug)]
 struct CalloutProjection {
@@ -712,7 +733,6 @@ impl Supervisor {
                     step: entry.step,
                     pre_state: entry.pre_state,
                     post_state: entry.post_state,
-                    fuel_used: entry.fuel_used,
                     signers,
                     participants,
                 });
@@ -806,7 +826,7 @@ impl Supervisor {
                         if let Some(source) = source {
                             self.events.emit(HostEvent::SessionAborted {
                                 source,
-                                step: state.public().next_step().saturating_sub(1),
+                                step: state.agreed_step().saturating_sub(1),
                                 reason,
                                 failure: arena0_protocol::ExecutionFailureCode::ProgramAborted,
                             });

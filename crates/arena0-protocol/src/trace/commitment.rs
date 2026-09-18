@@ -12,7 +12,7 @@ use crate::{OutcomeHash, SessionHash, StateHash};
 use super::entry::TraceEntry;
 
 /// Domain separation tag for the shared per-entry commitment participants sign.
-pub const STEP_COMMIT_DOMAIN: [u8; 24] = *b"arena0/step-commit/v2\0\0\0";
+pub const STEP_COMMIT_DOMAIN: [u8; 24] = *b"arena0/step-commit/v3\0\0\0";
 
 /// Domain separation tag for the signed terminal boundary participants sign at
 /// session completion.
@@ -41,8 +41,7 @@ pub struct StepSig {
 
 /// The shared per-entry message every participant signs. Byte-identical across
 /// participants and bound to the public entry itself: the canonical position,
-/// the entry content hash (event bytes, effects, deterministic fuel, and
-/// witness), the pre/post
+/// the entry content hash (normalized event and terminal effect), the pre/post
 /// shared state hashes, and the chain link to the previous position's
 /// commitment. Signatures are therefore never interchangeable tokens: a
 /// signature names exactly one entry at exactly one position in exactly one
@@ -416,18 +415,16 @@ mod tests {
         TraceEntry {
             trace_version: crate::TRACE_FORMAT_VERSION,
             step,
-            event: crate::PublicEvent::MessageReceived {
+            event: crate::Event::MessageReceived {
                 message_id: crate::MessageId([step as u8; 32]),
                 from: crate::PeerId([1; 32]),
                 position: step,
                 pre_state: pre,
                 msg: Vec::new(),
             },
-            effects: Vec::new(),
             pre_state: pre,
             post_state: post,
-            fuel_used: 0,
-            witness: None,
+            terminal: None,
             agreement: AggregateAttestation::empty(),
         }
     }

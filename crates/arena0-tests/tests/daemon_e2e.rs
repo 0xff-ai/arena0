@@ -1,14 +1,14 @@
 //! End-to-end: two Hosts in one in-process daemon form a session through real
 //! negotiation (one creator, one joiner), get driven through the shared Unix
 //! socket with JSON answers (no hex), and produce matching, verifiable receipts
-//! whose verify call returns the recovered evidence (program, ensemble, steps,
-//! typed outcome).
+//! whose verify call returns the recovered portable evidence (program, ensemble,
+//! steps, and terminal proof).
 
 mod common;
 
 use arena0_api::{
-    EnsembleSpec, EventData, EventFilter, EventFrame, FullVerifiedTerminal, HostRequest,
-    LightVerifiedTerminal, NextEvent, ReceiptRef, Response, ResponseOk, VerifiedResult,
+    EnsembleSpec, EventData, EventFilter, EventFrame, HostRequest, LightVerifiedTerminal,
+    NextEvent, ReceiptRef, Response, ResponseOk, VerifiedResult,
 };
 use arena0_protocol::{NegotiationTarget, SessionHash};
 use arena0_sandbox::Program;
@@ -182,7 +182,7 @@ async fn daemon_hosts_play_and_verify() {
     assert_eq!(sid_a, sid_b, "both parties confirmed the same session");
     assert_eq!(event_session_id, Some(sid_a));
 
-    // Receipts are fetchable and verify at both tiers, on both Hosts, returning
+    // Receipts are fetchable and verify on both Hosts, returning portable
     // evidence rather than a bool.
     let mut artifacts = Vec::new();
     for (target, sid) in [(&d.host_a, sid_a), (&d.host_b, sid_b)] {
@@ -196,8 +196,7 @@ async fn daemon_hosts_play_and_verify() {
             panic!("expected a receipt");
         };
         artifacts.push(receipt);
-        assert_verified(target, sid, false).await;
-        assert_verified(target, sid, true).await;
+        assert_verified(target, sid).await;
     }
     assert_eq!(
         artifacts[0].encode().unwrap(),
@@ -205,12 +204,11 @@ async fn daemon_hosts_play_and_verify() {
     );
 }
 
-async fn assert_verified(target: &HostTarget, session_id: SessionHash, full: bool) {
+async fn assert_verified(target: &HostTarget, session_id: SessionHash) {
     let resp = ok(call(
         target,
         &HostRequest::ReceiptVerify {
             receipt: ReceiptRef::Produced(session_id),
-            full,
         },
     )
     .await);
@@ -226,25 +224,11 @@ async fn assert_verified(target: &HostTarget, session_id: SessionHash, full: boo
             assert_eq!(verified_sid, session_id, "verify recovers the session id");
             assert_eq!(ensemble.len(), 2, "two participants");
             assert!(steps > 0, "at least one step");
-            match (full, result) {
-                (
-                    false,
-                    VerifiedResult::Light {
-                        terminal: LightVerifiedTerminal::Completed { .. },
-                    },
-                ) => {}
-                (
-                    true,
-                    VerifiedResult::Full {
-                        terminal: FullVerifiedTerminal::Completed { outcome_json, .. },
-                    },
-                ) => {
-                    assert!(
-                        outcome_json.get("Win").is_some() || outcome_json.get("Draw").is_some(),
-                        "typed rps outcome, got {outcome_json}"
-                    );
-                }
-                (_, result) => panic!("expected completed evidence for requested tier: {result:?}"),
+            match result {
+                VerifiedResult::Light {
+                    terminal: LightVerifiedTerminal::Completed { .. },
+                } => {}
+                result => panic!("expected completed portable evidence: {result:?}"),
             }
         }
         other => panic!("unexpected verify response: {other:?}"),
@@ -301,7 +285,6 @@ async fn joiner_without_params_adopts_creator_terms() {
             target,
             &HostRequest::ReceiptVerify {
                 receipt: ReceiptRef::Produced(sid),
-                full: false,
             },
         )
         .await);

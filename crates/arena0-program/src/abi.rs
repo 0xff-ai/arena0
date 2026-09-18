@@ -10,14 +10,14 @@ use crate::{LocalStateBytes, SharedStateBytes};
 use crate::Capability;
 
 /// Current ABI version. A sandbox rejects modules declaring a different one.
-pub const ABI_VERSION: u32 = 20;
+pub const ABI_VERSION: u32 = 21;
 
 /// Wasm import module name for all arena0 host functions.
 pub const HOST_MODULE: &str = "arena0";
 
 /// Maximum bytes in one semantic call payload.
 pub const MAX_CALL_PAYLOAD_BYTES: usize = crate::profile::MAX_INPUT_BYTES as usize;
-/// Maximum bytes in the session context carried into a fresh call.
+/// Maximum bytes in the committed session context carried into a dispatch.
 pub const MAX_SESSION_CONTEXT_BYTES: usize = 1024 * 1024;
 
 /// Bounded, complete JSON bytes at an agent-facing request or projection boundary.
@@ -139,21 +139,25 @@ pub enum OutcomeBytesError {
     TooLarge { actual: usize, max: usize },
 }
 
-/// Export names in the fresh-instance guest ABI.
+/// Export names in the resident-instance guest ABI.
 pub mod exports {
     /// Guest allocation entry point.
     pub const ALLOC: &str = "arena0_alloc";
     /// Guest deallocation entry point.
     pub const DEALLOC: &str = "arena0_dealloc";
-    /// Initialize a fresh program state.
+    /// Prepare the guest allocator before a resident baseline is captured.
+    pub const PREPARE: &str = "arena0_prepare";
+    /// Initialize a program's state before a session starts.
     pub const INITIALIZE: &str = "arena0_initialize";
-    /// Apply one shared/public event.
-    pub const SHARED: &str = "arena0_shared";
-    /// Apply one local/private event.
-    pub const LOCAL: &str = "arena0_local";
+    /// Dispatch one session event against the resident state memories.
+    pub const DISPATCH: &str = "arena0_dispatch";
+    /// Canonical replicated-state memory export.
+    pub const SHARED_MEMORY: &str = "arena0_shared";
+    /// Canonical participant-local-state memory export.
+    pub const LOCAL_MEMORY: &str = "arena0_local";
     /// Produce the agent-facing terminal outcome.
     pub const OUTCOME: &str = "arena0_outcome";
-    /// Select the sole participant eligible to author the next public message.
+    /// Select the sole participant eligible to author the next program message.
     pub const WRITER: &str = "arena0_writer";
     /// Answer one agent-facing query.
     pub const QUERY: &str = "arena0_query";
@@ -161,6 +165,31 @@ pub mod exports {
     pub const VIEW: &str = "arena0_view";
     /// Return the embedded program definition.
     pub const METADATA: &str = "arena0_metadata";
+}
+
+/// The state memory selected by a bounded host state-I/O import.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum StateMemoryKind {
+    /// The replicated state memory.
+    Shared = 0,
+    /// The participant-local state memory.
+    Local = 1,
+}
+
+impl TryFrom<u32> for StateMemoryKind {
+    type Error = io::Error;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Shared),
+            1 => Ok(Self::Local),
+            value => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown state memory kind {value}"),
+            )),
+        }
+    }
 }
 
 /// Whether a mutating guest call accepted its event.
@@ -423,188 +452,86 @@ impl BorshDeserialize for InitializedState {
     }
 }
 
-/// Shared/public event input. It deliberately contains no peer or local state.
+/// One resident-program dispatch input.
+///
+/// State is deliberately absent: the host stores the committed values in the
+/// exported state memories and restores those memories around failure
+/// boundaries. The session and event fields are serialized protocol values,
+/// rather than host-owned DTOs, so this ABI remains independent of the
+/// concrete program's message type.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SharedInput {
-    /// Explicit replicated state bytes.
-    pub shared: SharedStateBytes,
-    /// Opaque Borsh `Option<Ensemble<Committed>>` session context. It is `None`
-    /// only for the session-start event, whose ensemble is in `event`.
-    pub session: Vec<u8>,
-    /// Stock-Borsh public protocol event bytes.
-    pub event: Vec<u8>,
-}
-
-impl SharedInput {
-    /// Construct a shared input after checking its variable fields.
-    pub fn try_new(
-        shared: SharedStateBytes,
-        session: Vec<u8>,
-        event: Vec<u8>,
-    ) -> Result<Self, AbiEnvelopeError> {
-        ensure_field("session context", &session, MAX_SESSION_CONTEXT_BYTES)?;
-        ensure_field("public event", &event, MAX_CALL_PAYLOAD_BYTES)?;
-        Ok(Self {
-            shared,
-            session,
-            event,
-        })
-    }
-}
-
-impl BorshSerialize for SharedInput {
-    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        let mut writer = EnvelopeWriter::new(writer);
-        self.shared.serialize(&mut writer)?;
-        write_bounded_vec(
-            &mut writer,
-            &self.session,
-            MAX_SESSION_CONTEXT_BYTES,
-            "session context",
-        )?;
-        write_bounded_vec(
-            &mut writer,
-            &self.event,
-            MAX_CALL_PAYLOAD_BYTES,
-            "public event",
-        )
-    }
-}
-
-impl BorshDeserialize for SharedInput {
-    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let mut reader = EnvelopeReader::new(reader);
-        Ok(Self {
-            shared: SharedStateBytes::deserialize_reader(&mut reader)?,
-            session: read_bounded_vec(&mut reader, MAX_SESSION_CONTEXT_BYTES, "session context")?,
-            event: read_bounded_vec(&mut reader, MAX_CALL_PAYLOAD_BYTES, "public event")?,
-        })
-    }
-}
-
-/// Result of a shared/public event. Local state is intentionally absent: the
-/// host retains the caller's local state outside this guest call.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SharedOutput {
-    /// Whether the event was accepted or deterministically rejected.
-    pub status: CallStatus,
-    /// Replacement replicated state bytes.
-    pub shared: SharedStateBytes,
-}
-
-impl BorshSerialize for SharedOutput {
-    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        let mut writer = EnvelopeWriter::new(writer);
-        self.status.serialize(&mut writer)?;
-        self.shared.serialize(&mut writer)
-    }
-}
-
-impl BorshDeserialize for SharedOutput {
-    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let mut reader = EnvelopeReader::new(reader);
-        Ok(Self {
-            status: CallStatus::deserialize_reader(&mut reader)?,
-            shared: SharedStateBytes::deserialize_reader(&mut reader)?,
-        })
-    }
-}
-
-/// Local/private event input. This is the only ABI input carrying peer identity
-/// and participant-local state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LocalInput {
-    /// Local node identity in the protocol's canonical 32-byte form.
+pub struct DispatchInput {
+    /// Local participant identity in the protocol's canonical 32-byte form.
     pub peer_id: [u8; 32],
-    /// Explicit replicated state bytes, retained unchanged by the local call.
-    pub shared: SharedStateBytes,
-    /// Explicit participant-local state bytes.
-    pub local: LocalStateBytes,
-    /// Opaque Borsh committed `Ensemble` session context.
+    /// Borsh encoding of the committed session ensemble.
     pub session: Vec<u8>,
-    /// Stock-Borsh private protocol event bytes.
+    /// Borsh encoding of one flat protocol `Event<Vec<u8>>`.
     pub event: Vec<u8>,
 }
 
-impl LocalInput {
-    /// Construct a local input after checking its variable fields.
+impl DispatchInput {
+    /// Construct a dispatch input after checking its variable-field bounds.
     pub fn try_new(
         peer_id: [u8; 32],
-        shared: SharedStateBytes,
-        local: LocalStateBytes,
         session: Vec<u8>,
         event: Vec<u8>,
     ) -> Result<Self, AbiEnvelopeError> {
         ensure_field("session context", &session, MAX_SESSION_CONTEXT_BYTES)?;
-        ensure_field("private event", &event, MAX_CALL_PAYLOAD_BYTES)?;
+        ensure_field("event", &event, MAX_CALL_PAYLOAD_BYTES)?;
         Ok(Self {
             peer_id,
-            shared,
-            local,
             session,
             event,
         })
     }
 }
 
-impl BorshSerialize for LocalInput {
+impl BorshSerialize for DispatchInput {
     fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
         let mut writer = EnvelopeWriter::new(writer);
         self.peer_id.serialize(&mut writer)?;
-        self.shared.serialize(&mut writer)?;
-        self.local.serialize(&mut writer)?;
         write_bounded_vec(
             &mut writer,
             &self.session,
             MAX_SESSION_CONTEXT_BYTES,
             "session context",
         )?;
-        write_bounded_vec(
-            &mut writer,
-            &self.event,
-            MAX_CALL_PAYLOAD_BYTES,
-            "private event",
-        )
+        write_bounded_vec(&mut writer, &self.event, MAX_CALL_PAYLOAD_BYTES, "event")
     }
 }
 
-impl BorshDeserialize for LocalInput {
+impl BorshDeserialize for DispatchInput {
     fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
         let mut reader = EnvelopeReader::new(reader);
         Ok(Self {
             peer_id: <[u8; 32]>::deserialize_reader(&mut reader)?,
-            shared: SharedStateBytes::deserialize_reader(&mut reader)?,
-            local: LocalStateBytes::deserialize_reader(&mut reader)?,
             session: read_bounded_vec(&mut reader, MAX_SESSION_CONTEXT_BYTES, "session context")?,
-            event: read_bounded_vec(&mut reader, MAX_CALL_PAYLOAD_BYTES, "private event")?,
+            event: read_bounded_vec(&mut reader, MAX_CALL_PAYLOAD_BYTES, "event")?,
         })
     }
 }
 
-/// Result of a local/private event. Shared state is intentionally absent: the
-/// host retains it outside the guest call and rejects any attempted replacement.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LocalOutput {
-    /// Whether the event was accepted.
+/// The only value returned in the guest result envelope for a mutating
+/// dispatch. Effects remain in the host's per-call effect queue and are never
+/// duplicated in guest-owned state bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchOutput {
+    /// Whether the event was accepted or deterministically rejected.
     pub status: CallStatus,
-    /// Replacement participant-local state bytes.
-    pub local: LocalStateBytes,
 }
 
-impl BorshSerialize for LocalOutput {
+impl BorshSerialize for DispatchOutput {
     fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
         let mut writer = EnvelopeWriter::new(writer);
-        self.status.serialize(&mut writer)?;
-        self.local.serialize(&mut writer)
+        self.status.serialize(&mut writer)
     }
 }
 
-impl BorshDeserialize for LocalOutput {
+impl BorshDeserialize for DispatchOutput {
     fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
         let mut reader = EnvelopeReader::new(reader);
         Ok(Self {
             status: CallStatus::deserialize_reader(&mut reader)?,
-            local: LocalStateBytes::deserialize_reader(&mut reader)?,
         })
     }
 }
@@ -798,7 +725,7 @@ pub struct OutcomeInput {
     pub session: Vec<u8>,
 }
 
-/// Read-only input for selecting the next public-message writer.
+/// Read-only input for selecting the next program-message writer.
 ///
 /// Writer selection is deliberately a function of replicated state alone. The
 /// host invokes it before applying a candidate message so transport arrival
@@ -823,9 +750,9 @@ impl BorshDeserialize for WriterInput {
     }
 }
 
-/// Sole participant eligible to author the next public message.
+/// Sole participant eligible to author the next program message.
 ///
-/// `None` means that no public message is admissible from the current shared
+/// `None` means that no program message is admissible from the current shared
 /// state. The host validates a returned index against the committed ensemble.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct WriterOutput {
@@ -915,6 +842,12 @@ fn ensure_field(field: &'static str, bytes: &[u8], max: usize) -> Result<(), Abi
 
 /// Names of host-function imports. These values are part of the ABI.
 pub mod imports {
+    /// Return the current payload length of one canonical state memory.
+    pub const STATE_LEN: &str = "state_len";
+    /// Copy a state payload into the guest's work memory.
+    pub const STATE_READ: &str = "state_read";
+    /// Replace a canonical state payload from bytes in the guest's work memory.
+    pub const STATE_WRITE: &str = "state_write";
     /// Terminate execution with an error message.
     pub const FAIL: &str = "fail";
     /// Emit a structured log line to the host.
@@ -962,6 +895,9 @@ impl Capability {
 #[must_use]
 pub fn always_available_imports() -> &'static [&'static str] {
     &[
+        imports::STATE_LEN,
+        imports::STATE_READ,
+        imports::STATE_WRITE,
         imports::FAIL,
         imports::LOG,
         imports::RANDOM,
@@ -1092,20 +1028,11 @@ mod tests {
     fn input_length_prefixes_are_checked_before_allocation() {
         let oversized = u32::MAX.to_le_bytes();
         let session = [0u32.to_le_bytes(), oversized].concat();
-        let local_session = [vec![0; 40], oversized.to_vec()].concat();
         // Omit the declared payload: a size error must precede a body read.
         for (input, error) in [
             (
                 "init",
                 borsh::from_slice::<InitInput>(&oversized).unwrap_err(),
-            ),
-            (
-                "shared",
-                borsh::from_slice::<SharedInput>(&session).unwrap_err(),
-            ),
-            (
-                "local",
-                borsh::from_slice::<LocalInput>(&local_session).unwrap_err(),
             ),
             (
                 "query",
@@ -1119,6 +1046,13 @@ mod tests {
                 "outcome",
                 borsh::from_slice::<OutcomeInput>(&session).unwrap_err(),
             ),
+            (
+                "dispatch session",
+                borsh::from_slice::<DispatchInput>(
+                    &[[0; 32].as_slice(), oversized.as_slice()].concat(),
+                )
+                .unwrap_err(),
+            ),
         ] {
             assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{input}: {error}");
         }
@@ -1127,18 +1061,9 @@ mod tests {
     #[test]
     fn output_length_prefixes_are_checked_before_allocation() {
         let oversized = u32::MAX.to_le_bytes();
-        let state = [vec![0], oversized.to_vec()].concat();
         let query = [0u32.to_le_bytes(), oversized].concat();
         let outcome = (MAX_CALL_PAYLOAD_BYTES as u32 + 1).to_le_bytes();
         for (output, error) in [
-            (
-                "shared",
-                borsh::from_slice::<SharedOutput>(&state).unwrap_err(),
-            ),
-            (
-                "local",
-                borsh::from_slice::<LocalOutput>(&state).unwrap_err(),
-            ),
             (
                 "query",
                 borsh::from_slice::<QueryOutput>(&query).unwrap_err(),

@@ -1,9 +1,12 @@
 //! Authenticated inbound frames and durable inbox resolution.
 //!
-//! Transport readers only enqueue deliveries. This module performs the
-//! durable acceptance, frame classification, and reducer application.
+//! The transport reader only authenticates and queues a frame. This module
+//! first records that responsibility in the inbox, then resolves messages
+//! through the actor's flat dispatch or resolves protocol signatures/stops
+//! through their focused store operations. It never invokes a second generic
+//! execution-input pipeline.
 
-use arena0_protocol::ExecFrame;
+use arena0_protocol::{ExecFrame, ParticipantStepSignature, ParticipantTerminalSignature};
 use arena0_store::{ApplyOutcome, InboxAcceptOutcome, PendingInboxItem, StoreError};
 use arena0_transport::{ExecDelivery, ExecDeliveryRejection};
 
@@ -21,10 +24,6 @@ impl ExecutionActor {
             .await
         {
             Ok(outcome) => outcome,
-            // A peer can present a frame that is well-formed on the wire but
-            // is not authenticated for this activation. Reject that delivery
-            // in place; an untrusted packet must not take the whole actor
-            // terminal or poison the durable execution.
             Err(StoreError::UnauthenticatedSource(_)) => {
                 delivery.reject(ExecDeliveryRejection::Rejected)?;
                 return Ok(());
@@ -40,9 +39,8 @@ impl ExecutionActor {
             | InboxAcceptOutcome::AlreadyAccepted
             | InboxAcceptOutcome::AlreadyApplied
             | InboxAcceptOutcome::AlreadyConsumed => {
-                // A transport acknowledgement is sent only after the frame
-                // and its authenticated source have crossed the store
-                // boundary.
+                // Transport acknowledgement follows the durable inbox
+                // acceptance boundary, not the later guest dispatch.
                 delivery.acknowledge()?;
             }
         }
@@ -77,104 +75,181 @@ impl ExecutionActor {
     async fn resolve_inbox_item(&mut self, item: PendingInboxItem) -> Result<(), ExecError> {
         match item.frame().clone() {
             frame @ ExecFrame::Message { .. } => {
+                // A future message or a proposal-frozen message remains in
+                // the inbox. apply_message rejects only an invalid message or
+                // a guest rejection, and leaves these causal waits pending.
                 let _ = self
                     .apply_message(item.source(), frame, Some(item.inbox_id()))
                     .await?;
             }
-            ExecFrame::StepSignature { ref commitment, .. } => {
-                let state = self.load_state().await?;
-                if state.pending_shared().is_none() {
-                    // A participant can publish its signature as soon as it
-                    // applies a proposal. Another participant may receive
-                    // that signature before the proposal's message itself.
-                    // The inbox acceptance above is already the durable
-                    // responsibility boundary; retain the fact until the
-                    // causal proposal is present instead of consuming a
-                    // valid signature as stale.
-                    if state.status().is_terminal() {
-                        self.reject_inbound(item.inbox_id()).await?;
-                    }
-                    return Ok(());
-                }
-                let proposal = state.pending_shared().expect("checked above");
-                if !proposal.entry().is_terminal()
-                    && proposal.commitment().step.checked_add(1) == Some(commitment.step)
-                {
-                    // N-of-N agreement limits an honest participant to one
-                    // proposal ahead. Retain its signature until that proposal
-                    // becomes the current inbox head.
-                    return Ok(());
-                }
-                let outcome = self
-                    .context
-                    .store
-                    .apply_inbound(item.inbox_id(), now_ms())
-                    .await;
-                match outcome {
-                    Ok(outcome) => {
-                        self.emit_trace_appended(&outcome).await;
-                        match outcome {
-                            ApplyOutcome::VersionMismatch { .. } => Ok(()),
-                            ApplyOutcome::Conflict(_) => self.reject_inbound(item.inbox_id()).await,
-                            ApplyOutcome::InboxAlreadyApplied { .. }
-                            | ApplyOutcome::InboxAlreadyConsumed { .. }
-                            | ApplyOutcome::AlreadyApplied
-                            | ApplyOutcome::Committed(_) => Ok(()),
-                        }
-                    }
-                    Err(StoreError::InboxInputMismatch { .. }) => {
-                        self.reject_inbound(item.inbox_id()).await
-                    }
-                    Err(error) => Err(error.into()),
-                }?;
+            ExecFrame::StepSignature {
+                commitment,
+                signature,
+            } => {
+                self.resolve_step_signature(item, commitment, signature)
+                    .await?;
             }
-            ExecFrame::End { .. } => {
-                let state = self.load_state().await?;
-                if !state.terminal_pending() {
-                    // As with step signatures, terminal signatures may be
-                    // reordered ahead of the shared terminal proposal. Keep
-                    // the accepted fact until the terminal commitment is
-                    // durable, where the store will validate its exact
-                    // commitment and either apply or consume it.
-                    if state.status().is_terminal() {
-                        self.reject_inbound(item.inbox_id()).await?;
-                    }
-                    return Ok(());
-                }
-                let outcome = self
-                    .context
-                    .store
-                    .apply_inbound(item.inbox_id(), now_ms())
-                    .await;
-                match outcome {
-                    Ok(ApplyOutcome::VersionMismatch { .. }) => Ok(()),
-                    Ok(ApplyOutcome::Conflict(_)) | Err(StoreError::InboxInputMismatch { .. }) => {
-                        self.reject_inbound(item.inbox_id()).await
-                    }
-                    Ok(_) => Ok(()),
-                    Err(error) => Err(error.into()),
-                }?;
+            ExecFrame::End {
+                commitment,
+                signature,
+            } => {
+                self.resolve_terminal_signature(item, commitment, signature)
+                    .await?;
             }
-            ExecFrame::Abort { .. } => {
-                let outcome = self
-                    .context
-                    .store
-                    .apply_inbound(item.inbox_id(), now_ms())
-                    .await;
-                match outcome {
-                    Ok(ApplyOutcome::VersionMismatch { .. }) => Ok(()),
-                    Ok(ApplyOutcome::Conflict(_)) | Err(StoreError::InboxInputMismatch { .. }) => {
-                        self.reject_inbound(item.inbox_id()).await
-                    }
-                    Ok(_) => Ok(()),
-                    Err(error) => Err(error.into()),
-                }?;
+            ExecFrame::Abort { occurrence } => {
+                self.resolve_abort(item, occurrence).await?;
             }
         }
         Ok(())
     }
 
-    async fn reject_inbound(&mut self, inbox_id: arena0_store::InboxId) -> Result<(), ExecError> {
+    async fn resolve_step_signature(
+        &mut self,
+        item: PendingInboxItem,
+        commitment: arena0_protocol::StepCommitment,
+        signature: arena0_crypto::BlsSignature,
+    ) -> Result<(), ExecError> {
+        let state = self.load_state().await?;
+        let Some(proposal) = state.pending_shared() else {
+            if state.status().is_terminal() {
+                self.reject_inbound(item.inbox_id()).await?;
+            }
+            // A signature may arrive before the corresponding proposal. Keep
+            // the accepted frame until the proposal is visible locally.
+            return Ok(());
+        };
+
+        if commitment.step != proposal.commitment().step {
+            if proposal.commitment().step.checked_add(1) == Some(commitment.step) {
+                // One participant can observe the next proposal before this
+                // actor has completed its current one. Preserve causal order.
+                return Ok(());
+            }
+            self.reject_inbound(item.inbox_id()).await?;
+            return Ok(());
+        }
+        if commitment != *proposal.commitment() {
+            self.reject_inbound(item.inbox_id()).await?;
+            return Ok(());
+        }
+
+        let participant = ParticipantStepSignature::new(item.source(), commitment.step, signature);
+        let outcome = self
+            .context
+            .store
+            .commit_step_signature(
+                state.version(),
+                participant,
+                Some(item.inbox_id()),
+                now_ms(),
+            )
+            .await;
+        let Some(outcome) = self
+            .settle_inbox_store_result(item.inbox_id(), outcome)
+            .await?
+        else {
+            return Ok(());
+        };
+        match outcome {
+            ApplyOutcome::Committed { agreed_step, .. } => {
+                self.reload_resident().await?;
+                self.emit_trace_appended(agreed_step).await;
+            }
+            ApplyOutcome::VersionMismatch { .. } => {}
+            ApplyOutcome::AlreadyApplied
+            | ApplyOutcome::InboxAlreadyApplied { .. }
+            | ApplyOutcome::InboxAlreadyConsumed { .. } => {
+                self.reload_resident().await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn resolve_terminal_signature(
+        &mut self,
+        item: PendingInboxItem,
+        commitment: arena0_protocol::TerminalCommitment,
+        signature: arena0_crypto::BlsSignature,
+    ) -> Result<(), ExecError> {
+        let state = self.load_state().await?;
+        let Some(expected) = state.pending_terminal() else {
+            if state.status().is_terminal() {
+                self.reject_inbound(item.inbox_id()).await?;
+            }
+            return Ok(());
+        };
+        if expected != &commitment {
+            self.reject_inbound(item.inbox_id()).await?;
+            return Ok(());
+        }
+        let participant = ParticipantTerminalSignature::new(item.source(), signature);
+        let outcome = self
+            .context
+            .store
+            .commit_terminal_signature(
+                state.version(),
+                participant,
+                Some(item.inbox_id()),
+                now_ms(),
+            )
+            .await;
+        self.settle_inbox_store_result(item.inbox_id(), outcome)
+            .await?;
+        Ok(())
+    }
+
+    async fn resolve_abort(
+        &mut self,
+        item: PendingInboxItem,
+        occurrence: arena0_protocol::AbortOccurrence,
+    ) -> Result<(), ExecError> {
+        let state = self.load_state().await?;
+        if state.status().is_terminal() {
+            self.reject_inbound(item.inbox_id()).await?;
+            return Ok(());
+        }
+        let outcome = self
+            .context
+            .store
+            .stop_execution(state.version(), occurrence, Some(item.inbox_id()), now_ms())
+            .await;
+        let outcome = match outcome {
+            // A transport-authenticated peer can still send an invalid or
+            // no-longer-applicable abort. It is durable inbox input to reject,
+            // not a local actor failure to feed back into another stop.
+            Err(StoreError::Protocol(_)) => {
+                self.reject_inbound(item.inbox_id()).await?;
+                return Ok(());
+            }
+            outcome => outcome,
+        };
+        self.settle_inbox_store_result(item.inbox_id(), outcome)
+            .await?;
+        Ok(())
+    }
+
+    async fn settle_inbox_store_result(
+        &mut self,
+        inbox_id: arena0_store::InboxId,
+        outcome: Result<ApplyOutcome, StoreError>,
+    ) -> Result<Option<ApplyOutcome>, ExecError> {
+        match outcome {
+            Ok(outcome) => Ok(Some(outcome)),
+            Err(StoreError::InboxInputMismatch { .. }) => {
+                self.reject_inbound(inbox_id).await?;
+                Ok(None)
+            }
+            Err(error) => {
+                self.restore_after_store_error().await;
+                Err(error.into())
+            }
+        }
+    }
+
+    pub(super) async fn reject_inbound(
+        &mut self,
+        inbox_id: arena0_store::InboxId,
+    ) -> Result<(), ExecError> {
         self.context
             .store
             .reject_inbound(inbox_id, now_ms())

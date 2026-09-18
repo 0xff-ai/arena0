@@ -6,12 +6,13 @@ use std::time::{Duration, Instant};
 use arena0_node::{ExecContext, Host, SessionMessage};
 use arena0_program::JsonBytes;
 use arena0_protocol::{
-    AbortKind, AbortOccurrence, ExecId, ExecutionAdmission, ExecutionInput, NegotiationId,
-    PeerIdSource, StateHash,
+    AbortKind, AbortOccurrence, ExecId, ExecLifecycle, ExecutionAdmission, ExecutionVersion,
+    NegotiationId, PeerIdSource, StateHash,
 };
 use arena0_sandbox::{InitializeCall, Program, WasmtimeEngine};
 use arena0_store::{RecoveryCursor, Store, StoreConfig};
 use arena0_tests::fixtures::{activation_for, execution_key, ordering_program_wasm, provider};
+use arena0_transport::Transport;
 use arena0_transport::local::{LocalNetwork, LocalTransport};
 
 #[derive(Clone, Copy, Debug)]
@@ -25,9 +26,9 @@ enum Milestone {
     Started,
     CrashBoundaryPersisted,
     RecoveryStarted,
-    AbortObserved,
+    TerminalObserved,
     OutboxDrained,
-    ReceiptReplayed,
+    ReceiptVerified,
     SecondRestartVerified,
 }
 
@@ -53,7 +54,7 @@ async fn recover_after(cut: CrashAfter) {
             negotiation_id,
             program.hash(),
             params.as_bytes().to_vec(),
-            StateHash::of(initialized.shared.as_bytes()),
+            StateHash::of_shared(&initialized.shared),
         );
         let store = Store::open(StoreConfig::new(&path, peers[0])).unwrap();
         store
@@ -89,30 +90,30 @@ async fn recover_after(cut: CrashAfter) {
             )
             .await
             .unwrap();
-        writer
-            .apply_input(ExecutionInput::Activate, 6)
-            .await
-            .unwrap();
+        writer.activate(ExecutionVersion::ZERO, 6).await.unwrap();
         let state = writer.load_execution().await.unwrap().unwrap();
         let unsigned = AbortOccurrence::unsigned(
             activation.session_hash(),
-            peers[1],
+            peers[0],
             AbortKind::Abort,
             7,
-            "peer stopped before the first public call",
-            state.public(),
+            "Host stopped before the first public call",
+            state.step_cursor(),
         )
         .unwrap();
-        let signature = keys[1].sign(&unsigned.signing_bytes().unwrap());
+        let signature = keys[0].sign(&unsigned.signing_bytes().unwrap());
         writer
-            .apply_input(
-                ExecutionInput::Abort(unsigned.with_signature(signature).unwrap()),
+            .stop_execution(
+                state.version(),
+                unsigned.with_signature(signature).unwrap(),
+                None,
                 7,
             )
             .await
             .unwrap();
         if matches!(cut, CrashAfter::Publication) {
-            writer.assemble_receipt(8).await.unwrap();
+            let state = writer.load_execution().await.unwrap().unwrap();
+            writer.publish_terminal(state.version(), 8).await.unwrap();
         }
         // No actor runs between these durable mutations and the store close.
         // The reopened Host sees exactly the selected crash boundary.
@@ -134,6 +135,12 @@ async fn recover_after(cut: CrashAfter) {
         let network = LocalNetwork::new();
         let mut transports = LocalTransport::create_network(&network, peers.clone())
             .expect("attach local transports");
+        // The recovery actor owns the producer side of the persisted abort
+        // frame. Keep the remote endpoint alive with a transport-only reader
+        // so this test exercises the real outbox acknowledgement boundary
+        // without starting a second execution actor or fabricating state.
+        let remote_transport = Arc::new(transports.remove(1));
+        let remote_ack_task = tokio::spawn(acknowledge_exec_streams(remote_transport));
         let transport = Arc::new(transports.remove(0));
         let identity = Arc::new(provider(7));
         let host = Host::start(Arc::clone(&identity), transport, store.handle().clone());
@@ -147,28 +154,35 @@ async fn recover_after(cut: CrashAfter) {
         );
         let mut spawned = host.spawn(context, writer).unwrap();
         progress.push((Milestone::RecoveryStarted, started.elapsed()));
-        loop {
-            match spawned.message_rx.recv().await.expect("actor observation") {
-                SessionMessage::Aborted { .. } => break,
-                SessionMessage::Failed { reason } => panic!("recovery failed at {cut:?}: {reason}"),
-                _ => {}
-            }
-        }
-        progress.push((Milestone::AbortObserved, started.elapsed()));
-        loop {
-            if store
+        let state = store
+            .handle()
+            .load_execution(exec_id)
+            .await
+            .unwrap()
+            .expect("durable execution after recovery");
+        assert_eq!(state.status().lifecycle(), ExecLifecycle::Aborted);
+        progress.push((Milestone::TerminalObserved, started.elapsed()));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let receipts = loop {
+            let receipts = store.handle().list_receipts(10).await.unwrap();
+            let candidates = store
                 .handle()
                 .list_recovery_candidates(RecoveryCursor::start(), 10)
                 .await
-                .unwrap()
-                .is_empty()
-            {
-                break;
+                .unwrap();
+            if receipts.len() == 1 && candidates.is_empty() {
+                break receipts;
             }
-            tokio::task::yield_now().await;
-        }
+            if let Ok(SessionMessage::Failed { reason }) = spawned.message_rx.try_recv() {
+                panic!("recovery failed at {cut:?}: {reason}");
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "receipt recovery made no progress at {cut:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
         progress.push((Milestone::OutboxDrained, started.elapsed()));
-        let receipts = store.handle().list_receipts(10).await.unwrap();
         assert_eq!(receipts.len(), 1);
         assert_eq!(
             receipts[0].provenance,
@@ -178,14 +192,15 @@ async fn recover_after(cut: CrashAfter) {
             receipts[0].receipt,
             arena0_protocol::ReceiptArtifact::StopReport(_)
         ));
-        let verified =
-            arena0_verify::verify_full(&wasm, &receipts[0].receipt.encode().unwrap()).unwrap();
+        let verified = arena0_verify::verify_light(&receipts[0].receipt.encode().unwrap()).unwrap();
         assert!(matches!(
             verified.terminal,
-            arena0_verify::VerifiedTerminal::Stopped { .. }
+            arena0_verify::LightVerifiedTerminal::Stopped { .. }
         ));
-        progress.push((Milestone::ReceiptReplayed, started.elapsed()));
+        progress.push((Milestone::ReceiptVerified, started.elapsed()));
         spawned.shutdown().await;
+        remote_ack_task.abort();
+        let _ = remote_ack_task.await;
         host.stop().await;
         store.shutdown().await.unwrap();
         let reopened = Store::open(StoreConfig::new(&path, peers[0])).unwrap();
@@ -205,6 +220,20 @@ async fn recover_after(cut: CrashAfter) {
     .unwrap_or_else(|_| {
         panic!("receipt recovery exceeded 15 seconds after {cut:?}; milestones: {progress:?}")
     });
+}
+
+/// A transport-only remote seat that acknowledges the producer's stream
+/// responsibility. It deliberately does not apply the frame: receipt
+/// recovery owns the producer's durable terminal artifact, while this helper
+/// only prevents an absent remote actor from masking that outbox boundary.
+async fn acknowledge_exec_streams(transport: Arc<LocalTransport>) {
+    let Ok(accepted) = transport.accept_exec().await else {
+        return;
+    };
+    let (_, receiver) = accepted.into_parts();
+    while let Ok(delivery) = receiver.recv_exec().await {
+        let _ = delivery.acknowledge();
+    }
 }
 
 #[tokio::test]

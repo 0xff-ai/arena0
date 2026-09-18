@@ -7,28 +7,26 @@
 //! **Phase shape**: commit-reveal is two ordered collect rounds. Every participant broadcasts exactly one
 //! `Commit`, applied in participant-index order, then exactly one `Reveal`.
 //!
-//! **Handler discipline**:
-//! [`handle`](crate::commit_reveal::CommitReveal::handle) is the shared-event
-//! side. It runs identically on every node (the sender included) at the same
-//! public position, keyed by the authenticated sender, and mutates only the
-//! shared-visible fields.
+//! **Dispatch discipline**:
+//! [`handle`](crate::commit_reveal::CommitReveal::handle) applies an
+//! authenticated message to shared state during the current dispatch.
 //! [`commit_with_salt`](crate::commit_reveal::CommitReveal::commit_with_salt)
-//! and [`take_reveal`](crate::commit_reveal::CommitReveal::take_reveal) are
-//! local decision code: they read shared state, stash the secret value and salt
-//! in a [`crate::commit_reveal::CommitRevealLocal`] companion value, and produce the message to
-//! broadcast; shared state moves only when that message applies.
+//! and [`take_reveal`](crate::commit_reveal::CommitReveal::take_reveal) update
+//! the participant-local companion while the enclosing `Context` can update
+//! shared state in the same accepted event. A broadcast is delivered to other
+//! participants; the producer does not apply its own message a second time.
 //!
 //! Program usage:
 //! ```ignore
-//! // local (on_input): stash the secret and broadcast the commit
-//! ctx.commitments().commit(value)?.broadcast_via(Message::CommitReveal);
-//! // local (on_react): once all commits are in, broadcast the reveal
-//! if let Some(reveal) = ctx.commitments().take_reveal() {
+//! // any mutating handler: stash the secret, update shared state, and broadcast
+//! ctx.commit_reveal().commit(value)?.broadcast_via(Message::CommitReveal);
+//! // once all commits are in, broadcast the reveal
+//! if let Some(reveal) = ctx.commit_reveal().take_reveal() {
 //!     reveal.broadcast_via(Message::CommitReveal);
 //! }
-//! // shared (on_message): apply the round for the authenticated sender
-//! ctx.commitments().handle(from, msg)?;
-//! if ctx.shared().commitments.is_complete() {
+//! // an incoming message applies the round for the authenticated sender
+//! ctx.commit_reveal().handle(from, msg)?;
+//! if ctx.shared().commit_reveal.is_complete() {
 //!     // score, then return Transition::End or Transition::To(...)
 //! }
 //! ```
@@ -57,7 +55,7 @@ pub enum Phase {
 /// Participant-local companion state for [`CommitReveal`].
 ///
 /// A program embeds this value in its `Program::Local` DTO. Its fields are
-/// serialized at every local fresh-call boundary and never enter the shared
+/// serialized at every dispatch boundary and never enter the shared
 /// state commitment.
 #[arena0::local]
 #[derive(Clone, Default)]
@@ -129,8 +127,8 @@ pub enum Error {
 ///
 /// Programs with more than one local field implement this trait by returning
 /// the `CommitRevealLocal<T>` member used by their commit-reveal instance. The
-/// primitive extension then keeps shared protocol state and local stash state
-/// separate at the context boundary.
+/// primitive extension updates the local stash through the enclosing context
+/// while shared protocol state remains in the primitive field.
 pub trait CommitRevealLocalState<T> {
     /// Borrow this program's local commit-reveal stash.
     fn commit_reveal_local(&self) -> &CommitRevealLocal<T>;
@@ -149,18 +147,19 @@ impl<T> CommitRevealLocalState<T> for CommitRevealLocal<T> {
     }
 }
 
-/// Local context-field operations for `CommitReveal` primitives.
+/// Unified context-field operations for `CommitReveal` primitives.
 ///
 /// `#[arena0::state]` generates field-named accessors such as
-/// `ctx.commit_reveal()`. These operations inspect shared protocol state,
-/// update the caller's `Program::Local` stash, and return detached outputs that
-/// can be broadcast with `.broadcast()` (or `.broadcast_via(...)`).
-pub trait CommitRevealLocalFieldExt<T, Route = RawPrimitiveRoute> {
+/// `ctx.commit_reveal()`. Outgoing commit and reveal operations consume the
+/// participant-local opening and apply its corresponding shared value during
+/// the same event before returning a detached output. Incoming messages use
+/// the same handle, so every accepted event can update both state values.
+pub trait CommitRevealFieldExt<T, Route = RawPrimitiveRoute> {
     /// Whether this node still owes its commit for the current round.
     fn needs_commit(self) -> bool;
 
-    /// Commit a local value with a host-generated salt and return the commit
-    /// message to broadcast. Local decision code only.
+    /// Commit a local value with a host-generated salt, apply its shared
+    /// commitment, and return the commit message to broadcast.
     fn commit(self, value: T) -> Result<PrimitiveOutput<Message<T>, Route>, Error>;
 
     /// Commit a local value with an explicit salt.
@@ -173,24 +172,18 @@ pub trait CommitRevealLocalFieldExt<T, Route = RawPrimitiveRoute> {
         salt: [u8; 32],
     ) -> Result<PrimitiveOutput<Message<T>, Route>, Error>;
 
-    /// Take the reveal message owed this round, once every commitment is in.
-    /// Local decision code; returns `None` until the reveal is due and at most
+    /// Take and apply the reveal message owed this round, once every
+    /// commitment is in. Returns `None` until the reveal is due and at most
     /// once per round.
     fn take_reveal(self) -> Option<PrimitiveOutput<Message<T>, Route>>;
-}
 
-/// Shared context-field operations for `CommitReveal` primitives.
-///
-/// Shared handlers apply authenticated messages at the canonical public
-/// position. This handle exposes only the shared mutation operation.
-pub trait CommitRevealSharedFieldExt<T, Route = RawPrimitiveRoute> {
     /// Apply a commit-reveal message from the authenticated sender. Every node
-    /// runs this operation at the same public position.
+    /// runs this operation at the same agreed position.
     fn handle(self, from: Participant, msg: Message<T>) -> Result<(), Error>;
 }
 
-impl<Shared, Local, T, Route> CommitRevealLocalFieldExt<T, Route>
-    for LocalPrimitiveField<'_, Shared, Local, CommitReveal<T>, Route>
+impl<Shared, Local, T, Route> CommitRevealFieldExt<T, Route>
+    for PrimitiveField<'_, Shared, Local, CommitReveal<T>, Route>
 where
     Shared: Primitive,
     Local: CommitRevealLocalState<T>,
@@ -202,7 +195,7 @@ where
 
     fn commit(mut self, value: T) -> Result<PrimitiveOutput<Message<T>, Route>, Error> {
         let salt = self.random_bytes();
-        self.commit_with_salt(value, salt)
+        <Self as CommitRevealFieldExt<T, Route>>::commit_with_salt(self, value, salt)
     }
 
     fn commit_with_salt(
@@ -210,25 +203,25 @@ where
         value: T,
         salt: [u8; 32],
     ) -> Result<PrimitiveOutput<Message<T>, Route>, Error> {
+        let participant = self.me();
         let commit = self.with_shared_local(|cr, local| {
             cr.commit_with_salt(local.commit_reveal_local_mut(), value, salt)
         })?;
+        self.mutate(|cr| cr.handle(participant, commit.clone()))?;
         Ok(self.output(commit))
     }
 
     fn take_reveal(mut self) -> Option<PrimitiveOutput<Message<T>, Route>> {
+        let participant = self.me();
         let reveal =
             self.with_shared_local(|cr, local| cr.take_reveal(local.commit_reveal_local_mut()))?;
+        self.mutate(|cr| {
+            cr.handle(participant, reveal.clone())
+                .expect("local commit-reveal reveal must be valid")
+        });
         Some(self.output(reveal))
     }
-}
 
-impl<Shared, T, Route> CommitRevealSharedFieldExt<T, Route>
-    for SharedPrimitiveField<'_, Shared, CommitReveal<T>, Route>
-where
-    Shared: Primitive,
-    T: BorshSerialize + Clone,
-{
     fn handle(mut self, from: Participant, msg: Message<T>) -> Result<(), Error> {
         self.mutate(|cr| cr.handle(from, msg))
     }
@@ -307,8 +300,8 @@ impl<T> CommitReveal<T> {
     /// Whether the supplied local stash still owes its commit for the current
     /// round.
     ///
-    /// Local decision code should normally call the matching method on its
-    /// `CommitRevealLocalFieldExt` handle, which supplies the program-local DTO.
+    /// Callers can use the matching method on a `CommitRevealFieldExt` handle,
+    /// which supplies the program-local DTO through the enclosing context.
     pub fn needs_commit(&self, local: &CommitRevealLocal<T>) -> bool {
         self.phase == Phase::Idle && local.committed_round != Some(self.round)
     }
@@ -328,9 +321,8 @@ impl<T> CommitReveal<T> {
     }
 
     /// Stash a value and salt in the supplied local DTO and return the Commit
-    /// message to broadcast. Local decision code: does NOT mutate
-    /// shared-visible state; this node's hash lands in shared state when its
-    /// own broadcast applies through [`handle`](Self::handle).
+    /// message to broadcast. The caller may apply the corresponding shared
+    /// transition in the same event before emitting that message.
     pub fn commit_with_salt(
         &self,
         local: &mut CommitRevealLocal<T>,
@@ -350,13 +342,13 @@ impl<T> CommitReveal<T> {
         Ok(Message::Commit(hash))
     }
 
-    /// Apply a message from the authenticated sender. The shared-event side:
-    /// pure over shared state plus the event, identical on every node.
+    /// Apply a message from the authenticated sender. The operation is pure
+    /// over shared state plus the event, and therefore identical on every node.
     ///
     /// A `Commit` outside the commit round, a second message from the same
     /// participant inside a round, or a reveal that fails its commitment hash
-    /// is a protocol violation surfaced as `Err` (the program's shared handler
-    /// propagates it, aborting identically on every node).
+    /// is a protocol violation surfaced as `Err` (the enclosing program
+    /// handler propagates it, aborting identically on every node).
     pub fn handle(&mut self, from: Participant, msg: Message<T>) -> Result<(), Error>
     where
         T: BorshSerialize,
@@ -401,7 +393,7 @@ impl<T> CommitReveal<T> {
 
     /// Take the reveal owed for the current round: `Some` exactly once, when
     /// every commitment has been applied and this node committed this round.
-    /// Local decision code (reads and writes the supplied local stash only).
+    /// Reads and writes the supplied local stash.
     pub fn take_reveal(&self, local: &mut CommitRevealLocal<T>) -> Option<Message<T>>
     where
         T: Clone,
@@ -489,8 +481,8 @@ mod tests {
     const P1: Participant = Participant::new(1);
     const P2: Participant = Participant::new(2);
 
-    /// Apply the same shared event to both replicas, as the runtime does at
-    /// one canonical position, and assert the shared bytes stay identical.
+    /// Apply the same commit-reveal event to both replicas, as the runtime does
+    /// at one canonical position, and assert their serialized values match.
     fn apply_both(
         a: &mut CommitReveal<u32>,
         b: &mut CommitReveal<u32>,
@@ -511,7 +503,7 @@ mod tests {
         let mut a_local = CommitRevealLocal::default();
         let mut b_local = CommitRevealLocal::default();
 
-        // Local decision code on each node: stash and produce the commit.
+        // Each node stashes its value and produces the commit in one context.
         let a_commit = a.commit_with_salt(&mut a_local, 42, [0xAA; 32]).unwrap();
         let b_commit = b.commit_with_salt(&mut b_local, 99, [0xBB; 32]).unwrap();
 

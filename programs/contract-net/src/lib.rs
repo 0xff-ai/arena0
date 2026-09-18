@@ -164,6 +164,7 @@ impl Shared {
 )]
 pub mod contract_net {
     use super::*;
+    use arena0::ProgramTransition;
 
     type Shared = super::Shared;
     type Local = super::Local;
@@ -188,19 +189,17 @@ pub mod contract_net {
         state.expected_writer()
     }
 
-    fn initialize(ctx: &mut SharedContext, params: Params) -> Result<(), ProgramFault> {
+    fn initialize(shared: &mut Shared, params: Params) -> Result<(), ProgramFault> {
         params.validate().map_err(|error| anyhow!(error))?;
-        ctx.mutate_shared(|state| {
-            state.target_size = params.target_size;
-            state.tasks = params.tasks;
-        });
+        shared.target_size = params.target_size;
+        shared.tasks = params.tasks;
         Ok(())
     }
 
     fn on_session_started(
-        ctx: &mut SharedContext,
+        ctx: &mut Context<Shared, Local>,
         ensemble: &Ensemble,
-    ) -> Result<Transition<Phase>, ProgramFault> {
+    ) -> Result<ProgramTransition<ContractNet>, ProgramFault> {
         if ensemble.len() != ctx.shared().target_size as usize {
             return Err(anyhow!(
                 "expected {} participants, got {}",
@@ -209,21 +208,26 @@ pub mod contract_net {
             )
             .into());
         }
-        ctx.mutate_shared(|state| state.offers = vec![None; ensemble.len()]);
+        ctx.shared_mut().offers = vec![None; ensemble.len()];
         Ok(Transition::Stay)
     }
 
-    fn on_react(ctx: &mut Context) -> Result<(), ProgramFault> {
+    fn on_react(
+        ctx: &mut Context<Shared, Local>,
+    ) -> Result<ProgramTransition<ContractNet>, ProgramFault> {
         if ctx.shared().expected_writer() != Some(ctx.me()) {
-            return Ok(());
+            return Ok(Transition::Stay);
         }
 
         match ctx.shared().phase() {
             Phase::CollectingOffers if ctx.me() == COORDINATOR => {
                 if !ctx.local().proposal_sent {
                     let plan = ctx.shared().plan();
+                    let participant_count = ctx.ensemble().len();
+                    apply_proposal(ctx.shared_mut(), plan.clone(), participant_count)?;
                     ctx.effects().broadcast(&Message::Proposal { plan });
                     ctx.mutate_local(|local| local.proposal_sent = true);
+                    return Ok(Transition::To(Phase::ReviewingProposal));
                 }
             }
             Phase::CollectingOffers => {
@@ -251,17 +255,23 @@ pub mod contract_net {
                 }
                 let proposal_id = proposal.id;
                 if ctx.local().accepted_proposal != Some(proposal_id) {
+                    let me = ctx.me();
+                    let tally = apply_accept(ctx.shared_mut(), me, proposal_id)?;
                     ctx.effects().broadcast(&Message::Accept {
                         proposal: proposal_id,
                     });
                     ctx.mutate_local(|local| local.accepted_proposal = Some(proposal_id));
+                    return transition_for_tally(tally);
                 }
             }
         }
-        Ok(())
+        Ok(Transition::Stay)
     }
 
-    fn on_input(ctx: &mut Context, input: Input) -> Result<(), InputFault> {
+    fn on_input(
+        ctx: &mut Context<Shared, Local>,
+        input: Input,
+    ) -> Result<ProgramTransition<ContractNet>, InputFault> {
         let Input::SubmitOffer(offer) = input;
         if ctx.shared().phase() != Phase::CollectingOffers
             || ctx.shared().expected_offer_writer() != Some(ctx.me())
@@ -272,16 +282,18 @@ pub mod contract_net {
             .validate(&ctx.shared().tasks)
             .map_err(|error| anyhow!(error))
             .retryable()?;
+        let from = ctx.me();
+        apply_offer(ctx.shared_mut(), from, offer.clone());
         ctx.effects().broadcast(&Message::Offer(offer));
         ctx.mutate_local(|local| local.offer_sent = true);
-        Ok(())
+        Ok(Transition::Stay)
     }
 
     fn on_message(
-        ctx: &mut SharedContext,
+        ctx: &mut Context<Shared, Local>,
         from: Participant,
         message: Message,
-    ) -> Result<ApplyDecision<Phase>, ProtocolFault> {
+    ) -> MessageApply<ContractNet> {
         if ctx.shared().expected_writer() != Some(from) {
             return Ok(ApplyDecision::Reject);
         }
@@ -294,7 +306,7 @@ pub mod contract_net {
                 {
                     return Ok(ApplyDecision::Reject);
                 }
-                ctx.mutate_shared(|state| state.offers[from.index()] = Some(offer));
+                apply_offer(ctx.shared_mut(), from, offer);
                 Ok(ApplyDecision::Accept(Transition::Stay))
             }
             Message::Proposal { plan } => {
@@ -306,19 +318,8 @@ pub mod contract_net {
                     return Ok(ApplyDecision::Reject);
                 }
 
-                let eligible = (0..ctx.ensemble().len())
-                    .map(|index| {
-                        Participant::try_from(index)
-                            .expect("validated participant count fits a participant index")
-                    })
-                    .collect();
-                let threshold = ctx.ensemble().len() as u16;
-                let proposed = ctx.mutate_shared(|state| {
-                    state
-                        .agreement
-                        .propose(PROPOSAL_VERSION, plan, eligible, threshold)
-                });
-                if proposed.is_err() {
+                let participant_count = ctx.ensemble().len();
+                if apply_proposal(ctx.shared_mut(), plan, participant_count).is_err() {
                     return Ok(ApplyDecision::Reject);
                 }
                 Ok(ApplyDecision::Accept(Transition::To(
@@ -329,49 +330,38 @@ pub mod contract_net {
                 if ctx.shared().phase() != Phase::ReviewingProposal {
                     return Ok(ApplyDecision::Reject);
                 }
-                let tally =
-                    ctx.mutate_shared(|state| state.agreement.vote(from, proposal, Vote::Accept));
-                let Ok(tally) = tally else {
+                let Ok(tally) = apply_accept(ctx.shared_mut(), from, proposal) else {
                     return Ok(ApplyDecision::Reject);
                 };
-                match tally {
-                    Tally::Pending { .. } => Ok(ApplyDecision::Accept(Transition::Stay)),
-                    Tally::Accepted { .. } => Ok(ApplyDecision::Accept(Transition::End)),
-                    Tally::NotStarted | Tally::Rejected { .. } => {
-                        Err(ProtocolFault::shared_violation(anyhow!(
-                            "accept-only ballot reached an impossible result"
-                        )))
-                    }
-                }
+                Ok(ApplyDecision::Accept(transition_for_tally(tally)?))
             }
         }
     }
 
-    fn view(ctx: &SharedContext, vp: &Viewport) -> View {
-        let state = ctx.shared();
+    fn view(state: &Shared, ensemble: &Ensemble, vp: &Viewport) -> View {
         View::new()
             .header(vp.fit_text(format!(
                 "Contract net - {} task{}",
                 state.tasks.len(),
                 if state.tasks.len() == 1 { "" } else { "s" }
             )))
-            .agents(vp.fit_text(render_agents(ctx)))
+            .agents(vp.fit_text(render_agents(state, ensemble)))
             .state(vp.fit_text(render_state(state)))
             .status_bar(vp.fit_text(render_status(state)))
     }
 
-    fn on_query(_ctx: &SharedContext, _: ()) {}
+    fn on_query(_shared: &Shared, _: ()) {}
 
-    fn render_agents(ctx: &SharedContext) -> String {
+    fn render_agents(state: &Shared, ensemble: &Ensemble) -> String {
         let mut output = String::new();
-        for index in 0..ctx.ensemble().len() {
+        for index in 0..ensemble.len() {
             let participant = Participant::try_from(index)
                 .expect("validated participant count fits a participant index");
             if participant == COORDINATOR {
                 let _ = writeln!(output, "P{index}: coordinator");
                 continue;
             }
-            let offer = ctx.shared().offers.get(index).and_then(Option::as_ref);
+            let offer = state.offers.get(index).and_then(Option::as_ref);
             match offer {
                 Some(offer) => {
                     let _ = writeln!(output, "P{index}: worker, capacity {}", offer.capacity);
@@ -425,6 +415,50 @@ pub mod contract_net {
             }
             AgreementStatus::Accepted => "assignment plan accepted".to_string(),
             AgreementStatus::Rejected => "assignment plan rejected".to_string(),
+        }
+    }
+
+    fn apply_offer(state: &mut Shared, from: Participant, offer: WorkerOffer) {
+        state.offers[from.index()] = Some(offer);
+    }
+
+    fn apply_proposal(
+        state: &mut Shared,
+        plan: AssignmentPlan,
+        participant_count: usize,
+    ) -> Result<(), arena0::anyhow::Error> {
+        let eligible = (0..participant_count)
+            .map(|index| {
+                Participant::try_from(index)
+                    .expect("validated participant count fits a participant index")
+            })
+            .collect();
+        let threshold = participant_count as u16;
+        state
+            .agreement
+            .propose(PROPOSAL_VERSION, plan, eligible, threshold)
+            .map(|_| ())
+            .map_err(|error| anyhow!(error))
+    }
+
+    fn apply_accept(
+        state: &mut Shared,
+        from: Participant,
+        proposal: ProposalId,
+    ) -> Result<Tally, arena0::anyhow::Error> {
+        state
+            .agreement
+            .vote(from, proposal, Vote::Accept)
+            .map_err(|error| anyhow!(error))
+    }
+
+    fn transition_for_tally(tally: Tally) -> Result<ProgramTransition<ContractNet>, ProgramFault> {
+        match tally {
+            Tally::Pending { .. } => Ok(Transition::Stay),
+            Tally::Accepted { .. } => Ok(Transition::End),
+            Tally::NotStarted | Tally::Rejected { .. } => {
+                Err(anyhow!("accept-only ballot reached an impossible result").into())
+            }
         }
     }
 }
@@ -659,64 +693,106 @@ mod tests {
             let result = message_harness.message(worker, Message::Offer(offer));
             assert!(result.rejected);
             assert!(result.effects.is_empty());
-            assert!(result.step.is_none());
+            assert!(result.records.is_empty());
             assert_eq!(message_harness.shared_hash(), before);
         }
     }
 
-    #[arena0::test(
-        ContractNet,
-        Params {
+    #[test]
+    fn native_scenario_accepts_only_the_exact_plan() {
+        let params = Params {
             target_size: 2,
             tasks: vec![Task {
                 name: "compile".to_string(),
                 capability: "rust".to_string(),
             }],
-        }
-    )]
-    fn native_scenario_accepts_only_the_exact_plan(h: _) {
+        };
         let worker = PeerId([1; 32]);
-        let coordinator = h.peer_id();
-        let started = h.session_started(worker);
+        let coordinator = PeerId([0; 32]);
+        let mut coordinator_harness =
+            TestHarness::<ContractNet>::with_peer_id(coordinator, params.clone());
+        let mut worker_harness = TestHarness::<ContractNet>::with_peer_id(worker, params);
+        let started = coordinator_harness.session_started(worker);
         assert!(matches!(started.fault, FaultStatus::None));
 
-        let offered = h.message(worker, Message::Offer(offer(&["rust"], 1, &[(0, 7)])));
+        let worker_started = worker_harness.session_started(coordinator);
+        assert!(matches!(worker_started.fault, FaultStatus::None));
+        let worker_offer = offer(&["rust"], 1, &[(0, 7)]);
+        let offered = worker_harness.resolve_callout::<callouts::SubmitOffer>(worker_offer);
+        assert!(matches!(offered.fault, FaultStatus::None));
+        let offer_message = offered
+            .messages::<Message>()
+            .into_iter()
+            .find(|message| matches!(message, Message::Offer(_)))
+            .expect("worker emits the offer");
+        let offered = coordinator_harness.message(worker, offer_message);
+        assert!(matches!(offered.fault, FaultStatus::None));
+        assert!(
+            offered
+                .messages::<Message>()
+                .iter()
+                .any(|message| matches!(message, Message::Proposal { .. })),
+            "coordinator emits the deterministic proposal"
+        );
         let proposal = offered
             .messages::<Message>()
             .into_iter()
             .find(|message| matches!(message, Message::Proposal { .. }))
             .expect("coordinator emits the deterministic proposal");
-        let proposed = h.message(coordinator, proposal);
-        assert!(matches!(proposed.fault, FaultStatus::None));
-
-        let wrong = ProposalId {
-            version: PROPOSAL_VERSION,
-            hash: [0xff; 32],
-        };
-        assert!(
-            h.message(coordinator, Message::Accept { proposal: wrong })
-                .rejected
-        );
-
-        let id = h
+        let id = coordinator_harness
             .shared()
             .agreement
             .proposal()
             .expect("proposal is active")
             .id;
-        let first = h.message(coordinator, Message::Accept { proposal: id });
-        assert!(matches!(first.fault, FaultStatus::None));
-        let finished = h.message(worker, Message::Accept { proposal: id });
-        assert!(matches!(finished.fault, FaultStatus::None));
-        assert!(
-            finished
-                .step
-                .as_ref()
-                .is_some_and(|step| step.is_terminal())
-        );
-        assert_eq!(h.shared().agreement.status(), AgreementStatus::Accepted);
 
-        let view = h.view(Viewport {
+        // The worker rejects a proposal whose plan is not the deterministic
+        // allocation, before the real proposal is delivered.
+        let wrong_plan = AssignmentPlan {
+            assignments: vec![Assignment {
+                task: 0,
+                award: Award::Unassigned,
+            }],
+        };
+        let wrong_proposal =
+            worker_harness.message(coordinator, Message::Proposal { plan: wrong_plan });
+        assert!(wrong_proposal.rejected);
+
+        // Deliver the producer's proposal to the worker. The coordinator's
+        // ballot puts its own vote first, so inject that distinct vote event on
+        // the coordinator replica before delivering it to the worker. This is
+        // not a re-delivery of a producer broadcast.
+        let proposed = worker_harness.message(coordinator, proposal);
+        assert!(matches!(proposed.fault, FaultStatus::None));
+        let wrong = ProposalId {
+            version: PROPOSAL_VERSION,
+            hash: [0xff; 32],
+        };
+        let wrong_accept = worker_harness.message(coordinator, Message::Accept { proposal: wrong });
+        assert!(wrong_accept.rejected);
+
+        let coordinator_vote =
+            coordinator_harness.message(coordinator, Message::Accept { proposal: id });
+        assert!(matches!(coordinator_vote.fault, FaultStatus::None));
+        let worker_vote = worker_harness.message(coordinator, Message::Accept { proposal: id });
+        let worker_accept = worker_vote
+            .messages::<Message>()
+            .into_iter()
+            .find(|message| matches!(message, Message::Accept { .. }))
+            .expect("worker accepts the exact proposal");
+        let finished = coordinator_harness.message(worker, worker_accept);
+        assert!(matches!(finished.fault, FaultStatus::None));
+        assert!(finished.has_session_end());
+        assert_eq!(
+            coordinator_harness.shared().agreement.status(),
+            AgreementStatus::Accepted
+        );
+        assert_eq!(
+            worker_harness.shared().agreement.status(),
+            AgreementStatus::Accepted
+        );
+
+        let view = coordinator_harness.view(Viewport {
             width: 96,
             color: ColorDepth::Mono,
         });

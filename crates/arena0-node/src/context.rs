@@ -11,9 +11,8 @@ use std::sync::Arc;
 use arena0_crypto::{ExecutionKey, ExecutionSalt, NodeKeys};
 use arena0_program::{JsonBytes, ProgramHash};
 use arena0_protocol::{
-    Activation, Ensemble, ExecId, ExecutionAdmission, ExecutionInput, FrameId, LocalStateBytes,
-    NegotiationTarget, PeerIdSource, PreparedActivation, ReceiptArtifact, SessionHash,
-    SharedStateBytes, View,
+    Activation, Ensemble, ExecId, ExecutionAdmission, FrameId, LocalStateBytes, NegotiationTarget,
+    PeerIdSource, PreparedActivation, ReceiptArtifact, SessionHash, SharedStateBytes, View,
 };
 use arena0_sandbox::LoadedProgram;
 use arena0_store::{
@@ -27,7 +26,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 /// Failures returned by one execution actor.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum ExecError {
     /// No durable execution exists for the requested identity.
     #[error("execution {0} was not found")]
@@ -36,6 +35,9 @@ pub enum ExecError {
     /// durable callout continuation.
     #[error("callout is no longer pending")]
     CalloutNotPending,
+    /// A shared proposal is pending, so an input event was not consumed.
+    #[error("execution is waiting for shared agreement; input was not consumed")]
+    AgreementPending,
     /// Durable or guest state violates an execution invariant.
     #[error("invalid execution state: {0}")]
     InvalidState(String),
@@ -290,15 +292,6 @@ impl HostExecutionStore {
         self.store
             .create_execution(activation, producer, shared_state, local_state, now_ms)
             .await
-    }
-
-    /// Apply one protocol input to this execution.
-    pub async fn apply_input(
-        &mut self,
-        input: ExecutionInput,
-        now_ms: u64,
-    ) -> Result<arena0_store::ApplyOutcome, StoreError> {
-        self.store.apply_input(input, now_ms).await
     }
 
     pub(crate) fn store_mut(&mut self) -> &mut ExecutionStore {

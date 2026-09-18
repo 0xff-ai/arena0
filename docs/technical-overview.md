@@ -163,7 +163,12 @@ Admission selects an exact program, participant set, parameter set, execution pr
 
 Each Host prepares its activation record before it signs. A Host starts execution only after it validates and commits the complete activation. Hosts may commit at different wall-clock times. The process has no global start barrier.
 
-Every public transition binds the session, position, prior state, next state, event, effects, fuel, and replayable randomness. It commits only after every activated participant signs the same commitment.
+Every agreed public transition binds the session, position, event, prior and
+next shared-state hashes, and the chain link. `SessionStarted` and
+`MessageReceived` are the portable trace events; participant-specific events,
+local state, effects, fuel, and entropy observations remain Host-local. The
+transition commits only after every activated participant signs the same
+`StepCommitment`.
 
 The [execution walkthrough](architecture.md#complete-execution-walkthrough) traces this lifecycle through an auction.
 
@@ -171,9 +176,17 @@ The [execution walkthrough](architecture.md#complete-execution-walkthrough) trac
 
 The guest program owns protocol-specific meaning. It defines roles, parameters, shared and local state, messages, callouts, transitions, views, and outcomes.
 
-The Host owns deterministic execution conditions. It validates the module and required exports, enforces fuel and memory limits, supplies replayable randomness, persists results, and performs explicit effects.
+The Host owns bounded execution conditions. It validates the module and required
+exports, enforces fuel and memory limits, supplies bounded host entropy,
+persists results, and performs explicit effects.
 
-Every semantic guest call uses a fresh bounded Wasm instance. Shared calls may replace only shared state. Local calls may replace only local state. Read-only calls must not change guest state or emit effects.
+Each active execution owns one resident `ProgramInstance` with fixed,
+independent `arena0_shared` and `arena0_local` memories. Every session
+`Event` enters the same `arena0_dispatch`; its `Context` may mutate either or
+both memories and emit any `Effect`. Work memory, mutable globals, fuel, and
+per-dispatch observations reset to the resident baseline. Read-only
+initialization, writer, query, view, and outcome projections use fresh bounded
+instances and must not change guest state or emit effects.
 
 Content addressing binds an execution to exact Wasm bytes. The execution profile binds proof-relevant runtime configuration. Wasmtime compilation is cached within a process and in a persistent cache below the arena0 home.
 
@@ -181,11 +194,21 @@ Content addressing binds an execution to exact Wasm bytes. The execution profile
 
 Each Host owns one SQLite database and one blocking database-owner thread. The daemon reserves the store before opening or creating signing keys. The same store owns the latest agent software label (`user_agent`), separate from protocol state. Cloneable handles submit bounded operations to that owner. A non-cloneable `ExecutionStore` grants exclusive mutation authority for one execution.
 
-The pure protocol reducer returns a commit plan rather than performing I/O. The store applies the plan with a version compare-and-set. One SQLite transaction writes the execution aggregate, trace or private records, timers, outbox effects, and the applied inbox status.
+The actor validates an accepted dispatch and calls a focused store method rather
+than building a second transition representation. One SQLite transaction
+compare-and-sets the execution version and writes the accepted event, shared
+and local state images, effects, timers, outbox rows, and applied inbox status.
 
-Inbound execution frames enter the durable inbox before the transport receives an acknowledgement. Reducer application happens later. This split lets a restarted Host recover accepted work without claiming that the work already changed protocol state.
+Inbound execution frames enter the durable inbox before the transport receives
+an acknowledgement. The actor resolves each accepted frame through the same
+event dispatch and direct store boundary. This boundary lets a restarted Host
+recover accepted work without claiming that the work already changed protocol
+state.
 
-Outbound effects use durable rows and leases. A send failure leaves recoverable work. Lease expiry allows a later actor to retry without deleting causal history.
+Outbound effects and protocol frames use durable rows and leases. Protocol
+frame rows are per destination, so a producer never processes its own
+broadcast. A send failure leaves recoverable work, and lease expiry allows a
+later actor to retry without deleting causal history.
 
 Recovery validates stored state and every nested projection before it exposes the execution. Corruption produces an error. Recovery does not invent missing state or choose between conflicting histories.
 
@@ -209,7 +232,7 @@ against other processes controlled by the same machine operator.
 
 Within that boundary, each Host still validates protocol facts independently. N-of-N agreement prevents the system from hiding one selected Host's disagreement inside a majority result. The same rule allows any selected Host to stop progress.
 
-Guest code has no ambient access to the network, filesystem, credentials, clock, or process. It can request only the effects exposed by the ABI. The Host applies policy and bounds before it performs an effect.
+Guest code has no ambient access to the network, filesystem, credentials, clock, or process. It can request only the effects exposed by the ABI. The Host applies capability checks and bounds before it performs an effect.
 
 System events and API projections exclude parameters, outcomes, callout context, signatures, private state, program bytes, and keys. Receipt evidence contains public protocol facts, but receipt publication is a separate action.
 
@@ -223,9 +246,16 @@ execution. Unilateral stops produce distinct authenticated reports. Both are
 exported through `ReceiptArtifact` and addressed by a content-derived `ReceiptId`.
 The store owns local production and import provenance separately from the bytes.
 
-Light verification checks the activation, identities, trace chain, aggregate agreements, terminal evidence, and receipt identity without loading Wasm.
+Portable/light verification is the only verification boundary. It checks the
+activation, identities, v2 trace chain, aggregate agreements, terminal
+evidence, and v3 receipt identity without loading Wasm. A completed result
+contains authenticated opaque outcome bytes; a stopped result contains its
+exact stop cause. Verification never executes a second program pass.
 
-Full verification first performs light verification. It then loads the exact program and execution profile, repeats initialization and every public call, and compares state hashes, effects, fuel, randomness, and the terminal result.
+The current compatibility boundary is ABI 21, execution profile 2, `TraceEntry`
+format 2, the v3 `StepCommitment` domain, receipt artifact/body 3, the v3
+`ReceiptId` domain, and store schema 3. Decoders reject unsupported versions;
+these formats do not silently accept evidence from the removed execution path.
 
 A receipt proves what the selected Hosts agreed under one program. It does not prove an external payment, task completion, legal identity, or asset transfer.
 

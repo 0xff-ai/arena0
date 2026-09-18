@@ -9,8 +9,7 @@ use std::fmt::Write;
 
 use arena0::prelude::*;
 use arena0_primitives::commit_reveal::{
-    self, CommitReveal, CommitRevealLocal, CommitRevealLocalFieldExt, CommitRevealLocalState,
-    CommitRevealSharedFieldExt,
+    self, CommitReveal, CommitRevealFieldExt, CommitRevealLocal, CommitRevealLocalState,
 };
 use arena0_primitives::turn_manager::TurnManager;
 
@@ -90,6 +89,7 @@ impl CommitRevealLocalState<[u8; 32]> for Local {
 )]
 pub mod sequential_count {
     use super::*;
+    use arena0::ProgramTransition;
 
     type Shared = super::Shared;
     type Local = super::Local;
@@ -112,9 +112,7 @@ pub mod sequential_count {
         }
     }
 
-    fn view(ctx: &SharedContext, vp: &Viewport) -> View {
-        let state = ctx.shared();
-
+    fn view(state: &Shared, _ensemble: &Ensemble, vp: &Viewport) -> View {
         View::new()
             .header(vp.fit_text(format!(
                 "Sequential count - {} of {}",
@@ -172,7 +170,7 @@ pub mod sequential_count {
         }
     }
 
-    fn initialize(ctx: &mut SharedContext, params: Params) -> Result<(), ProgramFault> {
+    fn initialize(shared: &mut Shared, params: Params) -> Result<(), ProgramFault> {
         if params.target_size < 3 {
             return Err(anyhow!("sequential-count needs at least three participants").into());
         }
@@ -188,17 +186,15 @@ pub mod sequential_count {
         if params.count_to > MAX_COUNT {
             return Err(anyhow!("count_to must not exceed {MAX_COUNT}").into());
         }
-        ctx.mutate_shared(|state| {
-            state.target_size = params.target_size;
-            state.count_to = params.count_to;
-        });
+        shared.target_size = params.target_size;
+        shared.count_to = params.count_to;
         Ok(())
     }
 
     fn on_session_started(
-        ctx: &mut SharedContext,
+        ctx: &mut Context<Shared, Local>,
         ensemble: &Ensemble,
-    ) -> Result<Transition<Phase>, ProgramFault> {
+    ) -> Result<ProgramTransition<SequentialCount>, ProgramFault> {
         if ensemble.len() != ctx.shared().target_size as usize {
             return Err(anyhow!(
                 "expected {} participants, got {}",
@@ -207,23 +203,31 @@ pub mod sequential_count {
             )
             .into());
         }
-        let configured =
-            ctx.mutate_shared(|state| state.commit_reveal.set_participant_count(ensemble.len()));
+        let configured = ctx
+            .shared_mut()
+            .commit_reveal
+            .set_participant_count(ensemble.len());
         configured.map_err(|error| anyhow!(error))?;
         Ok(Transition::Stay)
     }
 
-    fn on_react(ctx: &mut Context) -> Result<(), ProgramFault> {
+    fn on_react(
+        ctx: &mut Context<Shared, Local>,
+    ) -> Result<ProgramTransition<SequentialCount>, ProgramFault> {
         match ctx.shared().phase() {
             Phase::Setup => {
                 // Unique-writer rule: react only when this node is the
                 // participant whose commit or reveal is next.
                 if ctx.shared().commit_reveal.expected_writer() != Some(ctx.me()) {
-                    return Ok(());
+                    return Ok(Transition::Stay);
                 }
                 if let Some(reveal) = ctx.commit_reveal().take_reveal() {
                     reveal.broadcast();
-                    return Ok(());
+                    if ctx.shared().commit_reveal.is_complete() {
+                        apply_order(ctx.shared_mut())?;
+                        return Ok(Transition::To(Phase::Counting));
+                    }
+                    return Ok(Transition::Stay);
                 }
                 if ctx.commit_reveal().needs_commit() {
                     let mut nonce = [0u8; 32];
@@ -242,19 +246,26 @@ pub mod sequential_count {
                     (next, is_my_turn)
                 };
                 if is_my_turn && ctx.local().last_sent != Some(next) {
+                    let me = ctx.me();
+                    let finished = apply_count(ctx.shared_mut(), me, next);
                     ctx.effects().broadcast(&Message::Count { value: next });
                     ctx.mutate_local(|state| state.last_sent = Some(next));
+                    return Ok(if finished {
+                        Transition::End
+                    } else {
+                        Transition::Stay
+                    });
                 }
             }
         }
-        Ok(())
+        Ok(Transition::Stay)
     }
 
     fn on_message(
-        ctx: &mut SharedContext,
+        ctx: &mut Context<Shared, Local>,
         from: Participant,
         message: Message,
-    ) -> Result<ApplyDecision<Phase>, ProtocolFault> {
+    ) -> MessageApply<SequentialCount> {
         match message {
             Message::CommitReveal(message) => {
                 if ctx.shared().phase() != Phase::Setup {
@@ -273,23 +284,7 @@ pub mod sequential_count {
                     return Ok(ApplyDecision::Accept(Transition::Stay));
                 }
 
-                let participant_count = ctx.shared().commit_reveal.participant_count();
-                let start = ctx
-                    .shared()
-                    .commit_reveal
-                    .random_range(participant_count as u64)
-                    .expect("completed commit-reveal has random bytes")
-                    as usize;
-                let order: Vec<Participant> = (0..participant_count)
-                    .map(|offset| {
-                        Participant::try_from((start + offset) % participant_count)
-                            .expect("commit-reveal participant count fits in u8")
-                    })
-                    .collect();
-                ctx.mutate_shared(|state| {
-                    state.order.clone_from(&order);
-                    state.turns = Some(TurnManager::new(order));
-                });
+                apply_order(ctx.shared_mut())?;
                 Ok(ApplyDecision::Accept(Transition::To(Phase::Counting)))
             }
             Message::Count { value } => {
@@ -310,16 +305,7 @@ pub mod sequential_count {
                     return Ok(ApplyDecision::Reject);
                 }
 
-                let finished = ctx.mutate_shared(|state| {
-                    state.count = value;
-                    state.history.push(from);
-                    state
-                        .turns
-                        .as_mut()
-                        .expect("turn order initialized")
-                        .advance();
-                    state.count == state.count_to
-                });
+                let finished = apply_count(ctx.shared_mut(), from, value);
                 if finished {
                     Ok(ApplyDecision::Accept(Transition::End))
                 } else {
@@ -329,7 +315,39 @@ pub mod sequential_count {
         }
     }
 
-    fn on_query(_ctx: &SharedContext, _: ()) {}
+    fn on_query(_shared: &Shared, _: ()) {}
+
+    /// Install the deterministic round-robin order selected by the completed
+    /// nonce exchange. Both the producer's reveal reaction and receivers call
+    /// this helper before entering the counting phase.
+    fn apply_order(state: &mut Shared) -> Result<(), arena0::anyhow::Error> {
+        let participant_count = state.commit_reveal.participant_count();
+        let start = state
+            .commit_reveal
+            .random_range(participant_count as u64)
+            .ok_or_else(|| anyhow!("completed commit-reveal has random bytes"))?
+            as usize;
+        let order: Vec<Participant> = (0..participant_count)
+            .map(|offset| {
+                Participant::try_from((start + offset) % participant_count)
+                    .expect("commit-reveal participant count fits in u8")
+            })
+            .collect();
+        state.order.clone_from(&order);
+        state.turns = Some(TurnManager::new(order));
+        Ok(())
+    }
+
+    fn apply_count(state: &mut Shared, from: Participant, value: u32) -> bool {
+        state.count = value;
+        state.history.push(from);
+        state
+            .turns
+            .as_mut()
+            .expect("turn order initialized")
+            .advance();
+        state.count == state.count_to
+    }
 }
 
 #[cfg(test)]
@@ -349,6 +367,11 @@ mod tests {
         }
     )]
     fn view_shows_the_current_program_state(h: ()) {
+        let ensemble =
+            Ensemble::from_peers(vec![PeerId([0; 32]), PeerId([1; 32]), PeerId([2; 32])])
+                .expect("valid sequential-count ensemble");
+        let started = h.session_started_with_ensemble(ensemble);
+        assert!(matches!(started.fault, arena0::testing::FaultStatus::None));
         let view = h.view(Viewport {
             width: 80,
             color: ColorDepth::Mono,

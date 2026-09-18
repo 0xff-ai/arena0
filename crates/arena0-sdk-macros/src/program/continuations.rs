@@ -39,20 +39,37 @@ pub(super) fn lower_async_module_handlers(
         if function.sig.asyncness.is_none() {
             continue;
         }
-        if matches!(
-            function.sig.ident.to_string().as_str(),
-            "initialize" | "on_session_started" | "on_message" | "on_query" | "view"
-        ) {
-            return Err(Error::new(
-                function.sig.ident.span(),
-                "async shared handlers are not supported; shared dispatch must be a synchronous function of shared state and its public event",
-            ));
-        }
-        if function.sig.ident == "on_input" {
-            return Err(Error::new(
-                function.sig.ident.span(),
-                "async on_input continuations are not lowered yet; use a synchronous on_input handler",
-            ));
+        match function.sig.ident.to_string().as_str() {
+            // These handlers do not return a ProgramTransition, so there is
+            // no continuation result shape for the generated resume path.
+            "initialize" | "on_query" | "view" => {
+                let handler = function.sig.ident.to_string();
+                return Err(Error::new(
+                    function.sig.ident.span(),
+                    format!(
+                        "async `{handler}` handlers are not supported by module-shell lowering; use a synchronous handler"
+                    ),
+                ));
+            }
+            // MessageApply carries the deterministic Accept/Reject decision.
+            // The current continuation dispatcher resumes through on_input,
+            // whose result is a ProgramTransition, so it cannot preserve that
+            // decision for an awaited message handler.
+            "on_message" => {
+                return Err(Error::new(
+                    function.sig.ident.span(),
+                    "async `on_message` handlers are not supported by module-shell lowering; use a synchronous handler so MessageApply can preserve Accept/Reject",
+                ));
+            }
+            // on_input is itself the continuation entry point. Lowering it
+            // would recursively replace the dispatcher that resumes awaits.
+            "on_input" => {
+                return Err(Error::new(
+                    function.sig.ident.span(),
+                    "async `on_input` continuations are not lowered yet; use a synchronous on_input handler",
+                ));
+            }
+            _ => {}
         }
         let index = continuations.len();
         continuations.extend(lower_async_module_handler(function, program_ident, index)?);
@@ -127,7 +144,7 @@ fn lower_async_module_handler(
                     #next_effect_expr
                         .__continuation_tag(__arena0_continuation.__tag())
                         .dispatch();
-                    Ok(())
+                    Ok(::arena0::Transition::Stay)
                 }
             } else {
                 quote! {
@@ -142,7 +159,10 @@ fn lower_async_module_handler(
                     <#program_ident as ::arena0::Program>::Local,
                 >,
                 #pat: #resume_arg_ty,
-            ) -> ::core::result::Result<(), #resume_fault_ty> {
+            ) -> ::core::result::Result<
+                ::arena0::ProgramTransition<#program_ident>,
+                #resume_fault_ty,
+            > {
                 #body
             }
         };
@@ -166,7 +186,7 @@ fn lower_async_module_handler(
         #first_effect_expr
             .__continuation_tag(__arena0_continuation.__tag())
             .dispatch();
-        Ok(())
+        Ok(::arena0::Transition::Stay)
     });
 
     Ok(continuations)
@@ -535,7 +555,7 @@ pub(super) fn inject_module_continuation_items(
         quote! {
             None => {
                 #(#recover_input_arms)*
-                Ok(())
+                Ok(::arena0::Transition::Stay)
             },
         }
     };
@@ -603,7 +623,7 @@ pub(super) fn inject_module_continuation_items(
     });
     let initialize_fallback = if module_has_fn(items, "__arena0_user_initialize") {
         quote! {
-            self::__arena0_user_initialize(ctx, params)
+            self::__arena0_user_initialize(shared, params)
         }
     } else {
         quote! {
@@ -612,7 +632,7 @@ pub(super) fn inject_module_continuation_items(
     };
     items.push(syn::parse_quote! {
         fn initialize(
-            ctx: &mut ::arena0::SharedContext<#shared_ty>,
+            shared: &mut #shared_ty,
             params: <#program_ident as ::arena0::Program>::Params,
         ) -> ::core::result::Result<(), ::arena0::ProgramFault> {
             let _ = &params;
@@ -623,7 +643,7 @@ pub(super) fn inject_module_continuation_items(
         fn on_input(
             ctx: &mut ::arena0::Context<#shared_ty, #local_ty>,
             input: <#program_ident as ::arena0::Program>::Input,
-        ) -> ::core::result::Result<(), ::arena0::InputFault> {
+        ) -> ::core::result::Result<::arena0::ProgramTransition<#program_ident>, ::arena0::InputFault> {
             use ::arena0::anyhow::anyhow;
 
             match __arena0_take_continuation(ctx) {
@@ -642,12 +662,12 @@ pub(super) fn inject_module_continuation_items(
         fn __arena0_on_signed(
             ctx: &mut ::arena0::Context<#shared_ty, #local_ty>,
             signature: ::std::vec::Vec<u8>,
-        ) -> ::core::result::Result<(), ::arena0::ProgramFault> {
+        ) -> ::core::result::Result<::arena0::ProgramTransition<#program_ident>, ::arena0::ProgramFault> {
             use ::arena0::anyhow::anyhow;
 
             match __arena0_take_continuation(ctx) {
                 #(#signed_arms)*
-                None => Ok(()),
+                None => Ok(::arena0::Transition::Stay),
                 Some(__other) => {
                     __arena0_set_continuation(ctx, __other);
                     Err(::arena0::ProgramFault(

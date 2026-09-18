@@ -26,7 +26,7 @@ use arena0_sandbox::{InitializeCall, Program, WasmtimeEngine};
 use arena0_store::{Store, StoreConfig, StoreHandle};
 use arena0_transport::Transport;
 use arena0_transport::local::LocalTransport;
-use arena0_verify::verify_full;
+use arena0_verify::verify_light;
 use tempfile::TempDir;
 use tokio::sync::Barrier;
 
@@ -51,7 +51,7 @@ pub enum ArenaProgress {
     SessionStarted,
     CertifiedStep { step: u64 },
     TerminalPublished,
-    ReceiptReplay { elapsed_us: u64, success: bool },
+    ReceiptVerified { elapsed_us: u64, success: bool },
 }
 
 /// A monotonic, participant-scoped point in an [`Arena`] run.
@@ -126,8 +126,8 @@ fn progress_summary(timeline: &[TimedProgress], participant_count: usize) -> Str
         let terminal = points.iter().find_map(|point| {
             matches!(&point.progress, ArenaProgress::TerminalPublished).then_some(point.elapsed_us)
         });
-        let replay = points.iter().find_map(|point| match &point.progress {
-            ArenaProgress::ReceiptReplay {
+        let verification = points.iter().find_map(|point| match &point.progress {
+            ArenaProgress::ReceiptVerified {
                 elapsed_us,
                 success,
             } => Some((*elapsed_us, *success)),
@@ -136,7 +136,7 @@ fn progress_summary(timeline: &[TimedProgress], participant_count: usize) -> Str
         let (last_step, last_step_at) = certified.last().copied().unzip();
         let _ = write!(
             summary,
-            "p{participant}[neg@{negotiation:?} start@{started:?} steps={count} last={last_step:?}@{last_step_at:?} terminal@{terminal:?} replay={replay:?}] ",
+            "p{participant}[neg@{negotiation:?} start@{started:?} steps={count} last={last_step:?}@{last_step_at:?} terminal@{terminal:?} verified={verification:?}] ",
             count = certified.len(),
         );
     }
@@ -231,7 +231,7 @@ impl Arena {
                 JsonBytes::try_new(creator_params.clone()).expect("valid creator params"),
             ))
             .expect("initialize program");
-        let initial_state = StateHash::of(initialized.shared.as_bytes());
+        let initial_state = StateHash::of_shared(&initialized.shared);
 
         // Every Host gets a real SQLite owner and a registry entry before the
         // negotiation driver is allowed to prepare activation evidence.
@@ -290,7 +290,7 @@ impl Arena {
         let negotiation_events =
             Arc::new(Mutex::new(Vec::<(EventSource, NegotiationEvent)>::new()));
         // Let every participant install its topic subscription before any
-        // drive emits the initial offer. LocalTransport has no replay for a
+        // drive emits the initial offer. LocalTransport has no duplicate delivery for a
         // fact published before a peer joins, so starting one drive ahead of
         // the rest can strand a participant in Gossiping indefinitely.
         let negotiation_barrier = Arc::new(Barrier::new(n));
@@ -422,7 +422,7 @@ impl Arena {
                                 .map_err(|error| error.to_string())?,
                         ))
                         .map_err(|error| error.to_string())?;
-                    Ok(StateHash::of(initialized.shared.as_bytes()))
+                    Ok(StateHash::of_shared(&initialized.shared))
                 });
                 let effects = NegotiationEffects {
                     prepare,
@@ -703,15 +703,14 @@ impl Run {
                             })
                             .unwrap_or_default();
                         format!(
-                            "lifecycle={:?} version={} step={} private={} reacted={:?} proposal_step={:?} shared_signatures={signatures:?} terminal_pending={} timers={}",
+                            "lifecycle={:?} version={} step={} event_position={} reacted={:?} proposal_step={:?} shared_signatures={signatures:?} terminal_pending={}",
                             state.lifecycle(),
                             state.version(),
-                            state.public().next_step(),
-                            state.private().next_record(),
-                            state.private().last_reaction_position(),
+                            state.agreed_step(),
+                            state.event_position(),
+                            state.last_reacted_step(),
                             state.pending_shared().map(|proposal| proposal.commitment().step),
                             state.terminal_pending(),
-                            state.active_timers().count(),
                         )
                     });
                     let trace = match loaded_state.as_ref() {
@@ -849,9 +848,9 @@ impl Run {
         self.receipt(i).encode().expect("encode receipt")
     }
 
-    /// Replay-verify every participant's complete durable receipt, returning
-    /// the verified outcomes in participant order.
-    pub fn verify_all(&self, wasm: &[u8]) -> Result<Vec<arena0_verify::VerifiedOutcome>, String> {
+    /// Verify every participant's complete durable receipt, returning the
+    /// authenticated proof evidence in participant order.
+    pub fn verify_all(&self) -> Result<Vec<arena0_verify::LightVerified>, String> {
         let jobs = (0..self.node_count())
             .map(|i| {
                 let receipt = self.participants[i]
@@ -865,13 +864,13 @@ impl Run {
             })
             .collect::<Result<Vec<_>, String>>()?;
         std::thread::scope(|scope| {
-            let mut replays = Vec::with_capacity(jobs.len());
+            let mut verifications = Vec::with_capacity(jobs.len());
             for (i, bytes, expected_session) in jobs {
                 let timeline = Arc::clone(&self.timeline);
                 let timeline_started = self.timeline_started;
-                replays.push(scope.spawn(move || {
-                    let replay_started = Instant::now();
-                    let result = verify_full(wasm, &bytes)
+                verifications.push(scope.spawn(move || {
+                    let verification_started = Instant::now();
+                    let result = verify_light(&bytes)
                         .map_err(|error| format!("node {i}: {error:?}"))
                         .and_then(|verified| {
                             if verified.session_id != expected_session {
@@ -882,26 +881,27 @@ impl Run {
                             }
                             Ok(verified)
                         });
-                    let replay_elapsed_us =
-                        u64::try_from(replay_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                    let verification_elapsed_us =
+                        u64::try_from(verification_started.elapsed().as_micros())
+                            .unwrap_or(u64::MAX);
                     record_progress(
                         &timeline,
                         timeline_started,
                         i,
-                        ArenaProgress::ReceiptReplay {
-                            elapsed_us: replay_elapsed_us,
+                        ArenaProgress::ReceiptVerified {
+                            elapsed_us: verification_elapsed_us,
                             success: result.is_ok(),
                         },
                     );
                     result
                 }));
             }
-            replays
+            verifications
                 .into_iter()
-                .map(|replay| {
-                    replay
+                .map(|verification| {
+                    verification
                         .join()
-                        .map_err(|_| "full-replay worker panicked".to_owned())?
+                        .map_err(|_| "receipt verification worker panicked".to_owned())?
                 })
                 .collect()
         })

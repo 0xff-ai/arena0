@@ -13,116 +13,120 @@ use super::{
     TerminalCertificate, ensure_payload,
 };
 
-/// Build the activation-bound N-of-N certificate for a shared proposal.
-pub(crate) fn make_step_certificate(
-    binding: &ExecutionBinding,
-    proposal: &SharedProposal,
-) -> Result<StepCertificate, ProtocolError> {
-    let participants = binding.participant_keys()?;
-    if proposal.signatures.len() != participants.len() {
-        return Err(ProtocolError::IncompleteProof {
-            actual: proposal.signatures.len(),
-            expected: participants.len(),
-        });
-    }
-
-    let mut signatures = Vec::with_capacity(participants.len());
-    let mut signer_set = crate::SignerSet::with_capacity(participants.len());
-    for (index, (participant, key)) in participants.iter().enumerate() {
-        let Some(signature) = proposal
-            .signatures
-            .iter()
-            .find(|signature| signature.participant == *participant)
-        else {
+impl StepCertificate {
+    /// Build an activation-bound N-of-N certificate for a shared proposal.
+    pub fn from_signatures(
+        binding: &ExecutionBinding,
+        proposal: &SharedProposal,
+    ) -> Result<Self, ProtocolError> {
+        let participants = binding.participant_keys()?;
+        if proposal.signatures.len() != participants.len() {
             return Err(ProtocolError::IncompleteProof {
                 actual: proposal.signatures.len(),
                 expected: participants.len(),
             });
-        };
-        let valid = key
-            .verify(
+        }
+
+        let mut signatures = Vec::with_capacity(participants.len());
+        let mut signer_set = crate::SignerSet::with_capacity(participants.len());
+        for (index, (participant, key)) in participants.iter().enumerate() {
+            let Some(signature) = proposal
+                .signatures
+                .iter()
+                .find(|signature| signature.participant == *participant)
+            else {
+                return Err(ProtocolError::IncompleteProof {
+                    actual: proposal.signatures.len(),
+                    expected: participants.len(),
+                });
+            };
+            let valid = key
+                .verify(
+                    &proposal.commitment.signing_bytes(),
+                    &signature.signature.sig,
+                )
+                .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
+            if !valid {
+                return Err(ProtocolError::InvalidStepSignature {
+                    participant: *participant,
+                    step: proposal.commitment.step,
+                });
+            }
+            signer_set.set(index);
+            signatures.push(signature.signature.sig);
+        }
+
+        let agreement = AggregateAttestation::from_signatures(signer_set, &signatures)
+            .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
+        agreement
+            .verify_signatures(
+                proposal.commitment.step,
                 &proposal.commitment.signing_bytes(),
-                &signature.signature.sig,
+                &participants.iter().map(|(_, key)| *key).collect::<Vec<_>>(),
             )
             .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
-        if !valid {
-            return Err(ProtocolError::InvalidStepSignature {
-                participant: *participant,
-                step: proposal.commitment.step,
-            });
-        }
-        signer_set.set(index);
-        signatures.push(signature.signature.sig);
+
+        Ok(Self {
+            commitment: proposal.commitment.clone(),
+            agreement,
+        })
     }
-
-    let agreement = AggregateAttestation::from_signatures(signer_set, &signatures)
-        .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
-    agreement
-        .verify_signatures(
-            proposal.commitment.step,
-            &proposal.commitment.signing_bytes(),
-            &participants.iter().map(|(_, key)| *key).collect::<Vec<_>>(),
-        )
-        .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
-
-    Ok(StepCertificate {
-        commitment: proposal.commitment.clone(),
-        agreement,
-    })
 }
 
-/// Build the activation-bound N-of-N certificate for a terminal commitment.
-pub(crate) fn make_terminal_certificate(
-    binding: &ExecutionBinding,
-    commitment: &TerminalCommitment,
-    signatures: &[ParticipantTerminalSignature],
-) -> Result<TerminalCertificate, ProtocolError> {
-    let participants = binding.participant_keys()?;
-    if signatures.len() != participants.len() {
-        return Err(ProtocolError::IncompleteProof {
-            actual: signatures.len(),
-            expected: participants.len(),
-        });
-    }
-
-    let mut collected = Vec::with_capacity(participants.len());
-    let mut signer_set = crate::SignerSet::with_capacity(participants.len());
-    for (index, (participant, key)) in participants.iter().enumerate() {
-        let Some(signature) = signatures
-            .iter()
-            .find(|signature| signature.participant == *participant)
-        else {
+impl TerminalCertificate {
+    /// Build an activation-bound N-of-N certificate for a terminal commitment.
+    pub fn from_signatures(
+        binding: &ExecutionBinding,
+        commitment: &TerminalCommitment,
+        signatures: &[ParticipantTerminalSignature],
+    ) -> Result<Self, ProtocolError> {
+        let participants = binding.participant_keys()?;
+        if signatures.len() != participants.len() {
             return Err(ProtocolError::IncompleteProof {
                 actual: signatures.len(),
                 expected: participants.len(),
             });
-        };
-        let valid = key
-            .verify(&commitment.signing_bytes(), &signature.signature)
-            .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
-        if !valid {
-            return Err(ProtocolError::InvalidTerminalSignature {
-                participant: *participant,
-            });
         }
-        signer_set.set(index);
-        collected.push(signature.signature);
+
+        let mut collected = Vec::with_capacity(participants.len());
+        let mut signer_set = crate::SignerSet::with_capacity(participants.len());
+        for (index, (participant, key)) in participants.iter().enumerate() {
+            let Some(signature) = signatures
+                .iter()
+                .find(|signature| signature.participant == *participant)
+            else {
+                return Err(ProtocolError::IncompleteProof {
+                    actual: signatures.len(),
+                    expected: participants.len(),
+                });
+            };
+            let valid = key
+                .verify(&commitment.signing_bytes(), &signature.signature)
+                .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
+            if !valid {
+                return Err(ProtocolError::InvalidTerminalSignature {
+                    participant: *participant,
+                });
+            }
+            signer_set.set(index);
+            collected.push(signature.signature);
+        }
+
+        let agreement = AggregateAttestation::from_signatures(signer_set, &collected)
+            .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
+        agreement
+            .verify_signatures(
+                commitment.final_step,
+                &commitment.signing_bytes(),
+                &participants.iter().map(|(_, key)| *key).collect::<Vec<_>>(),
+            )
+            .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
+
+        Ok(Self {
+            commitment: commitment.clone(),
+            agreement,
+        })
     }
-
-    let agreement = AggregateAttestation::from_signatures(signer_set, &collected)
-        .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
-    agreement
-        .verify_signatures(
-            commitment.final_step,
-            &commitment.signing_bytes(),
-            &participants.iter().map(|(_, key)| *key).collect::<Vec<_>>(),
-        )
-        .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
-
-    Ok(TerminalCertificate {
-        commitment: commitment.clone(),
-        agreement,
-    })
 }
 
 /// Bounded portable evidence assembled from authoritative activation and trace rows.
@@ -149,8 +153,8 @@ impl<'de> Deserialize<'de> for ReceiptBody {
     }
 }
 
-const RECEIPT_BODY_VERSION: u8 = 2;
-const RECEIPT_VERSION: u8 = 2;
+const RECEIPT_BODY_VERSION: u8 = 3;
+const RECEIPT_VERSION: u8 = 3;
 
 impl ReceiptBody {
     /// Assemble a receipt body from its portable proof fields.
@@ -305,7 +309,7 @@ impl ReceiptId {
             borsh::to_vec(body).map_err(|error| ProtocolError::Serialization(error.to_string()))?;
         ensure_payload("receipt body", bytes.len(), MAX_RECEIPT_BYTES)?;
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"arena0/receipt/v2");
+        hasher.update(b"arena0/receipt/v3");
         hasher.update(&[RECEIPT_VERSION]);
         hasher.update(&bytes);
         Ok(Self(*hasher.finalize().as_bytes()))

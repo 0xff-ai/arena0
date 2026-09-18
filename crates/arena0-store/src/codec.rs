@@ -7,17 +7,16 @@ pub(crate) enum EnvelopeKind {
     Activation = 1,
     PreparedActivation = 2,
     ExecutionState = 3,
-    ExecutionInput = 4,
-    SharedCommit = 5,
-    PrivateCommit = 6,
+    EventRecord = 4,
+    AgreedStep = 5,
+    Effects = 6,
     TerminalPublication = 7,
     Receipt = 8,
     InboundFrame = 9,
-    Effect = 10,
-    Timer = 11,
-    ExecutionSalt = 12,
-    Program = 13,
-    ExecutionAdmission = 14,
+    Timer = 10,
+    ExecutionSalt = 11,
+    Program = 12,
+    ExecutionAdmission = 13,
 }
 
 impl EnvelopeKind {
@@ -146,8 +145,13 @@ pub(crate) fn state_bytes(state: &ExecutionState) -> Result<Vec<u8>, StoreError>
     state.encode().map_err(StoreError::Protocol)
 }
 
-pub(crate) fn input_bytes(input: &ExecutionInput) -> Result<Vec<u8>, StoreError> {
-    input.encode().map_err(StoreError::Protocol)
+pub(crate) fn event_bytes(event: &Event<Vec<u8>>) -> Result<Vec<u8>, StoreError> {
+    borsh::to_vec(event).map_err(|error| StoreError::Corruption(format!("event encode: {error}")))
+}
+
+pub(crate) fn effects_bytes(effects: &[Effect]) -> Result<Vec<u8>, StoreError> {
+    borsh::to_vec(effects)
+        .map_err(|error| StoreError::Corruption(format!("effects encode: {error}")))
 }
 
 pub(crate) fn decode_execution_salt(encoded: &[u8]) -> Result<ExecutionSalt, StoreError> {
@@ -192,31 +196,17 @@ pub(crate) fn inbox_identity_digest(
     Ok(*blake3::hash(&identity).as_bytes())
 }
 
-pub(crate) fn occurrence_key_bytes(key: OccurrenceKey) -> Result<Vec<u8>, StoreError> {
-    borsh::to_vec(&key)
-        .map_err(|error| StoreError::Corruption(format!("occurrence key encode: {error}")))
-}
-
-pub(crate) fn decode_effect(encoded: &[u8]) -> Result<DurableEffect, StoreError> {
-    let payload = open_envelope(
-        EnvelopeKind::Effect,
-        encoded,
-        arena0_protocol::MAX_RECEIPT_BYTES,
-    )?;
-    decode_borsh(&payload, "outbox effect")
-}
-
 pub(crate) fn canonical_frame_shape(frame: &ExecFrame) -> Result<StoredFrame, StoreError> {
     let (tag, payload) = match frame {
         ExecFrame::Message {
             message_id,
             seq,
             prestate,
+            poststate,
             data,
-            witness,
         } => (
             0,
-            borsh::to_vec(&(*message_id, *seq, *prestate, data, *witness)),
+            borsh::to_vec(&(*message_id, *seq, *prestate, *poststate, data)),
         ),
         ExecFrame::StepSignature {
             commitment,
@@ -249,19 +239,19 @@ pub(crate) fn canonical_frame_shape(frame: &ExecFrame) -> Result<StoredFrame, St
 pub(crate) fn decode_stored_frame(stored: &StoredFrame) -> Result<ExecFrame, StoreError> {
     let frame = match stored.tag {
         0 => {
-            let (message_id, seq, prestate, data, witness): (
+            let (message_id, seq, prestate, poststate, data): (
                 MessageId,
                 u64,
                 StateHash,
+                StateHash,
                 Vec<u8>,
-                WitnessCommitment,
             ) = decode_borsh(&stored.payload, "inbox message frame")?;
             ExecFrame::Message {
                 message_id,
                 seq,
                 prestate,
+                poststate,
                 data,
-                witness,
             }
         }
         1 => {
@@ -312,16 +302,16 @@ pub(crate) fn canonical_frame(
             message_id,
             seq,
             prestate,
+            poststate,
             data,
-            witness,
         } => {
             let expected = MessageId::derive(
                 state.binding().session_id(),
                 frame.source,
                 *seq,
                 *prestate,
+                *poststate,
                 data,
-                *witness,
             );
             if expected != *message_id {
                 return Err(StoreError::UnauthenticatedSource(
@@ -416,6 +406,7 @@ pub(crate) fn parse_outbox_status(value: &str) -> Result<OutboxStatus, StoreErro
         "pending" => Ok(OutboxStatus::Pending),
         "leased" => Ok(OutboxStatus::Leased),
         "acknowledged" => Ok(OutboxStatus::Acknowledged),
+        "cancelled" => Ok(OutboxStatus::Cancelled),
         other => Err(StoreError::Corruption(format!(
             "unknown outbox status {other}"
         ))),

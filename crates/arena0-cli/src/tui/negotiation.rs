@@ -153,7 +153,7 @@ fn render_hosts(
             ),
             Cell::from(inspection.map_or_else(
                 || "-".to_owned(),
-                |inspection| format!("{}/{}", inspection.private.len(), inspection.private_total),
+                |inspection| format!("{}/{}", inspection.events.len(), inspection.events_total),
             )),
             Cell::from(receipt),
         ])
@@ -176,7 +176,7 @@ fn render_hosts(
     }
     let table = Table::new(rows, widths)
         .header(
-            Row::new(vec!["Host", "lifecycle", "step", "private", "receipt"])
+            Row::new(vec!["Host", "lifecycle", "step", "events", "receipt"])
                 .style(state.palette.emphasis()),
         )
         .row_highlight_style(state.palette.strong().add_modifier(Modifier::BOLD))
@@ -407,16 +407,15 @@ fn receipt_lines(lines: &mut Vec<Line<'static>>, state: &ScreenState, host: &Hos
         any = true;
         lines.push(Line::styled(
             format!(
-                "  peer_id              {}  verified  {}",
-                receipt.peer_id.fmt_short(),
-                receipt.tier
+                "  peer_id              {}  verified",
+                receipt.peer_id.fmt_short()
             ),
             state.palette.muted(),
         ));
     }
     if !any {
         lines.push(Line::styled(
-            "  no receipt replay observed",
+            "  no receipt verification observed",
             state.palette.muted(),
         ));
     }

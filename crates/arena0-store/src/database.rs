@@ -189,14 +189,111 @@ fn dispatch_command(database: &mut Database, command: Command) {
         Command::ListExecutions { limit, reply } => {
             let _ = reply.send(database.list_executions(limit));
         }
-        Command::ApplyInput {
+        Command::Activate {
             execution_id,
-            input,
-            inbox,
+            expected_version,
             now_ms,
             reply,
         } => {
-            let _ = reply.send(database.apply_input(execution_id, *input, inbox, now_ms));
+            let _ = reply.send(database.activate(execution_id, expected_version, now_ms));
+        }
+        Command::CommitDispatch {
+            execution_id,
+            expected_version,
+            event,
+            shared,
+            local,
+            effects,
+            terminal_outcome,
+            inbox_id,
+            timer_id,
+            pending_id,
+            now_ms,
+            reply,
+        } => {
+            let _ = reply.send(database.commit_dispatch(
+                execution_id,
+                expected_version,
+                *event,
+                shared,
+                local,
+                effects,
+                terminal_outcome,
+                inbox_id,
+                timer_id,
+                pending_id,
+                now_ms,
+            ));
+        }
+        Command::CommitStepSignature {
+            execution_id,
+            expected_version,
+            signature,
+            inbox_id,
+            now_ms,
+            reply,
+        } => {
+            let _ = reply.send(database.commit_step_signature(
+                execution_id,
+                expected_version,
+                signature,
+                inbox_id,
+                now_ms,
+            ));
+        }
+        Command::CommitTerminalSignature {
+            execution_id,
+            expected_version,
+            signature,
+            inbox_id,
+            now_ms,
+            reply,
+        } => {
+            let _ = reply.send(database.commit_terminal_signature(
+                execution_id,
+                expected_version,
+                signature,
+                inbox_id,
+                now_ms,
+            ));
+        }
+        Command::Stop {
+            execution_id,
+            expected_version,
+            occurrence,
+            inbox_id,
+            now_ms,
+            reply,
+        } => {
+            let _ = reply.send(database.stop_execution(
+                execution_id,
+                expected_version,
+                occurrence,
+                inbox_id,
+                now_ms,
+            ));
+        }
+        Command::InterruptTerminal {
+            execution_id,
+            expected_version,
+            reason,
+            now_ms,
+            reply,
+        } => {
+            let _ = reply.send(database.interrupt_terminal(
+                execution_id,
+                expected_version,
+                reason,
+                now_ms,
+            ));
+        }
+        Command::PublishTerminal {
+            execution_id,
+            expected_version,
+            now_ms,
+            reply,
+        } => {
+            let _ = reply.send(database.publish_terminal(execution_id, expected_version, now_ms));
         }
         Command::AcceptInbound {
             execution_id,
@@ -227,31 +324,13 @@ fn dispatch_command(database: &mut Database, command: Command) {
         } => {
             let _ = reply.send(database.read_trace(execution_id, from, to));
         }
-        Command::ReadPrivateSummaries {
+        Command::ReadEventSummaries {
             execution_id,
             from,
             limit,
             reply,
         } => {
-            let _ = reply.send(database.read_private_summaries(execution_id, from, limit));
-        }
-        Command::ApplyInbound {
-            execution_id,
-            inbox_id,
-            now_ms,
-            reply,
-        } => {
-            let _ = reply.send(database.apply_inbound(execution_id, inbox_id, now_ms));
-        }
-        Command::ApplyInboundMessage {
-            execution_id,
-            inbox_id,
-            delta,
-            now_ms,
-            reply,
-        } => {
-            let _ =
-                reply.send(database.apply_inbound_message(execution_id, inbox_id, *delta, now_ms));
+            let _ = reply.send(database.read_event_summaries(execution_id, from, limit));
         }
         Command::RejectInbound {
             execution_id,
@@ -267,6 +346,12 @@ fn dispatch_command(database: &mut Database, command: Command) {
             reply,
         } => {
             let _ = reply.send(database.lease_next_outbox(execution_id, now_ms));
+        }
+        Command::HasUnsettledFrames {
+            execution_id,
+            reply,
+        } => {
+            let _ = reply.send(database.has_unsettled_frames(execution_id));
         }
         Command::AcknowledgeOutbox {
             execution_id,
@@ -306,13 +391,6 @@ fn dispatch_command(database: &mut Database, command: Command) {
             reply,
         } => {
             let _ = reply.send(database.due_timers(execution_id, now_ms, limit));
-        }
-        Command::AssembleReceipt {
-            execution_id,
-            now_ms,
-            reply,
-        } => {
-            let _ = reply.send(database.assemble_receipt(execution_id, now_ms));
         }
         Command::ImportReceipt {
             receipt,
@@ -359,8 +437,8 @@ struct ExecutionIndexRow {
     local_checksum: Vec<u8>,
     version: i64,
     lifecycle: i64,
-    public_step: i64,
-    private_next_record: i64,
+    agreed_step: i64,
+    event_position: i64,
     producer: PeerId,
     session_id: SessionHash,
 }
@@ -557,7 +635,6 @@ impl Database {
         self.validate_activation_conflicts()?;
         self.validate_execution_salts()?;
         self.validate_programs()?;
-        self.validate_occurrences()?;
         self.validate_receipts()?;
         self.validate_outbox_rows()?;
         self.validate_inbox_rows()?;
@@ -618,12 +695,10 @@ mod tests {
         let state = execution_state(8);
         let state_size = state_bytes(&state).expect("state encoding").len();
         database.executions.insert(state.clone(), state_size);
-        let next = match arena0_protocol::execution::transition(&state, ExecutionInput::Activate)
-            .expect("activation transition")
-        {
-            TransitionOutcome::Commit(plan) => plan.next_state().clone(),
-            TransitionOutcome::AlreadyApplied => panic!("fresh execution must activate"),
-        };
+        // The rollback proof only needs a pending cache candidate. The
+        // protocol activation mutator is owned by the execution boundary and
+        // is exercised by the direct store API tests.
+        let next = state.clone();
 
         database.begin().expect("transaction");
         database

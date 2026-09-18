@@ -5,9 +5,7 @@
 use std::time::Duration;
 
 use arena0_crypto::NodeKeys;
-use arena0_protocol::{
-    ExecFrame, ExecId, MessageId, NegotiationId, PeerId, StateHash, WitnessCommitment,
-};
+use arena0_protocol::{Event, ExecFrame, ExecId, MessageId, NegotiationId, PeerId, StateHash};
 use arena0_tests::assert::wait_for_entry;
 use arena0_tests::fixtures::{
     complete_pending_shared, establish_live_session, ordering_program_wasm, provider,
@@ -29,14 +27,13 @@ fn message(
     prestate: StateHash,
     payload: u8,
 ) -> ExecFrame {
-    let witness = WitnessCommitment([0x22; 32]);
     let data = vec![payload];
     ExecFrame::Message {
-        message_id: MessageId::derive(session, source, seq, prestate, &data, witness),
+        message_id: MessageId::derive(session, source, seq, prestate, prestate, &data),
         seq,
         prestate,
         data,
-        witness,
+        poststate: prestate,
     }
 }
 
@@ -130,7 +127,7 @@ async fn ordered_message_passes_the_public_edge() {
     complete_pending_shared(&execution, &participants).await;
     let trace = wait_for_entry(&execution.store_handle, execution.exec_id, 1).await;
     let message = trace.iter().find_map(|entry| match &entry.event {
-        arena0_protocol::PublicEvent::MessageReceived { msg, .. } => msg.first().copied(),
+        Event::MessageReceived { msg, .. } => msg.first().copied(),
         _ => None,
     });
     assert_eq!(message, Some(7));

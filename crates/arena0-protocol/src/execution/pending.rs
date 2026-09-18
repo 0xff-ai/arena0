@@ -43,6 +43,30 @@ impl PendingId {
     }
 }
 
+/// Derive a continuation identity from the execution event position and the
+/// effect ordinal that created it. Event position is the only execution
+/// coordinate; there is no private record sequence.
+#[must_use]
+pub fn pending_id(
+    execution_id: crate::ExecId,
+    event_position: u64,
+    effect_index: u32,
+) -> PendingId {
+    let bytes = borsh::to_vec(&(
+        b"arena0/pending/v2",
+        execution_id,
+        event_position,
+        effect_index,
+    ))
+    .expect("pending id preimage is serializable");
+    let digest = blake3::hash(&bytes);
+    PendingId::new(u64::from_le_bytes(
+        digest.as_bytes()[..8]
+            .try_into()
+            .expect("digest prefix has eight bytes"),
+    ))
+}
+
 impl From<u64> for PendingId {
     fn from(value: u64) -> Self {
         Self::new(value)

@@ -85,8 +85,8 @@
 //! | --- | --- | --- |
 //! | Negotiation | Which stage is active, and have the scoped Hosts converged? | Which Host or participant is waiting, and what observed or durable evidence does it hold? |
 //! | Program | What does each scoped Host show now? | What did each Host's program-owned view show at each retained step? |
-//! | Public Trace | Which public transitions have the scoped Hosts observed? | Which Host observed each event, state edge, fuel charge, and agreement at a selected public step? |
-//! | WASM | Which shared and Host-private handlers have run? | Which public handler established each boundary, which private handlers ran afterward on each Host, and what effects did they return? |
+//! | Public Trace | Which public transitions have the scoped Hosts observed? | Which Host observed each event, state edge, and agreement at a selected public step? |
+//! | WASM | Which guest handlers have run? | Which event records and effects did each Host observe? |
 //! | System Events | What did the Hosts most recently report? | What did each Host observe in its own sequence, and what safe fields belong to the selected event? |
 //!
 //! Detail views use the widget that matches their data. Use a stateful table
@@ -108,15 +108,12 @@
 //!   the plain `Header`, `Agents`, `State`, and `StatusBar` slot names. Do not
 //!   interpret their contents as protocol state.
 //! - Public Trace is a table keyed by public step. Its inspector owns the
-//!   event, pre-state and post-state hashes, bounded message projection, fuel,
-//!   agreement, witness, and public effects.
-//! - WASM preserves the execution hierarchy. A private commit at public cursor
-//!   `N` ran after the public entries `0..N`, so render it beneath public step
-//!   `N - 1`; cursor zero is before the first public step. Private sequence is
-//!   Host-local and must not imply a global order between Hosts. Never invent
-//!   a public entry merely because a private cursor refers to its boundary.
-//!   Private summaries remain bounded pages; `<` and `>` load the selected
-//!   Host's adjacent page without exposing private payloads.
+//!   event, pre-state and post-state hashes, bounded message projection,
+//!   agreement, and optional terminal effect.
+//! - WASM shows the public trace beside each Host's bounded event-record page.
+//!   Event positions are Host-local and must not imply a global order between
+//!   Hosts. Each record exposes event/effect kinds and sizes, never payloads;
+//!   `<` and `>` load the selected Host's adjacent page.
 //! - System Events is a bounded, redacted event table keyed by Host boot and
 //!   local sequence. Wall-clock display order is not a global causal order,
 //!   and this stream is not a durable audit log.
@@ -130,11 +127,11 @@
 //! across unrelated views.
 //!
 //! Preserve the protocol's visibility rules in every projection and
-//! inspector. Private records expose event kinds, sizes, effects, and fuel,
-//! never payloads. Program Borsh values remain opaque. Public message decoding
+//! inspector. Event records expose event/effect kinds and sizes, never
+//! payloads. Program Borsh values remain opaque. Public message decoding
 //! is a bounded, best-effort diagnostic projection. It cannot affect execution
 //! or proof semantics. System events remain redacted. If an inspection response
-//! contains fewer private records than its total, show `visible X of Y`; do
+//! contains fewer event records than its total, show `visible X of Y`; do
 //! not render invented placeholder records.
 //!
 //! Shared helpers may own collapsed borders, table styling, scrollbars,
@@ -166,18 +163,16 @@ mod wasm;
 use crate::ui::TuiPalette;
 use anyhow::{Context, anyhow};
 use arena0_client::answer;
-#[cfg(test)]
-use arena0_client::api::PrivateCommitSummary;
 use arena0_client::api::{
-    ActivationInspection, EventData, EventFrame, ExecStatus, ExecutionInspection,
-    PrivateEffectKind, PrivateEventKind, SessionTerminal,
+    ActivationInspection, EffectKind, EventData, EventFrame, EventKind, ExecStatus,
+    ExecutionInspection, SessionTerminal,
 };
 use arena0_client::program::{BorshSchemaDocument, ProgramHash};
 #[cfg(test)]
 use arena0_client::protocol::TicketHash;
 use arena0_client::protocol::{
-    ExecId, ExecLifecycle, PeerId, PendingId, PublicEffect, PublicEvent, SessionHash, Slot,
-    TraceEntry, View,
+    Effect as TraceEffect, Event as TraceEvent, ExecId, ExecLifecycle, PeerId, PendingId,
+    SessionHash, Slot, TraceEntry, View,
 };
 use arena0_client::sanitize;
 use arena0_home::HostName;
@@ -204,7 +199,7 @@ const MIN_HEIGHT: u16 = 23;
 const MAX_SYSTEM_EVENTS: usize = 256;
 const MAX_VIEW_HISTORY: usize = 256;
 const MIN_OVERVIEW_HEIGHT: u16 = 11;
-pub(crate) const PRIVATE_INSPECTION_LIMIT: u16 = 256;
+pub(crate) const EVENT_INSPECTION_LIMIT: u16 = 256;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TuiConfig {
@@ -329,14 +324,10 @@ pub(crate) fn event_summary(event: &EventFrame) -> String {
         }
         EventData::SessionStep {
             step,
-            fuel_used,
             signers,
             participants,
             ..
-        } => format!(
-            "step {}  fuel {}  agreement {}/{}",
-            step, fuel_used, signers, participants
-        ),
+        } => format!("step {}  agreement {}/{}", step, signers, participants),
         EventData::SessionEnded { terminal } => match terminal {
             SessionTerminal::Completed { .. } => "completed".to_owned(),
             SessionTerminal::Aborted { step, reason } => format!("aborted at {}  {}", step, reason),
@@ -391,12 +382,10 @@ pub(crate) enum RunUpdate {
     ReceiptVerified {
         host: HostName,
         peer_id: PeerId,
-        tier: &'static str,
     },
     VerificationProgress {
         verified: usize,
         total: usize,
-        tier: &'static str,
     },
     Completed {
         outcome: Option<Value>,
@@ -530,11 +519,11 @@ pub(crate) enum MonitorAction {
 pub(crate) struct TuiHandle {
     updates: mpsc::Sender<RunUpdate>,
     width: watch::Receiver<u16>,
-    private_page: watch::Receiver<Option<PrivatePageRequest>>,
+    event_page: watch::Receiver<Option<EventPageRequest>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PrivatePageRequest {
+pub(crate) struct EventPageRequest {
     pub(crate) host: HostName,
     pub(crate) from: Option<u64>,
 }
@@ -556,16 +545,16 @@ impl TuiHandle {
     pub(crate) fn test_channel() -> (
         Self,
         mpsc::Receiver<RunUpdate>,
-        watch::Sender<Option<PrivatePageRequest>>,
+        watch::Sender<Option<EventPageRequest>>,
     ) {
         let (updates, receiver) = mpsc::channel(32);
         let (_, width) = watch::channel(80);
-        let (pages, private_page) = watch::channel(None);
+        let (pages, event_page) = watch::channel(None);
         (
             Self {
                 updates,
                 width,
-                private_page,
+                event_page,
             },
             receiver,
             pages,
@@ -607,11 +596,11 @@ impl TuiHandle {
         }
     }
 
-    pub(crate) async fn changed_private_page(&mut self) -> Option<PrivatePageRequest> {
-        if self.private_page.changed().await.is_err() {
+    pub(crate) async fn changed_event_page(&mut self) -> Option<EventPageRequest> {
+        if self.event_page.changed().await.is_err() {
             std::future::pending().await
         }
-        self.private_page.borrow().clone()
+        self.event_page.borrow().clone()
     }
 }
 
@@ -636,19 +625,14 @@ impl TuiSession {
     ) -> Self {
         let (updates, receiver) = mpsc::channel(UPDATE_CAPACITY);
         let (width, width_rx) = watch::channel(80);
-        let (private_page, private_page_rx) = watch::channel(None);
+        let (event_page, event_page_rx) = watch::channel(None);
         let handle = TuiHandle {
             updates,
             width: width_rx,
-            private_page: private_page_rx,
+            event_page: event_page_rx,
         };
         let task = tokio::spawn(run_screen(
-            config,
-            receiver,
-            width,
-            private_page,
-            cancel,
-            actions,
+            config, receiver, width, event_page, cancel, actions,
         ));
         Self {
             handle,
@@ -734,8 +718,7 @@ enum HostScope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CrossingKey {
     Public { step: u64 },
-    Boundary { after_position: u64 },
-    Private { host: HostName, sequence: u64 },
+    Event { host: HostName, event_position: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -859,12 +842,13 @@ struct TraceViewEntry {
 impl TraceViewEntry {
     fn new(entry: TraceEntry, schema: Result<&BorshSchemaDocument, &str>) -> Self {
         let message = match &entry.event {
-            PublicEvent::SessionStarted { .. } => None,
-            PublicEvent::MessageReceived { msg, .. } => Some(
+            TraceEvent::SessionStarted { .. } => None,
+            TraceEvent::MessageReceived { msg, .. } => Some(
                 schema
                     .map_err(str::to_owned)
                     .and_then(|schema| schema.decode_json(msg).map_err(|error| error.to_string())),
             ),
+            _ => None,
         };
         Self { entry, message }
     }
@@ -881,7 +865,6 @@ struct ViewSnapshot {
 struct ReceiptSnapshot {
     host: HostName,
     peer_id: PeerId,
-    tier: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1281,12 +1264,12 @@ struct ScreenState {
     system_events: Vec<EventFrame>,
     callouts: CalloutQueue,
     receipts: Vec<ReceiptSnapshot>,
-    verification_progress: Option<(usize, usize, &'static str)>,
+    verification_progress: Option<(usize, usize)>,
     outcome: Option<Value>,
     host_scope: HostScope,
     host_cursor: usize,
     selected_host: Option<HostName>,
-    selected_public_position: Option<u64>,
+    selected_step: Option<u64>,
     trace_cursor: usize,
     complete: bool,
     failure: Option<String>,
@@ -1301,7 +1284,7 @@ struct ScreenState {
     crossings_follow: FollowState,
     trace_follow: FollowState,
     events_follow: FollowState,
-    private_page_request: Option<PrivatePageRequest>,
+    event_page_request: Option<EventPageRequest>,
     monitor: Option<MonitorState>,
 }
 
@@ -1326,7 +1309,7 @@ impl ScreenState {
             host_scope: HostScope::All,
             host_cursor: 0,
             selected_host,
-            selected_public_position: None,
+            selected_step: None,
             trace_cursor: 0,
             complete: false,
             failure: None,
@@ -1341,7 +1324,7 @@ impl ScreenState {
             crossings_follow: FollowState::default(),
             trace_follow: FollowState::default(),
             events_follow: FollowState::default(),
-            private_page_request: None,
+            event_page_request: None,
             monitor: None,
         }
     }
@@ -1462,8 +1445,7 @@ impl ScreenState {
         let trace_cursor = monitor
             .trace_cursor
             .min(execution.trace.len().saturating_sub(1));
-        projected.selected_public_position =
-            execution.trace.get(trace_cursor).map(|entry| entry.step);
+        projected.selected_step = execution.trace.get(trace_cursor).map(|entry| entry.step);
         projected.trace_cursor = trace_cursor;
         projected.view_cursor = 0;
         projected.page.select(monitor.view);
@@ -1524,8 +1506,8 @@ impl ScreenState {
                 let previous_total = self
                     .inspections
                     .get(&host)
-                    .map_or(0, |current| current.private_total);
-                let added = inspection.private_total.saturating_sub(previous_total);
+                    .map_or(0, |current| current.events_total);
+                let added = inspection.events_total.saturating_sub(previous_total);
                 self.crossings_follow
                     .items_added(usize::try_from(added).unwrap_or(usize::MAX));
                 if !self
@@ -1573,8 +1555,8 @@ impl ScreenState {
                 if self.trace_cursor >= trace_len {
                     self.trace_cursor = trace_len.saturating_sub(1);
                 }
-                if self.selected_public_position.is_none() || self.trace_follow.offset == 0 {
-                    self.selected_public_position = last_step;
+                if self.selected_step.is_none() || self.trace_follow.offset == 0 {
+                    self.selected_step = last_step;
                     self.trace_cursor = trace_len.saturating_sub(1);
                 }
                 self.reconcile_crossing_selection();
@@ -1647,30 +1629,18 @@ impl ScreenState {
                     self.focus = Focus::Composer;
                 }
             }
-            RunUpdate::ReceiptVerified {
-                host,
-                peer_id,
-                tier,
-            } => {
-                if let Some(receipt) = self
+            RunUpdate::ReceiptVerified { host, peer_id } => {
+                if !self
                     .receipts
-                    .iter_mut()
-                    .find(|receipt| receipt.host == host && receipt.peer_id == peer_id)
+                    .iter()
+                    .any(|receipt| receipt.host == host && receipt.peer_id == peer_id)
                 {
-                    receipt.tier = tier;
-                } else {
-                    self.receipts.push(ReceiptSnapshot {
-                        host,
-                        peer_id,
-                        tier,
-                    });
+                    self.receipts.push(ReceiptSnapshot { host, peer_id });
                 }
             }
-            RunUpdate::VerificationProgress {
-                verified,
-                total,
-                tier,
-            } => self.verification_progress = Some((verified, total, tier)),
+            RunUpdate::VerificationProgress { verified, total } => {
+                self.verification_progress = Some((verified, total))
+            }
             RunUpdate::Completed { outcome } => {
                 self.complete = true;
                 self.outcome = outcome;
@@ -2175,13 +2145,13 @@ impl ScreenState {
             KeyCode::Char('<')
                 if !self.in_insert_mode() && self.page.view() == WorkspaceView::Wasm =>
             {
-                self.request_private_page(false);
+                self.request_event_page(false);
                 None
             }
             KeyCode::Char('>')
                 if !self.in_insert_mode() && self.page.view() == WorkspaceView::Wasm =>
             {
-                self.request_private_page(true);
+                self.request_event_page(true);
                 None
             }
             KeyCode::Char('a' | 'A') if !self.in_insert_mode() => {
@@ -2279,7 +2249,7 @@ impl ScreenState {
                     self.end_focused_scroll();
                 }
                 if self.focus == Focus::Workspace && self.page.view() == WorkspaceView::Wasm {
-                    self.request_private_tail();
+                    self.request_event_tail();
                 }
                 None
             }
@@ -2554,7 +2524,7 @@ impl ScreenState {
         self.selected_host = projected.selected_host;
         self.selected_event = projected.selected_event;
         self.selected_crossing = projected.selected_crossing;
-        self.selected_public_position = projected.selected_public_position;
+        self.selected_step = projected.selected_step;
         self.trace_cursor = projected.trace_cursor;
         self.crossings_follow = projected.crossings_follow;
         self.trace_follow = projected.trace_follow;
@@ -2626,7 +2596,7 @@ impl ScreenState {
         self.reconcile_scope_selection();
     }
 
-    fn request_private_page(&mut self, newer: bool) {
+    fn request_event_page(&mut self, newer: bool) {
         let Some(host) = self.primary_host().cloned() else {
             return;
         };
@@ -2634,28 +2604,28 @@ impl ScreenState {
             return;
         };
         let from = if newer {
-            if let Some(next) = inspection.private_next {
+            if let Some(next) = inspection.events_next {
                 Some(next)
-            } else if inspection.private_from > 0 {
+            } else if inspection.events_from > 0 {
                 None
             } else {
                 return;
             }
-        } else if inspection.private_from == 0 {
+        } else if inspection.events_from == 0 {
             return;
         } else {
             Some(
                 inspection
-                    .private_from
-                    .saturating_sub(u64::from(PRIVATE_INSPECTION_LIMIT)),
+                    .events_from
+                    .saturating_sub(u64::from(EVENT_INSPECTION_LIMIT)),
             )
         };
-        self.private_page_request = Some(PrivatePageRequest { host, from });
+        self.event_page_request = Some(EventPageRequest { host, from });
     }
 
-    fn request_private_tail(&mut self) {
+    fn request_event_tail(&mut self) {
         if let Some(host) = self.primary_host().cloned() {
-            self.private_page_request = Some(PrivatePageRequest { host, from: None });
+            self.event_page_request = Some(EventPageRequest { host, from: None });
         }
     }
 
@@ -2674,7 +2644,7 @@ impl ScreenState {
             .get(self.trace_cursor.min(trace_len.saturating_sub(1)))
             .copied();
         self.trace_cursor = self.trace_cursor.min(trace_len.saturating_sub(1));
-        self.selected_public_position = selected_step;
+        self.selected_step = selected_step;
         let event_keys = events::keys(self);
         if !self
             .selected_event
@@ -2687,7 +2657,7 @@ impl ScreenState {
     }
 
     fn select_public_step(&mut self, step: Option<u64>) {
-        self.selected_public_position = step;
+        self.selected_step = step;
         let Some(step) = step else {
             return;
         };
@@ -3035,7 +3005,7 @@ fn status_is_stale(current: &ExecStatus, incoming: &ExecStatus) -> bool {
 
 fn inspection_is_stale(current: &ExecutionInspection, incoming: &ExecutionInspection) -> bool {
     status_is_stale(&current.status, &incoming.status)
-        || incoming.private_total < current.private_total
+        || incoming.events_total < current.events_total
         || matches!(
             (&current.activation, &incoming.activation),
             (Some(_), None)
@@ -3067,7 +3037,7 @@ async fn run_screen(
     config: TuiConfig,
     mut updates: mpsc::Receiver<RunUpdate>,
     width: watch::Sender<u16>,
-    private_page: watch::Sender<Option<PrivatePageRequest>>,
+    event_page: watch::Sender<Option<EventPageRequest>>,
     cancel: watch::Sender<Option<String>>,
     monitor_actions: Option<mpsc::Sender<MonitorAction>>,
 ) -> anyhow::Result<UiExit> {
@@ -3075,7 +3045,7 @@ async fn run_screen(
         config,
         &mut updates,
         width,
-        private_page,
+        event_page,
         &cancel,
         monitor_actions,
     )
@@ -3090,7 +3060,7 @@ async fn run_screen_inner(
     config: TuiConfig,
     updates: &mut mpsc::Receiver<RunUpdate>,
     width: watch::Sender<u16>,
-    private_page: watch::Sender<Option<PrivatePageRequest>>,
+    event_page: watch::Sender<Option<EventPageRequest>>,
     cancel: &watch::Sender<Option<String>>,
     monitor_actions: Option<mpsc::Sender<MonitorAction>>,
 ) -> anyhow::Result<UiExit> {
@@ -3126,7 +3096,7 @@ async fn run_screen_inner(
                             }
                             return Ok(exit);
                         }
-                        publish_private_page(&mut state, &private_page);
+                        publish_event_page(&mut state, &event_page);
                     } else if let Event::Paste(text) = event {
                         state.on_paste(text);
                     }
@@ -3157,7 +3127,7 @@ async fn run_screen_inner(
                             }
                             return Ok(exit);
                         }
-                        publish_private_page(&mut state, &private_page);
+                        publish_event_page(&mut state, &event_page);
                     }
                     Event::Resize(_, _) => {}
                     Event::Paste(text) => state.on_paste(text),
@@ -3168,11 +3138,8 @@ async fn run_screen_inner(
     }
 }
 
-fn publish_private_page(
-    state: &mut ScreenState,
-    requests: &watch::Sender<Option<PrivatePageRequest>>,
-) {
-    if let Some(request) = state.private_page_request.take() {
+fn publish_event_page(state: &mut ScreenState, requests: &watch::Sender<Option<EventPageRequest>>) {
+    if let Some(request) = state.event_page_request.take() {
         requests.send_replace(Some(request));
     }
 }
@@ -3263,7 +3230,7 @@ fn render(frame: &mut Frame<'_>, state: &ScreenState) {
                     "Move rows / scroll; jump up or down",
                 ),
                 help_line(state, "h/l (program)", "Browse state history"),
-                help_line(state, "</> (Wasm)", "Load older or newer private records"),
+                help_line(state, "</> (Wasm)", "Load older or newer event records"),
                 help_line(state, "g/G  Home/End", "First / last position; follow tail"),
                 help_line(state, "Enter", "Open a pane, inspect a row, or submit"),
                 help_line(state, "Esc", "Return to Overview or close help"),
@@ -3964,19 +3931,18 @@ fn render_composer(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
         let (content, style) = if let Some(failure) = &state.failure {
             (format!("Failed    {failure}"), state.palette.error())
         } else if state.complete {
-            let evidence =
-                state
-                    .verification_progress
-                    .map_or_else(String::new, |(verified, total, tier)| {
-                        format!("    verified {verified}/{total} Host receipts ({tier})")
-                    });
+            let evidence = state
+                .verification_progress
+                .map_or_else(String::new, |(verified, total)| {
+                    format!("    verified {verified}/{total} Host receipts")
+                });
             (
                 format!("Run complete{evidence}    q to return"),
                 state.palette.success(),
             )
-        } else if let Some((verified, total, tier)) = state.verification_progress {
+        } else if let Some((verified, total)) = state.verification_progress {
             (
-                format!("Verified {verified}/{total} Host receipts ({tier})"),
+                format!("Verified {verified}/{total} Host receipts"),
                 state.palette.success(),
             )
         } else {

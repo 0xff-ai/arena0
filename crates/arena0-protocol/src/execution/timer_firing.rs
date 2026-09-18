@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use super::TimerId;
 /// A timer firing supplied by the timer adapter.  No clock is read by the
-/// reducer; the timer identity was already authenticated by storage.
+/// actor; the timer identity was already authenticated by storage.
 #[derive(
     BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq,
 )]

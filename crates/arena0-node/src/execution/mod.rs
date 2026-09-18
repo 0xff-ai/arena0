@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use arena0_sandbox::ProgramInstance;
 use arena0_transport::SendHandle;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -37,6 +38,11 @@ const MAX_CAS_RETRIES: usize = 8;
 /// command and observation handles created by `spawn_execution`.
 struct ExecutionActor {
     context: ActorContext,
+    /// The sole live Wasm instance for this execution.  The compiled
+    /// `LoadedProgram` stays in `ActorContext` and may be shared by other
+    /// actors, but this instance is execution-local and is only entered by
+    /// the serialized actor loop.
+    pub(super) instance: Option<ProgramInstance>,
     messages: mpsc::Sender<SessionMessage>,
     send_streams: HashMap<arena0_protocol::PeerId, SendHandle>,
     /// One remote effect may be waiting for the receiver's durable
@@ -48,6 +54,11 @@ struct ExecutionActor {
     /// handoff to its observer. A restart may intentionally deliver it again;
     /// the durable public boundary remains the source of truth.
     session_started_emitted: bool,
+    /// Whether this actor lifetime has delivered the durable terminal
+    /// publication and lifecycle observation. Recovery intentionally emits
+    /// them again for a new observer; ticker progress must not duplicate them
+    /// within one actor lifetime.
+    terminal_emitted: bool,
 }
 
 /// A leased remote outbox effect whose transport acknowledgement is being
@@ -58,9 +69,20 @@ struct ExecutionActor {
 /// recovery if the actor stops before the acknowledgement arrives.
 pub(super) struct InflightSend {
     pub(super) destination: arena0_protocol::PeerId,
-    pub(super) outbox_id: arena0_protocol::OutboxId,
+    pub(super) outbox_id: arena0_store::OutboxId,
     pub(super) lease_id: arena0_store::LeaseId,
     pub(super) task: Option<JoinHandle<Result<(), arena0_transport::TransportError>>>,
+}
+
+impl InflightSend {
+    pub(super) async fn wait(
+        &mut self,
+    ) -> Result<Result<(), arena0_transport::TransportError>, tokio::task::JoinError> {
+        self.task
+            .as_mut()
+            .expect("in-flight send task exists while selected")
+            .await
+    }
 }
 
 impl Drop for InflightSend {

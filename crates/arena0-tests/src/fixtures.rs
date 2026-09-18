@@ -108,7 +108,7 @@ pub fn activation_for(
 
 /// The collective signature over the activation data signed only by the given
 /// participant indices (for consensus-gate tests: a partial aggregate fails
-/// verification against the full ticket set).
+/// verification against the complete ticket set).
 pub fn partial_aggregate(
     cryptos: &[&NodeKeys],
     activation: &Activation,
@@ -182,7 +182,7 @@ pub async fn spawn_live_execution(
     let initialized = loaded
         .initialize(InitializeCall::new(params_json.clone()))
         .expect("initialize program");
-    let initial_state = StateHash::of(initialized.shared.as_bytes());
+    let initial_state = StateHash::of_shared(&initialized.shared);
     let activation = activation_for(
         &cryptos,
         negotiation_id,
@@ -483,9 +483,8 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
     };
     let metadata = definition.encode().expect("ordering metadata");
     let init = wat_data(&[0, 0, 0, 0, 0, 0, 0, 0]);
-    let shared = wat_data(&[0, 0, 0, 0, 0]);
-    let rejected_shared = wat_data(&[1, 0, 0, 0, 0]);
-    let local = wat_data(&[0, 0, 0, 0, 0]);
+    let accepted = wat_data(&[0]);
+    let rejected = wat_data(&[1]);
     let writer = wat_data(&[1, 1]);
     let outcome = wat_data(&[0, 0, 0, 0, 4, 0, 0, 0, b'n', b'u', b'l', b'l']);
     let query = wat_data(&[0, 0, 0, 0, 4, 0, 0, 0, b'n', b'u', b'l', b'l']);
@@ -496,12 +495,11 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
         (module
           (import "arena0" "broadcast" (func $broadcast (param i32 i32)))
           {stop_import}
-          (memory (export "memory") 2)
-          (global (export "arena0_abi_version") i32 (i32.const 20))
+          (memory (export "memory") 1)
+          (global (export "arena0_abi_version") i32 (i32.const 21))
           (data (i32.const 2048) "{init}")
-          (data (i32.const 4096) "{shared}")
-          (data (i32.const 5120) "{rejected_shared}")
-          (data (i32.const 6144) "{local}")
+          (data (i32.const 32768) "{accepted}")
+          (data (i32.const 32769) "{rejected}")
           (data (i32.const 8192) "{writer}")
           (data (i32.const 10240) "{outcome}")
           (data (i32.const 12288) "{query}")
@@ -519,11 +517,14 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
             i64.or)
           (func (export "arena0_alloc") (param i32) (result i32) i32.const 1024)
           (func (export "arena0_dealloc") (param i32 i32))
+          (func (export "arena0_prepare") (result i32)
+            i32.const 895
+            memory.grow
+            drop
+            i32.const 1)
           (func (export "arena0_initialize") (param i32 i32) (result i64)
             i32.const 2048 i32.const 8 call $pack)
-          {shared_export}
-          (func (export "arena0_local") (param i32 i32) (result i64)
-            i32.const 6144 i32.const 5 call $pack)
+          {dispatch_export}
           (func (export "arena0_writer") (param i32 i32) (result i64)
             i32.const 8192 i32.const 2 call $pack)
           (func (export "arena0_outcome") (param i32 i32) (result i64)
@@ -536,39 +537,58 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
             i32.const 16384 i32.const {metadata_len} call $pack))
         "#,
         init = init,
-        shared = shared,
-        rejected_shared = rejected_shared,
+        accepted = accepted,
+        rejected = rejected,
         stop_import = if matches!(behavior, OrderingBehavior::Fail) {
             r#"(import "arena0" "fail" (func $fail (param i32 i32)))"#
         } else {
             ""
         },
-        shared_export = if matches!(behavior, OrderingBehavior::Fail) {
-            r#"(func (export "arena0_shared") (param i32 i32) (result i64)
+        dispatch_export = if matches!(behavior, OrderingBehavior::Fail) {
+            r#"(func (export "arena0_dispatch") (param i32 i32) (result i64)
             i32.const 10248 i32.const 4 call $fail
-            i32.const 4096 i32.const 5 call $pack)"#
+            i32.const 32768 i32.const 1 call $pack)"#
         } else if matches!(behavior, OrderingBehavior::RejectMessage) {
-            r#"(func (export "arena0_shared") (param $input_ptr i32) (param i32) (result i64)
-            (local $shared_len i32)
+            r#"(func (export "arena0_dispatch") (param $input_ptr i32) (param i32) (result i64)
+            (local $session_len i32)
             local.get $input_ptr
-            i32.load
-            local.set $shared_len
-            local.get $input_ptr
-            i32.const 8
+            i32.const 32
             i32.add
-            local.get $shared_len
+            i32.load
+            local.set $session_len
+            local.get $input_ptr
+            i32.const 36
+            i32.add
+            local.get $session_len
+            i32.add
+            i32.const 4
             i32.add
             i32.load8_u
+            i32.const 1
+            i32.eq
             if (result i64)
-              i32.const 5120 i32.const 5 call $pack
+              local.get $input_ptr
+              i32.const 36
+              i32.add
+              local.get $session_len
+              i32.add
+              i32.const 109
+              i32.add
+              i32.load8_u
+              i32.const 1
+              i32.eq
+              if (result i64)
+                i32.const 32769 i32.const 1 call $pack
+              else
+                i32.const 32768 i32.const 1 call $pack
+              end
             else
-              i32.const 4096 i32.const 5 call $pack
+              i32.const 32768 i32.const 1 call $pack
             end)"#
         } else {
-            r#"(func (export "arena0_shared") (param i32 i32) (result i64)
-            i32.const 4096 i32.const 5 call $pack)"#
+            r#"(func (export "arena0_dispatch") (param i32 i32) (result i64)
+            i32.const 32768 i32.const 1 call $pack)"#
         },
-        local = local,
         writer = writer,
         outcome = outcome,
         query = query,
@@ -576,7 +596,13 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
         metadata_data = metadata_data,
         metadata_len = metadata.len(),
     );
-    append_metadata(&wat::parse_str(wat).expect("ordering Wasm"), &metadata)
+    let raw = wat::parse_str(wat).expect("ordering Wasm");
+    WasmtimeEngine::new()
+        .expect("sandbox engine")
+        .build_program(&raw)
+        .expect("finalize ordering Wasm")
+        .bytes()
+        .to_vec()
 }
 
 fn wat_data(bytes: &[u8]) -> String {
@@ -585,30 +611,4 @@ fn wat_data(bytes: &[u8]) -> String {
         .map(|byte| format!("\\{byte:02x}"))
         .collect::<Vec<_>>()
         .join("")
-}
-
-fn append_metadata(binary: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(2 + data.len());
-    push_leb128(&mut payload, b"arena0.metadata".len() as u64);
-    payload.extend_from_slice(b"arena0.metadata");
-    payload.extend_from_slice(data);
-    let mut out = binary.to_vec();
-    out.push(0);
-    push_leb128(&mut out, payload.len() as u64);
-    out.extend_from_slice(&payload);
-    out
-}
-
-fn push_leb128(out: &mut Vec<u8>, mut value: u64) {
-    loop {
-        let mut byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        out.push(byte);
-        if value == 0 {
-            return;
-        }
-    }
 }

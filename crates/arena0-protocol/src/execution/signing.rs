@@ -22,7 +22,7 @@ pub struct GuestSignData {
     session_id: SessionHash,
     program_hash: ProgramHash,
     execution_id: ExecId,
-    private_sequence: u64,
+    event_position: u64,
     effect_index: u32,
     scheme: SignScheme,
     payload: Vec<u8>,
@@ -35,7 +35,7 @@ impl BorshSerialize for GuestSignData {
         BorshSerialize::serialize(&self.session_id, writer)?;
         BorshSerialize::serialize(&self.program_hash, writer)?;
         BorshSerialize::serialize(&self.execution_id, writer)?;
-        BorshSerialize::serialize(&self.private_sequence, writer)?;
+        BorshSerialize::serialize(&self.event_position, writer)?;
         BorshSerialize::serialize(&self.effect_index, writer)?;
         BorshSerialize::serialize(&self.scheme, writer)?;
         let length = u32::try_from(self.payload.len())
@@ -53,7 +53,7 @@ impl BorshDeserialize for GuestSignData {
             session_id: crate::SessionHash::deserialize_reader(reader)?,
             program_hash: ProgramHash::deserialize_reader(reader)?,
             execution_id: crate::ExecId::deserialize_reader(reader)?,
-            private_sequence: u64::deserialize_reader(reader)?,
+            event_position: u64::deserialize_reader(reader)?,
             effect_index: u32::deserialize_reader(reader)?,
             scheme: SignScheme::deserialize_reader(reader)?,
             payload: read_bytes(reader, MAX_EFFECT_PAYLOAD_BYTES, "signing payload")?,
@@ -66,15 +66,15 @@ impl BorshDeserialize for GuestSignData {
 
 impl GuestSignData {
     /// Domain separation tag for guest-owned signing requests.
-    pub const DOMAIN: [u8; 24] = *b"arena0/guest-sign/v1\0\0\0\0";
+    pub const DOMAIN: [u8; 24] = *b"arena0/guest-sign/v2\0\0\0\0";
     /// Version of the guest signing request contract.
-    pub const VERSION: u16 = 1;
+    pub const VERSION: u16 = 2;
 
-    pub(crate) fn new(
+    pub fn new(
         session_id: SessionHash,
         program_hash: ProgramHash,
         execution_id: ExecId,
-        private_sequence: u64,
+        event_position: u64,
         effect_index: u32,
         scheme: SignScheme,
         payload: Vec<u8>,
@@ -85,7 +85,7 @@ impl GuestSignData {
             session_id,
             program_hash,
             execution_id,
-            private_sequence,
+            event_position,
             effect_index,
             scheme,
             payload,
@@ -112,10 +112,10 @@ impl GuestSignData {
         self.execution_id
     }
 
-    /// Return the private coordinate bound into the signing request.
+    /// Return the event position bound into the signing request.
     #[must_use]
-    pub const fn private_sequence(&self) -> u64 {
-        self.private_sequence
+    pub const fn event_position(&self) -> u64 {
+        self.event_position
     }
 
     /// Return the guest effect ordinal bound into the signing request.

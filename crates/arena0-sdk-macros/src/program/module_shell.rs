@@ -16,7 +16,7 @@ use super::continuations::{
 };
 use super::host_async::reject_disallowed_host_async_in_module;
 use super::trait_form::expand_arena0_program_with_inferred;
-use super::{rewrite_context_type, rewrite_shared_context_name, to_pascal_case};
+use super::{rewrite_context_type, to_pascal_case};
 
 #[allow(clippy::too_many_lines)]
 pub(super) fn expand_arena0_program_module(
@@ -56,7 +56,7 @@ pub(super) fn expand_arena0_program_module(
     if module_has_fn(items, "on_message") && !module_has_fn(items, "writer") {
         return Err(Error::new(
             module.span(),
-            "arena0::program modules with on_message must define writer(shared) -> Option<Participant>",
+            "arena0::program modules with on_message must define writer(shared) -> Option<Participant> for agreed messages",
         ));
     }
     let local_ty: Type = if continuations.is_empty() {
@@ -123,22 +123,36 @@ fn module_query_impl(items: &[Item], program_ident: &Ident) -> TokenStream2 {
     } else {
         quote! { () }
     };
-    let query_method = if module_has_fn(items, "on_query") {
-        quote! {
+    let query_method = match module_fn_typed_arg_count(items, "on_query") {
+        // A three-argument callback can inspect the committed participant set.
+        Some(3) => quote! {
             fn query(
-                ctx: &::arena0::SharedContext<Self::Shared>,
+                shared: &Self::Shared,
+                ensemble: &::arena0::Ensemble,
                 query: Self::Query,
             ) -> <Self::Query as ::arena0::Arena0Query>::Response {
-                self::on_query(ctx, query)
+                self::on_query(shared, ensemble, query)
             }
-        }
-    } else {
-        quote! {
+        },
+        // Keep the compact two-argument module callback for projections that
+        // only need state. The trait surface remains explicit about the
+        // session ensemble so callers that need it do not reconstruct it.
+        Some(2) => quote! {
             fn query(
-                _ctx: &::arena0::SharedContext<Self::Shared>,
+                shared: &Self::Shared,
+                _ensemble: &::arena0::Ensemble,
+                query: Self::Query,
+            ) -> <Self::Query as ::arena0::Arena0Query>::Response {
+                self::on_query(shared, query)
+            }
+        },
+        Some(_) | None => quote! {
+            fn query(
+                _shared: &Self::Shared,
+                _ensemble: &::arena0::Ensemble,
                 _query: Self::Query,
             ) -> <Self::Query as ::arena0::Arena0Query>::Response {}
-        }
+        },
     };
 
     quote! {
@@ -198,10 +212,10 @@ fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
     if module_has_fn(items, "initialize") {
         methods.push(quote! {
             fn initialize(
-                ctx: &mut ::arena0::SharedContext<Self::Shared>,
+                shared: &mut Self::Shared,
                 params: Self::Params,
             ) -> Result<(), ::arena0::ProgramFault> {
-                self::initialize(ctx, params)
+                self::initialize(shared, params)
             }
         });
     }
@@ -215,10 +229,11 @@ fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
     if module_has_fn(items, "view") {
         methods.push(quote! {
             fn view(
-                ctx: &::arena0::SharedContext<Self::Shared>,
+                shared: &Self::Shared,
+                ensemble: &::arena0::Ensemble,
                 viewport: &::arena0::Viewport,
             ) -> ::arena0::View {
-                self::view(ctx, viewport)
+                self::view(shared, ensemble, viewport)
             }
         });
     }
@@ -237,7 +252,7 @@ fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
         };
         methods.push(quote! {
             fn on_session_started(
-                ctx: &mut ::arena0::SharedContext<Self::Shared>,
+                ctx: &mut ::arena0::Context<Self::Shared, Self::Local>,
                 #ensemble_binding: &::arena0::Ensemble,
             ) -> Result<::arena0::ProgramTransition<Self>, ::arena0::ProgramFault> {
                 #call
@@ -248,7 +263,7 @@ fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
         methods.push(quote! {
             fn on_react(
                 ctx: &mut ::arena0::Context<Self::Shared, Self::Local>,
-            ) -> Result<(), ::arena0::ProgramFault> {
+            ) -> Result<::arena0::ProgramTransition<Self>, ::arena0::ProgramFault> {
                 self::on_react(ctx)
             }
         });
@@ -269,7 +284,7 @@ fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
     if module_has_fn(items, "on_message") {
         methods.push(quote! {
             fn on_message(
-                ctx: &mut ::arena0::SharedContext<Self::Shared>,
+                ctx: &mut ::arena0::Context<Self::Shared, Self::Local>,
                 from: ::arena0::Participant,
                 msg: Self::Message,
             ) -> ::arena0::MessageApply<Self> {
@@ -282,7 +297,7 @@ fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
             fn on_input(
                 ctx: &mut ::arena0::Context<Self::Shared, Self::Local>,
                 input: Self::Input,
-            ) -> Result<(), ::arena0::InputFault> {
+            ) -> Result<::arena0::ProgramTransition<Self>, ::arena0::InputFault> {
                 self::on_input(ctx, input)
             }
         });
@@ -293,7 +308,7 @@ fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
             fn __arena0_on_signed(
                 ctx: &mut ::arena0::Context<Self::Shared, Self::Local>,
                 signature: ::std::vec::Vec<u8>,
-            ) -> Result<(), ::arena0::ProgramFault> {
+            ) -> Result<::arena0::ProgramTransition<Self>, ::arena0::ProgramFault> {
                 self::__arena0_on_signed(ctx, signature)
             }
         });
@@ -315,7 +330,7 @@ fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
             fn __arena0_on_typed_timer(
                 ctx: &mut ::arena0::Context<Self::Shared, Self::Local>,
                 timer: ::arena0::TimerPayload,
-            ) -> Result<(), ::arena0::ProgramFault> {
+            ) -> Result<::arena0::ProgramTransition<Self>, ::arena0::ProgramFault> {
                 let timer: #timer_ty = ::arena0::decode_timer_payload(timer)?;
                 self::on_timer(ctx, timer)
             }
@@ -324,7 +339,7 @@ fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
         methods.push(quote! {
             fn on_timer(
                 ctx: &mut ::arena0::Context<Self::Shared, Self::Local>,
-            ) -> Result<(), ::arena0::ProgramFault> {
+            ) -> Result<::arena0::ProgramTransition<Self>, ::arena0::ProgramFault> {
                 self::on_timer(ctx)
             }
         });
@@ -387,15 +402,8 @@ fn rewrite_bare_context_in_module(items: &mut [Item], shared_ty: &Type, local_ty
 }
 
 fn rewrite_bare_context_in_fn(function: &mut ItemFn, shared_ty: &Type, local_ty: &Type) {
-    let shared_handler = matches!(
-        function.sig.ident.to_string().as_str(),
-        "initialize" | "on_session_started" | "on_message" | "on_query" | "view"
-    );
     for arg in &mut function.sig.inputs {
         if let syn::FnArg::Typed(pat_type) = arg {
-            if shared_handler {
-                rewrite_shared_context_name(&mut pat_type.ty);
-            }
             rewrite_context_type(&mut pat_type.ty, shared_ty, local_ty);
         }
     }

@@ -41,7 +41,8 @@ wasmtime = { version = "46.0.3", default-features = false, features = [
     "runtime",
     "std",
 ] }
-wasmparser = "0.221"
+wasm-encoder = { version = "0.251", features = ["wasmparser"] }
+wasmparser = "0.251"
 wat = "1.221"
 moka = { version = "0.12", default-features = false, features = ["sync"] }
 

@@ -391,15 +391,15 @@ fn render_overview_trace(frame: &mut Frame<'_>, state: &ScreenState, area: Rect,
             let (_, projected) = observed.first()?;
             let entry = &projected.entry;
             let event = match &entry.event {
-                PublicEvent::SessionStarted { .. } => "session started".to_owned(),
-                PublicEvent::MessageReceived { from, .. } => {
+                TraceEvent::SessionStarted { .. } => "session started".to_owned(),
+                TraceEvent::MessageReceived { from, .. } => {
                     format!("message from {}", from.fmt_short())
                 }
+                _ => "non-public event".to_owned(),
             };
             let equal = observed.iter().skip(1).all(|(_, other)| {
                 other.entry.pre_state == entry.pre_state
                     && other.entry.post_state == entry.post_state
-                    && other.entry.fuel_used == entry.fuel_used
                     && other.entry.agreement.signers.count() == entry.agreement.signers.count()
             });
             let result = if observed.len() != hosts.len() {
@@ -409,7 +409,7 @@ fn render_overview_trace(frame: &mut Frame<'_>, state: &ScreenState, area: Rect,
             } else {
                 "DIFFERENT"
             };
-            let selected = state.selected_public_position == Some(entry.step);
+            let selected = state.selected_step == Some(entry.step);
             Some(
                 Row::new([
                     Cell::from(format!("#{:03}", entry.step)).style(state.palette.public()),
@@ -465,17 +465,17 @@ fn render_overview_wasm(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, 
         .iter()
         .filter(|(host, _)| state.host_is_visible(host))
         .map(|(_, inspection)| inspection)
-        .map(|inspection| inspection.private.len())
+        .map(|inspection| inspection.events.len())
         .sum::<usize>();
     let total = state
         .inspections
         .iter()
         .filter(|(host, _)| state.host_is_visible(host))
         .map(|(_, inspection)| inspection)
-        .map(|inspection| inspection.private_total)
+        .map(|inspection| inspection.events_total)
         .sum::<u64>();
     let hosts = state.scoped_host_names();
-    let step = state.selected_public_position.or_else(|| {
+    let step = state.selected_step.or_else(|| {
         hosts
             .iter()
             .filter_map(|host| state.host_trace(host).last().map(|entry| entry.entry.step))
@@ -490,10 +490,11 @@ fn render_overview_wasm(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, 
             .map_or_else(
                 || "handler observation unavailable".to_owned(),
                 |entry| match &entry.entry.event {
-                    PublicEvent::SessionStarted { .. } => "session started".to_owned(),
-                    PublicEvent::MessageReceived { from, .. } => {
+                    TraceEvent::SessionStarted { .. } => "session started".to_owned(),
+                    TraceEvent::MessageReceived { from, .. } => {
                         format!("message from {}", from.fmt_short())
                     }
+                    _ => "non-public event".to_owned(),
                 },
             );
         lines.push(Line::from(vec![
@@ -508,23 +509,23 @@ fn render_overview_wasm(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, 
             };
             let record = state.inspections.get(host).and_then(|inspection| {
                 inspection
-                    .private
+                    .events
                     .iter()
                     .rev()
-                    .find(|record| record.public_position == step.saturating_add(1))
+                    .find(|record| record.agreed_steps.contains(&step))
             });
             lines.push(match record {
                 Some(record) => Line::from(vec![
-                    Span::styled(format!(" {branch} (priv) "), state.palette.emphasis()),
+                    Span::styled(format!(" {branch} (event) "), state.palette.emphasis()),
                     Span::raw(format!(
                         "{host} #{} {}",
-                        record.sequence,
-                        wasm::private_event_name(record.event)
+                        record.event_position,
+                        wasm::event_name(record.event)
                     )),
                 ]),
                 None => Line::from(vec![
                     Span::styled(format!(" {branch} "), state.palette.muted()),
-                    Span::raw(format!("{host}  no private handler observed")),
+                    Span::raw(format!("{host}  no event observed")),
                 ]),
             });
         }
@@ -539,7 +540,7 @@ fn render_overview_wasm(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, 
         state,
         area,
         focused,
-        format!("Wasm  private visible {shown} of {total}"),
+        format!("Wasm  event visible {shown} of {total}"),
         lines,
     );
 }

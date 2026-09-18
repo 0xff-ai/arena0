@@ -5,12 +5,14 @@ use arena0_wire::{
     ABORT_KIND_ABORT, ABORT_KIND_FAIL, ExecFrame as WireExecFrame, MAX_EXEC_MESSAGE_BYTES,
     MAX_EXEC_REASON_BYTES, MessageIdBytes, PeerIdBytes, SessionHashBytes, StateHashBytes,
     WireAbortCoordinate, WireAbortOccurrence, WireError, WireStepCommitment,
-    WireTerminalCommitment, WitnessCommitmentBytes,
+    WireTerminalCommitment,
 };
+use borsh::{BorshDeserialize, BorshSerialize};
+use std::io;
 use thiserror::Error;
 
 use crate::trace::{StepCommitment, TerminalCommitment};
-use crate::{AbortKind, AbortOccurrence, MessageId, SessionHash, StateHash, WitnessCommitment};
+use crate::{AbortKind, AbortOccurrence, MessageId, SessionHash, StateHash};
 
 /// A validated execution fact used by protocol machinery.
 ///
@@ -19,18 +21,18 @@ use crate::{AbortKind, AbortOccurrence, MessageId, SessionHash, StateHash, Witne
 /// complete commitment, or one authenticated abort occurrence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecFrame {
-    /// Broadcast one program payload at a public trace position.
+    /// Broadcast one program payload at an agreed trace position.
     Message {
         /// Content identity of the message envelope.
         message_id: MessageId,
-        /// Public trace position.
+        /// Agreed trace position.
         seq: u64,
         /// Shared state hash before applying the message.
         prestate: StateHash,
         /// Opaque guest payload.
         data: Vec<u8>,
-        /// Content commitment for private witness evidence.
-        witness: WitnessCommitment,
+        /// Shared state hash after applying the message.
+        poststate: StateHash,
     },
     /// One participant's signature over one exact shared-state commitment.
     StepSignature {
@@ -76,16 +78,16 @@ impl TryFrom<WireExecFrame> for ExecFrame {
                 message_id,
                 seq,
                 prestate,
+                poststate,
                 data,
-                witness,
             } => {
                 check_data_len(data.len())?;
                 Self::Message {
                     message_id: MessageId(message_id.0),
                     seq,
                     prestate: StateHash(prestate.0),
+                    poststate: StateHash(poststate.0),
                     data,
-                    witness: WitnessCommitment(witness.0),
                 }
             }
             WireExecFrame::StepSignature {
@@ -119,16 +121,16 @@ impl TryFrom<&ExecFrame> for WireExecFrame {
                 message_id,
                 seq,
                 prestate,
+                poststate,
                 data,
-                witness,
             } => {
                 check_data_len(data.len())?;
                 Self::Message {
                     message_id: MessageIdBytes(message_id.0),
                     seq: *seq,
                     prestate: StateHashBytes(prestate.0),
+                    poststate: StateHashBytes(poststate.0),
                     data: data.clone(),
-                    witness: WitnessCommitmentBytes(witness.0),
                 }
             }
             ExecFrame::StepSignature {
@@ -157,6 +159,22 @@ impl TryFrom<ExecFrame> for WireExecFrame {
 
     fn try_from(frame: ExecFrame) -> Result<Self, Self::Error> {
         Self::try_from(&frame)
+    }
+}
+
+impl BorshSerialize for ExecFrame {
+    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
+        let wire = WireExecFrame::try_from(self)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        BorshSerialize::serialize(&wire, writer)
+    }
+}
+
+impl BorshDeserialize for ExecFrame {
+    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
+        let wire = WireExecFrame::deserialize_reader(reader)?;
+        Self::try_from(wire)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
     }
 }
 
@@ -244,7 +262,7 @@ fn abort_from_wire(raw: WireAbortOccurrence) -> Result<AbortOccurrence, ExecFram
     };
     let reason = String::from_utf8(raw.reason)
         .map_err(|error| ExecFrameError::Abort(format!("abort reason is not UTF-8: {error}")))?;
-    let coordinate = crate::PublicCursor::new(
+    let coordinate = crate::StepCursor::new(
         raw.coordinate.next_step,
         StateHash(raw.coordinate.state_hash.0),
         raw.coordinate.chain_hash,
@@ -306,4 +324,99 @@ fn check_reason_len(reason: Option<&str>) -> Result<(), ExecFrameError> {
         .into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arena0_crypto::Ed25519Signature;
+
+    fn message_frame() -> ExecFrame {
+        ExecFrame::Message {
+            message_id: MessageId([1; 32]),
+            seq: 7,
+            prestate: StateHash([2; 32]),
+            data: vec![3, 4, 5],
+            poststate: StateHash([6; 32]),
+        }
+    }
+
+    fn step_signature_frame() -> ExecFrame {
+        ExecFrame::StepSignature {
+            commitment: StepCommitment {
+                domain: crate::STEP_COMMIT_DOMAIN,
+                session_id: SessionHash([1; 32]),
+                step: 8,
+                entry_hash: [2; 32],
+                pre_state: StateHash([3; 32]),
+                post_state: StateHash([4; 32]),
+                link: [5; 32],
+            },
+            signature: BlsSignature([6; 48]),
+        }
+    }
+
+    fn end_frame() -> ExecFrame {
+        ExecFrame::End {
+            commitment: TerminalCommitment {
+                domain: crate::TERMINAL_DOMAIN,
+                session_id: SessionHash([1; 32]),
+                final_step: 9,
+                final_state: StateHash([2; 32]),
+                outcome_hash: crate::OutcomeHash([3; 32]),
+            },
+            signature: BlsSignature([4; 48]),
+        }
+    }
+
+    fn abort_frame() -> ExecFrame {
+        let occurrence = AbortOccurrence::new(
+            SessionHash([1; 32]),
+            crate::PeerId([2; 32]),
+            AbortKind::Abort,
+            3,
+            "reason",
+            crate::StepCursor::new(0, StateHash([4; 32]), crate::CHAIN_START),
+            Ed25519Signature([5; 64]),
+        )
+        .expect("test abort occurrence has a valid shape");
+        ExecFrame::Abort { occurrence }
+    }
+
+    fn assert_roundtrip(frame: ExecFrame) {
+        let protocol_bytes = borsh::to_vec(&frame).expect("protocol frame serializes");
+        let wire = WireExecFrame::try_from(&frame).expect("frame converts to wire");
+        let wire_bytes = borsh::to_vec(&wire).expect("wire frame serializes");
+        assert_eq!(protocol_bytes, wire_bytes);
+        assert_eq!(
+            borsh::from_slice::<ExecFrame>(&protocol_bytes).expect("protocol frame decodes"),
+            frame
+        );
+    }
+
+    #[test]
+    fn borsh_roundtrips_every_execution_frame_variant_using_wire_encoding() {
+        for frame in [
+            message_frame(),
+            step_signature_frame(),
+            end_frame(),
+            abort_frame(),
+        ] {
+            assert_roundtrip(frame);
+        }
+    }
+
+    #[test]
+    fn borsh_decode_rejects_oversized_message_before_allocating() {
+        let mut bytes = vec![arena0_wire::EXEC_KIND_MESSAGE];
+        bytes.extend_from_slice(&[0; 32]);
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&[0; 32]);
+        bytes.extend_from_slice(&[0; 32]);
+        bytes.extend_from_slice(&(MAX_EXEC_MESSAGE_BYTES as u32 + 1).to_le_bytes());
+
+        let error = borsh::from_slice::<ExecFrame>(&bytes).expect_err("oversized data is invalid");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
 }

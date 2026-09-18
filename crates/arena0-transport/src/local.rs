@@ -976,8 +976,7 @@ mod tests {
     use super::*;
     use arena0_crypto::{NodeKeys, SecretKey};
     use arena0_protocol::{
-        AbortKind, AbortOccurrence, ExecFrame, MessageId, PublicCursor, StateHash,
-        WitnessCommitment,
+        AbortKind, AbortOccurrence, ExecFrame, MessageId, StateHash, StepCursor,
     };
     use tokio::time::{Duration, timeout};
 
@@ -999,7 +998,7 @@ mod tests {
             seq: u64::from(byte),
             prestate: StateHash([byte.wrapping_add(1); 32]),
             data: vec![byte.wrapping_add(2)],
-            witness: WitnessCommitment([byte.wrapping_add(3); 32]),
+            poststate: StateHash([byte.wrapping_add(3); 32]),
         }
     }
 
@@ -1011,7 +1010,7 @@ mod tests {
             AbortKind::Abort,
             1,
             "test abort",
-            PublicCursor::new(0, StateHash([0; 32]), arena0_protocol::CHAIN_START),
+            StepCursor::new(0, StateHash([0; 32]), arena0_protocol::CHAIN_START),
         )
         .expect("abort occurrence");
         let signature = keys.sign(&unsigned.signing_bytes().expect("abort signing bytes"));

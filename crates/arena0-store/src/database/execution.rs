@@ -74,12 +74,11 @@ impl Database {
         state: &ExecutionState,
         now_ms: u64,
     ) -> Result<(), StoreError> {
-        let state_bytes = state_bytes(state)?;
-        let local = state.local_state().as_bytes();
+        let bytes = state_bytes(state)?;
         self.connection.execute(
             "INSERT INTO executions
              (execution_id, host_id, producer, session_id, state,
-              local_state_checksum, version, lifecycle, public_step, private_next_record,
+              local_state_checksum, version, lifecycle, agreed_step, event_position,
               created_at_ms, updated_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
             params![
@@ -87,12 +86,12 @@ impl Database {
                 self.host_id.0.to_vec(),
                 state.producer().0.to_vec(),
                 state.binding().session_id().0.to_vec(),
-                envelope(EnvelopeKind::ExecutionState, &state_bytes)?,
-                checksum(local).to_vec(),
+                envelope(EnvelopeKind::ExecutionState, &bytes)?,
+                checksum(state.local_state().as_bytes()).to_vec(),
                 sqlite_u64(state.version().get())?,
                 lifecycle_tag(state.lifecycle()),
-                sqlite_u64(state.public().next_step())?,
-                sqlite_u64(state.private().next_record())?,
+                sqlite_u64(state.agreed_step())?,
+                sqlite_u64(state.event_position())?,
                 sqlite_u64(now_ms)?,
             ],
         )?;
@@ -110,7 +109,7 @@ impl Database {
         &mut self,
         session_id: SessionHash,
     ) -> Result<Option<ExecutionState>, StoreError> {
-        let Some(execution_bytes) = self
+        let Some(bytes) = self
             .connection
             .query_row(
                 "SELECT execution_id FROM executions WHERE session_id = ?1",
@@ -121,7 +120,7 @@ impl Database {
         else {
             return Ok(None);
         };
-        self.load_execution(ExecId(array32(&execution_bytes, "execution id")?))
+        self.load_execution(ExecId(array32(&bytes, "execution id")?))
     }
 
     pub(super) fn list_activations(
@@ -214,8 +213,8 @@ impl Database {
             .connection
             .query_row(
                 "SELECT host_id, producer, session_id, state,
-                        local_state_checksum, version, lifecycle, public_step,
-                        private_next_record
+                        local_state_checksum, version, lifecycle, agreed_step,
+                        event_position
                  FROM executions WHERE execution_id = ?1",
                 params![execution_id.0.to_vec()],
                 |row| {
@@ -241,8 +240,8 @@ impl Database {
             local_checksum,
             version,
             lifecycle,
-            public_step,
-            private_next_record,
+            agreed_step,
+            event_position,
         )) = row
         else {
             return Ok(None);
@@ -260,8 +259,8 @@ impl Database {
             local_checksum,
             version,
             lifecycle,
-            public_step,
-            private_next_record,
+            agreed_step,
+            event_position,
             producer: peer_id_from_blob(&producer_bytes, "execution producer")?,
             session_id: SessionHash(array32(&session_bytes, "execution session")?),
         })
@@ -278,15 +277,15 @@ impl Database {
             local_checksum,
             version,
             lifecycle,
-            public_step,
-            private_next_record,
+            agreed_step,
+            event_position,
             producer,
             session_id,
         } = row;
         let state_payload = open_envelope(
             EnvelopeKind::ExecutionState,
             &state_bytes,
-            arena0_protocol::execution::MAX_EXECUTION_STATE_BYTES,
+            arena0_protocol::MAX_EXECUTION_STATE_BYTES,
         )?;
         let state = ExecutionState::decode(&state_payload)?;
         if state.execution_id() != execution_id
@@ -302,7 +301,7 @@ impl Database {
                 "local state checksum does not match execution state".into(),
             ));
         }
-        self.validate_state_indexes(&state, version, lifecycle, public_step, private_next_record)?;
+        self.validate_state_indexes(&state, version, lifecycle, agreed_step, event_position)?;
         Ok(state)
     }
 
@@ -311,16 +310,13 @@ impl Database {
         state: &ExecutionState,
         version: i64,
         lifecycle: i64,
-        public_step: i64,
-        private_next_record: i64,
+        agreed_step: i64,
+        event_position: i64,
     ) -> Result<(), StoreError> {
-        let version = sqlite_i64(version)?;
-        let public_step = sqlite_i64(public_step)?;
-        let private_next_record = sqlite_i64(private_next_record)?;
-        if version != state.version().get()
+        if sqlite_i64(version)? != state.version().get()
             || lifecycle != lifecycle_tag(state.lifecycle())
-            || public_step != state.public().next_step()
-            || private_next_record != state.private().next_record()
+            || sqlite_i64(agreed_step)? != state.agreed_step()
+            || sqlite_i64(event_position)? != state.event_position()
         {
             return Err(StoreError::Corruption(
                 "execution scheduling index does not match state".into(),
@@ -333,95 +329,665 @@ impl Database {
         &mut self,
         state: &ExecutionState,
     ) -> Result<(), StoreError> {
-        self.validate_public_rows(state)?;
-        self.validate_private_rows(state)?;
+        self.validate_event_rows(state)?;
+        self.validate_agreed_rows(state)?;
         self.validate_timer_rows(state)?;
         self.validate_terminal_rows(state)?;
         Ok(())
     }
 
-    pub(super) fn apply_input(
+    pub(super) fn activate(
         &mut self,
         execution_id: ExecId,
-        input: ExecutionInput,
-        inbox: Option<InboxReference>,
+        expected: ExecutionVersion,
         now_ms: u64,
     ) -> Result<ApplyOutcome, StoreError> {
         self.begin()?;
-        let result = self.apply_input_in_transaction(execution_id, input, inbox, now_ms);
+        let result = self.activate_in_transaction(execution_id, expected, now_ms);
         match result {
-            Ok(outcome) => self.commit_result(outcome),
+            Ok(value) => self.commit_result(value),
             Err(error) => self.rollback_result(error),
         }
     }
 
-    /// Assemble the canonical receipt body from durable source rows and stage
-    /// it through the protocol reducer without leaving the transaction.
-    pub(super) fn assemble_receipt(
+    fn activate_in_transaction(
         &mut self,
         execution_id: ExecId,
-        now_ms: u64,
-    ) -> Result<ApplyOutcome, StoreError> {
-        self.begin()?;
-        let result = self.assemble_receipt_in_transaction(execution_id, now_ms);
-        match result {
-            Ok(outcome) => self.commit_result(outcome),
-            Err(error) => self.rollback_result(error),
-        }
-    }
-
-    fn assemble_receipt_in_transaction(
-        &mut self,
-        execution_id: ExecId,
+        expected: ExecutionVersion,
         now_ms: u64,
     ) -> Result<ApplyOutcome, StoreError> {
         let state = self
             .load_execution_in_transaction(execution_id)?
             .ok_or(StoreError::ExecutionNotFound(execution_id))?;
+        if state.version() != expected {
+            return self.version_mismatch(state, expected);
+        }
+        let mut next = state.clone();
+        next.activate()?;
+        self.persist_state_cas(&state, &next, now_ms)?;
+        self.cache_pending(next.clone())?;
+        Ok(ApplyOutcome::Committed {
+            agreed_step: None,
+            proposal_staged: false,
+        })
+    }
 
-        // Once the artifact is published or proof work is frozen, assembly
-        // is an idempotent acknowledgement.
-        if matches!(
-            state.status(),
-            arena0_protocol::ExecutionStatus::Completed { .. }
-                | arena0_protocol::ExecutionStatus::StoppedPublished { .. }
-                | arena0_protocol::ExecutionStatus::Incomplete { .. }
-        ) {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn commit_dispatch(
+        &mut self,
+        execution_id: ExecId,
+        expected: ExecutionVersion,
+        event: Event<Vec<u8>>,
+        shared: SharedStateBytes,
+        local: LocalStateBytes,
+        effects: Vec<Effect>,
+        terminal_outcome: Option<TerminalOutcome>,
+        inbox_id: Option<InboxId>,
+        timer_id: Option<TimerId>,
+        pending_id: Option<PendingId>,
+        now_ms: u64,
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.begin()?;
+        let result = self.commit_dispatch_in_transaction(
+            execution_id,
+            expected,
+            event,
+            shared,
+            local,
+            effects,
+            terminal_outcome,
+            inbox_id,
+            timer_id,
+            pending_id,
+            now_ms,
+        );
+        match result {
+            Ok(value) => self.commit_result(value),
+            Err(error) => self.rollback_result(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_dispatch_in_transaction(
+        &mut self,
+        execution_id: ExecId,
+        expected: ExecutionVersion,
+        event: Event<Vec<u8>>,
+        shared: SharedStateBytes,
+        local: LocalStateBytes,
+        effects: Vec<Effect>,
+        terminal_outcome: Option<TerminalOutcome>,
+        inbox_id: Option<InboxId>,
+        timer_id: Option<TimerId>,
+        pending_id: Option<PendingId>,
+        now_ms: u64,
+    ) -> Result<ApplyOutcome, StoreError> {
+        let state = self
+            .load_execution_in_transaction(execution_id)?
+            .ok_or(StoreError::ExecutionNotFound(execution_id))?;
+        if state.version() != expected {
+            return self.version_mismatch(state, expected);
+        }
+        if state.pending_shared().is_some() {
+            return Err(StoreError::Protocol(ProtocolError::SharedProposalExists));
+        }
+        validate_effect_payloads(&effects)?;
+        let post_state = StateHash::of_shared(&shared);
+        validate_dispatch_sources(
+            self, &state, &event, post_state, &effects, inbox_id, timer_id, pending_id,
+        )?;
+        let closes_pending = validate_pending_answer(&state, &event, pending_id, &effects)?;
+        let source_status = inbox_id
+            .map(|id| self.load_inbox_fact(execution_id, id, &state))
+            .transpose()?;
+        if let Some((_, _, status, version)) = source_status {
+            match status {
+                InboxStatus::Applied => {
+                    return Ok(ApplyOutcome::InboxAlreadyApplied {
+                        inbox_id: inbox_id.expect("source status has inbox id"),
+                        version: version.ok_or_else(|| {
+                            StoreError::Corruption("applied inbox row has no version".into())
+                        })?,
+                    });
+                }
+                InboxStatus::Consumed => {
+                    return Ok(ApplyOutcome::InboxAlreadyConsumed {
+                        inbox_id: inbox_id.expect("source status has inbox id"),
+                    });
+                }
+                InboxStatus::Accepted => {}
+            }
+        }
+
+        let event_position = state.event_position();
+        let event_payload = event_bytes(&event)?;
+        let effects_payload = effects_bytes(&effects)?;
+        let lifecycle = lifecycle_effect(&effects)?;
+        let broadcast_index = effects
+            .iter()
+            .position(|effect| matches!(effect, Effect::Broadcast { .. }));
+        // Every portable event occupies an agreed trace step, even when its
+        // shared bytes are unchanged. A state hash delta is therefore not a
+        // sufficient agreement predicate.
+        let portable_event = matches!(
+            event,
+            Event::SessionStarted { .. } | Event::MessageReceived { .. }
+        );
+        let requires_agreement = portable_event
+            || post_state != state.agreed_state()
+            || broadcast_index.is_some()
+            || lifecycle.is_some();
+        let reacted_step = reacted_step_for_event(&state, &event)?;
+
+        if !requires_agreement {
+            if terminal_outcome.is_some() {
+                return Err(StoreError::Protocol(ProtocolError::TerminalOutcomeMismatch));
+            }
+            let status = immediate_status(&state, &event, event_position, &effects)?;
+            let mut next = state.clone();
+            next.install_dispatch(event_position, shared, local, status, reacted_step)?;
+            self.persist_state_cas(&state, &next, now_ms)?;
+            self.insert_event_record(
+                execution_id,
+                event_position,
+                &event_payload,
+                &effects_payload,
+            )?;
+            let indexed_effects = indexed_effects(&effects)?;
+            self.persist_effects(
+                execution_id,
+                event_position,
+                next.version(),
+                &indexed_effects,
+                now_ms,
+                &state,
+            )?;
+            if let Some(inbox_id) = inbox_id {
+                self.mark_inbox_applied(execution_id, inbox_id, next.version())?;
+            }
+            if closes_pending {
+                self.acknowledge_pending_effect(
+                    execution_id,
+                    pending_id.expect("pending answer was validated"),
+                    &event,
+                )?;
+            }
+            if let Some(timer_id) = timer_id {
+                self.consume_timer(execution_id, timer_id)?;
+            }
+            self.cache_pending(next.clone())?;
+            return Ok(ApplyOutcome::Committed {
+                agreed_step: None,
+                proposal_staged: false,
+            });
+        }
+
+        let (trace_event, proposal_effects, establishing_frame) =
+            normalized_proposal_event(&state, &event, &shared, &effects, broadcast_index)?;
+        if lifecycle.is_some()
+            && proposal_effects
+                .iter()
+                .any(|(_, effect)| matches!(effect, Effect::Broadcast { .. }))
+        {
+            return Err(StoreError::Protocol(ProtocolError::InvalidTerminalStatus));
+        }
+        let entry = TraceEntry {
+            trace_version: arena0_protocol::TRACE_FORMAT_VERSION,
+            step: state.agreed_step(),
+            event: trace_event,
+            pre_state: state.agreed_state(),
+            post_state,
+            terminal: lifecycle,
+            agreement: arena0_protocol::AggregateAttestation::empty(),
+        };
+        let commitment =
+            StepCommitment::for_entry(state.binding().session_id(), &entry, state.agreed_link());
+        let status = proposal_status(
+            &state,
+            &event,
+            event_position,
+            &entry,
+            &commitment,
+            &effects,
+            terminal_outcome,
+        )?;
+        let proposal = arena0_protocol::SharedProposal::new(
+            commitment,
+            entry,
+            shared,
+            local,
+            proposal_effects,
+            event_position,
+            status,
+            Vec::new(),
+        )?;
+        let mut next = state.clone();
+        next.stage_proposal(proposal, reacted_step)?;
+        self.persist_state_cas(&state, &next, now_ms)?;
+        self.insert_event_record(
+            execution_id,
+            event_position,
+            &event_payload,
+            &effects_payload,
+        )?;
+        if let Some((index, frame)) = establishing_frame {
+            let frame_ordinal = message_frame_ordinal(index)?;
+            self.persist_frame_for_remotes(
+                execution_id,
+                event_position,
+                next.version(),
+                frame_ordinal,
+                &frame,
+                &state,
+                now_ms,
+            )?;
+        }
+        if let Some(inbox_id) = inbox_id {
+            self.mark_inbox_consumed(execution_id, inbox_id, now_ms)?;
+        }
+        if closes_pending {
+            self.acknowledge_pending_effect(
+                execution_id,
+                pending_id.expect("pending answer was validated"),
+                &event,
+            )?;
+        }
+        if let Some(timer_id) = timer_id {
+            self.consume_timer(execution_id, timer_id)?;
+        }
+        self.cache_pending(next.clone())?;
+        Ok(ApplyOutcome::Committed {
+            agreed_step: None,
+            proposal_staged: true,
+        })
+    }
+
+    pub(super) fn commit_step_signature(
+        &mut self,
+        execution_id: ExecId,
+        expected: ExecutionVersion,
+        signature: ParticipantStepSignature,
+        inbox_id: Option<InboxId>,
+        now_ms: u64,
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.begin()?;
+        let result = self.commit_step_signature_in_transaction(
+            execution_id,
+            expected,
+            signature,
+            inbox_id,
+            now_ms,
+        );
+        match result {
+            Ok(value) => self.commit_result(value),
+            Err(error) => self.rollback_result(error),
+        }
+    }
+
+    fn commit_step_signature_in_transaction(
+        &mut self,
+        execution_id: ExecId,
+        expected: ExecutionVersion,
+        signature: ParticipantStepSignature,
+        inbox_id: Option<InboxId>,
+        now_ms: u64,
+    ) -> Result<ApplyOutcome, StoreError> {
+        let state = self
+            .load_execution_in_transaction(execution_id)?
+            .ok_or(StoreError::ExecutionNotFound(execution_id))?;
+        if state.version() != expected {
+            return self.version_mismatch(state, expected);
+        }
+        self.validate_step_inbox(&state, &signature, inbox_id)?;
+        if let Some(outcome) = self.inbox_replay_outcome(&state, inbox_id)? {
+            return Ok(outcome);
+        }
+        if state.pending_shared().is_some_and(|proposal| {
+            proposal
+                .signatures()
+                .iter()
+                .any(|existing| existing == &signature)
+        }) {
+            if let Some(inbox_id) = inbox_id {
+                self.mark_inbox_consumed(execution_id, inbox_id, now_ms)?;
+            }
             return Ok(ApplyOutcome::AlreadyApplied);
         }
-
-        let activation_record = self
-            .load_activation_in_transaction(execution_id)?
-            .ok_or(StoreError::ActivationNotFound(execution_id))?;
-        let activation = activation_record
-            .activation()
-            .ok_or(StoreError::ActivationNotCommitted(execution_id))?;
-        if activation != state.binding().activation() {
-            return Err(StoreError::Corruption(
-                "receipt activation does not match permanent activation".into(),
-            ));
+        let proposal = state
+            .pending_shared()
+            .ok_or(StoreError::Protocol(ProtocolError::SharedProposalMissing))?;
+        let event_position = proposal.event_position();
+        let local_frame = inbox_id.is_none().then(|| ExecFrame::StepSignature {
+            commitment: proposal.commitment().clone(),
+            signature: signature.signature().sig,
+        });
+        let mut next = state.clone();
+        let committed = next.add_step_signature(signature)?;
+        if let Some(proposal) = committed.as_ref() {
+            self.commit_staged_event(
+                execution_id,
+                proposal,
+                next.pending_shared(),
+                next.version(),
+                now_ms,
+                &state,
+            )?;
         }
-        let request = self
-            .load_execution_request_in_transaction(execution_id)?
-            .ok_or(StoreError::ExecutionRequestNotFound(execution_id))?;
-        if request.program_hash() != state.binding().program_hash()
-            || request.params().is_some_and(|params| {
-                params.as_bytes() != activation.offer().data().params.as_bytes()
+        self.persist_state_cas(&state, &next, now_ms)?;
+        if let Some(frame) = local_frame {
+            self.persist_frame_for_remotes(
+                execution_id,
+                event_position,
+                next.version(),
+                0,
+                &frame,
+                &state,
+                now_ms,
+            )?;
+        }
+        if !matches!(
+            next.status().receipt_work(),
+            arena0_protocol::ReceiptWork::NotTerminal
+        ) {
+            self.cancel_terminal_effects(execution_id)?;
+        }
+        if let Some(inbox_id) = inbox_id {
+            self.mark_inbox_consumed(execution_id, inbox_id, now_ms)?;
+        }
+        self.cache_pending(next.clone())?;
+        Ok(ApplyOutcome::Committed {
+            agreed_step: committed.as_ref().map(|proposal| proposal.entry().step),
+            proposal_staged: next.pending_shared().is_some(),
+        })
+    }
+
+    pub(super) fn commit_terminal_signature(
+        &mut self,
+        execution_id: ExecId,
+        expected: ExecutionVersion,
+        signature: ParticipantTerminalSignature,
+        inbox_id: Option<InboxId>,
+        now_ms: u64,
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.begin()?;
+        let result = self.commit_terminal_signature_in_transaction(
+            execution_id,
+            expected,
+            signature,
+            inbox_id,
+            now_ms,
+        );
+        match result {
+            Ok(value) => self.commit_result(value),
+            Err(error) => self.rollback_result(error),
+        }
+    }
+
+    fn commit_terminal_signature_in_transaction(
+        &mut self,
+        execution_id: ExecId,
+        expected: ExecutionVersion,
+        signature: ParticipantTerminalSignature,
+        inbox_id: Option<InboxId>,
+        now_ms: u64,
+    ) -> Result<ApplyOutcome, StoreError> {
+        let state = self
+            .load_execution_in_transaction(execution_id)?
+            .ok_or(StoreError::ExecutionNotFound(execution_id))?;
+        if state.version() != expected {
+            return self.version_mismatch(state, expected);
+        }
+        self.validate_terminal_inbox(&state, &signature, inbox_id)?;
+        if let Some(outcome) = self.inbox_replay_outcome(&state, inbox_id)? {
+            return Ok(outcome);
+        }
+        if let ExecutionStatus::TerminalProof { proof } = state.status()
+            && proof.pending_parts().is_some_and(|(_, _, signatures)| {
+                signatures.iter().any(|existing| existing == &signature)
             })
         {
-            return Err(StoreError::Corruption(
-                "receipt request does not match permanent activation".into(),
-            ));
+            if let Some(inbox_id) = inbox_id {
+                self.mark_inbox_consumed(execution_id, inbox_id, now_ms)?;
+            }
+            return Ok(ApplyOutcome::AlreadyApplied);
+        }
+        let local_frame = inbox_id
+            .is_none()
+            .then(|| {
+                state.pending_terminal().map(|commitment| ExecFrame::End {
+                    commitment: commitment.clone(),
+                    signature: signature.signature(),
+                })
+            })
+            .flatten();
+        let mut next = state.clone();
+        next.add_terminal_signature(signature)?;
+        self.persist_state_cas(&state, &next, now_ms)?;
+        if let Some(frame) = local_frame {
+            self.persist_frame_for_remotes(
+                execution_id,
+                state.event_position(),
+                next.version(),
+                0,
+                &frame,
+                &state,
+                now_ms,
+            )?;
+        }
+        if !matches!(
+            next.status().receipt_work(),
+            arena0_protocol::ReceiptWork::NotTerminal
+        ) {
+            self.cancel_terminal_effects(execution_id)?;
+        }
+        if let Some(inbox_id) = inbox_id {
+            self.mark_inbox_consumed(execution_id, inbox_id, now_ms)?;
+        }
+        self.cache_pending(next.clone())?;
+        Ok(ApplyOutcome::Committed {
+            agreed_step: None,
+            proposal_staged: false,
+        })
+    }
+
+    pub(super) fn stop_execution(
+        &mut self,
+        execution_id: ExecId,
+        expected: ExecutionVersion,
+        occurrence: AbortOccurrence,
+        inbox_id: Option<InboxId>,
+        now_ms: u64,
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.begin()?;
+        let result = self.stop_execution_in_transaction(
+            execution_id,
+            expected,
+            occurrence,
+            inbox_id,
+            now_ms,
+        );
+        match result {
+            Ok(value) => self.commit_result(value),
+            Err(error) => self.rollback_result(error),
+        }
+    }
+
+    fn stop_execution_in_transaction(
+        &mut self,
+        execution_id: ExecId,
+        expected: ExecutionVersion,
+        occurrence: AbortOccurrence,
+        inbox_id: Option<InboxId>,
+        now_ms: u64,
+    ) -> Result<ApplyOutcome, StoreError> {
+        let state = self
+            .load_execution_in_transaction(execution_id)?
+            .ok_or(StoreError::ExecutionNotFound(execution_id))?;
+        if state.version() != expected {
+            return self.version_mismatch(state, expected);
+        }
+        self.validate_abort_inbox(&state, &occurrence, inbox_id)?;
+        if let Some(outcome) = self.inbox_replay_outcome(&state, inbox_id)? {
+            return Ok(outcome);
+        }
+        if state.status().terminal_cause().is_some_and(|cause| {
+            matches!(
+                cause,
+                arena0_protocol::StopCause::Authenticated(existing) if existing == &occurrence
+            )
+        }) {
+            if let Some(inbox_id) = inbox_id {
+                self.mark_inbox_consumed(execution_id, inbox_id, now_ms)?;
+            }
+            return Ok(ApplyOutcome::AlreadyApplied);
+        }
+        let mut next = state.clone();
+        let pending_proposal = state.pending_shared().cloned();
+        next.stop(occurrence)?;
+        if let Some(proposal) = pending_proposal.as_ref() {
+            self.cancel_proposal_frames(execution_id, proposal)?;
+        }
+        self.persist_state_cas(&state, &next, now_ms)?;
+        if inbox_id.is_none() {
+            let frame = ExecFrame::Abort {
+                occurrence: match next.status().terminal_cause() {
+                    Some(arena0_protocol::StopCause::Authenticated(occurrence)) => {
+                        occurrence.clone()
+                    }
+                    _ => {
+                        return Err(StoreError::Corruption(
+                            "stopped state lost its authenticated occurrence".into(),
+                        ));
+                    }
+                },
+            };
+            self.persist_frame_for_remotes(
+                execution_id,
+                state.event_position(),
+                next.version(),
+                0,
+                &frame,
+                &state,
+                now_ms,
+            )?;
+        }
+        self.cancel_terminal_effects(execution_id)?;
+        if let Some(inbox_id) = inbox_id {
+            self.mark_inbox_consumed(execution_id, inbox_id, now_ms)?;
+        }
+        self.cache_pending(next.clone())?;
+        Ok(ApplyOutcome::Committed {
+            agreed_step: None,
+            proposal_staged: false,
+        })
+    }
+
+    pub(super) fn interrupt_terminal(
+        &mut self,
+        execution_id: ExecId,
+        expected: ExecutionVersion,
+        reason: String,
+        now_ms: u64,
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.begin()?;
+        let result = self.interrupt_terminal_in_transaction(execution_id, expected, reason, now_ms);
+        match result {
+            Ok(value) => self.commit_result(value),
+            Err(error) => self.rollback_result(error),
+        }
+    }
+
+    fn interrupt_terminal_in_transaction(
+        &mut self,
+        execution_id: ExecId,
+        expected: ExecutionVersion,
+        reason: String,
+        now_ms: u64,
+    ) -> Result<ApplyOutcome, StoreError> {
+        let state = self
+            .load_execution_in_transaction(execution_id)?
+            .ok_or(StoreError::ExecutionNotFound(execution_id))?;
+        if state.version() != expected {
+            return self.version_mismatch(state, expected);
         }
 
-        let trace = self.load_public_trace_in_transaction(&state)?;
+        // The protocol mutator both checks that a proof is in progress and
+        // preserves that proof in the resulting Incomplete status. Timer
+        // rows are store-owned, so clear every active timer in this same
+        // transaction before the state CAS becomes visible.
+        let mut next = state.clone();
+        next.interrupt_terminal(reason)?;
+        self.cancel_active_timers(execution_id)?;
+        self.persist_state_cas(&state, &next, now_ms)?;
+        self.cancel_terminal_effects(execution_id)?;
+        self.cache_pending(next.clone())?;
+        Ok(ApplyOutcome::Committed {
+            agreed_step: None,
+            proposal_staged: false,
+        })
+    }
+
+    pub(super) fn publish_terminal(
+        &mut self,
+        execution_id: ExecId,
+        expected: ExecutionVersion,
+        now_ms: u64,
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.begin()?;
+        let result = self.publish_terminal_in_transaction(execution_id, expected, now_ms);
+        match result {
+            Ok(value) => self.commit_result(value),
+            Err(error) => self.rollback_result(error),
+        }
+    }
+
+    fn publish_terminal_in_transaction(
+        &mut self,
+        execution_id: ExecId,
+        expected: ExecutionVersion,
+        now_ms: u64,
+    ) -> Result<ApplyOutcome, StoreError> {
+        let state = self
+            .load_execution_in_transaction(execution_id)?
+            .ok_or(StoreError::ExecutionNotFound(execution_id))?;
+        if state.version() != expected {
+            return self.version_mismatch(state, expected);
+        }
+        if state.published_receipt_id().is_some() {
+            return Ok(ApplyOutcome::AlreadyApplied);
+        }
+        let artifact = self.assemble_terminal_artifact(&state)?;
+        let mut next = state.clone();
+        next.publish_receipt(artifact.clone())?;
+        self.persist_state_cas(&state, &next, now_ms)?;
+        self.persist_terminal_publication(execution_id, next.version(), &artifact, now_ms)?;
+        self.cancel_terminal_effects(execution_id)?;
+        self.cache_pending(next.clone())?;
+        Ok(ApplyOutcome::Committed {
+            agreed_step: None,
+            proposal_staged: false,
+        })
+    }
+
+    fn assemble_terminal_artifact(
+        &mut self,
+        state: &ExecutionState,
+    ) -> Result<ReceiptArtifact, StoreError> {
+        let activation = self
+            .load_activation_in_transaction(state.execution_id())?
+            .ok_or(StoreError::ActivationNotFound(state.execution_id()))?;
+        let activation = activation
+            .activation()
+            .ok_or(StoreError::ActivationNotCommitted(state.execution_id()))?;
+        let trace = self.load_agreed_trace_in_transaction(state)?;
         let termination = if let Some(cause) = state.status().terminal_cause() {
             arena0_protocol::ReceiptTermination::Stopped {
                 cause: cause.clone(),
             }
-        } else if let (Some(certificate), Some(_outcome)) =
-            (state.terminal_certificate(), state.terminal_outcome())
-        {
+        } else {
+            let certificate = state
+                .terminal_certificate()
+                .ok_or(StoreError::Protocol(ProtocolError::TerminalProofMissing))?;
             arena0_protocol::ReceiptTermination::Completed {
                 terminal: arena0_protocol::SessionTerminal {
                     final_step: certificate.commitment().final_step,
@@ -430,108 +996,19 @@ impl Database {
                     agreement: certificate.agreement().clone(),
                 },
             }
-        } else {
-            return Err(StoreError::Protocol(ProtocolError::TerminalProofMissing));
         };
-        let outcome = match &termination {
-            arena0_protocol::ReceiptTermination::Completed { .. } => state
-                .terminal_outcome()
-                .ok_or(StoreError::Protocol(ProtocolError::TerminalProofMissing))?
-                .borsh()
-                .to_vec(),
-            arena0_protocol::ReceiptTermination::Stopped { .. } => Vec::new(),
-        };
+        let outcome = state
+            .terminal_outcome()
+            .map_or_else(Vec::new, |outcome| outcome.borsh().to_vec());
         let body = arena0_protocol::ReceiptBody::new(
             arena0_protocol::SessionHeader::new(activation.clone(), termination),
             outcome,
             activation.offer().data().params.as_bytes().to_vec(),
             trace,
         )?;
-        self.apply_input_in_transaction(
-            execution_id,
-            ExecutionInput::ReceiptBody(Box::new(body)),
-            None,
-            now_ms,
-        )
+        Ok(ReceiptArtifact::new(body)?)
     }
 
-    pub(super) fn load_public_trace_in_transaction(
-        &mut self,
-        state: &ExecutionState,
-    ) -> Result<Vec<arena0_protocol::TraceEntry>, StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT step, version, artifact, entry_hash FROM public_commits
-             WHERE execution_id = ?1 ORDER BY step",
-        )?;
-        let mut rows = statement.query(params![state.execution_id().0.to_vec()])?;
-        let mut commits = Vec::new();
-        while let Some(row) = rows.next()? {
-            commits.push((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-            ));
-        }
-        drop(rows);
-        drop(statement);
-
-        let mut trace = Vec::with_capacity(commits.len());
-        for (index, (step, version, encoded, entry_hash)) in commits.into_iter().enumerate() {
-            let step = sqlite_i64(step)?;
-            let expected_step = u64::try_from(index)
-                .map_err(|_| StoreError::Corruption("public step overflow".into()))?;
-            if step != expected_step {
-                return Err(StoreError::Corruption(
-                    "public commit steps are not gapless".into(),
-                ));
-            }
-            let version = sqlite_i64(version)?;
-            if version == 0 || version > state.version().get() {
-                return Err(StoreError::Corruption(
-                    "public commit version is invalid".into(),
-                ));
-            }
-            let payload = open_envelope(
-                EnvelopeKind::SharedCommit,
-                &encoded,
-                arena0_protocol::MAX_COMMIT_PLAN_BYTES,
-            )?;
-            let commit: arena0_protocol::SharedCommit = decode_borsh(&payload, "public commit")?;
-            let entry = commit.entry();
-            if entry.step != step
-                || entry.entry_hash() != array32(&entry_hash, "public entry hash")?
-            {
-                return Err(StoreError::Corruption(
-                    "public commit index mismatch".into(),
-                ));
-            }
-            let commitment = commit.certificate().commitment();
-            if commitment.session_id != state.binding().session_id()
-                || commitment.step != entry.step
-                || commitment.entry_hash != entry.entry_hash()
-                || commitment.pre_state != entry.pre_state
-                || commitment.post_state != entry.post_state
-            {
-                return Err(StoreError::Corruption(
-                    "public certificate does not match entry".into(),
-                ));
-            }
-            trace.push(entry.clone());
-        }
-        let count = u64::try_from(trace.len())
-            .map_err(|_| StoreError::Corruption("public commit count overflows u64".into()))?;
-        if count != state.public().next_step() {
-            return Err(StoreError::Corruption(
-                "public cursor does not match public commits".into(),
-            ));
-        }
-        Ok(trace)
-    }
-
-    /// Validate the complete public trace, then return the requested bounded
-    /// projection. The daemon uses this for event and API reads while the
-    /// execution actor retains the only mutable store capability.
     pub(super) fn read_trace(
         &mut self,
         execution_id: ExecId,
@@ -544,613 +1021,1326 @@ impl Database {
         let state = self
             .load_execution_in_transaction(execution_id)?
             .ok_or(StoreError::ExecutionNotFound(execution_id))?;
-        let trace = self.load_public_trace_in_transaction(&state)?;
-        let end = to.min(
-            u64::try_from(trace.len())
-                .map_err(|_| StoreError::Corruption("public trace length overflows u64".into()))?,
-        );
-        let start = from.min(end);
-        let start = usize::try_from(start)
-            .map_err(|_| StoreError::Corruption("public trace start overflows usize".into()))?;
+        let trace = self.load_agreed_trace_in_transaction(&state)?;
+        let end = to.min(trace.len() as u64);
+        let start = usize::try_from(from.min(end))
+            .map_err(|_| StoreError::Corruption("trace start overflows usize".into()))?;
         let end = usize::try_from(end)
-            .map_err(|_| StoreError::Corruption("public trace end overflows usize".into()))?;
+            .map_err(|_| StoreError::Corruption("trace end overflows usize".into()))?;
         Ok(trace[start..end].to_vec())
     }
 
-    /// Validate and summarize one bounded range of durable private records.
-    /// Private payloads and replacement local state never leave the store
-    /// owner; full-projection validation remains part of execution recovery.
-    pub(super) fn read_private_summaries(
+    pub(super) fn read_event_summaries(
         &mut self,
         execution_id: ExecId,
         from: Option<u64>,
         limit: usize,
-    ) -> Result<PrivateInspectionPage, StoreError> {
-        if limit > MAX_PRIVATE_INSPECTION_RECORDS {
+    ) -> Result<EventInspectionPage, StoreError> {
+        if limit == 0 || limit > MAX_EVENT_INSPECTION_RECORDS {
             return Err(StoreError::InvalidConfiguration(
-                "private inspection limit exceeds the fixed bound",
-            ));
-        }
-        if limit == 0 {
-            return Err(StoreError::InvalidConfiguration(
-                "private inspection limit must be non-zero",
+                "event inspection limit is outside the fixed bound",
             ));
         }
         let state = self
             .load_execution_in_transaction(execution_id)?
             .ok_or(StoreError::ExecutionNotFound(execution_id))?;
-        let total = state.private().next_record();
+        let total = state.event_position();
         let start = from
             .unwrap_or_else(|| total.saturating_sub(limit as u64))
             .min(total);
         let end = start.saturating_add(limit as u64).min(total);
-        if start == end {
-            return Ok(PrivateInspectionPage::new(start, Vec::new(), total, None));
-        }
-
-        let start_sequence = start;
-        let end_sequence = end;
-        let start = sqlite_u64(start_sequence)?;
-        let end = sqlite_u64(end_sequence)?;
         let mut statement = self.connection.prepare(
-            "SELECT sequence, version, artifact, record_digest
-             FROM private_commits
-             WHERE execution_id = ?1 AND sequence >= ?2 AND sequence < ?3
-             ORDER BY sequence",
+            "SELECT event_position, event, effects
+             FROM event_records
+             WHERE execution_id = ?1 AND event_position >= ?2 AND event_position < ?3
+             ORDER BY event_position",
         )?;
-        let mut rows = statement.query(params![execution_id.0.to_vec(), start, end])?;
+        let mut rows = statement.query(params![
+            execution_id.0.to_vec(),
+            sqlite_u64(start)?,
+            sqlite_u64(end)?,
+        ])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            let position = sqlite_i64(row.get::<_, i64>(0)?)?;
+            let event_payload = open_envelope(
+                EnvelopeKind::EventRecord,
+                &row.get::<_, Vec<u8>>(1)?,
+                arena0_protocol::MAX_EXECUTION_STATE_BYTES,
+            )?;
+            let effects_payload = open_envelope(
+                EnvelopeKind::Effects,
+                &row.get::<_, Vec<u8>>(2)?,
+                arena0_protocol::MAX_RECEIPT_BYTES,
+            )?;
+            records.push((position, event_payload, effects_payload));
+        }
+        drop(rows);
+        drop(statement);
         let mut summaries = Vec::new();
         let mut response_bytes = 0;
-        while let Some(row) = rows.next()? {
-            let sequence = sqlite_i64(row.get::<_, i64>(0)?)?;
-            let version = sqlite_i64(row.get::<_, i64>(1)?)?;
-            let encoded = row.get::<_, Vec<u8>>(2)?;
-            let digest = row.get::<_, Vec<u8>>(3)?;
-            let payload = open_envelope(
-                EnvelopeKind::PrivateCommit,
-                &encoded,
-                arena0_protocol::MAX_PRIVATE_RECORD_BYTES + 1024,
+        for (position, event_payload, effects_payload) in records {
+            let event: Event<Vec<u8>> = decode_borsh(&event_payload, "event record event")?;
+            let effects: Vec<Effect> = decode_borsh(&effects_payload, "event record effects")?;
+            let mut agreed_statement = self.connection.prepare(
+                "SELECT step FROM agreed_steps
+                 WHERE execution_id = ?1 AND origin_event_position = ?2
+                 ORDER BY step",
             )?;
-            let commit: arena0_protocol::PrivateCommit = decode_borsh(&payload, "private commit")?;
-            if commit.record().seq != sequence
-                || checksum(&borsh::to_vec(&commit).map_err(|error| {
-                    StoreError::Corruption(format!("private commit encode: {error}"))
-                })?) != array32(&digest, "private record digest")?
-            {
-                return Err(StoreError::Corruption(
-                    "private commit index mismatch".into(),
-                ));
-            }
-            if version == 0 || version > state.version().get() {
-                return Err(StoreError::Corruption(
-                    "private commit version is invalid".into(),
-                ));
-            }
-            let summary = PrivateCommitSummary::from_commit(&commit);
-            account_response(
-                &mut response_bytes,
-                256 + summary.effects.len().saturating_mul(64),
-            )?;
-            summaries.push(summary);
-        }
-        if summaries.len()
-            != usize::try_from(end_sequence - start_sequence).map_err(|_| {
-                StoreError::Corruption("private inspection row count overflows usize".into())
-            })?
-        {
-            return Err(StoreError::Corruption(
-                "private inspection range is incomplete".into(),
+            let agreed_steps = agreed_statement
+                .query_map(
+                    params![execution_id.0.to_vec(), sqlite_u64(position)?],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(StoreError::Sqlite)?
+                .map(|step| step.map_err(StoreError::Sqlite).and_then(sqlite_i64))
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(agreed_statement);
+            account_response(&mut response_bytes, 256 + effects.len() * 32)?;
+            summaries.push(EventRecordSummary::from_record(
+                position,
+                agreed_steps,
+                &event,
+                &effects,
             ));
         }
-        let next = (end_sequence < total).then_some(end_sequence);
-        Ok(PrivateInspectionPage::new(
-            start_sequence,
+        let expected = usize::try_from(end - start)
+            .map_err(|_| StoreError::Corruption("event range overflows usize".into()))?;
+        if summaries.len() != expected {
+            return Err(StoreError::Corruption(
+                "event inspection range is incomplete".into(),
+            ));
+        }
+        Ok(EventInspectionPage::new(
+            start,
             summaries,
             total,
-            next,
+            (end < total).then_some(end),
         ))
     }
 
-    pub(super) fn apply_input_in_transaction(
+    pub(super) fn load_agreed_trace_in_transaction(
         &mut self,
-        execution_id: ExecId,
-        input: ExecutionInput,
-        inbox: Option<InboxReference>,
-        now_ms: u64,
-    ) -> Result<ApplyOutcome, StoreError> {
-        let state = self
-            .load_execution_in_transaction(execution_id)?
-            .ok_or(StoreError::ExecutionNotFound(execution_id))?;
-        let input_bytes = input_bytes(&input)?;
-        let occurrence = input.occurrence(&state)?;
-        let occurrence_key = occurrence_key_bytes(occurrence.key())?;
-        let occurrence_digest = occurrence.digest();
-
-        if let Some(reference) = inbox {
-            let row = self.inbox_row(execution_id, reference.inbox_id)?;
-            let Some((stored_source, status, applied_version)) = row else {
-                return Err(StoreError::InboxNotAccepted(reference.inbox_id));
-            };
-            if stored_source != reference.source {
+        state: &ExecutionState,
+    ) -> Result<Vec<arena0_protocol::TraceEntry>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT step, origin_event_position, version, artifact, entry_hash
+             FROM agreed_steps WHERE execution_id = ?1 ORDER BY step",
+        )?;
+        let mut rows = statement.query(params![state.execution_id().0.to_vec()])?;
+        let mut raw = Vec::new();
+        while let Some(row) = rows.next()? {
+            raw.push((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+            ));
+        }
+        drop(rows);
+        drop(statement);
+        let mut participants = state
+            .binding()
+            .activation()
+            .tickets()
+            .iter()
+            .filter_map(|ticket| match &ticket.data.action {
+                arena0_protocol::TicketAction::Active { execution_bls, .. } => {
+                    Some((ticket.data.signer, *execution_bls))
+                }
+                arena0_protocol::TicketAction::Withdrawn => None,
+            })
+            .collect::<Vec<_>>();
+        participants.sort_by_key(|(peer, _)| *peer);
+        if participants.len() != state.binding().activation().tickets().len() {
+            return Err(StoreError::Corruption(
+                "activation contains a non-active participant ticket".into(),
+            ));
+        }
+        let keys = participants.iter().map(|(_, key)| *key).collect::<Vec<_>>();
+        let mut trace = Vec::with_capacity(raw.len());
+        let mut cursor_state = state.binding().activation().offer().data().initial_state;
+        let mut cursor_link = arena0_protocol::CHAIN_START;
+        for (index, (step, origin_event_position, version, artifact, entry_hash)) in
+            raw.into_iter().enumerate()
+        {
+            let step = sqlite_i64(step)?;
+            let expected_step = index as u64;
+            if step != expected_step {
                 return Err(StoreError::Corruption(
-                    "inbox source changed before application".into(),
+                    "agreed steps are not gapless".into(),
                 ));
             }
-            if status == InboxStatus::Applied {
-                return Ok(ApplyOutcome::InboxAlreadyApplied {
-                    inbox_id: reference.inbox_id,
-                    version: applied_version.ok_or_else(|| {
-                        StoreError::Corruption("applied inbox row has no version".into())
-                    })?,
-                });
+            let origin_event_position = sqlite_i64(origin_event_position)?;
+            let origin_exists = self
+                .connection
+                .query_row(
+                    "SELECT 1 FROM event_records
+                     WHERE execution_id = ?1 AND event_position = ?2",
+                    params![
+                        state.execution_id().0.to_vec(),
+                        sqlite_u64(origin_event_position)?,
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if origin_exists != Some(1) {
+                return Err(StoreError::Corruption(
+                    "agreed step origin has no event record".into(),
+                ));
             }
-            if status == InboxStatus::Consumed {
-                return Ok(ApplyOutcome::InboxAlreadyConsumed {
-                    inbox_id: reference.inbox_id,
-                });
+            let version = sqlite_i64(version)?;
+            if version == 0 || version > state.version().get() {
+                return Err(StoreError::Corruption(
+                    "agreed step version is invalid".into(),
+                ));
             }
-        }
-
-        let existing = self
-            .connection
-            .query_row(
-                "SELECT digest, committed_version FROM occurrences
-                 WHERE execution_id = ?1 AND occurrence_key = ?2",
-                params![execution_id.0.to_vec(), occurrence_key.clone()],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
-            )
-            .optional()?;
-        if let Some((existing_bytes, existing_version)) = existing {
-            let existing =
-                OccurrenceDigest::from_bytes(array32(&existing_bytes, "occurrence digest")?);
-            if existing == occurrence_digest {
-                if let Some(reference) = inbox.filter(|reference| reference.complete_on_apply) {
-                    self.mark_inbox_applied(
-                        execution_id,
-                        reference,
-                        ExecutionVersion::new(sqlite_i64(existing_version)?),
-                    )?;
-                }
-                return Ok(ApplyOutcome::AlreadyApplied);
-            }
-            let conflict = OccurrenceConflict::new(occurrence.key(), existing, occurrence_digest);
-            self.connection.execute(
-                "INSERT INTO occurrence_conflicts
-                 (execution_id, occurrence_key, existing_digest, incoming_digest,
-                  incoming_input, observed_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    execution_id.0.to_vec(),
-                    occurrence_key,
-                    existing.as_bytes().to_vec(),
-                    occurrence_digest.as_bytes().to_vec(),
-                    envelope(EnvelopeKind::ExecutionInput, &input_bytes)?,
-                    sqlite_u64(now_ms)?,
-                ],
+            let entry: arena0_protocol::TraceEntry = decode_borsh(
+                &open_envelope(
+                    EnvelopeKind::AgreedStep,
+                    &artifact,
+                    arena0_protocol::MAX_TRACE_ENTRY_BYTES,
+                )?,
+                "agreed trace entry",
             )?;
-            return Ok(ApplyOutcome::Conflict(conflict));
+            if entry.step != step || entry.entry_hash() != array32(&entry_hash, "entry hash")? {
+                return Err(StoreError::Corruption(
+                    "agreed step index does not match entry".into(),
+                ));
+            }
+            if entry.pre_state != cursor_state {
+                return Err(StoreError::Corruption(
+                    "agreed trace pre-state does not match cursor".into(),
+                ));
+            }
+            let commitment =
+                StepCommitment::for_entry(state.binding().session_id(), &entry, cursor_link);
+            if commitment.post_state != entry.post_state
+                || !entry.agreement.signers.is_full(keys.len())
+            {
+                return Err(StoreError::Corruption(
+                    "agreed trace commitment is inconsistent".into(),
+                ));
+            }
+            entry
+                .agreement
+                .verify_signatures(step, &commitment.signing_bytes(), &keys)
+                .map_err(|error| StoreError::Corruption(format!("agreed signature: {error}")))?;
+            cursor_state = entry.post_state;
+            cursor_link = commitment.link_hash();
+            trace.push(entry);
         }
-
-        let transition = arena0_protocol::execution::transition(&state, input)?;
-        let TransitionOutcome::Commit(plan) = transition else {
-            return Err(StoreError::Corruption(format!(
-                "execution {execution_id} recognizes applied input without its occurrence fact"
-            )));
-        };
-        self.commit_plan_in_transaction(&state, &plan, occurrence, &input_bytes, inbox, now_ms)
+        if trace.len() as u64 != state.agreed_step()
+            || cursor_state != state.agreed_state()
+            || cursor_link != state.agreed_link()
+        {
+            return Err(StoreError::Corruption(
+                "agreed trace does not match execution cursor".into(),
+            ));
+        }
+        Ok(trace)
     }
 
-    pub(super) fn mark_inbox_applied(
+    fn commit_staged_event(
         &mut self,
         execution_id: ExecId,
-        reference: InboxReference,
+        proposal: &arena0_protocol::SharedProposal,
+        successor: Option<&arena0_protocol::SharedProposal>,
         version: ExecutionVersion,
+        now_ms: u64,
+        state: &ExecutionState,
     ) -> Result<(), StoreError> {
-        let changed = self.connection.execute(
-            "UPDATE inbox SET status = 'applied', applied_version = ?1
-             WHERE execution_id = ?2 AND inbox_id = ?3 AND source = ?4
-               AND status = 'accepted'",
-            params![
-                sqlite_u64(version.get())?,
-                execution_id.0.to_vec(),
-                reference.inbox_id.as_bytes().to_vec(),
-                reference.source.0.to_vec(),
-            ],
-        )?;
-        if changed != 1 {
+        let release_effects = proposal
+            .effects()
+            .iter()
+            .filter(|(_, effect)| !matches!(effect, Effect::Broadcast { .. }))
+            .cloned()
+            .collect::<Vec<_>>();
+        let deferred_broadcast =
+            proposal
+                .effects()
+                .iter()
+                .find_map(|(ordinal, effect)| match effect {
+                    Effect::Broadcast { data } => Some((*ordinal, data.clone())),
+                    _ => None,
+                });
+        if successor.is_some() != deferred_broadcast.is_some() {
             return Err(StoreError::Corruption(
-                "inbox responsibility CAS failed while acknowledging duplicate".into(),
+                "deferred broadcast and successor proposal disagree".into(),
             ));
+        }
+        let event_exists = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM event_records
+                 WHERE execution_id = ?1 AND event_position = ?2",
+                params![
+                    execution_id.0.to_vec(),
+                    sqlite_u64(proposal.event_position())?,
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if event_exists != Some(1) {
+            return Err(StoreError::Corruption(
+                "step signature did not find its event record".into(),
+            ));
+        }
+        self.insert_agreed_step(
+            execution_id,
+            proposal.event_position(),
+            version,
+            proposal.entry(),
+        )?;
+        self.persist_effects(
+            execution_id,
+            proposal.event_position(),
+            version,
+            &release_effects,
+            now_ms,
+            state,
+        )?;
+        if let (Some(successor), Some((ordinal, _))) = (successor, deferred_broadcast) {
+            let frame = successor_broadcast_frame(successor)?;
+            let frame_ordinal = message_frame_ordinal(ordinal)?;
+            self.persist_frame_for_remotes(
+                execution_id,
+                proposal.event_position(),
+                version,
+                frame_ordinal,
+                &frame,
+                state,
+                now_ms,
+            )?;
         }
         Ok(())
     }
 
-    pub(super) fn commit_plan_in_transaction(
-        &mut self,
-        state: &ExecutionState,
-        plan: &CommitPlan,
-        occurrence: OccurrenceEvidence,
-        input_bytes: &[u8],
-        inbox: Option<InboxReference>,
-        now_ms: u64,
-    ) -> Result<ApplyOutcome, StoreError> {
-        if plan.execution_id() != state.execution_id()
-            || plan.expected_version() != state.version()
-            || plan.occurrence() != occurrence
-        {
-            return Err(StoreError::Corruption(
-                "reducer plan does not match loaded execution or occurrence".into(),
-            ));
-        }
-        let expected = plan.expected_version();
-        let next = plan.next_version();
-        if next
-            != expected.next().ok_or_else(|| {
-                StoreError::Corruption("plan advances an exhausted execution version".into())
-            })?
-        {
-            return Err(StoreError::Corruption(
-                "plan next version is not the expected single-step successor".into(),
-            ));
-        }
-
-        // CAS the aggregate before writing projections.  The enclosing
-        // transaction rolls it back if any projection fails.
-        let encoded_state = state_bytes(plan.next_state())?;
-        let local = plan.next_state().local_state().as_bytes();
-        let changed = self.connection.execute(
-            "UPDATE executions SET state = ?1,
-                local_state_checksum = ?2, version = ?3, lifecycle = ?4,
-                public_step = ?5, private_next_record = ?6, updated_at_ms = ?7
-             WHERE execution_id = ?8 AND version = ?9",
-            params![
-                envelope(EnvelopeKind::ExecutionState, &encoded_state)?,
-                checksum(local).to_vec(),
-                sqlite_u64(next.get())?,
-                lifecycle_tag(plan.next_state().lifecycle()),
-                sqlite_u64(plan.next_state().public().next_step())?,
-                sqlite_u64(plan.next_state().private().next_record())?,
-                sqlite_u64(now_ms)?,
-                state.execution_id().0.to_vec(),
-                sqlite_u64(expected.get())?,
-            ],
-        )?;
-        if changed != 1 {
-            let actual = self
-                .load_execution_from_sqlite(state.execution_id())?
-                .ok_or(StoreError::ExecutionNotFound(state.execution_id()))?;
-            self.validate_projection_rows(&actual)?;
-            let actual_version = actual.version();
-            self.pending_execution = Some(PendingExecution {
-                encoded_bytes: state_bytes(&actual)?.len(),
-                state: actual,
-            });
-            return Ok(ApplyOutcome::VersionMismatch {
-                expected,
-                actual: actual_version,
-            });
-        }
-
-        self.insert_occurrence(state.execution_id(), occurrence, input_bytes, next, now_ms)?;
-        self.persist_shared_commit(state.execution_id(), next, plan)?;
-        self.persist_private_commit(state.execution_id(), next, plan)?;
-        self.persist_terminal(state.execution_id(), next, plan, now_ms)?;
-        self.persist_timers(state.execution_id(), next, plan)?;
-        self.persist_outbox(state.execution_id(), next, plan, now_ms)?;
-        if let Some(reference) = inbox.filter(|reference| reference.complete_on_apply) {
-            self.mark_inbox_applied(state.execution_id(), reference, next)?;
-        }
-        self.pending_execution = Some(PendingExecution {
-            state: plan.next_state().clone(),
-            encoded_bytes: encoded_state.len(),
-        });
-        let previous_public_step = state.public().next_step();
-        let next_public_step = plan.next_state().public().next_step();
-        let public_step =
-            (next_public_step != previous_public_step).then_some(previous_public_step);
-        Ok(ApplyOutcome::Committed(CommittedSummary {
-            version: next,
-            public_step,
-        }))
-    }
-
-    pub(super) fn insert_occurrence(
+    fn insert_event_record(
         &mut self,
         execution_id: ExecId,
-        occurrence: OccurrenceEvidence,
-        input_bytes: &[u8],
-        version: ExecutionVersion,
-        now_ms: u64,
+        event_position: u64,
+        event: &[u8],
+        effects: &[u8],
     ) -> Result<(), StoreError> {
         self.connection.execute(
-            "INSERT INTO occurrences
-             (execution_id, occurrence_key, digest, input, committed_version, committed_at_ms)
+            "INSERT INTO event_records
+             (execution_id, event_position, event, effects, event_digest)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                execution_id.0.to_vec(),
+                sqlite_u64(event_position)?,
+                envelope(EnvelopeKind::EventRecord, event)?,
+                envelope(EnvelopeKind::Effects, effects)?,
+                dispatch_digest(event, effects).to_vec(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn insert_agreed_step(
+        &mut self,
+        execution_id: ExecId,
+        origin_event_position: u64,
+        version: ExecutionVersion,
+        entry: &arena0_protocol::TraceEntry,
+    ) -> Result<(), StoreError> {
+        let bytes = borsh::to_vec(entry)
+            .map_err(|error| StoreError::Corruption(format!("agreed entry encode: {error}")))?;
+        self.connection.execute(
+            "INSERT INTO agreed_steps
+             (execution_id, step, origin_event_position, version, artifact, entry_hash)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 execution_id.0.to_vec(),
-                occurrence_key_bytes(occurrence.key())?,
-                occurrence.digest().as_bytes().to_vec(),
-                envelope(EnvelopeKind::ExecutionInput, input_bytes)?,
+                sqlite_u64(entry.step)?,
+                sqlite_u64(origin_event_position)?,
                 sqlite_u64(version.get())?,
+                envelope(EnvelopeKind::AgreedStep, &bytes)?,
+                entry.entry_hash().to_vec(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn persist_state_cas(
+        &mut self,
+        current: &ExecutionState,
+        next: &ExecutionState,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        let bytes = state_bytes(next)?;
+        let changed = self.connection.execute(
+            "UPDATE executions SET state = ?1, local_state_checksum = ?2,
+                    version = ?3, lifecycle = ?4, agreed_step = ?5,
+                    event_position = ?6, updated_at_ms = ?7
+             WHERE execution_id = ?8 AND version = ?9",
+            params![
+                envelope(EnvelopeKind::ExecutionState, &bytes)?,
+                checksum(next.local_state().as_bytes()).to_vec(),
+                sqlite_u64(next.version().get())?,
+                lifecycle_tag(next.lifecycle()),
+                sqlite_u64(next.agreed_step())?,
+                sqlite_u64(next.event_position())?,
                 sqlite_u64(now_ms)?,
+                current.execution_id().0.to_vec(),
+                sqlite_u64(current.version().get())?,
             ],
         )?;
-        Ok(())
-    }
-
-    pub(super) fn persist_shared_commit(
-        &mut self,
-        execution_id: ExecId,
-        version: ExecutionVersion,
-        plan: &CommitPlan,
-    ) -> Result<(), StoreError> {
-        let Some(shared) = plan.shared() else {
-            return Ok(());
-        };
-        let entry = shared.entry();
-        let step = entry.step;
-        let entry_hash = entry.entry_hash();
-        let bytes = borsh::to_vec(shared)
-            .map_err(|error| StoreError::Corruption(format!("shared commit encode: {error}")))?;
-        self.connection.execute(
-            "INSERT INTO public_commits
-             (execution_id, step, version, artifact, entry_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                execution_id.0.to_vec(),
-                sqlite_u64(step)?,
-                sqlite_u64(version.get())?,
-                envelope(EnvelopeKind::SharedCommit, &bytes)?,
-                entry_hash.to_vec(),
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub(super) fn persist_private_commit(
-        &mut self,
-        execution_id: ExecId,
-        version: ExecutionVersion,
-        plan: &CommitPlan,
-    ) -> Result<(), StoreError> {
-        let Some(private) = plan.private() else {
-            return Ok(());
-        };
-        let record = private.record();
-        let sequence = record.seq;
-        let bytes = borsh::to_vec(private)
-            .map_err(|error| StoreError::Corruption(format!("private commit encode: {error}")))?;
-        self.connection.execute(
-            "INSERT INTO private_commits
-             (execution_id, sequence, version, artifact, record_digest)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                execution_id.0.to_vec(),
-                sqlite_u64(sequence)?,
-                sqlite_u64(version.get())?,
-                envelope(EnvelopeKind::PrivateCommit, &bytes)?,
-                checksum(&bytes).to_vec(),
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub(super) fn validate_occurrences(&mut self) -> Result<(), StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT execution_id, occurrence_key, digest, input, committed_version
-             FROM occurrences ORDER BY execution_id, occurrence_key",
-        )?;
-        let mut rows = statement.query([])?;
-        let mut values = Vec::new();
-        while let Some(row) = rows.next()? {
-            values.push((
-                ExecId(array32(&row.get::<_, Vec<u8>>(0)?, "occurrence execution")?),
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, i64>(4)?,
+        if changed != 1 {
+            return Err(StoreError::Corruption(
+                "execution compare-and-set changed no row".into(),
             ));
         }
-        drop(rows);
-        drop(statement);
-        for (execution_id, key, digest, input, version) in values {
-            let state = self
-                .load_execution(execution_id)?
-                .ok_or(StoreError::ExecutionNotFound(execution_id))?;
-            let key: OccurrenceKey = decode_borsh(&key, "occurrence key")?;
-            if key.execution_id() != execution_id {
-                return Err(StoreError::Corruption(
-                    "occurrence key is bound to another execution".into(),
+        Ok(())
+    }
+
+    fn cache_pending(&mut self, state: ExecutionState) -> Result<(), StoreError> {
+        self.pending_execution = Some(PendingExecution {
+            encoded_bytes: state_bytes(&state)?.len(),
+            state,
+        });
+        Ok(())
+    }
+
+    fn version_mismatch(
+        &mut self,
+        state: ExecutionState,
+        expected: ExecutionVersion,
+    ) -> Result<ApplyOutcome, StoreError> {
+        Ok(ApplyOutcome::VersionMismatch {
+            expected,
+            actual: state.version(),
+        })
+    }
+
+    fn inbox_replay_outcome(
+        &mut self,
+        state: &ExecutionState,
+        inbox_id: Option<InboxId>,
+    ) -> Result<Option<ApplyOutcome>, StoreError> {
+        let Some(inbox_id) = inbox_id else {
+            return Ok(None);
+        };
+        let (_, _, status, version) =
+            self.load_inbox_fact(state.execution_id(), inbox_id, state)?;
+        match status {
+            InboxStatus::Accepted => Ok(None),
+            InboxStatus::Applied => Ok(Some(ApplyOutcome::InboxAlreadyApplied {
+                inbox_id,
+                version: version.ok_or_else(|| {
+                    StoreError::Corruption("applied inbox row has no version".into())
+                })?,
+            })),
+            InboxStatus::Consumed => Ok(Some(ApplyOutcome::InboxAlreadyConsumed { inbox_id })),
+        }
+    }
+
+    fn validate_step_inbox(
+        &mut self,
+        state: &ExecutionState,
+        signature: &ParticipantStepSignature,
+        inbox_id: Option<InboxId>,
+    ) -> Result<(), StoreError> {
+        let Some(inbox_id) = inbox_id else {
+            if signature.participant() != self.host_id || state.producer() != self.host_id {
+                return Err(StoreError::UnauthenticatedSource(
+                    "local step evidence is not authored by this Host".into(),
                 ));
             }
-            let input = open_envelope(
-                EnvelopeKind::ExecutionInput,
-                &input,
-                arena0_protocol::MAX_EXECUTION_INPUT_BYTES,
-            )?;
-            let input = ExecutionInput::decode(&input)?;
-            let evidence = input.occurrence(&state)?;
-            if evidence.key() != key
-                || evidence.digest().as_bytes() != array32(&digest, "occurrence digest")?.as_slice()
-                || sqlite_i64(version)? > state.version().get()
-            {
+            return Ok(());
+        };
+        let (source, stored, status, _) =
+            self.load_inbox_fact(state.execution_id(), inbox_id, state)?;
+        let ExecFrame::StepSignature {
+            commitment,
+            signature: frame_signature,
+        } = decode_stored_frame(&stored)?
+        else {
+            return Err(StoreError::InboxInputMismatch {
+                inbox_id,
+                part_index: 0,
+            });
+        };
+        let pending_matches = state
+            .pending_shared()
+            .is_some_and(|proposal| proposal.commitment() == &commitment);
+        if source != signature.participant()
+            || frame_signature != signature.signature().sig
+            || signature.signature().step != commitment.step
+            || (status == InboxStatus::Accepted && !pending_matches)
+        {
+            return Err(StoreError::InboxInputMismatch {
+                inbox_id,
+                part_index: 0,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_terminal_inbox(
+        &mut self,
+        state: &ExecutionState,
+        signature: &ParticipantTerminalSignature,
+        inbox_id: Option<InboxId>,
+    ) -> Result<(), StoreError> {
+        let Some(inbox_id) = inbox_id else {
+            if signature.participant() != self.host_id || state.producer() != self.host_id {
+                return Err(StoreError::UnauthenticatedSource(
+                    "local terminal evidence is not authored by this Host".into(),
+                ));
+            }
+            return Ok(());
+        };
+        let (source, stored, status, _) =
+            self.load_inbox_fact(state.execution_id(), inbox_id, state)?;
+        let ExecFrame::End {
+            commitment,
+            signature: frame_signature,
+        } = decode_stored_frame(&stored)?
+        else {
+            return Err(StoreError::InboxInputMismatch {
+                inbox_id,
+                part_index: 0,
+            });
+        };
+        if source != signature.participant()
+            || frame_signature != signature.signature()
+            || (status == InboxStatus::Accepted && state.pending_terminal() != Some(&commitment))
+        {
+            return Err(StoreError::InboxInputMismatch {
+                inbox_id,
+                part_index: 0,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_abort_inbox(
+        &mut self,
+        state: &ExecutionState,
+        occurrence: &AbortOccurrence,
+        inbox_id: Option<InboxId>,
+    ) -> Result<(), StoreError> {
+        let Some(inbox_id) = inbox_id else {
+            if occurrence.sender() != self.host_id || state.producer() != self.host_id {
+                return Err(StoreError::UnauthenticatedSource(
+                    "local abort evidence is not authored by this Host".into(),
+                ));
+            }
+            return Ok(());
+        };
+        let (source, stored, _status, _) =
+            self.load_inbox_fact(state.execution_id(), inbox_id, state)?;
+        let ExecFrame::Abort {
+            occurrence: stored_occurrence,
+        } = decode_stored_frame(&stored)?
+        else {
+            return Err(StoreError::InboxInputMismatch {
+                inbox_id,
+                part_index: 0,
+            });
+        };
+        if source != occurrence.sender() || stored_occurrence != *occurrence {
+            return Err(StoreError::InboxInputMismatch {
+                inbox_id,
+                part_index: 0,
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_event_rows(&mut self, state: &ExecutionState) -> Result<(), StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT event_position, event, effects, event_digest
+             FROM event_records WHERE execution_id = ?1 ORDER BY event_position",
+        )?;
+        let mut rows = statement.query(params![state.execution_id().0.to_vec()])?;
+        let mut count = 0u64;
+        while let Some(row) = rows.next()? {
+            let position = sqlite_i64(row.get::<_, i64>(0)?)?;
+            if position != count {
                 return Err(StoreError::Corruption(
-                    "occurrence row does not match its canonical input".into(),
+                    "event positions are not gapless".into(),
+                ));
+            }
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| StoreError::Corruption("event count overflow".into()))?;
+            let event_payload = open_envelope(
+                EnvelopeKind::EventRecord,
+                &row.get::<_, Vec<u8>>(1)?,
+                arena0_protocol::MAX_EXECUTION_STATE_BYTES,
+            )?;
+            let effects_payload = open_envelope(
+                EnvelopeKind::Effects,
+                &row.get::<_, Vec<u8>>(2)?,
+                arena0_protocol::MAX_RECEIPT_BYTES,
+            )?;
+            let _: Event<Vec<u8>> = decode_borsh(&event_payload, "event record event")?;
+            let effects: Vec<Effect> = decode_borsh(&effects_payload, "event record effects")?;
+            validate_effect_payloads(&effects)?;
+            if dispatch_digest(&event_payload, &effects_payload)
+                != array32(&row.get::<_, Vec<u8>>(3)?, "event digest")?
+            {
+                return Err(StoreError::Corruption("event digest mismatch".into()));
+            }
+        }
+        if count != state.event_position() {
+            return Err(StoreError::Corruption(
+                "event records do not match execution position".into(),
+            ));
+        }
+        if let Some(proposal) = state.pending_shared() {
+            let Some(last_position) = count.checked_sub(1) else {
+                return Err(StoreError::Corruption(
+                    "pending proposal has no originating event record".into(),
+                ));
+            };
+            if proposal.event_position() != last_position {
+                return Err(StoreError::Corruption(
+                    "pending proposal is not paired with the last event record".into(),
                 ));
             }
         }
         Ok(())
     }
 
-    pub(super) fn validate_public_rows(
+    pub(super) fn validate_agreed_rows(
         &mut self,
         state: &ExecutionState,
     ) -> Result<(), StoreError> {
-        let execution_id = state.execution_id();
-        let mut statement = self.connection.prepare(
-            "SELECT step, version, artifact, entry_hash FROM public_commits
-             WHERE execution_id = ?1 ORDER BY step",
-        )?;
-        let mut rows = statement.query(params![execution_id.0.to_vec()])?;
-        let mut commits = Vec::new();
-        while let Some(row) = rows.next()? {
-            commits.push((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-            ));
-        }
-        drop(rows);
-        drop(statement);
-        for (index, (step, version, encoded, hash)) in commits.iter().enumerate() {
-            let step = sqlite_i64(*step)?;
-            if step
-                != u64::try_from(index)
-                    .map_err(|_| StoreError::Corruption("public step overflow".into()))?
-            {
-                return Err(StoreError::Corruption(
-                    "public commit steps are not gapless".into(),
-                ));
-            }
-            let version = sqlite_i64(*version)?;
-            if version == 0 || version > state.version().get() {
-                return Err(StoreError::Corruption(
-                    "public commit version is invalid".into(),
-                ));
-            }
-            let payload = open_envelope(
-                EnvelopeKind::SharedCommit,
-                encoded,
-                arena0_protocol::MAX_COMMIT_PLAN_BYTES,
-            )?;
-            let commit: arena0_protocol::SharedCommit = decode_borsh(&payload, "public commit")?;
-            let entry = commit.entry();
-            if entry.step != step || entry.entry_hash() != array32(hash, "public entry hash")? {
-                return Err(StoreError::Corruption(
-                    "public commit index mismatch".into(),
-                ));
-            }
-            let commitment = commit.certificate().commitment();
-            if commitment.session_id != state.binding().session_id()
-                || commitment.step != entry.step
-                || commitment.entry_hash != entry.entry_hash()
-                || commitment.pre_state != entry.pre_state
-                || commitment.post_state != entry.post_state
-            {
-                return Err(StoreError::Corruption(
-                    "public certificate does not match entry".into(),
-                ));
-            }
-        }
-        let commit_count = u64::try_from(commits.len())
-            .map_err(|_| StoreError::Corruption("public commit count overflows u64".into()))?;
-        if state.public().next_step() != commit_count {
-            return Err(StoreError::Corruption(
-                "public cursor does not match public commits".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    pub(super) fn validate_private_rows(
-        &mut self,
-        state: &ExecutionState,
-    ) -> Result<(), StoreError> {
-        let execution_id = state.execution_id();
-        let mut statement = self.connection.prepare(
-            "SELECT sequence, version, artifact, record_digest FROM private_commits
-             WHERE execution_id = ?1 ORDER BY sequence",
-        )?;
-        let mut rows = statement.query(params![execution_id.0.to_vec()])?;
-        let mut records = Vec::new();
-        while let Some(row) = rows.next()? {
-            records.push((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-            ));
-        }
-        drop(rows);
-        drop(statement);
-        for (index, (sequence, version, encoded, digest)) in records.iter().enumerate() {
-            let sequence = sqlite_i64(*sequence)?;
-            if sequence
-                != u64::try_from(index)
-                    .map_err(|_| StoreError::Corruption("private sequence overflow".into()))?
-            {
-                return Err(StoreError::Corruption(
-                    "private commit sequences are not gapless".into(),
-                ));
-            }
-            let version = sqlite_i64(*version)?;
-            if version == 0 || version > state.version().get() {
-                return Err(StoreError::Corruption(
-                    "private commit version is invalid".into(),
-                ));
-            }
-            let payload = open_envelope(
-                EnvelopeKind::PrivateCommit,
-                encoded,
-                arena0_protocol::MAX_PRIVATE_RECORD_BYTES + 1024,
-            )?;
-            let commit: arena0_protocol::PrivateCommit = decode_borsh(&payload, "private commit")?;
-            if commit.record().seq != sequence
-                || checksum(&borsh::to_vec(&commit).map_err(|error| {
-                    StoreError::Corruption(format!("private commit encode: {error}"))
-                })?) != array32(digest, "private record digest")?
-            {
-                return Err(StoreError::Corruption(
-                    "private commit index mismatch".into(),
-                ));
-            }
-        }
-        let record_count = u64::try_from(records.len())
-            .map_err(|_| StoreError::Corruption("private commit count overflows u64".into()))?;
-        if state.private().next_record() != record_count {
-            return Err(StoreError::Corruption(
-                "private cursor does not match private commits".into(),
-            ));
-        }
+        let _ = self.load_agreed_trace_in_transaction(state)?;
         Ok(())
     }
 
     pub(super) fn validate_timer_rows(&mut self, state: &ExecutionState) -> Result<(), StoreError> {
-        let expected: std::collections::BTreeSet<_> = state.active_timers().collect();
         let mut statement = self.connection.prepare(
-            "SELECT timer_id, deadline_ms, payload, armed_version FROM active_timers
-             WHERE execution_id = ?1 ORDER BY timer_id",
+            "SELECT timer_id, deadline_ms, payload, armed_version
+             FROM active_timers WHERE execution_id = ?1 ORDER BY timer_id",
         )?;
         let mut rows = statement.query(params![state.execution_id().0.to_vec()])?;
-        let mut actual = std::collections::BTreeSet::new();
         while let Some(row) = rows.next()? {
-            let timer_id = TimerId::from_bytes(array32(&row.get::<_, Vec<u8>>(0)?, "timer id")?);
-            if !expected.contains(&timer_id) {
-                return Err(StoreError::Corruption(
-                    "timer projection contains an unknown timer".into(),
-                ));
+            if row.get::<_, Vec<u8>>(0)?.len() != 32 {
+                return Err(StoreError::Corruption("timer id is not 32 bytes".into()));
             }
-            let deadline = sqlite_i64(row.get::<_, i64>(1)?)?;
-            let armed_version = sqlite_i64(row.get::<_, i64>(3)?)?;
-            if armed_version == 0 || armed_version > state.version().get() {
-                return Err(StoreError::Corruption(
-                    "timer armed version is invalid".into(),
-                ));
-            }
-            let _ = deadline;
-            let _ = open_envelope(
+            let _ = sqlite_i64(row.get::<_, i64>(1)?)?;
+            let payload = open_envelope(
                 EnvelopeKind::Timer,
                 &row.get::<_, Vec<u8>>(2)?,
-                arena0_protocol::MAX_TIMER_PAYLOAD_BYTES,
+                MAX_TIMER_RECORD_BYTES,
             )?;
-            actual.insert(timer_id);
+            let timer: Option<TimerPayload> = decode_borsh(&payload, "timer payload")?;
+            if timer.as_ref().is_some_and(|timer| {
+                timer.type_name.len() > arena0_protocol::MAX_TERMINAL_REASON_BYTES
+                    || timer.data.len() > arena0_protocol::MAX_TIMER_PAYLOAD_BYTES
+            }) {
+                return Err(StoreError::Corruption(
+                    "timer payload exceeds bounds".into(),
+                ));
+            }
+            let armed = sqlite_i64(row.get::<_, i64>(3)?)?;
+            if armed == 0 || armed > state.version().get() {
+                return Err(StoreError::Corruption("timer version is invalid".into()));
+            }
         }
-        if actual != expected {
+        Ok(())
+    }
+
+    fn validate_timer_source(
+        &mut self,
+        execution_id: ExecId,
+        timer_id: TimerId,
+        event: &Event<Vec<u8>>,
+    ) -> Result<(), StoreError> {
+        let payload: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT payload FROM active_timers WHERE execution_id = ?1 AND timer_id = ?2",
+                params![execution_id.0.to_vec(), timer_id.as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let payload =
+            payload.ok_or_else(|| StoreError::Corruption("timer source is not active".into()))?;
+        let payload = open_envelope(EnvelopeKind::Timer, &payload, MAX_TIMER_RECORD_BYTES)?;
+        let timer: Option<TimerPayload> = decode_borsh(&payload, "timer payload")?;
+        match event {
+            Event::TimerFired if timer.is_none() => Ok(()),
+            Event::TypedTimerFired { timer: expected } if timer.as_ref() == Some(expected) => {
+                Ok(())
+            }
+            _ => Err(StoreError::Corruption(
+                "timer event does not match active timer".into(),
+            )),
+        }
+    }
+
+    fn consume_timer(&mut self, execution_id: ExecId, timer_id: TimerId) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "DELETE FROM active_timers WHERE execution_id = ?1 AND timer_id = ?2",
+            params![execution_id.0.to_vec(), timer_id.as_bytes().to_vec()],
+        )?;
+        if changed != 1 {
             return Err(StoreError::Corruption(
-                "timer projection does not match state".into(),
+                "timer consume compare-and-set failed".into(),
             ));
         }
         Ok(())
     }
+
+    /// Cancel all active timers while the execution is being frozen. Timer
+    /// rows are the scheduling authority, so this deletion must share the
+    /// terminal state CAS transaction; otherwise a restart could enqueue work
+    /// for an execution whose proof is already incomplete.
+    fn cancel_active_timers(&mut self, execution_id: ExecId) -> Result<(), StoreError> {
+        self.connection.execute(
+            "DELETE FROM active_timers WHERE execution_id = ?1",
+            params![execution_id.0.to_vec()],
+        )?;
+        Ok(())
+    }
+
+    /// Close the exact durable request that supplied a continuation answer.
+    /// The row is identified by the protocol's `(execution,event,ordinal)`
+    /// pending identity, not by the current event position or by whichever
+    /// request happens to be first in the outbox. Clearing a live lease here
+    /// makes the dispatch transaction the acknowledgement point; a later
+    /// explicit delivery acknowledgement is consequently idempotent.
+    fn acknowledge_pending_effect(
+        &mut self,
+        execution_id: ExecId,
+        pending: PendingId,
+        event: &Event<Vec<u8>>,
+    ) -> Result<(), StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT outbox_id, event_position, ordinal, status, payload
+             FROM outbox
+             WHERE execution_id = ?1 AND destination IS NULL AND payload_kind = 'effect'
+             ORDER BY event_position, ordinal",
+        )?;
+        let mut rows = statement.query(params![execution_id.0.to_vec()])?;
+        let mut match_row: Option<(OutboxId, String, Effect)> = None;
+        while let Some(row) = rows.next()? {
+            let event_position = sqlite_i64(row.get::<_, i64>(1)?)?;
+            let ordinal = u32::try_from(sqlite_i64(row.get::<_, i64>(2)?)?)
+                .map_err(|_| StoreError::Corruption("pending effect ordinal exceeds u32".into()))?;
+            if pending_id(execution_id, event_position, ordinal) != pending {
+                continue;
+            }
+            let effect: Effect = decode_borsh(&row.get::<_, Vec<u8>>(4)?, "pending effect")?;
+            let outbox_id = OutboxId::from_bytes(array32(&row.get::<_, Vec<u8>>(0)?, "outbox id")?);
+            if match_row.is_some() {
+                return Err(StoreError::Corruption(
+                    "pending identity names multiple durable effects".into(),
+                ));
+            }
+            match_row = Some((outbox_id, row.get::<_, String>(3)?, effect));
+        }
+        drop(rows);
+        drop(statement);
+        let Some((outbox_id, status, effect)) = match_row else {
+            return Err(StoreError::Corruption(
+                "pending continuation has no durable originating effect".into(),
+            ));
+        };
+        let operation_matches = match (event, &effect) {
+            (
+                Event::InputReceived {
+                    callout_index,
+                    continuation_tag,
+                    ..
+                },
+                Effect::Callout {
+                    callout_index: effect_index,
+                    continuation_tag: effect_tag,
+                    ..
+                },
+            ) => callout_index == effect_index && continuation_tag == effect_tag,
+            (
+                Event::Signed {
+                    continuation_tag, ..
+                },
+                Effect::Sign {
+                    continuation_tag: effect_tag,
+                    ..
+                },
+            ) => continuation_tag == effect_tag,
+            _ => false,
+        };
+        if !operation_matches {
+            return Err(StoreError::Protocol(
+                ProtocolError::PendingContinuationMismatch,
+            ));
+        }
+        if parse_outbox_status(&status)? == OutboxStatus::Acknowledged {
+            // The exact request may already have been acknowledged by the
+            // delivery worker. The answer still consumes every retry marker
+            // emitted while that same continuation remained pending.
+            self.cancel_retry_effects(execution_id)?;
+            return Ok(());
+        }
+        self.acknowledge_effect_rows(execution_id, &[outbox_id])?;
+        // RetryInput is deliberately not a second continuation. It is a
+        // durable request to redeliver the one existing continuation, so the
+        // successful answer retires all of its pending/leased retry rows in
+        // this same transaction.
+        self.cancel_retry_effects(execution_id)?;
+        Ok(())
+    }
+}
+
+fn validate_pending_answer(
+    state: &ExecutionState,
+    event: &Event<Vec<u8>>,
+    pending_id: Option<PendingId>,
+    effects: &[Effect],
+) -> Result<bool, StoreError> {
+    let lifecycle = effects.iter().any(|effect| {
+        matches!(
+            effect,
+            Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. }
+        )
+    });
+    let continuation = effects.iter().any(|effect| {
+        matches!(
+            effect,
+            Effect::Callout { .. }
+                | Effect::Sign { .. }
+                | Effect::RetryInput { .. }
+                | Effect::SetTimer { .. }
+        )
+    });
+    if lifecycle && continuation {
+        return Err(StoreError::Protocol(ProtocolError::InvalidTerminalStatus));
+    }
+    let answer = matches!(event, Event::InputReceived { .. } | Event::Signed { .. });
+    let retries = effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::RetryInput { .. }));
+    if !answer {
+        if retries {
+            let Some(current) = state.status().pending() else {
+                return Err(StoreError::Protocol(
+                    ProtocolError::PendingContinuationMismatch,
+                ));
+            };
+            if !matches!(
+                current.operation,
+                arena0_protocol::PendingOperation::Callout { .. }
+            ) {
+                return Err(StoreError::Protocol(
+                    ProtocolError::PendingContinuationMismatch,
+                ));
+            }
+            if pending_id.is_some_and(|id| id != current.id) {
+                return Err(StoreError::Protocol(
+                    ProtocolError::PendingContinuationMismatch,
+                ));
+            }
+            return Ok(false);
+        }
+        if pending_id.is_some() {
+            return Err(StoreError::Protocol(
+                ProtocolError::PendingContinuationMismatch,
+            ));
+        }
+        return Ok(false);
+    }
+    let Some(pending_id) = pending_id else {
+        return Err(StoreError::Protocol(
+            ProtocolError::PendingContinuationMismatch,
+        ));
+    };
+    let Some(current) = state.status().pending() else {
+        return Err(StoreError::Protocol(
+            ProtocolError::PendingContinuationMismatch,
+        ));
+    };
+    if current.id != pending_id {
+        return Err(StoreError::Protocol(
+            ProtocolError::PendingContinuationMismatch,
+        ));
+    }
+    match (event, current.operation) {
+        (
+            Event::InputReceived {
+                callout_index,
+                continuation_tag,
+                ..
+            },
+            arena0_protocol::PendingOperation::Callout {
+                callout_index: expected_index,
+            },
+        ) if *callout_index == expected_index && *continuation_tag == current.continuation_tag => {}
+        (
+            Event::Signed {
+                continuation_tag, ..
+            },
+            arena0_protocol::PendingOperation::Sign,
+        ) if *continuation_tag == current.continuation_tag => {}
+        _ => {
+            return Err(StoreError::Protocol(
+                ProtocolError::PendingContinuationMismatch,
+            ));
+        }
+    }
+    Ok(!effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::RetryInput { .. })))
+}
+
+fn validate_effect_payloads(effects: &[Effect]) -> Result<(), StoreError> {
+    if effects.len() > arena0_protocol::MAX_EFFECTS {
+        return Err(StoreError::CommandTooLarge {
+            required: effects.len(),
+            capacity: arena0_protocol::MAX_EFFECTS,
+        });
+    }
+    let bytes = effects_bytes(effects)?;
+    if bytes.len() > arena0_protocol::MAX_RECEIPT_BYTES {
+        return Err(StoreError::CommandTooLarge {
+            required: bytes.len(),
+            capacity: arena0_protocol::MAX_RECEIPT_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn indexed_effects(effects: &[Effect]) -> Result<Vec<(u32, Effect)>, StoreError> {
+    effects
+        .iter()
+        .enumerate()
+        .map(|(index, effect)| {
+            Ok((
+                u32::try_from(index).map_err(|_| StoreError::CommandTooLarge {
+                    required: index,
+                    capacity: u32::MAX as usize,
+                })?,
+                effect.clone(),
+            ))
+        })
+        .collect()
+}
+
+fn message_frame_ordinal(effect_ordinal: u32) -> Result<u32, StoreError> {
+    effect_ordinal
+        .checked_add(1)
+        .ok_or_else(|| StoreError::Corruption("broadcast frame ordinal exhausted".into()))
+}
+
+fn successor_broadcast_frame(
+    proposal: &arena0_protocol::SharedProposal,
+) -> Result<ExecFrame, StoreError> {
+    let Event::MessageReceived {
+        message_id,
+        position,
+        pre_state,
+        msg,
+        ..
+    } = &proposal.entry().event
+    else {
+        return Err(StoreError::Corruption(
+            "deferred broadcast successor is not a message event".into(),
+        ));
+    };
+    Ok(ExecFrame::Message {
+        message_id: *message_id,
+        seq: *position,
+        prestate: *pre_state,
+        poststate: proposal.entry().post_state,
+        data: msg.clone(),
+    })
+}
+
+fn lifecycle_effect(effects: &[Effect]) -> Result<Option<Effect>, StoreError> {
+    let mut lifecycle = None;
+    for effect in effects {
+        if matches!(
+            effect,
+            Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. }
+        ) {
+            if lifecycle.is_some() {
+                return Err(StoreError::Protocol(ProtocolError::MultipleTerminalEffects));
+            }
+            lifecycle = Some(effect.clone());
+        }
+    }
+    Ok(lifecycle)
+}
+
+fn immediate_status(
+    state: &ExecutionState,
+    event: &Event<Vec<u8>>,
+    event_position: u64,
+    effects: &[Effect],
+) -> Result<ExecutionStatus, StoreError> {
+    next_dispatch_status(state, event, event_position, effects)
+}
+
+fn proposal_status(
+    state: &ExecutionState,
+    event: &Event<Vec<u8>>,
+    event_position: u64,
+    entry: &arena0_protocol::TraceEntry,
+    commitment: &StepCommitment,
+    effects: &[Effect],
+    terminal_outcome: Option<TerminalOutcome>,
+) -> Result<ExecutionStatus, StoreError> {
+    if let Some(terminal) = &entry.terminal {
+        match terminal {
+            Effect::SessionEnd {
+                outcome: effect_outcome,
+            } => {
+                let outcome = terminal_outcome
+                    .ok_or(StoreError::Protocol(ProtocolError::TerminalOutcomeRequired))?;
+                if outcome.borsh() != effect_outcome.as_slice() {
+                    return Err(StoreError::Protocol(
+                        ProtocolError::OutcomeProjectionMismatch,
+                    ));
+                }
+                let terminal_commitment = arena0_protocol::TerminalCommitment::new(
+                    state.binding().session_id(),
+                    entry.step,
+                    entry.post_state,
+                    arena0_protocol::OutcomeHash::of(outcome.borsh()),
+                );
+                return Ok(ExecutionStatus::from_terminal_proof(
+                    arena0_protocol::TerminalProof::pending(
+                        terminal_commitment,
+                        outcome,
+                        Vec::new(),
+                    ),
+                ));
+            }
+            Effect::SessionAbort { .. } | Effect::Fail { .. } => {
+                if terminal_outcome.is_some() {
+                    return Err(StoreError::Protocol(ProtocolError::TerminalOutcomeMismatch));
+                }
+                return ExecutionStatus::from_shared_entry(entry, commitment.clone())?
+                    .ok_or_else(|| StoreError::Protocol(ProtocolError::InvalidTerminalStatus));
+            }
+            _ => return Err(StoreError::Protocol(ProtocolError::InvalidTerminalStatus)),
+        }
+    }
+    if terminal_outcome.is_some() {
+        return Err(StoreError::Protocol(ProtocolError::TerminalOutcomeMismatch));
+    }
+    next_dispatch_status(state, event, event_position, effects)
+}
+
+/// Derive the next waiting continuation without treating the status as a
+/// second input source. A continuation is consumed only by a matching
+/// `InputReceived`/`Signed`; unrelated events retain an existing continuation,
+/// while a new callout/sign while one is retained is rejected.
+fn next_dispatch_status(
+    state: &ExecutionState,
+    event: &Event<Vec<u8>>,
+    event_position: u64,
+    effects: &[Effect],
+) -> Result<ExecutionStatus, StoreError> {
+    let existing = state.status().pending().cloned();
+    let continuation = effects
+        .iter()
+        .enumerate()
+        .filter(|(_, effect)| matches!(effect, Effect::Callout { .. } | Effect::Sign { .. }))
+        .map(|(index, effect)| {
+            let id = pending_id(state.execution_id(), event_position, index as u32);
+            PendingRecord::from_effect(id, effect)
+                .ok_or_else(|| StoreError::Corruption("pending effect metadata is missing".into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if continuation.len() > 1 {
+        return Err(StoreError::Protocol(
+            ProtocolError::InvalidPendingContinuation,
+        ));
+    }
+    let consumes_pending = matches!(event, Event::InputReceived { .. } | Event::Signed { .. });
+    let retries = effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::RetryInput { .. }));
+    if let Some(next) = continuation.into_iter().next() {
+        if retries || (existing.is_some() && !consumes_pending) {
+            return Err(StoreError::Protocol(
+                ProtocolError::InvalidPendingContinuation,
+            ));
+        }
+        return Ok(ExecutionStatus::waiting(next));
+    }
+    if retries {
+        return existing.map_or_else(
+            || {
+                Err(StoreError::Protocol(
+                    ProtocolError::PendingContinuationMismatch,
+                ))
+            },
+            |pending| Ok(ExecutionStatus::waiting(pending)),
+        );
+    }
+    if !consumes_pending {
+        return existing.map_or_else(
+            || Ok(ExecutionStatus::active()),
+            |pending| Ok(ExecutionStatus::waiting(pending)),
+        );
+    }
+    Ok(ExecutionStatus::active())
+}
+
+fn reacted_step_for_event(
+    state: &ExecutionState,
+    event: &Event<Vec<u8>>,
+) -> Result<Option<u64>, StoreError> {
+    if !matches!(event, Event::React) {
+        return Ok(None);
+    }
+    state
+        .agreed_step()
+        .checked_sub(1)
+        .map(Some)
+        .ok_or(StoreError::Protocol(ProtocolError::InvalidTerminalStatus))
+}
+
+type NormalizedProposal = (Event<Vec<u8>>, Vec<(u32, Effect)>, Option<(u32, ExecFrame)>);
+
+fn normalized_proposal_event(
+    state: &ExecutionState,
+    event: &Event<Vec<u8>>,
+    shared: &SharedStateBytes,
+    effects: &[Effect],
+    broadcast_index: Option<usize>,
+) -> Result<NormalizedProposal, StoreError> {
+    let mut proposal_effects = effects
+        .iter()
+        .enumerate()
+        .map(|(index, effect)| {
+            Ok((
+                u32::try_from(index).map_err(|_| StoreError::CommandTooLarge {
+                    required: index,
+                    capacity: u32::MAX as usize,
+                })?,
+                effect.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    if let Some(index) = broadcast_index
+        && matches!(
+            event,
+            Event::InputReceived { .. }
+                | Event::TimerFired
+                | Event::TypedTimerFired { .. }
+                | Event::Signed { .. }
+                | Event::React
+        )
+    {
+        let Effect::Broadcast { data } = &effects[index] else {
+            unreachable!();
+        };
+        proposal_effects.retain(|(ordinal, _)| *ordinal != index as u32);
+        let post_state = StateHash::of_shared(shared);
+        let message_id = MessageId::derive(
+            state.binding().session_id(),
+            state.producer(),
+            state.agreed_step(),
+            state.agreed_state(),
+            post_state,
+            data,
+        );
+        let frame = ExecFrame::Message {
+            message_id,
+            seq: state.agreed_step(),
+            prestate: state.agreed_state(),
+            poststate: post_state,
+            data: data.clone(),
+        };
+        return Ok((
+            Event::MessageReceived {
+                message_id,
+                from: state.producer(),
+                position: state.agreed_step(),
+                pre_state: state.agreed_state(),
+                msg: data.clone(),
+            },
+            proposal_effects,
+            Some((
+                u32::try_from(index).map_err(|_| StoreError::CommandTooLarge {
+                    required: index,
+                    capacity: u32::MAX as usize,
+                })?,
+                frame,
+            )),
+        ));
+    }
+    match event {
+        Event::SessionStarted { .. } | Event::MessageReceived { .. } => {
+            validate_portable_event(state, event, StateHash::of_shared(shared))?;
+            Ok((event.clone(), proposal_effects, None))
+        }
+        _ => Err(StoreError::Protocol(ProtocolError::InvalidCertificate(
+            "shared dispatch requires a portable event or a broadcast".into(),
+        ))),
+    }
+}
+
+fn validate_portable_event(
+    state: &ExecutionState,
+    event: &Event<Vec<u8>>,
+    post_state: StateHash,
+) -> Result<(), StoreError> {
+    match event {
+        Event::SessionStarted { ensemble } => {
+            let expected = arena0_protocol::Ensemble::from_peers(
+                state
+                    .binding()
+                    .activation()
+                    .tickets()
+                    .iter()
+                    .map(|ticket| ticket.data.signer)
+                    .collect(),
+            )
+            .map_err(|error| {
+                StoreError::Protocol(ProtocolError::InvalidCertificate(format!(
+                    "activation ensemble: {error}"
+                )))
+            })?;
+            if state.agreed_step() != 0 || ensemble != &expected {
+                return Err(StoreError::Protocol(ProtocolError::SessionStartMismatch));
+            }
+        }
+        Event::MessageReceived {
+            message_id,
+            from,
+            position,
+            pre_state,
+            msg,
+        } => {
+            if *position != state.agreed_step()
+                || *pre_state != state.agreed_state()
+                || !is_participant(state, *from)
+                || *message_id
+                    != MessageId::derive(
+                        state.binding().session_id(),
+                        *from,
+                        *position,
+                        *pre_state,
+                        post_state,
+                        msg,
+                    )
+            {
+                return Err(StoreError::Protocol(ProtocolError::InvalidCertificate(
+                    "message event does not match agreed cursor".into(),
+                )));
+            }
+        }
+        _ => {
+            return Err(StoreError::Protocol(ProtocolError::InvalidCertificate(
+                "non-portable event".into(),
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_dispatch_sources(
+    database: &mut Database,
+    state: &ExecutionState,
+    event: &Event<Vec<u8>>,
+    post_state: StateHash,
+    effects: &[Effect],
+    inbox_id: Option<InboxId>,
+    timer_id: Option<TimerId>,
+    pending_id: Option<PendingId>,
+) -> Result<(), StoreError> {
+    let inbox_applicable = matches!(event, Event::MessageReceived { .. });
+    let timer_applicable = matches!(event, Event::TimerFired | Event::TypedTimerFired { .. });
+    let pending_applicable = matches!(event, Event::InputReceived { .. } | Event::Signed { .. })
+        || effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RetryInput { .. }));
+    if let Some(inbox_id) = inbox_id
+        && !inbox_applicable
+    {
+        return Err(StoreError::InboxInputMismatch {
+            inbox_id,
+            part_index: 0,
+        });
+    }
+    if timer_id.is_some() && !timer_applicable {
+        return Err(StoreError::Corruption(
+            "timer id supplied for a non-timer event".into(),
+        ));
+    }
+    if pending_id.is_some() && !pending_applicable {
+        return Err(StoreError::Corruption(
+            "pending id supplied for a non-continuation event".into(),
+        ));
+    }
+    let answer = matches!(event, Event::InputReceived { .. } | Event::Signed { .. });
+    if (answer || pending_id.is_some())
+        && pending_id != state.status().pending().map(|pending| pending.id)
+    {
+        return Err(StoreError::Corruption(
+            "continuation pending id does not match status".into(),
+        ));
+    }
+    if let Some(timer_id) = timer_id {
+        database.validate_timer_source(state.execution_id(), timer_id, event)?;
+    }
+    if let Some(inbox_id) = inbox_id {
+        let (source, stored, status, _) =
+            database.load_inbox_fact(state.execution_id(), inbox_id, state)?;
+        if status == InboxStatus::Accepted {
+            let ExecFrame::Message {
+                message_id,
+                seq,
+                prestate,
+                poststate: frame_poststate,
+                data,
+            } = decode_stored_frame(&stored)?
+            else {
+                return Err(StoreError::InboxNotMessage(inbox_id));
+            };
+            let Event::MessageReceived {
+                message_id: event_id,
+                from,
+                position,
+                pre_state,
+                msg,
+            } = event
+            else {
+                unreachable!();
+            };
+            if source != *from
+                || message_id != *event_id
+                || seq != *position
+                || prestate != *pre_state
+                || frame_poststate != post_state
+                || data != *msg
+            {
+                return Err(StoreError::InboxInputMismatch {
+                    inbox_id,
+                    part_index: 0,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_participant(state: &ExecutionState, peer: PeerId) -> bool {
+    state
+        .binding()
+        .activation()
+        .tickets()
+        .iter()
+        .any(|ticket| ticket.data.signer == peer)
+}
+
+fn dispatch_digest(event: &[u8], effects: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"arena0/store/event/v2");
+    hasher.update(event);
+    hasher.update(effects);
+    *hasher.finalize().as_bytes()
 }

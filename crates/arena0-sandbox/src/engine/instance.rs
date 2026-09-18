@@ -35,7 +35,7 @@ impl super::WasmtimeEngine {
         config.consume_fuel(true);
         config.wasm_simd(false);
         config.wasm_relaxed_simd(false);
-        config.wasm_multi_memory(false);
+        config.wasm_multi_memory(true);
         config.wasm_memory64(false);
         config.wasm_tail_call(false);
         config.cache(persistent_cache.clone());
@@ -120,7 +120,8 @@ impl super::WasmtimeEngine {
     fn compile(&self, program: &Program) -> Result<Arc<super::LoadedProgram>, SandboxError> {
         let module = Module::new(&self.engine, program.bytes())
             .map_err(|error| SandboxError::compilation_failed(error.to_string()))?;
-        validation::validate_exports(&module)?;
+        crate::finalize::validate_finalized_shape(program.bytes(), &self.profile)?;
+        validation::validate_exports(&module, &self.profile)?;
         validation::validate_imports(&module, &program.definition().metadata)?;
         let _probe = instantiate_module(
             &self.engine,
@@ -148,10 +149,22 @@ impl super::WasmtimeEngine {
     /// output uses the bounded metadata export probe.
     pub fn build_program(&self, wasm: &[u8]) -> Result<Program, SandboxError> {
         match Program::parse(wasm) {
-            Ok(program) => Ok(program),
+            Ok(program) => {
+                // Probe completed artifacts as well as section-less raw
+                // modules. This rejects stale ABI versions before a caller
+                // can treat the parsed bytes as a current ProgramHash.
+                self.compile(&program)?;
+                Ok(program)
+            }
             Err(SandboxError::MissingMetadata) => {
                 let definition = self.metadata_for_embedding(wasm)?;
-                Program::embed(wasm, &definition)
+                let finalized = crate::finalize::finalize(wasm, &self.profile)?;
+                let module = Module::new(&self.engine, &finalized)
+                    .map_err(|error| SandboxError::compilation_failed(error.to_string()))?;
+                crate::finalize::validate_finalized_shape(&finalized, &self.profile)?;
+                validation::validate_exports(&module, &self.profile)?;
+                validation::validate_imports(&module, &definition.metadata)?;
+                Program::embed(&finalized, &definition)
             }
             Err(error) => Err(error),
         }
@@ -163,7 +176,7 @@ impl super::WasmtimeEngine {
     ) -> Result<arena0_program::ProgramDefinition, SandboxError> {
         let module = Module::new(&self.engine, binary)
             .map_err(|error| SandboxError::compilation_failed(error.to_string()))?;
-        validation::validate_exports(&module)?;
+        validation::validate_raw_exports(&module)?;
         let mut store = Store::new(
             &self.engine,
             HostState::new(
@@ -185,6 +198,18 @@ impl super::WasmtimeEngine {
             .instantiate(&mut store, &module)
             .map_err(|error| SandboxError::instantiation_failed(error.to_string()))?;
         validation::check_abi_version(&mut store, &instance)?;
+        {
+            let mut guest = super::memory::Guest::new(&mut store, &instance);
+            guest
+                .prepare()
+                .map_err(|error| SandboxError::instantiation_failed(error.to_string()))?;
+        }
+        store
+            .data_mut()
+            .reset_after_prepare(CallKind::Metadata, None);
+        store
+            .set_fuel(self.profile.fuel.per_call)
+            .map_err(|error| SandboxError::instantiation_failed(error.to_string()))?;
         let (ptr, len) = {
             let mut guest = super::memory::Guest::new(&mut store, &instance);
             guest.call_metadata()?

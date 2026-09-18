@@ -8,10 +8,9 @@
 use arena0_crypto::{BlsSignature, NodeKeys, SecretKey};
 use arena0_program::ProgramHash;
 use arena0_protocol::{
-    AbortKind, AbortOccurrence, Activation, AggregateAttestation, Ensemble, MessageId,
-    NegotiationId, PeerIdSource, PublicCursor, PublicEffect, PublicEvent, ReceiptArtifact,
-    ReceiptBody, ReceiptTermination, SessionHash, SessionHeader, SignerSet, StateHash,
-    StepCommitment, TraceEntry, WitnessCommitment,
+    AbortKind, AbortOccurrence, Activation, AggregateAttestation, Effect, Ensemble, Event,
+    MessageId, NegotiationId, PeerIdSource, ReceiptArtifact, ReceiptBody, ReceiptTermination,
+    SessionHash, SessionHeader, SignerSet, StateHash, StepCommitment, StepCursor, TraceEntry,
 };
 
 use crate::fixtures::activation_for;
@@ -105,9 +104,8 @@ impl Synthetic {
     pub fn signed_entry(
         &self,
         step: u64,
-        event: PublicEvent,
-        effects: Vec<PublicEffect>,
-        witness: Option<WitnessCommitment>,
+        event: Event<Vec<u8>>,
+        terminal: Option<Effect>,
         link: [u8; 32],
         signers: &[usize],
     ) -> (TraceEntry, StepCommitment) {
@@ -115,11 +113,9 @@ impl Synthetic {
             trace_version: arena0_protocol::TRACE_FORMAT_VERSION,
             step,
             event,
-            effects,
             pre_state: self.initial,
             post_state: self.initial,
-            fuel_used: 0,
-            witness,
+            terminal,
             agreement: AggregateAttestation::empty(),
         };
         let commitment = StepCommitment::for_entry(self.session_hash, &entry, link);
@@ -130,10 +126,9 @@ impl Synthetic {
     pub fn started_entry(&self, signers: &[usize]) -> (TraceEntry, StepCommitment) {
         self.signed_entry(
             0,
-            PublicEvent::SessionStarted {
+            Event::SessionStarted {
                 ensemble: self.ensemble(),
             },
-            Vec::new(),
             None,
             arena0_protocol::CHAIN_START,
             signers,
@@ -141,17 +136,17 @@ impl Synthetic {
     }
 
     /// A `MessageReceived` event with a self-consistent content address.
-    pub fn message_event(
-        &self,
-        step: u64,
-        from_idx: usize,
-        data: Vec<u8>,
-        witness: WitnessCommitment,
-    ) -> PublicEvent {
+    pub fn message_event(&self, step: u64, from_idx: usize, data: Vec<u8>) -> Event<Vec<u8>> {
         let from = self.peer(from_idx);
-        let message_id =
-            MessageId::derive(self.session_hash, from, step, self.initial, &data, witness);
-        PublicEvent::MessageReceived {
+        let message_id = MessageId::derive(
+            self.session_hash,
+            from,
+            step,
+            self.initial,
+            self.initial,
+            &data,
+        );
+        Event::MessageReceived {
             message_id,
             position: step,
             pre_state: self.initial,
@@ -169,7 +164,7 @@ impl Synthetic {
         reason: &str,
     ) -> arena0_protocol::StopCause {
         let sender = self.cryptos[sender_idx].peer_id();
-        let cursor = PublicCursor::new(0, self.initial, arena0_protocol::CHAIN_START);
+        let cursor = StepCursor::new(0, self.initial, arena0_protocol::CHAIN_START);
         let unsigned =
             AbortOccurrence::unsigned(self.session_hash, sender, kind, 1, reason, cursor)
                 .expect("abort occurrence");

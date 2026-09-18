@@ -155,8 +155,8 @@ fn module_shell_generates_program_struct_and_impl() {
                 Pong,
             }
 
-            fn initialize(_ctx: &mut Context, _params: ()) -> Result<Transition<Phase>, ProgramFault> {
-                Ok(Transition::Stay)
+            fn initialize(_shared: &mut Shared, _params: ()) -> Result<(), ProgramFault> {
+                Ok(())
             }
 
             fn writer(_shared: &Shared) -> Option<Participant> {
@@ -195,7 +195,7 @@ fn module_shell_generates_program_struct_and_impl() {
 }
 
 #[test]
-fn module_shell_requires_writer_for_public_messages() {
+fn module_shell_requires_writer_for_program_messages() {
     let item: Item = syn::parse_quote! {
         pub mod ping {
             use arena0::prelude::*;
@@ -208,7 +208,7 @@ fn module_shell_requires_writer_for_public_messages() {
             pub enum Message { Ping }
 
             fn on_message(
-                _ctx: &mut SharedContext,
+                _ctx: &mut Context,
                 _from: Participant,
                 _message: Message,
             ) -> MessageApply<Ping> {
@@ -237,14 +237,16 @@ fn trait_form_emits_default_view_export() {
     let expanded = expand_arena0_program(args(), item).unwrap().to_string();
 
     assert!(expanded.contains("pub extern \"C\" fn arena0_view"));
+    assert!(expanded.contains("pub extern \"C\" fn arena0_prepare"));
+    assert!(expanded.contains("__prepare_allocator"));
     assert!(expanded.contains("impl :: arena0 :: ProgramView for TestProgram"));
     assert!(expanded.contains("View :: new"));
-    assert!(expanded.contains("format ! (\"{:#?}\" , ctx . shared ())"));
+    assert!(expanded.contains("format ! (\"{:#?}\" , shared)"));
     assert!(expanded.contains("InitInput"));
-    assert!(expanded.contains("SharedInput"));
-    assert!(expanded.contains("SharedOutput"));
-    assert!(expanded.contains("LocalInput"));
-    assert!(expanded.contains("LocalOutput"));
+    assert!(expanded.contains("DispatchInput"));
+    assert!(expanded.contains("DispatchOutput"));
+    assert!(!expanded.contains("arena0_shared"));
+    assert!(!expanded.contains("arena0_local"));
     assert!(expanded.contains("QueryOutput"));
     assert!(expanded.contains("ViewOutput"));
     assert!(expanded.contains("OutcomeOutput"));
@@ -254,6 +256,46 @@ fn trait_form_emits_default_view_export() {
     assert!(!expanded.contains("__restore_shared"));
     assert!(expanded.contains("__phase_decls"));
     assert!(expanded.contains("status_bar"));
+}
+
+#[test]
+fn module_shell_lowers_async_session_started_handler() {
+    let item: Item = syn::parse_quote! {
+        pub mod chess {
+            use arena0::prelude::*;
+
+            #[arena0::callouts]
+            pub enum Callout {
+                Choose { board: String },
+            }
+
+            #[arena0::state(max = 256)]
+            pub struct Shared {
+                move_text: String,
+            }
+
+            async fn on_session_started(
+                ctx: &mut Context,
+                _ensemble: &Ensemble,
+            ) -> Result<Transition<Phase>, ProgramFault> {
+                let move_text = ctx
+                    .effects()
+                    .callout(callouts::Choose { board: String::new() })
+                    .pending("thinking")
+                    .await?;
+                ctx.mutate_shared(|state| {
+                    state.move_text = move_text;
+                });
+                Ok(Transition::Stay)
+            }
+        }
+    };
+
+    let expanded = expand_arena0_program_item(args(), item)
+        .unwrap()
+        .to_string();
+    assert!(expanded.contains("__arena0_resume_on_session_started_0"));
+    assert!(expanded.contains("fn on_session_started"));
 }
 
 #[test]
@@ -267,7 +309,7 @@ fn trait_form_wires_explicit_view_handler() {
             type Input = ();
             type Params = ();
 
-            fn view(_ctx: &Context, _viewport: &Viewport) -> View {
+            fn view(_shared: &Shared, _ensemble: &Ensemble, _viewport: &Viewport) -> View {
                 View::new().header("explicit")
             }
         }
@@ -291,10 +333,10 @@ fn module_shell_wires_explicit_view_handler() {
                 round: u64,
             }
 
-            fn view(ctx: &Context, viewport: &Viewport) -> View {
+            fn view(shared: &Shared, ensemble: &Ensemble, viewport: &Viewport) -> View {
                 View::new()
                     .header(format!("width {}", viewport.width))
-                    .state(format!("{:?}", ctx.shared()))
+                    .state(format!("{:?} ({})", shared, ensemble.len()))
             }
         }
     };
@@ -304,7 +346,7 @@ fn module_shell_wires_explicit_view_handler() {
         .to_string();
 
     assert!(expanded.contains("impl :: arena0 :: ProgramView for Ping"));
-    assert!(expanded.contains("self :: view (ctx , viewport)"));
+    assert!(expanded.contains("self :: view (shared , ensemble , viewport)"));
     assert!(expanded.contains("pub extern \"C\" fn arena0_view"));
 }
 
@@ -704,7 +746,7 @@ fn module_shell_rejects_async_std_network_io_calls() {
 }
 
 #[test]
-fn module_shell_rejects_async_shared_message_handler() {
+fn module_shell_rejects_async_message_handler() {
     let item: Item = syn::parse_quote! {
         pub mod chess {
             use arena0::prelude::*;
@@ -742,7 +784,10 @@ fn module_shell_rejects_async_shared_message_handler() {
     )
     .unwrap();
     let err = expand_arena0_program_item(args, item).unwrap_err();
-    assert!(err.to_string().contains("async shared handlers"));
+    assert!(
+        err.to_string()
+            .contains("async `on_message` handlers are not supported by module-shell lowering")
+    );
 }
 
 #[test]
@@ -841,7 +886,11 @@ fn infers_direct_effect_capabilities_from_handlers() {
             type Params = ();
             type Query = ();
 
-            fn initialize(ctx: &mut Context, _params: ()) -> Result<Transition<Phase>, ProgramFault> {
+            fn initialize(_shared: &mut Shared, _params: ()) -> Result<(), ProgramFault> {
+                Ok(())
+            }
+
+            fn on_react(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
                 let mut fx = ctx.effects();
                 fx.callout(());
                 fx.set_timer(1, ());
@@ -881,10 +930,10 @@ fn effect_capability_inference_ignores_unrelated_method_names() {
             type Params = ();
             type Query = ();
 
-            fn initialize(_ctx: &mut Context, _params: ()) -> Result<Transition<Phase>, ProgramFault> {
+            fn initialize(_shared: &mut Shared, _params: ()) -> Result<(), ProgramFault> {
                 formatter.sign();
                 mailbox.send(vec![]);
-                Ok(Transition::Stay)
+                Ok(())
             }
         }
     };

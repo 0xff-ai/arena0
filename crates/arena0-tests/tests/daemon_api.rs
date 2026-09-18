@@ -219,7 +219,7 @@ async fn competing_callout_submissions_return_typed_conflict_and_execution_conti
 }
 
 /// The other RPS Host answers first in the final round, then the human answers
-/// the final callout. Once the terminal supervisor has cleaned up, replaying
+/// the final callout. Once the terminal supervisor has cleaned up, retrying
 /// that old pending id is a typed conflict while an unknown execution remains
 /// NotFound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -343,7 +343,7 @@ async fn stale_callout_after_terminal_is_typed_conflict_and_missing_exec_is_not_
             other => panic!("unexpected terminal await response: {other:?}"),
         }
     }
-    // Let the terminal message reach the supervisor before replaying the old
+    // Let the terminal message reach the supervisor before retrying the old
     // answer; this is the stale-handle path that previously returned NotFound.
     tokio::time::sleep(Duration::from_millis(100)).await;
 

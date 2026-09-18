@@ -7,6 +7,13 @@
 use arena0_crypto::SignScheme;
 use arena0_protocol::{LogLevel, TimerSpec};
 
+/// State-memory selector used by the always-available state imports.
+#[doc(hidden)]
+pub const STATE_KIND_SHARED: u32 = arena0_program::StateMemoryKind::Shared as u32;
+/// State-memory selector used by the always-available state imports.
+#[doc(hidden)]
+pub const STATE_KIND_LOCAL: u32 = arena0_program::StateMemoryKind::Local as u32;
+
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "arena0")]
 unsafe extern "C" {
@@ -40,6 +47,50 @@ unsafe extern "C" {
     fn abort_session(reason_ptr: u32, reason_len: u32);
     fn retry_input(reason_ptr: u32, reason_len: u32);
     fn set_continuation_tag(tag: u32);
+    fn state_len(kind: u32) -> u32;
+    fn state_read(kind: u32, ptr: u32, len: u32);
+    fn state_write(kind: u32, ptr: u32, len: u32);
+}
+
+/// Return the encoded byte length of one host-owned state value.
+#[doc(hidden)]
+pub fn host_state_len(kind: u32) -> usize {
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        state_len(kind) as usize
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = kind;
+        0
+    }
+}
+
+/// Read one host-owned state value into a guest buffer.
+#[doc(hidden)]
+pub fn host_state_read(kind: u32, buffer: &mut [u8]) {
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        state_read(kind, buffer.as_mut_ptr() as u32, buffer.len() as u32);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = kind;
+        buffer.fill(0);
+    }
+}
+
+/// Replace one host-owned state value from a guest buffer.
+#[doc(hidden)]
+pub fn host_state_write(kind: u32, buffer: &[u8]) {
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        state_write(kind, buffer.as_ptr() as u32, buffer.len() as u32);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (kind, buffer);
+    }
 }
 
 pub fn host_log(level: LogLevel, msg: &str) {

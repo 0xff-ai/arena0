@@ -29,7 +29,6 @@ object. The object must satisfy `MAX_FRAME_BYTES` in
     "step": 1,
     "pre_state": "c4a7d974c56f03351afe0341e290799a40bbe94c8fcbb5a2e15a7d7cbcfe75b2",
     "post_state": "8b2f49023de586beeceeeaaef110d5d777cfdea0fa0a9d24365afcd2cb2a4c4",
-    "fuel_used": 124,
     "signers": 2,
     "participants": 2
   }

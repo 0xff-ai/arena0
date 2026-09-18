@@ -16,11 +16,11 @@ mod orchestration;
 pub use diagnostics::{CoverageReport, PairTrace};
 pub use fixtures::{ReplayReport, TestHarness};
 #[doc(hidden)]
-pub use harness::__step_record;
+pub use harness::__dispatch_record;
 #[doc(hidden)]
 pub use harness::PendingLedger;
 pub use harness::{
-    ClosedPendingReason, ClosedPendingRecord, FaultStatus, HandlerResult, Harness,
+    ClosedPendingReason, ClosedPendingRecord, DispatchRecord, FaultStatus, HandlerResult, Harness,
     PendingHarnessError, TypedCalloutRecord,
 };
 pub use orchestration::{

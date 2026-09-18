@@ -7,14 +7,14 @@
 use arena0_crypto::NodeKeys;
 use arena0_node::SessionMessage;
 use arena0_protocol::{
-    AbortKind, AbortOccurrence, ExecFrame, ExecId, NegotiationId, PeerIdSource, PublicCursor,
-    StepCommitment,
+    AbortKind, AbortOccurrence, ExecFrame, ExecId, NegotiationId, PeerIdSource, StepCommitment,
+    StepCursor,
 };
 use arena0_tests::fixtures::{
     LIVE_EXECUTION_TIMEOUT, establish_live_session, provider, spawn_live_execution,
 };
 use arena0_tests::wasm::program_wasm;
-use arena0_verify::{LightVerifiedTerminal, verify_full, verify_light};
+use arena0_verify::{LightVerifiedTerminal, verify_light};
 
 const EXEC_ID: ExecId = ExecId([0xA0; 32]);
 const NEGOTIATION_ID: NegotiationId = NegotiationId([0xA1; 32]);
@@ -47,7 +47,7 @@ async fn bilateral_peer_abort_publishes_a_stopped_receipt() {
         .fold(arena0_protocol::CHAIN_START, |link, entry| {
             StepCommitment::for_entry(execution.session_hash, entry, link).link_hash()
         });
-    let cursor = PublicCursor::new(trace.len() as u64, last.post_state, link);
+    let cursor = StepCursor::new(trace.len() as u64, last.post_state, link);
     let sender = execution.peer_ids[1];
     let sender_crypto = participants
         .iter()
@@ -103,11 +103,6 @@ async fn bilateral_peer_abort_publishes_a_stopped_receipt() {
         light.terminal,
         LightVerifiedTerminal::Stopped { .. }
     ));
-    let full = verify_full(&wasm, &bytes).expect("full verify stopped receipt");
-    assert!(matches!(
-        full.terminal,
-        arena0_verify::VerifiedTerminal::Stopped { .. }
-    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
@@ -129,10 +124,10 @@ async fn shared_program_stop_produces_one_canonical_receipt() {
         ));
         assert_eq!(run.receipt_bytes(i), expected);
         assert_eq!(run.receipt(i).receipt_id(), run.receipt(0).receipt_id());
-        let verified = verify_full(&wasm, &run.receipt_bytes(i)).expect("shared stop replay");
+        let verified = verify_light(&run.receipt_bytes(i)).expect("shared stop verification");
         assert!(matches!(
             verified.terminal,
-            arena0_verify::VerifiedTerminal::Stopped {
+            LightVerifiedTerminal::Stopped {
                 cause: arena0_protocol::StopCause::Shared { .. }
             }
         ));

@@ -16,7 +16,7 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 1_048_576;
 /// Size of the frame header: four bytes containing a little-endian body size.
 pub const FRAME_HEADER_SIZE: usize = 4;
 /// The current version of the canonical transport-frame envelope.
-pub const FRAME_VERSION: u16 = 1;
+pub const FRAME_VERSION: u16 = 2;
 /// Size of the little-endian frame-version field.
 pub const FRAME_VERSION_SIZE: usize = std::mem::size_of::<u16>();
 
@@ -226,7 +226,7 @@ mod tests {
         EXEC_KIND_ABORT, EXEC_KIND_MESSAGE, ExecFrame, FetchFrame, MAX_EXEC_REASON_BYTES,
         MAX_FETCH_RESPONSE_BYTES, MessageIdBytes, PeerIdBytes, SessionHashBytes, StateHashBytes,
         StreamProtocol, WireAbortCoordinate, WireAbortOccurrence, WireError, WireStepCommitment,
-        WireTerminalCommitment, WitnessCommitmentBytes,
+        WireTerminalCommitment,
     };
     use arena0_crypto::BlsSignature;
     use borsh::BorshSerialize;
@@ -237,8 +237,8 @@ mod tests {
             message_id: MessageIdBytes,
             seq: u64,
             prestate: StateHashBytes,
+            poststate: StateHashBytes,
             data: Vec<u8>,
-            witness: WitnessCommitmentBytes,
         },
         StepSignature {
             commitment: WireStepCommitment,
@@ -298,7 +298,7 @@ mod tests {
 
     fn step_commitment() -> WireStepCommitment {
         WireStepCommitment {
-            domain: *b"arena0/step-commit/v2\0\0\0",
+            domain: *b"arena0/step-commit/v3\0\0\0",
             session_id: SessionHashBytes([0x11; 32]),
             step: 3,
             entry_hash: [0x22; 32],
@@ -324,8 +324,8 @@ mod tests {
             message_id: MessageIdBytes([0; 32]),
             seq: 0,
             prestate: StateHashBytes([0; 32]),
+            poststate: StateHashBytes([0; 32]),
             data: vec![0u8; 100],
-            witness: WitnessCommitmentBytes([0; 32]),
         };
         let result = Codec::new(10).encode(&message);
         assert!(matches!(result, Err(WireError::PayloadTooLarge { .. })));
@@ -367,15 +367,15 @@ mod tests {
                     message_id: MessageIdBytes([3; 32]),
                     seq: 4,
                     prestate: StateHashBytes([5; 32]),
+                    poststate: StateHashBytes([8; 32]),
                     data: vec![6, 7],
-                    witness: WitnessCommitmentBytes([8; 32]),
                 },
                 DerivedExecFrame::Message {
                     message_id: MessageIdBytes([3; 32]),
                     seq: 4,
                     prestate: StateHashBytes([5; 32]),
+                    poststate: StateHashBytes([8; 32]),
                     data: vec![6, 7],
-                    witness: WitnessCommitmentBytes([8; 32]),
                 },
             ),
             (
@@ -489,6 +489,7 @@ mod tests {
         message_body.extend_from_slice(&[0; 32]);
         message_body.extend_from_slice(&0u64.to_le_bytes());
         message_body.extend_from_slice(&[0; 32]);
+        message_body.extend_from_slice(&[0; 32]);
         message_body.extend_from_slice(&u32::MAX.to_le_bytes());
         let message_frame = raw_frame(&message_body);
         assert!(matches!(
@@ -522,7 +523,7 @@ mod tests {
     #[test]
     fn frame_envelope_is_versioned_and_exact_length() {
         let encoded = Codec::new(1).encode(&7u8).unwrap();
-        assert_eq!(encoded, [3, 0, 0, 0, 1, 0, 7]);
+        assert_eq!(encoded, [3, 0, 0, 0, 2, 0, 7]);
         assert_eq!(Codec::new(1).decode_frame(&encoded).unwrap(), &[7]);
 
         for (bytes, error) in [
@@ -548,7 +549,7 @@ mod tests {
                 },
             ),
             (
-                vec![3, 0, 0, 0, 1, 0, 7, 8],
+                vec![3, 0, 0, 0, 2, 0, 7, 8],
                 WireError::TrailingBytes {
                     expected: 7,
                     actual: 8,
@@ -557,7 +558,7 @@ mod tests {
             (
                 vec![3, 0, 0, 0, 255, 255, 7],
                 WireError::UnsupportedVersion {
-                    expected: 1,
+                    expected: 2,
                     actual: u16::MAX,
                 },
             ),

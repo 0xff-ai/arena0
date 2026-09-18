@@ -1,10 +1,12 @@
-//! Wasmtime ownership for one fresh guest invocation.
+//! Wasmtime ownership for resident dispatches and fresh projections.
 
 mod entropy;
 mod imports;
 mod instance;
 mod memory;
 mod runtime;
+
+pub use runtime::ProgramInstance;
 
 use std::sync::Arc;
 
@@ -26,10 +28,10 @@ const PROGRAM_CACHE_CAPACITY: u64 = 32;
 /// context API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CallKind {
+    Prepare,
     Metadata,
     Initialize,
-    Shared,
-    Local,
+    Dispatch,
     Writer,
     Query,
     View,
@@ -39,32 +41,29 @@ pub(crate) enum CallKind {
 impl CallKind {
     /// Whether this export may request any host effect or diagnostic log.
     pub(crate) const fn allows_effects(self) -> bool {
-        matches!(self, Self::Shared | Self::Local)
+        matches!(self, Self::Dispatch)
     }
 
     pub(crate) const fn allows_random(self) -> bool {
-        matches!(self, Self::Local)
-    }
-
-    pub(crate) const fn allows_local_effects(self) -> bool {
-        matches!(self, Self::Local)
+        matches!(self, Self::Dispatch)
     }
 
     /// Whether this call kind may record the given protocol effect.
-    pub(crate) fn allows_effect(&self, effect: &Effect) -> bool {
+    pub(crate) fn allows_effect(&self, _effect: &Effect) -> bool {
         match self {
-            Self::Local => true,
-            Self::Shared => matches!(
-                effect,
-                Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. }
-            ),
-            Self::Metadata
+            Self::Dispatch => true,
+            Self::Prepare
+            | Self::Metadata
             | Self::Initialize
             | Self::Writer
             | Self::Query
             | Self::View
             | Self::Outcome => false,
         }
+    }
+
+    pub(crate) const fn allows_state_io(self) -> bool {
+        matches!(self, Self::Dispatch)
     }
 }
 
@@ -240,6 +239,45 @@ impl HostState {
             logs: std::mem::take(&mut self.logs),
         })
     }
+
+    /// Clear every per-dispatch observation and reset deterministic host
+    /// accounting before a resident instance is re-entered.
+    pub(crate) fn reset_for_dispatch(
+        &mut self,
+        lifecycle: arena0_protocol::Lifecycle,
+        random_replay: Option<&[Vec<u8>]>,
+    ) {
+        self.call_kind = CallKind::Dispatch;
+        self.lifecycle = lifecycle;
+        self.logs.clear();
+        self.effect_queue.clear();
+        self.next_continuation_tag = None;
+        self.ledger = ResourceLedger::new();
+        self.entropy.reset();
+        if let Some(draws) = random_replay {
+            self.entropy.set_replay(draws.to_vec());
+        }
+    }
+
+    /// Clear setup observations while retaining the call kind selected for a
+    /// fresh operation. Preparation is a bootstrap boundary, not a dispatch;
+    /// it must neither consume operation fuel nor leave allocator accounting
+    /// in the subsequent call.
+    pub(crate) fn reset_after_prepare(
+        &mut self,
+        call_kind: CallKind,
+        random_replay: Option<&[Vec<u8>]>,
+    ) {
+        self.call_kind = call_kind;
+        self.logs.clear();
+        self.effect_queue.clear();
+        self.next_continuation_tag = None;
+        self.ledger = ResourceLedger::new();
+        self.entropy.reset();
+        if let Some(draws) = random_replay {
+            self.entropy.set_replay(draws.to_vec());
+        }
+    }
 }
 
 /// Configured deterministic Wasmtime engine.
@@ -338,7 +376,7 @@ pub(crate) fn instantiate_module(
         engine,
         HostState::new(
             profile.clone(),
-            call_kind,
+            CallKind::Prepare,
             lifecycle,
             random_replay,
             schema.callouts.iter().map(|c| c.input.clone()).collect(),
@@ -358,6 +396,18 @@ pub(crate) fn instantiate_module(
     instance
         .get_memory(&mut store, "memory")
         .ok_or_else(|| SandboxError::instantiation_failed("no 'memory' export"))?;
+    {
+        let mut guest = memory::Guest::new(&mut store, &instance);
+        guest
+            .prepare()
+            .map_err(|error| SandboxError::instantiation_failed(error.to_string()))?;
+    }
+    store
+        .data_mut()
+        .reset_after_prepare(call_kind, random_replay);
+    store
+        .set_fuel(profile.fuel.per_call)
+        .map_err(|error| SandboxError::instantiation_failed(error.to_string()))?;
     Ok(CallInstance { store, instance })
 }
 
@@ -371,17 +421,18 @@ mod tests {
 
     #[test]
     fn call_kinds_expose_only_their_declared_effect_surface() {
+        assert!(!CallKind::Prepare.allows_effects());
+        assert!(!CallKind::Prepare.allows_random());
+        assert!(!CallKind::Prepare.allows_state_io());
         assert!(!CallKind::Initialize.allows_effects());
         assert!(!CallKind::Writer.allows_effects());
         assert!(!CallKind::Query.allows_effects());
         assert!(!CallKind::View.allows_effects());
         assert!(!CallKind::Outcome.allows_effects());
-        assert!(CallKind::Shared.allows_effects());
-        assert!(CallKind::Local.allows_effects());
-        assert!(CallKind::Local.allows_random());
-        assert!(!CallKind::Shared.allows_random());
-        assert!(CallKind::Shared.allows_effect(&Effect::SessionEnd { outcome: vec![] }));
-        assert!(!CallKind::Shared.allows_effect(&Effect::Broadcast { data: vec![] }));
+        assert!(CallKind::Dispatch.allows_effects());
+        assert!(CallKind::Dispatch.allows_random());
+        assert!(CallKind::Dispatch.allows_effect(&Effect::SessionEnd { outcome: vec![] }));
+        assert!(CallKind::Dispatch.allows_effect(&Effect::Broadcast { data: vec![] }));
         assert!(!CallKind::Initialize.allows_effect(&Effect::Fail {
             reason: String::new(),
         }));
@@ -404,5 +455,30 @@ mod tests {
         let mut ledger = ResourceLedger::new();
         assert!(ledger.log(2, 2, 1).is_ok());
         assert!(ledger.log(0, 2, 1).is_err());
+    }
+
+    #[test]
+    fn host_copy_budget_admits_maximum_state_round_trip_and_envelope() {
+        let mut ledger = ResourceLedger::new();
+        for bytes in [
+            arena0_program::MAX_SHARED_STATE_BYTES,
+            arena0_program::MAX_LOCAL_STATE_BYTES,
+            arena0_program::MAX_SHARED_STATE_BYTES,
+            arena0_program::MAX_LOCAL_STATE_BYTES,
+            arena0_program::MAX_INPUT_BYTES as usize,
+            arena0_program::MAX_OUTPUT_BYTES as usize,
+            arena0_program::MAX_EFFECT_BYTES as usize,
+            arena0_program::MAX_EFFECT_BYTES as usize,
+        ] {
+            ledger
+                .copy_bytes(bytes, arena0_program::MAX_HOST_BYTES as u64)
+                .unwrap();
+        }
+        assert_eq!(ledger.host_bytes, 32 * 1024 * 1024);
+        assert!(
+            ledger
+                .copy_bytes(1, arena0_program::MAX_HOST_BYTES as u64)
+                .is_err()
+        );
     }
 }

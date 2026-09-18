@@ -3,7 +3,7 @@
 //! Activity is deliberately separate from the semantic [`crate::EventFrame`]
 //! stream. It records only tool lifecycle and bounded result classes so a
 //! monitor can follow liveness without receiving tool arguments, answers,
-//! outcomes, or other private payloads.
+//! outcomes, or other participant-specific payloads.
 
 use arena0_protocol::ExecId;
 use serde::{Deserialize, Serialize};

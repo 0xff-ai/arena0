@@ -31,7 +31,7 @@ struct QueuedMessage {
 /// Two native replicas running the same bilateral program.
 ///
 /// `BilateralPair` is a higher-level harness for tests that need to prove
-/// convergence across both sides instead of inspecting one local handler at a
+/// convergence across both sides instead of inspecting one dispatch at a
 /// time. It keeps peer-message delivery deterministic and lets tests inject
 /// drops or duplicates before asserting shared and transition alignment.
 pub struct BilateralPair<P: Program>
@@ -192,8 +192,8 @@ where
         PairSnapshot {
             alice_shared: self.alice.shared_hash(),
             bob_shared: self.bob.shared_hash(),
-            alice_steps: self.alice.trace().len(),
-            bob_steps: self.bob.trace().len(),
+            alice_event_count: self.alice.trace().len(),
+            bob_event_count: self.bob.trace().len(),
             queued_messages: self.outbox.len(),
             transcript: self.trace().pretty(),
         }
@@ -229,9 +229,9 @@ where
     }
 
     fn queue_effects(&mut self, from: PeerId, effects: &[Effect]) {
-        // Broadcast-only messaging: every message goes to both participants,
-        // the sender included, so the sender applies its own message through
-        // the same shared handler (self-delivery is queued first).
+        // Broadcast effects are delivered to the other participant. The
+        // originating dispatch has already applied its own dispatch result;
+        // queuing a producer self-message would apply that event twice.
         for effect in effects {
             if let Effect::Broadcast { data } = effect {
                 let other = if from == self.alice.peer_id() {
@@ -239,11 +239,6 @@ where
                 } else {
                     self.alice.peer_id()
                 };
-                self.outbox.push_back(QueuedMessage {
-                    from,
-                    to: from,
-                    data: data.clone(),
-                });
                 self.outbox.push_back(QueuedMessage {
                     from,
                     to: other,
@@ -278,8 +273,8 @@ where
 pub struct PairSnapshot {
     pub alice_shared: StateHash,
     pub bob_shared: StateHash,
-    pub alice_steps: usize,
-    pub bob_steps: usize,
+    pub alice_event_count: usize,
+    pub bob_event_count: usize,
     pub queued_messages: usize,
     pub transcript: String,
 }

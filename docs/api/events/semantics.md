@@ -86,7 +86,7 @@ reload state and evidence through the direct API methods.
 ## Payload safety
 
 Event payloads contain public identity values, protocol IDs, bounded counts,
-lifecycle values, state hashes, fuel counts, and host failure descriptions.
+lifecycle values, state hashes, and host failure descriptions.
 They never contain private keys, signatures, invite tokens, opaque program
 bytes, or raw Borsh payloads.
 

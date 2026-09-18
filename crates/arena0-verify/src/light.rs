@@ -2,10 +2,10 @@
 
 use arena0_program::ProgramHash;
 use arena0_protocol::{
-    AbortKind, Activation, AggregateAttestation, CHAIN_START, Committed, Ensemble,
-    MAX_PARTICIPANTS, MessageId, OutcomeHash, PeerId, PublicCursor, PublicEffect, PublicEvent,
-    ReceiptArtifact, ReceiptBody, ReceiptTermination, SessionHash, StepCommitment, StopCause,
-    TRACE_FORMAT_VERSION, TerminalCommitment, TicketAction,
+    AbortKind, Activation, AggregateAttestation, CHAIN_START, Committed, Effect, Ensemble, Event,
+    MAX_PARTICIPANTS, MessageId, OutcomeHash, PeerId, ReceiptArtifact, ReceiptBody,
+    ReceiptTermination, SessionHash, StepCommitment, StepCursor, StopCause, TRACE_FORMAT_VERSION,
+    TerminalCommitment, TicketAction,
 };
 
 use crate::error::{VerifyError, sanitize_verify_message};
@@ -21,17 +21,16 @@ pub struct LightVerified {
     pub ensemble: Vec<PeerId>,
     /// Number of contiguous public entries.
     pub steps: u64,
-    /// The required successful terminal certificate.
+    /// The authenticated terminal evidence represented by the artifact.
     pub terminal: LightVerifiedTerminal,
 }
 
 /// The terminal proof evidence accepted by light verification.
 ///
 /// Light verification authenticates the opaque Borsh outcome but cannot run the
-/// guest to produce its JSON projection. The full verifier converts this type
-/// into its replay terminal type only after replay. A stopped result never
-/// carries an outcome field, so callers cannot mistake an empty byte vector for
-/// a stopped proof.
+/// guest to produce its JSON projection. A stopped result never carries an
+/// outcome field, so callers cannot mistake an empty byte vector for a stopped
+/// proof.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LightVerifiedTerminal {
@@ -65,7 +64,7 @@ pub(crate) fn decode_receipt(receipt_bytes: &[u8]) -> Result<ReceiptArtifact, Ve
 }
 
 /// Verify a decoded receipt. The public entrypoint performs bounded decoding;
-/// replay uses this helper after it has decoded the same value.
+/// this helper is also used by tests that construct an authenticated artifact.
 pub(crate) fn verify_decoded(receipt: &ReceiptArtifact) -> Result<LightVerified, VerifyError> {
     let body = receipt.body();
     let header = body.header();
@@ -193,7 +192,7 @@ fn verify_trace(
     }
 
     let final_entry = trace.last();
-    let cursor = PublicCursor::new(trace_len, previous_state, previous_link);
+    let cursor = StepCursor::new(trace_len, previous_state, previous_link);
     match termination {
         ReceiptTermination::Completed { terminal } => {
             let final_entry = final_entry.ok_or(VerifyError::EmptyTrace)?;
@@ -238,14 +237,7 @@ fn verify_trace(
                         ));
                     }
                     if let Some(final_entry) = final_entry
-                        && final_entry.effects.iter().any(|effect| {
-                            matches!(
-                                effect,
-                                PublicEffect::SessionEnd { .. }
-                                    | PublicEffect::SessionAbort { .. }
-                                    | PublicEffect::Fail { .. }
-                            )
-                        })
+                        && final_entry.terminal.is_some()
                     {
                         return Err(VerifyError::TerminalNotLast {
                             step: final_entry.step,
@@ -266,9 +258,9 @@ fn verify_trace(
                     {
                         return Err(VerifyError::TerminalMismatch { field: "stop" });
                     }
-                    let valid = match (kind, final_entry.effects.as_slice()) {
-                        (AbortKind::Abort, [PublicEffect::SessionAbort { reason: actual }])
-                        | (AbortKind::Fail, [PublicEffect::Fail { reason: actual }]) => {
+                    let valid = match (kind, final_entry.terminal.as_ref()) {
+                        (AbortKind::Abort, Some(Effect::SessionAbort { reason: actual }))
+                        | (AbortKind::Fail, Some(Effect::Fail { reason: actual })) => {
                             actual == reason
                         }
                         _ => false,
@@ -291,7 +283,7 @@ fn verify_event(
 ) -> Result<(), VerifyError> {
     match (&entry.event, step) {
         (
-            PublicEvent::SessionStarted {
+            Event::SessionStarted {
                 ensemble: event_ensemble,
             },
             0,
@@ -302,27 +294,21 @@ fn verify_event(
                     message: "SessionStarted ensemble does not match activation".to_owned(),
                 });
             }
-            if entry.witness.is_some() {
-                return Err(VerifyError::PublicEntryInvalid {
-                    step,
-                    message: "SessionStarted carries a witness".to_owned(),
-                });
-            }
         }
-        (PublicEvent::SessionStarted { .. }, _) => {
+        (Event::SessionStarted { .. }, _) => {
             return Err(VerifyError::PublicEntryInvalid {
                 step,
                 message: "SessionStarted is only valid at public position zero".to_owned(),
             });
         }
-        (PublicEvent::MessageReceived { .. }, 0) => {
+        (Event::MessageReceived { .. }, 0) => {
             return Err(VerifyError::PublicEntryInvalid {
                 step,
                 message: "first public entry must be SessionStarted".to_owned(),
             });
         }
         (
-            PublicEvent::MessageReceived {
+            Event::MessageReceived {
                 message_id,
                 from,
                 position,
@@ -331,12 +317,6 @@ fn verify_event(
             },
             _,
         ) => {
-            let Some(witness) = entry.witness else {
-                return Err(VerifyError::PublicEntryInvalid {
-                    step,
-                    message: "message has no witness commitment".to_owned(),
-                });
-            };
             if !ensemble.contains(from) {
                 return Err(VerifyError::PublicEntryInvalid {
                     step,
@@ -355,14 +335,26 @@ fn verify_event(
                     message: "message pre-state does not equal entry pre-state".to_owned(),
                 });
             }
-            let expected =
-                MessageId::derive(session_id, *from, *position, *pre_state, msg, witness);
+            let expected = MessageId::derive(
+                session_id,
+                *from,
+                *position,
+                *pre_state,
+                entry.post_state,
+                msg,
+            );
             if *message_id != expected {
                 return Err(VerifyError::PublicEntryInvalid {
                     step,
                     message: "message id does not match its authenticated envelope".to_owned(),
                 });
             }
+        }
+        _ => {
+            return Err(VerifyError::PublicEntryInvalid {
+                step,
+                message: "event is not portable agreed evidence".to_owned(),
+            });
         }
     }
     Ok(())
@@ -377,27 +369,14 @@ fn verify_terminal_position(
     let next_step = step
         .checked_add(1)
         .ok_or_else(|| VerifyError::ReceiptInvalid("trace step overflow".to_owned()))?;
-    let terminal_count = entry
-        .effects
-        .iter()
-        .filter(|effect| {
-            matches!(
-                effect,
-                PublicEffect::SessionEnd { .. }
-                    | PublicEffect::SessionAbort { .. }
-                    | PublicEffect::Fail { .. }
-            )
-        })
-        .count();
+    let terminal_count = usize::from(entry.terminal.is_some());
     if terminal_count > 0 && next_step != trace_len {
         return Err(VerifyError::TerminalNotLast { step });
     }
     if next_step == trace_len {
         match termination {
             ReceiptTermination::Completed { .. } => {
-                if terminal_count != 1
-                    || !matches!(entry.effects.as_slice(), [PublicEffect::SessionEnd { .. }])
-                {
+                if !matches!(entry.terminal, Some(Effect::SessionEnd { .. })) {
                     return Err(VerifyError::OutcomeMissing);
                 }
             }
@@ -409,9 +388,9 @@ fn verify_terminal_position(
                 }
                 arena0_protocol::StopCause::Shared { kind, .. } => {
                     let valid = matches!(
-                        (kind, entry.effects.as_slice()),
-                        (AbortKind::Abort, [PublicEffect::SessionAbort { .. }])
-                            | (AbortKind::Fail, [PublicEffect::Fail { .. }])
+                        (kind, entry.terminal.as_ref()),
+                        (AbortKind::Abort, Some(Effect::SessionAbort { .. }))
+                            | (AbortKind::Fail, Some(Effect::Fail { .. }))
                     );
                     if !valid {
                         return Err(VerifyError::OutcomeMissing);
@@ -484,14 +463,6 @@ pub(crate) mod tests {
     fn fixture() -> Vec<u8> {
         fixture_with_binding(ProgramHash([0x44; 32]), StateHash([0x11; 32]), false)
             .expect("valid fixture")
-    }
-
-    #[cfg(feature = "replay")]
-    pub(crate) fn fixture_for_replay(
-        program_hash: ProgramHash,
-        initial_state: StateHash,
-    ) -> Vec<u8> {
-        fixture_with_binding(program_hash, initial_state, true).expect("valid replay fixture")
     }
 
     fn fixture_with_binding(
@@ -583,20 +554,14 @@ pub(crate) mod tests {
         let mut first = TraceEntry {
             trace_version: TRACE_FORMAT_VERSION,
             step: 0,
-            event: PublicEvent::SessionStarted {
+            event: Event::SessionStarted {
                 ensemble: ensemble.clone(),
-            },
-            effects: if two_steps {
-                Vec::new()
-            } else {
-                vec![PublicEffect::SessionEnd {
-                    outcome: outcome.clone(),
-                }]
             },
             pre_state: initial_state,
             post_state: first_post_state,
-            fuel_used: 3,
-            witness: None,
+            terminal: (!two_steps).then(|| Effect::SessionEnd {
+                outcome: outcome.clone(),
+            }),
             agreement: AggregateAttestation::empty(),
         };
         let first_commitment = StepCommitment::for_entry(session, &first, CHAIN_START);
@@ -612,32 +577,29 @@ pub(crate) mod tests {
         entries.push(first);
         if two_steps {
             let msg = vec![42];
-            let witness = arena0_protocol::WitnessCommitment([0x55; 32]);
             let sender = participants[1].0;
             let mut second = TraceEntry {
                 trace_version: TRACE_FORMAT_VERSION,
                 step: 1,
-                event: PublicEvent::MessageReceived {
+                event: Event::MessageReceived {
                     message_id: MessageId::derive(
                         session,
                         sender,
                         1,
                         first_post_state,
+                        final_state,
                         &msg,
-                        witness,
                     ),
                     from: sender,
                     position: 1,
                     pre_state: first_post_state,
                     msg,
                 },
-                effects: vec![PublicEffect::SessionEnd {
-                    outcome: outcome.clone(),
-                }],
                 pre_state: first_post_state,
                 post_state: final_state,
-                fuel_used: 4,
-                witness: Some(witness),
+                terminal: Some(Effect::SessionEnd {
+                    outcome: outcome.clone(),
+                }),
                 agreement: AggregateAttestation::empty(),
             };
             let second_commitment =
@@ -712,10 +674,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn obsolete_receipt_and_body_versions_are_rejected() {
+        let original = fixture();
+        for offset in [0, 1] {
+            let mut bytes = original.clone();
+            bytes[offset] = 2;
+            assert!(
+                verify_light(&bytes).is_err(),
+                "obsolete version at {offset}"
+            );
+        }
+    }
+
+    #[test]
     fn valid_canonical_receipt_is_accepted() {
         let bytes = fixture();
         let verified = verify_light(&bytes).expect("fixture verifies");
         assert_eq!(verified.steps, 1);
+        assert!(matches!(
+            verified.terminal,
+            LightVerifiedTerminal::Completed { outcome_borsh }
+                if outcome_borsh == vec![7, 8, 9]
+        ));
+    }
+
+    #[test]
+    fn valid_multi_step_message_receipt_is_accepted() {
+        let bytes = fixture_with_binding(ProgramHash([0x44; 32]), StateHash([0x11; 32]), true)
+            .expect("valid multi-step fixture");
+        let verified = verify_light(&bytes).expect("multi-step fixture verifies");
+        assert_eq!(verified.steps, 2);
         assert!(matches!(
             verified.terminal,
             LightVerifiedTerminal::Completed { outcome_borsh }

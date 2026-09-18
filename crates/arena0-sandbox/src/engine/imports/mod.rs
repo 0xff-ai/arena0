@@ -4,7 +4,7 @@ mod capabilities;
 mod core;
 
 use arena0_crypto::SignScheme;
-use arena0_program::Capability;
+use arena0_program::{Capability, StateMemoryKind};
 use arena0_protocol::Lifecycle;
 use wasmtime::{Caller, Extern, Memory};
 
@@ -32,6 +32,8 @@ pub(super) fn register_metadata_imports(
 /// Arena0-specific operations on a Wasmtime host-function caller.
 pub(super) trait CallerExt {
     fn work_memory(&mut self) -> Result<Memory, wasmtime::Error>;
+    fn state_memory(&mut self, kind: u32) -> Result<Memory, wasmtime::Error>;
+    fn reject_state_io(&self, name: &str) -> Result<(), wasmtime::Error>;
     fn read_guest_bytes(
         &mut self,
         ptr: u32,
@@ -40,7 +42,6 @@ pub(super) trait CallerExt {
     ) -> Result<Vec<u8>, wasmtime::Error>;
     fn begin_import(&mut self, _name: &str) -> Result<(), wasmtime::Error>;
     fn reject_read_only(&self, name: &str) -> Result<(), wasmtime::Error>;
-    fn reject_non_local(&self, name: &str) -> Result<(), wasmtime::Error>;
     fn reject_random_disallowed(&self, name: &str) -> Result<(), wasmtime::Error>;
     fn reject_if_lifecycle_disallowed(
         &self,
@@ -56,6 +57,28 @@ impl CallerExt for Caller<'_, HostState> {
             Some(Extern::Memory(memory)) => Ok(memory),
             _ => Err(wasmtime::Error::msg("memory not found in caller")),
         }
+    }
+
+    fn state_memory(&mut self, kind: u32) -> Result<Memory, wasmtime::Error> {
+        let name = match StateMemoryKind::try_from(kind)
+            .map_err(|error| wasmtime::Error::msg(error.to_string()))?
+        {
+            StateMemoryKind::Shared => arena0_program::abi::exports::SHARED_MEMORY,
+            StateMemoryKind::Local => arena0_program::abi::exports::LOCAL_MEMORY,
+        };
+        match self.get_export(name) {
+            Some(Extern::Memory(memory)) => Ok(memory),
+            _ => Err(wasmtime::Error::msg(format!("{name} memory not found"))),
+        }
+    }
+
+    fn reject_state_io(&self, name: &str) -> Result<(), wasmtime::Error> {
+        if !self.data().call_kind.allows_state_io() {
+            return Err(wasmtime::Error::msg(format!(
+                "{name}: state memory imports are unavailable to this call"
+            )));
+        }
+        Ok(())
     }
 
     fn read_guest_bytes(
@@ -98,21 +121,11 @@ impl CallerExt for Caller<'_, HostState> {
         Ok(())
     }
 
-    fn reject_non_local(&self, name: &str) -> Result<(), wasmtime::Error> {
-        self.reject_read_only(name)?;
-        if !self.data().call_kind.allows_local_effects() {
-            return Err(wasmtime::Error::msg(format!(
-                "{name}: import is unavailable to shared calls"
-            )));
-        }
-        Ok(())
-    }
-
     fn reject_random_disallowed(&self, name: &str) -> Result<(), wasmtime::Error> {
         self.reject_read_only(name)?;
         if !self.data().call_kind.allows_random() {
             return Err(wasmtime::Error::msg(format!(
-                "{name}: randomness is unavailable to shared calls"
+                "{name}: randomness is unavailable to this call"
             )));
         }
         Ok(())

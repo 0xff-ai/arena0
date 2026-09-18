@@ -66,7 +66,7 @@ The activation events `prepared`, `resumed`, and `committed` carry
 | `exec.session.started` | `{ensemble}` |
 | `exec.session.callout` | `{pending_id, callout_index, name, prompt, schema, context}` |
 | `exec.session.callout_answered` | `{pending_id}` |
-| `exec.session.step` | `{step, pre_state, post_state, fuel_used, signers, participants}` |
+| `exec.session.step` | `{step, pre_state, post_state, signers, participants}` |
 | `exec.session.ended` | `{terminal}` |
 
 `pending_id` values in the callout rows are decimal JSON strings. Consumers

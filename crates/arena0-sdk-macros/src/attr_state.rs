@@ -9,6 +9,7 @@ use crate::util::to_pascal_case;
 const RESERVED_PRIMITIVE_ACCESSORS: &[&str] = &[
     "shared",
     "shared_mut",
+    "state_mut",
     "mutate_shared",
     "local",
     "local_mut",
@@ -333,11 +334,8 @@ pub(crate) fn expand_arena0_state(
         }
     });
     let accessor_trait = format_ident!("__Arena0{}PrimitiveAccess", ident);
-    let shared_accessor_trait = format_ident!("__Arena0{}SharedPrimitiveAccess", ident);
     let generic_lookup_trait = format_ident!("__Arena0{}PrimitiveLookup", ident);
     let generic_has_trait = format_ident!("__Arena0{}HasPrimitive", ident);
-    let shared_generic_lookup_trait = format_ident!("__Arena0{}SharedPrimitiveLookup", ident);
-    let shared_generic_has_trait = format_ident!("__Arena0{}HasSharedPrimitive", ident);
     let primitive_routes: Vec<_> = parsed_fields
         .iter()
         .filter(|f| f.is_primitive)
@@ -398,13 +396,13 @@ pub(crate) fn expand_arena0_state(
                 let doc = format!("Access the `{name}` primitive field with generated routing metadata.");
                 quote! {
                     #[doc = #doc]
-                    fn #name(&mut self) -> ::arena0::LocalPrimitiveField<'_, #ident, __Arena0Local, #ty, #route_ident>;
+                    fn #name(&mut self) -> ::arena0::PrimitiveField<'_, #ident, __Arena0Local, #ty, #route_ident>;
                 }
             } else {
                 let doc = format!("Access the `{name}` primitive field.");
                 quote! {
                     #[doc = #doc]
-                    fn #name(&mut self) -> ::arena0::LocalPrimitiveField<'_, #ident, __Arena0Local, #ty>;
+                    fn #name(&mut self) -> ::arena0::PrimitiveField<'_, #ident, __Arena0Local, #ty>;
                 }
             }
         })
@@ -418,70 +416,26 @@ pub(crate) fn expand_arena0_state(
             if f.primitive_route.is_some() {
                 let route_ident = primitive_route_ident(ident, name);
                 quote! {
-                    fn #name(&mut self) -> ::arena0::LocalPrimitiveField<'_, #ident, __Arena0Local, #ty, #route_ident> {
-                        fn field(state: &#ident) -> &#ty {
+                    fn #name(&mut self) -> ::arena0::PrimitiveField<'_, #ident, __Arena0Local, #ty, #route_ident> {
+                        fn shared_field(state: &#ident) -> &#ty {
                             &state.#name
                         }
-                        self.__local_primitive_field_routed(field)
-                    }
-                }
-            } else {
-                quote! {
-                    fn #name(&mut self) -> ::arena0::LocalPrimitiveField<'_, #ident, __Arena0Local, #ty> {
-                        fn field(state: &#ident) -> &#ty {
-                            &state.#name
-                        }
-                        self.__local_primitive_field(field)
-                    }
-                }
-            }
-        })
-        .collect();
-    let shared_accessor_methods: Vec<_> = parsed_fields
-        .iter()
-        .filter(|f| f.is_primitive)
-        .map(|f| {
-            let name = &f.ident;
-            let ty = &f.ty;
-            if f.primitive_route.is_some() {
-                let route_ident = primitive_route_ident(ident, name);
-                let doc = format!("Access the `{name}` primitive field for a shared apply.");
-                quote! {
-                    #[doc = #doc]
-                    fn #name(&mut self) -> ::arena0::SharedPrimitiveField<'_, #ident, #ty, #route_ident>;
-                }
-            } else {
-                let doc = format!("Access the `{name}` primitive field for a shared apply.");
-                quote! {
-                    #[doc = #doc]
-                    fn #name(&mut self) -> ::arena0::SharedPrimitiveField<'_, #ident, #ty>;
-                }
-            }
-        })
-        .collect();
-    let shared_accessor_impls: Vec<_> = parsed_fields
-        .iter()
-        .filter(|f| f.is_primitive)
-        .map(|f| {
-            let name = &f.ident;
-            let ty = &f.ty;
-            if f.primitive_route.is_some() {
-                let route_ident = primitive_route_ident(ident, name);
-                quote! {
-                    fn #name(&mut self) -> ::arena0::SharedPrimitiveField<'_, #ident, #ty, #route_ident> {
                         fn field(state: &mut #ident) -> &mut #ty {
                             &mut state.#name
                         }
-                        self.__shared_primitive_field_routed(field)
+                        self.__primitive_field_routed(field, shared_field)
                     }
                 }
             } else {
                 quote! {
-                    fn #name(&mut self) -> ::arena0::SharedPrimitiveField<'_, #ident, #ty> {
+                    fn #name(&mut self) -> ::arena0::PrimitiveField<'_, #ident, __Arena0Local, #ty> {
+                        fn shared_field(state: &#ident) -> &#ty {
+                            &state.#name
+                        }
                         fn field(state: &mut #ident) -> &mut #ty {
                             &mut state.#name
                         }
-                        self.__shared_primitive_field(field)
+                        self.__primitive_field(field, shared_field)
                     }
                 }
             }
@@ -510,53 +464,31 @@ pub(crate) fn expand_arena0_state(
             } else {
                 quote! { ::arena0::RawPrimitiveRoute }
             };
-            let local_field_fn = format_ident!("__arena0_local_primitive_field_{}", name);
+            let field_fn = format_ident!("__arena0_primitive_field_{}", name);
             let shared_field_fn = format_ident!("__arena0_shared_primitive_field_{}", name);
-            let local_builder = if f.primitive_route.is_some() {
-                quote! { self.__local_primitive_field_routed(#local_field_fn) }
+            let builder = if f.primitive_route.is_some() {
+                quote! { self.__primitive_field_routed(#field_fn, #shared_field_fn) }
             } else {
-                quote! { self.__local_primitive_field(#local_field_fn) }
+                quote! { self.__primitive_field(#field_fn, #shared_field_fn) }
             };
-            let shared_builder = if f.primitive_route.is_some() {
-                quote! { self.__shared_primitive_field_routed(#shared_field_fn) }
-            } else {
-                quote! { self.__shared_primitive_field(#shared_field_fn) }
-            };
-            let context_impl = quote! {
+            quote! {
                 impl<__Arena0Local> #generic_has_trait<__Arena0Local, #ty>
                     for ::arena0::Context<#ident, __Arena0Local>
                 {
-                    type Access<'a> = ::arena0::LocalPrimitiveField<'a, #ident, __Arena0Local, #ty, #route_ty>
+                    type Access<'a> = ::arena0::PrimitiveField<'a, #ident, __Arena0Local, #ty, #route_ty>
                     where
                         Self: 'a;
 
                     fn __arena0_primitive(&mut self) -> Self::Access<'_> {
-                        fn #local_field_fn(state: &#ident) -> &#ty {
-                            &state.#name
-                        }
-                        #local_builder
-                    }
-                }
-            };
-            let shared_impl = quote! {
-                impl #shared_generic_has_trait<#ty>
-                    for ::arena0::SharedContext<#ident>
-                {
-                    type Access<'a> = ::arena0::SharedPrimitiveField<'a, #ident, #ty, #route_ty>
-                    where
-                        Self: 'a;
-
-                    fn __arena0_primitive(&mut self) -> Self::Access<'_> {
-                        fn #shared_field_fn(state: &mut #ident) -> &mut #ty {
+                        fn #field_fn(state: &mut #ident) -> &mut #ty {
                             &mut state.#name
                         }
-                        #shared_builder
+                        fn #shared_field_fn(state: &#ident) -> &#ty {
+                            &state.#name
+                        }
+                        #builder
                     }
                 }
-            };
-            quote! {
-                #context_impl
-                #shared_impl
             }
         })
         .collect();
@@ -610,11 +542,6 @@ pub(crate) fn expand_arena0_state(
         }
 
         #[doc(hidden)]
-        trait #shared_accessor_trait {
-            #(#shared_accessor_methods)*
-        }
-
-        #[doc(hidden)]
         trait #generic_has_trait<__Arena0Local, __Arena0Primitive> {
             type Access<'a>
             where
@@ -632,30 +559,8 @@ pub(crate) fn expand_arena0_state(
                 Self: #generic_has_trait<__Arena0Local, __Arena0Primitive>;
         }
 
-        #[doc(hidden)]
-        trait #shared_generic_has_trait<__Arena0Primitive> {
-            type Access<'a>
-            where
-                Self: 'a;
-
-            fn __arena0_primitive(&mut self) -> Self::Access<'_>;
-        }
-
-        #[doc(hidden)]
-        trait #shared_generic_lookup_trait {
-            fn primitive<__Arena0Primitive>(
-                &mut self,
-            ) -> <Self as #shared_generic_has_trait<__Arena0Primitive>>::Access<'_>
-            where
-                Self: #shared_generic_has_trait<__Arena0Primitive>;
-        }
-
         impl<__Arena0Local> #accessor_trait<__Arena0Local> for ::arena0::Context<#ident, __Arena0Local> {
             #(#accessor_impls)*
-        }
-
-        impl #shared_accessor_trait for ::arena0::SharedContext<#ident> {
-            #(#shared_accessor_impls)*
         }
 
         impl<__Arena0Local> #generic_lookup_trait<__Arena0Local> for ::arena0::Context<#ident, __Arena0Local> {
@@ -666,17 +571,6 @@ pub(crate) fn expand_arena0_state(
                 Self: #generic_has_trait<__Arena0Local, __Arena0Primitive>,
             {
                 <Self as #generic_has_trait<__Arena0Local, __Arena0Primitive>>::__arena0_primitive(self)
-            }
-        }
-
-        impl #shared_generic_lookup_trait for ::arena0::SharedContext<#ident> {
-            fn primitive<__Arena0Primitive>(
-                &mut self,
-            ) -> <Self as #shared_generic_has_trait<__Arena0Primitive>>::Access<'_>
-            where
-                Self: #shared_generic_has_trait<__Arena0Primitive>,
-            {
-                <Self as #shared_generic_has_trait<__Arena0Primitive>>::__arena0_primitive(self)
             }
         }
 
@@ -728,8 +622,8 @@ mod tests {
         assert!(expanded.contains("\"commit_reveal\""));
         assert!(expanded.contains("\"Message :: CommitReveal\""));
         assert!(expanded.contains("Message"));
-        assert!(expanded.contains("__local_primitive_field_routed"));
-        assert!(expanded.contains("__shared_primitive_field_routed"));
+        assert!(expanded.contains("__primitive_field_routed"));
+        assert!(expanded.contains("__arena0_primitive_field_commit_reveal"));
         assert!(expanded.contains("HasPrimitive"));
         assert!(expanded.contains("CommitReveal < Choice >"));
         assert!(expanded.contains("type Access"));

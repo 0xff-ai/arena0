@@ -247,29 +247,77 @@ impl Database {
         Ok(())
     }
 
-    pub(super) fn persist_terminal(
+    pub(super) fn persist_terminal_publication(
         &mut self,
         execution_id: ExecId,
         version: ExecutionVersion,
-        plan: &CommitPlan,
+        receipt: &ReceiptArtifact,
         now_ms: u64,
     ) -> Result<(), StoreError> {
-        let Some(terminal) = plan.terminal() else {
-            return Ok(());
-        };
-        let receipt = terminal.receipt();
-        let publication_bytes = borsh::to_vec(terminal).map_err(|error| {
-            StoreError::Corruption(format!("terminal publication encode: {error}"))
-        })?;
         self.insert_artifact(receipt, now_ms)?;
+        let publication_bytes = receipt.encode()?;
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT version, receipt_id, publication FROM terminal_proofs
+             WHERE execution_id = ?1",
+                params![execution_id.0.to_vec()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((old_version, old_id, old_publication)) = existing {
+            let old_payload = open_envelope(
+                EnvelopeKind::TerminalPublication,
+                &old_publication,
+                arena0_protocol::MAX_RECEIPT_BYTES,
+            )?;
+            if sqlite_i64(old_version)? != version.get()
+                || old_id != receipt.receipt_id().as_bytes().to_vec()
+                || old_payload != publication_bytes
+            {
+                return Err(StoreError::Corruption(
+                    "terminal publication identity was reused with different evidence".into(),
+                ));
+            }
+            if self.receipt_production(receipt.receipt_id())? != Some(execution_id) {
+                return Err(StoreError::Corruption(
+                    "terminal publication is missing its execution relation".into(),
+                ));
+            }
+            return Ok(());
+        }
+        let production = self.receipt_production(receipt.receipt_id())?;
+        if production.is_some_and(|existing| existing != execution_id) {
+            return Err(StoreError::Corruption(
+                "receipt is already produced by another execution".into(),
+            ));
+        }
+        if production.is_none() {
+            self.connection.execute(
+                "INSERT INTO receipt_productions (receipt_id, execution_id) VALUES (?1, ?2)",
+                params![
+                    receipt.receipt_id().as_bytes().to_vec(),
+                    execution_id.0.to_vec()
+                ],
+            )?;
+        }
         self.connection.execute(
-            "INSERT INTO receipt_productions (receipt_id, execution_id) VALUES (?1, ?2)",
+            "INSERT INTO terminal_proofs
+             (execution_id, version, receipt_id, publication)
+             VALUES (?1, ?2, ?3, ?4)",
             params![
+                execution_id.0.to_vec(),
+                sqlite_u64(version.get())?,
                 receipt.receipt_id().as_bytes().to_vec(),
-                execution_id.0.to_vec()
+                envelope(EnvelopeKind::TerminalPublication, &publication_bytes)?,
             ],
         )?;
-        self.connection.execute("INSERT INTO terminal_proofs (execution_id, version, receipt_id, publication) VALUES (?1, ?2, ?3, ?4)", params![execution_id.0.to_vec(), sqlite_u64(version.get())?, receipt.receipt_id().as_bytes().to_vec(), envelope(EnvelopeKind::TerminalPublication, &publication_bytes)?])?;
         Ok(())
     }
 
@@ -307,9 +355,8 @@ impl Database {
             &publication,
             arena0_protocol::MAX_RECEIPT_BYTES,
         )?;
-        let terminal: arena0_protocol::TerminalPublication =
-            decode_borsh(&payload, "terminal publication")?;
-        let receipt = terminal.receipt();
+        let receipt: ReceiptArtifact = ReceiptArtifact::decode(&payload)
+            .map_err(|error| StoreError::Corruption(format!("terminal publication: {error}")))?;
         if sqlite_i64(version)? != state.version().get()
             || row_id != receipt_id.as_bytes().to_vec()
             || receipt.receipt_id() != receipt_id
@@ -321,7 +368,7 @@ impl Database {
                 "terminal proof does not match published execution state".into(),
             ));
         }
-        if receipt.body().trace() != self.load_public_trace_in_transaction(state)? {
+        if receipt.body().trace() != self.load_agreed_trace_in_transaction(state)? {
             return Err(StoreError::Corruption(
                 "receipt trace does not match durable public commits".into(),
             ));
@@ -358,9 +405,9 @@ impl Database {
             &row.artifact,
             arena0_protocol::MAX_RECEIPT_BYTES,
         )?;
-        if ReceiptArtifact::decode(&bytes)? != *receipt
+        if ReceiptArtifact::decode(&bytes)? != receipt
             || row.session_id != state.binding().session_id().0.to_vec()
-            || row.kind != artifact_kind(receipt)
+            || row.kind != artifact_kind(&receipt)
         {
             return Err(StoreError::Corruption(
                 "receipt artifact does not match terminal publication".into(),

@@ -17,13 +17,12 @@ use std::{future::Future, path::PathBuf};
 use anyhow::Context as _;
 use arena0_api::{
     ActivationInspection, ActivationInspectionState, ActivationParticipant, ActivityData,
-    ActivityFrame, ApiError, ApiErrorCode, EnsembleSpec, EventData, EventFilter, EventFrame,
-    ExecLifecycle, ExecOrigin, ExecStatus, ExecStatusState, ExecutionFailureKind,
-    ExecutionInspection, FullVerifiedTerminal, HostInfo, LightVerifiedTerminal, NegotiationStage,
-    NextEvent, PendingCalloutStatus, PrivateCommitSummary as ApiPrivateCommitSummary,
-    PrivateEffectKind as ApiPrivateEffectKind, PrivateEffectSummary as ApiPrivateEffectSummary,
-    PrivateEventKind as ApiPrivateEventKind, ProgramRefError, ReceiptRef, Response, ResponseOk,
-    SessionProgress, SessionStatus, VerifiedResult, frame,
+    ActivityFrame, ApiError, ApiErrorCode, EffectKind as ApiEffectKind,
+    EffectSummary as ApiEffectSummary, EnsembleSpec, EventData, EventFilter, EventFrame,
+    EventKind as ApiEventKind, EventRecordSummary as ApiEventRecordSummary, ExecLifecycle,
+    ExecOrigin, ExecStatus, ExecStatusState, ExecutionFailureKind, ExecutionInspection, HostInfo,
+    LightVerifiedTerminal, NegotiationStage, NextEvent, PendingCalloutStatus, ProgramRefError,
+    ReceiptRef, Response, ResponseOk, SessionProgress, SessionStatus, VerifiedResult, frame,
 };
 use arena0_api::{HostRequest, HostStatus};
 use arena0_crypto::{AgentPubKey, ExecutionKey, NodeKeys};
@@ -45,7 +44,7 @@ use arena0_protocol::{
 };
 use arena0_sandbox::{InitializeCall, LoadedProgram, Program, ViewCall, WasmtimeEngine};
 use arena0_transport::{NegotiationTopic, ProgramTopicEvent, Transport};
-use arena0_verify::{LightVerifiedTerminal as VerifiedLightTerminal, verify_full, verify_light};
+use arena0_verify::{LightVerifiedTerminal as VerifiedLightTerminal, verify_light};
 use retry::delay::{Exponential, jitter};
 use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
@@ -63,10 +62,10 @@ use crate::schema;
 use crate::startup::{StartupStage, StartupTimeline};
 use crate::store::{Keystore, KeystoreError};
 use arena0_store::{
-    ActivationRecord, ActivationRecordStatus, AdmissionBindingOutcome, ExecutionRequest,
-    ExecutionRequestFailureOutcome, MAX_PRIVATE_INSPECTION_RECORDS,
-    PrivateCommitSummary as StorePrivateCommitSummary, RecoveryCandidate, RecoveryCursor,
-    StoreHandle,
+    ActivationRecord, ActivationRecordStatus, AdmissionBindingOutcome,
+    EventRecordSummary as StoreEventRecordSummary, ExecutionRequest,
+    ExecutionRequestFailureOutcome, MAX_EVENT_INSPECTION_RECORDS, RecoveryCandidate,
+    RecoveryCursor, StoreHandle,
 };
 
 /// Capacity of the event broadcast bus. A slow subscriber that falls this far
@@ -395,7 +394,6 @@ pub(crate) enum HostEvent {
         step: u64,
         pre_state: arena0_protocol::StateHash,
         post_state: arena0_protocol::StateHash,
-        fuel_used: u64,
         signers: u16,
         participants: u16,
     },
@@ -465,25 +463,10 @@ impl HostEvent {
                     ensemble: ensemble.clone(),
                 },
             }),
-            Self::SessionStep {
-                source,
-                step,
-                pre_state,
-                post_state,
-                fuel_used,
-                signers,
-                participants,
-            } => Some(SystemEvent::Execution {
-                source: source.clone(),
-                event: ExecutionEvent::StepCommitted {
-                    step: *step,
-                    pre_state: *pre_state,
-                    post_state: *post_state,
-                    fuel_used: *fuel_used,
-                    signer_count: *signers,
-                    participant_count: *participants,
-                },
-            }),
+            // The durable trace no longer carries fuel telemetry. Keep the
+            // semantic step on the API event stream, but do not fabricate an
+            // operational value for the process-local system projection.
+            Self::SessionStep { .. } => None,
             Self::SessionCallout {
                 source,
                 pending_id,
@@ -603,7 +586,6 @@ impl HostEvent {
                 step,
                 pre_state,
                 post_state,
-                fuel_used,
                 signers,
                 participants,
                 ..
@@ -611,7 +593,6 @@ impl HostEvent {
                 step: *step,
                 pre_state: *pre_state,
                 post_state: *post_state,
-                fuel_used: *fuel_used,
                 signers: *signers,
                 participants: *participants,
             },
@@ -1040,7 +1021,7 @@ fn load_and_initialize(
     let initialized = loaded
         .initialize(InitializeCall::new(params))
         .map_err(|error| anyhow::anyhow!("{context} initialize: {error}"))?;
-    Ok((loaded, StateHash::of(initialized.shared.as_bytes())))
+    Ok((loaded, StateHash::of_shared(&initialized.shared)))
 }
 
 /// Load and initialize one program in a blocking worker. Wasmtime loading and
@@ -1992,10 +1973,10 @@ impl HostService {
             }
             HostRequest::ExecInspect {
                 exec_id,
-                private_from,
-                private_limit,
+                events_from,
+                events_limit,
             } => self
-                .exec_inspect(exec_id, private_from, private_limit)
+                .exec_inspect(exec_id, events_from, events_limit)
                 .await
                 .map(ResponseOk::Inspection),
             HostRequest::ExecAwait { exec_id, until } => {
@@ -2061,7 +2042,7 @@ impl HostService {
                     receipts.into_iter().map(receipt_list_entry).collect(),
                 ))
             }
-            HostRequest::ReceiptVerify { receipt, full } => self.verify(receipt, full).await,
+            HostRequest::ReceiptVerify { receipt } => self.verify(receipt).await,
         }
     }
 
@@ -2102,16 +2083,16 @@ impl HostService {
     async fn exec_inspect(
         &self,
         exec_id: ExecId,
-        private_from: Option<u64>,
-        private_limit: u16,
+        events_from: Option<u64>,
+        events_limit: u16,
     ) -> Result<ExecutionInspection, ApiError> {
-        let private_limit = usize::from(private_limit);
-        if private_limit == 0 || private_limit > MAX_PRIVATE_INSPECTION_RECORDS {
+        let events_limit = usize::from(events_limit);
+        if events_limit == 0 || events_limit > MAX_EVENT_INSPECTION_RECORDS {
             return Err(ApiError::new(
                 ApiErrorCode::BadRequest,
                 format!(
-                    "private inspection limit must be between 1 and {}",
-                    MAX_PRIVATE_INSPECTION_RECORDS
+                    "event inspection limit must be between 1 and {}",
+                    MAX_EVENT_INSPECTION_RECORDS
                 ),
             ));
         }
@@ -2130,32 +2111,32 @@ impl HostService {
         {
             Some(_) => self
                 .store
-                .read_private_summaries(exec_id, private_from, private_limit)
+                .read_event_summaries(exec_id, events_from, events_limit)
                 .await
                 .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?,
             None => {
                 return Ok(empty_execution_inspection(
                     status,
                     activation,
-                    private_from.unwrap_or(0),
+                    events_from.unwrap_or(0),
                 ));
             }
         };
-        let private_from = page.from();
-        let private_total = page.total();
-        let private_next = page.next();
-        let private = page
+        let events_from = page.from();
+        let events_total = page.total();
+        let events_next = page.next();
+        let events = page
             .into_summaries()
             .into_iter()
-            .map(project_private_commit_summary)
+            .map(project_event_record_summary)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(ExecutionInspection {
             status,
             activation,
-            private_from,
-            private,
-            private_total,
-            private_next,
+            events_from,
+            events,
+            events_total,
+            events_next,
         })
     }
 
@@ -3505,7 +3486,7 @@ impl HostService {
             )
             .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
             let engine = Arc::clone(&self.engine);
-            let step = state.public().next_step();
+            let step = state.agreed_step();
             let shared = state.shared_state().clone();
             let projection = tokio::task::spawn_blocking(move || {
                 engine
@@ -3593,57 +3574,14 @@ impl HostService {
             .ok_or_else(|| ApiError::new(ApiErrorCode::NotFound, "no such receipt or stop report"))
     }
 
-    /// Verify a receipt and return its evidence: light by default, full on request.
-    async fn verify(&self, receipt: ReceiptRef, full: bool) -> Response {
+    /// Verify a receipt and return its portable structural evidence.
+    async fn verify(&self, receipt: ReceiptRef) -> Response {
         let receipt = self.resolve_receipt(receipt).await?;
         let receipt_bytes = receipt
             .encode()
             .map_err(|error| ApiError::new(ApiErrorCode::Verification, error.to_string()))?;
         let light = verify_light(&receipt_bytes)
             .map_err(|e| ApiError::new(ApiErrorCode::Verification, format!("light: {e:?}")))?;
-
-        if full {
-            let program = self
-                .catalog
-                .load_program(light.program_id)
-                .await
-                .map_err(|error| {
-                    ApiError::new(ApiErrorCode::Storage, format!("load program: {error}"))
-                })?;
-            let receipt_bytes = receipt_bytes.clone();
-            let full =
-                tokio::task::spawn_blocking(move || verify_full(program.bytes(), &receipt_bytes))
-                    .await
-                    .map_err(|error| {
-                        ApiError::new(ApiErrorCode::Internal, format!("join: {error}"))
-                    })?
-                    .map_err(|error| {
-                        ApiError::new(ApiErrorCode::Verification, format!("full: {error:?}"))
-                    })?;
-            let terminal = match full.terminal {
-                arena0_verify::VerifiedTerminal::Completed {
-                    outcome_borsh,
-                    outcome_json,
-                } => FullVerifiedTerminal::Completed {
-                    outcome_borsh,
-                    outcome_json: schema::decode_guest_json(
-                        outcome_json.as_bytes(),
-                        "verified outcome",
-                    )?,
-                },
-                arena0_verify::VerifiedTerminal::Stopped { cause } => {
-                    FullVerifiedTerminal::Stopped { cause }
-                }
-            };
-            return Ok(ResponseOk::Verified {
-                receipt_id: receipt.receipt_id(),
-                program_id: light.program_id,
-                session_id: light.session_id,
-                ensemble: light.ensemble,
-                steps: light.steps,
-                result: VerifiedResult::Full { terminal },
-            });
-        }
 
         let terminal = match light.terminal {
             VerifiedLightTerminal::Completed { outcome_borsh } => {
@@ -3690,7 +3628,7 @@ fn project_exec_status_facts(
         let activation = state.binding().activation();
         SessionStatus {
             session_id: state.binding().session_id(),
-            step: state.public().next_step(),
+            step: state.agreed_step(),
             peers: activation
                 .tickets()
                 .iter()
@@ -3764,15 +3702,15 @@ fn project_exec_status_facts(
 fn empty_execution_inspection(
     status: ExecStatus,
     activation: Option<ActivationInspection>,
-    private_from: u64,
+    events_from: u64,
 ) -> ExecutionInspection {
     ExecutionInspection {
         status,
         activation,
-        private_from,
-        private: Vec::new(),
-        private_total: 0,
-        private_next: None,
+        events_from,
+        events: Vec::new(),
+        events_total: 0,
+        events_next: None,
     }
 }
 
@@ -3802,14 +3740,14 @@ fn project_activation_inspection(record: ActivationRecord) -> ActivationInspecti
     }
 }
 
-fn project_private_commit_summary(
-    summary: StorePrivateCommitSummary,
-) -> Result<ApiPrivateCommitSummary, ApiError> {
+fn project_event_record_summary(
+    summary: StoreEventRecordSummary,
+) -> Result<ApiEventRecordSummary, ApiError> {
     let input_payload_bytes = summary
         .input_payload_bytes
         .map(u64::try_from)
         .transpose()
-        .map_err(|_| ApiError::new(ApiErrorCode::Internal, "private input size overflows u64"))?;
+        .map_err(|_| ApiError::new(ApiErrorCode::Internal, "event input size overflows u64"))?;
     let effects = summary
         .effects
         .into_iter()
@@ -3819,33 +3757,37 @@ fn project_private_commit_summary(
                 .map(u64::try_from)
                 .transpose()
                 .map_err(|_| {
-                    ApiError::new(ApiErrorCode::Internal, "private effect size overflows u64")
+                    ApiError::new(ApiErrorCode::Internal, "event effect size overflows u64")
                 })?;
-            Ok(ApiPrivateEffectSummary {
+            Ok(ApiEffectSummary {
                 kind: match effect.kind {
-                    arena0_store::PrivateEffectKind::Broadcast => ApiPrivateEffectKind::Broadcast,
-                    arena0_store::PrivateEffectKind::Callout => ApiPrivateEffectKind::Callout,
-                    arena0_store::PrivateEffectKind::SetTimer => ApiPrivateEffectKind::SetTimer,
-                    arena0_store::PrivateEffectKind::Sign => ApiPrivateEffectKind::Sign,
-                    arena0_store::PrivateEffectKind::RetryInput => ApiPrivateEffectKind::RetryInput,
+                    arena0_store::EffectKind::SessionEnd => ApiEffectKind::SessionEnd,
+                    arena0_store::EffectKind::SessionAbort => ApiEffectKind::SessionAbort,
+                    arena0_store::EffectKind::Broadcast => ApiEffectKind::Broadcast,
+                    arena0_store::EffectKind::Callout => ApiEffectKind::Callout,
+                    arena0_store::EffectKind::SetTimer => ApiEffectKind::SetTimer,
+                    arena0_store::EffectKind::Sign => ApiEffectKind::Sign,
+                    arena0_store::EffectKind::Fail => ApiEffectKind::Fail,
+                    arena0_store::EffectKind::RetryInput => ApiEffectKind::RetryInput,
                 },
                 payload_bytes,
             })
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
-    Ok(ApiPrivateCommitSummary {
-        sequence: summary.sequence,
-        public_position: summary.public_position,
+    Ok(ApiEventRecordSummary {
+        event_position: summary.event_position,
+        agreed_steps: summary.agreed_steps,
         event: match summary.event {
-            arena0_store::PrivateEventKind::InputReceived => ApiPrivateEventKind::InputReceived,
-            arena0_store::PrivateEventKind::TimerFired => ApiPrivateEventKind::TimerFired,
-            arena0_store::PrivateEventKind::TypedTimerFired => ApiPrivateEventKind::TypedTimerFired,
-            arena0_store::PrivateEventKind::Signed => ApiPrivateEventKind::Signed,
-            arena0_store::PrivateEventKind::React => ApiPrivateEventKind::React,
+            arena0_store::EventKind::SessionStarted => ApiEventKind::SessionStarted,
+            arena0_store::EventKind::MessageReceived => ApiEventKind::MessageReceived,
+            arena0_store::EventKind::InputReceived => ApiEventKind::InputReceived,
+            arena0_store::EventKind::TimerFired => ApiEventKind::TimerFired,
+            arena0_store::EventKind::TypedTimerFired => ApiEventKind::TypedTimerFired,
+            arena0_store::EventKind::Signed => ApiEventKind::Signed,
+            arena0_store::EventKind::React => ApiEventKind::React,
         },
         input_payload_bytes,
         effects,
-        fuel_used: summary.fuel_used,
     })
 }
 
@@ -4275,7 +4217,7 @@ mod tests {
     use arena0_crypto::bls::BlsSecretKey;
     use arena0_crypto::{BlsSignature, SecretKey, key_binding_message};
     use arena0_program::{LocalStateBytes, SharedStateBytes};
-    use arena0_protocol::execution::{ExecutionInput, ExecutionState};
+    use arena0_protocol::execution::ExecutionState;
     use arena0_protocol::{AbortKind, Activation, ActivationData, PreparedActivation};
     use arena0_transport::local::{LocalNetwork, LocalTransport};
 
@@ -4330,24 +4272,23 @@ mod tests {
     }
 
     #[test]
-    fn private_inspection_projection_has_no_private_payload_fields() {
-        let summary = arena0_store::PrivateCommitSummary {
-            sequence: 4,
-            public_position: 3,
-            event: arena0_store::PrivateEventKind::InputReceived,
+    fn event_inspection_projection_has_no_payload_fields() {
+        let summary = arena0_store::EventRecordSummary {
+            event_position: 4,
+            agreed_steps: vec![3],
+            event: arena0_store::EventKind::InputReceived,
             input_payload_bytes: Some(2),
-            effects: vec![arena0_store::PrivateEffectSummary {
-                kind: arena0_store::PrivateEffectKind::Callout,
+            effects: vec![arena0_store::EffectSummary {
+                kind: arena0_store::EffectKind::Callout,
                 payload_bytes: Some(8),
             }],
-            fuel_used: 17,
         };
-        let projected = project_private_commit_summary(summary).expect("projection");
-        assert_eq!(projected.sequence, 4);
-        assert_eq!(projected.public_position, 3);
-        assert_eq!(projected.event, ApiPrivateEventKind::InputReceived);
+        let projected = project_event_record_summary(summary).expect("projection");
+        assert_eq!(projected.event_position, 4);
+        assert_eq!(projected.agreed_steps, vec![3]);
+        assert_eq!(projected.event, ApiEventKind::InputReceived);
         assert_eq!(projected.input_payload_bytes, Some(2));
-        assert_eq!(projected.effects[0].kind, ApiPrivateEffectKind::Callout);
+        assert_eq!(projected.effects[0].kind, ApiEffectKind::Callout);
         assert_eq!(projected.effects[0].payload_bytes, Some(8));
         let encoded = serde_json::to_value(projected).expect("projection JSON");
         assert!(encoded.get("data").is_none());
@@ -4843,8 +4784,8 @@ mod tests {
         match daemon
             .dispatch(HostRequest::ExecInspect {
                 exec_id,
-                private_from: Some(0),
-                private_limit: MAX_PRIVATE_INSPECTION_RECORDS as u16,
+                events_from: Some(0),
+                events_limit: MAX_EVENT_INSPECTION_RECORDS as u16,
             })
             .await
         {
@@ -4852,9 +4793,9 @@ mod tests {
                 assert_eq!(inspection.status.exec_id, exec_id);
                 assert_eq!(inspection.status.lifecycle(), ExecLifecycle::Failed);
                 assert!(inspection.activation.is_none());
-                assert!(inspection.private.is_empty());
-                assert_eq!(inspection.private_total, 0);
-                assert_eq!(inspection.private_next, None);
+                assert!(inspection.events.is_empty());
+                assert_eq!(inspection.events_total, 0);
+                assert_eq!(inspection.events_next, None);
             }
             other => panic!("expected exec.inspect, got {other:?}"),
         }
@@ -4862,8 +4803,8 @@ mod tests {
             daemon
                 .dispatch(HostRequest::ExecInspect {
                     exec_id,
-                    private_from: Some(0),
-                    private_limit: (MAX_PRIVATE_INSPECTION_RECORDS + 1) as u16,
+                    events_from: Some(0),
+                    events_limit: (MAX_EVENT_INSPECTION_RECORDS + 1) as u16,
                 })
                 .await,
             Err(ApiError {
@@ -4875,8 +4816,8 @@ mod tests {
             daemon
                 .dispatch(HostRequest::ExecInspect {
                     exec_id,
-                    private_from: Some(0),
-                    private_limit: 0,
+                    events_from: Some(0),
+                    events_limit: 0,
                 })
                 .await,
             Err(ApiError {
@@ -4974,6 +4915,7 @@ mod tests {
         let other = PeerId::from_ed25519(&other_keys.ed25519_public_key());
         let producer_bls = BlsSecretKey::from_seed(&[11; 32]).expect("producer bls");
         let other_bls = BlsSecretKey::from_seed(&[12; 32]).expect("other bls");
+        let initial_shared = SharedStateBytes::try_new(vec![0]).expect("shared state");
         let offer_data = OfferData::new(
             negotiation_id,
             0,
@@ -4982,7 +4924,7 @@ mod tests {
             arena0_program::ExecutionProfile::current().hash(),
             JsonBytes::try_new(b"null".to_vec()).expect("params"),
             2,
-            StateHash::of(&[0]),
+            StateHash::of_shared(&initial_shared),
             u64::MAX,
         )
         .expect("offer");
@@ -5163,7 +5105,7 @@ mod tests {
             execution_id,
             activation.clone(),
             peer,
-            SharedStateBytes::try_new(vec![0]).expect("shared state"),
+            initial_shared,
             LocalStateBytes::try_new(Vec::new()).expect("local state"),
         )
         .expect("execution state");
@@ -5177,10 +5119,6 @@ mod tests {
             )
             .await
             .expect("execution");
-        writer
-            .apply_input(ExecutionInput::Activate, 5)
-            .await
-            .expect("activate");
         drop(writer);
 
         daemon.resume_durable().await.expect("recovery");

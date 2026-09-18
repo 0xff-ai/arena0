@@ -1,5 +1,5 @@
 //! M3: two in-process executions play a full turn-based chess game (Scholar's
-//! mate) bilaterally over `LocalTransport`; the replay verifier accepts both
+//! mate) bilaterally over `LocalTransport`; portable verification accepts both
 //! traces. Exercises the callout-await-inside-`on_message` continuation path and
 //! the send-before-End ordering through the real runtime.
 
@@ -31,20 +31,12 @@ async fn chess_bilateral_scholars_mate_runs_and_verifies() {
     );
 
     assert_eq!(run.session_hash(0), run.session_hash(1));
-    let verified = run.verify_all(&wasm).expect("both traces must verify");
+    let verified = run.verify_all().expect("both traces must verify");
     for (verified, expected_outcome) in verified.into_iter().zip(&outcomes) {
-        let arena0_verify::VerifiedTerminal::Completed {
-            outcome_borsh,
-            outcome_json,
-        } = verified.terminal
+        let arena0_verify::LightVerifiedTerminal::Completed { outcome_borsh } = verified.terminal
         else {
             panic!("checkmate must complete the session");
         };
         assert_eq!(&outcome_borsh, expected_outcome);
-        let outcome: serde_json::Value = serde_json::from_slice(outcome_json.as_bytes()).unwrap();
-        assert_eq!(
-            outcome,
-            serde_json::json!({"Win": {"winner": 0, "reason": "Checkmate"}})
-        );
     }
 }

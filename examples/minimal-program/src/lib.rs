@@ -72,6 +72,7 @@ pub struct Local {}
 )]
 pub mod minimal_choice {
     use super::*;
+    use arena0::ProgramTransition;
 
     type Shared = super::Shared;
     type Local = super::Local;
@@ -106,8 +107,7 @@ pub mod minimal_choice {
         }
     }
 
-    fn view(ctx: &SharedContext, vp: &Viewport) -> View {
-        let state = ctx.shared();
+    fn view(state: &Shared, _ensemble: &Ensemble, vp: &Viewport) -> View {
         let mut agents = String::new();
         for (index, choice) in state.choices.iter().enumerate() {
             let value = choice.map_or("waiting", |choice| match choice {
@@ -130,47 +130,65 @@ pub mod minimal_choice {
             .status_bar(vp.fit_text(status))
     }
 
-    fn on_session_started(_ctx: &mut SharedContext) -> Result<Transition<Phase>, ProgramFault> {
+    fn on_session_started(
+        _ctx: &mut Context<Shared, Local>,
+    ) -> Result<ProgramTransition<MinimalChoice>, ProgramFault> {
         Ok(Transition::To(Phase::Choosing))
     }
 
-    fn on_react(ctx: &mut Context) -> Result<(), ProgramFault> {
+    fn on_react(
+        ctx: &mut Context<Shared, Local>,
+    ) -> Result<ProgramTransition<MinimalChoice>, ProgramFault> {
         if writer(ctx.shared()) == Some(ctx.me()) {
             let previous = ctx.shared().choices.iter().flatten().next().copied();
             ctx.effects()
                 .callout(callouts::Choose { previous })
                 .dispatch();
         }
-        Ok(())
+        Ok(Transition::Stay)
     }
 
     fn on_message(
-        ctx: &mut SharedContext,
+        ctx: &mut Context<Shared, Local>,
         from: Participant,
         message: Message,
-    ) -> Result<ApplyDecision<Phase>, ProtocolFault> {
+    ) -> MessageApply<MinimalChoice> {
         if writer(ctx.shared()) != Some(from) {
             return Ok(ApplyDecision::Reject);
         }
         let Message::Choice(choice) = message;
-        ctx.mutate_shared(|state| state.choices[from.index()] = Some(choice));
-        if writer(ctx.shared()).is_none() {
-            Ok(ApplyDecision::Accept(Transition::End))
-        } else {
-            Ok(ApplyDecision::Accept(Transition::Stay))
-        }
+        let transition = apply_choice(ctx.shared_mut(), from, choice);
+        Ok(ApplyDecision::Accept(transition))
     }
 
-    fn on_input(ctx: &mut Context, input: Input) -> Result<(), InputFault> {
-        if writer(ctx.shared()) != Some(ctx.me()) {
+    fn on_input(
+        ctx: &mut Context<Shared, Local>,
+        input: Input,
+    ) -> Result<ProgramTransition<MinimalChoice>, InputFault> {
+        let from = ctx.me();
+        if writer(ctx.shared()) != Some(from) {
             return Err(anyhow!("this participant does not own the next choice").into());
         }
         let Input::Choose(choice) = input;
+        let transition = apply_choice(ctx.shared_mut(), from, choice);
         ctx.effects().broadcast(&Message::Choice(choice));
-        Ok(())
+        Ok(transition)
     }
 
-    fn on_query(_ctx: &SharedContext, _: ()) {}
+    fn on_query(_shared: &Shared, _: ()) {}
+
+    fn apply_choice(
+        state: &mut Shared,
+        from: Participant,
+        choice: Choice,
+    ) -> ProgramTransition<MinimalChoice> {
+        state.choices[from.index()] = Some(choice);
+        if writer(state).is_none() {
+            Transition::End
+        } else {
+            Transition::Stay
+        }
+    }
 }
 
 #[cfg(test)]

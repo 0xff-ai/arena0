@@ -153,9 +153,6 @@ enum Command {
         /// Program params as KEY=VALUE.
         #[arg(long, value_name = "KEY=VALUE")]
         param: Vec<String>,
-        /// Fully replay every Host receipt before succeeding.
-        #[arg(long)]
-        replay: bool,
     },
     /// Observe the local daemon and optionally answer individual callouts.
     Monitor(monitor::MonitorArgs),
@@ -192,9 +189,6 @@ enum Command {
     Verify {
         /// A receipt JSON path, receipt id, or session id.
         target: String,
-        /// Request full replay from a running Host.
-        #[arg(long)]
-        replay: bool,
         /// Verify every Host through these named local Hosts.
         #[arg(long, value_delimiter = ',', value_name = "HOSTS")]
         hosts: Vec<HostName>,
@@ -215,9 +209,6 @@ enum Command {
         /// Program params as KEY=VALUE (repeatable).
         #[arg(long, value_name = "KEY=VALUE")]
         param: Vec<String>,
-        /// Fully replay every Host receipt before succeeding.
-        #[arg(long)]
-        replay: bool,
         /// Use inline terminal output instead of the focused TUI.
         #[arg(long)]
         no_tui: bool,
@@ -337,11 +328,7 @@ enum ReceiptCommand {
     /// List receipts held by this Host.
     List,
     /// Verify a Host-resident receipt.
-    Verify {
-        session: String,
-        #[arg(long)]
-        replay: bool,
-    },
+    Verify { session: String },
 }
 
 fn main() -> ExitCode {
@@ -537,7 +524,6 @@ async fn interactive_workspace() -> anyhow::Result<()> {
             fixed_hosts: false,
             bindings: None,
             params: None,
-            replay: true,
         },
         None,
     )
@@ -604,15 +590,9 @@ async fn choose_and_run(
             })
             .collect(),
     };
-    let result = run_with_connected_bindings(
-        Mode::Human,
-        launch.program,
-        launch.params,
-        bindings,
-        launch.replay,
-        false,
-    )
-    .await;
+    let result =
+        run_with_connected_bindings(Mode::Human, launch.program, launch.params, bindings, false)
+            .await;
     finish_with_daemon(result, daemon).await
 }
 
@@ -675,7 +655,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             builtin,
             agent,
             param,
-            replay,
         } => {
             if socket.is_some() || host.is_some() {
                 bail!("--socket and --host do not apply to `arena0 launch`; use --hosts");
@@ -709,7 +688,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 fixed_hosts,
                 bindings: configured.then(|| bindings.clone()),
                 params: params.clone(),
-                replay,
             };
             let Some(mut program) = program else {
                 return choose_and_run(daemon, setup, None).await;
@@ -763,8 +741,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     eprintln!("unbound Hosts wait for an external client or a monitor answer");
                 }
             }
-            let result =
-                run_with_connected_bindings(mode, program, params, bindings, replay, true).await;
+            let result = run_with_connected_bindings(mode, program, params, bindings, true).await;
             return finish_with_daemon(result, daemon).await;
         }
         Command::Monitor(mut args) => {
@@ -792,7 +769,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             builtin,
             agent,
             param,
-            replay,
             no_tui,
         } => {
             if socket.is_some() || host.is_some() {
@@ -806,7 +782,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     builtins: builtin,
                     agents: agent,
                     params: param,
-                    replay,
                     no_tui,
                 },
             )
@@ -817,7 +792,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     if let Command::Verify {
         ref target,
-        replay,
         ref hosts,
     } = command
         && !hosts.is_empty()
@@ -828,7 +802,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         if verify::is_path_target(Path::new(target), target) {
             bail!("--hosts verifies Host-resident session receipts, not a receipt file");
         }
-        return verify::verify_hosts(mode, Palette::for_mode(mode), target, hosts, replay).await;
+        return verify::verify_hosts(mode, Palette::for_mode(mode), target, hosts).await;
     }
 
     // Context binding applies only to ordinary Host operations. Daemon-only
@@ -836,11 +810,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // an explicit --host also bypasses context parsing altogether.
     let agent_context = match &command {
         Command::Stop => None,
-        Command::Verify { target, replay, .. }
-            if !*replay && verify::is_path_target(Path::new(target), target) =>
-        {
-            None
-        }
+        Command::Verify { target, .. } if verify::is_path_target(Path::new(target), target) => None,
         _ if host.is_some() => None,
         _ => context::AgentContext::from_env()?,
     };
@@ -848,42 +818,20 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let host = host
         .or_else(|| agent_context.as_ref().map(|context| context.host().clone()))
         .unwrap_or_default();
-    if let Command::Verify {
-        ref target, replay, ..
-    } = command
+    if let Command::Verify { ref target, .. } = command
         && verify::is_path_target(Path::new(target), target)
     {
         let palette = Palette::for_mode(mode);
-        if !replay {
-            if let Some(socket) = socket {
-                let ctx = Ctx {
-                    client: DaemonClient::new(socket),
-                    host,
-                    mode,
-                    palette,
-                };
-                return verify::verify(&ctx, target.clone(), false).await;
-            }
-            return verify::verify_offline(mode, palette, Path::new(target)).await;
+        if let Some(socket) = socket {
+            let ctx = Ctx {
+                client: DaemonClient::new(socket),
+                host,
+                mode,
+                palette,
+            };
+            return verify::verify(&ctx, target.clone()).await;
         }
-
-        // An explicit full-replay target is read before Home/socket resolution so
-        // missing or malformed paths retain their actionable file diagnostics.
-        verify::read_receipt(Path::new(target))?;
-        let client = match socket {
-            Some(socket) => DaemonClient::new(socket),
-            None => match DaemonClient::from_env() {
-                Ok(client) => client,
-                Err(_) => return verify::full_replay_requires_daemon(),
-            },
-        };
-        let ctx = Ctx {
-            client,
-            host,
-            mode,
-            palette,
-        };
-        return verify::verify(&ctx, target.clone(), true).await;
+        return verify::verify_offline(mode, palette, Path::new(target)).await;
     }
 
     let client = match socket {
@@ -910,7 +858,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Exec { command } => execution(&ctx, command).await,
         Command::Watch { exec } => watch::watch(&ctx, exec).await,
         Command::Receipt { command } => receipt(&ctx, command).await,
-        Command::Verify { target, replay, .. } => verify::verify(&ctx, target, replay).await,
+        Command::Verify { target, .. } => verify::verify(&ctx, target).await,
         Command::Run { .. } => unreachable!("coordinated run returned before client construction"),
         Command::Launch { .. } | Command::Monitor(_) => {
             unreachable!("launch/monitor returned before client construction")
@@ -924,7 +872,6 @@ struct CoordinatedCliArgs {
     builtins: Vec<String>,
     agents: Vec<String>,
     params: Vec<String>,
-    replay: bool,
     no_tui: bool,
 }
 
@@ -990,15 +937,7 @@ async fn coordinated_run(mode: Mode, args: CoordinatedCliArgs) -> anyhow::Result
         bindings.push(parse_agent_binding(&binding)?);
     }
     let params = answer::assemble_params(&args.params).map_err(anyhow::Error::msg)?;
-    run_with_bindings(
-        mode,
-        args.program,
-        params,
-        bindings,
-        args.replay,
-        args.no_tui,
-    )
-    .await
+    run_with_bindings(mode, args.program, params, bindings, args.no_tui).await
 }
 
 fn parse_agent_binding(value: &str) -> anyhow::Result<coordinated::DriverBinding> {
@@ -1038,7 +977,6 @@ async fn run_with_bindings(
     program: String,
     params: Option<Value>,
     bindings: Vec<coordinated::DriverBinding>,
-    replay: bool,
     no_tui: bool,
 ) -> anyhow::Result<()> {
     if bindings.len() < 2 {
@@ -1052,7 +990,7 @@ async fn run_with_bindings(
         eprintln!("preparing {} local Hosts", hosts.len());
     }
     let daemon = local_daemon::LocalDaemon::connect_or_start(hosts).await?;
-    let result = run_with_connected_bindings(mode, program, params, bindings, replay, no_tui).await;
+    let result = run_with_connected_bindings(mode, program, params, bindings, no_tui).await;
     finish_with_daemon(result, daemon).await
 }
 
@@ -1061,7 +999,6 @@ async fn run_with_connected_bindings(
     program: String,
     params: Option<Value>,
     bindings: Vec<coordinated::DriverBinding>,
-    replay: bool,
     no_tui: bool,
 ) -> anyhow::Result<()> {
     let has_human = bindings
@@ -1091,7 +1028,6 @@ async fn run_with_connected_bindings(
             program: program.clone(),
             params,
             bindings,
-            replay,
             use_tui,
         },
         progress,
@@ -1161,7 +1097,6 @@ fn render_coordinated_result(
             "participants": result.participants.len(),
             "steps": result.steps,
             "verified": {
-                "tier": result.verification.tier.as_str(),
                 "receipts": receipts,
                 "all_verified": result.verification.all_verified,
                 "shared_evidence_agrees": result.verification.shared_evidence_agrees,
@@ -1191,10 +1126,9 @@ fn render_coordinated_result(
             println!("  outcome      {}", answer::describe_outcome(outcome));
         }
         println!(
-            "  verified     {}/{} receipts ({})",
+            "  verified     {}/{} receipts",
             result.receipts.len(),
-            result.participants.len(),
-            result.verification.tier.as_str()
+            result.participants.len()
         );
     }
 }
@@ -1701,8 +1635,8 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
                     } else {
                         for entry in entries {
                             println!(
-                                "step {}  fuel={}  {} -> {}",
-                                entry.step, entry.fuel_used, entry.pre_state, entry.post_state
+                                "step {}  {} -> {}",
+                                entry.step, entry.pre_state, entry.post_state
                             );
                         }
                     }
@@ -1911,18 +1845,12 @@ async fn receipt(ctx: &Ctx, command: ReceiptCommand) -> anyhow::Result<()> {
             }
             other => bail!("unexpected response to receipt.list: {other:?}"),
         },
-        ReceiptCommand::Verify { session, replay } => {
+        ReceiptCommand::Verify { session } => {
             let receipt = ctx
                 .client()
                 .resolve_receipt_ref(&ctx.host, &session)
                 .await?;
-            match ctx
-                .call(&HostRequest::ReceiptVerify {
-                    receipt,
-                    full: replay,
-                })
-                .await?
-            {
+            match ctx.call(&HostRequest::ReceiptVerify { receipt }).await? {
                 ResponseOk::Verified {
                     receipt_id,
                     program_id,
@@ -1965,10 +1893,6 @@ fn render_verified(
     result: VerifiedResult,
 ) {
     let document = json!({
-        "tier": match &result {
-            VerifiedResult::Light { .. } => "Light",
-            VerifiedResult::Full { .. } => "Full",
-        },
         "receipt_id": receipt_id.to_string(),
         "program_id": program_id.to_string(),
         "session_id": session_id.to_string(),
@@ -1979,10 +1903,7 @@ fn render_verified(
     if ctx.mode.is_json() {
         ui::print_json(&document);
     } else {
-        println!(
-            "verified ({})",
-            document["tier"].as_str().unwrap_or("unknown")
-        );
+        println!("verified");
         println!("  receipt  {}", receipt_id);
         println!("  program  {}", program_id);
         println!("  session  {}", session_id);
@@ -2107,7 +2028,6 @@ mod tests {
                 &"22".repeat(32),
                 "--hosts",
                 "host-01,host-02",
-                "--replay",
             ])
             .is_ok()
         );

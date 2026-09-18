@@ -34,10 +34,12 @@ first participant chooses, then the second chooses, and the program compares
 the values. The shared state records accepted choices. `writer` selects the
 participant allowed to act next; `on_message` rejects a choice from anyone else.
 
-The SDK uses an actor-oriented model. Handlers receive events and produce state
-changes or effects. Shared handlers determine public behavior. Local handlers
-request input and prepare messages. Queries and views project information
-without changing state.
+The SDK uses an actor-oriented model. Every session source produces one flat
+`Event`, and every mutating callback receives one `Context` over the
+participant's shared and local state. A callback may mutate either state or both
+and may emit any existing `Effect`. If a dispatch changes shared state or emits
+a lifecycle effect, the Host applies the agreement rules for that result.
+Queries and views project information without changing state.
 
 ## State, messages, and inputs
 
@@ -49,10 +51,12 @@ Shared state contains what all participants certify. Local state can hold a
 private strategy or unrevealed value. Keep secrets out of public messages,
 views, and outcomes until the interaction requires disclosure.
 
-A callout asks an agent or human for input. That input is still local: validate
-it before broadcasting a program message. The shared message handler must also
-validate the action against the program state, because remote input must follow
-the same rules as local input.
+A callout asks an agent or human for input. The answer enters the program as an
+`InputReceived` event. Validate it against the current state, then update local
+or shared state and emit any required effects in that same dispatch. If the
+result changes shared state for the other participants, emit a program message
+that they apply as `MessageReceived`; the receiver validates the message
+against its own state before signing the advertised shared result.
 
 ## Handler lifecycle
 
@@ -61,15 +65,18 @@ The minimal program demonstrates the full path:
 | Handler | Responsibility |
 | --- | --- |
 | `writer` | Select who may author the next shared action. |
-| `on_react` | Request input from that participant. |
-| `on_input` | Validate the answer and broadcast a program message. |
-| `on_message` | Accept or reject the message and advance shared state. |
+| `on_session_started` | Initialize the active session through the same dispatch context. |
+| `on_react` | Handle a `React` event and request input or perform program work. |
+| `on_input` | Validate the answer, mutate either state, and emit any effects. |
+| `on_message` | Accept or reject the message and mutate either state. |
+| `on_timer` | Handle a timer event using the same context and effect rules. |
 | `outcome` | Derive the terminal result from shared state. |
 | `view` | Render the current program state without changing it. |
 
-When both choices have been accepted, `on_message` returns the terminal
-transition. The protocol certifies the shared execution and terminal evidence.
-The program defines the outcome; it does not assemble its own receipt.
+When both choices have been accepted, the callback returns a terminal
+transition. `SessionStarted` and `MessageReceived` provide the portable public
+agreement path; the protocol certifies the shared execution and terminal
+evidence. The program defines the outcome; it does not assemble its own receipt.
 
 ## Interfaces and encoding
 
@@ -84,10 +91,10 @@ projection, not an alternate execution format or part of the signed commitment.
 
 ## Effects and capabilities
 
-Request interaction through explicit effects and declared capabilities. The
-runtime performs permitted effects after accepting the corresponding execution
-work. Programs have no ambient access to the network, filesystem, credentials,
-or clock.
+Request interaction through explicit effects and declared capabilities. Any
+event callback may emit those effects, and the runtime performs permitted
+effects after accepting the corresponding execution work. Programs have no
+ambient access to the network, filesystem, credentials, or clock.
 
 An agent may use external tools or model inference to answer a callout. The
 program must decide which answers are valid and how accepted observations enter
@@ -130,15 +137,18 @@ and `StatusBar` slots. Rendering must leave state unchanged and support plain
 text. Private state should not leak through a view merely because the renderer
 can access it.
 
-## Execute and replay
+## Execute and verify
 
 Use the [guided or agent flow](getting-started.md) to execute the built program.
 Activation requires agreement on the exact program, parameters, and Participant
 set.
 
-Replay checks public state changes, effects, computation costs, and terminal
-output. Use it alongside scenario tests: scenario tests exercise your rules,
-while replay checks an actual certified execution against the accepted Wasm.
+Portable/light verification checks the activation binding, ordered public trace,
+N-of-N signatures, shared pre/post hashes, terminal evidence, and receipt
+identity without loading Wasm. It returns opaque outcome bytes for a completed
+receipt or the exact stop cause for a stopped artifact. Use it alongside
+scenario tests: scenario tests exercise your rules, while light verification
+authenticates an actual certified execution.
 
 See [Getting started](getting-started.md) for the guided flow, agent connections, and monitoring,
 and [Architecture](architecture.md) for the execution and evidence model.

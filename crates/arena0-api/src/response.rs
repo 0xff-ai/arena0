@@ -61,9 +61,8 @@ pub enum ResponseOk {
     Trace(Vec<TraceEntry>),
     Receipt(Box<ReceiptArtifact>),
     ReceiptList(Vec<ReceiptListEntry>),
-    /// `receipt.verify`: the recovered evidence, not a bool. The result variant
-    /// records whether structural light verification or Wasm replay ran, so a
-    /// completed result cannot claim an unavailable JSON projection.
+    /// `receipt.verify`: the recovered structural and cryptographic evidence,
+    /// not a bool.
     Verified {
         receipt_id: arena0_protocol::ReceiptId,
         program_id: ProgramHash,
@@ -230,7 +229,7 @@ pub struct SessionStatus {
 
 /// A bounded, host-local projection of durable execution facts for inspection
 /// UIs. It contains no signatures, keys, parameters, outcomes, callout
-/// contexts, or private payload bytes.
+/// contexts, or participant-specific payload bytes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionInspection {
@@ -238,14 +237,14 @@ pub struct ExecutionInspection {
     pub status: ExecStatus,
     /// The durable activation evidence, when preparation has started.
     pub activation: Option<ActivationInspection>,
-    /// The returned private-record window's first sequence.
-    pub private_from: u64,
-    /// The bounded private-record projection.
-    pub private: Vec<PrivateCommitSummary>,
-    /// Total private records currently durable for this execution.
-    pub private_total: u64,
-    /// Next sequence available after this page, if more records exist.
-    pub private_next: Option<u64>,
+    /// The returned event-record window's first event position.
+    pub events_from: u64,
+    /// The bounded event-record projection.
+    pub events: Vec<EventRecordSummary>,
+    /// Total event records currently durable for this execution.
+    pub events_total: u64,
+    /// Next event position available after this page, if more records exist.
+    pub events_next: Option<u64>,
 }
 
 /// Durable activation facts safe to display in a local diagnostic view.
@@ -287,10 +286,12 @@ pub struct ActivationParticipant {
     pub ticket_hash: TicketHash,
 }
 
-/// Kind of local event that caused one private handler run.
+/// Kind of event recorded for one Host-local dispatch.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum PrivateEventKind {
+pub enum EventKind {
+    SessionStarted,
+    MessageReceived,
     InputReceived,
     TimerFired,
     TypedTimerFired,
@@ -298,40 +299,42 @@ pub enum PrivateEventKind {
     React,
 }
 
-/// Kind and bounded payload size of one private effect. The payload itself is
+/// Kind and bounded payload size of one effect. The payload itself is
 /// deliberately never returned.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct PrivateEffectSummary {
-    pub kind: PrivateEffectKind,
+pub struct EffectSummary {
+    pub kind: EffectKind,
     pub payload_bytes: Option<u64>,
 }
 
-/// Kind of effect emitted by one private handler run.
+/// Kind of effect emitted by one Host-local dispatch.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum PrivateEffectKind {
+pub enum EffectKind {
+    SessionEnd,
+    SessionAbort,
     Broadcast,
     Callout,
     SetTimer,
     Sign,
+    Fail,
     RetryInput,
 }
 
-/// A bounded summary of one durable private handler commit.
+/// A bounded summary of one durable Host-local event record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct PrivateCommitSummary {
-    /// Gapless local private-record sequence.
-    pub sequence: u64,
-    /// Public cursor observed by the local run.
-    pub public_position: u64,
-    pub event: PrivateEventKind,
+pub struct EventRecordSummary {
+    /// Authoritative local event position.
+    pub event_position: u64,
+    /// Public steps produced by this event, when any.
+    pub agreed_steps: Vec<u64>,
+    pub event: EventKind,
     /// Size of the input payload, when the event has one. The payload is not
     /// exposed.
     pub input_payload_bytes: Option<u64>,
-    pub effects: Vec<PrivateEffectSummary>,
-    pub fuel_used: u64,
+    pub effects: Vec<EffectSummary>,
 }
 
 /// How far a failed execution got before it stopped.
@@ -487,7 +490,7 @@ pub struct ReceiptListEntry {
     pub provenance: ReceiptProvenance,
 }
 
-/// The result of one verification tier.
+/// The result of receipt verification.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub enum VerifiedResult {
@@ -495,12 +498,6 @@ pub enum VerifiedResult {
     Light {
         /// Terminal evidence available without executing the guest.
         terminal: LightVerifiedTerminal,
-    },
-    /// Structural verification followed by deterministic Wasm replay.
-    Full {
-        /// Terminal evidence including the replayed JSON projection when the
-        /// receipt completed.
-        terminal: FullVerifiedTerminal,
     },
 }
 
@@ -514,25 +511,6 @@ pub enum LightVerifiedTerminal {
     Completed {
         /// Opaque stock-Borsh outcome bytes committed by the receipt.
         outcome_borsh: Vec<u8>,
-    },
-    /// The receipt records an authenticated unilateral stop or a shared
-    /// N-of-N stop. The protocol evidence remains intact for callers.
-    Stopped { cause: StopCause },
-}
-
-/// Terminal evidence returned by full verification.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub enum FullVerifiedTerminal {
-    /// The receipt records a signed completion and replay produced the JSON
-    /// projection from the guest's concrete outcome DTO.
-    Completed {
-        /// Opaque stock-Borsh outcome bytes committed by the receipt.
-        outcome_borsh: Vec<u8>,
-        /// Guest-produced agent-facing JSON. Full completion always has this
-        /// value; stopped proofs have no outcome field at all.
-        outcome_json: Value,
     },
     /// The receipt records an authenticated unilateral stop or a shared
     /// N-of-N stop. The protocol evidence remains intact for callers.

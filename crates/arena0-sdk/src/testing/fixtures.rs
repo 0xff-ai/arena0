@@ -9,20 +9,19 @@ use std::cell::RefCell;
 use arena0_protocol::trace::JsonDiffExt;
 use arena0_protocol::{
     DivergenceDiagnostic, DivergenceKind, Effect, Ensemble, Event, MessageId, Participant, PeerId,
-    PendingRecord, PrivateEffect, PrivateEvent, PrivateRecord, PublicEffect, PublicEvent,
-    StateHash, TraceEntry, View, Viewport,
+    PendingRecord, StateHash, View, Viewport,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::{
     ApplyDecision, Arena0Callout, CalloutSpec, Context, InputFault, MessageApply, Program,
-    ProgramFault, ProgramTransition, ProgramView, SharedContext,
+    ProgramFault, ProgramTransition, ProgramView,
 };
 
 use super::diagnostics::event_name;
 use super::harness::{
-    __step_record, ClosedPendingReason, ClosedPendingRecord, FaultStatus, HandlerResult, Harness,
-    PendingHarnessError, PendingLedger,
+    __dispatch_record, ClosedPendingReason, ClosedPendingRecord, DispatchRecord, FaultStatus,
+    HandlerResult, Harness, PendingHarnessError, PendingLedger,
 };
 
 // ---------------------------------------------------------------------------
@@ -51,15 +50,25 @@ fn drain_logs() -> Vec<(String, String)> {
 }
 
 fn shared_hash<C: crate::Primitive>(shared: &C) -> StateHash {
-    StateHash(*blake3::hash(&shared_snapshot(shared)).as_bytes())
+    shared_hash_snapshot(&shared_snapshot(shared))
 }
 
 fn shared_snapshot<C: crate::Primitive>(shared: &C) -> Vec<u8> {
     borsh::to_vec(shared).expect("shared serialization failed")
 }
 
+fn shared_hash_snapshot(snapshot: &[u8]) -> StateHash {
+    let shared = arena0_program::SharedStateBytes::try_new(snapshot.to_vec())
+        .expect("shared state exceeds canonical state bound");
+    StateHash::of_shared(&shared)
+}
+
 fn restore_shared<C: crate::Primitive>(shared: &mut C, snapshot: &[u8]) {
     *shared = borsh::from_slice(snapshot).expect("shared rollback failed");
+}
+
+fn restore_local<L: BorshDeserialize>(local: &mut L, snapshot: &[u8]) {
+    *local = borsh::from_slice(snapshot).expect("local rollback failed");
 }
 
 fn fault_effects(fault: &FaultStatus) -> Vec<Effect> {
@@ -74,16 +83,51 @@ fn fault_effects(fault: &FaultStatus) -> Vec<Effect> {
     }
 }
 
-fn terminal_pending_close(step: &TraceEntry) -> Option<ClosedPendingReason> {
-    step.is_terminal().then_some(ClosedPendingReason::Cancelled)
+fn pending_from_effects(id: PendingId, effects: &[Effect]) -> Option<PendingRecord> {
+    effects.iter().find_map(|effect| match effect {
+        Effect::Callout {
+            callout_index,
+            pending_label,
+            expected_type,
+            continuation_tag,
+            ..
+        } => Some(PendingRecord {
+            id,
+            operation: arena0_protocol::PendingOperation::Callout {
+                callout_index: *callout_index,
+            },
+            label: pending_label.clone(),
+            expected_type: expected_type.clone(),
+            continuation_tag: *continuation_tag,
+        }),
+        Effect::Sign {
+            pending_label,
+            expected_type,
+            continuation_tag,
+            ..
+        } => Some(PendingRecord {
+            id,
+            operation: arena0_protocol::PendingOperation::Sign,
+            label: pending_label.clone(),
+            expected_type: expected_type.clone().or_else(|| Some("Vec<u8>".into())),
+            continuation_tag: *continuation_tag,
+        }),
+        _ => None,
+    })
 }
 
-fn compare_replayed_step(
-    expected: &TraceEntry,
-    actual: &TraceEntry,
+fn terminal_pending_close(record: &DispatchRecord) -> Option<ClosedPendingReason> {
+    record
+        .is_terminal()
+        .then_some(ClosedPendingReason::Cancelled)
+}
+
+fn compare_replayed_event(
+    expected: &DispatchRecord,
+    actual: &DispatchRecord,
     participant: Option<Participant>,
 ) -> Result<(), DivergenceDiagnostic> {
-    TraceEntry::compare_step(expected, actual).map_err(|err| {
+    DispatchRecord::compare_event(expected, actual).map_err(|err| {
         let err = err.with_event(event_name(&expected.event));
         if let Some(participant) = participant {
             err.with_participant(participant)
@@ -96,7 +140,7 @@ fn compare_replayed_step(
 /// Result of re-driving a saved trace through a native [`TestHarness`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayReport {
-    pub steps: usize,
+    pub event_count: usize,
     pub final_state: Option<StateHash>,
 }
 
@@ -114,12 +158,10 @@ pub struct TestHarness<P: Program> {
     local: P::Local,
     peer_id: PeerId,
     /// The confirmed session ensemble, captured at `SessionStarted` so the program
-    /// can read it via `ctx.ensemble()` on later steps, mirroring the runtime.
+    /// can read it via `ctx.ensemble()` on later dispatches, mirroring the runtime.
     committed_ensemble: Option<Ensemble>,
-    step: u64,
-    trace: Vec<TraceEntry>,
-    private_seq: u64,
-    private_trace: Vec<PrivateRecord>,
+    event_position: u64,
+    trace: Vec<DispatchRecord>,
     pending: PendingLedger,
 }
 
@@ -131,21 +173,18 @@ impl<P: Program> TestHarness<P> {
 
     /// Create a new harness with a specific local peer identity.
     pub fn with_peer_id(peer_id: PeerId, params: P::Params) -> Self {
-        let shared = P::Shared::default();
-        let mut ctx = SharedContext::__new(shared, None);
-
         // Drain any stale effects/logs from a prior test.
         drain_effects();
         drain_logs();
 
-        match P::initialize(&mut ctx, params) {
+        let mut shared = P::Shared::default();
+        match P::initialize(&mut shared, params) {
             Ok(()) => {}
             Err(ProgramFault(e)) => {
                 crate::effects::host_fail(&format!("{e:#}"));
             }
         }
 
-        let shared = ctx.__into_shared();
         let local = P::Local::default();
 
         // Discard initialize effects; caller can use new_raw to inspect them.
@@ -157,10 +196,8 @@ impl<P: Program> TestHarness<P> {
             local,
             peer_id,
             committed_ensemble: None,
-            step: 0,
+            event_position: 0,
             trace: Vec::new(),
-            private_seq: 0,
-            private_trace: Vec::new(),
             pending: PendingLedger::default(),
         }
     }
@@ -175,10 +212,8 @@ impl<P: Program> TestHarness<P> {
             local: P::Local::default(),
             peer_id,
             committed_ensemble: None,
-            step: 0,
+            event_position: 0,
             trace: Vec::new(),
-            private_seq: 0,
-            private_trace: Vec::new(),
             pending: PendingLedger::default(),
         }
     }
@@ -201,24 +236,16 @@ impl<P: Program> TestHarness<P> {
 
     /// Render the program's read-only view against the current harness state.
     ///
-    /// The context is assembled with the same participant and committed
-    /// ensemble metadata used by lifecycle dispatch, then its state is put
-    /// back into the harness after rendering. This keeps native view tests on
-    /// the same context surface as the runtime without requiring each program
-    /// to reimplement the setup.
-    pub fn view(&mut self, viewport: Viewport) -> View
+    /// Views are pure projections over the current replicated state.
+    pub fn view(&self, viewport: Viewport) -> View
     where
         P: ProgramView,
     {
-        let shared = std::mem::take(&mut self.shared);
-        let mut ctx = SharedContext::__new(shared, None);
-        if let Some(ref ensemble) = self.committed_ensemble {
-            ctx.__set_ensemble(ensemble.clone());
-        }
-
-        let view = P::view(&ctx, &viewport);
-        self.shared = ctx.__into_shared();
-        view
+        let ensemble = self
+            .committed_ensemble
+            .as_ref()
+            .expect("view requested before the session started");
+        P::view(&self.shared, ensemble, &viewport)
     }
 
     /// Simulate loss of participant-local state while preserving shared state.
@@ -227,57 +254,49 @@ impl<P: Program> TestHarness<P> {
         self.pending.clear();
     }
 
-    /// Recorded state-machine steps emitted by this harness.
+    /// Flat dispatch records emitted by this harness.
     #[must_use]
-    pub fn trace(&self) -> &[TraceEntry] {
+    pub fn trace(&self) -> &[DispatchRecord] {
         &self.trace
     }
 
-    /// Clear and return the recorded state-machine steps.
-    pub fn take_trace(&mut self) -> Vec<TraceEntry> {
+    /// Clear and return the recorded dispatch history.
+    pub fn take_trace(&mut self) -> Vec<DispatchRecord> {
         std::mem::take(&mut self.trace)
-    }
-
-    /// Private local records produced by callouts, timers, signatures, and
-    /// reaction handlers.
-    #[must_use]
-    pub fn private_trace(&self) -> &[PrivateRecord] {
-        &self.private_trace
     }
 
     /// Verify the recorded trace as a replayable hash chain.
     pub fn verify_trace(&self) -> Result<(), DivergenceDiagnostic> {
-        TraceEntry::verify_chain(&self.trace)
+        DispatchRecord::verify_chain(&self.trace)
     }
 
     /// Compare this harness trace against another local replica.
     pub fn compare_trace(&self, other: &Self) -> Result<(), DivergenceDiagnostic> {
-        TraceEntry::compare_traces(&self.trace, &other.trace)
+        DispatchRecord::compare_traces(&self.trace, &other.trace)
     }
 
     /// Re-drive a saved trace through the native program implementation.
     ///
-    /// Unlike [`TraceEntry::verify_chain`], this executes every saved event
-    /// again and compares the effects, pending metadata, and shared hashes
-    /// produced by the current program.
+    /// This executes every saved event again and compares the effects, pending
+    /// metadata, and shared hashes produced by the current program.
     pub fn replay_trace(
         peer_id: PeerId,
         params: P::Params,
-        trace: &[TraceEntry],
+        trace: &[DispatchRecord],
     ) -> Result<ReplayReport, DivergenceDiagnostic>
     where
         P::Message: BorshDeserialize + BorshSerialize,
     {
-        TraceEntry::verify_chain(trace)?;
+        DispatchRecord::verify_chain(trace)?;
         let mut harness = Self::with_peer_id(peer_id, params);
         for expected in trace {
             let (actual, participant) = harness.dispatch_replay_event(&expected.event)?;
-            let actual = actual.step();
-            compare_replayed_step(expected, actual, participant)?;
+            let actual = actual.record();
+            compare_replayed_event(expected, actual, participant)?;
         }
         Ok(ReplayReport {
-            steps: trace.len(),
-            final_state: trace.last().map(|step| step.post_state),
+            event_count: trace.len(),
+            final_state: trace.last().map(|record| record.post_state),
         })
     }
 
@@ -300,7 +319,7 @@ impl<P: Program> TestHarness<P> {
             && left_value != right_value
         {
             return Err(DivergenceDiagnostic::new_at(
-                self.step.max(other.step),
+                self.event_position.max(other.event_position),
                 DivergenceKind::SharedMismatch,
                 format!("shared{}", left_value.first_difference_path(right_value)),
                 left_value,
@@ -308,7 +327,7 @@ impl<P: Program> TestHarness<P> {
             ));
         }
         Err(DivergenceDiagnostic::new_at(
-            self.step.max(other.step),
+            self.event_position.max(other.event_position),
             DivergenceKind::PostStateMismatch,
             "shared_hash",
             left,
@@ -331,7 +350,7 @@ impl<P: Program> TestHarness<P> {
         map_err: impl FnOnce(E) -> FaultStatus,
     ) -> HandlerResult
     where
-        F: FnOnce(&mut Context<P::Shared, P::Local>) -> Result<(), E>,
+        F: FnOnce(&mut Context<P::Shared, P::Local>) -> Result<ProgramTransition<P>, E>,
     {
         let previous_pending = self.pending.active().cloned();
         let pending_close = match &event {
@@ -340,10 +359,9 @@ impl<P: Program> TestHarness<P> {
             }
             _ => None,
         };
-        let public_event = PublicEvent::try_from(event.clone()).ok();
-        let private_event = PrivateEvent::try_from(event.clone()).ok();
         let pre_snapshot = shared_snapshot(&self.shared);
-        let pre_state = StateHash(*blake3::hash(&pre_snapshot).as_bytes());
+        let local_snapshot = borsh::to_vec(&self.local).expect("local serialization failed");
+        let pre_state = shared_hash_snapshot(&pre_snapshot);
         let shared = std::mem::take(&mut self.shared);
         let local = std::mem::take(&mut self.local);
         let mut ctx = Context::__new(shared, local, self.peer_id);
@@ -361,69 +379,56 @@ impl<P: Program> TestHarness<P> {
         drain_logs();
         let mut failed = false;
         let fault = match f(&mut ctx) {
-            Ok(()) => FaultStatus::None,
+            Ok(transition) => {
+                ctx.__apply_transition::<P>(transition);
+                FaultStatus::None
+            }
             Err(e) => {
                 failed = true;
                 map_err(e)
             }
         };
 
-        let (mut shared, local, _) = ctx.__into_parts();
+        let (mut shared, mut local, _) = ctx.__into_parts();
         let mut effects = drain_effects();
+        let logs = if failed {
+            // Faults roll back the complete dispatch observation. In
+            // particular, provisional logs must not outlive the state/effect
+            // rollback that turns this call into a fault result.
+            drain_logs();
+            Vec::new()
+        } else {
+            drain_logs()
+        };
         if failed {
             restore_shared(&mut shared, &pre_snapshot);
+            restore_local(&mut local, &local_snapshot);
             effects = fault_effects(&fault);
         }
         let post_state = shared_hash(&shared);
         self.shared = shared;
         self.local = local;
 
-        let private_effects: Vec<PrivateEffect> = effects
-            .iter()
-            .cloned()
-            .filter_map(|effect| PrivateEffect::try_from(effect).ok())
-            .collect();
-        let new_pending = private_event.as_ref().and_then(|_| {
-            PendingRecord::from_effects(PendingId::new(self.private_seq), &private_effects)
-        });
-
-        let private_record = private_event.map(|event| {
-            let record = PrivateRecord {
-                seq: self.private_seq,
-                after_position: self.step,
-                event,
-                effects: private_effects,
-                draws: Vec::new(),
-                fuel_used: 0,
-                pending: new_pending.clone(),
-            };
-            self.private_seq += 1;
-            self.private_trace.push(record.clone());
-            record
-        });
-
-        let public_record = public_event.map(|event| {
-            let public_effects: Vec<PublicEffect> = effects
-                .iter()
-                .cloned()
-                .filter_map(|effect| PublicEffect::try_from(effect).ok())
-                .collect();
-            let record = __step_record(self.step, event, public_effects, pre_state, post_state);
-            self.step += 1;
-            self.trace.push(record.clone());
-            record
-        });
-        let pending_close =
-            pending_close.or_else(|| public_record.as_ref().and_then(terminal_pending_close));
+        let pending = pending_from_effects(PendingId::new(self.event_position), &effects);
+        let record = __dispatch_record(
+            self.event_position,
+            event,
+            effects.clone(),
+            pre_state,
+            post_state,
+            pending.clone(),
+        );
+        self.event_position += 1;
+        self.trace.push(record.clone());
+        let pending_close = pending_close.or_else(|| terminal_pending_close(&record));
         self.pending
-            .update(previous_pending, pending_close, &fault, new_pending);
+            .update(previous_pending, pending_close, &fault, pending);
 
         HandlerResult {
             effects,
-            logs: drain_logs(),
+            logs,
             fault,
-            step: public_record,
-            private_record,
+            records: vec![record],
             rejected: false,
         }
     }
@@ -431,93 +436,48 @@ impl<P: Program> TestHarness<P> {
     fn run_program(
         &mut self,
         event: Event,
-        f: impl FnOnce(&mut Context<P::Shared, P::Local>) -> Result<(), ProgramFault>,
+        f: impl FnOnce(&mut Context<P::Shared, P::Local>) -> Result<ProgramTransition<P>, ProgramFault>,
     ) -> HandlerResult {
         self.run(event, f, |ProgramFault(e)| {
             FaultStatus::Abort(format!("{e:#}"))
         })
     }
 
-    fn run_shared(
-        &mut self,
-        event: Event,
-        f: impl FnOnce(&mut SharedContext<P::Shared>) -> Result<ProgramTransition<P>, ProgramFault>,
-    ) -> HandlerResult {
-        let previous_pending = self.pending.active().cloned();
-        let pre_snapshot = shared_snapshot(&self.shared);
-        let pre_state = StateHash(*blake3::hash(&pre_snapshot).as_bytes());
-        let shared = std::mem::take(&mut self.shared);
-        let mut ctx = SharedContext::__new(shared, self.committed_ensemble.clone());
-
-        drain_effects();
-        drain_logs();
-        let mut failed = false;
-        let fault = match f(&mut ctx) {
-            Ok(transition) => {
-                ctx.__apply_transition::<P>(transition);
-                FaultStatus::None
-            }
-            Err(ProgramFault(error)) => {
-                failed = true;
-                FaultStatus::Abort(format!("{error:#}"))
-            }
-        };
-
-        let mut shared = ctx.__into_shared();
-        let mut effects = drain_effects();
-        if failed {
-            restore_shared(&mut shared, &pre_snapshot);
-            effects = fault_effects(&fault);
-        }
-        let post_state = shared_hash(&shared);
-        self.shared = shared;
-
-        let event = PublicEvent::try_from(event).expect("shared event must be public");
-        let public_effects: Vec<PublicEffect> = effects
-            .iter()
-            .cloned()
-            .filter_map(|effect| PublicEffect::try_from(effect).ok())
-            .collect();
-        let record = __step_record(self.step, event, public_effects, pre_state, post_state);
-        self.step += 1;
-        self.trace.push(record.clone());
-        let pending_close = terminal_pending_close(&record);
-        self.pending
-            .update(previous_pending, pending_close, &fault, None);
-
-        HandlerResult {
-            effects,
-            logs: drain_logs(),
-            fault,
-            step: Some(record),
-            private_record: None,
-            rejected: false,
-        }
-    }
-
     fn run_input(
         &mut self,
         event: Event,
-        f: impl FnOnce(&mut Context<P::Shared, P::Local>) -> Result<(), InputFault>,
+        f: impl FnOnce(&mut Context<P::Shared, P::Local>) -> Result<ProgramTransition<P>, InputFault>,
     ) -> HandlerResult {
         self.run(event, f, |e| match e {
             InputFault::Unrecoverable(e) => FaultStatus::Abort(format!("{e:#}")),
             InputFault::Retryable(e) => FaultStatus::Retryable(format!("{e:#}")),
         })
     }
-    /// Run a shared message apply transactionally, mirroring the sandbox layer
-    /// model: `Accept` records a step, `Reject` restores the committed
-    /// shared-visible bytes and records nothing.
+    /// Run a message apply transactionally, mirroring the sandbox layer model:
+    /// `Accept` commits both state values, while `Reject` restores both values
+    /// and records nothing.
     fn run_apply(
         &mut self,
         event: Event,
-        f: impl FnOnce(&mut SharedContext<P::Shared>) -> MessageApply<P>,
+        f: impl FnOnce(&mut Context<P::Shared, P::Local>) -> MessageApply<P>,
     ) -> HandlerResult {
         let previous_pending = self.pending.active().cloned();
         let pre_snapshot = shared_snapshot(&self.shared);
-        let pre_state = StateHash(*blake3::hash(&pre_snapshot).as_bytes());
+        let local_snapshot = borsh::to_vec(&self.local).expect("local serialization failed");
+        let pre_state = shared_hash_snapshot(&pre_snapshot);
         let shared = std::mem::take(&mut self.shared);
-        let mut ctx = SharedContext::__new(shared, self.committed_ensemble.clone());
+        let local = std::mem::take(&mut self.local);
+        let mut ctx = Context::__new(shared, local, self.peer_id);
+        if let Some(ref ensemble) = self.committed_ensemble {
+            let participant = ensemble
+                .participant_of(&self.peer_id)
+                .expect("local peer is not in the committed ensemble");
+            ctx.__set_participant(participant);
+            if let Some(peer) = self.peer() {
+                ctx.__set_remote_peer(*peer);
+            }
+            ctx.__set_committed_ensemble(ensemble.clone());
+        }
 
         drain_effects();
         drain_logs();
@@ -538,57 +498,71 @@ impl<P: Program> TestHarness<P> {
             }
         };
 
-        let mut shared = ctx.__into_shared();
+        let (mut shared, mut local, _) = ctx.__into_parts();
         let mut effects = drain_effects();
 
         if rejected {
-            // Roll the candidate layer back: restore the committed
-            // shared-visible bytes, discard effects, record nothing.
+            // Roll the dispatch result back: restore both state values,
+            // discard effects, and record nothing.
+            drain_logs();
             restore_shared(&mut shared, &pre_snapshot);
+            restore_local(&mut local, &local_snapshot);
             self.shared = shared;
+            self.local = local;
             return HandlerResult {
                 effects: Vec::new(),
-                logs: drain_logs(),
+                logs: Vec::new(),
                 fault: FaultStatus::None,
-                step: None,
-                private_record: None,
+                records: Vec::new(),
                 rejected: true,
             };
         }
 
+        let logs = if failed {
+            // A faulting message has the same rollback observation as every
+            // other failed dispatch: provisional logs are discarded.
+            drain_logs();
+            Vec::new()
+        } else {
+            drain_logs()
+        };
         if failed {
             restore_shared(&mut shared, &pre_snapshot);
+            restore_local(&mut local, &local_snapshot);
             effects = fault_effects(&fault);
         }
         let post_state = shared_hash(&shared);
         self.shared = shared;
+        self.local = local;
 
-        let event = PublicEvent::try_from(event).expect("apply event must be public");
-        let public_effects: Vec<PublicEffect> = effects
-            .iter()
-            .cloned()
-            .filter_map(|effect| PublicEffect::try_from(effect).ok())
-            .collect();
-        let record = __step_record(self.step, event, public_effects, pre_state, post_state);
-        let new_pending = None;
-        self.step += 1;
+        let pending = pending_from_effects(PendingId::new(self.event_position), &effects);
+        let record = __dispatch_record(
+            self.event_position,
+            event,
+            effects.clone(),
+            pre_state,
+            post_state,
+            pending.clone(),
+        );
+        self.event_position += 1;
         self.trace.push(record.clone());
         let pending_close = terminal_pending_close(&record);
         self.pending
-            .update(previous_pending, pending_close, &fault, new_pending);
+            .update(previous_pending, pending_close, &fault, pending);
 
         HandlerResult {
             effects,
-            logs: drain_logs(),
+            logs,
             fault,
-            step: Some(record),
-            private_record: None,
+            records: vec![record],
             rejected: false,
         }
     }
 
-    /// Run the local decision hook, as the runtime does after every applied
-    /// public entry (skipped while a callout is pending or after a fault).
+    /// Run the reaction hook after an accepted agreed event, matching the
+    /// runtime's explicit reaction step. This does not enqueue a producer
+    /// self-message; the originating dispatch already applied its own state
+    /// before this step begins.
     fn react(&mut self) -> HandlerResult {
         self.run(
             Event::React,
@@ -597,10 +571,8 @@ impl<P: Program> TestHarness<P> {
         )
     }
 
-    /// Merge a shared apply with the react run that follows it, mirroring the
-    /// runtime: one result carrying both effect sets, keyed on the shared step.
     fn with_react(&mut self, result: HandlerResult) -> HandlerResult {
-        let terminal = result.step.as_ref().is_some_and(TraceEntry::is_terminal);
+        let terminal = result.records.iter().any(DispatchRecord::is_terminal);
         if !matches!(result.fault, FaultStatus::None)
             || result.rejected
             || terminal
@@ -613,28 +585,29 @@ impl<P: Program> TestHarness<P> {
         effects.extend(react.effects);
         let mut logs = result.logs;
         logs.extend(react.logs);
+        let mut records = result.records;
+        records.extend(react.records);
         HandlerResult {
             effects,
             logs,
             fault: react.fault,
-            step: result.step,
-            private_record: react.private_record.or(result.private_record),
+            records,
             rejected: result.rejected,
         }
     }
 
     fn dispatch_replay_event(
         &mut self,
-        event: &PublicEvent,
+        event: &Event,
     ) -> Result<(HandlerResult, Option<Participant>), DivergenceDiagnostic>
     where
         P::Message: BorshDeserialize + BorshSerialize,
     {
         Ok(match event.clone() {
-            PublicEvent::SessionStarted { ensemble } => {
+            Event::SessionStarted { ensemble } => {
                 if !ensemble.contains(&self.peer_id) {
                     return Err(DivergenceDiagnostic::new_at(
-                        self.step,
+                        self.event_position,
                         DivergenceKind::EventMismatch,
                         "event.ensemble",
                         format!("ensemble containing replay participant {}", self.peer_id),
@@ -642,9 +615,9 @@ impl<P: Program> TestHarness<P> {
                     )
                     .with_event(event_name(event)));
                 }
-                (self.start_session(ensemble), None)
+                (self.start_session_raw(ensemble), None)
             }
-            PublicEvent::MessageReceived {
+            Event::MessageReceived {
                 message_id,
                 from,
                 position,
@@ -657,7 +630,7 @@ impl<P: Program> TestHarness<P> {
                     .and_then(|ensemble| ensemble.participant_of(&from))
                     .ok_or_else(|| {
                         DivergenceDiagnostic::new_at(
-                            self.step,
+                            self.event_position,
                             DivergenceKind::EventMismatch,
                             "event.from",
                             "sender in the committed ensemble",
@@ -667,15 +640,13 @@ impl<P: Program> TestHarness<P> {
                     })?;
                 let decoded: P::Message = borsh::from_slice(&msg).map_err(|err| {
                     DivergenceDiagnostic::new_at(
-                        self.step,
+                        self.event_position,
                         DivergenceKind::EventMismatch,
                         "event.msg",
                         "encoded Message",
                         err.to_string(),
                     )
                 })?;
-                // React is a private record attached to this public step, so
-                // replay the same public dispatch followed by its local hook.
                 let result = self.run_apply(
                     Event::MessageReceived {
                         message_id,
@@ -686,8 +657,56 @@ impl<P: Program> TestHarness<P> {
                     },
                     |ctx| P::on_message(ctx, participant, decoded),
                 );
-                (self.with_react(result), Some(participant))
+                (result, Some(participant))
             }
+            Event::InputReceived {
+                callout_index,
+                data,
+                continuation_tag,
+            } => {
+                let input = P::Callout::from_raw(callout_index, data.clone());
+                let result = self.run_input(
+                    Event::InputReceived {
+                        callout_index,
+                        data,
+                        continuation_tag,
+                    },
+                    |ctx| P::on_input(ctx, input),
+                );
+                (result, None)
+            }
+            Event::TimerFired => (
+                self.run_program(Event::TimerFired, |ctx| P::on_timer(ctx)),
+                None,
+            ),
+            Event::TypedTimerFired { timer } => (
+                self.run_program(
+                    Event::TypedTimerFired {
+                        timer: timer.clone(),
+                    },
+                    |ctx| P::__arena0_on_typed_timer(ctx, timer),
+                ),
+                None,
+            ),
+            Event::Signed {
+                signature,
+                continuation_tag,
+            } => {
+                let result = self.run_program(
+                    Event::Signed {
+                        signature: signature.clone(),
+                        continuation_tag,
+                    },
+                    |ctx| {
+                        if let Some(tag) = continuation_tag {
+                            P::__arena0_restore_continuation(ctx, tag);
+                        }
+                        P::__arena0_on_signed(ctx, signature)
+                    },
+                );
+                (result, None)
+            }
+            Event::React => (self.react(), None),
         })
     }
 
@@ -712,14 +731,19 @@ impl<P: Program> TestHarness<P> {
     }
 
     fn start_session(&mut self, ensemble: Ensemble) -> HandlerResult {
+        let result = self.start_session_raw(ensemble);
+        self.with_react(result)
+    }
+
+    fn start_session_raw(&mut self, ensemble: Ensemble) -> HandlerResult {
         self.committed_ensemble = Some(ensemble.clone());
-        let result = self.run_shared(
+        self.run(
             Event::SessionStarted {
                 ensemble: ensemble.clone(),
             },
             |ctx| P::on_session_started(ctx, &ensemble),
-        );
-        self.with_react(result)
+            |ProgramFault(e)| FaultStatus::Abort(format!("{e:#}")),
+        )
     }
 }
 
@@ -968,13 +992,18 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default, borsh::BorshSerialize, borsh::BorshDeserialize)]
+    struct FaultyLocal {
+        value: u32,
+    }
+
     struct FaultyProgram;
 
     impl Program for FaultyProgram {
         type Shared = FaultyShared;
-        type Local = ();
+        type Local = FaultyLocal;
         type Phase = TestPhase;
-        type Message = ();
+        type Message = bool;
         type Callout = FaultyCallout;
         type Input = ();
         type Params = ();
@@ -987,18 +1016,27 @@ mod tests {
         }
 
         fn on_message(
-            ctx: &mut SharedContext<Self::Shared>,
+            ctx: &mut Context<Self::Shared, Self::Local>,
             _from: Participant,
-            _msg: Self::Message,
+            msg: Self::Message,
         ) -> MessageApply<Self> {
             ctx.shared_mut().value = 7;
-            Err(anyhow!("bad message").into())
+            ctx.local_mut().value = 9;
+            ctx.log("provisional message log");
+            ctx.effects().broadcast(&msg);
+            if msg {
+                Err(anyhow!("bad message").into())
+            } else {
+                Ok(ApplyDecision::Reject)
+            }
         }
 
         fn on_input(
             ctx: &mut Context<Self::Shared, Self::Local>,
             _input: Self::Input,
-        ) -> Result<(), InputFault> {
+        ) -> Result<ProgramTransition<Self>, InputFault> {
+            ctx.local_mut().value = 9;
+            ctx.log("provisional retry log");
             ctx.effects().broadcast(&());
             Err(InputFault::Retryable(anyhow!("try again")))
         }
@@ -1007,7 +1045,7 @@ mod tests {
     impl ProgramQuery for FaultyProgram {
         type Query = ();
 
-        fn query(_ctx: &SharedContext<Self::Shared>, _query: Self::Query) {}
+        fn query(_shared: &Self::Shared, _ensemble: &Ensemble, _query: Self::Query) {}
     }
 
     fn peer_b() -> PeerId {
@@ -1029,12 +1067,31 @@ mod tests {
         let mut h = TestHarness::<FaultyProgram>::new(());
         h.session_started(peer_b());
 
-        let result = h.message(peer_b(), ());
+        let result = h.message(peer_b(), true);
 
         assert_eq!(h.shared().value, 0);
+        assert_eq!(h.local().value, 0);
         assert!(result.has_state_fault());
+        assert!(result.logs.is_empty());
         assert!(matches!(result.effects.as_slice(), [Effect::Fail { .. }]));
-        assert_eq!(result.step().pre_state, result.step().post_state);
+        assert_eq!(result.record().pre_state, result.record().post_state);
+    }
+
+    #[test]
+    fn message_reject_rolls_back_shared_and_local_without_a_trace_or_effect() {
+        let mut h = TestHarness::<FaultyProgram>::new(());
+        h.session_started(peer_b());
+        let trace_len = h.trace().len();
+
+        let result = h.message(peer_b(), false);
+
+        assert_eq!(h.shared().value, 0);
+        assert_eq!(h.local().value, 0);
+        assert!(result.rejected);
+        assert!(result.logs.is_empty());
+        assert!(result.effects.is_empty());
+        assert!(result.records.is_empty());
+        assert_eq!(h.trace().len(), trace_len);
     }
 
     #[test]
@@ -1046,15 +1103,17 @@ mod tests {
         let result = h.input(());
 
         assert_eq!(h.shared().value, 0);
+        assert_eq!(h.local().value, 0);
         assert!(result.has_input_fault());
+        assert!(result.logs.is_empty());
         assert!(matches!(
             result.effects.as_slice(),
             [Effect::RetryInput { .. }]
         ));
-        assert!(result.step.is_none());
+        assert!(result.records.len() == 1);
         assert!(matches!(
-            result.private_record().map(|record| &record.event),
-            Some(PrivateEvent::InputReceived { .. })
+            result.records.first().map(|record| &record.event),
+            Some(Event::InputReceived { .. })
         ));
         assert_eq!(
             h.active_pending().map(|pending| pending.id),
@@ -1126,16 +1185,17 @@ mod tests {
     fn harness_replays_trace_through_program() {
         let mut h = TestHarness::<FaultyProgram>::new(());
         h.session_started(peer_b());
-        h.message(peer_b(), ());
+        h.message(peer_b(), true);
 
         let report =
             TestHarness::<FaultyProgram>::replay_trace(PeerId([0; 32]), (), h.trace()).unwrap();
-        // Public transcript: the boundary and message. Local reaction is in
-        // the harness's private trace instead of the public transcript.
-        assert_eq!(report.steps, 2);
+        // The flat transcript includes the boundary, its reaction, and the
+        // message dispatch. The faulting message does not schedule another
+        // reaction.
+        assert_eq!(report.event_count, 3);
         assert_eq!(
             report.final_state,
-            h.trace().last().map(|step| step.post_state)
+            h.trace().last().map(|record| record.post_state)
         );
     }
 
@@ -1143,11 +1203,15 @@ mod tests {
     fn harness_replay_reports_effect_pending_and_state_mismatches() {
         let mut h = TestHarness::<FaultyProgram>::new(());
         h.session_started(peer_b());
-        h.message(peer_b(), ());
+        h.message(peer_b(), true);
         let trace = h.trace().to_vec();
 
         let mut effect_mismatch = trace.clone();
-        effect_mismatch[1].effects.clear();
+        let message_index = effect_mismatch
+            .iter()
+            .position(|record| matches!(record.event, Event::MessageReceived { .. }))
+            .expect("message dispatch is recorded");
+        effect_mismatch[message_index].effects.clear();
         let err = TestHarness::<FaultyProgram>::replay_trace(PeerId([0; 32]), (), &effect_mismatch)
             .unwrap_err();
         assert_eq!(err.kind, DivergenceKind::EffectMismatch);

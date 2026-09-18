@@ -8,16 +8,15 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
+use crate::TraceEntry;
 use crate::bounded::read_string as read_bounded_string;
 use crate::exec::ExecLifecycle;
 use crate::trace::{PendingRecord, StepCommitment, TerminalCommitment};
-use crate::{ExecId, TraceEntry};
 
 use super::{
     AbortKind, AbortOccurrence, ExecutionBinding, MAX_PROOF_SIGNATURES, MAX_TERMINAL_REASON_BYTES,
-    ParticipantTerminalSignature, PendingCoordinate, PrivateCursor, ProtocolError, PublicCursor,
-    ReceiptId, TerminalCertificate, TerminalOutcome, ensure_payload, validate_pending_record,
-    validate_terminal_progress,
+    ParticipantTerminalSignature, ProtocolError, ReceiptId, StepCursor, TerminalCertificate,
+    TerminalOutcome, ensure_payload, validate_pending_record, validate_terminal_progress,
 };
 
 /// The one persisted owner of execution progress, waiting continuations,
@@ -26,14 +25,10 @@ use super::{
 pub enum ExecutionStatus {
     /// Activation is committed but the host has not injected SessionStarted.
     Activating,
-    /// The execution is runnable and has no stored private continuation.
+    /// The execution is runnable and has no stored continuation.
     Active,
-    /// A private continuation is awaiting a callout answer, signature, or
-    /// timer resume. The continuation coordinate is retained with the status.
-    Waiting {
-        pending: PendingRecord,
-        coordinate: PendingCoordinate,
-    },
+    /// A continuation is awaiting a callout answer or signature.
+    Waiting { pending: PendingRecord },
     /// Successful terminal proof collection is in progress.
     TerminalProof { proof: Box<TerminalProof> },
     /// A complete terminal proof and canonical receipt were published.
@@ -114,13 +109,9 @@ impl BorshSerialize for ExecutionStatus {
         match self {
             Self::Activating => BorshSerialize::serialize(&0u8, writer),
             Self::Active => BorshSerialize::serialize(&1u8, writer),
-            Self::Waiting {
-                pending,
-                coordinate,
-            } => {
+            Self::Waiting { pending } => {
                 BorshSerialize::serialize(&2u8, writer)?;
-                BorshSerialize::serialize(pending, writer)?;
-                BorshSerialize::serialize(coordinate, writer)
+                BorshSerialize::serialize(pending, writer)
             }
             Self::TerminalProof { proof } => {
                 BorshSerialize::serialize(&3u8, writer)?;
@@ -161,7 +152,6 @@ impl BorshDeserialize for ExecutionStatus {
             1 => Ok(Self::Active),
             2 => Ok(Self::Waiting {
                 pending: PendingRecord::deserialize_reader(reader)?,
-                coordinate: PendingCoordinate::deserialize_reader(reader)?,
             }),
             3 => Ok(Self::TerminalProof {
                 proof: Box::<TerminalProof>::deserialize_reader(reader)?,
@@ -302,7 +292,7 @@ fn read_bounded_signatures<R: borsh::io::Read>(
 }
 
 impl TerminalProof {
-    pub(crate) fn pending(
+    pub fn pending(
         commitment: TerminalCommitment,
         outcome: TerminalOutcome,
         signatures: Vec<ParticipantTerminalSignature>,
@@ -314,14 +304,16 @@ impl TerminalProof {
         }
     }
 
-    pub(crate) fn certified(certificate: TerminalCertificate, outcome: TerminalOutcome) -> Self {
+    pub fn certified(certificate: TerminalCertificate, outcome: TerminalOutcome) -> Self {
         Self::Certified {
             certificate,
             outcome,
         }
     }
 
-    pub(crate) fn pending_parts(
+    /// Borrow pending terminal evidence and its collected signatures.
+    #[must_use]
+    pub fn pending_parts(
         &self,
     ) -> Option<(
         &TerminalCommitment,
@@ -334,17 +326,19 @@ impl TerminalProof {
                 outcome,
                 signatures,
             } => Some((commitment, outcome, signatures)),
-            _ => None,
+            Self::Certified { .. } => None,
         }
     }
 
-    pub(crate) fn certified_parts(&self) -> Option<(&TerminalCertificate, &TerminalOutcome)> {
+    /// Borrow a complete terminal certificate and its outcome.
+    #[must_use]
+    pub fn certified_parts(&self) -> Option<(&TerminalCertificate, &TerminalOutcome)> {
         match self {
+            Self::Pending { .. } => None,
             Self::Certified {
                 certificate,
                 outcome,
             } => Some((certificate, outcome)),
-            _ => None,
         }
     }
 }
@@ -446,14 +440,11 @@ impl ExecutionStatus {
         )
     }
 
-    /// Borrow the stored private continuation, if any.
+    /// Borrow the stored continuation, if any.
     #[must_use]
-    pub const fn pending(&self) -> Option<(&PendingRecord, PendingCoordinate)> {
+    pub const fn pending(&self) -> Option<&PendingRecord> {
         match self {
-            Self::Waiting {
-                pending,
-                coordinate,
-            } => Some((pending, *coordinate)),
+            Self::Waiting { pending } => Some(pending),
             _ => None,
         }
     }
@@ -490,24 +481,21 @@ impl ExecutionStatus {
         }
     }
 
-    pub(crate) fn waiting(pending: PendingRecord, coordinate: PendingCoordinate) -> Self {
-        Self::Waiting {
-            pending,
-            coordinate,
-        }
+    pub fn waiting(pending: PendingRecord) -> Self {
+        Self::Waiting { pending }
     }
 
-    pub(crate) const fn active() -> Self {
+    pub const fn active() -> Self {
         Self::Active
     }
 
-    pub(crate) fn from_terminal_proof(proof: TerminalProof) -> Self {
+    pub fn from_terminal_proof(proof: TerminalProof) -> Self {
         Self::TerminalProof {
             proof: Box::new(proof),
         }
     }
 
-    pub(crate) fn completed(
+    pub fn completed(
         certificate: TerminalCertificate,
         outcome: TerminalOutcome,
 
@@ -523,12 +511,12 @@ impl ExecutionStatus {
         }
     }
 
-    pub(crate) fn stopped_published(cause: StopCause, receipt_id: ReceiptId) -> Self {
+    pub fn stopped_published(cause: StopCause, receipt_id: ReceiptId) -> Self {
         Self::StoppedPublished { cause, receipt_id }
     }
 
     /// Construct a status from an authenticated abort/failure occurrence.
-    pub(crate) fn stopped(occurrence: AbortOccurrence) -> Result<Self, ProtocolError> {
+    pub fn stopped(occurrence: AbortOccurrence) -> Result<Self, ProtocolError> {
         occurrence.validate_shape()?;
         Ok(Self::Stopped {
             cause: StopCause::Authenticated(occurrence),
@@ -536,10 +524,7 @@ impl ExecutionStatus {
     }
 
     /// Construct an incomplete status retaining terminal proof evidence.
-    pub(crate) fn incomplete_from_local(
-        proof: TerminalProof,
-        reason: String,
-    ) -> Result<Self, ProtocolError> {
+    pub fn incomplete(proof: TerminalProof, reason: String) -> Result<Self, ProtocolError> {
         ensure_reason(&reason)?;
         Ok(Self::Incomplete {
             proof: Box::new(proof),
@@ -547,10 +532,73 @@ impl ExecutionStatus {
         })
     }
 
+    /// Add one checked participant signature to pending terminal proof.
+    ///
+    /// Returns `true` when the added signature completed the N-of-N
+    /// certificate and promoted this status to `Certified` proof progress.
+    /// The enclosing [`ExecutionState`](super::ExecutionState) owns the
+    /// durable version and should persist this mutation atomically.
+    pub fn add_terminal_signature(
+        &mut self,
+        binding: &ExecutionBinding,
+        signature: ParticipantTerminalSignature,
+    ) -> Result<bool, ProtocolError> {
+        let (commitment, outcome, signatures) = match self.terminal_proof() {
+            Some(TerminalProof::Pending {
+                commitment,
+                outcome,
+                signatures,
+            }) => (commitment.clone(), outcome.clone(), signatures.to_vec()),
+            Some(TerminalProof::Certified { .. }) => {
+                return Err(ProtocolError::TerminalAlreadyPublished);
+            }
+            None => return Err(ProtocolError::TerminalProofMissing),
+        };
+
+        let participant = signature.participant();
+        if let Some(existing) = signatures
+            .iter()
+            .find(|existing| existing.participant() == participant)
+        {
+            if existing.signature() == signature.signature() {
+                return Err(ProtocolError::DuplicateTerminalSignature { participant });
+            }
+            return Err(ProtocolError::ConflictingTerminalSignature { participant });
+        }
+        let key = binding.participant_key(&participant)?;
+        let valid = key
+            .verify(&commitment.signing_bytes(), &signature.signature())
+            .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
+        if !valid {
+            return Err(ProtocolError::InvalidTerminalSignature { participant });
+        }
+        if signatures.len() >= MAX_PROOF_SIGNATURES {
+            return Err(ProtocolError::CollectionTooLarge {
+                kind: "terminal signatures",
+                actual: signatures.len() + 1,
+                max: MAX_PROOF_SIGNATURES,
+            });
+        }
+
+        let mut signatures = signatures;
+        signatures.push(signature);
+        signatures.sort_by_key(ParticipantTerminalSignature::participant);
+        if signatures.len() == binding.activation().tickets().len() {
+            let certificate =
+                TerminalCertificate::from_signatures(binding, &commitment, &signatures)?;
+            *self = Self::from_terminal_proof(TerminalProof::certified(certificate, outcome));
+            Ok(true)
+        } else {
+            *self =
+                Self::from_terminal_proof(TerminalProof::pending(commitment, outcome, signatures));
+            Ok(false)
+        }
+    }
+
     /// Construct the status represented by one certified shared termination
     /// entry. Successful `SessionEnd` entries begin proof progress and are
     /// therefore not terminal status until the canonical receipt is published.
-    pub(crate) fn from_shared_entry(
+    pub fn from_shared_entry(
         entry: &TraceEntry,
         commitment: StepCommitment,
     ) -> Result<Option<Self>, ProtocolError> {
@@ -558,14 +606,10 @@ impl ExecutionStatus {
             return Ok(None);
         };
         ensure_reason(reason)?;
-        let kind = if entry
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, crate::PublicEffect::SessionAbort { .. }))
-        {
-            AbortKind::Abort
-        } else {
-            AbortKind::Fail
+        let kind = match entry.terminal.as_ref() {
+            Some(crate::Effect::SessionAbort { .. }) => AbortKind::Abort,
+            Some(crate::Effect::Fail { .. }) => AbortKind::Fail,
+            _ => return Ok(None),
         };
         Ok(Some(Self::Stopped {
             cause: StopCause::Shared {
@@ -576,42 +620,26 @@ impl ExecutionStatus {
         }))
     }
 
-    /// Validate the complete status against the aggregate binding and public
-    /// cursor. No independent lifecycle/status cross-product is consulted.
+    /// Validate the complete status against the aggregate binding and agreed
+    /// step cursor.
     pub(crate) fn validate_binding(
         &self,
-        execution_id: ExecId,
         binding: &ExecutionBinding,
-
-        public: PublicCursor,
-        private: PrivateCursor,
+        agreed: StepCursor,
     ) -> Result<(), ProtocolError> {
         match self {
             Self::Activating | Self::Active => Ok(()),
-            Self::Waiting {
-                pending,
-                coordinate,
-            } => {
+            Self::Waiting { pending } => {
                 validate_pending_record(pending)?;
-                if coordinate.record >= private.next_record
-                    || pending.id
-                        != super::pending_id(
-                            execution_id,
-                            coordinate.record,
-                            coordinate.effect_index,
-                        )
-                {
-                    return Err(ProtocolError::PendingCoordinateMismatch);
-                }
                 Ok(())
             }
-            Self::TerminalProof { proof } => validate_terminal_progress(binding, public, proof),
+            Self::TerminalProof { proof } => validate_terminal_progress(binding, agreed, proof),
             Self::Completed { proof } => {
                 let progress = TerminalProof::Certified {
                     certificate: proof.certificate.clone(),
                     outcome: proof.outcome.clone(),
                 };
-                validate_terminal_progress(binding, public, &progress)?;
+                validate_terminal_progress(binding, agreed, &progress)?;
                 if proof.receipt_id == ReceiptId::from_bytes([0; 32]) {
                     return Err(ProtocolError::InvalidTerminalStatus);
                 }
@@ -619,11 +647,11 @@ impl ExecutionStatus {
             }
             Self::Stopped { cause } => {
                 cause.validate()?;
-                validate_cause_binding(cause, binding, public)
+                validate_cause_binding(cause, binding, agreed)
             }
             Self::StoppedPublished { cause, receipt_id } => {
                 cause.validate()?;
-                validate_cause_binding(cause, binding, public)?;
+                validate_cause_binding(cause, binding, agreed)?;
                 if *receipt_id == ReceiptId::from_bytes([0; 32]) {
                     return Err(ProtocolError::InvalidTerminalStatus);
                 }
@@ -631,7 +659,7 @@ impl ExecutionStatus {
             }
             Self::Incomplete { proof, reason } => {
                 ensure_reason(reason)?;
-                validate_terminal_progress(binding, public, proof)?;
+                validate_terminal_progress(binding, agreed, proof)?;
                 Ok(())
             }
         }
@@ -641,12 +669,12 @@ impl ExecutionStatus {
 pub(crate) fn validate_cause_binding(
     cause: &StopCause,
     binding: &ExecutionBinding,
-    public: PublicCursor,
+    agreed: StepCursor,
 ) -> Result<(), ProtocolError> {
     match cause {
         StopCause::Authenticated(occurrence) => {
             if occurrence.session_id() != binding.session_id()
-                || *occurrence.coordinate() != public
+                || *occurrence.coordinate() != agreed
                 || !binding
                     .participant_keys()?
                     .into_iter()
@@ -661,9 +689,9 @@ pub(crate) fn validate_cause_binding(
         StopCause::Shared { commitment, .. } => {
             if commitment.domain != crate::STEP_COMMIT_DOMAIN
                 || commitment.session_id != binding.session_id()
-                || commitment.step.checked_add(1) != Some(public.next_step())
-                || commitment.post_state != public.state_hash()
-                || commitment.link_hash() != public.chain_hash()
+                || commitment.step.checked_add(1) != Some(agreed.next_step())
+                || commitment.post_state != agreed.state_hash()
+                || commitment.link_hash() != agreed.chain_hash()
             {
                 return Err(ProtocolError::InvalidTerminalStatus);
             }

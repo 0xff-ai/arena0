@@ -6,12 +6,12 @@
 //! has both an item limit and a byte budget; a command cannot enter the owner
 //! queue until it has reserved its encoded byte cost.
 //!
-//! The protocol reducer remains the sole owner of execution-state and commit
-//! plan construction.  This crate only validates, checks lifetime evidence,
-//! performs the SQLite transaction, and materializes the projections that are
-//! needed for recovery and scheduling.
+//! The store owns the SQLite transaction boundaries around flat event
+//! dispatches, shared proposals, signatures, terminal publication, and the
+//! recovery projections needed for scheduling. Protocol constructors remain
+//! authoritative for state and certificate validation.
 
-use arena0_protocol::PendingId;
+use arena0_protocol::{Effect, Event, PendingId, pending_id};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
@@ -24,16 +24,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arena0_crypto::{BlsSignature, ExecutionSalt};
 use arena0_program::{JsonBytes, ProgramHash};
 use arena0_protocol::execution::{
-    CommitPlan, DurableEffect, ExecutionInput, ExecutionState, ExecutionVersion, GuestSignData,
-    OccurrenceConflict, OccurrenceDigest, OccurrenceEvidence, OccurrenceKey, OutboxId,
-    ParticipantStepSignature, ParticipantTerminalSignature, ReceiptArtifact, ReceiptId,
-    SharedDelta, TimerId, TimerMutation, TransitionOutcome,
+    ExecutionState, ExecutionStatus, ExecutionVersion, GuestSignData, ParticipantStepSignature,
+    ParticipantTerminalSignature, ReceiptArtifact, ReceiptId, TimerId,
 };
+use arena0_protocol::trace::PendingRecord;
 use arena0_protocol::{
-    Activation, ExecFrame, ExecId, ExecLifecycle, ExecutionAdmission, LocalStateBytes, MessageId,
-    NegotiationTarget, PeerId, PreparedActivation, PrivateEffect, PrivateEvent, ProtocolError,
-    SessionHash, SharedStateBytes, StateHash, StepCommitment, TerminalCommitment,
-    WitnessCommitment,
+    AbortOccurrence, Activation, ExecFrame, ExecId, ExecLifecycle, ExecutionAdmission,
+    LocalStateBytes, MessageId, NegotiationTarget, PeerId, PreparedActivation, ProtocolError,
+    SessionHash, SharedStateBytes, StateHash, StepCommitment, TerminalCommitment, TerminalOutcome,
+    TimerPayload, TraceEntry,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -49,10 +48,10 @@ use lock::{
     OwnerLock, acquire_process_lock, configure_connection, initialize_schema, prepare_database_file,
 };
 
-const SCHEMA_VERSION: u64 = 2;
-const ENVELOPE_VERSION: u16 = 1;
+const SCHEMA_VERSION: u64 = 3;
+const ENVELOPE_VERSION: u16 = 2;
 const ENVELOPE_MAGIC: [u8; 8] = *b"AR0STOR1";
-const ENVELOPE_DOMAIN: &[u8] = b"arena0/store-envelope/v1";
+const ENVELOPE_DOMAIN: &[u8] = b"arena0/store-envelope/v2";
 const DEFAULT_QUEUE_CAPACITY: usize = 64;
 // Command costs include the encoded payload plus a bounded response/metadata
 // allowance. Keep the default at least as large as the largest legal program
@@ -65,16 +64,71 @@ const DEFAULT_RETRY_DELAY_MS: u64 = 1_000;
 const MAX_ERROR_BYTES: usize = 4 * 1024;
 const MAX_ADMISSION_BYTES: usize = 4 * 1024;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+// Timer rows store the complete `Option<TimerPayload>` (including the type
+// name), not just its value bytes. Keep the envelope bound large enough for
+// both protocol components plus their Borsh length prefixes.
+const MAX_TIMER_RECORD_BYTES: usize =
+    arena0_protocol::MAX_TIMER_PAYLOAD_BYTES + arena0_protocol::MAX_TERMINAL_REASON_BYTES + 16;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ENVELOPE_OVERHEAD: usize = 8 + 2 + 2 + 4 + 32;
 const EXECUTION_WORKING_SET_BYTES: usize = 64 * 1024 * 1024;
 const MAX_USER_AGENT_BYTES: usize = 256;
 const USER_AGENT_COMMAND_OVERHEAD: usize = 512;
 
-/// Maximum number of private commit summaries returned by one inspection page.
+/// Maximum number of local event summaries returned by one inspection page.
 /// The durable store may contain more records; callers use the returned cursor
 /// to request another bounded page.
-pub const MAX_PRIVATE_INSPECTION_RECORDS: usize = 256;
+pub const MAX_EVENT_INSPECTION_RECORDS: usize = 256;
+
+/// Stable identity of one store-local outbox row.
+///
+/// This is deliberately owned by the persistence boundary. Protocol frames
+/// and guest effects have different semantics, so neither is wrapped in a
+/// protocol-level durable-effect enum. The identity is nevertheless stable
+/// across retries and process restarts.
+#[derive(
+    BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+pub struct OutboxId([u8; 32]);
+
+impl OutboxId {
+    fn derive(
+        execution_id: ExecId,
+        event_position: u64,
+        ordinal: u32,
+        destination: Option<PeerId>,
+        payload: &[u8],
+    ) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"arena0/store-outbox/v2");
+        hasher.update(&execution_id.0);
+        hasher.update(&event_position.to_le_bytes());
+        hasher.update(&ordinal.to_le_bytes());
+        match destination {
+            Some(destination) => {
+                hasher.update(&[1]);
+                hasher.update(&destination.0);
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+        hasher.update(payload);
+        Self(*hasher.finalize().as_bytes())
+    }
+
+    /// Construct an outbox identity from persisted bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrow the identity bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
 
 /// Configuration for one Host-owned SQLite database.
 #[derive(Debug, Clone)]
@@ -519,7 +573,7 @@ pub enum StoreError {
     /// An input does not correspond to the selected frame part.
     #[error("input does not correspond to inbound frame {inbox_id:?} part {part_index}")]
     InboxInputMismatch { inbox_id: InboxId, part_index: u32 },
-    /// The selected inbound message requires an explicit guest shared delta.
+    /// The selected inbound message requires an explicit dispatch result.
     #[error("inbound message {0:?} requires explicit message resolution")]
     InboxMessageNeedsResolution(InboxId),
     /// The selected inbound frame is not a message and cannot use message resolution.
@@ -606,10 +660,12 @@ pub struct ActivationRecord {
     state: ActivationRecordState,
 }
 
-/// The event kind in one host-local private handler commit. Payloads remain
-/// private; this enum is the store's safe diagnostic projection.
+/// The event kind in one Host-local event record. Payloads remain opaque; this
+/// enum is the store's safe diagnostic projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrivateEventKind {
+pub enum EventKind {
+    SessionStarted,
+    MessageReceived,
     InputReceived,
     TimerFired,
     TypedTimerFired,
@@ -617,72 +673,76 @@ pub enum PrivateEventKind {
     React,
 }
 
-/// One private effect's kind and bounded payload size. The store never returns
+/// One effect's kind and bounded payload size. The store never returns
 /// the effect payload itself from inspection reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PrivateEffectSummary {
-    pub kind: PrivateEffectKind,
+pub struct EffectSummary {
+    pub kind: EffectKind,
     pub payload_bytes: Option<usize>,
 }
 
-/// The effect kind in one host-local private handler commit.
+/// The effect kind in one Host-local event record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrivateEffectKind {
+pub enum EffectKind {
+    SessionEnd,
+    SessionAbort,
     Broadcast,
     Callout,
     SetTimer,
     Sign,
+    Fail,
     RetryInput,
 }
 
-/// A safe projection of one durable private commit for local diagnostics.
-/// Sequence and public position are authoritative durable coordinates; input
-/// and effects contain only kinds and payload sizes, never raw private values.
+/// A safe projection of one durable event record for local diagnostics.
+/// Event position is an authoritative local coordinate. An event may produce
+/// more than one agreed step (for example, a deferred broadcast successor), so
+/// the relation is represented as a list rather than a misleading scalar.
+/// Payloads contain only kinds and sizes, never raw private values.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrivateCommitSummary {
-    pub sequence: u64,
-    pub public_position: u64,
-    pub event: PrivateEventKind,
+pub struct EventRecordSummary {
+    pub event_position: u64,
+    pub agreed_steps: Vec<u64>,
+    pub event: EventKind,
     pub input_payload_bytes: Option<usize>,
-    pub effects: Vec<PrivateEffectSummary>,
-    pub fuel_used: u64,
+    pub effects: Vec<EffectSummary>,
 }
 
-/// One bounded page of private commit summaries.
+/// One bounded page of local event summaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrivateInspectionPage {
+pub struct EventInspectionPage {
     from: u64,
-    summaries: Vec<PrivateCommitSummary>,
+    summaries: Vec<EventRecordSummary>,
     total: u64,
     next: Option<u64>,
 }
 
-impl PrivateInspectionPage {
-    /// Return the first private sequence represented by this page.
+impl EventInspectionPage {
+    /// Return the first event position represented by this page.
     #[must_use]
     pub const fn from(&self) -> u64 {
         self.from
     }
 
-    /// Borrow summaries in ascending private sequence order.
+    /// Borrow summaries in ascending event-position order.
     #[must_use]
-    pub fn summaries(&self) -> &[PrivateCommitSummary] {
+    pub fn summaries(&self) -> &[EventRecordSummary] {
         &self.summaries
     }
 
     /// Consume the page and return its summaries.
     #[must_use]
-    pub fn into_summaries(self) -> Vec<PrivateCommitSummary> {
+    pub fn into_summaries(self) -> Vec<EventRecordSummary> {
         self.summaries
     }
 
-    /// Return the durable number of private commits at read time.
+    /// Return the durable number of local event records at read time.
     #[must_use]
     pub const fn total(&self) -> u64 {
         self.total
     }
 
-    /// Return the next private sequence when another page remains.
+    /// Return the next event position when another page remains.
     #[must_use]
     pub const fn next(&self) -> Option<u64> {
         self.next
@@ -690,7 +750,7 @@ impl PrivateInspectionPage {
 
     pub(crate) const fn new(
         from: u64,
-        summaries: Vec<PrivateCommitSummary>,
+        summaries: Vec<EventRecordSummary>,
         total: u64,
         next: Option<u64>,
     ) -> Self {
@@ -703,55 +763,67 @@ impl PrivateInspectionPage {
     }
 }
 
-impl PrivateCommitSummary {
-    fn from_commit(commit: &arena0_protocol::PrivateCommit) -> Self {
-        let record = commit.record();
-        let (event, input_payload_bytes) = match &record.event {
-            PrivateEvent::InputReceived { data, .. } => {
-                (PrivateEventKind::InputReceived, Some(data.len()))
+impl EventRecordSummary {
+    fn from_record(
+        event_position: u64,
+        agreed_steps: Vec<u64>,
+        event: &Event<Vec<u8>>,
+        effects: &[Effect],
+    ) -> Self {
+        let (event_kind, input_payload_bytes) = match event {
+            Event::SessionStarted { .. } => (EventKind::SessionStarted, None),
+            Event::MessageReceived { msg, .. } => (EventKind::MessageReceived, Some(msg.len())),
+            Event::InputReceived { data, .. } => (EventKind::InputReceived, Some(data.len())),
+            Event::TimerFired => (EventKind::TimerFired, None),
+            Event::TypedTimerFired { timer } => {
+                (EventKind::TypedTimerFired, Some(timer.data.len()))
             }
-            PrivateEvent::TimerFired => (PrivateEventKind::TimerFired, None),
-            PrivateEvent::TypedTimerFired { timer } => {
-                (PrivateEventKind::TypedTimerFired, Some(timer.data.len()))
-            }
-            PrivateEvent::Signed { signature, .. } => {
-                (PrivateEventKind::Signed, Some(signature.len()))
-            }
-            PrivateEvent::React => (PrivateEventKind::React, None),
+            Event::Signed { signature, .. } => (EventKind::Signed, Some(signature.len())),
+            Event::React => (EventKind::React, None),
         };
-        let effects = record
-            .effects
+        let effects = effects
             .iter()
             .map(|effect| match effect {
-                PrivateEffect::Broadcast { data } => PrivateEffectSummary {
-                    kind: PrivateEffectKind::Broadcast,
+                Effect::SessionEnd { outcome } => EffectSummary {
+                    kind: EffectKind::SessionEnd,
+                    payload_bytes: Some(outcome.len()),
+                },
+                Effect::SessionAbort { reason } => EffectSummary {
+                    kind: EffectKind::SessionAbort,
+                    payload_bytes: Some(reason.len()),
+                },
+                Effect::Broadcast { data } => EffectSummary {
+                    kind: EffectKind::Broadcast,
                     payload_bytes: Some(data.len()),
                 },
-                PrivateEffect::Callout { context, .. } => PrivateEffectSummary {
-                    kind: PrivateEffectKind::Callout,
+                Effect::Callout { context, .. } => EffectSummary {
+                    kind: EffectKind::Callout,
                     payload_bytes: Some(context.len()),
                 },
-                PrivateEffect::SetTimer { timer, .. } => PrivateEffectSummary {
-                    kind: PrivateEffectKind::SetTimer,
+                Effect::SetTimer { timer, .. } => EffectSummary {
+                    kind: EffectKind::SetTimer,
                     payload_bytes: timer.as_ref().map(|timer| timer.data.len()),
                 },
-                PrivateEffect::Sign { data, .. } => PrivateEffectSummary {
-                    kind: PrivateEffectKind::Sign,
+                Effect::Sign { data, .. } => EffectSummary {
+                    kind: EffectKind::Sign,
                     payload_bytes: Some(data.len()),
                 },
-                PrivateEffect::RetryInput { reason } => PrivateEffectSummary {
-                    kind: PrivateEffectKind::RetryInput,
+                Effect::Fail { reason } => EffectSummary {
+                    kind: EffectKind::Fail,
+                    payload_bytes: Some(reason.len()),
+                },
+                Effect::RetryInput { reason } => EffectSummary {
+                    kind: EffectKind::RetryInput,
                     payload_bytes: Some(reason.len()),
                 },
             })
             .collect();
         Self {
-            sequence: record.seq,
-            public_position: record.after_position,
-            event,
+            event_position,
+            agreed_steps,
+            event: event_kind,
             input_payload_bytes,
             effects,
-            fuel_used: record.fuel_used,
         }
     }
 }
@@ -844,37 +916,19 @@ pub enum CommitActivationOutcome {
     },
 }
 
-/// Outcome of applying one validated execution input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CommittedSummary {
-    version: ExecutionVersion,
-    /// The public trace step certified by this commit, if the public cursor
-    /// advanced. A shared proposal and partial signature commit leave this
-    /// unset; only the complete N-of-N signature commit sets it.
-    public_step: Option<u64>,
-}
-
-impl CommittedSummary {
-    #[must_use]
-    pub const fn version(self) -> ExecutionVersion {
-        self.version
-    }
-
-    /// Return the public trace step that became durable, if any.
-    #[must_use]
-    pub const fn public_step(self) -> Option<u64> {
-        self.public_step
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApplyOutcome {
-    /// The reducer-derived plan and all durable consequences committed.
-    Committed(CommittedSummary),
-    /// The exact occurrence was already durably applied.
+    /// The direct operation and all durable consequences committed.
+    Committed {
+        /// The agreed trace step certified by this commit, if the agreed
+        /// cursor advanced. A proposal and partial signature commit leave
+        /// this unset.
+        agreed_step: Option<u64>,
+        /// Whether this operation left a shared proposal awaiting agreement.
+        proposal_staged: bool,
+    },
+    /// The exact operation/input was already durably applied.
     AlreadyApplied,
-    /// The semantic occurrence slot was reused with a different input digest.
-    Conflict(OccurrenceConflict),
     /// A compare-and-set found another committed version.
     VersionMismatch {
         expected: ExecutionVersion,
@@ -885,7 +939,7 @@ pub enum ApplyOutcome {
         inbox_id: InboxId,
         version: ExecutionVersion,
     },
-    /// The frame was consumed without a reducer input.
+    /// The frame was consumed without dispatch/application.
     InboxAlreadyConsumed { inbox_id: InboxId },
 }
 
@@ -898,7 +952,7 @@ pub enum InboxAcceptOutcome {
     AlreadyAccepted,
     /// The exact frame was already applied by the execution transaction.
     AlreadyApplied,
-    /// The exact frame was already consumed without a reducer input.
+    /// The exact frame was already consumed without dispatch/application.
     AlreadyConsumed,
     /// The frame id was reused with different durable evidence.
     Conflict,
@@ -949,7 +1003,7 @@ impl InboxId {
     }
 }
 
-/// One accepted inbound frame awaiting its execution reducer input.
+/// One accepted inbound frame awaiting its operation-specific resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingInboxItem {
     execution_id: ExecId,
@@ -1013,6 +1067,26 @@ pub enum OutboxStatus {
     Leased,
     /// Delivery was durably acknowledged.
     Acknowledged,
+    /// Delivery was cancelled because its durable obligation was superseded.
+    ///
+    /// This is distinct from `Acknowledged`: cancellation is a local durable
+    /// disposition, not evidence that a receiver accepted the payload. For a
+    /// protocol frame this is permitted only before this Host's signature
+    /// exists; local continuation effects are cancelled when their request is
+    /// consumed, replaced, or made obsolete by a terminal boundary.
+    Cancelled,
+}
+
+/// Storage classification for one outbox payload.
+///
+/// The payload bytes are either a canonical program [`Effect`] or a
+/// canonical protocol [`ExecFrame`]. Keeping this as a scalar classification
+/// avoids reintroducing a second protocol effect sum type while allowing the
+/// delivery worker to route frames and local work independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboxPayloadKind {
+    Effect,
+    Frame,
 }
 
 /// One decoded outbox occurrence.
@@ -1024,10 +1098,17 @@ pub struct OutboxItem {
     pub execution_id: ExecId,
     /// Version that emitted the effect.
     pub version: ExecutionVersion,
-    /// Position within that plan's effect list.
+    /// Event coordinate that produced the payload. This is distinct from the
+    /// aggregate version because one event can cross multiple store writes.
+    pub event_position: u64,
+    /// Position within the originating event's effect/frame list.
     pub ordinal: u32,
-    /// Typed durable effect.
-    pub effect: DurableEffect,
+    /// Destination for a protocol frame; `None` for local program effects.
+    pub destination: Option<PeerId>,
+    /// Whether `payload` contains a program effect or protocol frame.
+    pub payload_kind: OutboxPayloadKind,
+    /// Canonical Borsh payload. Decode according to `payload_kind`.
+    pub payload: Vec<u8>,
     /// Number of lease attempts so far; informational, never a dead-letter policy.
     pub attempts: u32,
     /// Current state.
@@ -1054,6 +1135,8 @@ pub enum OutboxDeliveryOutcome {
     Acknowledged,
     /// The occurrence was already acknowledged.
     AlreadyAcknowledged,
+    /// The occurrence was cancelled before delivery completed.
+    AlreadyCancelled,
     /// The lease did not own the occurrence.
     LeaseMismatch,
     /// The occurrence was not leased.
@@ -1069,8 +1152,8 @@ pub struct ActiveTimer {
     pub timer_id: TimerId,
     /// Absolute due time.
     pub deadline_ms: u64,
-    /// Opaque timer payload.
-    pub payload: Vec<u8>,
+    /// Exact optional typed timer payload emitted by the program.
+    pub timer: Option<TimerPayload>,
     /// Version that armed the timer.
     pub armed_version: ExecutionVersion,
 }
@@ -1191,9 +1274,9 @@ pub struct StoreHandle {
 /// ```compile_fail
 /// fn shared_writer_cannot_mutate(
 ///     writer: &arena0_store::ExecutionStore,
-///     input: arena0_protocol::ExecutionInput,
+///     event: arena0_protocol::Event,
 /// ) {
-///     let _future = writer.apply_input(input, 0);
+///     let _future = writer.activate(arena0_protocol::ExecutionVersion::ZERO, 0);
 /// }
 /// ```
 ///
@@ -1341,10 +1424,60 @@ enum Command {
         limit: usize,
         reply: oneshot::Sender<Result<Vec<ExecutionState>, StoreError>>,
     },
-    ApplyInput {
+    Activate {
         execution_id: ExecId,
-        input: Box<ExecutionInput>,
-        inbox: Option<InboxReference>,
+        expected_version: ExecutionVersion,
+        now_ms: u64,
+        reply: oneshot::Sender<Result<ApplyOutcome, StoreError>>,
+    },
+    CommitDispatch {
+        execution_id: ExecId,
+        expected_version: ExecutionVersion,
+        event: Box<Event<Vec<u8>>>,
+        shared: SharedStateBytes,
+        local: LocalStateBytes,
+        effects: Vec<Effect>,
+        terminal_outcome: Option<arena0_protocol::TerminalOutcome>,
+        inbox_id: Option<InboxId>,
+        timer_id: Option<TimerId>,
+        pending_id: Option<PendingId>,
+        now_ms: u64,
+        reply: oneshot::Sender<Result<ApplyOutcome, StoreError>>,
+    },
+    CommitStepSignature {
+        execution_id: ExecId,
+        expected_version: ExecutionVersion,
+        signature: ParticipantStepSignature,
+        inbox_id: Option<InboxId>,
+        now_ms: u64,
+        reply: oneshot::Sender<Result<ApplyOutcome, StoreError>>,
+    },
+    CommitTerminalSignature {
+        execution_id: ExecId,
+        expected_version: ExecutionVersion,
+        signature: ParticipantTerminalSignature,
+        inbox_id: Option<InboxId>,
+        now_ms: u64,
+        reply: oneshot::Sender<Result<ApplyOutcome, StoreError>>,
+    },
+    Stop {
+        execution_id: ExecId,
+        expected_version: ExecutionVersion,
+        occurrence: arena0_protocol::AbortOccurrence,
+        inbox_id: Option<InboxId>,
+        now_ms: u64,
+        reply: oneshot::Sender<Result<ApplyOutcome, StoreError>>,
+    },
+    InterruptTerminal {
+        execution_id: ExecId,
+        expected_version: ExecutionVersion,
+        reason: String,
+        now_ms: u64,
+        reply: oneshot::Sender<Result<ApplyOutcome, StoreError>>,
+    },
+    PublishTerminal {
+        execution_id: ExecId,
+        expected_version: ExecutionVersion,
         now_ms: u64,
         reply: oneshot::Sender<Result<ApplyOutcome, StoreError>>,
     },
@@ -1369,24 +1502,11 @@ enum Command {
         to: u64,
         reply: oneshot::Sender<Result<Vec<arena0_protocol::TraceEntry>, StoreError>>,
     },
-    ReadPrivateSummaries {
+    ReadEventSummaries {
         execution_id: ExecId,
         from: Option<u64>,
         limit: usize,
-        reply: oneshot::Sender<Result<PrivateInspectionPage, StoreError>>,
-    },
-    ApplyInbound {
-        execution_id: ExecId,
-        inbox_id: InboxId,
-        now_ms: u64,
-        reply: oneshot::Sender<Result<ApplyOutcome, StoreError>>,
-    },
-    ApplyInboundMessage {
-        execution_id: ExecId,
-        inbox_id: InboxId,
-        delta: Box<SharedDelta>,
-        now_ms: u64,
-        reply: oneshot::Sender<Result<ApplyOutcome, StoreError>>,
+        reply: oneshot::Sender<Result<EventInspectionPage, StoreError>>,
     },
     RejectInbound {
         execution_id: ExecId,
@@ -1398,6 +1518,10 @@ enum Command {
         execution_id: ExecId,
         now_ms: u64,
         reply: oneshot::Sender<Result<Option<LeasedOutbox>, StoreError>>,
+    },
+    HasUnsettledFrames {
+        execution_id: ExecId,
+        reply: oneshot::Sender<Result<bool, StoreError>>,
     },
     AcknowledgeOutbox {
         execution_id: ExecId,
@@ -1423,11 +1547,6 @@ enum Command {
         now_ms: u64,
         limit: usize,
         reply: oneshot::Sender<Result<Vec<ActiveTimer>, StoreError>>,
-    },
-    AssembleReceipt {
-        execution_id: ExecId,
-        now_ms: u64,
-        reply: oneshot::Sender<Result<ApplyOutcome, StoreError>>,
     },
     ImportReceipt {
         receipt: Box<ReceiptArtifact>,
@@ -1456,16 +1575,6 @@ enum Command {
     Shutdown {
         reply: oneshot::Sender<Result<(), StoreError>>,
     },
-}
-
-/// The source and frame identity used to link an input application to an
-/// accepted inbox row.  It is kept private to prevent callers from changing
-/// source attribution between enqueue and apply.
-#[derive(Debug, Clone, Copy)]
-struct InboxReference {
-    inbox_id: InboxId,
-    source: PeerId,
-    complete_on_apply: bool,
 }
 
 struct QueuedCommand {
@@ -1888,32 +1997,30 @@ impl StoreHandle {
         response.await.map_err(|_| StoreError::ReplyDropped)?
     }
 
-    /// Read a bounded projection of durable private handler commits.
+    /// Read a bounded projection of durable local event records.
     ///
-    /// The store validates the selected durable records and their coordinates.
-    /// Full-projection validation remains part of execution recovery. Returned
-    /// values contain only event/effect kinds, payload sizes, fuel, and durable
-    /// coordinates; raw private payloads and replacement state never cross
-    /// this capability boundary.
-    pub async fn read_private_summaries(
+    /// Returned values contain only event/effect kinds, payload sizes, and
+    /// durable coordinates; raw state and payloads never cross this capability
+    /// boundary.
+    pub async fn read_event_summaries(
         &self,
         execution_id: ExecId,
         from: Option<u64>,
         limit: usize,
-    ) -> Result<PrivateInspectionPage, StoreError> {
-        if limit > MAX_PRIVATE_INSPECTION_RECORDS {
+    ) -> Result<EventInspectionPage, StoreError> {
+        if limit > MAX_EVENT_INSPECTION_RECORDS {
             return Err(StoreError::InvalidConfiguration(
-                "private inspection limit exceeds the fixed bound",
+                "event inspection limit exceeds the fixed bound",
             ));
         }
         if limit == 0 {
             return Err(StoreError::InvalidConfiguration(
-                "private inspection limit must be non-zero",
+                "event inspection limit must be non-zero",
             ));
         }
         let (reply, response) = oneshot::channel();
         self.send(
-            Command::ReadPrivateSummaries {
+            Command::ReadEventSummaries {
                 execution_id,
                 from,
                 limit,
@@ -2245,6 +2352,16 @@ impl ExecutionStore {
         self.handle.load_execution(self.execution_id).await
     }
 
+    /// Load one receipt by the content identity stored on this execution's
+    /// published terminal status. The caller supplies the identity so it can
+    /// check that the aggregate and immutable artifact remain bound together.
+    pub async fn load_receipt_by_id(
+        &self,
+        receipt_id: ReceiptId,
+    ) -> Result<Option<StoredReceipt>, StoreError> {
+        self.handle.load_receipt_by_id(receipt_id).await
+    }
+
     /// List this execution's accepted frames that still need resolution.
     pub async fn list_pending_inbox(
         &self,
@@ -2315,38 +2432,234 @@ impl ExecutionStore {
         response.await.map_err(|_| StoreError::ReplyDropped)?
     }
 
-    /// Derive and atomically apply one pure protocol input to this execution.
-    pub async fn apply_input(
+    /// Commit activation's lifecycle transition with a version compare.
+    pub async fn activate(
         &mut self,
-        input: ExecutionInput,
+        expected_version: ExecutionVersion,
         now_ms: u64,
     ) -> Result<ApplyOutcome, StoreError> {
-        if matches!(&input, ExecutionInput::ReceiptBody(_)) {
-            return Err(StoreError::ReceiptBodyRequiresAssembly);
-        }
-        self.apply_input_inner(input, None, now_ms).await
-    }
-
-    async fn apply_input_inner(
-        &mut self,
-        input: ExecutionInput,
-        inbox: Option<InboxReference>,
-        now_ms: u64,
-    ) -> Result<ApplyOutcome, StoreError> {
-        let cost = self
-            .handle
-            .command_cost(input_bytes(&input)?.len(), 1, 1_024)?;
         let (reply, response) = oneshot::channel();
         self.handle
             .send(
-                Command::ApplyInput {
+                Command::Activate {
                     execution_id: self.execution_id,
-                    input: Box::new(input),
-                    inbox,
+                    expected_version,
+                    now_ms,
+                    reply,
+                },
+                256,
+            )
+            .await?;
+        response.await.map_err(|_| StoreError::ReplyDropped)?
+    }
+
+    /// Commit one flat event dispatch atomically.
+    ///
+    /// The store validates the expected version and event/effect shape, then
+    /// chooses the immediate or shared-proposal boundary. `inbox_id`,
+    /// `timer_id`, and `pending_id` are explicit durable identities owned by
+    /// the caller's event source; at most the applicable identity is consumed
+    /// by this transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_dispatch(
+        &mut self,
+        expected_version: ExecutionVersion,
+        event: Event<Vec<u8>>,
+        shared: SharedStateBytes,
+        local: LocalStateBytes,
+        effects: Vec<Effect>,
+        terminal_outcome: Option<TerminalOutcome>,
+        inbox_id: Option<InboxId>,
+        timer_id: Option<TimerId>,
+        pending_id: Option<PendingId>,
+        now_ms: u64,
+    ) -> Result<ApplyOutcome, StoreError> {
+        let event_cost = event_bytes(&event)?.len();
+        let effect_cost = effects_bytes(&effects)?.len();
+        let terminal_cost = terminal_outcome
+            .as_ref()
+            .map(borsh::to_vec)
+            .transpose()
+            .map_err(|error| StoreError::Corruption(format!("terminal outcome encode: {error}")))?
+            .map_or(0, |bytes| bytes.len());
+        let cost = self.handle.command_cost(
+            event_cost
+                .saturating_add(effect_cost)
+                .saturating_add(shared.as_bytes().len())
+                .saturating_add(local.as_bytes().len())
+                .saturating_add(terminal_cost),
+            1,
+            2_048,
+        )?;
+        let (reply, response) = oneshot::channel();
+        self.handle
+            .send(
+                Command::CommitDispatch {
+                    execution_id: self.execution_id,
+                    expected_version,
+                    event: Box::new(event),
+                    shared,
+                    local,
+                    effects,
+                    terminal_outcome,
+                    inbox_id,
+                    timer_id,
+                    pending_id,
                     now_ms,
                     reply,
                 },
                 cost,
+            )
+            .await?;
+        response.await.map_err(|_| StoreError::ReplyDropped)?
+    }
+
+    /// Record one participant signature over the pending shared proposal.
+    pub async fn commit_step_signature(
+        &mut self,
+        expected_version: ExecutionVersion,
+        signature: ParticipantStepSignature,
+        inbox_id: Option<InboxId>,
+        now_ms: u64,
+    ) -> Result<ApplyOutcome, StoreError> {
+        let cost = self.handle.command_cost(
+            borsh::to_vec(&signature)
+                .map_err(|error| StoreError::Corruption(format!("step signature encode: {error}")))?
+                .len(),
+            1,
+            512,
+        )?;
+        let (reply, response) = oneshot::channel();
+        self.handle
+            .send(
+                Command::CommitStepSignature {
+                    execution_id: self.execution_id,
+                    expected_version,
+                    signature,
+                    inbox_id,
+                    now_ms,
+                    reply,
+                },
+                cost,
+            )
+            .await?;
+        response.await.map_err(|_| StoreError::ReplyDropped)?
+    }
+
+    /// Record one participant signature over the pending terminal commitment.
+    pub async fn commit_terminal_signature(
+        &mut self,
+        expected_version: ExecutionVersion,
+        signature: ParticipantTerminalSignature,
+        inbox_id: Option<InboxId>,
+        now_ms: u64,
+    ) -> Result<ApplyOutcome, StoreError> {
+        let cost = self.handle.command_cost(
+            borsh::to_vec(&signature)
+                .map_err(|error| {
+                    StoreError::Corruption(format!("terminal signature encode: {error}"))
+                })?
+                .len(),
+            1,
+            512,
+        )?;
+        let (reply, response) = oneshot::channel();
+        self.handle
+            .send(
+                Command::CommitTerminalSignature {
+                    execution_id: self.execution_id,
+                    expected_version,
+                    signature,
+                    inbox_id,
+                    now_ms,
+                    reply,
+                },
+                cost,
+            )
+            .await?;
+        response.await.map_err(|_| StoreError::ReplyDropped)?
+    }
+
+    /// Commit one authenticated unilateral stop occurrence.
+    pub async fn stop_execution(
+        &mut self,
+        expected_version: ExecutionVersion,
+        occurrence: AbortOccurrence,
+        inbox_id: Option<InboxId>,
+        now_ms: u64,
+    ) -> Result<ApplyOutcome, StoreError> {
+        let cost = self.handle.command_cost(
+            borsh::to_vec(&occurrence)
+                .map_err(|error| {
+                    StoreError::Corruption(format!("abort occurrence encode: {error}"))
+                })?
+                .len(),
+            1,
+            512,
+        )?;
+        let (reply, response) = oneshot::channel();
+        self.handle
+            .send(
+                Command::Stop {
+                    execution_id: self.execution_id,
+                    expected_version,
+                    occurrence,
+                    inbox_id,
+                    now_ms,
+                    reply,
+                },
+                cost,
+            )
+            .await?;
+        response.await.map_err(|_| StoreError::ReplyDropped)?
+    }
+
+    /// Freeze an in-flight terminal proof after an interrupted publication.
+    ///
+    /// The proof remains durable for inspection and recovery, but the
+    /// execution becomes incomplete and its active timers are cancelled by
+    /// the same store transaction. The protocol owns proof/reason validation;
+    /// the store owns the compare-and-set and timer rows.
+    pub async fn interrupt_terminal(
+        &mut self,
+        expected_version: ExecutionVersion,
+        reason: impl Into<String>,
+        now_ms: u64,
+    ) -> Result<ApplyOutcome, StoreError> {
+        let reason = bounded_reason(reason.into())?;
+        let cost = self.handle.command_cost(reason.len(), 1, 512)?;
+        let (reply, response) = oneshot::channel();
+        self.handle
+            .send(
+                Command::InterruptTerminal {
+                    execution_id: self.execution_id,
+                    expected_version,
+                    reason,
+                    now_ms,
+                    reply,
+                },
+                cost,
+            )
+            .await?;
+        response.await.map_err(|_| StoreError::ReplyDropped)?
+    }
+
+    /// Publish a terminal artifact already assembled from authoritative rows.
+    pub async fn publish_terminal(
+        &mut self,
+        expected_version: ExecutionVersion,
+        now_ms: u64,
+    ) -> Result<ApplyOutcome, StoreError> {
+        let (reply, response) = oneshot::channel();
+        self.handle
+            .send(
+                Command::PublishTerminal {
+                    execution_id: self.execution_id,
+                    expected_version,
+                    now_ms,
+                    reply,
+                },
+                512,
             )
             .await?;
         response.await.map_err(|_| StoreError::ReplyDropped)?
@@ -2373,54 +2686,6 @@ impl ExecutionStore {
                 Command::AcceptInbound {
                     execution_id: self.execution_id,
                     frame: Box::new(frame),
-                    now_ms,
-                    reply,
-                },
-                cost,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
-    }
-
-    /// Resolve an accepted signature, terminal signature, or abort frame.
-    pub async fn apply_inbound(
-        &mut self,
-        inbox_id: InboxId,
-        now_ms: u64,
-    ) -> Result<ApplyOutcome, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.handle
-            .send(
-                Command::ApplyInbound {
-                    execution_id: self.execution_id,
-                    inbox_id,
-                    now_ms,
-                    reply,
-                },
-                256,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
-    }
-
-    /// Resolve an accepted message with its guest-produced shared delta.
-    pub async fn apply_inbound_message(
-        &mut self,
-        inbox_id: InboxId,
-        delta: SharedDelta,
-        now_ms: u64,
-    ) -> Result<ApplyOutcome, StoreError> {
-        let input = ExecutionInput::ProposeShared(delta.clone());
-        let cost = self
-            .handle
-            .command_cost(input_bytes(&input)?.len(), 1, 1_024)?;
-        let (reply, response) = oneshot::channel();
-        self.handle
-            .send(
-                Command::ApplyInboundMessage {
-                    execution_id: self.execution_id,
-                    inbox_id,
-                    delta: Box::new(delta),
                     now_ms,
                     reply,
                 },
@@ -2465,6 +2730,23 @@ impl ExecutionStore {
                     reply,
                 },
                 640,
+            )
+            .await?;
+        response.await.map_err(|_| StoreError::ReplyDropped)?
+    }
+
+    /// Return whether this execution still has a protocol frame waiting for
+    /// delivery. Pending and leased rows are both unsettled; acknowledged and
+    /// cancelled rows remain as immutable delivery history and do not count.
+    pub async fn has_unsettled_frames(&mut self) -> Result<bool, StoreError> {
+        let (reply, response) = oneshot::channel();
+        self.handle
+            .send(
+                Command::HasUnsettledFrames {
+                    execution_id: self.execution_id,
+                    reply,
+                },
+                128,
             )
             .await?;
         response.await.map_err(|_| StoreError::ReplyDropped)?
@@ -2552,23 +2834,6 @@ impl ExecutionStore {
                     reply,
                 },
                 self.handle.command_cost(256, limit, 256)?,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
-    }
-
-    /// Assemble the exact receipt body from authoritative rows and stage it
-    /// through the protocol reducer in one SQLite transaction.
-    pub async fn assemble_receipt(&mut self, now_ms: u64) -> Result<ApplyOutcome, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.handle
-            .send(
-                Command::AssembleReceipt {
-                    execution_id: self.execution_id,
-                    now_ms,
-                    reply,
-                },
-                512,
             )
             .await?;
         response.await.map_err(|_| StoreError::ReplyDropped)?

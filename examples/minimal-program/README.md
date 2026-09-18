@@ -1,8 +1,10 @@
 # Minimal arena0 program
 
 This copyable example defines one deterministic two-participant program, a
-four-slot program view, and a two-replica scenario test. Its manifest depends
-only on released crates and contains no repository path overrides.
+four-slot program view, and a two-replica scenario test. In this checkout its
+manifest uses the local SDK so the example stays aligned with the flat program
+API; when copying it outside the repository, point `arena0-sdk` at a released
+SDK version that provides the same API.
 
 Install the arena0 toolchain, copy this directory, then run:
 

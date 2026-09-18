@@ -56,10 +56,6 @@ pub struct StateHashBytes(pub [u8; 32]);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
 pub struct PeerIdBytes(pub [u8; 32]);
 
-/// A fixed-width raw witness commitment in a wire frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
-pub struct WitnessCommitmentBytes(pub [u8; 32]);
-
 /// The raw fixed-width representation of a protocol step commitment.
 ///
 /// The protocol crate validates and converts these fields into its domain
@@ -99,10 +95,10 @@ pub struct WireTerminalCommitment {
     pub outcome_hash: [u8; 32],
 }
 
-/// The exact public cursor authenticated by an abort occurrence.
+/// The exact agreed cursor authenticated by an abort occurrence.
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct WireAbortCoordinate {
-    /// Next public trace position.
+    /// Next agreed trace position.
     pub next_step: u64,
     /// Last certified shared state hash.
     pub state_hash: StateHashBytes,
@@ -228,18 +224,18 @@ impl BorshDeserialize for WireAbortOccurrence {
 /// Raw execution protocol for a confirmed ensemble.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecFrame {
-    /// Broadcast one program payload at a public trace position.
+    /// Broadcast one program payload at an agreed trace position.
     Message {
         /// Content identity of the message envelope.
         message_id: MessageIdBytes,
-        /// Public trace position.
+        /// Agreed trace position.
         seq: u64,
         /// Shared state hash before applying the message.
         prestate: StateHashBytes,
+        /// Shared state hash after applying the message.
+        poststate: StateHashBytes,
         /// Opaque guest payload.
         data: Vec<u8>,
-        /// Content commitment for private witness evidence.
-        witness: WitnessCommitmentBytes,
     },
     /// One participant's signature over one exact shared-state commitment.
     StepSignature {
@@ -269,15 +265,16 @@ impl BorshSerialize for ExecFrame {
                 message_id,
                 seq,
                 prestate,
+                poststate,
                 data,
-                witness,
             } => {
                 BorshSerialize::serialize(&EXEC_KIND_MESSAGE, writer)?;
                 BorshSerialize::serialize(message_id, writer)?;
                 BorshSerialize::serialize(seq, writer)?;
                 BorshSerialize::serialize(prestate, writer)?;
+                BorshSerialize::serialize(poststate, writer)?;
                 serialize_bounded_bytes(writer, data, MAX_EXEC_MESSAGE_BYTES, "exec.data")?;
-                BorshSerialize::serialize(witness, writer)
+                Ok(())
             }
             Self::StepSignature {
                 commitment,
@@ -310,8 +307,8 @@ impl BorshDeserialize for ExecFrame {
                 message_id: MessageIdBytes::deserialize_reader(reader)?,
                 seq: u64::deserialize_reader(reader)?,
                 prestate: StateHashBytes::deserialize_reader(reader)?,
+                poststate: StateHashBytes::deserialize_reader(reader)?,
                 data: read_bounded_bytes(reader, MAX_EXEC_MESSAGE_BYTES, "exec.data")?,
-                witness: WitnessCommitmentBytes::deserialize_reader(reader)?,
             }),
             EXEC_KIND_STEP_SIGNATURE => Ok(Self::StepSignature {
                 commitment: WireStepCommitment::deserialize_reader(reader)?,

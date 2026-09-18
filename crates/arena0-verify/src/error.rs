@@ -1,14 +1,12 @@
 //! Errors returned by receipt verification.
 
-use arena0_program::ProgramHash;
-
 /// A failure while validating a portable authenticated artifact.
 #[derive(Debug, thiserror::Error)]
 pub enum VerifyError {
     /// The input exceeded the protocol's encoded receipt bound.
     #[error("authenticated artifact is {actual} bytes; maximum is {max}")]
     ReceiptTooLarge { actual: usize, max: usize },
-    /// The encoded receipt was not a bounded, version-1 wire value.
+    /// The encoded receipt was not a bounded, version-3 wire value.
     #[error("invalid authenticated artifact: {0}")]
     ReceiptDecode(String),
     /// The receipt failed a protocol or certificate invariant.
@@ -47,29 +45,6 @@ pub enum VerifyError {
     /// The terminal's outcome hash is not the hash of the receipt outcome.
     #[error("receipt outcome does not match the terminal outcome hash")]
     OutcomeHashMismatch,
-    /// The supplied program is not the program named by the activation.
-    #[error("supplied program hashes to {loaded} but receipt attests {attested}")]
-    ProgramMismatch {
-        /// Hash of the Wasm supplied for replay.
-        loaded: ProgramHash,
-        /// Hash committed by the activation.
-        attested: ProgramHash,
-    },
-    /// The supplied Wasm is over the sandbox's program-size bound.
-    #[error("program is {actual} bytes; maximum is {max}")]
-    ProgramTooLarge { actual: usize, max: u64 },
-    /// The replay sandbox rejected a fresh call.
-    #[error("sandbox error: {0}")]
-    Sandbox(String),
-    /// A fresh replay call disagreed with the recorded public state/effects.
-    #[error("replay equivalence failed at step {step}: {message}")]
-    ReplayMismatch { step: u64, message: String },
-    /// The replayed outcome differs from the recorded opaque outcome bytes.
-    #[error("replayed outcome differs from the recorded outcome")]
-    OutcomeMismatch,
-    /// The activated execution profile is not the local sandbox profile.
-    #[error("runtime fingerprint mismatch: attested {attested}, replaying {replaying}")]
-    FingerprintMismatch { attested: String, replaying: String },
 }
 
 /// Keep cryptographic implementation details out of the public error text.

@@ -50,26 +50,20 @@ pub use arena0_program::{
 pub use state::Hash as StateHash;
 pub use topic::Hash as TopicHash;
 
-pub use effect::{
-    DisconnectReason, Effect, EffectClassError, LogLevel, PrivateEffect, PublicEffect,
-};
-pub use event::{Event, EventClassError, PrivateEvent, PublicEvent};
+pub use effect::{DisconnectReason, Effect, LogLevel};
+pub use event::Event;
 pub use exec::ExecLifecycle;
 pub use exec_frame::{ExecFrame, ExecFrameError};
 pub use execution::{
-    ABORT_OCCURRENCE_DOMAIN, ABORT_OCCURRENCE_VERSION, AbortKind, AbortOccurrence, BroadcastFrame,
-    CommitPlan, DurableEffect, ExecutionBinding, ExecutionInput, ExecutionState, ExecutionStatus,
-    ExecutionVersion, FrameId, MAX_ACTIVE_TIMERS, MAX_COMMIT_PLAN_BYTES, MAX_EFFECT_PAYLOAD_BYTES,
-    MAX_EXECUTION_INPUT_BYTES, MAX_EXECUTION_STATE_BYTES, MAX_OUTBOX_OCCURRENCES,
-    MAX_PRIVATE_EFFECTS, MAX_PRIVATE_RECORD_BYTES, MAX_PROOF_SIGNATURES, MAX_RECEIPT_BYTES,
-    MAX_SHARED_EFFECTS, MAX_TERMINAL_OUTCOME_BYTES, MAX_TERMINAL_REASON_BYTES, MAX_TIMER_MUTATIONS,
-    MAX_TIMER_PAYLOAD_BYTES, MAX_TRACE_ENTRY_BYTES, OutboxId, OutboxIntent,
-    ParticipantStepSignature, ParticipantTerminalSignature, PendingId, PendingIdParseError, PlanId,
-    PrivateCause, PrivateCommit, PrivateCursor, PrivateDelta, ProtocolError, PublicCursor,
-    PublishedProof, Receipt, ReceiptArtifact, ReceiptBody, ReceiptId, ReceiptKind, ReceiptWork,
-    SharedCommit, SharedDelta, SharedProposal, StepCertificate, StopCause, StopReport,
-    TerminalCertificate, TerminalOutcome, TerminalProof, TerminalPublication, TimerFiring, TimerId,
-    TimerMutation, TransitionOutcome, pending_id, transition,
+    ABORT_OCCURRENCE_DOMAIN, ABORT_OCCURRENCE_VERSION, AbortKind, AbortOccurrence,
+    ExecutionBinding, ExecutionState, ExecutionStatus, ExecutionVersion, FrameId,
+    MAX_ACTIVE_TIMERS, MAX_EFFECT_PAYLOAD_BYTES, MAX_EFFECTS, MAX_EXECUTION_STATE_BYTES,
+    MAX_PROOF_SIGNATURES, MAX_RECEIPT_BYTES, MAX_TERMINAL_OUTCOME_BYTES, MAX_TERMINAL_REASON_BYTES,
+    MAX_TIMER_PAYLOAD_BYTES, MAX_TRACE_ENTRY_BYTES, ParticipantStepSignature,
+    ParticipantTerminalSignature, PendingId, PendingIdParseError, ProtocolError, PublishedProof,
+    Receipt, ReceiptArtifact, ReceiptBody, ReceiptId, ReceiptKind, ReceiptWork, SharedProposal,
+    StepCertificate, StepCursor, StopCause, StopReport, TerminalCertificate, TerminalOutcome,
+    TerminalProof, TerminalPublication, TimerFiring, TimerId, pending_id,
 };
 pub use fetch_frame::{FetchFrame, FetchFrameError};
 pub use id::IdParseError;
@@ -96,8 +90,8 @@ pub use terminal::TerminalResult;
 pub use timer::{TimerPayload, TimerSpec};
 pub use trace::{
     AggregateAttestation, AttestationError, CHAIN_START, DivergenceDiagnostic, DivergenceKind,
-    PendingKind, PendingOperation, PendingRecord, PrivateRecord, ReceiptTermination,
-    STEP_COMMIT_DOMAIN, SessionHeader, SessionTerminal, SignerSet, StepCommitment, StepSig,
-    TERMINAL_DOMAIN, TRACE_FORMAT_VERSION, TerminalCommitment, TraceEntry, WitnessCommitment,
+    PendingKind, PendingOperation, PendingRecord, ReceiptTermination, STEP_COMMIT_DOMAIN,
+    SessionHeader, SessionTerminal, SignerSet, StepCommitment, StepSig, TERMINAL_DOMAIN,
+    TRACE_FORMAT_VERSION, TerminalCommitment, TraceEntry,
 };
 pub use view::{ColorDepth, Slot, View, Viewport};

@@ -5,7 +5,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{Participant, PublicEffect};
+use crate::Participant;
 
 use super::TRACE_FORMAT_VERSION;
 use super::entry::TraceEntry;
@@ -36,12 +36,8 @@ pub enum DivergenceKind {
     EventMismatch,
     /// Compared entries started from different shared hashes.
     PreStateMismatch,
-    /// Compared entries emitted different effect journals.
+    /// Compared entries recorded different terminal effects.
     EffectMismatch,
-    /// Compared entries emitted the same effects in a different order.
-    EffectOrderingMismatch,
-    /// Compared entries recorded different sender witness commitments.
-    WitnessMismatch,
     /// Compared entries ended with different shared hashes.
     PostStateMismatch,
     /// Compared decoded shared values differ before falling back to hashes.
@@ -241,25 +237,16 @@ fn compare_entry(left: &TraceEntry, right: &TraceEntry) -> Result<(), Divergence
             right.pre_state,
         ));
     }
-    if left.effects != right.effects {
+    if left.terminal != right.terminal {
         return Err(DivergenceDiagnostic::new_at(
             left.step,
-            effect_mismatch_kind(&left.effects, &right.effects),
+            DivergenceKind::EffectMismatch,
             format!(
-                "effects{}",
-                first_json_diff_path(&left.effects, &right.effects)
+                "terminal{}",
+                first_json_diff_path(&left.terminal, &right.terminal)
             ),
-            &left.effects,
-            &right.effects,
-        ));
-    }
-    if left.witness != right.witness {
-        return Err(DivergenceDiagnostic::new_at(
-            left.step,
-            DivergenceKind::WitnessMismatch,
-            "witness",
-            left.witness,
-            right.witness,
+            &left.terminal,
+            &right.terminal,
         ));
     }
     if left.post_state != right.post_state {
@@ -272,27 +259,6 @@ fn compare_entry(left: &TraceEntry, right: &TraceEntry) -> Result<(), Divergence
         ));
     }
     Ok(())
-}
-
-fn effect_mismatch_kind(left: &[PublicEffect], right: &[PublicEffect]) -> DivergenceKind {
-    if left.len() == right.len()
-        && let (Some(mut left), Some(mut right)) =
-            (sorted_json_strings(left), sorted_json_strings(right))
-    {
-        left.sort();
-        right.sort();
-        if left == right {
-            return DivergenceKind::EffectOrderingMismatch;
-        }
-    }
-    DivergenceKind::EffectMismatch
-}
-
-fn sorted_json_strings<T: Serialize>(items: &[T]) -> Option<Vec<String>> {
-    items
-        .iter()
-        .map(|item| serde_json::to_string(item).ok())
-        .collect()
 }
 
 fn first_json_diff_path<T: Serialize>(left: &T, right: &T) -> String {
@@ -351,7 +317,7 @@ impl JsonDiffExt for Value {
 mod tests {
     use super::*;
     use crate::trace::AggregateAttestation;
-    use crate::{PublicEffect, PublicEvent, StateHash};
+    use crate::{Effect, Event, StateHash};
 
     fn hash(byte: u8) -> StateHash {
         StateHash([byte; 32])
@@ -361,18 +327,16 @@ mod tests {
         TraceEntry {
             trace_version: TRACE_FORMAT_VERSION,
             step,
-            event: PublicEvent::MessageReceived {
+            event: Event::MessageReceived {
                 message_id: crate::MessageId([step as u8; 32]),
                 from: crate::PeerId([1; 32]),
                 position: step,
                 pre_state: pre,
                 msg: Vec::new(),
             },
-            effects: Vec::new(),
             pre_state: pre,
             post_state: post,
-            fuel_used: 0,
-            witness: None,
+            terminal: None,
             agreement: AggregateAttestation::empty(),
         }
     }
@@ -396,27 +360,24 @@ mod tests {
     fn compare_traces_reports_effect_mismatch() {
         let left = vec![entry(0, hash(0), hash(1))];
         let mut right = left.clone();
-        right[0].effects = vec![PublicEffect::SessionEnd { outcome: vec![] }];
+        right[0].terminal = Some(Effect::SessionEnd { outcome: vec![] });
         let err = TraceEntry::compare_traces(&left, &right).unwrap_err();
         assert_eq!(err.kind, DivergenceKind::EffectMismatch);
     }
 
     #[test]
-    fn compare_step_reports_effect_ordering_mismatch() {
+    fn compare_step_reports_terminal_mismatch() {
         let mut left = entry(0, hash(0), hash(1));
-        left.effects = vec![
-            PublicEffect::Fail {
-                reason: "boom".into(),
-            },
-            PublicEffect::SessionAbort {
-                reason: "retry".into(),
-            },
-        ];
+        left.terminal = Some(Effect::Fail {
+            reason: "boom".into(),
+        });
         let mut right = left.clone();
-        right.effects.reverse();
+        right.terminal = Some(Effect::SessionAbort {
+            reason: "retry".into(),
+        });
         let err = TraceEntry::compare_step(&left, &right).unwrap_err();
-        assert_eq!(err.kind, DivergenceKind::EffectOrderingMismatch);
-        assert_eq!(err.field_path, "effects[0].Fail");
+        assert_eq!(err.kind, DivergenceKind::EffectMismatch);
+        assert_eq!(err.field_path, "terminal.Fail");
     }
     #[test]
     fn json_difference_paths_are_deterministic() {

@@ -1,101 +1,17 @@
-//! Typed inputs for fresh guest invocations.
+//! Typed inputs for loaded-program invocations.
 //!
-//! These values deliberately separate shared, local, and read-only calls.
-//! Constructing a call does not allocate a Wasmtime instance. The loaded
-//! program creates and destroys one instance when the call is executed.
+//! A loaded program owns one non-cloneable resident instance per actor for
+//! dispatches. Read-only projections continue to use fresh instances.
 
 use arena0_program::{
-    InitInput, JsonBytes, LocalInput, LocalStateBytes, MAX_CALL_ENVELOPE_BYTES, MAX_HOST_BYTES,
-    MAX_RANDOM_DRAW_BYTES, MAX_RANDOM_DRAWS, OutcomeInput, QueryInput, SharedInput,
-    SharedStateBytes, ViewInput, WriterInput,
+    DispatchInput, InitInput, JsonBytes, MAX_CALL_ENVELOPE_BYTES, MAX_HOST_BYTES,
+    MAX_RANDOM_DRAW_BYTES, MAX_RANDOM_DRAWS, OutcomeInput, QueryInput, SharedStateBytes, ViewInput,
+    WriterInput,
 };
 use arena0_protocol::{Committed, Ensemble, Event, PeerId};
 use borsh::BorshSerialize;
 
-/// Shared event surface. A local event cannot be constructed for a shared call.
-#[derive(Debug, Clone)]
-pub enum SharedEvent {
-    /// A public message at its canonical position.
-    MessageReceived {
-        message_id: arena0_protocol::MessageId,
-        from: PeerId,
-        position: u64,
-        pre_state: arena0_protocol::StateHash,
-        msg: Vec<u8>,
-    },
-}
-
-/// Local event surface. A shared event cannot be constructed for a local call.
-#[derive(Debug, Clone)]
-pub enum LocalEvent {
-    /// An answer to a pending callout, encoded as validated agent-facing JSON.
-    InputReceived {
-        callout_index: u32,
-        data: JsonBytes,
-        continuation_tag: Option<u32>,
-    },
-    /// An untyped timer fired.
-    TimerFired,
-    /// A typed timer fired.
-    TypedTimerFired {
-        timer: arena0_protocol::TimerPayload,
-    },
-    /// A signing operation completed.
-    Signed {
-        signature: Vec<u8>,
-        continuation_tag: Option<u32>,
-    },
-    /// Run local decision code after a public entry.
-    React,
-}
-
-impl SharedEvent {
-    pub(crate) fn into_protocol(self) -> Event<Vec<u8>> {
-        match self {
-            Self::MessageReceived {
-                message_id,
-                from,
-                position,
-                pre_state,
-                msg,
-            } => Event::MessageReceived {
-                message_id,
-                from,
-                position,
-                pre_state,
-                msg,
-            },
-        }
-    }
-}
-
-impl LocalEvent {
-    pub(crate) fn into_protocol(self) -> Event<Vec<u8>> {
-        match self {
-            Self::InputReceived {
-                callout_index,
-                data,
-                continuation_tag,
-            } => Event::InputReceived {
-                callout_index,
-                data: data.into_bytes(),
-                continuation_tag,
-            },
-            Self::TimerFired => Event::TimerFired,
-            Self::TypedTimerFired { timer } => Event::TypedTimerFired { timer },
-            Self::Signed {
-                signature,
-                continuation_tag,
-            } => Event::Signed {
-                signature,
-                continuation_tag,
-            },
-            Self::React => Event::React,
-        }
-    }
-}
-
-/// Replay evidence supplied to a local call.
+/// Replay evidence supplied to a dispatch call.
 #[derive(Debug, Clone, Default)]
 pub struct RandomReplay(Vec<Vec<u8>>);
 
@@ -170,77 +86,61 @@ impl InitializeCall {
     }
 }
 
-/// Apply one shared/public event against explicit state bytes.
+/// One event dispatched through the resident Wasm instance.
 #[derive(Debug, Clone)]
-pub enum SharedCall {
-    /// The session-start boundary, whose ensemble is the sole session source.
-    SessionStarted {
-        shared: SharedStateBytes,
-        ensemble: Ensemble<Committed>,
-    },
-    /// A later shared event, requiring the already committed ensemble.
-    Event {
-        shared: SharedStateBytes,
-        session: Ensemble<Committed>,
-        event: SharedEvent,
-    },
-}
-
-impl SharedCall {
-    /// Construct a shared event call.
-    #[must_use]
-    pub fn new(shared: SharedStateBytes, session: Ensemble<Committed>, event: SharedEvent) -> Self {
-        Self::Event {
-            shared,
-            session,
-            event,
-        }
-    }
-
-    /// Construct the session-start boundary. The event's ensemble is the sole
-    /// source of session context for this call.
-    #[must_use]
-    pub fn session_started(shared: SharedStateBytes, ensemble: Ensemble<Committed>) -> Self {
-        Self::SessionStarted { shared, ensemble }
-    }
-}
-
-/// Apply one local/private event against explicit state bytes.
-#[derive(Debug, Clone)]
-pub struct LocalCall {
+pub struct DispatchCall {
     pub(crate) peer_id: PeerId,
-    pub(crate) shared: SharedStateBytes,
-    pub(crate) local: LocalStateBytes,
-    pub(crate) event: LocalEvent,
     pub(crate) session: Ensemble<Committed>,
+    pub(crate) event: Event<Vec<u8>>,
     pub(crate) random_replay: Option<RandomReplay>,
 }
 
-impl LocalCall {
-    /// Construct a local event call.
+impl DispatchCall {
+    /// Construct a dispatch call with a committed session context and flat
+    /// protocol event. State is held in the resident instance, not this value.
     #[must_use]
-    pub fn new(
-        peer_id: PeerId,
-        shared: SharedStateBytes,
-        local: LocalStateBytes,
-        session: Ensemble<Committed>,
-        event: LocalEvent,
-    ) -> Self {
+    pub fn new(peer_id: PeerId, session: Ensemble<Committed>, event: Event<Vec<u8>>) -> Self {
         Self {
             peer_id,
-            shared,
-            local,
-            event,
             session,
+            event,
             random_replay: None,
         }
     }
 
-    /// Replay recorded entropy during this local call.
+    /// Replay the recorded random draws for this dispatch.
     #[must_use]
     pub fn with_random_replay(mut self, replay: RandomReplay) -> Self {
         self.random_replay = Some(replay);
         self
+    }
+
+    pub(crate) fn into_input(
+        self,
+    ) -> Result<
+        (
+            DispatchInput,
+            Option<RandomReplay>,
+            arena0_protocol::Lifecycle,
+        ),
+        crate::SandboxError,
+    > {
+        let Self {
+            peer_id,
+            session,
+            event,
+            random_replay,
+        } = self;
+        let session_bytes = serialize(&session)?;
+        let event_bytes = serialize(&event)?;
+        let input = DispatchInput::try_new(peer_id.0, session_bytes, event_bytes)
+            .map_err(|error| crate::SandboxError::input_limit(error.to_string()))?;
+        let lifecycle = if matches!(event, Event::SessionStarted { .. }) {
+            arena0_protocol::Lifecycle::PreSession
+        } else {
+            arena0_protocol::Lifecycle::Active
+        };
+        Ok((input, random_replay, lifecycle))
     }
 }
 
@@ -356,37 +256,6 @@ impl OutcomeCall {
     }
 }
 
-pub(crate) fn shared_input(
-    shared: SharedStateBytes,
-    event: Vec<u8>,
-    session: Option<Ensemble<Committed>>,
-) -> Result<SharedInput, crate::SandboxError> {
-    let session = serialize(&session)?;
-    SharedInput::try_new(shared, session, event)
-        .map_err(|error| crate::SandboxError::input_limit(error.to_string()))
-}
-
-impl LocalCall {
-    pub(crate) fn into_input(
-        self,
-    ) -> Result<(LocalInput, SharedStateBytes, Option<RandomReplay>), crate::SandboxError> {
-        let Self {
-            peer_id,
-            shared,
-            local,
-            event,
-            session,
-            random_replay,
-        } = self;
-        let event = serialize(&event.into_protocol())?;
-        let session = serialize(&session)?;
-        // ponytail: clone only for the input; return the original shared state.
-        let input = LocalInput::try_new(peer_id.0, shared.clone(), local, session, event)
-            .map_err(|error| crate::SandboxError::input_limit(error.to_string()))?;
-        Ok((input, shared, random_replay))
-    }
-}
-
 // ponytail: one bounded path keeps call-byte limits and faults consistent.
 pub(crate) fn serialize<T: BorshSerialize>(value: &T) -> Result<Vec<u8>, crate::SandboxError> {
     let bytes = borsh::to_vec(value)
@@ -406,11 +275,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_start_input_has_no_duplicate_session_context() {
-        let shared = SharedStateBytes::try_new(Vec::new()).unwrap();
-        let input = shared_input(shared, Vec::new(), None).unwrap();
-        let session: Option<Ensemble<Committed>> = borsh::from_slice(&input.session).unwrap();
-        assert!(session.is_none());
+    fn session_start_input_carries_the_committed_session_context() {
+        let peer = PeerId([1; 32]);
+        let session = Ensemble::from_peers(vec![peer, PeerId([2; 32])]).unwrap();
+        let input = DispatchCall::new(
+            peer,
+            session.clone(),
+            Event::SessionStarted { ensemble: session },
+        )
+        .into_input()
+        .unwrap()
+        .0;
+        assert_eq!(input.peer_id, [1; 32]);
+        assert!(borsh::from_slice::<Ensemble<Committed>>(&input.session).is_ok());
     }
 
     #[test]

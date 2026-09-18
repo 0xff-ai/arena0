@@ -33,20 +33,33 @@ mod transition;
 
 extern crate self as arena0;
 
+/// Temporary work-memory reserve established before a resident guest starts
+/// serving dispatches. The runtime measures the resulting work memory and
+/// freezes that capacity for the lifetime of the instance.
+pub const RESIDENT_ALLOCATOR_RESERVE_BYTES: usize = arena0_program::MIN_PREPARED_WORK_MEMORY_BYTES;
+
 pub use arena0_sdk_macros::{
     callout, callouts, data, local, message, outcome, pending, phases, primitive, program, query,
     state, test,
 };
 pub use context::{
-    ArenaFuture, CalloutBuilder, Context, Crypto, Effects, LocalPrimitiveField, PrimitiveOutput,
-    PrimitiveOutputs, PrimitiveRoute, RawPrimitiveRoute, SharedContext, SharedPrimitiveField,
-    SignBuilder,
+    ArenaFuture, CalloutBuilder, Context, Crypto, Effects, PrimitiveField, PrimitiveOutput,
+    PrimitiveOutputs, PrimitiveRoute, RawPrimitiveRoute, SignBuilder,
+};
+#[doc(hidden)]
+pub use effects::{
+    STATE_KIND_LOCAL as __STATE_KIND_LOCAL, STATE_KIND_SHARED as __STATE_KIND_SHARED,
+    host_state_len as __host_state_len, host_state_read as __host_state_read,
+    host_state_write as __host_state_write,
 };
 #[doc(hidden)]
 pub use effects::{
     host_fail as __host_fail, host_log as __host_log, host_retry_input as __host_retry_input,
 };
 pub use fault::{InputFault, ProgramFault, ProtocolFault, Retryable};
+#[doc(hidden)]
+#[cfg(target_arch = "wasm32")]
+pub use io_alloc::prepare_allocator as __prepare_allocator;
 pub use primitive::Primitive;
 pub use program::{
     ApplyDecision, MessageApply, PhasedProgram, PhaselessTransition, Program, ProgramQuery,
@@ -65,14 +78,14 @@ pub use anyhow;
 pub use arena0_crypto::{HashAlgorithm, SignScheme};
 pub use arena0_program::{
     ABI_VERSION, AbiEnvelopeError, BorshSchemaDocument, CallStatus, CalloutSchema, Capability,
-    CapabilityImport, CapabilitySet, ExecutionProfile, ExecutionProfileHash, HOST_MODULE,
-    InitInput, InitializedState, JsonBytes, JsonBytesError, JsonSchemaDocument,
-    JsonSchemaDocumentError, LocalInput, LocalOutput, LocalStateBytes, MAX_CALL_ENVELOPE_BYTES,
-    MessageSchema, OutcomeBytes, OutcomeBytesError, OutcomeInput, OutcomeOutput,
-    PROGRAM_DEFINITION_MAGIC, PROGRAM_DEFINITION_VERSION, PROGRAM_MAX_LEN, ParticipantCount,
-    ParticipantCountError, PrimitiveRouteSchema, ProgramDefinition, ProgramDefinitionError,
-    ProgramHash, ProgramMetadata, ProgramSchema, QueryInput, QueryOutput, QuerySchema, SharedInput,
-    SharedOutput, SharedStateBytes, StateBytesError, StateSchema, ViewInput, ViewOutput,
+    CapabilityImport, CapabilitySet, DispatchInput, DispatchOutput, ExecutionProfile,
+    ExecutionProfileHash, HOST_MODULE, InitInput, InitializedState, JsonBytes, JsonBytesError,
+    JsonSchemaDocument, JsonSchemaDocumentError, LocalStateBytes, MAX_CALL_ENVELOPE_BYTES,
+    MAX_LOCAL_STATE_BYTES, MessageSchema, OutcomeBytes, OutcomeBytesError, OutcomeInput,
+    OutcomeOutput, PROGRAM_DEFINITION_MAGIC, PROGRAM_DEFINITION_VERSION, PROGRAM_MAX_LEN,
+    ParticipantCount, ParticipantCountError, PrimitiveRouteSchema, ProgramDefinition,
+    ProgramDefinitionError, ProgramHash, ProgramMetadata, ProgramSchema, QueryInput, QueryOutput,
+    QuerySchema, SharedStateBytes, StateBytesError, StateSchema, ViewInput, ViewOutput,
     WriterInput, WriterOutput, abi,
 };
 pub use arena0_protocol as types;

@@ -54,6 +54,7 @@ pub enum Outcome {
 )]
 pub mod chess {
     use super::*;
+    use arena0::ProgramTransition;
 
     // Chess declares its SDK-facing types in-module (below); the module-shell
     // macro resolves them directly. Only `Outcome` lives at file scope, so it is
@@ -237,8 +238,7 @@ pub mod chess {
         state.turns.as_ref().map(TurnManager::current)
     }
 
-    fn view(ctx: &SharedContext, vp: &Viewport) -> View {
-        let state = ctx.shared();
+    fn view(state: &Shared, _ensemble: &Ensemble, vp: &Viewport) -> View {
         let board = state.current_board();
         // Read-only projections receive only shared state. Render the board in
         // canonical White-first orientation rather than depending on the local
@@ -432,7 +432,9 @@ pub mod chess {
     /// Position-0 boundary: set up the starting board and the turn order. Shared
     /// handler, so it issues no callout; asking the mover for a move is
     /// `on_react`'s job.
-    fn on_session_started(ctx: &mut SharedContext) -> Result<Transition<Phase>, ProgramFault> {
+    fn on_session_started(
+        ctx: &mut Context<Shared, Local>,
+    ) -> Result<ProgramTransition<Chess>, ProgramFault> {
         let participants = vec![Participant::new(0), Participant::new(1)];
         ctx.mutate_shared(|state| {
             let board = CozyBoard::default();
@@ -444,17 +446,19 @@ pub mod chess {
     }
 
     /// Local decision hook: when it is this node's turn, ask the agent for a move.
-    fn on_react(ctx: &mut Context) -> Result<(), ProgramFault> {
+    fn on_react(
+        ctx: &mut Context<Shared, Local>,
+    ) -> Result<ProgramTransition<Chess>, ProgramFault> {
         let state = ctx.shared();
         if state.phase() != Phase::Playing || state.status != Status::InProgress {
-            return Ok(());
+            return Ok(Transition::Stay);
         }
         let is_my_turn = state
             .turns
             .as_ref()
             .is_some_and(|turns| turns.current() == ctx.me());
         if !is_my_turn {
-            return Ok(());
+            return Ok(Transition::Stay);
         }
         let fen = state.fen.clone();
         let legal_moves = state.legal_moves_string();
@@ -462,37 +466,47 @@ pub mod chess {
             .callout(callouts::MakeMove { fen, legal_moves })
             .pending(Pending::Thinking)
             .dispatch();
-        Ok(())
+        Ok(Transition::Stay)
     }
 
-    fn on_input(ctx: &mut Context, input: Input) -> Result<(), InputFault> {
+    fn on_input(
+        ctx: &mut Context<Shared, Local>,
+        input: Input,
+    ) -> Result<ProgramTransition<Chess>, InputFault> {
         let Input::MakeMove(text) = input;
         let move_str = text.trim();
-        // Validate against the current board (read-only). A bad move is retryable;
-        // the authoritative apply happens in `on_message` when the broadcast lands.
-        ctx.shared()
-            .validate_move(move_str)
-            .map_err(|e| InputFault::Retryable(e.into()))?;
+        let from = ctx.me();
+        if writer(ctx.shared()) != Some(from) {
+            return Err(InputFault::Retryable(anyhow!(
+                "this participant does not own the next move"
+            )));
+        }
+        // A bad move is retryable. The originating event applies the move before
+        // its broadcast; receivers apply the same helper at the message boundary.
+        let finished =
+            apply_move(ctx.shared_mut(), move_str).map_err(|e| InputFault::Retryable(e.into()))?;
         ctx.effects()
             .broadcast(&Message::Move(move_str.to_string()));
-        Ok(())
+        Ok(if finished {
+            Transition::End
+        } else {
+            Transition::Stay
+        })
     }
 
     fn on_message(
-        ctx: &mut SharedContext,
-        _from: Participant,
+        ctx: &mut Context<Shared, Local>,
+        from: Participant,
         msg: Message,
-    ) -> Result<ApplyDecision<Phase>, ProtocolFault> {
+    ) -> MessageApply<Chess> {
+        if writer(ctx.shared()) != Some(from) {
+            return Ok(ApplyDecision::Reject);
+        }
         let Message::Move(text) = msg;
         let move_str = text.trim();
-        let Ok((board, algebraic)) = ctx.shared().validate_move(move_str) else {
+        let Ok(finished) = apply_move(ctx.shared_mut(), move_str) else {
             return Ok(ApplyDecision::Reject);
         };
-        let finished = ctx.mutate_shared(|state| {
-            state.apply_validated_move(&board, algebraic);
-            state.turns.as_mut().expect("turns initialized").advance();
-            state.status != Status::InProgress
-        });
         if finished {
             return Ok(ApplyDecision::Accept(Transition::End));
         }
@@ -500,7 +514,17 @@ pub mod chess {
         Ok(ApplyDecision::Accept(Transition::Stay))
     }
 
-    fn on_query(_ctx: &SharedContext, _: ()) {}
+    fn on_query(_shared: &Shared, _: ()) {}
+
+    /// Apply one validated move to the shared board and advance the canonical
+    /// turn. Both the originating input and every receiving message use this
+    /// helper so the producer never needs to self-apply its broadcast.
+    fn apply_move(state: &mut Shared, move_str: &str) -> Result<bool, Error> {
+        let (board, algebraic) = state.validate_move(move_str)?;
+        state.apply_validated_move(&board, algebraic);
+        state.turns.as_mut().expect("turns initialized").advance();
+        Ok(state.status != Status::InProgress)
+    }
 
     impl Shared {
         fn current_board(&self) -> Option<CozyBoard> {
@@ -756,23 +780,24 @@ mod tests {
         }
 
         /// Make the local side's move on a single native replica: answer the
-        /// pending `MakeMove` callout (which broadcasts the move) and apply the
-        /// node's own broadcast, which mutates the board and advances the turn.
+        /// pending `MakeMove` callout. The input handler applies the move before
+        /// emitting its broadcast, so this helper does not self-deliver it.
         /// The local node is White (participant 0). Returns the apply result.
         fn play_move<H>(h: &mut H, uci: &str) -> arena0::testing::HandlerResult
         where
             H: Harness<Chess>,
         {
-            let fx = h.resolve_callout::<callouts::MakeMove>(uci.to_string());
-            let mv = fx.messages::<Message>().remove(0);
-            h.message(h.peer_id(), mv)
+            h.resolve_callout::<callouts::MakeMove>(uci.to_string())
         }
 
         fn session_end_outcome(result: &HandlerResult) -> Outcome {
             let outcome = result
-                .step
-                .as_ref()
-                .and_then(TraceEntry::completed_outcome)
+                .effects
+                .iter()
+                .find_map(|effect| match effect {
+                    Effect::SessionEnd { outcome } => Some(outcome.as_slice()),
+                    _ => None,
+                })
                 .expect("terminal handler result should carry a completed outcome");
             arena0::borsh::from_slice(outcome).expect("terminal outcome must decode")
         }
@@ -780,13 +805,13 @@ mod tests {
         fn terminal_move(h: &mut TestHarness<Chess>, fen: &str, uci: &str) -> (Status, Outcome) {
             h.session_started(peer_a());
             h.shared_mut().fen = fen.to_owned();
-            let result = h.message(h.peer_id(), Message::Move(uci.to_owned()));
+            let result = h.resolve_callout::<callouts::MakeMove>(uci.to_owned());
             assert!(
                 result.has_session_end(),
                 "terminal move should end the session"
             );
             assert!(
-                h.trace().last().is_some_and(TraceEntry::is_terminal),
+                h.trace().last().is_some_and(|record| record.is_terminal()),
                 "terminal move should produce terminal trace evidence"
             );
             (h.shared().status, session_end_outcome(&result))
@@ -796,13 +821,10 @@ mod tests {
         fn valid_move_updates_board(h: ()) {
             h.session_started(peer_a());
 
-            // The move is broadcast by the local decision code, then applied to
-            // shared state when the broadcast lands through the shared handler.
+            // The input handler applies the move before broadcasting it.
             let fx = h.resolve_callout::<callouts::MakeMove>("e2e4".to_string());
             assert!(matches!(fx.fault, FaultStatus::None));
             assert!(fx.has_broadcast());
-            let mv = fx.messages::<Message>().remove(0);
-            h.message(h.peer_id(), mv);
 
             let state = h.shared();
             assert!(!state.fen.is_empty());
@@ -903,20 +925,16 @@ mod tests {
             play_move(&mut h, "d1h5");
             h.message(peer_a(), Message::Move("g8f6".to_string()));
 
-            // 4. Qxf7# (checkmate). The winning move is broadcast by the local
-            // decision code first; applying it through the shared handler ends the
-            // session. The broadcast entry precedes the End entry (they are now
-            // separate dispatches, not two effects on one).
+            // 4. Qxf7# (checkmate). The input handler applies the winning move
+            // before emitting its broadcast and terminal effect.
             let broadcast = h.resolve_callout::<callouts::MakeMove>("h5f7".to_string());
             assert!(
                 broadcast.has_broadcast(),
-                "winning move is broadcast before it applies"
+                "winning move is broadcast with the local apply"
             );
-            let mv = broadcast.messages::<Message>().remove(0);
-            let apply = h.message(h.peer_id(), mv);
             assert!(
-                apply.has_session_end(),
-                "applying the mate ends the session"
+                broadcast.has_session_end(),
+                "the local mate input ends the session"
             );
 
             let state = h.shared();
@@ -928,7 +946,7 @@ mod tests {
             );
             assert_eq!(state.move_history.len(), 7);
             assert_eq!(
-                session_end_outcome(&apply),
+                session_end_outcome(&broadcast),
                 Outcome::Win {
                     winner: Participant::new(0),
                     reason: WinReason::Checkmate,
@@ -978,8 +996,7 @@ mod tests {
             play_move(&mut h, "d1h5");
             h.message(peer_a(), Message::Move("g8f6".to_string()));
             let broadcast = h.resolve_callout::<callouts::MakeMove>("h5f7".to_string());
-            let mv = broadcast.messages::<Message>().remove(0);
-            h.message(h.peer_id(), mv);
+            assert!(broadcast.has_session_end());
             assert_eq!(
                 h.shared().status,
                 Status::Checkmate {
@@ -1022,9 +1039,9 @@ mod tests {
             trace.assert_shared_aligned();
             trace.assert_replayable();
             let snapshot = run.snapshot("after-e5").expect("snapshot");
-            assert!(!snapshot.transcript.contains("InputReceived"));
+            assert!(snapshot.transcript.contains("InputReceived"));
             assert!(snapshot.transcript.contains("MessageReceived"));
-            assert!(!snapshot.transcript.contains("Broadcast"));
+            assert!(snapshot.transcript.contains("Broadcast"));
         }
     }
 

@@ -8,14 +8,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arena0_protocol::{
-    Committed, Ensemble, ExecLifecycle, ExecutionInput, ExecutionState, PeerIdSource, PrivateCause,
-    PrivateEvent, ReceiptWork, TicketAction,
+    Committed, Ensemble, ExecLifecycle, ExecutionState, PeerIdSource, ReceiptWork, TicketAction,
 };
-use arena0_sandbox::{InitializeCall, LocalEvent};
-use arena0_store::{ApplyOutcome, PendingRequest};
-use arena0_transport::{RecvHandle, TransportError};
+use arena0_sandbox::{InitializeCall, ProgramInstance};
+use arena0_store::PendingRequest;
+use arena0_transport::RecvHandle;
 use tokio::sync::mpsc;
-use tokio::task::{JoinError, JoinSet};
+use tokio::task::JoinSet;
 use tokio::time::{Interval, MissedTickBehavior};
 
 use crate::Host;
@@ -23,9 +22,10 @@ use crate::context::{
     ActorContext, ExecCommand, ExecError, InboundStreamPayload, SessionMessage, SpawnedExec,
 };
 
-use super::{
-    COMMAND_CAPACITY, ExecutionActor, InflightSend, PROGRESS_INTERVAL, STREAM_CAPACITY, now_ms,
-};
+use super::guest::SubmitInputError;
+use super::{COMMAND_CAPACITY, ExecutionActor, PROGRESS_INTERVAL, STREAM_CAPACITY, now_ms};
+
+const MAX_PROGRESS_PASSES: usize = 64;
 
 /// Spawn one actor and one concurrent reader supervisor.
 #[must_use]
@@ -36,10 +36,12 @@ pub(crate) fn spawn_execution(context: ActorContext, host: Arc<Host>) -> Spawned
 
     let actor = ExecutionActor {
         context,
+        instance: None,
         messages: message_tx,
         send_streams: HashMap::new(),
         inflight_send: None,
         session_started_emitted: false,
+        terminal_emitted: false,
     };
     let actor_task = tokio::spawn(actor.run(command_rx));
     let stream_task = tokio::spawn(forward_streams(stream_rx, command_tx.clone()));
@@ -114,8 +116,8 @@ impl std::fmt::Debug for ExecutionActor {
 
 impl ExecutionActor {
     async fn run(mut self, mut commands: mpsc::Receiver<ExecCommand>) {
-        if let Err(error) = self.recover().await {
-            self.fail_terminal(error).await;
+        let recovered = self.recover().await;
+        if !self.continue_after(recovered).await {
             return;
         }
 
@@ -123,21 +125,27 @@ impl ExecutionActor {
         loop {
             let has_inflight_send = self.inflight_send.is_some();
             tokio::select! {
-                result = wait_for_inflight_send(&mut self.inflight_send), if has_inflight_send => {
-                    if let Err(error) = self.settle_inflight_send(result).await {
-                        self.fail_terminal(error).await;
+                result = async {
+                    self.inflight_send
+                        .as_mut()
+                        .expect("in-flight send exists while selected")
+                        .wait()
+                        .await
+                }, if has_inflight_send => {
+                    let settled = self.settle_inflight_send(result).await;
+                    if !self.continue_after(settled).await {
                         return;
                     }
-                    if let Err(error) = self.progress().await {
-                        self.fail_terminal(error).await;
+                    let progressed = self.progress().await;
+                    if !self.continue_after(progressed).await {
                         return;
                     }
                 }
                 command = commands.recv() => {
                     match command {
                         Some(command) => {
-                            if let Err(error) = self.handle(command).await {
-                                self.fail_terminal(error).await;
+                            let handled = self.handle(command).await;
+                            if !self.continue_after(handled).await {
                                 return;
                             }
                         }
@@ -150,12 +158,22 @@ impl ExecutionActor {
                     }
                 }
                 _ = ticker.tick() => {
-                    if let Err(error) = self.progress().await {
-                        self.fail_terminal(error).await;
+                    let progressed = self.progress().await;
+                    if !self.continue_after(progressed).await {
                         return;
                     }
                 }
             }
+        }
+    }
+
+    /// Keep one error boundary for recovery, commands, progress, and transport
+    /// settlement. A durably recorded terminal continues on the same actor
+    /// loop so inbound acknowledgements and outbox retries cannot deadlock.
+    async fn continue_after(&mut self, result: Result<(), ExecError>) -> bool {
+        match result {
+            Ok(()) => true,
+            Err(error) => self.fail_terminal(error).await,
         }
     }
 
@@ -168,12 +186,28 @@ impl ExecutionActor {
                 reply,
             } => {
                 let result = self.submit_input(pending_id, callout_index, data).await;
-                let _ = reply.send(result);
-                Ok(())
+                match result {
+                    Ok(()) => {
+                        let _ = reply.send(Ok(()));
+                        Ok(())
+                    }
+                    Err(SubmitInputError::Expected(error)) => {
+                        let _ = reply.send(Err(error));
+                        Ok(())
+                    }
+                    Err(SubmitInputError::Fatal(error)) => {
+                        let _ = reply.send(Err(error.clone()));
+                        Err(error)
+                    }
+                }
             }
             ExecCommand::Terminate { reason, reply } => {
                 let result = self.terminate(reason).await;
                 let _ = reply.send(result);
+                // A stop request can legitimately lose to a locally signed
+                // shared proposal. Keep the proposal recoverable and let the
+                // normal progress path continue; this command's reply is the
+                // durable result boundary for that expected rejection.
                 Ok(())
             }
             ExecCommand::Query {
@@ -210,6 +244,13 @@ impl ExecutionActor {
         self.context.store.recover_expired_leases(now_ms()).await?;
         self.ensure_execution().await?;
 
+        // Construct the resident only after the execution aggregate exists.
+        // Recovery always starts from the committed state images; a pending
+        // proposal remains durable evidence and is deliberately not installed
+        // as live guest state while signatures are outstanding.
+        let state = self.load_state().await?;
+        self.restore_resident(&state)?;
+
         // An acknowledged callout may have reached the observer immediately
         // before the actor crashed, leaving the durable continuation waiting
         // for an answer while its outbox row is no longer pending. Capture
@@ -230,7 +271,10 @@ impl ExecutionActor {
         let state = self.load_state().await?;
 
         if state.status().lifecycle() == ExecLifecycle::Activating {
-            self.apply_input(ExecutionInput::Activate).await?;
+            // Activation is a store-owned lifecycle transition.  The direct
+            // store API supplies this operation once the execution writer has
+            // adopted the flat dispatch contract.
+            self.activate_execution(state.version()).await?;
         }
 
         self.progress().await?;
@@ -361,45 +405,69 @@ impl ExecutionActor {
     }
 
     pub(super) async fn progress(&mut self) -> Result<(), ExecError> {
-        let state = self.load_state().await?;
-        match state.status().receipt_work() {
-            ReceiptWork::NotTerminal | ReceiptWork::CollectSignatures => {}
-            ReceiptWork::Incomplete => return Ok(()),
-            ReceiptWork::Assemble | ReceiptWork::Published => {
-                super::terminal::finalize_receipt(&mut self.context.store).await?;
-                return self.drain_outbox().await;
+        'progress: for _ in 0..MAX_PROGRESS_PASSES {
+            let mut drove_events = false;
+            let state = loop {
+                let state = self.load_state().await?;
+                match state.status().receipt_work() {
+                    ReceiptWork::NotTerminal | ReceiptWork::CollectSignatures if drove_events => {
+                        break state;
+                    }
+                    ReceiptWork::NotTerminal | ReceiptWork::CollectSignatures => {
+                        self.ensure_session_started().await?;
+                        self.resolve_pending_inbox().await?;
+                        self.fire_due_timers().await?;
+                        drove_events = true;
+                    }
+                    ReceiptWork::Incomplete => return Ok(()),
+                    ReceiptWork::Assemble | ReceiptWork::Published => {
+                        if !self.progress_terminal_boundary().await? {
+                            return Ok(());
+                        }
+                        continue 'progress;
+                    }
+                }
+            };
+            if state.pending_shared().is_some() {
+                self.ensure_step_signature().await?;
+            } else if state.terminal_pending() {
+                self.ensure_terminal_signature().await?;
+            } else if state.status().lifecycle() == ExecLifecycle::Active
+                && state.status().pending().is_none()
+                && state.agreed_step() > 0
+                && state.last_reacted_step() != Some(state.agreed_step() - 1)
+            {
+                self.dispatch_event(
+                    arena0_protocol::Event::React,
+                    super::guest::DispatchSource::default(),
+                )
+                .await?;
+            }
+            let summary = self.drain_outbox_report().await?;
+            if !summary.sign_consumed {
+                return Ok(());
             }
         }
-        self.ensure_session_started().await?;
-        self.resolve_pending_inbox().await?;
-        self.fire_due_timers().await?;
+        tracing::debug!(
+            exec_id = %self.context.exec_id,
+            passes = MAX_PROGRESS_PASSES,
+            "progress trampoline yielded after bounded Sign continuations"
+        );
+        Ok(())
+    }
 
-        let state = self.load_state().await?;
-        match state.status().receipt_work() {
-            ReceiptWork::NotTerminal | ReceiptWork::CollectSignatures => {}
-            ReceiptWork::Incomplete => return Ok(()),
-            ReceiptWork::Assemble | ReceiptWork::Published => {
-                super::terminal::finalize_receipt(&mut self.context.store).await?;
-                return self.drain_outbox().await;
-            }
+    /// Finish local terminal work before exposing the observer-facing
+    /// publication. Protocol frames remain durable obligations after a receipt
+    /// is published: an in-flight send is leased and a delayed retry is still
+    /// pending, so either must settle before this actor reports completion.
+    pub(super) async fn progress_terminal_boundary(&mut self) -> Result<bool, ExecError> {
+        super::terminal::finalize_receipt(&mut self.context.store).await?;
+        let summary = self.drain_outbox_report().await?;
+        if self.context.store.has_unsettled_frames().await? {
+            return Ok(false);
         }
-        if state.pending_shared().is_some() {
-            self.ensure_step_signature().await?;
-        } else if state.terminal_pending() {
-            self.ensure_terminal_signature().await?;
-        } else if state.status().lifecycle() == ExecLifecycle::Active
-            && state.status().pending().is_none()
-            && state.public().next_step() > 0
-            && state.private().last_reaction_position() != Some(state.public().next_step())
-        {
-            self.run_local(
-                LocalEvent::React,
-                PrivateEvent::React,
-                PrivateCause::react(),
-            )
-            .await?;
-        }
-        self.drain_outbox().await
+        self.emit_published_terminal().await?;
+        Ok(summary.sign_consumed)
     }
 
     pub(super) async fn load_state(&self) -> Result<ExecutionState, ExecError> {
@@ -410,11 +478,36 @@ impl ExecutionActor {
             .ok_or(ExecError::NotFound(self.context.exec_id))
     }
 
-    pub(super) async fn apply_input(
+    /// Construct or replace the execution-local resident from committed
+    /// durable images.  Replacing the instance is required after an unknown
+    /// store outcome; continuing with its candidate memory could duplicate a
+    /// committed effect.
+    pub(super) fn restore_resident(&mut self, state: &ExecutionState) -> Result<(), ExecError> {
+        let instance = self
+            .context
+            .program
+            .resident(state.shared_state().clone(), state.local_state().clone())?;
+        self.instance = Some(instance);
+        Ok(())
+    }
+
+    pub(super) fn resident_mut(&mut self) -> Result<&mut ProgramInstance, ExecError> {
+        self.instance.as_mut().ok_or_else(|| {
+            ExecError::InvalidState("execution resident has not been initialized".into())
+        })
+    }
+
+    /// Activate the durable aggregate.  This method is intentionally kept as
+    /// a node seam while the store owns the focused lifecycle transition.
+    async fn activate_execution(
         &mut self,
-        input: ExecutionInput,
-    ) -> Result<ApplyOutcome, ExecError> {
-        Ok(self.context.store.apply_input(input, now_ms()).await?)
+        expected_version: arena0_protocol::ExecutionVersion,
+    ) -> Result<(), ExecError> {
+        self.context
+            .store
+            .activate(expected_version, now_ms())
+            .await?;
+        Ok(())
     }
 
     pub(super) fn ensemble(&self) -> Ensemble<Committed> {
@@ -434,16 +527,4 @@ fn progress_ticker() -> Interval {
     let mut ticker = tokio::time::interval(PROGRESS_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ticker
-}
-
-async fn wait_for_inflight_send(
-    inflight: &mut Option<InflightSend>,
-) -> Result<Result<(), TransportError>, JoinError> {
-    inflight
-        .as_mut()
-        .expect("in-flight send exists while selected")
-        .task
-        .as_mut()
-        .expect("in-flight send task exists while selected")
-        .await
 }

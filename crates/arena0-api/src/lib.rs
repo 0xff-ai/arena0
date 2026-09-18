@@ -32,11 +32,10 @@ pub use request::{
 };
 pub use response::{
     ActivationInspection, ActivationInspectionState, ActivationParticipant, ApiError, ApiErrorCode,
-    DaemonInfo, ExecStatus, ExecStatusState, ExecutionInspection, FullVerifiedTerminal, HostInfo,
-    HostStatus, IdInfo, LightVerifiedTerminal, NextEvent, PendingCalloutStatus,
-    PrivateCommitSummary, PrivateEffectKind, PrivateEffectSummary, PrivateEventKind, ProgramDetail,
-    ProgramSummary, ReceiptListEntry, ReceiptProvenance, Response, ResponseOk, SessionProgress,
-    SessionStatus, VerifiedResult,
+    DaemonInfo, EffectKind, EffectSummary, EventKind, EventRecordSummary, ExecStatus,
+    ExecStatusState, ExecutionInspection, HostInfo, HostStatus, IdInfo, LightVerifiedTerminal,
+    NextEvent, PendingCalloutStatus, ProgramDetail, ProgramSummary, ReceiptListEntry,
+    ReceiptProvenance, Response, ResponseOk, SessionProgress, SessionStatus, VerifiedResult,
 };
 
 #[cfg(test)]
@@ -104,8 +103,8 @@ mod tests {
             (
                 HostRequest::ExecInspect {
                     exec_id: ExecId([9u8; 32]),
-                    private_from: Some(4),
-                    private_limit: 32,
+                    events_from: Some(4),
+                    events_limit: 32,
                 },
                 "exec.inspect",
             ),
@@ -139,6 +138,12 @@ mod tests {
                 },
                 "receipt.get",
             ),
+            (
+                HostRequest::ReceiptVerify {
+                    receipt: ReceiptRef::Produced(SessionHash([10u8; 32])),
+                },
+                "receipt.verify",
+            ),
         ];
         for (req, path) in cases {
             let json = serde_json::to_value(&req).unwrap();
@@ -146,6 +151,16 @@ mod tests {
             let back: HostRequest = serde_json::from_value(json).unwrap();
             assert_eq!(req, back);
         }
+    }
+
+    #[test]
+    fn receipt_verify_rejects_removed_full_parameter() {
+        let request = HostRequest::ReceiptVerify {
+            receipt: ReceiptRef::Produced(SessionHash([10u8; 32])),
+        };
+        let mut json = serde_json::to_value(request).expect("receipt verify JSON");
+        json["params"]["full"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<HostRequest>(json).is_err());
     }
 
     #[test]
@@ -363,20 +378,6 @@ mod tests {
             .is_err()
         );
 
-        let verified = FullVerifiedTerminal::Completed {
-            outcome_borsh: vec![0],
-            outcome_json: serde_json::json!({"winner": "Rock"}),
-        };
-        let json = serde_json::to_value(verified).unwrap();
-        assert_eq!(json["Completed"]["outcome_borsh"], serde_json::json!([0]));
-        assert_eq!(json["Completed"]["outcome_json"]["winner"], "Rock");
-        assert!(
-            serde_json::from_value::<FullVerifiedTerminal>(serde_json::json!({
-                "Completed": {"outcome_borsh": [0]}
-            }))
-            .is_err()
-        );
-
         let verified = VerifiedResult::Light {
             terminal: LightVerifiedTerminal::Completed {
                 outcome_borsh: vec![0],
@@ -395,18 +396,17 @@ mod tests {
             session_id: SessionHash([2; 32]),
             ensemble: vec![PeerId([3; 32])],
             steps: 1,
-            result: VerifiedResult::Full {
-                terminal: FullVerifiedTerminal::Completed {
+            result: VerifiedResult::Light {
+                terminal: LightVerifiedTerminal::Completed {
                     outcome_borsh: vec![0],
-                    outcome_json: serde_json::json!({"ok": true}),
                 },
             },
         });
         let encoded = serde_json::to_value(&response).unwrap();
         assert!(
-            encoded["Ok"]["Verified"]["result"]["Full"]["terminal"]["Completed"]
+            encoded["Ok"]["Verified"]["result"]["Light"]["terminal"]["Completed"]
                 .get("outcome_json")
-                .is_some()
+                .is_none()
         );
         assert_eq!(
             serde_json::from_value::<Response>(encoded).unwrap(),

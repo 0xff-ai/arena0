@@ -355,16 +355,6 @@ struct StopExecutionArg {
     reason: Option<String>,
 }
 
-#[derive(
-    Debug, Default, Clone, Copy, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-enum VerificationMode {
-    #[default]
-    Light,
-    Full,
-}
-
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct VerifySessionArg {
@@ -372,9 +362,6 @@ struct VerifySessionArg {
     #[schemars(rename = "token")]
     _token: McpToken,
     session: SessionRef,
-    /// `light` checks portable proof evidence; `full` also replays the exact Wasm.
-    #[serde(default)]
-    mode: VerificationMode,
 }
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
@@ -972,7 +959,7 @@ impl Arena0Mcp {
     }
 
     #[tool(
-        description = "Verify the receipt produced by one Host and return recovered proof evidence. Full mode also replays the exact registered Wasm.",
+        description = "Verify the receipt produced by one Host and return recovered portable proof evidence.",
         output_schema = output_schema::<VerifySessionOutput>(),
         annotations(title = "Verify session", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -987,7 +974,6 @@ impl Arena0Mcp {
                 &authorized,
                 HostRequest::ReceiptVerify {
                     receipt: ReceiptRef::Produced(session_id),
-                    full: matches!(arg.mode, VerificationMode::Full),
                 },
             )
             .await?
@@ -1000,12 +986,9 @@ impl Arena0Mcp {
                 steps,
                 result,
             } => {
-                let (mode, terminal) = match result {
-                    VerifiedResult::Light { terminal } => ("light", serialized_value(&terminal)?),
-                    VerifiedResult::Full { terminal } => ("full", serialized_value(&terminal)?),
-                };
+                let VerifiedResult::Light { terminal } = result;
                 Ok(Json(VerifySessionOutput {
-                    mode: serialized_value(&mode)?,
+                    mode: serialized_value(&"light")?,
                     session: session_ref(session_id),
                     program: ProgramRef {
                         program_id: program_id.to_string(),
@@ -1015,7 +998,7 @@ impl Arena0Mcp {
                         .map(|peer| self.participant(peer))
                         .collect(),
                     steps,
-                    terminal,
+                    terminal: serialized_value(&terminal)?,
                 }))
             }
             other => Err(unexpected(&other)),
@@ -2298,7 +2281,7 @@ mod tests {
                 })).await;
                 assert!(view["view"]["slots"].is_object());
                 let verified = call_mcp_tool(&clients[index], "verify_session", serde_json::json!({
-                    "token": tokens[index], "session": sessions[index], "mode": "full"
+                    "token": tokens[index], "session": sessions[index]
                 })).await;
                 assert_eq!(verified["session"], sessions[index]);
                 let participants = verified["participants"].as_array().unwrap();
@@ -2338,6 +2321,7 @@ mod tests {
         assert!(status["properties"]["execution"]["$ref"].is_string());
         let verify = tool_input_schema(&server, "verify_session");
         assert!(verify["properties"]["session"]["$ref"].is_string());
+        assert!(verify["properties"].get("mode").is_none());
         let answer = tool_input_schema(&server, "answer_callout");
         assert_eq!(answer["properties"]["pending_id"]["type"], "string");
         assert_eq!(answer["properties"]["pending_id"]["pattern"], "^[0-9]+$");

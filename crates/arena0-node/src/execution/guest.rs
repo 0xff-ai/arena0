@@ -1,184 +1,119 @@
-//! Guest-facing calls and private/shared progress transitions.
+//! Guest dispatches and execution-side agreement validation.
 //!
-//! Every method here loads a fresh durable snapshot, invokes the loaded
-//! guest, and commits the resulting protocol delta through the store.
+//! One actor owns one resident [`ProgramInstance`]. Every mutating program
+//! event enters that instance through `arena0_dispatch`; this module validates
+//! the resulting state/effect boundary and hands the complete result to the
+//! store's one transactional `commit_dispatch` operation. The resident is
+//! never used as durable state: a proposal or an uncertain store reply always
+//! restores it from the committed images.
 
 use crate::context::{ExecError, SessionMessage};
 use arena0_crypto::SignScheme;
 use arena0_program::{CallStatus, JsonBytes};
-use arena0_protocol::PendingId;
 use arena0_protocol::execution::GuestSignData;
 use arena0_protocol::{
-    AggregateAttestation, BroadcastFrame, Committed, Ensemble, Event, ExecFrame, ExecLifecycle,
-    ExecutionInput, ExecutionState, MessageId, ParticipantStepSignature,
-    ParticipantTerminalSignature, PeerIdSource, PendingKind, PendingRecord, PrivateCause,
-    PrivateDelta, PrivateEffect, PrivateEvent, PrivateRecord, PublicEffect, PublicEvent,
-    SharedDelta, StateHash, TRACE_FORMAT_VERSION, TerminalOutcome, TimerFiring, TimerPayload,
-    TraceEntry, WitnessCommitment,
+    Committed, Effect, Ensemble, Event, ExecFrame, ExecLifecycle, ExecutionState, ExecutionStatus,
+    MessageId, ParticipantStepSignature, ParticipantTerminalSignature, PeerIdSource, PendingId,
+    PendingOperation, StateHash, TerminalOutcome,
 };
-use arena0_sandbox::{
-    LocalCall, LocalEvent, OutcomeCall, QueryCall, RandomReplay, SharedCall, SharedEvent, ViewCall,
-    WriterCall,
-};
-use arena0_store::ApplyOutcome;
+use arena0_sandbox::{DispatchCall, OutcomeCall, QueryCall, RandomReplay, ViewCall, WriterCall};
+use arena0_store::{ApplyOutcome, InboxId};
 
 use super::{ExecutionActor, MAX_CAS_RETRIES, MAX_TIMER_BATCH, now_ms};
 
-/// A shared call may be replayed only when the durable head changed after the
-/// guest call. Keeping that case typed prevents ordinary runtime failures from
-/// accidentally entering the CAS retry loop.
+/// Durable identities owned by the source of an event. The store validates
+/// that only the applicable identity is present and that it matches its
+/// authoritative inbox, timer, or pending-continuation row.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct DispatchSource {
+    pub(super) inbox_id: Option<InboxId>,
+    pub(super) timer_id: Option<arena0_protocol::TimerId>,
+    pub(super) pending_id: Option<PendingId>,
+    pub(super) advertised_post_state: Option<StateHash>,
+}
+
+/// Classification for the agent-facing input command.
+///
+/// A callout can become unavailable for an expected protocol reason (for
+/// example, a proposal froze the execution or another answer consumed the
+/// continuation), in which case the command reports the error and the actor
+/// remains live. Guest traps, invalid durable state, and store failures are
+/// fatal execution errors; the actor must return those to `run` so its normal
+/// failure boundary can authenticate and persist the stop.
 #[derive(Debug)]
-enum SharedCommitError {
-    VersionMismatch,
-    Runtime(ExecError),
+pub(super) enum SubmitInputError {
+    Expected(ExecError),
+    Fatal(ExecError),
 }
 
-pub(super) struct ExecutionMessage {
-    message_id: MessageId,
-    sequence: u64,
-    pre_state: StateHash,
-    data: Vec<u8>,
-    witness: WitnessCommitment,
-}
-
-pub(super) trait IntoExecutionMessage {
-    fn into_execution_message(self) -> Result<ExecutionMessage, ExecError>;
-}
-
-impl IntoExecutionMessage for BroadcastFrame {
-    fn into_execution_message(self) -> Result<ExecutionMessage, ExecError> {
-        Ok(ExecutionMessage {
-            message_id: self.message_id(),
-            sequence: self.sequence(),
-            pre_state: self.pre_state(),
-            data: self.data().to_vec(),
-            witness: self.witness(),
-        })
-    }
-}
-
-impl IntoExecutionMessage for ExecFrame {
-    fn into_execution_message(self) -> Result<ExecutionMessage, ExecError> {
-        let Self::Message {
-            message_id,
-            seq,
-            prestate,
-            data,
-            witness,
-        } = self
-        else {
-            return Err(ExecError::InvalidState(
-                "execution frame is not a message".into(),
-            ));
-        };
-        Ok(ExecutionMessage {
-            message_id,
-            sequence: seq,
-            pre_state: prestate,
-            data,
-            witness,
-        })
-    }
-}
-
-impl From<ExecError> for SharedCommitError {
+impl From<ExecError> for SubmitInputError {
     fn from(error: ExecError) -> Self {
-        Self::Runtime(error)
+        Self::Fatal(error)
     }
 }
 
 impl ExecutionActor {
+    /// Submit the answer to the current callout continuation. A rejected
+    /// guest event leaves the continuation and both durable memories intact;
+    /// the command reports that rejection without taking the actor down.
     pub(super) async fn submit_input(
         &mut self,
         pending_id: PendingId,
         callout_index: u32,
         data: JsonBytes,
-    ) -> Result<(), ExecError> {
+    ) -> Result<(), SubmitInputError> {
         let state = self.load_state().await?;
-        let Some((pending, _)) = state.status().pending() else {
-            return Err(ExecError::CalloutNotPending);
+        let Some(pending) = state.status().pending() else {
+            return Err(SubmitInputError::Expected(ExecError::CalloutNotPending));
         };
         if pending.id != pending_id
-            || pending.operation != (arena0_protocol::PendingOperation::Callout { callout_index })
+            || pending.operation != (PendingOperation::Callout { callout_index })
         {
-            return Err(ExecError::CalloutNotPending);
+            return Err(SubmitInputError::Expected(ExecError::CalloutNotPending));
         }
-        self.run_local(
-            LocalEvent::InputReceived {
-                callout_index,
-                data: data.clone(),
-                continuation_tag: pending.continuation_tag,
-            },
-            PrivateEvent::InputReceived {
-                callout_index,
-                data: data.into_bytes(),
-                continuation_tag: pending.continuation_tag,
-            },
-            PrivateCause::resume(pending_id, PendingKind::Callout),
-        )
-        .await?;
-        self.progress().await
+        let accepted = self
+            .dispatch_event(
+                Event::InputReceived {
+                    callout_index,
+                    data: data.into_bytes(),
+                    continuation_tag: pending.continuation_tag,
+                },
+                DispatchSource {
+                    pending_id: Some(pending_id),
+                    ..DispatchSource::default()
+                },
+            )
+            .await?;
+        if accepted == Some(true) {
+            self.progress().await?;
+        } else if accepted.is_none() {
+            // A deferred broadcast may have left a successor proposal in
+            // flight while this continuation is still pending. The answer
+            // was not consumed; surface that boundary to the caller so it
+            // can retry with the same pending id.
+            return Err(SubmitInputError::Expected(ExecError::AgreementPending));
+        }
+        Ok(())
     }
 
-    /// Sign and durably resume one guest signing continuation.
-    ///
-    /// The request is an outbox effect, so the actor remains the only caller
-    /// with access to either signing capability. A missing continuation after
-    /// its private coordinate has advanced is the idempotent crash-replay
-    /// case; no second guest invocation or signature round trip is needed.
+    /// Sign and resume one guest signing continuation. The signer signs only
+    /// the exact versioned `GuestSignData` preimage supplied by the guest; it
+    /// cannot be used to sign a step or terminal commitment by relabelling it.
     pub(super) async fn sign_and_resume(
         &mut self,
         pending_id: PendingId,
         data: &GuestSignData,
-    ) -> Result<(), ExecError> {
+        continuation_tag: Option<u32>,
+    ) -> Result<bool, ExecError> {
         self.validate_guest_sign_data(pending_id, data)?;
-
-        let expected_next_record = data.private_sequence().checked_add(1).ok_or_else(|| {
-            ExecError::InvalidState("guest signing request private coordinate overflows".into())
-        })?;
-        let state = self.load_state().await?;
-        let already_resumed = state.private().next_record() > expected_next_record;
-        let Some((pending, coordinate)) = state.status().pending() else {
-            if already_resumed {
-                // The signature was durably applied before a crash interrupted
-                // outbox acknowledgement. Replaying the leased request is
-                // therefore an idempotent acknowledgement, not a new resume.
-                return Ok(());
-            }
-            return Err(ExecError::InvalidState(
-                "guest signing request has no durable continuation".into(),
-            ));
-        };
-        if pending.operation.kind() != PendingKind::Sign || pending.id != pending_id {
-            if already_resumed {
-                // A later private continuation may already be pending when an
-                // older signature lease is recovered. The private cursor proves
-                // that this request crossed its durable reducer boundary.
-                return Ok(());
-            }
-            return Err(ExecError::InvalidState(
-                "guest signing request does not match the durable continuation".into(),
-            ));
-        }
-        if coordinate.record() != data.private_sequence()
-            || coordinate.effect_index() != data.effect_index()
-        {
-            return Err(ExecError::InvalidState(
-                "guest signing request coordinate does not match durable continuation".into(),
-            ));
-        }
-        if state.private().next_record() != expected_next_record {
-            return Err(ExecError::InvalidState(
-                "guest signing request private coordinate does not match durable state".into(),
-            ));
-        }
 
         let signing_bytes = data.signing_bytes()?;
         let signature = match data.scheme() {
             SignScheme::Ed25519 => self.context.identity.sign(&signing_bytes).0.to_vec(),
             SignScheme::Bls => self.context.execution_key.sign(&signing_bytes).0.to_vec(),
         };
-        self.resume_signature(pending_id, signature).await
+        self.resume_signature(pending_id, continuation_tag, signature)
+            .await
     }
 
     fn validate_guest_sign_data(
@@ -201,12 +136,12 @@ impl ExecutionActor {
                 "guest signing request program does not match actor program".into(),
             ));
         }
-        let expected_pending_id = arena0_protocol::pending_id(
+        let expected = arena0_protocol::pending_id(
             self.context.exec_id,
-            data.private_sequence(),
+            data.event_position(),
             data.effect_index(),
         );
-        if pending_id != expected_pending_id {
+        if pending_id != expected {
             return Err(ExecError::InvalidState(
                 "guest signing request coordinate does not match its continuation".into(),
             ));
@@ -217,38 +152,31 @@ impl ExecutionActor {
     async fn resume_signature(
         &mut self,
         pending_id: PendingId,
+        continuation_tag: Option<u32>,
         signature: Vec<u8>,
-    ) -> Result<(), ExecError> {
+    ) -> Result<bool, ExecError> {
         if signature.len() > arena0_protocol::MAX_EFFECT_PAYLOAD_BYTES {
             return Err(ExecError::InvalidState(
                 "submitted signature exceeds the protocol payload bound".into(),
             ));
         }
-        let state = self.load_state().await?;
-        let Some((pending, _)) = state.status().pending() else {
-            return Err(ExecError::InvalidState(
-                "execution is not waiting for a signature".into(),
-            ));
-        };
-        if pending.operation.kind() != PendingKind::Sign || pending.id != pending_id {
-            return Err(ExecError::InvalidState(
-                "signature does not match the durable continuation".into(),
-            ));
-        }
-        let continuation_tag = pending.continuation_tag;
-        self.run_local(
-            LocalEvent::Signed {
-                signature: signature.clone(),
-                continuation_tag,
-            },
-            PrivateEvent::Signed {
-                signature,
-                continuation_tag,
-            },
-            PrivateCause::resume(pending_id, PendingKind::Sign),
-        )
-        .await?;
-        Ok(())
+        let accepted = self
+            .dispatch_event(
+                Event::Signed {
+                    signature,
+                    continuation_tag,
+                },
+                DispatchSource {
+                    pending_id: Some(pending_id),
+                    ..DispatchSource::default()
+                },
+            )
+            .await?;
+        // The caller is the outbox delivery loop. It acknowledges this exact
+        // sign row after the continuation is durably consumed, then the outer
+        // actor progress cycle drives any newly exposed proof or effect work.
+        // Calling `progress` here would recurse through Sign delivery.
+        Ok(accepted == Some(true))
     }
 
     pub(super) async fn query(
@@ -279,63 +207,41 @@ impl ExecutionActor {
         let view = serde_json::from_slice(projection.output.as_bytes()).map_err(|error| {
             ExecError::Unavailable(format!("view projection is not a View: {error}"))
         })?;
-        Ok((state.public().next_step(), view))
+        Ok((state.agreed_step(), view))
     }
 
     pub(super) async fn ensure_session_started(&mut self) -> Result<(), ExecError> {
-        for _ in 0..MAX_CAS_RETRIES {
-            let state = self.load_state().await?;
-            if state.status().lifecycle() != ExecLifecycle::Active
-                || state.public().next_step() != 0
-                || state.pending_shared().is_some()
-            {
-                if self.session_start_is_durable(&state) {
-                    self.emit_session_started().await?;
-                }
-                return Ok(());
+        let state = self.load_state().await?;
+        if state.status().lifecycle() != ExecLifecycle::Active
+            || state.agreed_step() != 0
+            || state.pending_shared().is_some()
+        {
+            if self.session_start_is_durable(&state) {
+                self.emit_session_started().await?;
             }
-            let ensemble = self.ensemble();
-            let raw = Event::SessionStarted {
-                ensemble: ensemble.clone(),
-            };
-            let result = self
-                .context
-                .program
-                .apply_shared(SharedCall::session_started(
-                    state.shared_state().clone(),
-                    ensemble,
-                ))?;
-            match self
-                .commit_shared_result(state, raw, result, None, None)
-                .await
-            {
-                Ok(true) => {
-                    // The observer boundary follows the store CAS. A
-                    // restarted actor may re-emit this handoff, but it can
-                    // never report SessionStarted before its durable proposal
-                    // exists.
-                    self.emit_session_started().await?;
-                    return Ok(());
-                }
-                Ok(false) => {
-                    return Err(ExecError::InvalidState(
-                        "session start was rejected by the shared guest handler".into(),
-                    ));
-                }
-                Err(SharedCommitError::VersionMismatch) => continue,
-                Err(SharedCommitError::Runtime(error)) => return Err(error),
-            }
+            return Ok(());
         }
-        Err(ExecError::Unavailable(
-            "session-start CAS retry limit exceeded".into(),
-        ))
+        let accepted = self
+            .dispatch_event(
+                Event::SessionStarted {
+                    ensemble: self.ensemble(),
+                },
+                DispatchSource::default(),
+            )
+            .await?;
+        if accepted != Some(true) {
+            return Err(ExecError::InvalidState(
+                "session start was rejected by the guest handler".into(),
+            ));
+        }
+        self.emit_session_started().await
     }
 
     fn session_start_is_durable(&self, state: &ExecutionState) -> bool {
-        state.public().next_step() > 0
+        state.agreed_step() > 0
             || state.pending_shared().is_some_and(|proposal| {
                 proposal.commitment().step == 0
-                    && matches!(proposal.entry().event, PublicEvent::SessionStarted { .. })
+                    && matches!(proposal.entry().event, Event::SessionStarted { .. })
             })
     }
 
@@ -354,95 +260,105 @@ impl ExecutionActor {
         Ok(())
     }
 
-    /// Apply one public message. The caller supplies an accepted inbox id for
-    /// inbound frames; local messages use `None` and the regular proposal path.
-    pub(super) async fn apply_message<F: IntoExecutionMessage>(
+    /// Apply one authenticated or locally generated message envelope. The
+    /// receiver checks both advertised frame hashes before it can sign the
+    /// resulting proposal; the producer never calls this method for its own
+    /// broadcast outbox row.
+    pub(super) async fn apply_message(
         &mut self,
         source: arena0_protocol::PeerId,
-        frame: F,
-        inbox_id: Option<arena0_store::InboxId>,
+        frame: ExecFrame,
+        inbox_id: Option<InboxId>,
     ) -> Result<bool, ExecError> {
-        let frame = frame.into_execution_message()?;
-        for _ in 0..MAX_CAS_RETRIES {
-            let state = self.load_state().await?;
-            if state.status().is_terminal() {
-                return Ok(false);
-            }
-            if state.pending_shared().is_some() {
-                if inbox_id.is_some() {
-                    // Public proposals are serialized before inbound frames
-                    // are resolved. Keep the accepted frame durable while
-                    // the current proposal gathers its signatures; a benign
-                    // network reorder must not turn into a session abort.
-                    return Ok(false);
-                }
-                return Err(ExecError::InvalidState(
-                    "cannot apply a local message while another public proposal is pending".into(),
-                ));
-            }
-            if frame.sequence > state.public().next_step() {
-                return Ok(false);
-            }
-            if frame.sequence < state.public().next_step()
-                || frame.pre_state != state.public().state_hash()
-            {
-                if let Some(inbox_id) = inbox_id {
-                    let _ = self
-                        .context
-                        .store
-                        .reject_inbound(inbox_id, now_ms())
-                        .await?;
-                }
-                return Ok(false);
-            }
-            let ensemble = self.ensemble();
-            if !self.writer_is(source, &state, &ensemble)? {
-                if let Some(inbox_id) = inbox_id {
-                    let _ = self
-                        .context
-                        .store
-                        .reject_inbound(inbox_id, now_ms())
-                        .await?;
-                    return Ok(false);
-                }
-                return Err(ExecError::InvalidState(
-                    "local producer is not the guest-selected writer".into(),
-                ));
-            }
-            // The writer projection and the semantic shared call both consume
-            // this exact loaded shared snapshot. A retry starts over with a
-            // fresh state and a fresh guest instance.
-            let raw = Event::MessageReceived {
-                message_id: frame.message_id,
-                from: source,
-                position: frame.sequence,
-                pre_state: frame.pre_state,
-                msg: frame.data.clone(),
-            };
-            let shared_event = SharedEvent::MessageReceived {
-                message_id: frame.message_id,
-                from: source,
-                position: frame.sequence,
-                pre_state: frame.pre_state,
-                msg: frame.data.clone(),
-            };
-            let result = self.context.program.apply_shared(SharedCall::new(
-                state.shared_state().clone(),
-                ensemble,
-                shared_event,
-            ))?;
-            match self
-                .commit_shared_result(state, raw, result, Some(frame.witness), inbox_id)
-                .await
-            {
-                Ok(committed) => return Ok(committed),
-                Err(SharedCommitError::VersionMismatch) => continue,
-                Err(SharedCommitError::Runtime(error)) => return Err(error),
-            }
+        let ExecFrame::Message {
+            message_id,
+            seq,
+            prestate,
+            data,
+            poststate,
+        } = frame
+        else {
+            return Err(ExecError::InvalidState(
+                "execution frame is not a message".into(),
+            ));
+        };
+        let state = self.load_state().await?;
+        if state.status().is_terminal() {
+            return Ok(false);
         }
-        Err(ExecError::Unavailable(
-            "shared proposal CAS retry limit exceeded".into(),
-        ))
+        if state.pending_shared().is_some() {
+            if inbox_id.is_some() {
+                // Keep the accepted inbox row pending while the current
+                // proposal gathers N-of-N signatures.
+                return Ok(false);
+            }
+            return Err(ExecError::InvalidState(
+                "cannot apply a local message while a shared proposal is pending".into(),
+            ));
+        }
+        if seq > state.agreed_step() {
+            return Ok(false);
+        }
+        if seq < state.agreed_step()
+            || prestate != state.agreed_state()
+            || MessageId::derive(
+                state.binding().session_id(),
+                source,
+                seq,
+                prestate,
+                poststate,
+                &data,
+            ) != message_id
+        {
+            if let Some(inbox_id) = inbox_id {
+                self.reject_inbound(inbox_id).await?;
+            }
+            return Ok(false);
+        }
+        if !self.writer_is(source, &state, &self.ensemble())? {
+            if let Some(inbox_id) = inbox_id {
+                self.reject_inbound(inbox_id).await?;
+                return Ok(false);
+            }
+            return Err(ExecError::InvalidState(
+                "message source is not the guest-selected writer".into(),
+            ));
+        }
+        let accepted = match self
+            .dispatch_event(
+                Event::MessageReceived {
+                    message_id,
+                    from: source,
+                    position: seq,
+                    pre_state: prestate,
+                    msg: data,
+                },
+                DispatchSource {
+                    inbox_id,
+                    advertised_post_state: Some(poststate),
+                    ..DispatchSource::default()
+                },
+            )
+            .await
+        {
+            Ok(accepted) => accepted,
+            Err(ExecError::InvalidState(message))
+                if message == "message dispatch did not reproduce the advertised post-state" =>
+            {
+                if let Some(inbox_id) = inbox_id {
+                    self.reject_inbound(inbox_id).await?;
+                    return Ok(false);
+                }
+                return Err(ExecError::InvalidState(message));
+            }
+            Err(error) => return Err(error),
+        };
+        if accepted == Some(false)
+            && let Some(inbox_id) = inbox_id
+        {
+            self.reject_inbound(inbox_id).await?;
+        }
+        Ok(accepted == Some(true))
     }
 
     pub(super) fn writer_is(
@@ -451,98 +367,349 @@ impl ExecutionActor {
         state: &ExecutionState,
         ensemble: &Ensemble<Committed>,
     ) -> Result<bool, ExecError> {
+        Ok(self.writer_for_shared(state.shared_state(), ensemble)? == Some(source))
+    }
+
+    fn writer_for_shared(
+        &self,
+        shared: &arena0_program::SharedStateBytes,
+        ensemble: &Ensemble<Committed>,
+    ) -> Result<Option<arena0_protocol::PeerId>, ExecError> {
         let writer = self
             .context
             .program
-            .writer(WriterCall::new(
-                state.shared_state().clone(),
-                ensemble.clone(),
-            ))?
+            .writer(WriterCall::new(shared.clone(), ensemble.clone()))?
             .writer;
-        Ok(writer.and_then(|participant| ensemble.peer_at(participant)) == Some(source))
+        Ok(writer.and_then(|participant| ensemble.peer_at(participant)))
     }
 
-    async fn commit_shared_result(
+    /// Dispatch one flat event and persist the complete result. `None` means
+    /// the actor is frozen behind a proposal, pending continuation, or
+    /// terminal boundary; a continuation source mismatch is also reported as
+    /// `None`. `Some(false)` is a guest rejection and `Some(true)`
+    /// is a committed event. No state, effect, timer, inbox, or pending fact
+    /// is committed for either non-accepted result. A compare-and-set mismatch
+    /// reloads the resident and retries with the recorded random draws from
+    /// the first invocation.
+    pub(super) async fn dispatch_event(
         &mut self,
-        state: ExecutionState,
-        raw_event: Event<Vec<u8>>,
-        result: arena0_sandbox::SharedCallResult,
-        witness: Option<arena0_protocol::WitnessCommitment>,
-        inbox_id: Option<arena0_store::InboxId>,
-    ) -> Result<bool, SharedCommitError> {
-        if result.status == CallStatus::Rejected {
-            if let Some(inbox_id) = inbox_id {
-                let _ = self
-                    .context
-                    .store
-                    .reject_inbound(inbox_id, now_ms())
-                    .await
-                    .map_err(ExecError::from)?;
+        event: Event<Vec<u8>>,
+        source: DispatchSource,
+    ) -> Result<Option<bool>, ExecError> {
+        let mut replay = None;
+        for _ in 0..MAX_CAS_RETRIES {
+            let state = self.load_state().await?;
+            if state.status().is_terminal() {
+                return Ok(None);
             }
-            return Ok(false);
-        }
-        let public_event = PublicEvent::try_from(raw_event).map_err(|error| {
-            ExecError::InvalidState(format!("shared event classification failed: {error}"))
-        })?;
-        let effects = result
-            .observations
-            .effects
-            .into_iter()
-            .map(PublicEffect::try_from)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                ExecError::InvalidState(format!("shared handler emitted local effect: {error}"))
-            })?;
-        let terminal_outcome = self
-            .terminal_outcome(&state, &result.shared, &effects)
-            .map_err(ExecError::from)?;
-        let entry = TraceEntry {
-            trace_version: TRACE_FORMAT_VERSION,
-            step: state.public().next_step(),
-            event: public_event,
-            effects,
-            pre_state: state.public().state_hash(),
-            post_state: StateHash::of(result.shared.as_bytes()),
-            fuel_used: result.observations.fuel_used,
-            witness,
-            agreement: AggregateAttestation::empty(),
-        };
-        let delta =
-            SharedDelta::new(entry, result.shared, terminal_outcome).map_err(ExecError::from)?;
-        let outcome = match inbox_id {
-            Some(inbox_id) => self
+            if state.pending_shared().is_some() {
+                self.discard_candidate()?;
+                return Ok(None);
+            }
+            if matches!(&event, Event::InputReceived { .. } | Event::Signed { .. }) {
+                let Some(pending) = state.status().pending() else {
+                    self.discard_candidate()?;
+                    return Ok(None);
+                };
+                if source.pending_id != Some(pending.id) {
+                    self.discard_candidate()?;
+                    return Ok(None);
+                }
+            }
+            if !matches!(
+                state.status(),
+                ExecutionStatus::Active | ExecutionStatus::Waiting { .. }
+            ) {
+                self.discard_candidate()?;
+                return Ok(None);
+            }
+            self.sync_resident(&state)?;
+
+            let call = {
+                let mut call = DispatchCall::new(
+                    self.context.identity.peer_id(),
+                    self.ensemble(),
+                    event.clone(),
+                );
+                if let Some(replay) = replay.clone() {
+                    call = call.with_random_replay(replay);
+                }
+                call
+            };
+            let result = match self.resident_mut()?.dispatch(call) {
+                Ok(result) => result,
+                Err(error) => {
+                    // ProgramInstance rolls back on guest traps, but loading
+                    // the durable image also covers a future sandbox error
+                    // path that cannot prove its own rollback.
+                    self.instance = None;
+                    let _ = self.restore_resident(&state);
+                    return Err(error.into());
+                }
+            };
+            if result.status == CallStatus::Rejected {
+                self.discard_candidate()?;
+                return Ok(Some(false));
+            }
+
+            let candidate_hash = StateHash::of_shared(&result.shared);
+            if candidate_hash != StateHash(result.shared_hash) {
+                self.discard_candidate()?;
+                return Err(ExecError::InvalidState(
+                    "sandbox shared-state hash does not match its payload".into(),
+                ));
+            }
+            if source
+                .advertised_post_state
+                .is_some_and(|post_state| post_state != candidate_hash)
+            {
+                self.discard_candidate()?;
+                return Err(ExecError::InvalidState(
+                    "message dispatch did not reproduce the advertised post-state".into(),
+                ));
+            }
+
+            let agreed_event = matches!(
+                &event,
+                Event::SessionStarted { .. } | Event::MessageReceived { .. }
+            );
+            let candidate_shared = result.shared.clone();
+            let effects = result.observations.effects;
+            let broadcast_count = effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::Broadcast { .. }))
+                .count();
+            let lifecycle_count = effects
+                .iter()
+                .filter(|effect| {
+                    matches!(
+                        effect,
+                        Effect::SessionEnd { .. }
+                            | Effect::SessionAbort { .. }
+                            | Effect::Fail { .. }
+                    )
+                })
+                .count();
+            let shared_changed = candidate_hash != state.agreed_state();
+            if broadcast_count > 1 || lifecycle_count > 1 {
+                self.discard_candidate()?;
+                return Err(ExecError::InvalidState(
+                    "dispatch emitted too many agreement or lifecycle effects".into(),
+                ));
+            }
+            if agreed_event && broadcast_count != 0 && lifecycle_count != 0 {
+                // The broadcast would begin a second position after this
+                // terminal step, which has no successor to host it.
+                self.discard_candidate()?;
+                return Err(ExecError::InvalidState(
+                    "terminal agreed event cannot defer a broadcast".into(),
+                ));
+            }
+            if (shared_changed || lifecycle_count != 0) && !agreed_event && broadcast_count == 0 {
+                self.discard_candidate()?;
+                return Err(ExecError::InvalidState(
+                    "local shared or lifecycle mutation requires a broadcast".into(),
+                ));
+            }
+            if broadcast_count != 0 {
+                // A broadcast is an agreement boundary, not an arbitrary
+                // local effect. For a local event, the current committed
+                // state selects its author. A broadcast observed while
+                // applying an already-agreed event is deferred to the next
+                // position, so the post-dispatch state selects that successor
+                // author. This check runs before the store can stage anything.
+                let writer_state = if agreed_event {
+                    &candidate_shared
+                } else {
+                    state.shared_state()
+                };
+                let writer = match self.writer_for_shared(writer_state, &self.ensemble()) {
+                    Ok(writer) => writer,
+                    Err(error) => {
+                        self.discard_candidate()?;
+                        return Err(error);
+                    }
+                };
+                if writer != Some(self.context.identity.peer_id()) {
+                    self.discard_candidate()?;
+                    return Err(ExecError::InvalidState(
+                        "broadcast was emitted by a participant that is not the selected writer"
+                            .into(),
+                    ));
+                }
+            }
+            if effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::RetryInput { .. }))
+                && !state.status().pending().is_some_and(|pending| {
+                    matches!(pending.operation, PendingOperation::Callout { .. })
+                })
+            {
+                self.discard_candidate()?;
+                return Err(ExecError::InvalidState(
+                    "retry input effect requires a pending callout continuation".into(),
+                ));
+            }
+
+            let terminal_outcome = match self.terminal_outcome(&result.shared, &effects) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.discard_candidate()?;
+                    return Err(error);
+                }
+            };
+            let random_draws = result.observations.random_draws;
+            let candidate_local = result.local.clone();
+            let outcome = self
                 .context
                 .store
-                .apply_inbound_message(inbox_id, delta, now_ms())
-                .await
-                .map_err(ExecError::from)?,
-            None => {
-                self.apply_input(ExecutionInput::ProposeShared(delta))
-                    .await?
+                .commit_dispatch(
+                    state.version(),
+                    event.clone(),
+                    result.shared,
+                    result.local,
+                    effects,
+                    terminal_outcome,
+                    source.inbox_id,
+                    source.timer_id,
+                    source.pending_id,
+                    now_ms(),
+                )
+                .await;
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // Store reply loss is an unknown outcome. Never continue
+                    // with candidate Wasm memories after that boundary.
+                    self.restore_after_store_error().await;
+                    return Err(error.into());
+                }
+            };
+            match outcome {
+                ApplyOutcome::Committed {
+                    agreed_step,
+                    proposal_staged,
+                } => {
+                    if proposal_staged {
+                        self.discard_candidate()?;
+                    } else {
+                        let (shared, local) = match self.resident_mut()?.commit_payloads() {
+                            Ok(payloads) => payloads,
+                            Err(error) => {
+                                self.instance = None;
+                                self.reload_resident().await?;
+                                return Err(error.into());
+                            }
+                        };
+                        if shared != candidate_shared || local != candidate_local {
+                            self.reload_resident().await?;
+                            return Err(ExecError::InvalidState(
+                                "store committed payloads differ from the resident dispatch result"
+                                    .into(),
+                            ));
+                        }
+                    }
+                    self.emit_trace_appended(agreed_step).await;
+                    return Ok(Some(true));
+                }
+                ApplyOutcome::AlreadyApplied
+                | ApplyOutcome::InboxAlreadyApplied { .. }
+                | ApplyOutcome::InboxAlreadyConsumed { .. } => {
+                    self.discard_candidate()?;
+                    self.reload_resident().await?;
+                    return Ok(Some(true));
+                }
+                ApplyOutcome::VersionMismatch { .. } => {
+                    replay = Some(match RandomReplay::new(random_draws) {
+                        Ok(replay) => replay,
+                        Err(error) => {
+                            self.discard_candidate()?;
+                            return Err(ExecError::InvalidState(error.to_string()));
+                        }
+                    });
+                    self.discard_candidate()?;
+                    self.reload_resident().await?;
+                }
             }
-        };
-        match outcome {
-            ApplyOutcome::Committed(_) => Ok(true),
-            ApplyOutcome::AlreadyApplied
-            | ApplyOutcome::InboxAlreadyApplied { .. }
-            | ApplyOutcome::InboxAlreadyConsumed { .. } => Ok(true),
-            ApplyOutcome::VersionMismatch { .. } => Err(SharedCommitError::VersionMismatch),
-            ApplyOutcome::Conflict(conflict) => {
-                Err(SharedCommitError::Runtime(ExecError::InvalidState(
-                    format!("shared proposal conflicts with durable occurrence: {conflict:?}"),
-                )))
+        }
+        Err(ExecError::Unavailable(
+            "dispatch CAS retry limit exceeded".into(),
+        ))
+    }
+
+    /// Discard an uncommitted candidate. If the resident cannot restore its
+    /// checkpoint, drop it so the next actor operation must instantiate from
+    /// the durable state rather than reusing a poisoned Wasm instance.
+    fn discard_candidate(&mut self) -> Result<(), ExecError> {
+        let restored = self
+            .resident_mut()?
+            .restore_committed()
+            .map_err(ExecError::from);
+        if restored.is_err() {
+            self.instance = None;
+        }
+        restored
+    }
+
+    fn sync_resident(&mut self, state: &ExecutionState) -> Result<(), ExecError> {
+        let needs_restore = self.instance.as_ref().is_none_or(|instance| {
+            instance.committed_payloads().0 != state.shared_state()
+                || instance.committed_payloads().1 != state.local_state()
+        });
+        if needs_restore {
+            self.restore_resident(state)?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn reload_resident(&mut self) -> Result<(), ExecError> {
+        let state = self
+            .context
+            .store
+            .load_execution()
+            .await?
+            .ok_or(ExecError::NotFound(self.context.exec_id))?;
+        let needs_restore = self.instance.as_ref().is_none_or(|instance| {
+            instance.committed_payloads().0 != state.shared_state()
+                || instance.committed_payloads().1 != state.local_state()
+        });
+        if !needs_restore {
+            return Ok(());
+        }
+        if let Some(instance) = self.instance.as_mut() {
+            let restored = instance
+                .restore_payloads(state.shared_state().clone(), state.local_state().clone())
+                .map_err(ExecError::from);
+            if restored.is_err() {
+                self.instance = None;
             }
+            restored
+        } else {
+            self.restore_resident(&state)
+        }
+    }
+
+    pub(super) async fn restore_after_store_error(&mut self) {
+        self.instance = None;
+        if let Ok(Some(state)) = self.context.store.load_execution().await
+            && let Err(error) = self.restore_resident(&state)
+        {
+            tracing::error!(
+                exec_id = %self.context.exec_id,
+                %error,
+                "unable to rebuild resident after unknown store outcome"
+            );
+            self.instance = None;
         }
     }
 
     fn terminal_outcome(
         &self,
-        _state: &ExecutionState,
         shared: &arena0_program::SharedStateBytes,
-        effects: &[PublicEffect],
-    ) -> Result<Option<TerminalOutcome>, arena0_protocol::ProtocolError> {
+        effects: &[Effect],
+    ) -> Result<Option<TerminalOutcome>, ExecError> {
         let Some(outcome_bytes) = effects.iter().find_map(|effect| match effect {
-            PublicEffect::SessionEnd { outcome } => Some(outcome.as_slice()),
+            Effect::SessionEnd { outcome } => Some(outcome.as_slice()),
             _ => None,
         }) else {
             return Ok(None);
@@ -550,142 +717,16 @@ impl ExecutionActor {
         let projection = self
             .context
             .program
-            .outcome(OutcomeCall::new(shared.clone(), self.ensemble()))
-            .map_err(|error| arena0_protocol::ProtocolError::Serialization(error.to_string()))?;
+            .outcome(OutcomeCall::new(shared.clone(), self.ensemble()))?;
         if projection.borsh.as_bytes() != outcome_bytes {
-            return Err(arena0_protocol::ProtocolError::OutcomeProjectionMismatch);
+            return Err(ExecError::InvalidState(
+                "SessionEnd outcome differs from the guest outcome projection".into(),
+            ));
         }
-        TerminalOutcome::new(projection.borsh.into_bytes(), projection.json.into_bytes()).map(Some)
-    }
-
-    pub(super) async fn run_local(
-        &mut self,
-        guest_event: LocalEvent,
-        trace_event: PrivateEvent,
-        cause: PrivateCause,
-    ) -> Result<bool, ExecError> {
-        let mut replay = None;
-        for _ in 0..MAX_CAS_RETRIES {
-            let state = self.load_state().await?;
-            if state.status().is_terminal() {
-                return Ok(false);
-            }
-            if state.status().pending().is_some() && !matches!(cause, PrivateCause::Resume { .. }) {
-                return Ok(false);
-            }
-            if matches!(cause, PrivateCause::React)
-                && state.private().last_reaction_position() == Some(state.public().next_step())
-            {
-                // The durable cursor is the idempotency boundary for the
-                // automatic local reaction. This also protects a caller that
-                // races a restart or recovery pass against an already
-                // committed reaction.
-                return Ok(false);
-            }
-            let mut call = LocalCall::new(
-                self.context.identity.peer_id(),
-                state.shared_state().clone(),
-                state.local_state().clone(),
-                self.ensemble(),
-                guest_event.clone(),
-            );
-            if let Some(random_replay) = replay.clone() {
-                call = call.with_random_replay(random_replay);
-            }
-            let result = self.context.program.apply_local(call)?;
-            if result.status == CallStatus::Rejected {
-                return Err(ExecError::InvalidState(
-                    "local event was rejected without a durable continuation".into(),
-                ));
-            }
-            let private_effects = result
-                .observations
-                .effects
-                .clone()
-                .into_iter()
-                .map(PrivateEffect::try_from)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| {
-                    ExecError::InvalidState(format!("local handler emitted public effect: {error}"))
-                })?;
-            if private_effects
-                .iter()
-                .any(|effect| matches!(effect, PrivateEffect::Broadcast { .. }))
-                && !self.writer_is(self.context.identity.peer_id(), &state, &self.ensemble())?
-            {
-                // The private delta has not reached the store yet. Rejecting
-                // here therefore leaves both state and outbox unchanged.
-                return Err(ExecError::InvalidState(
-                    "local producer is not the guest-selected writer".into(),
-                ));
-            }
-            let sequence = state.private().next_record();
-            let pending = private_effects
-                .iter()
-                .position(|effect| {
-                    matches!(
-                        effect,
-                        PrivateEffect::Callout { .. } | PrivateEffect::Sign { .. }
-                    )
-                })
-                .map(|index| {
-                    u32::try_from(index).map_err(|_| {
-                        ExecError::InvalidState("private effect coordinate exceeds u32".into())
-                    })
-                })
-                .transpose()?
-                .and_then(|index| {
-                    PendingRecord::from_effects(
-                        arena0_protocol::pending_id(self.context.exec_id, sequence, index),
-                        &private_effects,
-                    )
-                });
-            let draws = result.observations.random_draws.clone();
-            let replay_draws = draws.clone();
-            let record = PrivateRecord {
-                seq: sequence,
-                after_position: state.public().next_step(),
-                event: trace_event.clone(),
-                effects: private_effects,
-                draws,
-                fuel_used: result.observations.fuel_used,
-                pending,
-            };
-            let delta = PrivateDelta::from_record(
-                self.context.exec_id,
-                record,
-                result.local,
-                arena0_protocol::execution::PrivateContext::new(now_ms()),
-                cause,
-            )?;
-            let outcome = self
-                .context
-                .store
-                .apply_input(ExecutionInput::Private(delta), now_ms())
-                .await?;
-            match outcome {
-                ApplyOutcome::Committed(_) | ApplyOutcome::AlreadyApplied => {
-                    return Ok(true);
-                }
-                ApplyOutcome::VersionMismatch { .. } => {
-                    replay = Some(
-                        RandomReplay::new(replay_draws)
-                            .map_err(|error| ExecError::InvalidState(error.to_string()))?,
-                    );
-                    continue;
-                }
-                ApplyOutcome::Conflict(conflict) => {
-                    return Err(ExecError::InvalidState(format!(
-                        "private occurrence conflict: {conflict:?}"
-                    )));
-                }
-                ApplyOutcome::InboxAlreadyApplied { .. }
-                | ApplyOutcome::InboxAlreadyConsumed { .. } => return Ok(true),
-            }
-        }
-        Err(ExecError::Unavailable(
-            "private delta CAS retry limit exceeded".into(),
-        ))
+        Ok(Some(TerminalOutcome::new(
+            projection.borsh.into_bytes(),
+            projection.json.into_bytes(),
+        )?))
     }
 
     pub(super) async fn fire_due_timers(&mut self) -> Result<(), ExecError> {
@@ -695,32 +736,22 @@ impl ExecutionActor {
             .due_timers(now_ms(), MAX_TIMER_BATCH)
             .await?;
         for timer in timers {
-            let firing = TimerFiring::new(timer.timer_id);
-            let (guest_event, trace_event) = if timer.payload.is_empty() {
-                (LocalEvent::TimerFired, PrivateEvent::TimerFired)
-            } else {
-                let payload = TimerPayload {
-                    // The current store deliberately retains the opaque timer
-                    // data. An empty type name preserves that opacity until
-                    // the store's typed timer projection is available.
-                    type_name: String::new(),
-                    data: timer.payload,
-                };
-                (
-                    LocalEvent::TypedTimerFired {
-                        timer: payload.clone(),
-                    },
-                    PrivateEvent::TypedTimerFired { timer: payload },
-                )
+            let event = match timer.timer {
+                None => Event::TimerFired,
+                Some(timer) => Event::TypedTimerFired { timer },
             };
-            let ran = self
-                .run_local(guest_event, trace_event, PrivateCause::timer(firing))
+            let accepted = self
+                .dispatch_event(
+                    event,
+                    DispatchSource {
+                        timer_id: Some(timer.timer_id),
+                        ..DispatchSource::default()
+                    },
+                )
                 .await?;
-            if !ran {
-                // A pending callout/signature continuation owns the local
-                // guest until it is answered. Leave the due timer durable so
-                // the continuation can resume first; the next progress pass
-                // will revisit the timer.
+            if accepted.is_none() {
+                // A proposal or pending continuation owns the guest; leave
+                // the timer durable for the next progress pass.
                 break;
             }
         }
@@ -733,25 +764,40 @@ impl ExecutionActor {
             let Some(proposal) = state.pending_shared() else {
                 return Ok(());
             };
-            let commitment = proposal.commitment().clone();
-            let signature = self.context.execution_key.sign(&commitment.signing_bytes());
-            let input = ExecutionInput::StepSignature(ParticipantStepSignature::new(
+            let signature = ParticipantStepSignature::new(
                 self.context.identity.peer_id(),
-                commitment.step,
-                signature,
-            ));
-            let outcome = self.apply_input(input).await?;
-            self.emit_trace_appended(&outcome).await;
-            match outcome {
-                ApplyOutcome::Committed(_) | ApplyOutcome::AlreadyApplied => return Ok(()),
-                ApplyOutcome::VersionMismatch { .. } => continue,
-                ApplyOutcome::Conflict(conflict) => {
-                    return Err(ExecError::InvalidState(format!(
-                        "step signature conflict: {conflict:?}"
-                    )));
+                proposal.commitment().step,
+                self.context
+                    .execution_key
+                    .sign(&proposal.commitment().signing_bytes()),
+            );
+            let outcome = self
+                .context
+                .store
+                .commit_step_signature(state.version(), signature, None, now_ms())
+                .await;
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.restore_after_store_error().await;
+                    return Err(error.into());
                 }
-                ApplyOutcome::InboxAlreadyApplied { .. }
-                | ApplyOutcome::InboxAlreadyConsumed { .. } => return Ok(()),
+            };
+            match outcome {
+                ApplyOutcome::Committed { agreed_step, .. } => {
+                    self.reload_resident().await?;
+                    self.emit_trace_appended(agreed_step).await;
+                    return Ok(());
+                }
+                ApplyOutcome::AlreadyApplied
+                | ApplyOutcome::InboxAlreadyApplied { .. }
+                | ApplyOutcome::InboxAlreadyConsumed { .. } => {
+                    self.reload_resident().await?;
+                    return Ok(());
+                }
+                ApplyOutcome::VersionMismatch { .. } => {
+                    self.reload_resident().await?;
+                }
             }
         }
         Err(ExecError::Unavailable(
@@ -759,14 +805,7 @@ impl ExecutionActor {
         ))
     }
 
-    /// Emit the reliable trace observation only for a commit that advanced the
-    /// durable public cursor. Proposal and partial-signature commits carry no
-    /// public step in their typed store summary.
-    pub(super) async fn emit_trace_appended(&mut self, outcome: &ApplyOutcome) {
-        let step = match outcome {
-            ApplyOutcome::Committed(summary) => summary.public_step(),
-            _ => None,
-        };
+    pub(super) async fn emit_trace_appended(&mut self, step: Option<u64>) {
         let Some(step) = step else {
             return;
         };
@@ -782,21 +821,27 @@ impl ExecutionActor {
             let Some(commitment) = state.pending_terminal().cloned() else {
                 return Ok(());
             };
-            let signature = self.context.execution_key.sign(&commitment.signing_bytes());
-            let input = ExecutionInput::TerminalSignature(ParticipantTerminalSignature::new(
+            let signature = ParticipantTerminalSignature::new(
                 self.context.identity.peer_id(),
-                signature,
-            ));
-            match self.apply_input(input).await? {
-                ApplyOutcome::Committed(_) | ApplyOutcome::AlreadyApplied => return Ok(()),
-                ApplyOutcome::VersionMismatch { .. } => continue,
-                ApplyOutcome::Conflict(conflict) => {
-                    return Err(ExecError::InvalidState(format!(
-                        "terminal signature conflict: {conflict:?}"
-                    )));
+                self.context.execution_key.sign(&commitment.signing_bytes()),
+            );
+            let outcome = self
+                .context
+                .store
+                .commit_terminal_signature(state.version(), signature, None, now_ms())
+                .await;
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.restore_after_store_error().await;
+                    return Err(error.into());
                 }
+            };
+            match outcome {
+                ApplyOutcome::Committed { .. } | ApplyOutcome::AlreadyApplied => return Ok(()),
                 ApplyOutcome::InboxAlreadyApplied { .. }
                 | ApplyOutcome::InboxAlreadyConsumed { .. } => return Ok(()),
+                ApplyOutcome::VersionMismatch { .. } => {}
             }
         }
         Err(ExecError::Unavailable(

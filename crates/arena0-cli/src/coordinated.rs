@@ -32,8 +32,8 @@ use tokio::task::JoinSet;
 use crate::agent::{DEFAULT_RESPONSE_TIMEOUT, ExecutableAgent};
 use crate::progress::{RunProgress, RunStage, RunTerminalState};
 use crate::tui::{
-    PRIVATE_INSPECTION_LIMIT, RunUpdate, TuiCalloutRequest, TuiConfig, TuiDriver, TuiHandle,
-    TuiHost, TuiSession,
+    EVENT_INSPECTION_LIMIT, RunUpdate, TuiCalloutRequest, TuiConfig, TuiDriver, TuiHandle, TuiHost,
+    TuiSession,
 };
 
 const RECEIPT_RETRY_ATTEMPTS: usize = 20;
@@ -177,7 +177,6 @@ pub(crate) struct CoordinatedRunArgs {
     pub(crate) program: String,
     pub(crate) params: Option<Value>,
     pub(crate) bindings: Vec<DriverBinding>,
-    pub(crate) replay: bool,
     pub(crate) use_tui: bool,
 }
 
@@ -259,7 +258,7 @@ pub(crate) struct EvidenceAgreement {
 }
 
 /// One result document for the CLI to render.  It contains no receipt body and
-/// no private driver data.
+/// no driver-local data.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AggregateResult {
     pub(crate) receipt_id: arena0_client::protocol::ReceiptId,
@@ -275,30 +274,8 @@ pub(crate) struct AggregateResult {
 /// Aggregate verification facts suitable for human or JSON presentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VerificationSummary {
-    pub(crate) tier: VerificationTier,
     pub(crate) all_verified: bool,
     pub(crate) shared_evidence_agrees: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VerificationTier {
-    Light,
-    Full,
-}
-
-impl VerificationTier {
-    #[must_use]
-    pub(crate) const fn is_full(self) -> bool {
-        matches!(self, Self::Full)
-    }
-
-    #[must_use]
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Light => "light",
-            Self::Full => "full",
-        }
-    }
 }
 
 /// One Host's daemon identity and execution binding.
@@ -512,7 +489,6 @@ impl Coordinator {
         }
         let mut operation = Box::pin(coordinator.complete(
             program_id,
-            request.replay,
             cancel.clone(),
             cancelled,
             tui_handle,
@@ -603,7 +579,6 @@ impl Coordinator {
     async fn complete(
         &self,
         program_id: ProgramHash,
-        replay: bool,
         cancel: watch::Sender<bool>,
         cancelled: watch::Receiver<bool>,
         tui: Option<TuiHandle>,
@@ -611,7 +586,7 @@ impl Coordinator {
     ) -> anyhow::Result<AggregateResult> {
         let Some(tui_handle) = tui.clone() else {
             return self
-                .complete_inner(program_id, replay, cancel, cancelled, None)
+                .complete_inner(program_id, cancel, cancelled, None)
                 .await;
         };
         if tui_subscriptions.len() != self.participants.len() {
@@ -631,7 +606,6 @@ impl Coordinator {
         let (stop_observer, observer_stopped) = watch::channel(false);
         let operation = self.complete_inner(
             program_id,
-            replay,
             cancel,
             cancelled.clone(),
             Some(tui_handle.clone()),
@@ -661,7 +635,6 @@ impl Coordinator {
     async fn complete_inner(
         &self,
         program_id: ProgramHash,
-        replay: bool,
         cancel: watch::Sender<bool>,
         mut cancelled: watch::Receiver<bool>,
         tui: Option<TuiHandle>,
@@ -721,31 +694,17 @@ impl Coordinator {
             );
         }
 
-        let tier = if replay {
-            VerificationTier::Full
-        } else {
-            VerificationTier::Light
-        };
         let started = Instant::now();
-        let receipt_stage = if tier.is_full() {
-            RunStage::Replay
-        } else {
-            RunStage::Verification
-        };
         let verified = self
             .progress
             .during(
-                receipt_stage,
+                RunStage::Verification,
                 self.participants.len(),
-                self.verify_receipts(session_id, tier, tui.clone()),
+                self.verify_receipts(session_id, tui.clone()),
             )
             .await;
         record_stage(
-            if tier.is_full() {
-                "replay_receipts"
-            } else {
-                "verify_receipts"
-            },
+            "verify_receipts",
             started,
             self.participants.len(),
             verified.is_ok(),
@@ -786,7 +745,6 @@ impl Coordinator {
             steps: agreement.steps,
             terminal,
             verification: VerificationSummary {
-                tier,
                 all_verified: true,
                 shared_evidence_agrees: true,
             },
@@ -852,7 +810,6 @@ impl Coordinator {
     async fn verify_receipts(
         &self,
         session_id: SessionHash,
-        tier: VerificationTier,
         tui: Option<TuiHandle>,
     ) -> anyhow::Result<Vec<HostEvidence>> {
         let mut jobs = JoinSet::new();
@@ -861,7 +818,7 @@ impl Coordinator {
             let peer_id = participant.peer_id;
             let host = participant.host.clone();
             jobs.spawn(async move {
-                verify_one_receipt(host.clone(), client, session_id, peer_id, tier)
+                verify_one_receipt(host.clone(), client, session_id, peer_id)
                     .await
                     .map(|evidence| (host, peer_id, evidence))
             });
@@ -875,16 +832,11 @@ impl Coordinator {
                 joined.context("coordinated receipt verification task failed to join")??;
             verified += 1;
             if let Some(tui) = &tui {
-                tui.update(RunUpdate::ReceiptVerified {
-                    host,
-                    peer_id,
-                    tier: tier.as_str(),
-                })
-                .await?;
+                tui.update(RunUpdate::ReceiptVerified { host, peer_id })
+                    .await?;
                 tui.update(RunUpdate::VerificationProgress {
                     verified,
                     total: self.participants.len(),
-                    tier: tier.as_str(),
                 })
                 .await?;
             }
@@ -1766,15 +1718,15 @@ async fn refresh_tui_inspection(
     host: &HostName,
     client: &DaemonClient,
     exec_id: ExecId,
-    private_from: Option<u64>,
+    events_from: Option<u64>,
 ) -> anyhow::Result<()> {
     match client
         .call_host(
             host,
             &HostRequest::ExecInspect {
                 exec_id,
-                private_from,
-                private_limit: PRIVATE_INSPECTION_LIMIT,
+                events_from,
+                events_limit: EVENT_INSPECTION_LIMIT,
             },
         )
         .await
@@ -2074,7 +2026,6 @@ async fn verify_one_receipt(
     client: DaemonClient,
     session_id: SessionHash,
     peer_id: PeerId,
-    tier: VerificationTier,
 ) -> anyhow::Result<HostEvidence> {
     let mut last_error = None;
     for attempt in 0..RECEIPT_RETRY_ATTEMPTS {
@@ -2083,7 +2034,6 @@ async fn verify_one_receipt(
                 &host,
                 &HostRequest::ReceiptVerify {
                     receipt: ReceiptRef::Produced(session_id),
-                    full: tier.is_full(),
                 },
             )
             .await?
@@ -2211,19 +2161,6 @@ fn bind_verified_terminal(
 ) -> anyhow::Result<AggregateTerminal> {
     match (live, verified) {
         (
-            TerminalConsensus::Completed { outcome: live, .. },
-            VerifiedResult::Full {
-                terminal: arena0_client::api::FullVerifiedTerminal::Completed { outcome_json, .. },
-            },
-        ) => {
-            if live.as_ref() != Some(outcome_json) {
-                bail!("live terminal outcome disagrees with fully replayed receipt outcome");
-            }
-            Ok(AggregateTerminal::Completed {
-                outcome: Some(outcome_json.clone()),
-            })
-        }
-        (
             TerminalConsensus::Completed { outcome, .. },
             VerifiedResult::Light {
                 terminal: arena0_client::api::LightVerifiedTerminal::Completed { .. },
@@ -2233,9 +2170,6 @@ fn bind_verified_terminal(
             TerminalConsensus::Stopped,
             VerifiedResult::Light {
                 terminal: arena0_client::api::LightVerifiedTerminal::Stopped { cause },
-            }
-            | VerifiedResult::Full {
-                terminal: arena0_client::api::FullVerifiedTerminal::Stopped { cause },
             },
         ) => Ok(classify_stop(cause)),
         (TerminalConsensus::Completed { .. }, _) => {
@@ -2927,7 +2861,7 @@ mod tests {
         }))
     }
 
-    async fn run_scripted_coordinator(replay: bool) -> Vec<crate::progress::RunProgressState> {
+    async fn run_scripted_coordinator() -> Vec<crate::progress::RunProgressState> {
         let directory = tempfile::tempdir().expect("socket directory");
         let program_id = ProgramHash([0x31; 32]);
         let session_id = SessionHash([0x32; 32]);
@@ -2940,19 +2874,10 @@ mod tests {
         let mut connections = Vec::new();
 
         for (index, name) in ["first", "second"].into_iter().enumerate() {
-            let terminal = if replay {
-                VerifiedResult::Full {
-                    terminal: arena0_client::api::FullVerifiedTerminal::Completed {
-                        outcome_borsh: vec![1],
-                        outcome_json: json!({"winner": "none"}),
-                    },
-                }
-            } else {
-                VerifiedResult::Light {
-                    terminal: LightVerifiedTerminal::Completed {
-                        outcome_borsh: vec![1],
-                    },
-                }
+            let terminal = VerifiedResult::Light {
+                terminal: LightVerifiedTerminal::Completed {
+                    outcome_borsh: vec![1],
+                },
             };
             let responses = vec![
                 host_info_response(name, peers[index]),
@@ -3054,21 +2979,11 @@ mod tests {
             .expect("scripted execution");
         assert_eq!(terminals.len(), 2);
 
-        let tier = if replay {
-            VerificationTier::Full
-        } else {
-            VerificationTier::Light
-        };
-        let receipt_stage = if replay {
-            RunStage::Replay
-        } else {
-            RunStage::Verification
-        };
         let receipts = progress
             .during(
-                receipt_stage,
+                RunStage::Verification,
                 coordinator.participants.len(),
-                coordinator.verify_receipts(session_id, tier, None),
+                coordinator.verify_receipts(session_id, None),
             )
             .await
             .expect("scripted receipt verification");
@@ -3096,38 +3011,36 @@ mod tests {
 
     #[tokio::test]
     async fn coordinated_work_reports_real_typed_stages_and_exact_receipt_counts() {
-        for (replay, receipt_stage) in [(false, RunStage::Verification), (true, RunStage::Replay)] {
-            let observations = run_scripted_coordinator(replay).await;
-            for stage in [
-                RunStage::Connecting,
-                RunStage::ProgramResolution,
-                RunStage::Negotiation,
-                RunStage::Activation,
-                receipt_stage,
-            ] {
-                assert!(
-                    observations.contains(&crate::progress::RunProgressState::Active {
-                        stage,
-                        amount: crate::progress::ProgressAmount::Known {
-                            completed: 2,
-                            total: 2,
-                        },
-                    })
-                );
-            }
+        let observations = run_scripted_coordinator().await;
+        for stage in [
+            RunStage::Connecting,
+            RunStage::ProgramResolution,
+            RunStage::Negotiation,
+            RunStage::Activation,
+            RunStage::Verification,
+        ] {
             assert!(
                 observations.contains(&crate::progress::RunProgressState::Active {
-                    stage: RunStage::Execution,
-                    amount: crate::progress::ProgressAmount::Indeterminate,
+                    stage,
+                    amount: crate::progress::ProgressAmount::Known {
+                        completed: 2,
+                        total: 2,
+                    },
                 })
             );
-            assert_eq!(
-                observations.last(),
-                Some(&crate::progress::RunProgressState::Terminal(
-                    RunTerminalState::Succeeded
-                ))
-            );
         }
+        assert!(
+            observations.contains(&crate::progress::RunProgressState::Active {
+                stage: RunStage::Execution,
+                amount: crate::progress::ProgressAmount::Indeterminate,
+            })
+        );
+        assert_eq!(
+            observations.last(),
+            Some(&crate::progress::RunProgressState::Terminal(
+                RunTerminalState::Succeeded
+            ))
+        );
     }
 
     #[tokio::test]
@@ -3596,34 +3509,21 @@ mod tests {
     }
 
     #[test]
-    fn full_replay_outcome_must_match_the_live_terminal() {
-        let verified = VerifiedResult::Full {
-            terminal: arena0_client::api::FullVerifiedTerminal::Completed {
+    fn light_verification_keeps_live_terminal_outcome() {
+        let verified = VerifiedResult::Light {
+            terminal: arena0_client::api::LightVerifiedTerminal::Completed {
                 outcome_borsh: vec![1],
-                outcome_json: json!({"winner": 1}),
             },
         };
         let live = || TerminalConsensus::Completed {
             session_id: SessionHash([7; 32]),
-            outcome: Some(json!({"winner": 1})),
+            outcome: Some(json!({"winner": 2})),
         };
         assert_eq!(
-            bind_verified_terminal(live(), &verified).expect("matching replay outcome"),
+            bind_verified_terminal(live(), &verified).expect("live outcome"),
             AggregateTerminal::Completed {
-                outcome: Some(json!({"winner": 1}))
+                outcome: Some(json!({"winner": 2}))
             }
-        );
-        assert!(
-            bind_verified_terminal(
-                TerminalConsensus::Completed {
-                    session_id: SessionHash([7; 32]),
-                    outcome: Some(json!({"winner": 2})),
-                },
-                &verified,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("disagrees")
         );
     }
 

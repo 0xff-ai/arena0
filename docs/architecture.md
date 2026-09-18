@@ -3,7 +3,7 @@
 arena0 lets participants, including agents, agree on how an interaction must
 unfold and execute that agreement as a program. The program defines the rules,
 expectations, and conditions: who must do what, when, and how the outcome is
-determined. Signed agreement and replayable evidence connect those terms to
+determined. Signed agreement and portable evidence connect those terms to
 what actually happened during execution.
 
 This document explains the conceptual model. The [technical overview](technical-overview.md)
@@ -44,8 +44,10 @@ program still determines when that bid may be committed or revealed.
 
 Shared state contains the facts participants must agree on. Local state holds
 information used by one participant, such as an unrevealed bid and its salt.
-Local state does not enter public state commitments. The program determines
-when information is disclosed and which public transitions accept it.
+The program receives both through one dispatch context: any event may mutate
+shared state, local state, or both, and may emit any existing `Effect`. Local
+state does not enter public state commitments. The program determines when
+information is disclosed and which public transitions accept it.
 
 This separation lets participants keep private strategies while checking the
 same public interaction. It does not protect local data from whoever controls
@@ -59,10 +61,13 @@ protocol facts. A message has meaning within an execution and protocol position;
 receivers validate it against that context and their local state. Delivery alone
 does not make a message a valid action.
 
-A shared transition applies the program's rules to shared state. Participants
-compute the resulting state and effects and certify the same transition
-commitment before advancing. That commitment binds the session, position,
-previous and next state, event, effects, computation cost, and randomness evidence.
+An agreed public transition applies one `Event` through the program's `Context`.
+Participants certify the resulting shared state before advancing. The portable
+`TraceEntry` records only the agreed `SessionStarted` or `MessageReceived`
+event, the pre/post shared-state hashes, an optional terminal effect, and the
+aggregate agreement. `StepCommitment` binds that entry and the preceding chain
+link; participant-specific events, local state, ordinary effects, fuel, and
+entropy observations remain Host-local.
 
 A program can group actions into rounds or phases. The auction's commitment and
 revelation phases each contain multiple shared steps. Application rounds do not
@@ -87,15 +92,18 @@ separate conditions.
 
 ## Wasm and the guest ABI
 
-The guest ABI defines the program/runtime contract: initialization, shared and
-local transitions, turn selection, queries, views, and outcomes. Programs own
+The guest ABI defines the program/runtime contract: initialization, one flat
+session dispatch, turn selection, queries, views, and outcomes. Programs own
 the meaning of these operations. The runtime supplies bounded execution,
 agreement, persistence, and effect handling.
 
-State is explicit at the call boundary. A call receives state and returns its
-result; mutable Wasm memory does not persist between calls. Shared calls may
-replace shared state, local calls may replace local state, and read-only calls
-must neither change state nor emit effects.
+Each active `ExecutionActor` owns one resident `ProgramInstance`. It has fixed,
+separate `arena0_shared` and `arena0_local` Wasm memories. The state memories
+survive dispatches; work memory and mutable globals reset to the resident
+baseline. The Host hashes the complete canonical shared image—length prefix,
+Borsh payload, and zero-filled remainder—while local memory remains outside
+`StateHash`, commitments, and portable receipts. Read-only projections use
+isolated bounded instances and cannot emit effects.
 
 Programs own their concrete types and JSON/Borsh conversion. Agents interact
 through JSON interfaces described by embedded schemas. Deterministic program
@@ -104,20 +112,21 @@ meaning in the accepted program.
 
 ## Determinism
 
-Participants must be able to reproduce the same public transition from the same
-state and inputs. Execution therefore uses agreed computation and memory limits,
-an agreed execution profile, and replayable randomness. A public call cannot
-silently depend on local clock readings, process state, or an external service.
+Participants must reach the same public transition from the same agreed state
+and public message. Execution therefore uses agreed computation and memory
+limits and an agreed execution profile. A public call cannot silently depend on
+local clock readings, process state, or an external service.
 
 Wasm alone does not establish determinism. The execution contract supplies those
-constraints, and replay checks the resulting states, effects, computation costs,
-and outcomes. Private strategies and external observations need not be identical.
+constraints, and N-of-N agreement checks the resulting shared hashes and
+terminal facts. Private strategies, local state, and external observations need
+not be identical.
 
 ## Effects and the outside world
 
-Programs need external input without losing reproducible public execution.
-They therefore request actions through explicit effects and declared
-capabilities. The runtime delivers events and performs permitted effects;
+Programs need external input without losing agreed public execution. They
+therefore request actions through explicit effects and declared capabilities.
+The runtime delivers events and performs permitted effects;
 programs have no ambient network, filesystem, credential, or clock access.
 
 A callout can ask an agent for a bid, a decision, or an observation. The agent
@@ -125,6 +134,11 @@ may consult a model or service and return an answer. The program validates that
 answer and determines whether to publish a message or change the interaction.
 An external observation becomes a shared fact only through an accepted public
 transition.
+
+The actor persists an accepted event, both state images, and emitted effects
+through one direct store operation. Protocol frame outbox rows are addressed
+per destination; a producer does not process its own broadcast, and delivery
+acknowledgement is separate from agreement.
 
 arena0 does not prescribe real-world identity, reputation, value exchange, or
 asset custody. Those can use blockchains or other infrastructure. Agreement on
@@ -166,16 +180,12 @@ participant retains its own evidence for later inspection or verification.
 
 ## Verification
 
-Light verification checks activation, signatures, the trace chain, terminal
-evidence, and receipt identity without loading the program. It authenticates
-the certified facts. A completed result includes opaque outcome bytes; a stopped
-result includes the stop cause.
-
-Full verification first performs those checks, then loads the exact program and
-execution profile and replays public execution. It compares state hashes,
-effects, computation costs, randomness, and terminal output. Completion also
-returns the program's JSON outcome. Replay does not rerun private agent reasoning
-or establish that an external observation was true.
+Portable/light verification is the only verification boundary. It checks
+activation binding, signatures, the v2 trace chain, shared pre/post hashes,
+terminal evidence, and the v3 receipt identity without loading the program. A
+completed result includes authenticated opaque outcome bytes; a stopped result
+includes the exact stop cause. It authenticates certified facts and does not
+execute Wasm or claim to reproduce participant-specific state.
 
 ## Failure and trust
 
@@ -189,8 +199,10 @@ limits can stop an execution. Durable records preserve accepted work and
 certified history across interruption. Recovery does not manufacture missing
 signatures or turn a unilateral observation into shared agreement.
 
-Signatures depend on key custody. Replay depends on the exact program and its
-execution conditions. The current release runs all participants on one machine;
+Signatures depend on key custody. Live execution depends on the exact program
+and its execution conditions, while portable verification authenticates the
+resulting signed facts without rerunning the program. The current release runs
+all participants on one machine;
 separate identities and evidence do not protect them from compromise of that
 machine. arena0 is pre-1.0 and has not had an independent security audit.
 
@@ -209,7 +221,7 @@ the content-addressed program and signed activation.
 Remote discovery, program transfer, and P2P transport are not available in the
 current release. Explicit suspension/resumption and programs that generate
 subsequent programs remain design directions. Neither implies automatic child
-session creation or persistent Wasm memory between calls.
+session creation or a shared resident instance across sessions.
 
 ## Complete execution walkthrough
 
@@ -225,7 +237,8 @@ commitment and revelation phases. The seller participates in that agreement too.
 After checking the reveals, each participant computes the same outcome: the
 bidder offering 40 wins at a price of 30. All four sign the terminal commitment
 and retain the same canonical receipt. An independent verifier can check the
-signatures or replay the auction with the accepted program and public trace.
+signatures, ordered shared hashes, terminal evidence, and receipt identity from
+the portable artifact.
 
 If a bidder never reveals, this bundled program remains pending; it has no
 implicit timeout or forfeiture. If a participant stops unilaterally, an

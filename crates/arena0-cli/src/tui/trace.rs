@@ -114,7 +114,7 @@ fn render_records(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, focuse
         } else {
             ("no observation".to_owned(), "none".to_owned())
         };
-        let selected = state.selected_public_position == Some(observation.step);
+        let selected = state.selected_step == Some(observation.step);
         Row::new([
             Cell::from(format!(
                 "{}#{:03}",
@@ -128,7 +128,14 @@ fn render_records(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, focuse
                 observation
                     .entries
                     .first()
-                    .map_or_else(String::new, |(_, entry)| entry.entry.fuel_used.to_string()),
+                    .map_or_else(String::new, |(_, entry)| {
+                        if entry.entry.terminal.is_some() {
+                            "yes"
+                        } else {
+                            ""
+                        }
+                        .to_owned()
+                    }),
             ),
         ])
         .style(if selected {
@@ -142,7 +149,7 @@ fn render_records(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, focuse
         })
     });
     let mut table_state = TableState::default();
-    table_state.select(state.selected_public_position.and_then(|selected| {
+    table_state.select(state.selected_step.and_then(|selected| {
         rows_data
             .iter()
             .position(|observation| observation.step == selected)
@@ -154,12 +161,10 @@ fn render_records(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, focuse
             Constraint::Length(25),
             Constraint::Length(21),
             Constraint::Length(28),
-            Constraint::Length(10),
         ],
     )
     .header(
-        Row::new(["Step", "Event", "State edge", "Host alignment", "Fuel used"])
-            .style(state.palette.public()),
+        Row::new(["Step", "Event", "State edge", "Host alignment"]).style(state.palette.public()),
     )
     .block(block)
     .column_spacing(1)
@@ -177,7 +182,7 @@ fn render_records(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, focuse
 }
 
 fn render_inspector(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, focused: bool) {
-    let Some(step) = state.selected_public_position else {
+    let Some(step) = state.selected_step else {
         frame.render_widget(
             Paragraph::new("Select a public step to inspect")
                 .style(state.palette.muted())
@@ -215,24 +220,18 @@ fn render_inspector(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, focu
         {
             lines.push(Line::styled(
                 format!(
-                    "{host}  {}  state {} -> {}  fuel {}",
+                    "{host}  {}  state {} -> {}",
                     trace_event_label(&entry.entry),
                     entry.entry.pre_state.fmt_short(),
-                    entry.entry.post_state.fmt_short(),
-                    entry.entry.fuel_used
+                    entry.entry.post_state.fmt_short()
                 ),
                 state.palette.muted(),
             ));
             lines.push(Line::styled(
                 format!(
-                    "  agreement {}/{}  witness {}  effects {}",
+                    "  agreement {}/{}  terminal {}",
                     entry.entry.agreement.signers.count(),
                     state.config.host_count(),
-                    entry
-                        .entry
-                        .witness
-                        .as_ref()
-                        .map_or_else(|| "none".to_owned(), |witness| short_hex(&witness.0)),
                     trace_effect_labels(&entry.entry)
                 ),
                 state.palette.muted(),
@@ -264,10 +263,10 @@ fn render_inspector(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, focu
 
 fn trace_event_label(entry: &TraceEntry) -> String {
     match &entry.event {
-        PublicEvent::SessionStarted { ensemble } => {
+        TraceEvent::SessionStarted { ensemble } => {
             format!("session started  {} participants", ensemble.len())
         }
-        PublicEvent::MessageReceived {
+        TraceEvent::MessageReceived {
             message_id,
             from,
             msg,
@@ -278,29 +277,16 @@ fn trace_event_label(entry: &TraceEntry) -> String {
             from.fmt_short(),
             msg.len()
         ),
+        _ => "non-public event".to_owned(),
     }
 }
 
 fn trace_effect_labels(entry: &TraceEntry) -> String {
-    if entry.effects.is_empty() {
-        return "none".to_owned();
+    match entry.terminal.as_ref() {
+        None => "none".to_owned(),
+        Some(TraceEffect::SessionEnd { .. }) => "session end".to_owned(),
+        Some(TraceEffect::SessionAbort { .. }) => "session abort".to_owned(),
+        Some(TraceEffect::Fail { .. }) => "fail".to_owned(),
+        Some(_) => "terminal".to_owned(),
     }
-    entry
-        .effects
-        .iter()
-        .map(|effect| match effect {
-            PublicEffect::SessionEnd { .. } => "session end",
-            PublicEffect::SessionAbort { .. } => "session abort",
-            PublicEffect::Fail { .. } => "fail",
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn short_hex(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .take(4)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }

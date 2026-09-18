@@ -4,7 +4,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use arena0::testing::{Harness, TestHarness};
 use arena0::{
     ApplyDecision, Context, Ensemble, MessageApply, Participant, PeerId, Primitive, Program,
-    ProgramFault, ProgramTransition, ProgramValue, SharedContext, SharedState, Transition,
+    ProgramFault, ProgramTransition, ProgramValue, SharedState, Transition,
 };
 
 #[derive(
@@ -55,24 +55,26 @@ impl Program for EnsembleProgram {
     }
 
     fn on_session_started(
-        _ctx: &mut SharedContext<Self::Shared>,
+        _ctx: &mut Context<Self::Shared, Self::Local>,
         _ensemble: &Ensemble,
     ) -> Result<ProgramTransition<Self>, ProgramFault> {
         Ok(Transition::Stay)
     }
 
-    fn on_react(ctx: &mut Context<Self::Shared, Self::Local>) -> Result<(), ProgramFault> {
+    fn on_react(
+        ctx: &mut Context<Self::Shared, Self::Local>,
+    ) -> Result<ProgramTransition<Self>, ProgramFault> {
         let me = ctx.me();
         let ensemble_len = u8::try_from(ctx.ensemble().len()).expect("test ensemble fits in u8");
         ctx.mutate_local(|local| {
             local.me = Some(me);
             local.ensemble_len = ensemble_len;
         });
-        Ok(())
+        Ok(Transition::Stay)
     }
 
     fn on_message(
-        ctx: &mut SharedContext<Self::Shared>,
+        ctx: &mut Context<Self::Shared, Self::Local>,
         from: Participant,
         _msg: Self::Message,
     ) -> MessageApply<Self> {
@@ -129,7 +131,7 @@ fn n_party_replay_uses_canonical_diagnostics_and_rejects_bad_membership() {
 
     let report = TestHarness::<EnsembleProgram>::replay_trace(local, (), &trace)
         .expect("N-party trace replays");
-    assert_eq!(report.steps, 2);
+    assert_eq!(report.event_count, 4);
 
     let mut start_mismatch = trace[..1].to_vec();
     start_mismatch[0].post_state = arena0::StateHash([9; 32]);
@@ -139,7 +141,8 @@ fn n_party_replay_uses_canonical_diagnostics_and_rejects_bad_membership() {
     assert_eq!(error.participant, None, "session start has no author");
 
     let mut post_state_mismatch = trace.clone();
-    post_state_mismatch[1].post_state = arena0::StateHash([9; 32]);
+    post_state_mismatch[2].post_state = arena0::StateHash([9; 32]);
+    post_state_mismatch[3].pre_state = arena0::StateHash([9; 32]);
     let error = TestHarness::<EnsembleProgram>::replay_trace(local, (), &post_state_mismatch)
         .expect_err("changed message state must diverge");
     assert_eq!(error.kind, arena0::DivergenceKind::PostStateMismatch);
@@ -157,8 +160,8 @@ fn n_party_replay_uses_canonical_diagnostics_and_rejects_bad_membership() {
     );
 
     let mut missing_sender = trace.clone();
-    match &mut missing_sender[1].event {
-        arena0::types::PublicEvent::MessageReceived { from, .. } => *from = peer(9),
+    match &mut missing_sender[2].event {
+        arena0::types::Event::MessageReceived { from, .. } => *from = peer(9),
         event => panic!("expected message event, got {event:?}"),
     }
     let missing_sender = TestHarness::<EnsembleProgram>::replay_trace(local, (), &missing_sender)

@@ -17,7 +17,7 @@ pub struct ProposalRef<'a, T> {
     pub value: &'a T,
 }
 
-/// Public lifecycle projection for a single-proposal agreement.
+/// Agreed lifecycle projection for a single-proposal agreement.
 #[arena0::data]
 #[derive(Copy)]
 pub enum Status {

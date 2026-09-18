@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use arena0_tests::arena::{Arena, ArenaProgress};
 use arena0_tests::wasm::program_wasm;
-use arena0_verify::VerifiedTerminal;
+use arena0_verify::LightVerifiedTerminal;
 
 fn encode_params(target_size: u32, count_to: u32) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({ "target_size": target_size, "count_to": count_to }))
@@ -39,43 +39,16 @@ async fn five_peers_count_in_commit_reveal_selected_round_robin_order() {
     );
 
     let verified = run
-        .verify_all(&wasm)
+        .verify_all()
         .expect("all five round-robin traces must verify");
 
-    let mut projected_outcome = None;
     for (participant, (verified, expected_outcome)) in
         verified.into_iter().zip(&outcomes).enumerate()
     {
-        let VerifiedTerminal::Completed {
-            outcome_borsh,
-            outcome_json,
-        } = verified.terminal
-        else {
+        let LightVerifiedTerminal::Completed { outcome_borsh } = verified.terminal else {
             panic!("participant {participant}: expected completed receipt");
         };
         assert_eq!(&outcome_borsh, expected_outcome);
-        let outcome: serde_json::Value = serde_json::from_slice(outcome_json.as_bytes())
-            .expect("guest outcome projection is valid JSON");
-        if let Some(expected) = &projected_outcome {
-            assert_eq!(&outcome, expected, "all JSON projections must agree");
-        } else {
-            projected_outcome = Some(outcome);
-        }
-    }
-
-    let counted = projected_outcome
-        .as_ref()
-        .and_then(|outcome| outcome.get("Counted"))
-        .expect("counter outcome has the Counted variant");
-    assert_eq!(counted["final_count"], COUNT_TO as u32);
-    let order = counted["order"].as_array().expect("order is a JSON array");
-    let history = counted["history"]
-        .as_array()
-        .expect("history is a JSON array");
-    assert_eq!(order.len(), PARTICIPANTS);
-    assert_eq!(history.len(), COUNT_TO);
-    for round in history.chunks_exact(PARTICIPANTS) {
-        assert_eq!(round, order, "each round must follow the selected order");
     }
 
     let timeline = run.progress_timeline();

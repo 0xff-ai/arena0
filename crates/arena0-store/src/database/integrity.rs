@@ -30,7 +30,7 @@ impl Database {
             (
                 pending.state.execution_id(),
                 pending.state.version().get(),
-                pending.state.public().next_step(),
+                pending.state.agreed_step(),
                 pending.encoded_bytes,
             )
         });
@@ -81,7 +81,7 @@ impl Database {
             (
                 pending.state.execution_id(),
                 pending.state.version().get(),
-                pending.state.public().next_step(),
+                pending.state.agreed_step(),
                 pending.encoded_bytes,
             )
         });
@@ -123,12 +123,12 @@ fn record_transaction(
     let Some(started) = started else {
         return;
     };
-    let (exec_id, version, public_step, encoded_size) = correlation
-        .map(|(exec_id, version, public_step, encoded_size)| {
+    let (exec_id, version, agreed_step, encoded_size) = correlation
+        .map(|(exec_id, version, agreed_step, encoded_size)| {
             (
                 Some(exec_id),
                 Some(version),
-                Some(public_step),
+                Some(agreed_step),
                 Some(encoded_size),
             )
         })
@@ -139,7 +139,7 @@ fn record_transaction(
         operation,
         ?exec_id,
         ?version,
-        ?public_step,
+        ?agreed_step,
         ?encoded_size,
         success,
         result_class,
@@ -181,7 +181,7 @@ mod tests {
             "operation",
             "exec_id",
             "version",
-            "public_step",
+            "agreed_step",
             "encoded_size",
             "success",
             "result_class",

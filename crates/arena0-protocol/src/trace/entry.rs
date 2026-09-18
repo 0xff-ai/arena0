@@ -1,152 +1,137 @@
-//! Trace entry types: the public per-position record, pending continuation
-//! metadata shared by the live dispatch path and replay verifier.
+//! Portable trace entries and pending continuation metadata.
 
 use crate::PendingId;
 use crate::bounded::{read_option_string, write_option_string};
+use crate::{Effect, Event, StateHash};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::io;
 
-use crate::{PrivateEffect, PublicEffect, PublicEvent, StateHash};
-
 use super::commitment::AggregateAttestation;
-use super::private::WitnessCommitment;
 
-/// One entry in the public trace section, negotiating a link in the proof chain.
+/// One portable entry in the agreed session trace.
 ///
-/// The co-signed projection is byte-identical on every node: entries record
-/// shared events (boundaries and broadcast messages) applied at canonical
-/// positions, the effects they produce, deterministic fuel consumption, and
-/// the sender's witness commitment for message entries. `pre_state` of
-/// position N+1 must equal `post_state` of position N; verifiers check this
-/// invariant to confirm trace integrity. `step` is the canonical public
-/// position, identical across nodes.
+/// Only the two events that all participants can observe are portable:
+/// `SessionStarted` and `MessageReceived`. Participant-specific events and
+/// effects remain in the participant's store. A lifecycle effect is retained as the
+/// optional terminal value because terminal agreement must bind its kind and
+/// payload even when shared state is unchanged. The aggregate agreement is a
+/// log join and is intentionally excluded from [`Self::entry_hash`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct TraceEntry {
-    /// Trace schema version for this entry.
     pub trace_version: u32,
-    /// Zero-based canonical public position within the session.
     pub step: u64,
-    /// The shared event applied at this position.
-    pub event: PublicEvent,
-    /// The effects the shared handler emitted in response.
-    pub effects: Vec<PublicEffect>,
-    /// BLAKE3 hash of shared state before this entry.
+    pub event: Event<Vec<u8>>,
     pub pre_state: StateHash,
-    /// BLAKE3 hash of shared state after this entry.
     pub post_state: StateHash,
-    /// Fuel consumed by this fresh deterministic guest call. The execution
-    /// profile, explicit state, and event fully determine this value, so it is
-    /// part of the co-signed entry content and must match during replay.
-    pub fuel_used: u64,
-    /// For message entries, the sender's blake3 commitment to the local
-    /// witness that produced the message. Travels with the message so all
-    /// nodes record identical bytes; `None` for boundary entries.
-    pub witness: Option<WitnessCommitment>,
-    /// The BLS aggregate agreement recorded at this position: the aggregate
-    /// over the signing participants plus a bitmap of who signed. Joined from
-    /// the signature log at read time; excluded from the entry hash.
+    pub terminal: Option<Effect>,
     pub agreement: AggregateAttestation,
 }
 
 impl BorshSerialize for TraceEntry {
     fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        if self.effects.len() > crate::execution::MAX_SHARED_EFFECTS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "shared effect count exceeds bound",
-            ));
-        }
+        validate_version(self.trace_version)?;
+        self.validate_shape()?;
         BorshSerialize::serialize(&self.trace_version, writer)?;
         BorshSerialize::serialize(&self.step, writer)?;
         BorshSerialize::serialize(&self.event, writer)?;
-        let count = u32::try_from(self.effects.len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "effect count overflows u32")
-        })?;
-        BorshSerialize::serialize(&count, writer)?;
-        for effect in &self.effects {
-            BorshSerialize::serialize(effect, writer)?;
-        }
         BorshSerialize::serialize(&self.pre_state, writer)?;
         BorshSerialize::serialize(&self.post_state, writer)?;
-        BorshSerialize::serialize(&self.fuel_used, writer)?;
-        BorshSerialize::serialize(&self.witness, writer)?;
+        BorshSerialize::serialize(&self.terminal, writer)?;
         BorshSerialize::serialize(&self.agreement, writer)
     }
 }
 
 impl BorshDeserialize for TraceEntry {
     fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> io::Result<Self> {
-        let trace_version = u32::deserialize_reader(reader)?;
-        let step = u64::deserialize_reader(reader)?;
-        let event = PublicEvent::deserialize_reader(reader)?;
-        let count = u32::deserialize_reader(reader)? as usize;
-        if count > crate::execution::MAX_SHARED_EFFECTS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "shared effect count exceeds bound",
-            ));
-        }
-        let mut effects = Vec::with_capacity(count);
-        for _ in 0..count {
-            effects.push(PublicEffect::deserialize_reader(reader)?);
-        }
-        Ok(Self {
-            trace_version,
-            step,
-            event,
-            effects,
+        let entry = Self {
+            trace_version: u32::deserialize_reader(reader)?,
+            step: u64::deserialize_reader(reader)?,
+            event: Event::<Vec<u8>>::deserialize_reader(reader)?,
             pre_state: StateHash::deserialize_reader(reader)?,
             post_state: StateHash::deserialize_reader(reader)?,
-            fuel_used: u64::deserialize_reader(reader)?,
-            witness: Option::<WitnessCommitment>::deserialize_reader(reader)?,
+            terminal: Option::<Effect>::deserialize_reader(reader)?,
             agreement: AggregateAttestation::deserialize_reader(reader)?,
-        })
+        };
+        validate_version(entry.trace_version)?;
+        entry.validate_shape()?;
+        Ok(entry)
     }
 }
 
+fn validate_version(version: u32) -> io::Result<()> {
+    if version != crate::TRACE_FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported trace version {version}; expected {}",
+                crate::TRACE_FORMAT_VERSION
+            ),
+        ));
+    }
+    Ok(())
+}
+
 impl TraceEntry {
-    /// Whether this entry ends execution according to its event or real guest
-    /// effects. Program phase names and handler return values are guest state,
-    /// not a second host-visible lifecycle representation.
+    /// Reject an event or terminal value that cannot be included in portable
+    /// agreement evidence. This is deliberately a shape check; binding to an
+    /// activation and checking the expected step belongs to protocol
+    /// validation.
+    pub(crate) fn validate_shape(&self) -> io::Result<()> {
+        match &self.event {
+            Event::SessionStarted { .. } | Event::MessageReceived { .. } => {}
+            Event::InputReceived { .. }
+            | Event::TimerFired
+            | Event::TypedTimerFired { .. }
+            | Event::Signed { .. }
+            | Event::React => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "portable trace entry contains a non-agreed event",
+                ));
+            }
+        }
+        if let Some(effect) = &self.terminal
+            && !matches!(
+                effect,
+                Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. }
+            )
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "portable trace entry contains a non-lifecycle terminal effect",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether this entry carries a lifecycle effect.
     #[must_use]
     pub fn is_terminal(&self) -> bool {
-        self.effects.iter().any(|effect| {
-            matches!(
-                effect,
-                PublicEffect::SessionEnd { .. }
-                    | PublicEffect::SessionAbort { .. }
-                    | PublicEffect::Fail { .. }
-            )
-        })
+        self.terminal.is_some()
     }
 
     /// The successful outcome carried by this entry, if any.
     #[must_use]
     pub fn completed_outcome(&self) -> Option<&[u8]> {
-        self.effects.iter().find_map(|effect| match effect {
-            PublicEffect::SessionEnd { outcome } => Some(outcome.as_slice()),
+        match self.terminal.as_ref() {
+            Some(Effect::SessionEnd { outcome }) => Some(outcome.as_slice()),
             _ => None,
-        })
+        }
     }
 
     /// The abort or guest-failure reason carried by this entry, if any.
     #[must_use]
     pub fn abort_reason(&self) -> Option<&str> {
-        self.effects.iter().find_map(|effect| match effect {
-            PublicEffect::SessionAbort { reason } | PublicEffect::Fail { reason } => {
+        match self.terminal.as_ref() {
+            Some(Effect::SessionAbort { reason }) | Some(Effect::Fail { reason }) => {
                 Some(reason.as_str())
             }
             _ => None,
-        })
+        }
     }
 
-    /// The blake3 hash of this entry's canonical bytes, excluding only the
-    /// agreement (a log join, not entry content).
-    /// This is the entry-content commitment bound into the signed
-    /// [`StepCommitment`](super::commitment::StepCommitment): it covers the
-    /// position, event bytes, effects, pre/post state, fuel, and witness, so the
-    /// complete deterministic shared transition is co-signed.
+    /// Hash the canonical entry content, excluding the agreement join.
     #[must_use]
     pub fn entry_hash(&self) -> [u8; 32] {
         let mut canonical = self.clone();
@@ -156,18 +141,13 @@ impl TraceEntry {
     }
 }
 
-/// Runtime trace metadata for a suspended continuation or pending external callout.
+/// Runtime metadata for a suspended callout or signing continuation.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PendingRecord {
-    /// Stable id for this pending point within one local execution trace.
     pub id: PendingId,
-    /// Kind of external result that can resume the pending point.
     pub operation: PendingOperation,
-    /// Optional author-declared local pending label.
     pub label: Option<String>,
-    /// Human-readable expected result type, when known by generated code.
     pub expected_type: Option<String>,
-    /// Generated local continuation tag for restoring the right resume point.
     pub continuation_tag: Option<u32>,
 }
 
@@ -205,7 +185,6 @@ fn serialize_pending_string<W: borsh::io::Write>(
     writer: &mut W,
     value: Option<&str>,
 ) -> io::Result<()> {
-    // Pending records reject an oversized field before writing its option tag.
     if value.is_some_and(|value| value.len() > crate::execution::MAX_TERMINAL_REASON_BYTES) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -220,19 +199,16 @@ fn serialize_pending_string<W: borsh::io::Write>(
     )
 }
 
-/// The operation whose answer resumes one durable continuation.
+/// The operation whose answer resumes one pending continuation.
 #[derive(
     BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq,
 )]
 pub enum PendingOperation {
-    /// A typed callout always identifies its program variant.
     Callout { callout_index: u32 },
-    /// A signing continuation has no callout index.
     Sign,
 }
 
 impl PendingOperation {
-    /// The class of external answer this operation consumes.
     #[must_use]
     pub const fn kind(self) -> PendingKind {
         match self {
@@ -243,11 +219,11 @@ impl PendingOperation {
 }
 
 impl PendingRecord {
-    /// Build pending metadata from one effect that can suspend execution.
+    /// Build continuation metadata from one suspending effect.
     #[must_use]
-    pub fn from_effect(id: PendingId, effect: &PrivateEffect) -> Option<Self> {
+    pub fn from_effect(id: PendingId, effect: &Effect) -> Option<Self> {
         match effect {
-            PrivateEffect::Callout {
+            Effect::Callout {
                 callout_index,
                 pending_label,
                 expected_type,
@@ -262,7 +238,7 @@ impl PendingRecord {
                 expected_type: expected_type.clone(),
                 continuation_tag: *continuation_tag,
             }),
-            PrivateEffect::Sign {
+            Effect::Sign {
                 pending_label,
                 expected_type,
                 continuation_tag,
@@ -278,26 +254,24 @@ impl PendingRecord {
         }
     }
 
-    /// Build pending metadata from the first suspending effect in a step.
+    /// Build metadata from the first suspending effect in a dispatch.
     #[must_use]
-    pub fn from_effects(id: PendingId, effects: &[PrivateEffect]) -> Option<Self> {
+    pub fn from_effects(id: PendingId, effects: &[Effect]) -> Option<Self> {
         effects
             .iter()
             .find_map(|effect| Self::from_effect(id, effect))
     }
 }
 
-/// Class of external result that can resume a pending point.
+/// Class of external answer that resumes a pending continuation.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PendingKind {
-    /// Waiting for a typed input answer to a program callout.
     Callout,
-    /// Waiting for a host signature.
     Sign,
 }
 
 impl BorshSerialize for PendingKind {
-    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
         BorshSerialize::serialize(
             &match self {
                 Self::Callout => 0u8,
@@ -309,12 +283,12 @@ impl BorshSerialize for PendingKind {
 }
 
 impl BorshDeserialize for PendingKind {
-    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> io::Result<Self> {
         match u8::deserialize_reader(reader)? {
             0 => Ok(Self::Callout),
             1 => Ok(Self::Sign),
-            tag => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
+            tag => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
                 format!("unknown pending kind tag {tag}"),
             )),
         }
@@ -324,114 +298,73 @@ impl BorshDeserialize for PendingKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Ensemble, MessageId, PeerId, SignerSet};
     use arena0_crypto::BlsSignature;
 
-    use crate::{MessageId, PeerId, SignerSet};
-
-    #[test]
-    fn pending_record_from_callout_effect() {
-        let record = PendingRecord::from_effect(
-            PendingId::new(7),
-            &PrivateEffect::Callout {
-                callout_index: 3,
-                context: vec![1, 2, 3],
-                pending_label: Some("thinking".into()),
-                expected_type: Some("Choice".into()),
-                continuation_tag: Some(11),
-            },
-        )
-        .expect("callout effect should suspend");
-
-        assert_eq!(record.id, PendingId::new(7));
-        assert_eq!(
-            record.operation,
-            PendingOperation::Callout { callout_index: 3 }
-        );
-        assert_eq!(record.continuation_tag, Some(11));
-    }
-
-    #[test]
-    fn entry_hash_ignores_agreement_but_binds_content() {
-        let entry = TraceEntry {
+    fn entry(event: Event<Vec<u8>>) -> TraceEntry {
+        TraceEntry {
             trace_version: crate::TRACE_FORMAT_VERSION,
-            step: 4,
-            event: PublicEvent::MessageReceived {
-                message_id: MessageId([4; 32]),
-                from: PeerId([1; 32]),
-                position: 4,
-                pre_state: StateHash([1; 32]),
-                msg: Vec::new(),
-            },
-            effects: Vec::new(),
+            step: 0,
+            event,
             pre_state: StateHash([1; 32]),
             post_state: StateHash([2; 32]),
-            fuel_used: 9,
-            witness: Some(WitnessCommitment([7; 32])),
+            terminal: None,
             agreement: AggregateAttestation::empty(),
-        };
-        let hash = entry.entry_hash();
+        }
+    }
 
-        let mut signed = entry.clone();
-        signed.agreement = AggregateAttestation {
-            aggregate: BlsSignature([3; 48]),
+    #[test]
+    fn non_agreed_events_are_rejected_from_portable_entries() {
+        let value = entry(Event::InputReceived {
+            callout_index: 0,
+            data: Vec::new(),
+            continuation_tag: None,
+        });
+        assert!(borsh::to_vec(&value).is_err());
+    }
+
+    #[test]
+    fn non_lifecycle_terminal_effects_are_rejected() {
+        let mut value = entry(Event::SessionStarted {
+            ensemble: Ensemble::from_peers(vec![PeerId([1; 32]), PeerId([2; 32])]).unwrap(),
+        });
+        value.terminal = Some(Effect::Broadcast { data: Vec::new() });
+        assert!(borsh::to_vec(&value).is_err());
+    }
+
+    #[test]
+    fn incompatible_trace_versions_are_rejected_at_the_codec_boundary() {
+        let mut value = entry(Event::SessionStarted {
+            ensemble: Ensemble::from_peers(vec![PeerId([1; 32]), PeerId([2; 32])]).unwrap(),
+        });
+        value.trace_version = 1;
+        assert!(borsh::to_vec(&value).is_err());
+
+        value.trace_version = crate::TRACE_FORMAT_VERSION;
+        let mut encoded = borsh::to_vec(&value).unwrap();
+        encoded[..std::mem::size_of::<u32>()].copy_from_slice(&1u32.to_le_bytes());
+        assert!(TraceEntry::try_from_slice(&encoded).is_err());
+    }
+
+    #[test]
+    fn agreement_is_excluded_from_entry_hash() {
+        let value = entry(Event::MessageReceived {
+            message_id: MessageId([3; 32]),
+            from: PeerId([4; 32]),
+            position: 0,
+            pre_state: StateHash([1; 32]),
+            msg: vec![5],
+        });
+        let hash = value.entry_hash();
+        let mut agreed = value.clone();
+        agreed.agreement = AggregateAttestation {
+            aggregate: BlsSignature([6; 48]),
             signers: {
-                let mut s = SignerSet::with_capacity(2);
-                s.set(0);
-                s
+                let mut set = SignerSet::with_capacity(2);
+                set.set(0);
+                set
             },
         };
-        assert_eq!(hash, signed.entry_hash());
-
-        // Fuel is deterministic for a fresh call and is signed evidence.
-        let mut refueled = entry.clone();
-        refueled.fuel_used += 1;
-        assert_ne!(hash, refueled.entry_hash());
-
-        // Witness and post-state ARE co-signed content: changing them changes the hash.
-        let mut tampered = entry.clone();
-        tampered.witness = None;
-        assert_ne!(hash, tampered.entry_hash());
-        let mut tampered = entry;
-        tampered.post_state = StateHash([9; 32]);
-        assert_ne!(hash, tampered.entry_hash());
-    }
-    #[test]
-    fn pending_operations_have_exact_bounded_encodings() {
-        for operation in [
-            PendingOperation::Callout { callout_index: 3 },
-            PendingOperation::Sign,
-        ] {
-            let record = PendingRecord {
-                id: PendingId::new(u64::MAX),
-                operation,
-                label: None,
-                expected_type: None,
-                continuation_tag: None,
-            };
-            let mut expected = u64::MAX.to_le_bytes().to_vec();
-            match operation {
-                PendingOperation::Callout { callout_index } => {
-                    expected.push(0);
-                    expected.extend_from_slice(&callout_index.to_le_bytes());
-                }
-                PendingOperation::Sign => expected.push(1),
-            }
-            expected.extend_from_slice(&[0, 0, 0]);
-            assert_eq!(borsh::to_vec(&record).unwrap(), expected);
-            assert_eq!(PendingRecord::try_from_slice(&expected).unwrap(), record);
-            assert_eq!(
-                serde_json::to_value(&record).unwrap()["id"],
-                u64::MAX.to_string()
-            );
-            let mut unknown = expected.clone();
-            unknown[8] = 2;
-            assert!(PendingRecord::try_from_slice(&unknown).is_err());
-            if matches!(operation, PendingOperation::Callout { .. }) {
-                assert!(PendingRecord::try_from_slice(&expected[..9]).is_err());
-            }
-            let mut oversized = record;
-            oversized.label = Some("x".repeat(crate::execution::MAX_TERMINAL_REASON_BYTES + 1));
-            assert!(borsh::to_vec(&oversized).is_err());
-        }
+        assert_eq!(hash, agreed.entry_hash());
     }
 }

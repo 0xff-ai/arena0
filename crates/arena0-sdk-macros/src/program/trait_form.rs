@@ -1,8 +1,8 @@
 //! Expansion of the trait-form (`impl Program`) `#[arena0::program]`.
 //!
 //! This module owns trait parsing, associated-type defaulting, handler
-//! extraction, and rejection of async trait-form handlers. The fresh-instance
-//! Wasm ABI emission lives in the sibling `fresh_abi` module.
+//! extraction, and rejection of async trait-form handlers. The resident
+//! compatible Wasm ABI emission lives in the sibling `guest_abi` module.
 
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
@@ -11,8 +11,8 @@ use syn::{Error, ImplItem, ItemImpl, Result, Type, spanned::Spanned};
 
 use super::args::Arena0ProgramArgs;
 use super::capabilities::{InferredEffectCapability, infer_effect_capabilities};
-use super::fresh_abi::{FreshGuestAbi, fresh_guest_abi};
-use super::{rewrite_context_type, rewrite_shared_context_name};
+use super::guest_abi::{GuestAbi, guest_abi};
+use super::rewrite_context_type;
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn expand_arena0_program(
@@ -99,9 +99,9 @@ pub(super) fn expand_arena0_program_with_inferred(
     };
     let mut item = item;
 
-    // Shared handlers are rewritten to the shared-only context before the
-    // trait implementation is emitted; local handlers retain the local
-    // context with identity, local state, and effects.
+    // Bare event contexts are expanded to the concrete shared/local types
+    // before the trait implementation is emitted. Initialization and the
+    // read-only projections use direct shared-state references.
     rewrite_bare_context(&mut item, &shared_ty, &local_ty);
     let (query_impl, query_ty) = if emit_query_impl {
         extract_program_query_impl(&mut item, &program_ty, &shared_ty, &local_ty)
@@ -163,7 +163,7 @@ pub(super) fn expand_arena0_program_with_inferred(
         }
     }
 
-    Ok(fresh_guest_abi(FreshGuestAbi {
+    Ok(guest_abi(GuestAbi {
         item,
         query_impl,
         view_impl,
@@ -201,7 +201,19 @@ fn extract_program_query_impl(
                 query_ty = Some(ty.ty);
             }
             ImplItem::Fn(mut method) if method.sig.ident == "on_query" => {
+                let arg_count = method
+                    .sig
+                    .inputs
+                    .iter()
+                    .filter(|input| matches!(input, syn::FnArg::Typed(_)))
+                    .count();
                 method.sig.ident = format_ident!("query");
+                if arg_count == 2 {
+                    method
+                        .sig
+                        .inputs
+                        .insert(1, syn::parse_quote!(_ensemble: &::arena0::Ensemble));
+                }
                 query_method = Some(method);
             }
             other => retained.push(other),
@@ -214,7 +226,8 @@ fn extract_program_query_impl(
         || {
             quote! {
                 fn query(
-                    _ctx: &::arena0::SharedContext<#shared_ty>,
+                    _shared: &#shared_ty,
+                    _ensemble: &::arena0::Ensemble,
                     _query: Self::Query,
                 ) -> <Self::Query as ::arena0::Arena0Query>::Response {}
             }
@@ -280,14 +293,15 @@ fn extract_program_view_impl(
 fn default_view_method(program_ty: &Type, shared_ty: &Type, _local_ty: &Type) -> TokenStream2 {
     quote! {
         fn view(
-            ctx: &::arena0::SharedContext<#shared_ty>,
+            shared: &#shared_ty,
+            _ensemble: &::arena0::Ensemble,
             _viewport: &::arena0::Viewport,
         ) -> ::arena0::View {
             let mut view = ::arena0::View::new()
-                .state(::std::format!("{:#?}", ctx.shared()));
+                .state(::std::format!("{:#?}", shared));
             if !<#program_ty as ::arena0::Program>::__phase_decls().is_empty() {
                 if let ::core::option::Option::Some(phase) =
-                    <#program_ty as ::arena0::Program>::__phase(ctx.shared())
+                    <#program_ty as ::arena0::Program>::__phase(shared)
                 {
                     let phase_name =
                         <<#program_ty as ::arena0::Program>::Phase as ::arena0::Arena0Phase>::as_str(phase);
@@ -305,15 +319,8 @@ fn default_view_method(program_ty: &Type, shared_ty: &Type, _local_ty: &Type) ->
 fn rewrite_bare_context(item: &mut ItemImpl, shared_ty: &Type, local_ty: &Type) {
     for impl_item in &mut item.items {
         if let ImplItem::Fn(method) = impl_item {
-            let shared_handler = matches!(
-                method.sig.ident.to_string().as_str(),
-                "initialize" | "on_session_started" | "on_message"
-            );
             for arg in &mut method.sig.inputs {
                 if let syn::FnArg::Typed(pat_type) = arg {
-                    if shared_handler {
-                        rewrite_shared_context_name(&mut pat_type.ty);
-                    }
                     rewrite_context_type(&mut pat_type.ty, shared_ty, local_ty);
                 }
             }

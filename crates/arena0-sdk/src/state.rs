@@ -103,7 +103,7 @@ pub trait SharedState:
 ///
 /// Local state is semantic state even though it is not part of shared hashes.
 /// The guest serializes it with the type's stock Borsh implementation at every
-/// fresh-call boundary. Hidden Wasm memory and globals are not local state.
+/// dispatch boundary. Hidden Wasm memory and globals are not local state.
 pub trait LocalState: Default + BorshSerialize + BorshDeserialize + 'static {}
 
 impl<T> LocalState for T where T: Default + BorshSerialize + BorshDeserialize + 'static {}
