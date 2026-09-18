@@ -239,7 +239,7 @@ pub(crate) fn register_always_available(
             imports::RANDOM,
             |mut caller: Caller<'_, HostState>, ptr: u32, len: u32| {
                 caller.begin_import("random")?;
-                caller.reject_random_disallowed("random")?;
+                caller.reject_read_only("random")?;
                 let profile = caller.data().profile.clone();
                 if u64::from(len) > profile.randomness.max_draw_bytes {
                     return Err(wasmtime::Error::msg(format!(

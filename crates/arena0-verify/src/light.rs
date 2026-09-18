@@ -1,12 +1,7 @@
 //! Protocol-only validation of one complete authenticated artifact.
 
 use arena0_program::ProgramHash;
-use arena0_protocol::{
-    AbortKind, Activation, AggregateAttestation, CHAIN_START, Committed, Effect, Ensemble, Event,
-    MAX_PARTICIPANTS, MessageId, OutcomeHash, PeerId, ReceiptArtifact, ReceiptBody,
-    ReceiptTermination, SessionHash, StepCommitment, StepCursor, StopCause, TRACE_FORMAT_VERSION,
-    TerminalCommitment, TicketAction,
-};
+use arena0_protocol::{PeerId, ReceiptArtifact, ReceiptTermination, SessionHash, StopCause};
 
 use crate::error::{VerifyError, sanitize_verify_message};
 
@@ -49,7 +44,7 @@ pub enum LightVerifiedTerminal {
 /// sandbox.
 pub fn verify_light(receipt_bytes: &[u8]) -> Result<LightVerified, VerifyError> {
     let receipt = decode_receipt(receipt_bytes)?;
-    verify_decoded(&receipt)
+    project_verified(&receipt)
 }
 
 pub(crate) fn decode_receipt(receipt_bytes: &[u8]) -> Result<ReceiptArtifact, VerifyError> {
@@ -60,30 +55,21 @@ pub(crate) fn decode_receipt(receipt_bytes: &[u8]) -> Result<ReceiptArtifact, Ve
         });
     }
     ReceiptArtifact::decode(receipt_bytes)
-        .map_err(|error| VerifyError::ReceiptDecode(error.to_string()))
+        .map_err(|error| VerifyError::ReceiptDecode(sanitize_verify_message(error.to_string())))
 }
 
-/// Verify a decoded receipt. The public entrypoint performs bounded decoding;
-/// this helper is also used by tests that construct an authenticated artifact.
-pub(crate) fn verify_decoded(receipt: &ReceiptArtifact) -> Result<LightVerified, VerifyError> {
+/// Project evidence from an artifact authenticated by [`ReceiptArtifact::decode`].
+fn project_verified(receipt: &ReceiptArtifact) -> Result<LightVerified, VerifyError> {
     let body = receipt.body();
-    let header = body.header();
-    let activation = &header.activation;
-
-    activation
-        .validate()
-        .map_err(|error| VerifyError::ReceiptInvalid(format!("activation: {error}")))?;
-
-    if body.params() != activation.offer().data().params.as_bytes() {
-        return Err(VerifyError::ParamsMismatch);
-    }
-
-    let (ensemble, participant_keys) = participant_set(activation)?;
+    let activation = &body.header().activation;
+    let mut ensemble = activation
+        .tickets()
+        .iter()
+        .map(|ticket| ticket.data.signer)
+        .collect::<Vec<_>>();
+    ensemble.sort_unstable();
     let session_id = activation.session_hash();
-    let terminal = &header.terminal;
-    verify_trace(body, session_id, &ensemble, &participant_keys, terminal)?;
-
-    let terminal = match terminal {
+    let terminal = match &body.header().terminal {
         ReceiptTermination::Completed { .. } => LightVerifiedTerminal::Completed {
             outcome_borsh: body.outcome().to_vec(),
         },
@@ -102,362 +88,16 @@ pub(crate) fn verify_decoded(receipt: &ReceiptArtifact) -> Result<LightVerified,
     })
 }
 
-fn participant_set(
-    activation: &Activation,
-) -> Result<(Vec<PeerId>, Vec<arena0_crypto::BlsPublicKey>), VerifyError> {
-    if activation.tickets().len() > MAX_PARTICIPANTS {
-        return Err(VerifyError::ReceiptInvalid(
-            "activation has too many tickets".to_owned(),
-        ));
-    }
-    let mut participants = Vec::with_capacity(activation.tickets().len());
-    for ticket in activation.tickets() {
-        match ticket.data.action {
-            TicketAction::Active { execution_bls, .. } => {
-                participants.push((ticket.data.signer, execution_bls));
-            }
-            TicketAction::Withdrawn => {
-                return Err(VerifyError::ReceiptInvalid(
-                    "activation contains a withdrawn ticket".to_owned(),
-                ));
-            }
-        }
-    }
-    participants.sort_by_key(|(peer, _)| *peer);
-    let peers = participants
-        .iter()
-        .map(|(peer, _)| *peer)
-        .collect::<Vec<_>>();
-    let ensemble = Ensemble::<Committed>::from_peers(peers.clone())
-        .map_err(|error| VerifyError::ReceiptInvalid(format!("ensemble: {error}")))?;
-    let keys = participants.into_iter().map(|(_, key)| key).collect();
-    Ok((ensemble.peers().to_vec(), keys))
-}
-
-fn verify_trace(
-    body: &ReceiptBody,
-    session_id: SessionHash,
-    ensemble: &[PeerId],
-    participant_keys: &[arena0_crypto::BlsPublicKey],
-    termination: &ReceiptTermination,
-) -> Result<(), VerifyError> {
-    let trace = body.trace();
-    let allow_empty = matches!(
-        termination,
-        ReceiptTermination::Stopped {
-            cause: arena0_protocol::StopCause::Authenticated(_)
-        }
-    );
-    if trace.is_empty() && !allow_empty {
-        return Err(VerifyError::EmptyTrace);
-    }
-
-    let expected_initial = body.header().activation.offer().data().initial_state;
-    let mut previous_state = expected_initial;
-    let mut previous_link = CHAIN_START;
-    let trace_len = u64::try_from(trace.len())
-        .map_err(|_| VerifyError::ReceiptInvalid("trace length does not fit in u64".to_owned()))?;
-    for (index, entry) in trace.iter().enumerate() {
-        let step = u64::try_from(index)
-            .map_err(|_| VerifyError::ReceiptInvalid("trace index overflow".to_owned()))?;
-        if entry.trace_version != TRACE_FORMAT_VERSION {
-            return Err(VerifyError::PublicEntryInvalid {
-                step,
-                message: format!(
-                    "trace version {} is not {TRACE_FORMAT_VERSION}",
-                    entry.trace_version
-                ),
-            });
-        }
-        if entry.step != step {
-            return Err(VerifyError::ChainBroken {
-                step,
-                message: format!("entry step is {}, expected {step}", entry.step),
-            });
-        }
-        if entry.pre_state != previous_state {
-            return Err(VerifyError::ChainBroken {
-                step,
-                message: "entry pre-state does not equal the preceding post-state".to_owned(),
-            });
-        }
-
-        verify_event(entry, step, session_id, ensemble)?;
-        verify_terminal_position(entry, step, trace_len, termination)?;
-        let commitment = StepCommitment::for_entry(session_id, entry, previous_link);
-        verify_agreement(&entry.agreement, participant_keys, &commitment)?;
-
-        previous_state = entry.post_state;
-        previous_link = commitment.link_hash();
-    }
-
-    let final_entry = trace.last();
-    let cursor = StepCursor::new(trace_len, previous_state, previous_link);
-    match termination {
-        ReceiptTermination::Completed { terminal } => {
-            let final_entry = final_entry.ok_or(VerifyError::EmptyTrace)?;
-            if terminal.final_step != final_entry.step {
-                return Err(VerifyError::TerminalMismatch {
-                    field: "final_step",
-                });
-            }
-            if terminal.final_state != final_entry.post_state {
-                return Err(VerifyError::TerminalMismatch {
-                    field: "final_state",
-                });
-            }
-            let outcome = final_entry
-                .completed_outcome()
-                .ok_or(VerifyError::OutcomeMissing)?;
-            if outcome != body.outcome() {
-                return Err(VerifyError::TerminalMismatch { field: "outcome" });
-            }
-            if terminal.outcome_hash != OutcomeHash::of(body.outcome()) {
-                return Err(VerifyError::OutcomeHashMismatch);
-            }
-            verify_terminal_agreement(terminal, session_id, participant_keys)
-        }
-        ReceiptTermination::Stopped { cause } => {
-            if !body.outcome().is_empty() {
-                return Err(VerifyError::TerminalMismatch { field: "outcome" });
-            }
-            match cause {
-                arena0_protocol::StopCause::Authenticated(occurrence) => {
-                    occurrence
-                        .validate_for_session(session_id)
-                        .map_err(|error| VerifyError::ReceiptInvalid(error.to_string()))?;
-                    if !ensemble.contains(&occurrence.sender())
-                        || !occurrence
-                            .verify_signature()
-                            .map_err(|error| VerifyError::ReceiptInvalid(error.to_string()))?
-                        || *occurrence.coordinate() != cursor
-                    {
-                        return Err(VerifyError::ReceiptInvalid(
-                            "authenticated stop cause does not match the public cursor".to_owned(),
-                        ));
-                    }
-                    if let Some(final_entry) = final_entry
-                        && final_entry.terminal.is_some()
-                    {
-                        return Err(VerifyError::TerminalNotLast {
-                            step: final_entry.step,
-                        });
-                    }
-                }
-                arena0_protocol::StopCause::Shared {
-                    kind,
-                    commitment,
-                    reason,
-                } => {
-                    let final_entry = final_entry.ok_or(VerifyError::EmptyTrace)?;
-                    if final_entry.step != commitment.step
-                        || final_entry.entry_hash() != commitment.entry_hash
-                        || commitment.session_id != session_id
-                        || commitment.post_state != cursor.state_hash()
-                        || commitment.link_hash() != cursor.chain_hash()
-                    {
-                        return Err(VerifyError::TerminalMismatch { field: "stop" });
-                    }
-                    let valid = match (kind, final_entry.terminal.as_ref()) {
-                        (AbortKind::Abort, Some(Effect::SessionAbort { reason: actual }))
-                        | (AbortKind::Fail, Some(Effect::Fail { reason: actual })) => {
-                            actual == reason
-                        }
-                        _ => false,
-                    };
-                    if !valid {
-                        return Err(VerifyError::OutcomeMissing);
-                    }
-                }
-            }
-            Ok(())
-        }
-    }
-}
-
-fn verify_event(
-    entry: &arena0_protocol::TraceEntry,
-    step: u64,
-    session_id: SessionHash,
-    ensemble: &[PeerId],
-) -> Result<(), VerifyError> {
-    match (&entry.event, step) {
-        (
-            Event::SessionStarted {
-                ensemble: event_ensemble,
-            },
-            0,
-        ) => {
-            if event_ensemble.peers() != ensemble {
-                return Err(VerifyError::PublicEntryInvalid {
-                    step,
-                    message: "SessionStarted ensemble does not match activation".to_owned(),
-                });
-            }
-        }
-        (Event::SessionStarted { .. }, _) => {
-            return Err(VerifyError::PublicEntryInvalid {
-                step,
-                message: "SessionStarted is only valid at public position zero".to_owned(),
-            });
-        }
-        (Event::MessageReceived { .. }, 0) => {
-            return Err(VerifyError::PublicEntryInvalid {
-                step,
-                message: "first public entry must be SessionStarted".to_owned(),
-            });
-        }
-        (
-            Event::MessageReceived {
-                message_id,
-                from,
-                position,
-                pre_state,
-                msg,
-            },
-            _,
-        ) => {
-            if !ensemble.contains(from) {
-                return Err(VerifyError::PublicEntryInvalid {
-                    step,
-                    message: "message sender is not a committed participant".to_owned(),
-                });
-            }
-            if *position != step {
-                return Err(VerifyError::PublicEntryInvalid {
-                    step,
-                    message: format!("message position {position} does not equal {step}"),
-                });
-            }
-            if *pre_state != entry.pre_state {
-                return Err(VerifyError::PublicEntryInvalid {
-                    step,
-                    message: "message pre-state does not equal entry pre-state".to_owned(),
-                });
-            }
-            let expected = MessageId::derive(
-                session_id,
-                *from,
-                *position,
-                *pre_state,
-                entry.post_state,
-                msg,
-            );
-            if *message_id != expected {
-                return Err(VerifyError::PublicEntryInvalid {
-                    step,
-                    message: "message id does not match its authenticated envelope".to_owned(),
-                });
-            }
-        }
-        _ => {
-            return Err(VerifyError::PublicEntryInvalid {
-                step,
-                message: "event is not portable agreed evidence".to_owned(),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn verify_terminal_position(
-    entry: &arena0_protocol::TraceEntry,
-    step: u64,
-    trace_len: u64,
-    termination: &ReceiptTermination,
-) -> Result<(), VerifyError> {
-    let next_step = step
-        .checked_add(1)
-        .ok_or_else(|| VerifyError::ReceiptInvalid("trace step overflow".to_owned()))?;
-    let terminal_count = usize::from(entry.terminal.is_some());
-    if terminal_count > 0 && next_step != trace_len {
-        return Err(VerifyError::TerminalNotLast { step });
-    }
-    if next_step == trace_len {
-        match termination {
-            ReceiptTermination::Completed { .. } => {
-                if !matches!(entry.terminal, Some(Effect::SessionEnd { .. })) {
-                    return Err(VerifyError::OutcomeMissing);
-                }
-            }
-            ReceiptTermination::Stopped { cause } => match cause {
-                arena0_protocol::StopCause::Authenticated(_) => {
-                    if terminal_count != 0 {
-                        return Err(VerifyError::TerminalNotLast { step });
-                    }
-                }
-                arena0_protocol::StopCause::Shared { kind, .. } => {
-                    let valid = matches!(
-                        (kind, entry.terminal.as_ref()),
-                        (AbortKind::Abort, Some(Effect::SessionAbort { .. }))
-                            | (AbortKind::Fail, Some(Effect::Fail { .. }))
-                    );
-                    if !valid {
-                        return Err(VerifyError::OutcomeMissing);
-                    }
-                }
-            },
-        }
-    } else if terminal_count != 0 {
-        return Err(VerifyError::TerminalNotLast { step });
-    }
-    Ok(())
-}
-
-fn verify_agreement(
-    agreement: &AggregateAttestation,
-    participant_keys: &[arena0_crypto::BlsPublicKey],
-    commitment: &StepCommitment,
-) -> Result<(), VerifyError> {
-    let step = commitment.step;
-    if !agreement.signers.is_full(participant_keys.len()) {
-        return Err(VerifyError::MissingParticipantAgreement { step });
-    }
-    agreement
-        .verify_signatures(step, &commitment.signing_bytes(), participant_keys)
-        .map_err(|error| VerifyError::Agreement {
-            step,
-            message: sanitize_verify_message(error.to_string()),
-        })
-}
-
-fn verify_terminal_agreement(
-    terminal: &arena0_protocol::SessionTerminal,
-    session_id: SessionHash,
-    participant_keys: &[arena0_crypto::BlsPublicKey],
-) -> Result<(), VerifyError> {
-    if !terminal.agreement.signers.is_full(participant_keys.len()) {
-        return Err(VerifyError::MissingParticipantAgreement {
-            step: terminal.final_step,
-        });
-    }
-    let commitment = TerminalCommitment::new(
-        session_id,
-        terminal.final_step,
-        terminal.final_state,
-        terminal.outcome_hash,
-    );
-    terminal
-        .agreement
-        .verify_signatures(
-            terminal.final_step,
-            &commitment.signing_bytes(),
-            participant_keys,
-        )
-        .map_err(|error| VerifyError::Agreement {
-            step: terminal.final_step,
-            message: sanitize_verify_message(error.to_string()),
-        })
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use arena0_crypto::{BlsSignature, ExecutionKey, ExecutionSalt, NodeKeys, SecretKey};
     use arena0_program::ExecutionProfile;
     use arena0_protocol::{
-        Activation, AggregateAttestation, Offer, OfferData, PreparedActivation, SessionHeader,
-        SessionTerminal, SignerSet, StateHash, Ticket, TicketAction, TicketData, TraceEntry,
+        Activation, AggregateAttestation, CHAIN_START, Committed, Effect, Ensemble, Event,
+        MessageId, Offer, OfferData, OutcomeHash, PreparedActivation, ReceiptBody, SessionHeader,
+        SessionTerminal, SignerSet, StateHash, StepCommitment, TRACE_FORMAT_VERSION,
+        TerminalCommitment, Ticket, TicketAction, TicketData, TraceEntry,
     };
 
     fn fixture() -> Vec<u8> {
@@ -469,6 +109,15 @@ pub(crate) mod tests {
         program_hash: ProgramHash,
         initial_state: StateHash,
         two_steps: bool,
+    ) -> Result<Vec<u8>, arena0_protocol::ProtocolError> {
+        fixture_with_message_sender(program_hash, initial_state, two_steps, None)
+    }
+
+    fn fixture_with_message_sender(
+        program_hash: ProgramHash,
+        initial_state: StateHash,
+        two_steps: bool,
+        message_sender: Option<PeerId>,
     ) -> Result<Vec<u8>, arena0_protocol::ProtocolError> {
         let negotiation = arena0_protocol::NegotiationId([9; 32]);
         let keys = [
@@ -577,7 +226,7 @@ pub(crate) mod tests {
         entries.push(first);
         if two_steps {
             let msg = vec![42];
-            let sender = participants[1].0;
+            let sender = message_sender.unwrap_or(participants[1].0);
             let mut second = TraceEntry {
                 trace_version: TRACE_FORMAT_VERSION,
                 step: 1,
@@ -708,6 +357,21 @@ pub(crate) mod tests {
             verified.terminal,
             LightVerifiedTerminal::Completed { outcome_borsh }
                 if outcome_borsh == vec![7, 8, 9]
+        ));
+    }
+
+    #[test]
+    fn message_receipt_rejects_sender_outside_ensemble() {
+        let error = fixture_with_message_sender(
+            ProgramHash([0x44; 32]),
+            StateHash([0x11; 32]),
+            true,
+            Some(PeerId([0x77; 32])),
+        )
+        .expect_err("outsider message must not become authenticated evidence");
+        assert!(matches!(
+            error,
+            arena0_protocol::ProtocolError::UnknownParticipant { .. }
         ));
     }
 }

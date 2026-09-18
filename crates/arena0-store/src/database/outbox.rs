@@ -1,5 +1,13 @@
 use super::*;
 
+pub(super) struct PendingEffectRow {
+    pub(super) outbox_id: OutboxId,
+    pub(super) status: OutboxStatus,
+    pub(super) event_position: u64,
+    pub(super) ordinal: u32,
+    pub(super) effect: Effect,
+}
+
 impl Database {
     /// Recover the one agent-facing request for the current continuation.
     /// Acknowledged rows remain durable so recovery needs no second request log.
@@ -25,6 +33,88 @@ impl Database {
         {
             return Ok(Vec::new());
         }
+        let row = self.pending_effect_row(execution_id, pending.id)?;
+        let derived = PendingRecord::from_effect(pending.id, &row.effect).ok_or_else(|| {
+            StoreError::Corruption("pending identity names an effect without a continuation".into())
+        })?;
+        if &derived != pending {
+            return Err(StoreError::Corruption(
+                "durable request disagrees with pending continuation".into(),
+            ));
+        }
+        let mut response_bytes = 0;
+        let request = match row.effect {
+            Effect::Callout {
+                callout_index,
+                context,
+                expected_type,
+                ..
+            } => {
+                account_response(
+                    &mut response_bytes,
+                    context
+                        .len()
+                        .checked_add(128)
+                        .ok_or(StoreError::CommandTooLarge {
+                            required: usize::MAX,
+                            capacity: MAX_RESPONSE_BYTES,
+                        })?,
+                )?;
+                PendingRequest::Callout {
+                    outbox_id: row.outbox_id,
+                    status: row.status,
+                    pending_id: pending.id,
+                    callout_index,
+                    context,
+                    expected_type,
+                }
+            }
+            Effect::Sign { scheme, data, .. } => {
+                let data = GuestSignData::new(
+                    state.binding().session_id(),
+                    state.binding().program_hash(),
+                    execution_id,
+                    row.event_position,
+                    row.ordinal,
+                    scheme,
+                    data,
+                )?;
+                account_response(
+                    &mut response_bytes,
+                    borsh::to_vec(&data)
+                        .map_err(|error| {
+                            StoreError::Corruption(format!(
+                                "pending signature response encode: {error}"
+                            ))
+                        })?
+                        .len()
+                        .checked_add(128)
+                        .ok_or(StoreError::CommandTooLarge {
+                            required: usize::MAX,
+                            capacity: MAX_RESPONSE_BYTES,
+                        })?,
+                )?;
+                PendingRequest::Signature {
+                    outbox_id: row.outbox_id,
+                    status: row.status,
+                    pending_id: pending.id,
+                    data,
+                }
+            }
+            _ => {
+                return Err(StoreError::Corruption(
+                    "pending identity names the wrong effect kind".into(),
+                ));
+            }
+        };
+        Ok(vec![request])
+    }
+
+    pub(super) fn pending_effect_row(
+        &mut self,
+        execution_id: ExecId,
+        pending: PendingId,
+    ) -> Result<PendingEffectRow, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT outbox_id, event_position, ordinal, status, payload
              FROM outbox
@@ -33,107 +123,33 @@ impl Database {
              ORDER BY event_position, version, ordinal, outbox_id",
         )?;
         let mut rows = statement.query(params![execution_id.0.to_vec()])?;
-        let mut requests = Vec::new();
-        let mut response_bytes = 0;
+        let mut matched = None;
         while let Some(row) = rows.next()? {
             let event_position = sqlite_i64(row.get::<_, i64>(1)?)?;
             let ordinal = u32::try_from(sqlite_i64(row.get::<_, i64>(2)?)?)
-                .map_err(|_| StoreError::Corruption("outbox ordinal exceeds u32".into()))?;
-            let derived_id = pending_id(execution_id, event_position, ordinal);
-            if derived_id != pending.id {
+                .map_err(|_| StoreError::Corruption("pending effect ordinal exceeds u32".into()))?;
+            if pending_id(execution_id, event_position, ordinal) != pending {
                 continue;
             }
-            let outbox_id = OutboxId::from_bytes(array32(
-                &row.get::<_, Vec<u8>>(0)?,
-                "pending request outbox id",
-            )?);
-            let status = parse_outbox_status(&row.get::<_, String>(3)?)?;
-            let effect: Effect =
-                decode_borsh(&row.get::<_, Vec<u8>>(4)?, "pending request effect")?;
-            let derived = PendingRecord::from_effect(derived_id, &effect).ok_or_else(|| {
-                StoreError::Corruption(
-                    "pending identity names an effect without a continuation".into(),
-                )
-            })?;
-            if &derived != pending {
+            if matched.is_some() {
                 return Err(StoreError::Corruption(
-                    "durable request disagrees with pending continuation".into(),
+                    "pending identity names multiple durable effects".into(),
                 ));
             }
-            match effect {
-                Effect::Callout {
-                    callout_index,
-                    context,
-                    expected_type,
-                    ..
-                } => {
-                    account_response(
-                        &mut response_bytes,
-                        context
-                            .len()
-                            .checked_add(128)
-                            .ok_or(StoreError::CommandTooLarge {
-                                required: usize::MAX,
-                                capacity: MAX_RESPONSE_BYTES,
-                            })?,
-                    )?;
-                    requests.push(PendingRequest::Callout {
-                        outbox_id,
-                        status,
-                        pending_id: derived_id,
-                        callout_index,
-                        context,
-                        expected_type,
-                    });
-                }
-                Effect::Sign { scheme, data, .. } => {
-                    let data = GuestSignData::new(
-                        state.binding().session_id(),
-                        state.binding().program_hash(),
-                        execution_id,
-                        event_position,
-                        ordinal,
-                        scheme,
-                        data,
-                    )?;
-                    account_response(
-                        &mut response_bytes,
-                        borsh::to_vec(&data)
-                            .map_err(|error| {
-                                StoreError::Corruption(format!(
-                                    "pending signature response encode: {error}"
-                                ))
-                            })?
-                            .len()
-                            .checked_add(128)
-                            .ok_or(StoreError::CommandTooLarge {
-                                required: usize::MAX,
-                                capacity: MAX_RESPONSE_BYTES,
-                            })?,
-                    )?;
-                    requests.push(PendingRequest::Signature {
-                        outbox_id,
-                        status,
-                        pending_id: derived_id,
-                        data,
-                    });
-                }
-                _ => {
-                    return Err(StoreError::Corruption(
-                        "pending identity names the wrong effect kind".into(),
-                    ));
-                }
-            }
+            matched = Some(PendingEffectRow {
+                outbox_id: OutboxId::from_bytes(array32(
+                    &row.get::<_, Vec<u8>>(0)?,
+                    "pending effect outbox id",
+                )?),
+                status: parse_outbox_status(&row.get::<_, String>(3)?)?,
+                event_position,
+                ordinal,
+                effect: decode_borsh(&row.get::<_, Vec<u8>>(4)?, "pending effect")?,
+            });
         }
-        drop(rows);
-        drop(statement);
-        if requests.len() != 1 {
-            return Err(StoreError::Corruption(format!(
-                "pending continuation has {} durable request effects",
-                requests.len()
-            )));
-        }
-        Ok(requests)
+        matched.ok_or_else(|| {
+            StoreError::Corruption("pending continuation has no durable originating effect".into())
+        })
     }
 
     pub(super) fn lease_next_outbox(
@@ -141,12 +157,7 @@ impl Database {
         execution_id: ExecId,
         now_ms: u64,
     ) -> Result<Option<LeasedOutbox>, StoreError> {
-        self.begin()?;
-        let result = self.lease_next_outbox_in_transaction(execution_id, now_ms);
-        match result {
-            Ok(value) => self.commit_result(value),
-            Err(error) => self.rollback_result(error),
-        }
+        self.transaction(|store| store.lease_next_outbox_in_transaction(execution_id, now_ms))
     }
 
     pub(super) fn lease_next_outbox_in_transaction(
@@ -340,12 +351,9 @@ impl Database {
         outbox_id: OutboxId,
         lease_id: LeaseId,
     ) -> Result<OutboxDeliveryOutcome, StoreError> {
-        self.begin()?;
-        let result = self.acknowledge_outbox_in_transaction(execution_id, outbox_id, lease_id);
-        match result {
-            Ok(value) => self.commit_result(value),
-            Err(error) => self.rollback_result(error),
-        }
+        self.transaction(|store| {
+            store.acknowledge_outbox_in_transaction(execution_id, outbox_id, lease_id)
+        })
     }
 
     pub(super) fn acknowledge_outbox_in_transaction(
@@ -401,13 +409,9 @@ impl Database {
         now_ms: u64,
         reason: String,
     ) -> Result<OutboxDeliveryOutcome, StoreError> {
-        self.begin()?;
-        let result =
-            self.retry_outbox_in_transaction(execution_id, outbox_id, lease_id, now_ms, reason);
-        match result {
-            Ok(value) => self.commit_result(value),
-            Err(error) => self.rollback_result(error),
-        }
+        self.transaction(|store| {
+            store.retry_outbox_in_transaction(execution_id, outbox_id, lease_id, now_ms, reason)
+        })
     }
 
     pub(super) fn retry_outbox_in_transaction(
@@ -478,24 +482,16 @@ impl Database {
         execution_id: ExecId,
         now_ms: u64,
     ) -> Result<RecoveryReport, StoreError> {
-        self.begin()?;
-        let result = self.recover_expired_leases_in_transaction(Some(execution_id), now_ms);
-        match result {
-            Ok(value) => self.commit_result(value),
-            Err(error) => self.rollback_result(error),
-        }
+        self.transaction(|store| {
+            store.recover_expired_leases_in_transaction(Some(execution_id), now_ms)
+        })
     }
 
     pub(super) fn recover_all_expired_leases(
         &mut self,
         now_ms: u64,
     ) -> Result<RecoveryReport, StoreError> {
-        self.begin()?;
-        let result = self.recover_expired_leases_in_transaction(None, now_ms);
-        match result {
-            Ok(value) => self.commit_result(value),
-            Err(error) => self.rollback_result(error),
-        }
+        self.transaction(|store| store.recover_expired_leases_in_transaction(None, now_ms))
     }
 
     pub(super) fn recover_expired_leases_in_transaction(

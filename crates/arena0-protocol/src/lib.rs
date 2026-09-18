@@ -63,7 +63,7 @@ pub use execution::{
     ParticipantTerminalSignature, PendingId, PendingIdParseError, ProtocolError, PublishedProof,
     Receipt, ReceiptArtifact, ReceiptBody, ReceiptId, ReceiptKind, ReceiptWork, SharedProposal,
     StepCertificate, StepCursor, StopCause, StopReport, TerminalCertificate, TerminalOutcome,
-    TerminalProof, TerminalPublication, TimerFiring, TimerId, pending_id,
+    TerminalProof, TimerFiring, TimerId, pending_id,
 };
 pub use fetch_frame::{FetchFrame, FetchFrameError};
 pub use id::IdParseError;

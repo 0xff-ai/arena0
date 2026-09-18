@@ -9,13 +9,13 @@
 
 use std::time::Instant;
 
-use crate::context::{ExecError, SessionMessage};
+use crate::context::ExecError;
 use arena0_protocol::execution::GuestSignData;
 use arena0_protocol::{Effect, ExecFrame, PendingOperation, ReceiptWork};
 use arena0_store::{OutboxItem, OutboxPayloadKind};
 use arena0_transport::TransportError;
 
-use super::{ExecutionActor, InflightSend, now_ms};
+use super::{ExecutionActor, InflightSend, callout_requested, now_ms};
 
 const PERFORMANCE_TARGET: &str = "arena0::performance";
 
@@ -297,14 +297,14 @@ impl ExecutionActor {
                     .into());
                 }
                 self.messages
-                    .send(SessionMessage::CalloutRequested {
-                        pending_id: pending.id,
-                        callout_index: *callout_index,
-                        context: context.clone(),
-                        expected_type: expected_type
+                    .send(callout_requested(
+                        pending.id,
+                        *callout_index,
+                        context.clone(),
+                        expected_type
                             .clone()
                             .or_else(|| pending.expected_type.clone()),
-                    })
+                    ))
                     .await
                     .map_err(|_| ExecError::Unavailable("message receiver closed".into()))?;
                 Ok(false)
@@ -371,38 +371,20 @@ impl ExecutionActor {
                         } if pending_id == pending.id => Some((context, expected_type)),
                         _ => None,
                     });
+                let (context, request_type) = context.unwrap_or_default();
                 self.messages
-                    .send(SessionMessage::CalloutRequested {
-                        pending_id: pending.id,
+                    .send(callout_requested(
+                        pending.id,
                         callout_index,
-                        context: context
-                            .as_ref()
-                            .map_or_else(Vec::new, |(context, _)| context.clone()),
-                        expected_type: context
-                            .as_ref()
-                            .and_then(|(_, expected_type)| expected_type.clone())
-                            .or_else(|| pending.expected_type.clone()),
-                    })
+                        context,
+                        request_type.or_else(|| pending.expected_type.clone()),
+                    ))
                     .await
                     .map_err(|_| ExecError::Unavailable("message receiver closed".into()))?;
                 Ok(false)
             }
-            Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. } => {
-                // Terminal proof/publication is driven by durable status and
-                // progress, not by re-entering the guest or inventing a
-                // second terminal effect.
-                if self.load_state().await?.terminal_pending() {
-                    self.ensure_terminal_signature().await?;
-                }
-                Ok(false)
-            }
-            Effect::SetTimer { .. } => {
-                // Timer rows are written atomically by commit_dispatch.
-                Ok(false)
-            }
-            Effect::Broadcast { .. } => Err(ExecError::InvalidState(
-                "broadcast effect reached effect delivery; expected a protocol frame outbox row"
-                    .into(),
+            _ => Err(ExecError::InvalidState(
+                "non-deliverable effect reached the durable effect outbox".into(),
             )
             .into()),
         }

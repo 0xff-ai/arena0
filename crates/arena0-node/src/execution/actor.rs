@@ -18,12 +18,12 @@ use tokio::task::JoinSet;
 use tokio::time::{Interval, MissedTickBehavior};
 
 use crate::Host;
-use crate::context::{
-    ActorContext, ExecCommand, ExecError, InboundStreamPayload, SessionMessage, SpawnedExec,
-};
+use crate::context::{ActorContext, ExecCommand, ExecError, InboundStreamPayload, SpawnedExec};
 
 use super::guest::SubmitInputError;
-use super::{COMMAND_CAPACITY, ExecutionActor, PROGRESS_INTERVAL, STREAM_CAPACITY, now_ms};
+use super::{
+    COMMAND_CAPACITY, ExecutionActor, PROGRESS_INTERVAL, STREAM_CAPACITY, callout_requested, now_ms,
+};
 
 const MAX_PROGRESS_PASSES: usize = 64;
 
@@ -297,12 +297,12 @@ impl ExecutionActor {
             } = request
             {
                 self.messages
-                    .send(SessionMessage::CalloutRequested {
-                        pending_id: *pending_id,
-                        callout_index: *callout_index,
-                        context: context.clone(),
-                        expected_type: expected_type.clone(),
-                    })
+                    .send(callout_requested(
+                        *pending_id,
+                        *callout_index,
+                        context.clone(),
+                        expected_type.clone(),
+                    ))
                     .await
                     .map_err(|_| ExecError::Unavailable("message receiver closed".into()))?;
             }

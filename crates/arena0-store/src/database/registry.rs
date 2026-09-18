@@ -8,9 +8,8 @@ impl Database {
         execution_id: ExecId,
         now_ms: u64,
     ) -> Result<ExecutionSalt, StoreError> {
-        self.begin()?;
-        let result = (|| {
-            let request_exists: bool = self.connection.query_row(
+        self.transaction(|store| {
+            let request_exists: bool = store.connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM exec_requests WHERE execution_id = ?1)",
                 params![execution_id.0.to_vec()],
                 |row| row.get(0),
@@ -18,7 +17,7 @@ impl Database {
             if !request_exists {
                 return Err(StoreError::ExecutionRequestNotFound(execution_id));
             }
-            let existing = self
+            let existing = store
                 .connection
                 .query_row(
                     "SELECT salt FROM execution_salts WHERE execution_id = ?1",
@@ -42,17 +41,13 @@ impl Database {
                 }
             };
             let encoded = envelope(EnvelopeKind::ExecutionSalt, salt.as_bytes())?;
-            self.connection.execute(
+            store.connection.execute(
                 "INSERT INTO execution_salts (execution_id, salt, created_at_ms)
                  VALUES (?1, ?2, ?3)",
                 params![execution_id.0.to_vec(), encoded, sqlite_u64(now_ms)?,],
             )?;
             Ok(salt)
-        })();
-        match result {
-            Ok(salt) => self.commit_result(salt),
-            Err(error) => self.rollback_result(error),
-        }
+        })
     }
 
     pub(super) fn register_program(

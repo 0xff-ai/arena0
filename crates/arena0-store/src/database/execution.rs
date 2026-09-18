@@ -23,12 +23,7 @@ impl Database {
                 requested: state.producer(),
             });
         }
-        self.begin()?;
-        let result = self.create_execution_in_transaction(state, now_ms);
-        match result {
-            Ok(outcome) => self.commit_result(outcome),
-            Err(error) => self.rollback_result(error),
-        }
+        self.transaction(|store| store.create_execution_in_transaction(state, now_ms))
     }
 
     pub(super) fn create_execution_in_transaction(
@@ -342,12 +337,7 @@ impl Database {
         expected: ExecutionVersion,
         now_ms: u64,
     ) -> Result<ApplyOutcome, StoreError> {
-        self.begin()?;
-        let result = self.activate_in_transaction(execution_id, expected, now_ms);
-        match result {
-            Ok(value) => self.commit_result(value),
-            Err(error) => self.rollback_result(error),
-        }
+        self.transaction(|store| store.activate_in_transaction(execution_id, expected, now_ms))
     }
 
     fn activate_in_transaction(
@@ -387,24 +377,21 @@ impl Database {
         pending_id: Option<PendingId>,
         now_ms: u64,
     ) -> Result<ApplyOutcome, StoreError> {
-        self.begin()?;
-        let result = self.commit_dispatch_in_transaction(
-            execution_id,
-            expected,
-            event,
-            shared,
-            local,
-            effects,
-            terminal_outcome,
-            inbox_id,
-            timer_id,
-            pending_id,
-            now_ms,
-        );
-        match result {
-            Ok(value) => self.commit_result(value),
-            Err(error) => self.rollback_result(error),
-        }
+        self.transaction(|store| {
+            store.commit_dispatch_in_transaction(
+                execution_id,
+                expected,
+                event,
+                shared,
+                local,
+                effects,
+                terminal_outcome,
+                inbox_id,
+                timer_id,
+                pending_id,
+                now_ms,
+            )
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -428,141 +415,32 @@ impl Database {
         if state.version() != expected {
             return self.version_mismatch(state, expected);
         }
-        if state.pending_shared().is_some() {
-            return Err(StoreError::Protocol(ProtocolError::SharedProposalExists));
-        }
         validate_effect_payloads(&effects)?;
         let post_state = StateHash::of_shared(&shared);
         validate_dispatch_sources(
             self, &state, &event, post_state, &effects, inbox_id, timer_id, pending_id,
         )?;
-        let closes_pending = validate_pending_answer(&state, &event, pending_id, &effects)?;
-        let source_status = inbox_id
-            .map(|id| self.load_inbox_fact(execution_id, id, &state))
-            .transpose()?;
-        if let Some((_, _, status, version)) = source_status {
-            match status {
-                InboxStatus::Applied => {
-                    return Ok(ApplyOutcome::InboxAlreadyApplied {
-                        inbox_id: inbox_id.expect("source status has inbox id"),
-                        version: version.ok_or_else(|| {
-                            StoreError::Corruption("applied inbox row has no version".into())
-                        })?,
-                    });
-                }
-                InboxStatus::Consumed => {
-                    return Ok(ApplyOutcome::InboxAlreadyConsumed {
-                        inbox_id: inbox_id.expect("source status has inbox id"),
-                    });
-                }
-                InboxStatus::Accepted => {}
-            }
+        let mut next = state.clone();
+        let (establishing_frame, closes_pending) = next.apply_dispatch(
+            &event,
+            shared,
+            local,
+            &effects,
+            terminal_outcome,
+            pending_id,
+        )?;
+        if let Some(outcome) = self.inbox_replay_outcome(&state, inbox_id)? {
+            return Ok(outcome);
         }
 
         let event_position = state.event_position();
         let event_payload = event_bytes(&event)?;
         let effects_payload = effects_bytes(&effects)?;
-        let lifecycle = lifecycle_effect(&effects)?;
-        let broadcast_index = effects
-            .iter()
-            .position(|effect| matches!(effect, Effect::Broadcast { .. }));
-        // Every portable event occupies an agreed trace step, even when its
-        // shared bytes are unchanged. A state hash delta is therefore not a
-        // sufficient agreement predicate.
-        let portable_event = matches!(
-            event,
-            Event::SessionStarted { .. } | Event::MessageReceived { .. }
-        );
-        let requires_agreement = portable_event
-            || post_state != state.agreed_state()
-            || broadcast_index.is_some()
-            || lifecycle.is_some();
-        let reacted_step = reacted_step_for_event(&state, &event)?;
+        let proposal_staged = next.pending_shared().is_some();
+        let indexed_effects = (!proposal_staged)
+            .then(|| indexed_effects(&effects))
+            .transpose()?;
 
-        if !requires_agreement {
-            if terminal_outcome.is_some() {
-                return Err(StoreError::Protocol(ProtocolError::TerminalOutcomeMismatch));
-            }
-            let status = immediate_status(&state, &event, event_position, &effects)?;
-            let mut next = state.clone();
-            next.install_dispatch(event_position, shared, local, status, reacted_step)?;
-            self.persist_state_cas(&state, &next, now_ms)?;
-            self.insert_event_record(
-                execution_id,
-                event_position,
-                &event_payload,
-                &effects_payload,
-            )?;
-            let indexed_effects = indexed_effects(&effects)?;
-            self.persist_effects(
-                execution_id,
-                event_position,
-                next.version(),
-                &indexed_effects,
-                now_ms,
-                &state,
-            )?;
-            if let Some(inbox_id) = inbox_id {
-                self.mark_inbox_applied(execution_id, inbox_id, next.version())?;
-            }
-            if closes_pending {
-                self.acknowledge_pending_effect(
-                    execution_id,
-                    pending_id.expect("pending answer was validated"),
-                    &event,
-                )?;
-            }
-            if let Some(timer_id) = timer_id {
-                self.consume_timer(execution_id, timer_id)?;
-            }
-            self.cache_pending(next.clone())?;
-            return Ok(ApplyOutcome::Committed {
-                agreed_step: None,
-                proposal_staged: false,
-            });
-        }
-
-        let (trace_event, proposal_effects, establishing_frame) =
-            normalized_proposal_event(&state, &event, &shared, &effects, broadcast_index)?;
-        if lifecycle.is_some()
-            && proposal_effects
-                .iter()
-                .any(|(_, effect)| matches!(effect, Effect::Broadcast { .. }))
-        {
-            return Err(StoreError::Protocol(ProtocolError::InvalidTerminalStatus));
-        }
-        let entry = TraceEntry {
-            trace_version: arena0_protocol::TRACE_FORMAT_VERSION,
-            step: state.agreed_step(),
-            event: trace_event,
-            pre_state: state.agreed_state(),
-            post_state,
-            terminal: lifecycle,
-            agreement: arena0_protocol::AggregateAttestation::empty(),
-        };
-        let commitment =
-            StepCommitment::for_entry(state.binding().session_id(), &entry, state.agreed_link());
-        let status = proposal_status(
-            &state,
-            &event,
-            event_position,
-            &entry,
-            &commitment,
-            &effects,
-            terminal_outcome,
-        )?;
-        let proposal = arena0_protocol::SharedProposal::new(
-            commitment,
-            entry,
-            shared,
-            local,
-            proposal_effects,
-            event_position,
-            status,
-            Vec::new(),
-        )?;
-        let mut next = state.clone();
-        next.stage_proposal(proposal, reacted_step)?;
         self.persist_state_cas(&state, &next, now_ms)?;
         self.insert_event_record(
             execution_id,
@@ -570,6 +448,16 @@ impl Database {
             &event_payload,
             &effects_payload,
         )?;
+        if let Some(indexed_effects) = indexed_effects.as_ref() {
+            self.persist_effects(
+                execution_id,
+                event_position,
+                next.version(),
+                indexed_effects,
+                now_ms,
+                &state,
+            )?;
+        }
         if let Some((index, frame)) = establishing_frame {
             let frame_ordinal = message_frame_ordinal(index)?;
             self.persist_frame_for_remotes(
@@ -583,7 +471,11 @@ impl Database {
             )?;
         }
         if let Some(inbox_id) = inbox_id {
-            self.mark_inbox_consumed(execution_id, inbox_id, now_ms)?;
+            if proposal_staged {
+                self.mark_inbox_consumed(execution_id, inbox_id, now_ms)?;
+            } else {
+                self.mark_inbox_applied(execution_id, inbox_id, next.version())?;
+            }
         }
         if closes_pending {
             self.acknowledge_pending_effect(
@@ -598,7 +490,7 @@ impl Database {
         self.cache_pending(next.clone())?;
         Ok(ApplyOutcome::Committed {
             agreed_step: None,
-            proposal_staged: true,
+            proposal_staged,
         })
     }
 
@@ -610,18 +502,15 @@ impl Database {
         inbox_id: Option<InboxId>,
         now_ms: u64,
     ) -> Result<ApplyOutcome, StoreError> {
-        self.begin()?;
-        let result = self.commit_step_signature_in_transaction(
-            execution_id,
-            expected,
-            signature,
-            inbox_id,
-            now_ms,
-        );
-        match result {
-            Ok(value) => self.commit_result(value),
-            Err(error) => self.rollback_result(error),
-        }
+        self.transaction(|store| {
+            store.commit_step_signature_in_transaction(
+                execution_id,
+                expected,
+                signature,
+                inbox_id,
+                now_ms,
+            )
+        })
     }
 
     fn commit_step_signature_in_transaction(
@@ -673,7 +562,32 @@ impl Database {
                 &state,
             )?;
         }
-        self.persist_state_cas(&state, &next, now_ms)?;
+        let agreed_step = committed.as_ref().map(|proposal| proposal.entry().step);
+        self.persist_signature(
+            execution_id,
+            &state,
+            next,
+            event_position,
+            local_frame,
+            inbox_id,
+            now_ms,
+            agreed_step,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn persist_signature(
+        &mut self,
+        execution_id: ExecId,
+        state: &ExecutionState,
+        next: ExecutionState,
+        event_position: u64,
+        local_frame: Option<ExecFrame>,
+        inbox_id: Option<InboxId>,
+        now_ms: u64,
+        agreed_step: Option<u64>,
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.persist_state_cas(state, &next, now_ms)?;
         if let Some(frame) = local_frame {
             self.persist_frame_for_remotes(
                 execution_id,
@@ -681,7 +595,7 @@ impl Database {
                 next.version(),
                 0,
                 &frame,
-                &state,
+                state,
                 now_ms,
             )?;
         }
@@ -694,10 +608,11 @@ impl Database {
         if let Some(inbox_id) = inbox_id {
             self.mark_inbox_consumed(execution_id, inbox_id, now_ms)?;
         }
-        self.cache_pending(next.clone())?;
+        let proposal_staged = next.pending_shared().is_some();
+        self.cache_pending(next)?;
         Ok(ApplyOutcome::Committed {
-            agreed_step: committed.as_ref().map(|proposal| proposal.entry().step),
-            proposal_staged: next.pending_shared().is_some(),
+            agreed_step,
+            proposal_staged,
         })
     }
 
@@ -709,18 +624,15 @@ impl Database {
         inbox_id: Option<InboxId>,
         now_ms: u64,
     ) -> Result<ApplyOutcome, StoreError> {
-        self.begin()?;
-        let result = self.commit_terminal_signature_in_transaction(
-            execution_id,
-            expected,
-            signature,
-            inbox_id,
-            now_ms,
-        );
-        match result {
-            Ok(value) => self.commit_result(value),
-            Err(error) => self.rollback_result(error),
-        }
+        self.transaction(|store| {
+            store.commit_terminal_signature_in_transaction(
+                execution_id,
+                expected,
+                signature,
+                inbox_id,
+                now_ms,
+            )
+        })
     }
 
     fn commit_terminal_signature_in_transaction(
@@ -762,32 +674,16 @@ impl Database {
             .flatten();
         let mut next = state.clone();
         next.add_terminal_signature(signature)?;
-        self.persist_state_cas(&state, &next, now_ms)?;
-        if let Some(frame) = local_frame {
-            self.persist_frame_for_remotes(
-                execution_id,
-                state.event_position(),
-                next.version(),
-                0,
-                &frame,
-                &state,
-                now_ms,
-            )?;
-        }
-        if !matches!(
-            next.status().receipt_work(),
-            arena0_protocol::ReceiptWork::NotTerminal
-        ) {
-            self.cancel_terminal_effects(execution_id)?;
-        }
-        if let Some(inbox_id) = inbox_id {
-            self.mark_inbox_consumed(execution_id, inbox_id, now_ms)?;
-        }
-        self.cache_pending(next.clone())?;
-        Ok(ApplyOutcome::Committed {
-            agreed_step: None,
-            proposal_staged: false,
-        })
+        self.persist_signature(
+            execution_id,
+            &state,
+            next,
+            state.event_position(),
+            local_frame,
+            inbox_id,
+            now_ms,
+            None,
+        )
     }
 
     pub(super) fn stop_execution(
@@ -798,18 +694,15 @@ impl Database {
         inbox_id: Option<InboxId>,
         now_ms: u64,
     ) -> Result<ApplyOutcome, StoreError> {
-        self.begin()?;
-        let result = self.stop_execution_in_transaction(
-            execution_id,
-            expected,
-            occurrence,
-            inbox_id,
-            now_ms,
-        );
-        match result {
-            Ok(value) => self.commit_result(value),
-            Err(error) => self.rollback_result(error),
-        }
+        self.transaction(|store| {
+            store.stop_execution_in_transaction(
+                execution_id,
+                expected,
+                occurrence,
+                inbox_id,
+                now_ms,
+            )
+        })
     }
 
     fn stop_execution_in_transaction(
@@ -889,12 +782,9 @@ impl Database {
         reason: String,
         now_ms: u64,
     ) -> Result<ApplyOutcome, StoreError> {
-        self.begin()?;
-        let result = self.interrupt_terminal_in_transaction(execution_id, expected, reason, now_ms);
-        match result {
-            Ok(value) => self.commit_result(value),
-            Err(error) => self.rollback_result(error),
-        }
+        self.transaction(|store| {
+            store.interrupt_terminal_in_transaction(execution_id, expected, reason, now_ms)
+        })
     }
 
     fn interrupt_terminal_in_transaction(
@@ -933,12 +823,9 @@ impl Database {
         expected: ExecutionVersion,
         now_ms: u64,
     ) -> Result<ApplyOutcome, StoreError> {
-        self.begin()?;
-        let result = self.publish_terminal_in_transaction(execution_id, expected, now_ms);
-        match result {
-            Ok(value) => self.commit_result(value),
-            Err(error) => self.rollback_result(error),
-        }
+        self.transaction(|store| {
+            store.publish_terminal_in_transaction(execution_id, expected, now_ms)
+        })
     }
 
     fn publish_terminal_in_transaction(
@@ -1714,38 +1601,8 @@ impl Database {
         pending: PendingId,
         event: &Event<Vec<u8>>,
     ) -> Result<(), StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT outbox_id, event_position, ordinal, status, payload
-             FROM outbox
-             WHERE execution_id = ?1 AND destination IS NULL AND payload_kind = 'effect'
-             ORDER BY event_position, ordinal",
-        )?;
-        let mut rows = statement.query(params![execution_id.0.to_vec()])?;
-        let mut match_row: Option<(OutboxId, String, Effect)> = None;
-        while let Some(row) = rows.next()? {
-            let event_position = sqlite_i64(row.get::<_, i64>(1)?)?;
-            let ordinal = u32::try_from(sqlite_i64(row.get::<_, i64>(2)?)?)
-                .map_err(|_| StoreError::Corruption("pending effect ordinal exceeds u32".into()))?;
-            if pending_id(execution_id, event_position, ordinal) != pending {
-                continue;
-            }
-            let effect: Effect = decode_borsh(&row.get::<_, Vec<u8>>(4)?, "pending effect")?;
-            let outbox_id = OutboxId::from_bytes(array32(&row.get::<_, Vec<u8>>(0)?, "outbox id")?);
-            if match_row.is_some() {
-                return Err(StoreError::Corruption(
-                    "pending identity names multiple durable effects".into(),
-                ));
-            }
-            match_row = Some((outbox_id, row.get::<_, String>(3)?, effect));
-        }
-        drop(rows);
-        drop(statement);
-        let Some((outbox_id, status, effect)) = match_row else {
-            return Err(StoreError::Corruption(
-                "pending continuation has no durable originating effect".into(),
-            ));
-        };
-        let operation_matches = match (event, &effect) {
+        let row = self.pending_effect_row(execution_id, pending)?;
+        let operation_matches = match (event, &row.effect) {
             (
                 Event::InputReceived {
                     callout_index,
@@ -1774,14 +1631,14 @@ impl Database {
                 ProtocolError::PendingContinuationMismatch,
             ));
         }
-        if parse_outbox_status(&status)? == OutboxStatus::Acknowledged {
+        if row.status == OutboxStatus::Acknowledged {
             // The exact request may already have been acknowledged by the
             // delivery worker. The answer still consumes every retry marker
             // emitted while that same continuation remained pending.
             self.cancel_retry_effects(execution_id)?;
             return Ok(());
         }
-        self.acknowledge_effect_rows(execution_id, &[outbox_id])?;
+        self.acknowledge_effect_rows(execution_id, &[row.outbox_id])?;
         // RetryInput is deliberately not a second continuation. It is a
         // durable request to redeliver the one existing continuation, so the
         // successful answer retires all of its pending/leased retry rows in
@@ -1789,106 +1646,6 @@ impl Database {
         self.cancel_retry_effects(execution_id)?;
         Ok(())
     }
-}
-
-fn validate_pending_answer(
-    state: &ExecutionState,
-    event: &Event<Vec<u8>>,
-    pending_id: Option<PendingId>,
-    effects: &[Effect],
-) -> Result<bool, StoreError> {
-    let lifecycle = effects.iter().any(|effect| {
-        matches!(
-            effect,
-            Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. }
-        )
-    });
-    let continuation = effects.iter().any(|effect| {
-        matches!(
-            effect,
-            Effect::Callout { .. }
-                | Effect::Sign { .. }
-                | Effect::RetryInput { .. }
-                | Effect::SetTimer { .. }
-        )
-    });
-    if lifecycle && continuation {
-        return Err(StoreError::Protocol(ProtocolError::InvalidTerminalStatus));
-    }
-    let answer = matches!(event, Event::InputReceived { .. } | Event::Signed { .. });
-    let retries = effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::RetryInput { .. }));
-    if !answer {
-        if retries {
-            let Some(current) = state.status().pending() else {
-                return Err(StoreError::Protocol(
-                    ProtocolError::PendingContinuationMismatch,
-                ));
-            };
-            if !matches!(
-                current.operation,
-                arena0_protocol::PendingOperation::Callout { .. }
-            ) {
-                return Err(StoreError::Protocol(
-                    ProtocolError::PendingContinuationMismatch,
-                ));
-            }
-            if pending_id.is_some_and(|id| id != current.id) {
-                return Err(StoreError::Protocol(
-                    ProtocolError::PendingContinuationMismatch,
-                ));
-            }
-            return Ok(false);
-        }
-        if pending_id.is_some() {
-            return Err(StoreError::Protocol(
-                ProtocolError::PendingContinuationMismatch,
-            ));
-        }
-        return Ok(false);
-    }
-    let Some(pending_id) = pending_id else {
-        return Err(StoreError::Protocol(
-            ProtocolError::PendingContinuationMismatch,
-        ));
-    };
-    let Some(current) = state.status().pending() else {
-        return Err(StoreError::Protocol(
-            ProtocolError::PendingContinuationMismatch,
-        ));
-    };
-    if current.id != pending_id {
-        return Err(StoreError::Protocol(
-            ProtocolError::PendingContinuationMismatch,
-        ));
-    }
-    match (event, current.operation) {
-        (
-            Event::InputReceived {
-                callout_index,
-                continuation_tag,
-                ..
-            },
-            arena0_protocol::PendingOperation::Callout {
-                callout_index: expected_index,
-            },
-        ) if *callout_index == expected_index && *continuation_tag == current.continuation_tag => {}
-        (
-            Event::Signed {
-                continuation_tag, ..
-            },
-            arena0_protocol::PendingOperation::Sign,
-        ) if *continuation_tag == current.continuation_tag => {}
-        _ => {
-            return Err(StoreError::Protocol(
-                ProtocolError::PendingContinuationMismatch,
-            ));
-        }
-    }
-    Ok(!effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::RetryInput { .. })))
 }
 
 fn validate_effect_payloads(effects: &[Effect]) -> Result<(), StoreError> {
@@ -1952,293 +1709,6 @@ fn successor_broadcast_frame(
         poststate: proposal.entry().post_state,
         data: msg.clone(),
     })
-}
-
-fn lifecycle_effect(effects: &[Effect]) -> Result<Option<Effect>, StoreError> {
-    let mut lifecycle = None;
-    for effect in effects {
-        if matches!(
-            effect,
-            Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. }
-        ) {
-            if lifecycle.is_some() {
-                return Err(StoreError::Protocol(ProtocolError::MultipleTerminalEffects));
-            }
-            lifecycle = Some(effect.clone());
-        }
-    }
-    Ok(lifecycle)
-}
-
-fn immediate_status(
-    state: &ExecutionState,
-    event: &Event<Vec<u8>>,
-    event_position: u64,
-    effects: &[Effect],
-) -> Result<ExecutionStatus, StoreError> {
-    next_dispatch_status(state, event, event_position, effects)
-}
-
-fn proposal_status(
-    state: &ExecutionState,
-    event: &Event<Vec<u8>>,
-    event_position: u64,
-    entry: &arena0_protocol::TraceEntry,
-    commitment: &StepCommitment,
-    effects: &[Effect],
-    terminal_outcome: Option<TerminalOutcome>,
-) -> Result<ExecutionStatus, StoreError> {
-    if let Some(terminal) = &entry.terminal {
-        match terminal {
-            Effect::SessionEnd {
-                outcome: effect_outcome,
-            } => {
-                let outcome = terminal_outcome
-                    .ok_or(StoreError::Protocol(ProtocolError::TerminalOutcomeRequired))?;
-                if outcome.borsh() != effect_outcome.as_slice() {
-                    return Err(StoreError::Protocol(
-                        ProtocolError::OutcomeProjectionMismatch,
-                    ));
-                }
-                let terminal_commitment = arena0_protocol::TerminalCommitment::new(
-                    state.binding().session_id(),
-                    entry.step,
-                    entry.post_state,
-                    arena0_protocol::OutcomeHash::of(outcome.borsh()),
-                );
-                return Ok(ExecutionStatus::from_terminal_proof(
-                    arena0_protocol::TerminalProof::pending(
-                        terminal_commitment,
-                        outcome,
-                        Vec::new(),
-                    ),
-                ));
-            }
-            Effect::SessionAbort { .. } | Effect::Fail { .. } => {
-                if terminal_outcome.is_some() {
-                    return Err(StoreError::Protocol(ProtocolError::TerminalOutcomeMismatch));
-                }
-                return ExecutionStatus::from_shared_entry(entry, commitment.clone())?
-                    .ok_or_else(|| StoreError::Protocol(ProtocolError::InvalidTerminalStatus));
-            }
-            _ => return Err(StoreError::Protocol(ProtocolError::InvalidTerminalStatus)),
-        }
-    }
-    if terminal_outcome.is_some() {
-        return Err(StoreError::Protocol(ProtocolError::TerminalOutcomeMismatch));
-    }
-    next_dispatch_status(state, event, event_position, effects)
-}
-
-/// Derive the next waiting continuation without treating the status as a
-/// second input source. A continuation is consumed only by a matching
-/// `InputReceived`/`Signed`; unrelated events retain an existing continuation,
-/// while a new callout/sign while one is retained is rejected.
-fn next_dispatch_status(
-    state: &ExecutionState,
-    event: &Event<Vec<u8>>,
-    event_position: u64,
-    effects: &[Effect],
-) -> Result<ExecutionStatus, StoreError> {
-    let existing = state.status().pending().cloned();
-    let continuation = effects
-        .iter()
-        .enumerate()
-        .filter(|(_, effect)| matches!(effect, Effect::Callout { .. } | Effect::Sign { .. }))
-        .map(|(index, effect)| {
-            let id = pending_id(state.execution_id(), event_position, index as u32);
-            PendingRecord::from_effect(id, effect)
-                .ok_or_else(|| StoreError::Corruption("pending effect metadata is missing".into()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if continuation.len() > 1 {
-        return Err(StoreError::Protocol(
-            ProtocolError::InvalidPendingContinuation,
-        ));
-    }
-    let consumes_pending = matches!(event, Event::InputReceived { .. } | Event::Signed { .. });
-    let retries = effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::RetryInput { .. }));
-    if let Some(next) = continuation.into_iter().next() {
-        if retries || (existing.is_some() && !consumes_pending) {
-            return Err(StoreError::Protocol(
-                ProtocolError::InvalidPendingContinuation,
-            ));
-        }
-        return Ok(ExecutionStatus::waiting(next));
-    }
-    if retries {
-        return existing.map_or_else(
-            || {
-                Err(StoreError::Protocol(
-                    ProtocolError::PendingContinuationMismatch,
-                ))
-            },
-            |pending| Ok(ExecutionStatus::waiting(pending)),
-        );
-    }
-    if !consumes_pending {
-        return existing.map_or_else(
-            || Ok(ExecutionStatus::active()),
-            |pending| Ok(ExecutionStatus::waiting(pending)),
-        );
-    }
-    Ok(ExecutionStatus::active())
-}
-
-fn reacted_step_for_event(
-    state: &ExecutionState,
-    event: &Event<Vec<u8>>,
-) -> Result<Option<u64>, StoreError> {
-    if !matches!(event, Event::React) {
-        return Ok(None);
-    }
-    state
-        .agreed_step()
-        .checked_sub(1)
-        .map(Some)
-        .ok_or(StoreError::Protocol(ProtocolError::InvalidTerminalStatus))
-}
-
-type NormalizedProposal = (Event<Vec<u8>>, Vec<(u32, Effect)>, Option<(u32, ExecFrame)>);
-
-fn normalized_proposal_event(
-    state: &ExecutionState,
-    event: &Event<Vec<u8>>,
-    shared: &SharedStateBytes,
-    effects: &[Effect],
-    broadcast_index: Option<usize>,
-) -> Result<NormalizedProposal, StoreError> {
-    let mut proposal_effects = effects
-        .iter()
-        .enumerate()
-        .map(|(index, effect)| {
-            Ok((
-                u32::try_from(index).map_err(|_| StoreError::CommandTooLarge {
-                    required: index,
-                    capacity: u32::MAX as usize,
-                })?,
-                effect.clone(),
-            ))
-        })
-        .collect::<Result<Vec<_>, StoreError>>()?;
-    if let Some(index) = broadcast_index
-        && matches!(
-            event,
-            Event::InputReceived { .. }
-                | Event::TimerFired
-                | Event::TypedTimerFired { .. }
-                | Event::Signed { .. }
-                | Event::React
-        )
-    {
-        let Effect::Broadcast { data } = &effects[index] else {
-            unreachable!();
-        };
-        proposal_effects.retain(|(ordinal, _)| *ordinal != index as u32);
-        let post_state = StateHash::of_shared(shared);
-        let message_id = MessageId::derive(
-            state.binding().session_id(),
-            state.producer(),
-            state.agreed_step(),
-            state.agreed_state(),
-            post_state,
-            data,
-        );
-        let frame = ExecFrame::Message {
-            message_id,
-            seq: state.agreed_step(),
-            prestate: state.agreed_state(),
-            poststate: post_state,
-            data: data.clone(),
-        };
-        return Ok((
-            Event::MessageReceived {
-                message_id,
-                from: state.producer(),
-                position: state.agreed_step(),
-                pre_state: state.agreed_state(),
-                msg: data.clone(),
-            },
-            proposal_effects,
-            Some((
-                u32::try_from(index).map_err(|_| StoreError::CommandTooLarge {
-                    required: index,
-                    capacity: u32::MAX as usize,
-                })?,
-                frame,
-            )),
-        ));
-    }
-    match event {
-        Event::SessionStarted { .. } | Event::MessageReceived { .. } => {
-            validate_portable_event(state, event, StateHash::of_shared(shared))?;
-            Ok((event.clone(), proposal_effects, None))
-        }
-        _ => Err(StoreError::Protocol(ProtocolError::InvalidCertificate(
-            "shared dispatch requires a portable event or a broadcast".into(),
-        ))),
-    }
-}
-
-fn validate_portable_event(
-    state: &ExecutionState,
-    event: &Event<Vec<u8>>,
-    post_state: StateHash,
-) -> Result<(), StoreError> {
-    match event {
-        Event::SessionStarted { ensemble } => {
-            let expected = arena0_protocol::Ensemble::from_peers(
-                state
-                    .binding()
-                    .activation()
-                    .tickets()
-                    .iter()
-                    .map(|ticket| ticket.data.signer)
-                    .collect(),
-            )
-            .map_err(|error| {
-                StoreError::Protocol(ProtocolError::InvalidCertificate(format!(
-                    "activation ensemble: {error}"
-                )))
-            })?;
-            if state.agreed_step() != 0 || ensemble != &expected {
-                return Err(StoreError::Protocol(ProtocolError::SessionStartMismatch));
-            }
-        }
-        Event::MessageReceived {
-            message_id,
-            from,
-            position,
-            pre_state,
-            msg,
-        } => {
-            if *position != state.agreed_step()
-                || *pre_state != state.agreed_state()
-                || !is_participant(state, *from)
-                || *message_id
-                    != MessageId::derive(
-                        state.binding().session_id(),
-                        *from,
-                        *position,
-                        *pre_state,
-                        post_state,
-                        msg,
-                    )
-            {
-                return Err(StoreError::Protocol(ProtocolError::InvalidCertificate(
-                    "message event does not match agreed cursor".into(),
-                )));
-            }
-        }
-        _ => {
-            return Err(StoreError::Protocol(ProtocolError::InvalidCertificate(
-                "non-portable event".into(),
-            )));
-        }
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2326,15 +1796,6 @@ fn validate_dispatch_sources(
         }
     }
     Ok(())
-}
-
-fn is_participant(state: &ExecutionState, peer: PeerId) -> bool {
-    state
-        .binding()
-        .activation()
-        .tickets()
-        .iter()
-        .any(|ticket| ticket.data.signer == peer)
 }
 
 fn dispatch_digest(event: &[u8], effects: &[u8]) -> [u8; 32] {

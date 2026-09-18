@@ -57,9 +57,7 @@ pub use error::ProtocolError;
 pub use outcome::TerminalOutcome;
 pub use pending::{PendingId, PendingIdParseError, pending_id};
 pub use signing::GuestSignData;
-pub use state::{
-    ExecutionState, SharedProposal, StepCertificate, TerminalCertificate, TerminalPublication,
-};
+pub use state::{ExecutionState, SharedProposal, StepCertificate, TerminalCertificate};
 pub use status::{ExecutionStatus, PublishedProof, ReceiptWork, StopCause, TerminalProof};
 pub use timer::TimerId;
 pub use timer_firing::TimerFiring;

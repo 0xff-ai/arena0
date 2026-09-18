@@ -161,12 +161,7 @@ impl Database {
         receipt: ReceiptArtifact,
         now_ms: u64,
     ) -> Result<ReceiptImportOutcome, StoreError> {
-        self.begin()?;
-        let result = self.import_receipt_in_transaction(receipt, now_ms);
-        match result {
-            Ok(outcome) => self.commit_result(outcome),
-            Err(error) => self.rollback_result(error),
-        }
+        self.transaction(|store| store.import_receipt_in_transaction(receipt, now_ms))
     }
 
     fn import_receipt_in_transaction(

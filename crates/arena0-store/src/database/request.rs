@@ -17,9 +17,8 @@ impl Database {
             });
         }
         validate_request_params(&admission, params_bytes.is_some())?;
-        self.begin()?;
-        let result = (|| {
-            let existing = self.load_execution_request_in_transaction(execution_id)?;
+        self.transaction(|store| {
+            let existing = store.load_execution_request_in_transaction(execution_id)?;
             if let Some(existing) = existing {
                 if existing.program_hash == program_hash
                     && existing.params.as_ref().map(JsonBytes::as_bytes) == params_bytes.as_deref()
@@ -29,8 +28,8 @@ impl Database {
                 }
                 return Ok(ExecutionRequestOutcome::Conflict);
             }
-            self.ensure_program_registered(program_hash)?;
-            validate_local_admission(self.host_id, &admission)?;
+            store.ensure_program_registered(program_hash)?;
+            validate_local_admission(store.host_id, &admission)?;
             let admission_bytes = borsh::to_vec(&admission).map_err(|error| {
                 StoreError::InvalidAdmission(format!("admission encoding failed: {error}"))
             })?;
@@ -40,7 +39,7 @@ impl Database {
                     capacity: MAX_ADMISSION_BYTES,
                 });
             }
-            self.connection.execute(
+            store.connection.execute(
                 "INSERT INTO exec_requests
                  (execution_id, program_hash, params, admission, created_at_ms, failure)
                  VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
@@ -53,11 +52,7 @@ impl Database {
                 ],
             )?;
             Ok(ExecutionRequestOutcome::Created)
-        })();
-        match result {
-            Ok(outcome) => self.commit_result(outcome),
-            Err(error) => self.rollback_result(error),
-        }
+        })
     }
 
     pub(super) fn load_execution_request(
@@ -77,15 +72,17 @@ impl Database {
                 "a Host cannot join its own negotiation".into(),
             ));
         }
-        self.begin()?;
-        let result = (|| {
-            let request = self
+        self.transaction(|store| {
+            let request = store
                 .load_execution_request_in_transaction(execution_id)?
                 .ok_or(StoreError::ExecutionRequestNotFound(execution_id))?;
             if request.failure().is_some() {
                 return Err(StoreError::ExecutionLifecycleStarted(execution_id));
             }
-            if self.load_activation_in_transaction(execution_id)?.is_some() {
+            if store
+                .load_activation_in_transaction(execution_id)?
+                .is_some()
+            {
                 return Err(StoreError::ExecutionLifecycleStarted(execution_id));
             }
             let admission = match request.admission {
@@ -113,7 +110,7 @@ impl Database {
                     capacity: MAX_ADMISSION_BYTES,
                 });
             }
-            self.connection.execute(
+            store.connection.execute(
                 "UPDATE exec_requests SET admission = ?1
                  WHERE execution_id = ?2 AND failure IS NULL",
                 params![
@@ -122,11 +119,7 @@ impl Database {
                 ],
             )?;
             Ok(AdmissionBindingOutcome::Bound)
-        })();
-        match result {
-            Ok(outcome) => self.commit_result(outcome),
-            Err(error) => self.rollback_result(error),
-        }
+        })
     }
 
     pub(super) fn load_execution_request_in_transaction(
@@ -238,12 +231,14 @@ impl Database {
         execution_id: ExecId,
         reason: String,
     ) -> Result<ExecutionRequestFailureOutcome, StoreError> {
-        self.begin()?;
-        let result = (|| {
-            let request = self
+        self.transaction(|store| {
+            let request = store
                 .load_execution_request_in_transaction(execution_id)?
                 .ok_or(StoreError::ExecutionRequestNotFound(execution_id))?;
-            if self.load_activation_in_transaction(execution_id)?.is_some() {
+            if store
+                .load_activation_in_transaction(execution_id)?
+                .is_some()
+            {
                 return Err(StoreError::ExecutionLifecycleStarted(execution_id));
             }
             match request.failure() {
@@ -252,7 +247,7 @@ impl Database {
                 }
                 Some(_) => Ok(ExecutionRequestFailureOutcome::Conflict),
                 None => {
-                    self.connection.execute(
+                    store.connection.execute(
                         "UPDATE exec_requests SET failure = ?1 WHERE execution_id = ?2
                          AND failure IS NULL",
                         params![reason, execution_id.0.to_vec()],
@@ -260,11 +255,7 @@ impl Database {
                     Ok(ExecutionRequestFailureOutcome::Recorded)
                 }
             }
-        })();
-        match result {
-            Ok(outcome) => self.commit_result(outcome),
-            Err(error) => self.rollback_result(error),
-        }
+        })
     }
 
     pub(super) fn ensure_execution_request_matches(

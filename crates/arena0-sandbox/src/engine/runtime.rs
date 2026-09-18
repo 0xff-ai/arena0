@@ -433,25 +433,7 @@ impl ProgramInstance {
     /// Promote the currently resident state images to the rollback checkpoint
     /// after the owning store transaction confirms commitment.
     pub fn commit_payloads(&mut self) -> Result<(SharedStateBytes, LocalStateBytes), SandboxError> {
-        let (shared, local) = {
-            let shared_view = canonical_state_view(
-                &self.store,
-                self.shared_memory,
-                self.shared_max_bytes,
-                "shared",
-            )?;
-            let local_view = canonical_state_view(
-                &self.store,
-                self.local_memory,
-                self.profile.limits.max_local_state_bytes as usize,
-                "local",
-            )?;
-            let shared = SharedStateBytes::try_from_slice(shared_view.payload)
-                .map_err(|error| SandboxError::dispatch_failed(error.to_string()))?;
-            let local = LocalStateBytes::try_from_slice(local_view.payload)
-                .map_err(|error| SandboxError::dispatch_failed(error.to_string()))?;
-            (shared, local)
-        };
+        let (shared, local, _) = self.resident_payloads()?;
         self.committed_shared = shared.clone();
         self.committed_local = local.clone();
         Ok((shared, local))
@@ -461,6 +443,34 @@ impl ProgramInstance {
     #[must_use]
     pub fn committed_payloads(&self) -> (&SharedStateBytes, &LocalStateBytes) {
         (&self.committed_shared, &self.committed_local)
+    }
+
+    fn resident_payloads(
+        &self,
+    ) -> Result<(SharedStateBytes, LocalStateBytes, [u8; 32]), SandboxError> {
+        let shared_view = canonical_state_view(
+            &self.store,
+            self.shared_memory,
+            self.shared_max_bytes,
+            "shared",
+        )?;
+        let local_view = canonical_state_view(
+            &self.store,
+            self.local_memory,
+            self.profile.limits.max_local_state_bytes as usize,
+            "local",
+        )?;
+        let shared_hash = arena0_protocol::StateHash::of(shared_view.image).0;
+        let shared = SharedStateBytes::try_from_slice(shared_view.payload)
+            .map_err(|error| SandboxError::dispatch_failed(error.to_string()))?;
+        let local = LocalStateBytes::try_from_slice(local_view.payload)
+            .map_err(|error| SandboxError::dispatch_failed(error.to_string()))?;
+        Ok((shared, local, shared_hash))
+    }
+
+    fn rollback_error<T>(&mut self, error: SandboxError) -> Result<T, SandboxError> {
+        let _ = self.rollback_after_failure();
+        Err(error)
     }
 
     fn dispatch_input(
@@ -482,8 +492,7 @@ impl ProgramInstance {
             SandboxError::InputLimitExceeded("dispatch input length overflows u32".into())
         })?;
         if let Err(error) = self.reset_for_dispatch(lifecycle, random_replay) {
-            let _ = self.rollback_after_failure();
-            return Err(error);
+            return self.rollback_error(error);
         }
         let input_ptr_result = {
             let mut guest = Guest::new(&mut self.store, &self.instance);
@@ -493,39 +502,22 @@ impl ProgramInstance {
                     .map(|()| ptr)
             })
         };
-        let input_ptr = match input_ptr_result {
-            Ok(ptr) => ptr,
-            Err(error) => {
-                self.rollback_after_failure()?;
-                return Err(error);
-            }
-        };
+        let input_ptr = input_ptr_result.or_else(|error| self.rollback_error(error))?;
         let returned = {
             let mut guest = Guest::new(&mut self.store, &self.instance);
             guest.call_pair_return(abi::exports::DISPATCH, input_ptr, bytes_len)
         };
-        let returned = match returned {
-            Ok(returned) => returned,
-            Err(error) => {
-                self.rollback_after_failure()?;
-                return Err(error);
-            }
-        };
-        let output = match self.decode_resident_result(returned.0, returned.1) {
-            Ok(output) => output,
-            Err(error) => {
-                let _ = self.rollback_after_failure();
-                return Err(error);
-            }
-        };
+        let returned = returned.or_else(|error| self.rollback_error(error))?;
+        let output = self
+            .decode_resident_result(returned.0, returned.1)
+            .or_else(|error| self.rollback_error(error))?;
         {
             let mut guest = Guest::new(&mut self.store, &self.instance);
             if let Err(error) = guest
                 .zero_mem(input_ptr, bytes_len)
                 .and_then(|()| guest.dealloc(input_ptr, bytes_len))
             {
-                let _ = self.rollback_after_failure();
-                return Err(error);
+                return self.rollback_error(error);
             }
         }
         let fuel_used = self
@@ -554,24 +546,17 @@ impl ProgramInstance {
             });
         }
 
-        let mut observations = match self.store.data_mut().finish_observations(fuel_used) {
-            Ok(observations) => observations,
-            Err(error) => {
-                let _ = self.rollback_after_failure();
-                return Err(error);
-            }
-        };
+        let mut observations = self
+            .store
+            .data_mut()
+            .finish_observations(fuel_used)
+            .or_else(|error| self.rollback_error(error))?;
 
         // Retry is an accepted control path whose state result is discarded.
         // Decide it before reading candidate frames so a guest cannot turn a
         // retry into a sandbox error by corrupting either canonical memory.
-        let retry_effect = match retry_effect(&observations.effects) {
-            Ok(effect) => effect,
-            Err(error) => {
-                let _ = self.rollback_after_failure();
-                return Err(error);
-            }
-        };
+        let retry_effect =
+            retry_effect(&observations.effects).or_else(|error| self.rollback_error(error))?;
         if let Some(retry_effect) = retry_effect {
             self.rollback_after_failure()?;
             observations.effects = vec![retry_effect];
@@ -592,48 +577,9 @@ impl ProgramInstance {
         // the sole successful work-memory/global reset boundary; failed calls
         // use rollback below, while the next dispatch deterministically resets
         // any successful call's temporary work state before re-entry.
-        let (shared, local, shared_hash) = {
-            let shared_view = match canonical_state_view(
-                &self.store,
-                self.shared_memory,
-                self.shared_max_bytes,
-                "shared",
-            ) {
-                Ok(view) => view,
-                Err(error) => {
-                    let _ = self.rollback_after_failure();
-                    return Err(error);
-                }
-            };
-            let local_view = match canonical_state_view(
-                &self.store,
-                self.local_memory,
-                self.profile.limits.max_local_state_bytes as usize,
-                "local",
-            ) {
-                Ok(view) => view,
-                Err(error) => {
-                    let _ = self.rollback_after_failure();
-                    return Err(error);
-                }
-            };
-            let shared_hash = arena0_protocol::StateHash::of(shared_view.image).0;
-            let shared = match SharedStateBytes::try_from_slice(shared_view.payload) {
-                Ok(shared) => shared,
-                Err(error) => {
-                    let _ = self.rollback_after_failure();
-                    return Err(SandboxError::dispatch_failed(error.to_string()));
-                }
-            };
-            let local = match LocalStateBytes::try_from_slice(local_view.payload) {
-                Ok(local) => local,
-                Err(error) => {
-                    let _ = self.rollback_after_failure();
-                    return Err(SandboxError::dispatch_failed(error.to_string()));
-                }
-            };
-            (shared, local, shared_hash)
-        };
+        let (shared, local, shared_hash) = self
+            .resident_payloads()
+            .or_else(|error| self.rollback_error(error))?;
         Ok(DispatchCallResult {
             status: output.status,
             shared,

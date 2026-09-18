@@ -423,7 +423,7 @@ impl ExecutionActor {
                 self.discard_candidate()?;
                 return Ok(None);
             }
-            self.sync_resident(&state)?;
+            self.reconcile_resident(&state)?;
 
             let call = {
                 let mut call = DispatchCall::new(
@@ -651,29 +651,16 @@ impl ExecutionActor {
         restored
     }
 
-    fn sync_resident(&mut self, state: &ExecutionState) -> Result<(), ExecError> {
-        let needs_restore = self.instance.as_ref().is_none_or(|instance| {
-            instance.committed_payloads().0 != state.shared_state()
-                || instance.committed_payloads().1 != state.local_state()
-        });
-        if needs_restore {
-            self.restore_resident(state)?;
-        }
-        Ok(())
+    pub(super) async fn reload_resident(&mut self) -> Result<(), ExecError> {
+        let state = self.load_state().await?;
+        self.reconcile_resident(&state)
     }
 
-    pub(super) async fn reload_resident(&mut self) -> Result<(), ExecError> {
-        let state = self
-            .context
-            .store
-            .load_execution()
-            .await?
-            .ok_or(ExecError::NotFound(self.context.exec_id))?;
-        let needs_restore = self.instance.as_ref().is_none_or(|instance| {
-            instance.committed_payloads().0 != state.shared_state()
-                || instance.committed_payloads().1 != state.local_state()
-        });
-        if !needs_restore {
+    fn reconcile_resident(&mut self, state: &ExecutionState) -> Result<(), ExecError> {
+        if self.instance.as_ref().is_some_and(|instance| {
+            instance.committed_payloads().0 == state.shared_state()
+                && instance.committed_payloads().1 == state.local_state()
+        }) {
             return Ok(());
         }
         if let Some(instance) = self.instance.as_mut() {
@@ -685,14 +672,14 @@ impl ExecutionActor {
             }
             restored
         } else {
-            self.restore_resident(&state)
+            self.restore_resident(state)
         }
     }
 
     pub(super) async fn restore_after_store_error(&mut self) {
         self.instance = None;
         if let Ok(Some(state)) = self.context.store.load_execution().await
-            && let Err(error) = self.restore_resident(&state)
+            && let Err(error) = self.reconcile_resident(&state)
         {
             tracing::error!(
                 exec_id = %self.context.exec_id,

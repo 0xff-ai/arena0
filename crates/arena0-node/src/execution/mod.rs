@@ -74,6 +74,20 @@ pub(super) struct InflightSend {
     pub(super) task: Option<JoinHandle<Result<(), arena0_transport::TransportError>>>,
 }
 
+fn callout_requested(
+    pending_id: arena0_protocol::PendingId,
+    callout_index: u32,
+    context: Vec<u8>,
+    expected_type: Option<String>,
+) -> SessionMessage {
+    SessionMessage::CalloutRequested {
+        pending_id,
+        callout_index,
+        context,
+        expected_type,
+    }
+}
+
 impl InflightSend {
     pub(super) async fn wait(
         &mut self,

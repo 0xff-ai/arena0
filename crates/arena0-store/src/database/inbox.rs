@@ -22,12 +22,7 @@ impl Database {
         frame: AuthenticatedFrame,
         now_ms: u64,
     ) -> Result<InboxAcceptOutcome, StoreError> {
-        self.begin()?;
-        let result = self.accept_inbound_in_transaction(execution_id, frame, now_ms);
-        match result {
-            Ok(value) => self.commit_result(value),
-            Err(error) => self.rollback_result(error),
-        }
+        self.transaction(|store| store.accept_inbound_in_transaction(execution_id, frame, now_ms))
     }
 
     fn accept_inbound_in_transaction(
@@ -130,18 +125,17 @@ impl Database {
         inbox_id: InboxId,
         now_ms: u64,
     ) -> Result<InboxRejectOutcome, StoreError> {
-        self.begin()?;
-        let result = (|| {
-            let state = self
+        self.transaction(|store| {
+            let state = store
                 .load_execution_in_transaction(execution_id)?
                 .ok_or(StoreError::ExecutionNotFound(execution_id))?;
             let (_source, _stored, status, _version) =
-                self.load_inbox_fact(execution_id, inbox_id, &state)?;
+                store.load_inbox_fact(execution_id, inbox_id, &state)?;
             match status {
                 InboxStatus::Applied => Ok(InboxRejectOutcome::AlreadyApplied),
                 InboxStatus::Consumed => Ok(InboxRejectOutcome::AlreadyRejected),
                 InboxStatus::Accepted => {
-                    let changed = self.connection.execute("UPDATE inbox SET status = 'consumed', consumed_at_ms = ?1 WHERE execution_id = ?2 AND inbox_id = ?3 AND status = 'accepted'", params![sqlite_u64(now_ms)?, execution_id.0.to_vec(), inbox_id.as_bytes().to_vec()])?;
+                    let changed = store.connection.execute("UPDATE inbox SET status = 'consumed', consumed_at_ms = ?1 WHERE execution_id = ?2 AND inbox_id = ?3 AND status = 'accepted'", params![sqlite_u64(now_ms)?, execution_id.0.to_vec(), inbox_id.as_bytes().to_vec()])?;
                     if changed != 1 {
                         return Err(StoreError::Corruption(
                             "inbound rejection compare-and-set failed".into(),
@@ -150,11 +144,7 @@ impl Database {
                     Ok(InboxRejectOutcome::Rejected)
                 }
             }
-        })();
-        match result {
-            Ok(value) => self.commit_result(value),
-            Err(error) => self.rollback_result(error),
-        }
+        })
     }
 
     fn raw_inbox_row(

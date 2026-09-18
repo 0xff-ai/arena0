@@ -10,12 +10,9 @@ impl Database {
         prepared.validate().map_err(|error| {
             StoreError::Corruption(format!("activation validation failed: {error}"))
         })?;
-        self.begin()?;
-        let result = self.prepare_activation_in_transaction(execution_id, prepared, now_ms);
-        match result {
-            Ok(outcome) => self.commit_result(outcome),
-            Err(error) => self.rollback_result(error),
-        }
+        self.transaction(|store| {
+            store.prepare_activation_in_transaction(execution_id, prepared, now_ms)
+        })
     }
 
     pub(super) fn prepare_activation_in_transaction(
@@ -95,12 +92,9 @@ impl Database {
         activation.validate().map_err(|error| {
             StoreError::Corruption(format!("activation validation failed: {error}"))
         })?;
-        self.begin()?;
-        let result = self.commit_activation_in_transaction(execution_id, activation, now_ms);
-        match result {
-            Ok(outcome) => self.commit_result(outcome),
-            Err(error) => self.rollback_result(error),
-        }
+        self.transaction(|store| {
+            store.commit_activation_in_transaction(execution_id, activation, now_ms)
+        })
     }
 
     pub(super) fn commit_activation_in_transaction(

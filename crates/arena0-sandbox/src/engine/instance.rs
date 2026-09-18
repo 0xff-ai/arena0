@@ -121,7 +121,7 @@ impl super::WasmtimeEngine {
         let module = Module::new(&self.engine, program.bytes())
             .map_err(|error| SandboxError::compilation_failed(error.to_string()))?;
         crate::finalize::validate_finalized_shape(program.bytes(), &self.profile)?;
-        validation::validate_exports(&module, &self.profile)?;
+        validation::validate_required_exports(&module)?;
         validation::validate_imports(&module, &program.definition().metadata)?;
         let _probe = instantiate_module(
             &self.engine,
@@ -162,7 +162,7 @@ impl super::WasmtimeEngine {
                 let module = Module::new(&self.engine, &finalized)
                     .map_err(|error| SandboxError::compilation_failed(error.to_string()))?;
                 crate::finalize::validate_finalized_shape(&finalized, &self.profile)?;
-                validation::validate_exports(&module, &self.profile)?;
+                validation::validate_required_exports(&module)?;
                 validation::validate_imports(&module, &definition.metadata)?;
                 Program::embed(&finalized, &definition)
             }

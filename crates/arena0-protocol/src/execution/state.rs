@@ -8,9 +8,13 @@ use std::time::Instant;
 use crate::exec::ExecLifecycle;
 use crate::negotiation::Activation;
 use crate::trace::{
-    AggregateAttestation, StepCommitment, TRACE_FORMAT_VERSION, TerminalCommitment, TraceEntry,
+    AggregateAttestation, PendingOperation, PendingRecord, StepCommitment, TRACE_FORMAT_VERSION,
+    TerminalCommitment, TraceEntry,
 };
-use crate::{Effect, Event, ExecId, MessageId, PeerId, StateHash};
+use crate::{
+    Effect, Event, ExecFrame, ExecId, MessageId, OutcomeHash, PeerId, PendingId, StateHash,
+    pending_id,
+};
 
 use super::{
     ExecutionBinding, ExecutionStatus, ExecutionVersion, MAX_EFFECTS, MAX_EXECUTION_STATE_BYTES,
@@ -226,20 +230,6 @@ impl TerminalCertificate {
     #[must_use]
     pub const fn agreement(&self) -> &AggregateAttestation {
         &self.agreement
-    }
-}
-
-/// A terminal publication commit.
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct TerminalPublication {
-    pub(crate) receipt: ReceiptArtifact,
-}
-
-impl TerminalPublication {
-    /// Borrow the authenticated receipt artifact.
-    #[must_use]
-    pub const fn receipt(&self) -> &ReceiptArtifact {
-        &self.receipt
     }
 }
 
@@ -571,6 +561,106 @@ impl ExecutionState {
         Ok(())
     }
 
+    /// Apply the pure protocol part of one accepted guest dispatch.
+    ///
+    /// The state decides whether the result installs immediately or stages a
+    /// shared proposal, derives the next status, normalizes an establishing
+    /// broadcast, and advances the version. The caller remains responsible
+    /// for validating its durable source and atomically persisting this state,
+    /// the returned establishing frame, and the original effects.
+    ///
+    /// The optional frame establishes a normalized broadcast. The boolean is
+    /// true only when this dispatch consumes the current callout or signing
+    /// continuation instead of retrying it.
+    pub fn apply_dispatch(
+        &mut self,
+        event: &Event<Vec<u8>>,
+        shared_state: SharedStateBytes,
+        local_state: LocalStateBytes,
+        effects: &[Effect],
+        terminal_outcome: Option<TerminalOutcome>,
+        pending_id: Option<PendingId>,
+    ) -> Result<(Option<(u32, ExecFrame)>, bool), ProtocolError> {
+        if self.proposal.is_some() {
+            return Err(ProtocolError::SharedProposalExists);
+        }
+        let event_position = self.event_position;
+        let post_state = StateHash::of_shared(&shared_state);
+        let indexed_effects = indexed_dispatch_effects(effects)?;
+        validate_effects(&indexed_effects)?;
+        let lifecycle = dispatch_lifecycle_effect(effects)?;
+        let broadcast_index = effects
+            .iter()
+            .position(|effect| matches!(effect, Effect::Broadcast { .. }));
+        let portable_event = matches!(
+            event,
+            Event::SessionStarted { .. } | Event::MessageReceived { .. }
+        );
+        let requires_agreement = portable_event
+            || post_state != self.agreed_state
+            || broadcast_index.is_some()
+            || lifecycle.is_some();
+        let reacted_step = reacted_step(self, event)?;
+        let closes_pending = validate_pending_dispatch(self, event, pending_id, effects)?;
+
+        if !requires_agreement {
+            if terminal_outcome.is_some() {
+                return Err(ProtocolError::TerminalOutcomeMismatch);
+            }
+            let status = next_dispatch_status(self, event, event_position, effects)?;
+            self.install_dispatch(
+                event_position,
+                shared_state,
+                local_state,
+                status,
+                reacted_step,
+            )?;
+            return Ok((None, closes_pending));
+        }
+
+        let (trace_event, proposal_effects, establishing_frame) =
+            normalize_proposal_event(self, event, &shared_state, indexed_effects, broadcast_index)?;
+        if lifecycle.is_some()
+            && proposal_effects
+                .iter()
+                .any(|(_, effect)| matches!(effect, Effect::Broadcast { .. }))
+        {
+            return Err(ProtocolError::InvalidTerminalStatus);
+        }
+        let entry = TraceEntry {
+            trace_version: TRACE_FORMAT_VERSION,
+            step: self.agreed_step,
+            event: trace_event,
+            pre_state: self.agreed_state,
+            post_state,
+            terminal: lifecycle,
+            agreement: AggregateAttestation::empty(),
+        };
+        let commitment =
+            StepCommitment::for_entry(self.binding.session_id(), &entry, self.agreed_link);
+        let status = proposal_status(
+            self,
+            event,
+            event_position,
+            &entry,
+            &commitment,
+            effects,
+            terminal_outcome,
+        )?;
+        let proposal = SharedProposal::new(
+            commitment,
+            entry,
+            shared_state,
+            local_state,
+            proposal_effects,
+            event_position,
+            status,
+            Vec::new(),
+        )?;
+        self.stage_proposal(proposal, reacted_step)?;
+        Ok((establishing_frame, closes_pending))
+    }
+
     /// Install one accepted dispatch that does not require shared agreement.
     ///
     /// Such a dispatch may replace either memory and may leave a continuation,
@@ -578,7 +668,7 @@ impl ExecutionState {
     /// dispatch that changes that hash belongs in [`Self::stage_proposal`].
     /// `reacted_step` records a `React` dispatch in the same durable mutation;
     /// ordinary events pass `None`.
-    pub fn install_dispatch(
+    fn install_dispatch(
         &mut self,
         event_position: u64,
         shared_state: SharedStateBytes,
@@ -644,7 +734,7 @@ impl ExecutionState {
     /// is consumed atomically with proposal staging so recovery cannot rerun
     /// that reaction; the proposed memories and status remain uncommitted
     /// until the step receives agreement.
-    pub fn stage_proposal(
+    fn stage_proposal(
         &mut self,
         proposal: SharedProposal,
         reacted_step: Option<u64>,
@@ -1090,6 +1180,289 @@ impl ExecutionState {
         }
         Ok(())
     }
+}
+
+fn indexed_dispatch_effects(effects: &[Effect]) -> Result<Vec<(u32, Effect)>, ProtocolError> {
+    if effects.len() > MAX_EFFECTS {
+        return Err(ProtocolError::CollectionTooLarge {
+            kind: "effects",
+            actual: effects.len(),
+            max: MAX_EFFECTS,
+        });
+    }
+    effects
+        .iter()
+        .enumerate()
+        .map(|(index, effect)| {
+            let ordinal = u32::try_from(index).map_err(|_| ProtocolError::CollectionTooLarge {
+                kind: "effects",
+                actual: effects.len(),
+                max: u32::MAX as usize,
+            })?;
+            Ok((ordinal, effect.clone()))
+        })
+        .collect()
+}
+
+fn dispatch_lifecycle_effect(effects: &[Effect]) -> Result<Option<Effect>, ProtocolError> {
+    let mut lifecycle = None;
+    for effect in effects {
+        if matches!(
+            effect,
+            Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. }
+        ) {
+            if lifecycle.is_some() {
+                return Err(ProtocolError::MultipleTerminalEffects);
+            }
+            lifecycle = Some(effect.clone());
+        }
+    }
+    Ok(lifecycle)
+}
+
+fn validate_pending_dispatch(
+    state: &ExecutionState,
+    event: &Event<Vec<u8>>,
+    pending_id: Option<PendingId>,
+    effects: &[Effect],
+) -> Result<bool, ProtocolError> {
+    let lifecycle = effects.iter().any(|effect| {
+        matches!(
+            effect,
+            Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. }
+        )
+    });
+    let continuation = effects.iter().any(|effect| {
+        matches!(
+            effect,
+            Effect::Callout { .. }
+                | Effect::Sign { .. }
+                | Effect::RetryInput { .. }
+                | Effect::SetTimer { .. }
+        )
+    });
+    if lifecycle && continuation {
+        return Err(ProtocolError::InvalidTerminalStatus);
+    }
+    let answer = matches!(event, Event::InputReceived { .. } | Event::Signed { .. });
+    let retries = effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::RetryInput { .. }));
+    if !answer {
+        if retries {
+            let Some(current) = state.status.pending() else {
+                return Err(ProtocolError::PendingContinuationMismatch);
+            };
+            if !matches!(current.operation, PendingOperation::Callout { .. })
+                || pending_id.is_some_and(|id| id != current.id)
+            {
+                return Err(ProtocolError::PendingContinuationMismatch);
+            }
+            return Ok(false);
+        }
+        if pending_id.is_some() {
+            return Err(ProtocolError::PendingContinuationMismatch);
+        }
+        return Ok(false);
+    }
+    let Some(pending_id) = pending_id else {
+        return Err(ProtocolError::PendingContinuationMismatch);
+    };
+    let Some(current) = state.status.pending() else {
+        return Err(ProtocolError::PendingContinuationMismatch);
+    };
+    if current.id != pending_id {
+        return Err(ProtocolError::PendingContinuationMismatch);
+    }
+    let matches = match (event, current.operation) {
+        (
+            Event::InputReceived {
+                callout_index,
+                continuation_tag,
+                ..
+            },
+            PendingOperation::Callout {
+                callout_index: expected_index,
+            },
+        ) => *callout_index == expected_index && *continuation_tag == current.continuation_tag,
+        (
+            Event::Signed {
+                continuation_tag, ..
+            },
+            PendingOperation::Sign,
+        ) => *continuation_tag == current.continuation_tag,
+        _ => false,
+    };
+    if !matches {
+        return Err(ProtocolError::PendingContinuationMismatch);
+    }
+    Ok(!retries)
+}
+
+fn next_dispatch_status(
+    state: &ExecutionState,
+    event: &Event<Vec<u8>>,
+    event_position: u64,
+    effects: &[Effect],
+) -> Result<ExecutionStatus, ProtocolError> {
+    let existing = state.status.pending().cloned();
+    let continuation = effects
+        .iter()
+        .enumerate()
+        .filter(|(_, effect)| matches!(effect, Effect::Callout { .. } | Effect::Sign { .. }))
+        .map(|(index, effect)| {
+            let ordinal =
+                u32::try_from(index).map_err(|_| ProtocolError::InvalidPendingContinuation)?;
+            let id = pending_id(state.execution_id, event_position, ordinal);
+            PendingRecord::from_effect(id, effect).ok_or(ProtocolError::InvalidPendingContinuation)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if continuation.len() > 1 {
+        return Err(ProtocolError::InvalidPendingContinuation);
+    }
+    let consumes_pending = matches!(event, Event::InputReceived { .. } | Event::Signed { .. });
+    let retries = effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::RetryInput { .. }));
+    if let Some(next) = continuation.into_iter().next() {
+        if retries || (existing.is_some() && !consumes_pending) {
+            return Err(ProtocolError::InvalidPendingContinuation);
+        }
+        return Ok(ExecutionStatus::waiting(next));
+    }
+    if retries {
+        return existing
+            .map(ExecutionStatus::waiting)
+            .ok_or(ProtocolError::PendingContinuationMismatch);
+    }
+    if !consumes_pending {
+        return Ok(existing.map_or_else(ExecutionStatus::active, ExecutionStatus::waiting));
+    }
+    Ok(ExecutionStatus::active())
+}
+
+fn reacted_step(
+    state: &ExecutionState,
+    event: &Event<Vec<u8>>,
+) -> Result<Option<u64>, ProtocolError> {
+    if !matches!(event, Event::React) {
+        return Ok(None);
+    }
+    state
+        .agreed_step
+        .checked_sub(1)
+        .map(Some)
+        .ok_or(ProtocolError::InvalidTerminalStatus)
+}
+
+type NormalizedProposalEvent = (Event<Vec<u8>>, Vec<(u32, Effect)>, Option<(u32, ExecFrame)>);
+
+fn normalize_proposal_event(
+    state: &ExecutionState,
+    event: &Event<Vec<u8>>,
+    shared: &SharedStateBytes,
+    mut proposal_effects: Vec<(u32, Effect)>,
+    broadcast_index: Option<usize>,
+) -> Result<NormalizedProposalEvent, ProtocolError> {
+    if let Some(index) = broadcast_index
+        && matches!(
+            event,
+            Event::InputReceived { .. }
+                | Event::TimerFired
+                | Event::TypedTimerFired { .. }
+                | Event::Signed { .. }
+                | Event::React
+        )
+    {
+        let Effect::Broadcast { data } = &proposal_effects[index].1 else {
+            return Err(ProtocolError::InvalidCertificate(
+                "broadcast ordinal does not identify a broadcast".into(),
+            ));
+        };
+        let data = data.clone();
+        let ordinal = proposal_effects[index].0;
+        proposal_effects.remove(index);
+        let post_state = StateHash::of_shared(shared);
+        let message_id = MessageId::derive(
+            state.binding.session_id(),
+            state.producer,
+            state.agreed_step,
+            state.agreed_state,
+            post_state,
+            &data,
+        );
+        let frame = ExecFrame::Message {
+            message_id,
+            seq: state.agreed_step,
+            prestate: state.agreed_state,
+            poststate: post_state,
+            data: data.clone(),
+        };
+        return Ok((
+            Event::MessageReceived {
+                message_id,
+                from: state.producer,
+                position: state.agreed_step,
+                pre_state: state.agreed_state,
+                msg: data,
+            },
+            proposal_effects,
+            Some((ordinal, frame)),
+        ));
+    }
+    match event {
+        Event::SessionStarted { .. } | Event::MessageReceived { .. } => {
+            Ok((event.clone(), proposal_effects, None))
+        }
+        _ => Err(ProtocolError::InvalidCertificate(
+            "shared dispatch requires a portable event or a broadcast".into(),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn proposal_status(
+    state: &ExecutionState,
+    event: &Event<Vec<u8>>,
+    event_position: u64,
+    entry: &TraceEntry,
+    commitment: &StepCommitment,
+    effects: &[Effect],
+    terminal_outcome: Option<TerminalOutcome>,
+) -> Result<ExecutionStatus, ProtocolError> {
+    if let Some(terminal) = &entry.terminal {
+        match terminal {
+            Effect::SessionEnd {
+                outcome: effect_outcome,
+            } => {
+                let outcome = terminal_outcome.ok_or(ProtocolError::TerminalOutcomeRequired)?;
+                if outcome.borsh() != effect_outcome.as_slice() {
+                    return Err(ProtocolError::OutcomeProjectionMismatch);
+                }
+                let terminal_commitment = TerminalCommitment::new(
+                    state.binding.session_id(),
+                    entry.step,
+                    entry.post_state,
+                    OutcomeHash::of(outcome.borsh()),
+                );
+                return Ok(ExecutionStatus::from_terminal_proof(
+                    TerminalProof::pending(terminal_commitment, outcome, Vec::new()),
+                ));
+            }
+            Effect::SessionAbort { .. } | Effect::Fail { .. } => {
+                if terminal_outcome.is_some() {
+                    return Err(ProtocolError::TerminalOutcomeMismatch);
+                }
+                return ExecutionStatus::from_shared_entry(entry, commitment.clone())?
+                    .ok_or(ProtocolError::InvalidTerminalStatus);
+            }
+            _ => return Err(ProtocolError::InvalidTerminalStatus),
+        }
+    }
+    if terminal_outcome.is_some() {
+        return Err(ProtocolError::TerminalOutcomeMismatch);
+    }
+    next_dispatch_status(state, event, event_position, effects)
 }
 
 #[cfg(test)]

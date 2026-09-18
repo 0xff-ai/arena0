@@ -44,24 +44,6 @@ impl CallKind {
         matches!(self, Self::Dispatch)
     }
 
-    pub(crate) const fn allows_random(self) -> bool {
-        matches!(self, Self::Dispatch)
-    }
-
-    /// Whether this call kind may record the given protocol effect.
-    pub(crate) fn allows_effect(&self, _effect: &Effect) -> bool {
-        match self {
-            Self::Dispatch => true,
-            Self::Prepare
-            | Self::Metadata
-            | Self::Initialize
-            | Self::Writer
-            | Self::Query
-            | Self::View
-            | Self::Outcome => false,
-        }
-    }
-
     pub(crate) const fn allows_state_io(self) -> bool {
         matches!(self, Self::Dispatch)
     }
@@ -422,7 +404,6 @@ mod tests {
     #[test]
     fn call_kinds_expose_only_their_declared_effect_surface() {
         assert!(!CallKind::Prepare.allows_effects());
-        assert!(!CallKind::Prepare.allows_random());
         assert!(!CallKind::Prepare.allows_state_io());
         assert!(!CallKind::Initialize.allows_effects());
         assert!(!CallKind::Writer.allows_effects());
@@ -430,12 +411,6 @@ mod tests {
         assert!(!CallKind::View.allows_effects());
         assert!(!CallKind::Outcome.allows_effects());
         assert!(CallKind::Dispatch.allows_effects());
-        assert!(CallKind::Dispatch.allows_random());
-        assert!(CallKind::Dispatch.allows_effect(&Effect::SessionEnd { outcome: vec![] }));
-        assert!(CallKind::Dispatch.allows_effect(&Effect::Broadcast { data: vec![] }));
-        assert!(!CallKind::Initialize.allows_effect(&Effect::Fail {
-            reason: String::new(),
-        }));
     }
 
     #[test]

@@ -673,6 +673,7 @@ pub(crate) fn validate_shared_entry(
             if expected_step == 0 {
                 return Err(ProtocolError::MissingSessionStart);
             }
+            binding.participant_key(from)?;
             if *position != expected_step {
                 return Err(ProtocolError::StepCoordinateMismatch {
                     expected: expected_step,

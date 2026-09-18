@@ -23,6 +23,21 @@ impl Database {
         Ok(())
     }
 
+    /// Run one database operation inside the store's cache-aware transaction
+    /// boundary. Successful SQLite commit publishes the pending execution
+    /// snapshot; any operation or commit failure clears it, and a failed
+    /// rollback poisons the sole database owner.
+    pub(super) fn transaction<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        self.begin()?;
+        match operation(self) {
+            Ok(value) => self.commit_result(value),
+            Err(error) => self.rollback_result(error),
+        }
+    }
+
     pub(super) fn commit_result<T>(&mut self, value: T) -> Result<T, StoreError> {
         let started =
             tracing::enabled!(target: PERFORMANCE_TARGET, tracing::Level::DEBUG).then(Instant::now);

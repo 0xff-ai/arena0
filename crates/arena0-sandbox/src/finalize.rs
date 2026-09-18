@@ -544,14 +544,21 @@ pub(crate) fn validate_finalized_shape(
         (abi::exports::SHARED_MEMORY, 1),
         (abi::exports::LOCAL_MEMORY, 2),
     ];
-    if expected_memories.iter().any(|(name, index)| {
-        shape
-            .exports
-            .get(*name)
-            .is_none_or(|(kind, exported_index)| {
-                *kind != ExternalKind::Memory || exported_index != index
-            })
-    }) {
+    let exported_memory_count = shape
+        .exports
+        .values()
+        .filter(|(kind, _)| *kind == ExternalKind::Memory)
+        .count();
+    if exported_memory_count != expected_memories.len()
+        || expected_memories.iter().any(|(name, index)| {
+            shape
+                .exports
+                .get(*name)
+                .is_none_or(|(kind, exported_index)| {
+                    *kind != ExternalKind::Memory || exported_index != index
+                })
+        })
+    {
         return Err(SandboxError::InvalidMetadata(
             "ABI-21 work and state memory exports do not match their memories".into(),
         ));
@@ -598,5 +605,24 @@ mod tests {
         assert_eq!(pages_for_bytes(0).unwrap(), 0);
         assert_eq!(pages_for_bytes(65_536).unwrap(), 1);
         assert_eq!(pages_for_bytes(65_537).unwrap(), 2);
+    }
+
+    #[test]
+    fn finalized_shape_rejects_memory_alias_exports() {
+        let binary = wat::parse_str(
+            r#"(module
+                (memory $work 1 1024)
+                (memory $shared 65 65)
+                (memory $local 65 65)
+                (export "memory" (memory $work))
+                (export "work_alias" (memory $work))
+                (export "arena0_shared" (memory $shared))
+                (export "arena0_local" (memory $local))
+                (func (export "arena0_dispatch") (param i32 i32) (result i64)
+                    i64.const 0))"#,
+        )
+        .unwrap();
+        let error = validate_finalized_shape(&binary, &ExecutionProfile::current()).unwrap_err();
+        assert!(matches!(error, SandboxError::InvalidMetadata(_)));
     }
 }

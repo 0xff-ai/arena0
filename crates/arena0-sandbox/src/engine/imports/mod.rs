@@ -42,7 +42,6 @@ pub(super) trait CallerExt {
     ) -> Result<Vec<u8>, wasmtime::Error>;
     fn begin_import(&mut self, _name: &str) -> Result<(), wasmtime::Error>;
     fn reject_read_only(&self, name: &str) -> Result<(), wasmtime::Error>;
-    fn reject_random_disallowed(&self, name: &str) -> Result<(), wasmtime::Error>;
     fn reject_if_lifecycle_disallowed(
         &self,
         function_name: &str,
@@ -121,16 +120,6 @@ impl CallerExt for Caller<'_, HostState> {
         Ok(())
     }
 
-    fn reject_random_disallowed(&self, name: &str) -> Result<(), wasmtime::Error> {
-        self.reject_read_only(name)?;
-        if !self.data().call_kind.allows_random() {
-            return Err(wasmtime::Error::msg(format!(
-                "{name}: randomness is unavailable to this call"
-            )));
-        }
-        Ok(())
-    }
-
     fn reject_if_lifecycle_disallowed(
         &self,
         function_name: &str,
@@ -167,7 +156,7 @@ impl CallerExt for Caller<'_, HostState> {
                 wasmtime::Error::msg(format!("callout context schema validation failed: {error}"))
             })?;
         }
-        if !self.data().call_kind.allows_effect(&effect) {
+        if !self.data().call_kind.allows_effects() {
             return Err(wasmtime::Error::msg(format!(
                 "effect {:?} is unavailable to {:?} calls",
                 effect,

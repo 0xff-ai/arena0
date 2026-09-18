@@ -32,7 +32,7 @@ use arena0_protocol::{
     AbortOccurrence, Activation, ExecFrame, ExecId, ExecLifecycle, ExecutionAdmission,
     LocalStateBytes, MessageId, NegotiationTarget, PeerId, PreparedActivation, ProtocolError,
     SessionHash, SharedStateBytes, StateHash, StepCommitment, TerminalCommitment, TerminalOutcome,
-    TimerPayload, TraceEntry,
+    TimerPayload,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -1717,16 +1717,11 @@ impl StoreHandle {
         &self,
         execution_id: ExecId,
     ) -> Result<Option<ExecutionRequest>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::LoadExecutionRequest {
-                execution_id,
-                reply,
-            },
-            128,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.request(128, |reply| Command::LoadExecutionRequest {
+            execution_id,
+            reply,
+        })
+        .await
     }
 
     async fn bind_join_target(
@@ -1734,17 +1729,12 @@ impl StoreHandle {
         execution_id: ExecId,
         target: NegotiationTarget,
     ) -> Result<AdmissionBindingOutcome, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::BindJoinTarget {
-                execution_id,
-                target,
-                reply,
-            },
-            256,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.request(256, |reply| Command::BindJoinTarget {
+            execution_id,
+            target,
+            reply,
+        })
+        .await
     }
 
     /// List bounded admission roots in their durable creation order.
@@ -1752,13 +1742,10 @@ impl StoreHandle {
         &self,
         limit: usize,
     ) -> Result<Vec<ExecutionRequest>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::ListExecutionRequests { limit, reply },
-            self.command_cost(256, limit, 512)?,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.request(self.command_cost(256, limit, 512)?, |reply| {
+            Command::ListExecutionRequests { limit, reply }
+        })
+        .await
     }
 
     /// List one ordered page of every durable request that can still make
@@ -1775,17 +1762,14 @@ impl StoreHandle {
         cursor: RecoveryCursor,
         limit: usize,
     ) -> Result<RecoveryPage, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
+        self.request(self.command_cost(512, limit, 512)?, |reply| {
             Command::ListRecoveryCandidates {
                 cursor,
                 limit,
                 reply,
-            },
-            self.command_cost(512, limit, 512)?,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            }
+        })
+        .await
     }
 
     /// Import one bounded Wasm program under its verified content address.
@@ -1805,18 +1789,15 @@ impl StoreHandle {
         }
         let hash = ProgramHash::of(&wasm);
         let cost = self.command_cost(wasm.len(), 1, 512)?;
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::RegisterProgram {
+        let outcome = self
+            .request(cost, |reply| Command::RegisterProgram {
                 hash,
                 wasm,
                 now_ms,
                 reply,
-            },
-            cost,
-        )
-        .await?;
-        Ok((hash, response.await.map_err(|_| StoreError::ReplyDropped)??))
+            })
+            .await?;
+        Ok((hash, outcome))
     }
 
     /// Load one exact content-addressed Wasm program.
@@ -1824,20 +1805,16 @@ impl StoreHandle {
         &self,
         hash: ProgramHash,
     ) -> Result<Option<StoredProgram>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(Command::LoadProgram { hash, reply }, 128).await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.request(128, |reply| Command::LoadProgram { hash, reply })
+            .await
     }
 
     /// List bounded content addresses for registry recovery.
     pub async fn list_programs(&self, limit: usize) -> Result<Vec<ProgramHash>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::ListPrograms { limit, reply },
-            self.command_cost(128, limit, 40)?,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.request(self.command_cost(128, limit, 40)?, |reply| {
+            Command::ListPrograms { limit, reply }
+        })
+        .await
     }
 
     /// Unregister a program from the active catalog while retaining its bytes
@@ -1847,17 +1824,12 @@ impl StoreHandle {
         hash: ProgramHash,
         now_ms: u64,
     ) -> Result<ProgramRemoveOutcome, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::RemoveProgram {
-                hash,
-                now_ms,
-                reply,
-            },
-            128,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.request(128, |reply| Command::RemoveProgram {
+            hash,
+            now_ms,
+            reply,
+        })
+        .await
     }
 
     /// Load a permanent activation record.
@@ -1865,16 +1837,11 @@ impl StoreHandle {
         &self,
         execution_id: ExecId,
     ) -> Result<Option<ActivationRecord>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::LoadActivation {
-                execution_id,
-                reply,
-            },
-            64,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.request(64, |reply| Command::LoadActivation {
+            execution_id,
+            reply,
+        })
+        .await
     }
 
     /// Load and validate one execution aggregate.
@@ -1882,16 +1849,11 @@ impl StoreHandle {
         &self,
         execution_id: ExecId,
     ) -> Result<Option<ExecutionState>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::LoadExecution {
-                execution_id,
-                reply,
-            },
-            64,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.request(64, |reply| Command::LoadExecution {
+            execution_id,
+            reply,
+        })
+        .await
     }
 
     /// Load the unique local execution bound to a session identity.
@@ -1899,10 +1861,11 @@ impl StoreHandle {
         &self,
         session_id: SessionHash,
     ) -> Result<Option<ExecutionState>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(Command::LoadExecutionBySession { session_id, reply }, 64)
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.request(64, |reply| Command::LoadExecutionBySession {
+            session_id,
+            reply,
+        })
+        .await
     }
 
     /// List bounded permanent activation records for restart recovery.
@@ -1910,24 +1873,18 @@ impl StoreHandle {
         &self,
         limit: usize,
     ) -> Result<Vec<ActivationRecord>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::ListActivations { limit, reply },
-            self.command_cost(128, limit, 256)?,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.request(self.command_cost(128, limit, 256)?, |reply| {
+            Command::ListActivations { limit, reply }
+        })
+        .await
     }
 
     /// List bounded execution aggregates for restart recovery.
     pub async fn list_executions(&self, limit: usize) -> Result<Vec<ExecutionState>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::ListExecutions { limit, reply },
-            self.command_cost(128, limit, 1024)?,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.request(self.command_cost(128, limit, 1024)?, |reply| {
+            Command::ListExecutions { limit, reply }
+        })
+        .await
     }
 
     /// List accepted frames that still need resolution after a restart. The
@@ -1937,17 +1894,14 @@ impl StoreHandle {
         execution_id: ExecId,
         limit: usize,
     ) -> Result<Vec<PendingInboxItem>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
+        self.request(self.command_cost(256, limit, 1_024)?, |reply| {
             Command::ListPendingInbox {
                 execution_id,
                 limit,
                 reply,
-            },
-            self.command_cost(256, limit, 1_024)?,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            }
+        })
+        .await
     }
 
     /// Load the exact pending agent request for one execution.
@@ -1960,16 +1914,11 @@ impl StoreHandle {
         &self,
         execution_id: ExecId,
     ) -> Result<Vec<PendingRequest>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::ListPendingRequests {
-                execution_id,
-                reply,
-            },
-            512,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.request(512, |reply| Command::ListPendingRequests {
+            execution_id,
+            reply,
+        })
+        .await
     }
 
     /// Read a bounded public trace range from the durable execution.
@@ -1983,18 +1932,15 @@ impl StoreHandle {
         from: u64,
         to: u64,
     ) -> Result<Vec<arena0_protocol::TraceEntry>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
+        self.request(self.command_cost(256, 1, 1_024)?, |reply| {
             Command::ReadTrace {
                 execution_id,
                 from,
                 to,
                 reply,
-            },
-            self.command_cost(256, 1, 1_024)?,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            }
+        })
+        .await
     }
 
     /// Read a bounded projection of durable local event records.
@@ -2018,18 +1964,15 @@ impl StoreHandle {
                 "event inspection limit must be non-zero",
             ));
         }
-        let (reply, response) = oneshot::channel();
-        self.send(
+        self.request(self.command_cost(512, limit, 512)?, |reply| {
             Command::ReadEventSummaries {
                 execution_id,
                 from,
                 limit,
                 reply,
-            },
-            self.command_cost(512, limit, 512)?,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            }
+        })
+        .await
     }
 
     /// Import one validated portable receipt as foreign evidence.
@@ -2044,17 +1987,12 @@ impl StoreHandle {
     ) -> Result<ReceiptImportOutcome, StoreError> {
         let encoded = receipt.encode()?;
         let cost = self.command_cost(encoded.len(), 1, 512)?;
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::ImportReceipt {
-                receipt: Box::new(receipt),
-                now_ms,
-                reply,
-            },
-            cost,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.request(cost, |reply| Command::ImportReceipt {
+            receipt: Box::new(receipt),
+            now_ms,
+            reply,
+        })
+        .await
     }
 
     /// Load this Host's own publication for a session.
@@ -2062,10 +2000,8 @@ impl StoreHandle {
         &self,
         session_id: SessionHash,
     ) -> Result<Option<StoredReceipt>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(Command::LoadReceipt { session_id, reply }, 128)
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.request(128, |reply| Command::LoadReceipt { session_id, reply })
+            .await
     }
 
     /// Load one receipt by its content-addressed identity.
@@ -2073,37 +2009,39 @@ impl StoreHandle {
         &self,
         receipt_id: ReceiptId,
     ) -> Result<Option<StoredReceipt>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(Command::LoadReceiptById { receipt_id, reply }, 128)
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.request(128, |reply| Command::LoadReceiptById { receipt_id, reply })
+            .await
     }
 
     /// List receipts in deterministic key order.
     pub async fn list_receipts(&self, limit: usize) -> Result<Vec<StoredReceipt>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::ListReceipts { limit, reply },
-            self.command_cost(256, limit, 1_024)?,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.request(self.command_cost(256, limit, 1_024)?, |reply| {
+            Command::ListReceipts { limit, reply }
+        })
+        .await
     }
 
     /// Load the optional durable Host user agent.
     pub async fn load_user_agent(&self) -> Result<Option<String>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(Command::LoadUserAgent { reply }, 128).await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.request(128, |reply| Command::LoadUserAgent { reply })
+            .await
     }
 
     /// Persist the Host user agent in the store metadata.
     pub async fn set_user_agent(&self, value: String) -> Result<(), StoreError> {
         validate_user_agent(&value)?;
         let cost = self.command_cost(value.len(), 1, USER_AGENT_COMMAND_OVERHEAD)?;
+        self.request(cost, |reply| Command::SetUserAgent { value, reply })
+            .await
+    }
+
+    async fn request<T>(
+        &self,
+        required: usize,
+        make_command: impl FnOnce(oneshot::Sender<Result<T, StoreError>>) -> Command,
+    ) -> Result<T, StoreError> {
         let (reply, response) = oneshot::channel();
-        self.send(Command::SetUserAgent { value, reply }, cost)
-            .await?;
+        self.send(make_command(reply), required).await?;
         response.await.map_err(|_| StoreError::ReplyDropped)?
     }
 
@@ -2226,21 +2164,16 @@ impl ExecutionStore {
             });
         }
         let cost = self.handle.command_cost(params_len, 1, 512)?;
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
-                Command::CreateExecutionRequest {
-                    execution_id: self.execution_id,
-                    program_hash,
-                    params,
-                    admission,
-                    created_at_ms,
-                    reply,
-                },
-                cost,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .request(cost, |reply| Command::CreateExecutionRequest {
+                execution_id: self.execution_id,
+                program_hash,
+                params,
+                admission,
+                created_at_ms,
+                reply,
+            })
+            .await
     }
 
     /// Load this execution's durable admission root.
@@ -2254,18 +2187,13 @@ impl ExecutionStore {
         reason: impl Into<String>,
     ) -> Result<ExecutionRequestFailureOutcome, StoreError> {
         let reason = bounded_reason(reason.into())?;
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
-                Command::RecordExecutionRequestFailure {
-                    execution_id: self.execution_id,
-                    reason,
-                    reply,
-                },
-                256,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .request(256, |reply| Command::RecordExecutionRequestFailure {
+                execution_id: self.execution_id,
+                reason,
+                reply,
+            })
+            .await
     }
 
     /// Load the per-execution local secret, creating it durably on first use.
@@ -2273,18 +2201,13 @@ impl ExecutionStore {
         &mut self,
         now_ms: u64,
     ) -> Result<ExecutionSalt, StoreError> {
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
-                Command::LoadOrCreateExecutionSalt {
-                    execution_id: self.execution_id,
-                    now_ms,
-                    reply,
-                },
-                128,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .request(128, |reply| Command::LoadOrCreateExecutionSalt {
+                execution_id: self.execution_id,
+                now_ms,
+                reply,
+            })
+            .await
     }
 
     /// Prepare a validated activation under this execution's permanent key.
@@ -2299,19 +2222,14 @@ impl ExecutionStore {
         let cost = self
             .handle
             .command_cost(encoded_len(&prepared, MAX_FRAME_BYTES)?, 1, 256)?;
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
-                Command::PrepareActivation {
-                    execution_id: self.execution_id,
-                    prepared,
-                    now_ms,
-                    reply,
-                },
-                cost,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .request(cost, |reply| Command::PrepareActivation {
+                execution_id: self.execution_id,
+                prepared,
+                now_ms,
+                reply,
+            })
+            .await
     }
 
     /// Compare-and-set this execution's prepared activation to its permanent
@@ -2327,19 +2245,14 @@ impl ExecutionStore {
         let cost = self
             .handle
             .command_cost(encoded_len(&activation, MAX_FRAME_BYTES)?, 1, 256)?;
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
-                Command::CommitActivation {
-                    execution_id: self.execution_id,
-                    activation,
-                    now_ms,
-                    reply,
-                },
-                cost,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .request(cost, |reply| Command::CommitActivation {
+                execution_id: self.execution_id,
+                activation,
+                now_ms,
+                reply,
+            })
+            .await
     }
 
     /// Load this execution's permanent activation record.
@@ -2377,17 +2290,12 @@ impl ExecutionStore {
     /// restart recovery can re-emit a request that was delivered before the
     /// consumer submitted its answer.
     pub async fn pending_requests(&self) -> Result<Vec<PendingRequest>, StoreError> {
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
-                Command::ListPendingRequests {
-                    execution_id: self.execution_id,
-                    reply,
-                },
-                512,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .request(512, |reply| Command::ListPendingRequests {
+                execution_id: self.execution_id,
+                reply,
+            })
+            .await
     }
 
     /// Insert the initial execution aggregate from typed genesis inputs.
@@ -2414,22 +2322,17 @@ impl ExecutionStore {
         let cost = self
             .handle
             .command_cost(state_bytes(&genesis)?.len(), 1, 512)?;
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
-                Command::CreateExecution {
-                    execution_id: self.execution_id,
-                    activation,
-                    producer,
-                    shared_state,
-                    local_state,
-                    now_ms,
-                    reply,
-                },
-                cost,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .request(cost, |reply| Command::CreateExecution {
+                execution_id: self.execution_id,
+                activation,
+                producer,
+                shared_state,
+                local_state,
+                now_ms,
+                reply,
+            })
+            .await
     }
 
     /// Commit activation's lifecycle transition with a version compare.
@@ -2438,19 +2341,14 @@ impl ExecutionStore {
         expected_version: ExecutionVersion,
         now_ms: u64,
     ) -> Result<ApplyOutcome, StoreError> {
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
-                Command::Activate {
-                    execution_id: self.execution_id,
-                    expected_version,
-                    now_ms,
-                    reply,
-                },
-                256,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .request(256, |reply| Command::Activate {
+                execution_id: self.execution_id,
+                expected_version,
+                now_ms,
+                reply,
+            })
+            .await
     }
 
     /// Commit one flat event dispatch atomically.
@@ -2491,27 +2389,22 @@ impl ExecutionStore {
             1,
             2_048,
         )?;
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
-                Command::CommitDispatch {
-                    execution_id: self.execution_id,
-                    expected_version,
-                    event: Box::new(event),
-                    shared,
-                    local,
-                    effects,
-                    terminal_outcome,
-                    inbox_id,
-                    timer_id,
-                    pending_id,
-                    now_ms,
-                    reply,
-                },
-                cost,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .request(cost, |reply| Command::CommitDispatch {
+                execution_id: self.execution_id,
+                expected_version,
+                event: Box::new(event),
+                shared,
+                local,
+                effects,
+                terminal_outcome,
+                inbox_id,
+                timer_id,
+                pending_id,
+                now_ms,
+                reply,
+            })
+            .await
     }
 
     /// Record one participant signature over the pending shared proposal.
@@ -2529,21 +2422,16 @@ impl ExecutionStore {
             1,
             512,
         )?;
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
-                Command::CommitStepSignature {
-                    execution_id: self.execution_id,
-                    expected_version,
-                    signature,
-                    inbox_id,
-                    now_ms,
-                    reply,
-                },
-                cost,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .request(cost, |reply| Command::CommitStepSignature {
+                execution_id: self.execution_id,
+                expected_version,
+                signature,
+                inbox_id,
+                now_ms,
+                reply,
+            })
+            .await
     }
 
     /// Record one participant signature over the pending terminal commitment.
@@ -2563,21 +2451,16 @@ impl ExecutionStore {
             1,
             512,
         )?;
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
-                Command::CommitTerminalSignature {
-                    execution_id: self.execution_id,
-                    expected_version,
-                    signature,
-                    inbox_id,
-                    now_ms,
-                    reply,
-                },
-                cost,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .request(cost, |reply| Command::CommitTerminalSignature {
+                execution_id: self.execution_id,
+                expected_version,
+                signature,
+                inbox_id,
+                now_ms,
+                reply,
+            })
+            .await
     }
 
     /// Commit one authenticated unilateral stop occurrence.
@@ -2597,21 +2480,16 @@ impl ExecutionStore {
             1,
             512,
         )?;
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
-                Command::Stop {
-                    execution_id: self.execution_id,
-                    expected_version,
-                    occurrence,
-                    inbox_id,
-                    now_ms,
-                    reply,
-                },
-                cost,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .request(cost, |reply| Command::Stop {
+                execution_id: self.execution_id,
+                expected_version,
+                occurrence,
+                inbox_id,
+                now_ms,
+                reply,
+            })
+            .await
     }
 
     /// Freeze an in-flight terminal proof after an interrupted publication.
@@ -2628,20 +2506,15 @@ impl ExecutionStore {
     ) -> Result<ApplyOutcome, StoreError> {
         let reason = bounded_reason(reason.into())?;
         let cost = self.handle.command_cost(reason.len(), 1, 512)?;
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
-                Command::InterruptTerminal {
-                    execution_id: self.execution_id,
-                    expected_version,
-                    reason,
-                    now_ms,
-                    reply,
-                },
-                cost,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .request(cost, |reply| Command::InterruptTerminal {
+                execution_id: self.execution_id,
+                expected_version,
+                reason,
+                now_ms,
+                reply,
+            })
+            .await
     }
 
     /// Publish a terminal artifact already assembled from authoritative rows.
@@ -2650,19 +2523,14 @@ impl ExecutionStore {
         expected_version: ExecutionVersion,
         now_ms: u64,
     ) -> Result<ApplyOutcome, StoreError> {
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
-                Command::PublishTerminal {
-                    execution_id: self.execution_id,
-                    expected_version,
-                    now_ms,
-                    reply,
-                },
-                512,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .request(512, |reply| Command::PublishTerminal {
+                execution_id: self.execution_id,
+                expected_version,
+                now_ms,
+                reply,
+            })
+            .await
     }
 
     /// Accept one frame whose source is the identity authenticated by the
@@ -2680,19 +2548,14 @@ impl ExecutionStore {
         let cost = self
             .handle
             .command_cost(frame_bytes(&frame)?.len(), 1, 512)?;
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
-                Command::AcceptInbound {
-                    execution_id: self.execution_id,
-                    frame: Box::new(frame),
-                    now_ms,
-                    reply,
-                },
-                cost,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .request(cost, |reply| Command::AcceptInbound {
+                execution_id: self.execution_id,
+                frame: Box::new(frame),
+                now_ms,
+                reply,
+            })
+            .await
     }
 
     /// Explicitly reject an accepted inbound frame that cannot become valid.
@@ -2701,19 +2564,14 @@ impl ExecutionStore {
         inbox_id: InboxId,
         now_ms: u64,
     ) -> Result<InboxRejectOutcome, StoreError> {
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
-                Command::RejectInbound {
-                    execution_id: self.execution_id,
-                    inbox_id,
-                    now_ms,
-                    reply,
-                },
-                128,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .request(128, |reply| Command::RejectInbound {
+                execution_id: self.execution_id,
+                inbox_id,
+                now_ms,
+                reply,
+            })
+            .await
     }
 
     /// Lease the earliest ready outbox occurrence for this execution.
@@ -2721,35 +2579,25 @@ impl ExecutionStore {
         &mut self,
         now_ms: u64,
     ) -> Result<Option<LeasedOutbox>, StoreError> {
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
-                Command::LeaseOutbox {
-                    execution_id: self.execution_id,
-                    now_ms,
-                    reply,
-                },
-                640,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .request(640, |reply| Command::LeaseOutbox {
+                execution_id: self.execution_id,
+                now_ms,
+                reply,
+            })
+            .await
     }
 
     /// Return whether this execution still has a protocol frame waiting for
     /// delivery. Pending and leased rows are both unsettled; acknowledged and
     /// cancelled rows remain as immutable delivery history and do not count.
     pub async fn has_unsettled_frames(&mut self) -> Result<bool, StoreError> {
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
-                Command::HasUnsettledFrames {
-                    execution_id: self.execution_id,
-                    reply,
-                },
-                128,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .request(128, |reply| Command::HasUnsettledFrames {
+                execution_id: self.execution_id,
+                reply,
+            })
+            .await
     }
 
     /// Acknowledge a leased outbox occurrence for this execution.
@@ -2758,19 +2606,14 @@ impl ExecutionStore {
         outbox_id: OutboxId,
         lease_id: LeaseId,
     ) -> Result<OutboxDeliveryOutcome, StoreError> {
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
-                Command::AcknowledgeOutbox {
-                    execution_id: self.execution_id,
-                    outbox_id,
-                    lease_id,
-                    reply,
-                },
-                256,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .request(256, |reply| Command::AcknowledgeOutbox {
+                execution_id: self.execution_id,
+                outbox_id,
+                lease_id,
+                reply,
+            })
+            .await
     }
 
     /// Return a leased occurrence to pending with the configured delay.
@@ -2782,21 +2625,16 @@ impl ExecutionStore {
         reason: impl Into<String>,
     ) -> Result<OutboxDeliveryOutcome, StoreError> {
         let reason = bounded_reason(reason.into())?;
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
-                Command::RetryOutbox {
-                    execution_id: self.execution_id,
-                    outbox_id,
-                    lease_id,
-                    now_ms,
-                    reason,
-                    reply,
-                },
-                512,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .request(512, |reply| Command::RetryOutbox {
+                execution_id: self.execution_id,
+                outbox_id,
+                lease_id,
+                now_ms,
+                reason,
+                reply,
+            })
+            .await
     }
 
     /// Recover this execution's expired outbox leases.
@@ -2804,18 +2642,13 @@ impl ExecutionStore {
         &mut self,
         now_ms: u64,
     ) -> Result<RecoveryReport, StoreError> {
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
-                Command::RecoverExpiredLeases {
-                    execution_id: self.execution_id,
-                    now_ms,
-                    reply,
-                },
-                128,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .request(128, |reply| Command::RecoverExpiredLeases {
+                execution_id: self.execution_id,
+                now_ms,
+                reply,
+            })
+            .await
     }
 
     /// List due active timers for this execution.
@@ -2824,19 +2657,16 @@ impl ExecutionStore {
         now_ms: u64,
         limit: usize,
     ) -> Result<Vec<ActiveTimer>, StoreError> {
-        let (reply, response) = oneshot::channel();
         self.handle
-            .send(
+            .request(self.handle.command_cost(256, limit, 256)?, |reply| {
                 Command::DueTimers {
                     execution_id: self.execution_id,
                     now_ms,
                     limit,
                     reply,
-                },
-                self.handle.command_cost(256, limit, 256)?,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+                }
+            })
+            .await
     }
 }
 
