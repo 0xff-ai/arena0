@@ -168,7 +168,6 @@ pub(crate) struct HostState {
     pub lifecycle: arena0_protocol::Lifecycle,
     pub logs: Vec<(String, String)>,
     pub effect_queue: Vec<Effect>,
-    pub next_continuation_tag: Option<u32>,
     pub entropy: Entropy,
     pub ledger: ResourceLedger,
     pub profile: ExecutionProfile,
@@ -199,7 +198,6 @@ impl HostState {
             lifecycle,
             logs: Vec::new(),
             effect_queue: Vec::new(),
-            next_continuation_tag: None,
             entropy,
             ledger: ResourceLedger::new(),
             profile,
@@ -233,7 +231,6 @@ impl HostState {
         self.lifecycle = lifecycle;
         self.logs.clear();
         self.effect_queue.clear();
-        self.next_continuation_tag = None;
         self.ledger = ResourceLedger::new();
         self.entropy.reset();
         if let Some(draws) = random_replay {
@@ -253,7 +250,6 @@ impl HostState {
         self.call_kind = call_kind;
         self.logs.clear();
         self.effect_queue.clear();
-        self.next_continuation_tag = None;
         self.ledger = ResourceLedger::new();
         self.entropy.reset();
         if let Some(draws) = random_replay {

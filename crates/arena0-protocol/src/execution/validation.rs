@@ -702,13 +702,9 @@ pub(crate) fn validate_shared_entry(
 
 pub(crate) fn validate_pending_record(pending: &PendingRecord) -> Result<(), ProtocolError> {
     if pending
-        .label
+        .expected_type
         .as_ref()
-        .is_some_and(|label| label.len() > MAX_TERMINAL_REASON_BYTES)
-        || pending
-            .expected_type
-            .as_ref()
-            .is_some_and(|value| value.len() > MAX_TERMINAL_REASON_BYTES)
+        .is_some_and(|value| value.len() > MAX_TERMINAL_REASON_BYTES)
     {
         return Err(ProtocolError::InvalidPendingContinuation);
     }
@@ -783,7 +779,6 @@ fn validate_effect(effect: &Effect) -> Result<(), ProtocolError> {
         ),
         Effect::Callout {
             context,
-            pending_label,
             expected_type,
             ..
         } => {
@@ -792,9 +787,6 @@ fn validate_effect(effect: &Effect) -> Result<(), ProtocolError> {
                 context.len(),
                 super::MAX_EFFECT_PAYLOAD_BYTES,
             )?;
-            if let Some(label) = pending_label {
-                ensure_payload("pending label", label.len(), MAX_TERMINAL_REASON_BYTES)?;
-            }
             if let Some(expected) = expected_type {
                 ensure_payload("expected type", expected.len(), MAX_TERMINAL_REASON_BYTES)?;
             }
@@ -813,7 +805,6 @@ fn validate_effect(effect: &Effect) -> Result<(), ProtocolError> {
         }
         Effect::Sign {
             data,
-            pending_label,
             expected_type,
             ..
         } => {
@@ -822,9 +813,6 @@ fn validate_effect(effect: &Effect) -> Result<(), ProtocolError> {
                 data.len(),
                 super::MAX_EFFECT_PAYLOAD_BYTES,
             )?;
-            if let Some(label) = pending_label {
-                ensure_payload("pending label", label.len(), MAX_TERMINAL_REASON_BYTES)?;
-            }
             if let Some(expected) = expected_type {
                 ensure_payload("expected type", expected.len(), MAX_TERMINAL_REASON_BYTES)?;
             }

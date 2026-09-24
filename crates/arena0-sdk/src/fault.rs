@@ -82,15 +82,12 @@ impl From<ProgramFault> for ProtocolFault {
     }
 }
 
-/// Error returned by `on_input` handlers and generated awaited callout continuations.
+/// Error returned by `on_input` handlers while processing a callout response.
 ///
 /// `?` defaults to `Unrecoverable` (session aborts). Use `.retryable()?`
 /// to mark an error as retryable (the runtime re-requests the last input).
 ///
-/// The program macro lowers `ctx.effects().callout(...).await?` into a generated
-/// continuation that resumes through the `on_input` dispatch path, even when
-/// the source handler's visible signature returns [`ProgramFault`]. Validation
-/// after such an await reports `InputFault`; use `.retryable()?` when the
+/// Validation in `on_input` reports `InputFault`; use `.retryable()?` when the
 /// answer should be retried.
 #[derive(Debug)]
 pub enum InputFault {

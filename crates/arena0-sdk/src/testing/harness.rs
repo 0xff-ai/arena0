@@ -448,7 +448,6 @@ pub struct HandlerResult {
 #[derive(Debug, Clone)]
 pub struct TypedCalloutRecord<A> {
     pub request: A,
-    pub pending_label: Option<String>,
     pub expected_type: Option<String>,
 }
 
@@ -528,14 +527,12 @@ impl HandlerResult {
                 Effect::Callout {
                     callout_index,
                     context,
-                    pending_label,
                     expected_type,
                     ..
                 } if *callout_index == A::CALLOUT_INDEX => {
                     let request = serde_json::from_slice(context).ok()?;
                     Some(TypedCalloutRecord {
                         request,
-                        pending_label: pending_label.clone(),
                         expected_type: expected_type.clone(),
                     })
                 }

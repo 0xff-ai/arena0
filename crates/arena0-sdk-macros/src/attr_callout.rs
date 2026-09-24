@@ -93,12 +93,12 @@ pub(crate) fn expand_arena0_callouts(item: ItemEnum) -> Result<TokenStream2> {
         response_types.push(output_ty.clone());
         request_types.extend(v.context_fields.named.iter().map(|field| field.ty.clone()));
         let request_variant_doc = format!(
-            "Arena-owned callout `{name}`. Await this request to produce an `{output_ty_name}` response."
+            "Arena-owned callout `{name}`. The controlling agent supplies an `{output_ty_name}` response."
         );
         let response_variant_doc =
             format!("Input response for the `{name}` callout, carrying `{output_ty_name}`.");
         let request_struct_doc = format!(
-            "Typed request payload for callout `{name}`. `ctx.effects().callout(callouts::{name} {{ ... }}).await` resumes with `{output_ty_name}`."
+            "Typed request payload for callout `{name}`. Dispatch it with `ctx.effects().callout(callouts::{name} {{ ... }}).dispatch()`; the response reaches `on_input` as `{output_ty_name}`."
         );
 
         // Response variant: VariantName(OutputType)

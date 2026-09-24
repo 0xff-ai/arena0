@@ -410,104 +410,24 @@ pub struct Effects<'a, Shared> {
 
 /// Owned callout effect builder.
 ///
-/// The builder captures request bytes and optional local pending metadata
-/// without retaining a mutable borrow of [`Context`]. Trait-form programs call
-/// [`dispatch`](Self::dispatch) explicitly; generated async shells can lower an
-/// arena-owned await using the same owned representation.
+/// The builder captures request bytes without retaining a mutable borrow of
+/// [`Context`]. Programs call [`dispatch`](Self::dispatch) explicitly.
 #[derive(Debug, Clone)]
-#[must_use = "callout builders must be dispatched or awaited"]
+#[must_use = "callout builders must be dispatched"]
 pub struct CalloutBuilder<T = ()> {
     callout_index: u32,
     context: Vec<u8>,
-    pending_label: Option<String>,
     expected_type: Option<String>,
-    continuation_tag: Option<u32>,
     _output: PhantomData<fn() -> T>,
 }
 
 /// Owned external signing effect builder.
 #[derive(Debug, Clone)]
-#[must_use = "sign builders must be dispatched or awaited"]
+#[must_use = "sign builders must be dispatched"]
 pub struct SignBuilder {
     scheme: SignScheme,
     data: Vec<u8>,
-    pending_label: Option<String>,
     expected_type: Option<String>,
-    continuation_tag: Option<u32>,
-}
-
-/// The effect kinds an [`ArenaFuture`] can capture.
-///
-/// Only [`arena0_protocol::Effect::Callout`] and [`arena0_protocol::Effect::Sign`] are
-/// valid `ArenaFuture` payloads; keeping that as its own two-variant enum
-/// (instead of storing the general `Effect`) makes the other ten variants
-/// unrepresentable here, so the setters and `dispatch` below match
-/// exhaustively with no `unreachable!`/`panic!` guard for "some other effect
-/// snuck in".
-#[derive(Debug, Clone)]
-enum ArenaFutureEffect {
-    Callout {
-        callout_index: u32,
-        context: Vec<u8>,
-        pending_label: Option<String>,
-        expected_type: Option<String>,
-        continuation_tag: Option<u32>,
-    },
-    Sign {
-        scheme: SignScheme,
-        data: Vec<u8>,
-        pending_label: Option<String>,
-        expected_type: Option<String>,
-        continuation_tag: Option<u32>,
-    },
-}
-
-impl ArenaFutureEffect {
-    /// Widen back to the general effect for the host boundary (dispatch, or
-    /// inspection via [`ArenaFuture::effect`]/[`ArenaFuture::into_effect`]).
-    fn into_spec(self) -> arena0_protocol::Effect {
-        match self {
-            Self::Callout {
-                callout_index,
-                context,
-                pending_label,
-                expected_type,
-                continuation_tag,
-            } => arena0_protocol::Effect::Callout {
-                callout_index,
-                context,
-                pending_label,
-                expected_type,
-                continuation_tag,
-            },
-            Self::Sign {
-                scheme,
-                data,
-                pending_label,
-                expected_type,
-                continuation_tag,
-            } => arena0_protocol::Effect::Sign {
-                scheme,
-                data,
-                pending_label,
-                expected_type,
-                continuation_tag,
-            },
-        }
-    }
-}
-
-/// Arena-owned future token for a traced external effect.
-///
-/// `ArenaFuture` is plumbing for generated shells, not a general host future.
-/// It captures the effect request and output type without retaining a mutable
-/// context borrow. Trait-form programs can still call [`dispatch`](Self::dispatch)
-/// to emit the captured effect explicitly.
-#[derive(Debug, Clone)]
-#[must_use = "arena futures must be lowered by a generated shell or dispatched explicitly"]
-pub struct ArenaFuture<T> {
-    effect: ArenaFutureEffect,
-    _output: PhantomData<fn() -> T>,
 }
 
 /// Primitive message routing metadata.
@@ -608,24 +528,9 @@ impl<Shared: std::fmt::Debug> std::fmt::Debug for Effects<'_, Shared> {
 }
 
 impl<T> CalloutBuilder<T> {
-    /// Attach a local pending label for trace and lifecycle diagnostics.
-    ///
-    /// Pending labels are not shared phase transitions and are not mirrored
-    /// to the peer. They describe why this local continuation is waiting.
-    pub fn pending(mut self, label: impl std::fmt::Display) -> Self {
-        self.pending_label = Some(label.to_string());
-        self
-    }
-
     /// Override the expected output type name recorded for diagnostics.
     pub fn expected_type(mut self, expected_type: impl Into<String>) -> Self {
         self.expected_type = Some(expected_type.into());
-        self
-    }
-
-    #[doc(hidden)]
-    pub fn __continuation_tag(mut self, tag: u32) -> Self {
-        self.continuation_tag = Some(tag);
         self
     }
 
@@ -634,166 +539,21 @@ impl<T> CalloutBuilder<T> {
         effects::host_callout_raw(
             self.callout_index,
             &self.context,
-            self.pending_label.as_deref(),
             self.expected_type.as_deref(),
-            self.continuation_tag,
         );
-    }
-
-    /// Convert this callout into an arena-owned future token with a known output type.
-    ///
-    /// Generated shells lower this token into a pending continuation. Trait-form
-    /// programs should call [`dispatch`](ArenaFuture::dispatch) if they build it
-    /// directly.
-    pub fn into_arena_future(self) -> ArenaFuture<T> {
-        ArenaFuture::new(ArenaFutureEffect::Callout {
-            callout_index: self.callout_index,
-            context: self.context,
-            pending_label: self.pending_label,
-            expected_type: self.expected_type,
-            continuation_tag: self.continuation_tag,
-        })
     }
 }
 
 impl SignBuilder {
-    /// Attach a local pending label for trace and lifecycle diagnostics.
-    pub fn pending(mut self, label: impl std::fmt::Display) -> Self {
-        self.pending_label = Some(label.to_string());
-        self
-    }
-
     /// Override the expected output type name recorded for diagnostics.
     pub fn expected_type(mut self, expected_type: impl Into<String>) -> Self {
         self.expected_type = Some(expected_type.into());
         self
     }
 
-    #[doc(hidden)]
-    pub fn __continuation_tag(mut self, tag: u32) -> Self {
-        self.continuation_tag = Some(tag);
-        self
-    }
-
     /// Emit the sign effect.
     pub fn dispatch(self) {
-        effects::host_sign(
-            self.scheme,
-            &self.data,
-            self.pending_label.as_deref(),
-            self.expected_type.as_deref(),
-            self.continuation_tag,
-        );
-    }
-
-    /// Convert this sign request into an arena-owned future token.
-    pub fn into_arena_future(self) -> ArenaFuture<Vec<u8>> {
-        ArenaFuture::new(ArenaFutureEffect::Sign {
-            scheme: self.scheme,
-            data: self.data,
-            pending_label: self.pending_label,
-            expected_type: self.expected_type,
-            continuation_tag: self.continuation_tag,
-        })
-    }
-}
-
-impl<T> ArenaFuture<T> {
-    fn new(effect: ArenaFutureEffect) -> Self {
-        Self {
-            effect,
-            _output: PhantomData,
-        }
-    }
-
-    /// Inspect the captured effect request.
-    #[must_use]
-    pub fn effect(&self) -> arena0_protocol::Effect {
-        self.effect.clone().into_spec()
-    }
-
-    /// Consume this token and return the captured effect request.
-    #[must_use]
-    pub fn into_effect(self) -> arena0_protocol::Effect {
-        self.effect.into_spec()
-    }
-
-    /// Attach a local pending label to the captured external effect.
-    ///
-    /// This is primarily useful with `ctx.effects().callout_typed(...)` and generated
-    /// shells. Pending labels remain local trace metadata.
-    pub fn pending(mut self, label: impl std::fmt::Display) -> Self {
-        match &mut self.effect {
-            ArenaFutureEffect::Callout { pending_label, .. }
-            | ArenaFutureEffect::Sign { pending_label, .. } => {
-                *pending_label = Some(label.to_string());
-            }
-        }
-        self
-    }
-
-    /// Override the expected output type name recorded for diagnostics.
-    pub fn expected_type(mut self, expected_type: impl Into<String>) -> Self {
-        match &mut self.effect {
-            ArenaFutureEffect::Callout {
-                expected_type: recorded,
-                ..
-            }
-            | ArenaFutureEffect::Sign {
-                expected_type: recorded,
-                ..
-            } => {
-                *recorded = Some(expected_type.into());
-            }
-        }
-        self
-    }
-
-    #[doc(hidden)]
-    pub fn __continuation_tag(mut self, tag: u32) -> Self {
-        match &mut self.effect {
-            ArenaFutureEffect::Callout {
-                continuation_tag, ..
-            }
-            | ArenaFutureEffect::Sign {
-                continuation_tag, ..
-            } => {
-                *continuation_tag = Some(tag);
-            }
-        }
-        self
-    }
-
-    /// Emit the captured effect in trait-form programs.
-    pub fn dispatch(self) {
-        match self.effect {
-            ArenaFutureEffect::Callout {
-                callout_index,
-                context,
-                pending_label,
-                expected_type,
-                continuation_tag,
-            } => effects::host_callout_raw(
-                callout_index,
-                &context,
-                pending_label.as_deref(),
-                expected_type.as_deref(),
-                continuation_tag,
-            ),
-            ArenaFutureEffect::Sign {
-                scheme,
-                data,
-                pending_label,
-                expected_type,
-                continuation_tag,
-            } => effects::host_sign(
-                scheme,
-                &data,
-                pending_label.as_deref(),
-                expected_type.as_deref(),
-                continuation_tag,
-            ),
-        }
+        effects::host_sign(self.scheme, &self.data, self.expected_type.as_deref());
     }
 }
 
@@ -957,9 +717,6 @@ impl<Shared> Effects<'_, Shared> {
     }
 
     /// Build a callout effect.
-    ///
-    /// Call `.dispatch()` in trait-form programs. Generated async shells can
-    /// attach `.pending(...)` and lower the builder into a runtime-owned await.
     pub fn callout<A>(&mut self, req: A) -> CalloutBuilder<A::Output>
     where
         A: Arena0TypedCalloutRequest + serde::Serialize,
@@ -967,22 +724,9 @@ impl<Shared> Effects<'_, Shared> {
         CalloutBuilder {
             callout_index: req.callout_index(),
             context: serde_json::to_vec(&req).expect("callout context serialization failed"),
-            pending_label: None,
             expected_type: req.expected_type_name().map(str::to_string),
-            continuation_tag: None,
             _output: PhantomData,
         }
-    }
-
-    /// Build a typed arena-owned callout future from a generated callout request.
-    ///
-    /// This is the plumbing behind generated `.await` authoring. The returned
-    /// token is typed as the exact output of `req`.
-    pub fn callout_typed<A>(&mut self, req: A) -> ArenaFuture<A::Output>
-    where
-        A: Arena0TypedCalloutRequest + serde::Serialize,
-    {
-        self.callout(req).into_arena_future()
     }
 
     /// Schedule a timer.
@@ -1001,16 +745,11 @@ impl<Shared> Effects<'_, Shared> {
     }
 
     /// Build an external signing effect.
-    ///
-    /// Call `.dispatch()` in trait-form programs. Generated async shells can
-    /// attach `.pending(...)` and lower the builder into a runtime-owned await.
     pub fn sign(&mut self, scheme: SignScheme, data: &[u8]) -> SignBuilder {
         SignBuilder {
             scheme,
             data: data.to_vec(),
-            pending_label: None,
             expected_type: Some("Vec<u8>".into()),
-            continuation_tag: None,
         }
     }
 }
@@ -1054,12 +793,10 @@ mod tests {
         match effect {
             arena0_protocol::Effect::Callout {
                 callout_index,
-                pending_label,
                 expected_type,
                 ..
             } => {
                 assert_eq!(*callout_index, 7);
-                assert_eq!(pending_label.as_deref(), Some("thinking"));
                 assert_eq!(expected_type.as_deref(), Some("test::Output"));
             }
             other => panic!("expected callout effect, got {other:?}"),
@@ -1067,38 +804,26 @@ mod tests {
     }
 
     #[test]
-    fn callout_builders_and_futures_preserve_metadata() {
+    fn callout_builder_preserves_expected_type() {
         let mut ctx = make_ctx();
         crate::testing::drain_effects();
 
         ctx.effects()
             .callout(TestCallout)
-            .pending("thinking")
+            .expected_type("test::Output")
             .dispatch();
         let effects = crate::testing::drain_effects();
         assert_eq!(effects.len(), 1);
         assert_test_callout(&effects[0]);
-
-        let future: ArenaFuture<String> = ctx
-            .effects()
-            .callout(TestCallout)
-            .pending("thinking")
-            .into_arena_future();
-        assert_test_callout(&future.effect());
-
-        let future: ArenaFuture<String> =
-            ctx.effects().callout_typed(TestCallout).pending("thinking");
-        assert_test_callout(&future.effect());
     }
 
     #[test]
-    fn sign_builder_records_pending_metadata() {
+    fn sign_builder_records_expected_type() {
         let mut ctx = make_ctx();
         crate::testing::drain_effects();
 
         ctx.effects()
             .sign(SignScheme::Ed25519, b"payload")
-            .pending("signing")
             .dispatch();
 
         let effects = crate::testing::drain_effects();
@@ -1107,44 +832,11 @@ mod tests {
             arena0_protocol::Effect::Sign {
                 scheme,
                 data,
-                pending_label,
                 expected_type,
                 ..
             } => {
                 assert_eq!(*scheme, SignScheme::Ed25519);
                 assert_eq!(data, b"payload");
-                assert_eq!(pending_label.as_deref(), Some("signing"));
-                assert_eq!(expected_type.as_deref(), Some("Vec<u8>"));
-            }
-            other => panic!("expected sign effect, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn arena_future_dispatches_captured_sign_effect() {
-        let mut ctx = make_ctx();
-        crate::testing::drain_effects();
-
-        let future = ctx
-            .effects()
-            .sign(SignScheme::Ed25519, b"payload")
-            .pending("signing")
-            .into_arena_future();
-        future.dispatch();
-
-        let effects = crate::testing::drain_effects();
-        assert_eq!(effects.len(), 1);
-        match &effects[0] {
-            arena0_protocol::Effect::Sign {
-                scheme,
-                data,
-                pending_label,
-                expected_type,
-                ..
-            } => {
-                assert_eq!(*scheme, SignScheme::Ed25519);
-                assert_eq!(data, b"payload");
-                assert_eq!(pending_label.as_deref(), Some("signing"));
                 assert_eq!(expected_type.as_deref(), Some("Vec<u8>"));
             }
             other => panic!("expected sign effect, got {other:?}"),

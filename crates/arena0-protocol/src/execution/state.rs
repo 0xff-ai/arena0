@@ -1276,21 +1276,12 @@ fn validate_pending_dispatch(
     }
     let matches = match (event, current.operation) {
         (
-            Event::InputReceived {
-                callout_index,
-                continuation_tag,
-                ..
-            },
+            Event::InputReceived { callout_index, .. },
             PendingOperation::Callout {
                 callout_index: expected_index,
             },
-        ) => *callout_index == expected_index && *continuation_tag == current.continuation_tag,
-        (
-            Event::Signed {
-                continuation_tag, ..
-            },
-            PendingOperation::Sign,
-        ) => *continuation_tag == current.continuation_tag,
+        ) => *callout_index == expected_index,
+        (Event::Signed { .. }, PendingOperation::Sign) => true,
         _ => false,
     };
     if !matches {
@@ -1727,9 +1718,7 @@ mod tests {
         let pending = PendingRecord {
             id: pending_id(state.execution_id(), state.event_position(), 0),
             operation: PendingOperation::Callout { callout_index: 0 },
-            label: Some("lookup".into()),
             expected_type: Some("bytes".into()),
-            continuation_tag: Some(7),
         };
         let local = LocalStateBytes::try_new(vec![0xa0, 0xa1]).expect("bounded local state");
         state

@@ -10,7 +10,7 @@ use crate::{LocalStateBytes, SharedStateBytes};
 use crate::Capability;
 
 /// Current ABI version. A sandbox rejects modules declaring a different one.
-pub const ABI_VERSION: u32 = 21;
+pub const ABI_VERSION: u32 = 22;
 
 /// Wasm import module name for all arena0 host functions.
 pub const HOST_MODULE: &str = "arena0";
@@ -858,18 +858,12 @@ pub mod imports {
     pub const BROADCAST: &str = "broadcast";
     /// Request input from the controlling agent.
     pub const REQUEST_INPUT: &str = "request_input";
-    /// Request input with pending/expected-type trace metadata.
-    pub const REQUEST_INPUT_PENDING: &str = "request_input_pending";
-    /// Attach a generated continuation tag to the next pending effect.
-    pub const SET_CONTINUATION_TAG: &str = "set_continuation_tag";
     /// Start an untyped one-shot timer.
     pub const SET_TIMER: &str = "set_timer";
     /// Start a typed one-shot timer.
     pub const SET_TYPED_TIMER: &str = "set_typed_timer";
     /// Sign data with the node's key.
     pub const SIGN: &str = "sign";
-    /// Sign data with local pending/expected-type trace metadata.
-    pub const SIGN_PENDING: &str = "sign_pending";
     /// End the current session successfully.
     pub const END_SESSION: &str = "end_session";
     /// Abort the current session.
@@ -884,9 +878,9 @@ impl Capability {
     pub fn imports(&self) -> &'static [&'static str] {
         match self {
             Self::Messaging => &[imports::BROADCAST],
-            Self::Input => &[imports::REQUEST_INPUT, imports::REQUEST_INPUT_PENDING],
+            Self::Input => &[imports::REQUEST_INPUT],
             Self::Timers => &[imports::SET_TIMER, imports::SET_TYPED_TIMER],
-            Self::Sign { .. } => &[imports::SIGN, imports::SIGN_PENDING],
+            Self::Sign { .. } => &[imports::SIGN],
         }
     }
 }
@@ -904,7 +898,6 @@ pub fn always_available_imports() -> &'static [&'static str] {
         imports::END_SESSION,
         imports::ABORT_SESSION,
         imports::RETRY_INPUT,
-        imports::SET_CONTINUATION_TAG,
     ]
 }
 
@@ -917,15 +910,12 @@ pub fn all_effect_imports() -> &'static [&'static str] {
         imports::RANDOM,
         imports::BROADCAST,
         imports::REQUEST_INPUT,
-        imports::REQUEST_INPUT_PENDING,
         imports::SET_TIMER,
         imports::SET_TYPED_TIMER,
         imports::SIGN,
-        imports::SIGN_PENDING,
         imports::END_SESSION,
         imports::ABORT_SESSION,
         imports::RETRY_INPUT,
-        imports::SET_CONTINUATION_TAG,
     ]
 }
 
@@ -938,10 +928,7 @@ mod tests {
     #[test]
     fn imports_for_each_capability() {
         assert_eq!(Capability::Messaging.imports(), &["broadcast"]);
-        assert_eq!(
-            Capability::Input.imports(),
-            &["request_input", "request_input_pending"]
-        );
+        assert_eq!(Capability::Input.imports(), &["request_input"]);
         assert_eq!(
             Capability::Timers.imports(),
             &["set_timer", "set_typed_timer"]
@@ -951,7 +938,7 @@ mod tests {
                 schemes: vec![SignScheme::Ed25519]
             }
             .imports(),
-            &["sign", "sign_pending"]
+            &["sign"]
         );
     }
 

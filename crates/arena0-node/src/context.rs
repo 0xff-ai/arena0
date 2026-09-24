@@ -11,7 +11,7 @@ use std::sync::Arc;
 use arena0_crypto::{ExecutionKey, ExecutionSalt, NodeKeys};
 use arena0_program::{JsonBytes, ProgramHash};
 use arena0_protocol::{
-    Activation, Ensemble, ExecId, ExecutionAdmission, FrameId, LocalStateBytes, NegotiationTarget,
+    Activation, Ensemble, ExecId, ExecutionAdmission, LocalStateBytes, NegotiationTarget,
     PeerIdSource, PreparedActivation, ReceiptArtifact, SessionHash, SharedStateBytes, View,
 };
 use arena0_sandbox::LoadedProgram;
@@ -143,8 +143,6 @@ pub enum SessionMessage {
         context: Vec<u8>,
         expected_type: Option<String>,
     },
-    /// A local notification became deliverable.
-    Notification { frame_id: FrameId, payload: Vec<u8> },
     /// A final receipt was durably published locally.
     ReceiptPublished { receipt: ReceiptArtifact },
     /// The execution reached a completed terminal boundary.

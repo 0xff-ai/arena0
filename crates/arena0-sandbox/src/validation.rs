@@ -159,7 +159,7 @@ pub(crate) fn validate_required_exports(module: &Module) -> Result<(), SandboxEr
     Ok(())
 }
 
-/// Verify the raw ABI-21 module exports all required functions and work memory
+/// Verify the raw ABI-22 module exports all required functions and work memory
 /// before the artifact finalizer adds the state memories.
 pub(crate) fn validate_raw_exports(module: &Module) -> Result<(), SandboxError> {
     validate_required_exports(module)?;
@@ -338,7 +338,7 @@ mod tests {
         let abi_version = if omitted == Some("arena0_abi_version") {
             ""
         } else {
-            r#"(global (export "arena0_abi_version") i32 (i32.const 21))"#
+            r#"(global (export "arena0_abi_version") i32 (i32.const 22))"#
         };
         let alloc = export(
             "arena0_alloc",

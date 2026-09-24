@@ -40,7 +40,7 @@ impl<'ast> Visit<'ast> for EffectCapabilityVisitor {
         if receiver_is_effect_handle(&node.receiver, &self.effect_bindings) {
             match node.method.to_string().as_str() {
                 "send" | "broadcast" => self.messaging = true,
-                "callout" | "callout_typed" => self.input = true,
+                "callout" => self.input = true,
                 "set_timer" => self.timers = true,
                 "sign" => self.record_sign_scheme(node.args.first()),
                 _ => {}

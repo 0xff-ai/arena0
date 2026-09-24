@@ -92,7 +92,6 @@ fn record_session_progress(
         }
         SessionMessage::ReceiptPublished { .. } => Some(ArenaProgress::TerminalPublished),
         SessionMessage::CalloutRequested { .. }
-        | SessionMessage::Notification { .. }
         | SessionMessage::Completed { .. }
         | SessionMessage::Aborted { .. }
         | SessionMessage::Failed { .. } => None,

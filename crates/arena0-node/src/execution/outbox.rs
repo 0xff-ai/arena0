@@ -309,12 +309,7 @@ impl ExecutionActor {
                     .map_err(|_| ExecError::Unavailable("message receiver closed".into()))?;
                 Ok(false)
             }
-            Effect::Sign {
-                scheme,
-                data,
-                continuation_tag,
-                ..
-            } => {
+            Effect::Sign { scheme, data, .. } => {
                 let pending_id = arena0_protocol::pending_id(
                     self.context.exec_id,
                     item.event_position,
@@ -329,10 +324,7 @@ impl ExecutionActor {
                     *scheme,
                     data.clone(),
                 )?;
-                if !self
-                    .sign_and_resume(pending_id, &data, *continuation_tag)
-                    .await?
-                {
+                if !self.sign_and_resume(pending_id, &data).await? {
                     // A signing request is acknowledged only after its
                     // exact continuation was consumed. A frozen proposal or
                     // a guest rejection leaves the same outbox row retryable.

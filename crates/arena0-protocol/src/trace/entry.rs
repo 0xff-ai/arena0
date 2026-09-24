@@ -146,18 +146,15 @@ impl TraceEntry {
 pub struct PendingRecord {
     pub id: PendingId,
     pub operation: PendingOperation,
-    pub label: Option<String>,
     pub expected_type: Option<String>,
-    pub continuation_tag: Option<u32>,
 }
 
 impl BorshSerialize for PendingRecord {
     fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
         BorshSerialize::serialize(&self.id, writer)?;
         BorshSerialize::serialize(&self.operation, writer)?;
-        serialize_pending_string(writer, self.label.as_deref())?;
         serialize_pending_string(writer, self.expected_type.as_deref())?;
-        BorshSerialize::serialize(&self.continuation_tag, writer)
+        Ok(())
     }
 }
 
@@ -166,17 +163,11 @@ impl BorshDeserialize for PendingRecord {
         Ok(Self {
             id: PendingId::deserialize_reader(reader)?,
             operation: PendingOperation::deserialize_reader(reader)?,
-            label: read_option_string(
-                reader,
-                crate::execution::MAX_TERMINAL_REASON_BYTES,
-                "pending label",
-            )?,
             expected_type: read_option_string(
                 reader,
                 crate::execution::MAX_TERMINAL_REASON_BYTES,
                 "pending expected type",
             )?,
-            continuation_tag: Option::<u32>::deserialize_reader(reader)?,
         })
     }
 }
@@ -225,30 +216,19 @@ impl PendingRecord {
         match effect {
             Effect::Callout {
                 callout_index,
-                pending_label,
                 expected_type,
-                continuation_tag,
                 ..
             } => Some(Self {
                 id,
                 operation: PendingOperation::Callout {
                     callout_index: *callout_index,
                 },
-                label: pending_label.clone(),
                 expected_type: expected_type.clone(),
-                continuation_tag: *continuation_tag,
             }),
-            Effect::Sign {
-                pending_label,
-                expected_type,
-                continuation_tag,
-                ..
-            } => Some(Self {
+            Effect::Sign { expected_type, .. } => Some(Self {
                 id,
                 operation: PendingOperation::Sign,
-                label: pending_label.clone(),
                 expected_type: expected_type.clone().or_else(|| Some("Vec<u8>".into())),
-                continuation_tag: *continuation_tag,
             }),
             _ => None,
         }
@@ -318,7 +298,6 @@ mod tests {
         let value = entry(Event::InputReceived {
             callout_index: 0,
             data: Vec::new(),
-            continuation_tag: None,
         });
         assert!(borsh::to_vec(&value).is_err());
     }

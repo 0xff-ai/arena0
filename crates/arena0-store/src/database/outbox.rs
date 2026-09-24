@@ -746,8 +746,8 @@ impl Database {
 
     /// Retire retry markers after the continuation they redeliver is
     /// successfully consumed. The originating Callout/Sign is handled by
-    /// the caller because it must first validate the answer's exact
-    /// continuation tag.
+    /// the caller because it must first validate the answer's exact pending
+    /// operation and identity.
     pub(super) fn cancel_retry_effects(&mut self, execution_id: ExecId) -> Result<(), StoreError> {
         let effects = self.unsettled_continuation_effects(execution_id)?;
         let outbox_ids = effects

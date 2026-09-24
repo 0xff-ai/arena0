@@ -128,7 +128,7 @@ fn local_continuation_rows(path: &Path, execution_id: ExecId) -> Vec<(String, Ef
     result
 }
 
-async fn sign_pending_step(
+async fn sign_step(
     store: &Store,
     fixture: &ActivationFixture,
     execution_id: ExecId,
@@ -267,7 +267,7 @@ async fn certify_terminal(store: &Store, fixture: &ActivationFixture, execution_
         )
         .await
         .expect("proposal");
-    sign_pending_step(store, fixture, execution_id, &mut writer, 8, 9).await;
+    sign_step(store, fixture, execution_id, &mut writer, 8, 9).await;
     let producer_bls = BlsSecretKey::from_seed(&[11; 32]).expect("producer bls");
     let other_bls = BlsSecretKey::from_seed(&[12; 32]).expect("other bls");
     let state = store
@@ -1548,9 +1548,7 @@ async fn activation_prepare_commit_is_idempotent_and_recoverable() {
     let callout = Effect::Callout {
         callout_index: 0,
         context: vec![0xaa],
-        pending_label: None,
         expected_type: None,
-        continuation_tag: None,
     };
     assert!(matches!(
         writer
@@ -1584,7 +1582,7 @@ async fn activation_prepare_commit_is_idempotent_and_recoverable() {
         .handle()
         .claim_execution(id)
         .expect("execution writer");
-    sign_pending_step(&store, &fixture, id, &mut writer, 10, 11).await;
+    sign_step(&store, &fixture, id, &mut writer, 10, 11).await;
     assert!(writer.due_timers(20, 1).await.expect("not due").is_empty());
     assert_eq!(writer.due_timers(21, 8).await.expect("due").len(), 1);
     drop(writer);
@@ -1695,9 +1693,7 @@ async fn deferred_broadcast_commits_two_steps_at_one_event_position() {
                     Effect::Callout {
                         callout_index: 0,
                         context: vec![3],
-                        pending_label: None,
                         expected_type: None,
-                        continuation_tag: None,
                     },
                     Effect::Broadcast { data: vec![7, 8] },
                 ],
@@ -1730,7 +1726,7 @@ async fn deferred_broadcast_commits_two_steps_at_one_event_position() {
         0
     );
 
-    let after_first = sign_pending_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
+    let after_first = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
     let successor = after_first.pending_shared().expect("deferred successor");
     assert_eq!(after_first.event_position(), 1);
     assert_eq!(after_first.agreed_step(), 1);
@@ -1775,8 +1771,7 @@ async fn deferred_broadcast_commits_two_steps_at_one_event_position() {
         OutboxDeliveryOutcome::Acknowledged
     );
 
-    let after_successor =
-        sign_pending_step(&store, &fixture, execution_id, &mut writer, 10, 11).await;
+    let after_successor = sign_step(&store, &fixture, execution_id, &mut writer, 10, 11).await;
     assert_eq!(after_successor.event_position(), 1);
     assert_eq!(after_successor.agreed_step(), 2);
     assert!(after_successor.pending_shared().is_none());
@@ -1900,7 +1895,7 @@ async fn pending_proposal_leases_frames_but_withholds_local_effects() {
         )
         .await
         .expect("stage initial event");
-    let after_start = sign_pending_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
+    let after_start = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
     let initial_signature = writer
         .lease_next_outbox(10)
         .await
@@ -1918,9 +1913,7 @@ async fn pending_proposal_leases_frames_but_withholds_local_effects() {
     let callout = Effect::Callout {
         callout_index: 0,
         context: vec![0x51],
-        pending_label: None,
         expected_type: None,
-        continuation_tag: None,
     };
     let broadcast = vec![0x61, 0x62];
     writer
@@ -1972,7 +1965,7 @@ async fn pending_proposal_leases_frames_but_withholds_local_effects() {
             .is_none()
     );
 
-    let committed = sign_pending_step(&store, &fixture, execution_id, &mut writer, 12, 13).await;
+    let committed = sign_step(&store, &fixture, execution_id, &mut writer, 12, 13).await;
     assert!(committed.pending_shared().is_none());
     assert_eq!(
         committed.status().pending().expect("callout pending").id,
@@ -2043,7 +2036,7 @@ async fn interrupt_terminal_freezes_proof_and_cancels_timers_after_restart() {
         )
         .await
         .expect("stage timer event");
-    let after_start = sign_pending_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
+    let after_start = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
     assert_eq!(
         writer.due_timers(200, 8).await.expect("active timer").len(),
         1
@@ -2084,7 +2077,7 @@ async fn interrupt_terminal_freezes_proof_and_cancels_timers_after_restart() {
         )
         .await
         .expect("stage terminal proof");
-    let terminal = sign_pending_step(&store, &fixture, execution_id, &mut writer, 11, 12).await;
+    let terminal = sign_step(&store, &fixture, execution_id, &mut writer, 11, 12).await;
     assert!(terminal.terminal_pending());
     let commitment = terminal
         .pending_terminal()
@@ -2184,7 +2177,7 @@ async fn stopping_an_unsigned_proposal_cancels_exact_frames_and_recovers() {
         )
         .await
         .expect("stage session start");
-    let after_start = sign_pending_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
+    let after_start = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
     let start_frame = writer
         .lease_next_outbox(10)
         .await
@@ -2397,7 +2390,7 @@ async fn portable_events_stage_agreement_without_shared_state_delta() {
             ..
         }
     ));
-    let state = sign_pending_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
+    let state = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
     assert_eq!(state.agreed_step(), 1);
     assert_eq!(state.event_position(), 1);
 
@@ -2440,7 +2433,7 @@ async fn portable_events_stage_agreement_without_shared_state_delta() {
             ..
         }
     ));
-    let state = sign_pending_step(&store, &fixture, execution_id, &mut writer, 11, 12).await;
+    let state = sign_step(&store, &fixture, execution_id, &mut writer, 11, 12).await;
     assert_eq!(state.agreed_step(), 2);
     assert_eq!(state.event_position(), 2);
     let trace = store
@@ -2477,9 +2470,7 @@ async fn unrelated_event_can_retry_an_existing_callout() {
     let callout = Effect::Callout {
         callout_index: 0,
         context: vec![0x31],
-        pending_label: None,
         expected_type: None,
-        continuation_tag: Some(4),
     };
     let state = store
         .handle()
@@ -2502,7 +2493,7 @@ async fn unrelated_event_can_retry_an_existing_callout() {
         )
         .await
         .expect("stage callout");
-    let after_start = sign_pending_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
+    let after_start = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
     let pending = after_start.status().pending().expect("callout pending");
     let pending_id = pending.id;
     assert_eq!(pending_id, arena0_protocol::pending_id(execution_id, 0, 0));
@@ -2590,7 +2581,6 @@ async fn unrelated_event_can_retry_an_existing_callout() {
             Event::InputReceived {
                 callout_index: 0,
                 data: vec![0x32],
-                continuation_tag: Some(4),
             },
             SharedStateBytes::try_new(vec![0]).expect("answer shared state"),
             LocalStateBytes::try_new(Vec::new()).expect("answer local state"),
@@ -2649,9 +2639,7 @@ async fn terminal_agreement_retires_stale_continuation_effects() {
     let callout = Effect::Callout {
         callout_index: 0,
         context: vec![0x41],
-        pending_label: None,
         expected_type: None,
-        continuation_tag: Some(9),
     };
     let state = store
         .handle()
@@ -2674,7 +2662,7 @@ async fn terminal_agreement_retires_stale_continuation_effects() {
         )
         .await
         .expect("stage callout");
-    let waiting = sign_pending_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
+    let waiting = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
 
     // Leave the originating request leased while unrelated execution creates
     // a retry marker. The terminal agreement below must retire both rows.
@@ -2763,7 +2751,7 @@ async fn terminal_agreement_retires_stale_continuation_effects() {
         .expect("load terminal proposal")
         .expect("terminal proposal");
     assert!(staged.pending_shared().is_some());
-    sign_pending_step(&store, &fixture, execution_id, &mut writer, 13, 14).await;
+    sign_step(&store, &fixture, execution_id, &mut writer, 13, 14).await;
 
     drop(writer);
     store.shutdown().await.expect("shutdown");
@@ -2806,9 +2794,7 @@ async fn authenticated_stop_retires_stale_continuation_effects() {
             vec![Effect::Callout {
                 callout_index: 0,
                 context: vec![0x71],
-                pending_label: None,
                 expected_type: None,
-                continuation_tag: Some(3),
             }],
             None,
             None,
@@ -2818,7 +2804,7 @@ async fn authenticated_stop_retires_stale_continuation_effects() {
         )
         .await
         .expect("stage callout");
-    let waiting = sign_pending_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
+    let waiting = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
     let leased_callout = loop {
         let candidate = writer
             .lease_next_outbox(10)
@@ -2917,9 +2903,7 @@ async fn consumed_pending_request_is_hidden_while_dispatch_proposal_is_staged() 
     let callout = Effect::Callout {
         callout_index: 0,
         context: vec![0x91],
-        pending_label: None,
         expected_type: None,
-        continuation_tag: None,
     };
     let state = store
         .handle()
@@ -2942,7 +2926,7 @@ async fn consumed_pending_request_is_hidden_while_dispatch_proposal_is_staged() 
         )
         .await
         .expect("stage callout");
-    let waiting = sign_pending_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
+    let waiting = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
     let pending_id = waiting.status().pending().expect("pending callout").id;
 
     writer
@@ -2951,7 +2935,6 @@ async fn consumed_pending_request_is_hidden_while_dispatch_proposal_is_staged() 
             Event::InputReceived {
                 callout_index: 0,
                 data: vec![0x92],
-                continuation_tag: None,
             },
             SharedStateBytes::try_new(vec![1]).expect("updated shared state"),
             LocalStateBytes::try_new(Vec::new()).expect("local state"),
@@ -3007,9 +2990,7 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
     let callout = Effect::Callout {
         callout_index: 0,
         context: vec![3, 4],
-        pending_label: Some("answer".into()),
         expected_type: Some("u8".into()),
-        continuation_tag: Some(7),
     };
     let state = store
         .handle()
@@ -3032,7 +3013,7 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
         )
         .await
         .expect("stage callout");
-    sign_pending_step(&store, &fixture, execution_id, &mut writer, 21, 22).await;
+    sign_step(&store, &fixture, execution_id, &mut writer, 21, 22).await;
     let pending_id = arena0_protocol::pending_id(execution_id, 0, 0);
 
     let requests = store
@@ -3064,7 +3045,6 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
             Event::InputReceived {
                 callout_index: 0,
                 data: vec![0xff],
-                continuation_tag: Some(7),
             },
             SharedStateBytes::try_new(vec![0]).expect("shared state"),
             LocalStateBytes::try_new(vec![1]).expect("local state"),
@@ -3101,7 +3081,6 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
             Event::InputReceived {
                 callout_index: 0,
                 data: vec![0xfe],
-                continuation_tag: Some(7),
             },
             SharedStateBytes::try_new(vec![0]).expect("shared state"),
             LocalStateBytes::try_new(vec![2]).expect("local state"),
@@ -3130,9 +3109,7 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
             vec![Effect::Sign {
                 scheme: arena0_crypto::SignScheme::Ed25519,
                 data: vec![5, 6],
-                pending_label: Some("signature".into()),
                 expected_type: Some("bytes".into()),
-                continuation_tag: Some(9),
             }],
             None,
             None,
@@ -3142,7 +3119,7 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
         )
         .await
         .expect("stage signing request");
-    let sign_pending_id = arena0_protocol::pending_id(execution_id, 3, 0);
+    let sign_effect_id = arena0_protocol::pending_id(execution_id, 3, 0);
     let requests = store
         .handle()
         .list_pending_requests(execution_id)
@@ -3154,7 +3131,7 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
             pending_id,
             data,
             ..
-        }] if *pending_id == sign_pending_id
+        }] if *pending_id == sign_effect_id
             && data.execution_id() == execution_id
             && data.event_position() == 3
             && data.effect_index() == 0
@@ -3171,7 +3148,6 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
             state.version(),
             Event::Signed {
                 signature: vec![0xaa],
-                continuation_tag: Some(9),
             },
             SharedStateBytes::try_new(vec![0]).expect("shared state"),
             LocalStateBytes::try_new(vec![4]).expect("local state"),
@@ -3179,7 +3155,7 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
             None,
             None,
             None,
-            Some(sign_pending_id),
+            Some(sign_effect_id),
             26,
         )
         .await

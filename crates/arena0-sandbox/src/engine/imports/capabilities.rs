@@ -76,79 +76,24 @@ fn register_input(linker: &mut Linker<HostState>) -> Result<(), SandboxError> {
             |mut caller: Caller<'_, HostState>,
              variant_index: u32,
              context_ptr: u32,
-             context_len: u32| {
+             context_len: u32,
+             expected_ptr: u32,
+             expected_len: u32| {
                 caller.begin_import("request_input")?;
                 caller.reject_if_lifecycle_disallowed("request_input", &[Lifecycle::Active])?;
                 caller.reject_read_only("request_input")?;
                 let context =
                     caller.read_guest_bytes(context_ptr, context_len, "request_input:context")?;
-                let continuation_tag = caller.data_mut().next_continuation_tag.take();
+                let expected_type = read_optional_guest_string(
+                    &mut caller,
+                    expected_ptr,
+                    expected_len,
+                    "request_input:expected_type",
+                )?;
                 caller.record_effect(Effect::Callout {
                     callout_index: variant_index,
                     context,
-                    pending_label: None,
-                    expected_type: None,
-                    continuation_tag,
-                })
-            },
-        )
-        .map_err(map_err)?;
-    linker
-        .func_wrap(
-            abi::HOST_MODULE,
-            imports::REQUEST_INPUT_PENDING,
-            |mut caller: Caller<'_, HostState>,
-             variant_index: u32,
-             context_ptr: u32,
-             context_len: u32,
-             label_ptr: u32,
-             label_len: u32,
-             expected_ptr: u32,
-             expected_len: u32| {
-                caller.begin_import("request_input_pending")?;
-                caller.reject_if_lifecycle_disallowed(
-                    "request_input_pending",
-                    &[Lifecycle::Active],
-                )?;
-                caller.reject_read_only("request_input_pending")?;
-                let context = caller.read_guest_bytes(
-                    context_ptr,
-                    context_len,
-                    "request_input_pending:context",
-                )?;
-                let pending_label = if label_len == 0 {
-                    None
-                } else {
-                    let bytes = caller.read_guest_bytes(
-                        label_ptr,
-                        label_len,
-                        "request_input_pending:label",
-                    )?;
-                    Some(String::from_utf8(bytes).map_err(|e| {
-                        wasmtime::Error::msg(format!("request_input_pending: invalid label: {e}"))
-                    })?)
-                };
-                let expected_type = if expected_len == 0 {
-                    None
-                } else {
-                    let bytes = caller.read_guest_bytes(
-                        expected_ptr,
-                        expected_len,
-                        "request_input_pending:expected_type",
-                    )?;
-                    Some(String::from_utf8(bytes).map_err(|e| {
-                        wasmtime::Error::msg(format!(
-                            "request_input_pending: invalid expected_type: {e}"
-                        ))
-                    })?)
-                };
-                let continuation_tag = caller.data_mut().next_continuation_tag.take();
-                caller.record_effect(Effect::Callout {
-                    callout_index: variant_index,
-                    context,
-                    pending_label,
                     expected_type,
-                    continuation_tag,
                 })
             },
         )
@@ -216,80 +161,48 @@ fn register_sign(
         .func_wrap(
             abi::HOST_MODULE,
             imports::SIGN,
-            move |mut caller: Caller<'_, HostState>, scheme: u32, data_ptr: u32, data_len: u32| {
+            move |mut caller: Caller<'_, HostState>,
+                  scheme: u32,
+                  data_ptr: u32,
+                  data_len: u32,
+                  expected_ptr: u32,
+                  expected_len: u32| {
                 caller.begin_import("sign")?;
                 caller.reject_if_lifecycle_disallowed("sign", &[Lifecycle::Active])?;
                 caller.reject_read_only("sign")?;
                 let scheme = u32_to_sign_scheme(scheme)?;
                 reject_if_sign_scheme_disallowed("sign", scheme, &allowed_schemes_for_sign)?;
                 let data = caller.read_guest_bytes(data_ptr, data_len, "sign")?;
-                let continuation_tag = caller.data_mut().next_continuation_tag.take();
-                caller.record_effect(Effect::Sign {
-                    scheme,
-                    data,
-                    pending_label: None,
-                    expected_type: None,
-                    continuation_tag,
-                })
-            },
-        )
-        .map_err(map_err)?;
-    let allowed_schemes_for_pending = allowed_schemes;
-    linker
-        .func_wrap(
-            abi::HOST_MODULE,
-            imports::SIGN_PENDING,
-            move |mut caller: Caller<'_, HostState>,
-                  scheme: u32,
-                  data_ptr: u32,
-                  data_len: u32,
-                  label_ptr: u32,
-                  label_len: u32,
-                  expected_ptr: u32,
-                  expected_len: u32| {
-                caller.begin_import("sign_pending")?;
-                caller.reject_if_lifecycle_disallowed("sign_pending", &[Lifecycle::Active])?;
-                caller.reject_read_only("sign_pending")?;
-                let scheme = u32_to_sign_scheme(scheme)?;
-                reject_if_sign_scheme_disallowed(
-                    "sign_pending",
-                    scheme,
-                    &allowed_schemes_for_pending,
+                let expected_type = read_optional_guest_string(
+                    &mut caller,
+                    expected_ptr,
+                    expected_len,
+                    "sign:expected_type",
                 )?;
-                let data = caller.read_guest_bytes(data_ptr, data_len, "sign_pending:data")?;
-                let pending_label = if label_len == 0 {
-                    None
-                } else {
-                    let bytes =
-                        caller.read_guest_bytes(label_ptr, label_len, "sign_pending:label")?;
-                    Some(String::from_utf8(bytes).map_err(|e| {
-                        wasmtime::Error::msg(format!("sign_pending: invalid label: {e}"))
-                    })?)
-                };
-                let expected_type = if expected_len == 0 {
-                    None
-                } else {
-                    let bytes = caller.read_guest_bytes(
-                        expected_ptr,
-                        expected_len,
-                        "sign_pending:expected_type",
-                    )?;
-                    Some(String::from_utf8(bytes).map_err(|e| {
-                        wasmtime::Error::msg(format!("sign_pending: invalid expected_type: {e}"))
-                    })?)
-                };
-                let continuation_tag = caller.data_mut().next_continuation_tag.take();
                 caller.record_effect(Effect::Sign {
                     scheme,
                     data,
-                    pending_label,
                     expected_type,
-                    continuation_tag,
                 })
             },
         )
         .map_err(map_err)?;
     Ok(())
+}
+
+fn read_optional_guest_string(
+    caller: &mut Caller<'_, HostState>,
+    ptr: u32,
+    len: u32,
+    label: &str,
+) -> Result<Option<String>, wasmtime::Error> {
+    if len == 0 {
+        return Ok(None);
+    }
+    let bytes = caller.read_guest_bytes(ptr, len, label)?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| wasmtime::Error::msg(format!("{label}: invalid UTF-8: {error}")))
 }
 
 fn reject_if_sign_scheme_disallowed(
@@ -402,12 +315,15 @@ mod tests {
         let wat = format!(
             r#"
                 (module
-                  (import "arena0" "sign" (func $sign (param i32 i32 i32)))
+                  (import "arena0" "sign" (func $sign (param i32 i32 i32 i32 i32)))
                   (memory (export "memory") 1)
+                  (data (i32.const 16) "Signature")
                   (func (export "call_sign")
                     i32.const {scheme}
                     i32.const 0
                     i32.const 0
+                    i32.const 16
+                    i32.const 9
                     call $sign))
             "#
         );
@@ -438,6 +354,57 @@ mod tests {
             .get_typed_func::<(), ()>(&mut store, "call_sign")
             .unwrap();
         (store, sign)
+    }
+
+    fn instantiate_input_test_module(
+        stage: Lifecycle,
+    ) -> (Store<HostState>, wasmtime::TypedFunc<(), ()>) {
+        let engine = Engine::default();
+        let module = Module::new(
+            &engine,
+            r#"
+                (module
+                  (import "arena0" "request_input"
+                    (func $request_input (param i32 i32 i32 i32 i32)))
+                  (memory (export "memory") 1)
+                  (data (i32.const 0) "null")
+                  (data (i32.const 8) "Choice")
+                  (func (export "call_request_input")
+                    i32.const 0
+                    i32.const 0
+                    i32.const 4
+                    i32.const 8
+                    i32.const 6
+                    call $request_input))
+            "#,
+        )
+        .unwrap();
+
+        let mut linker = Linker::new(&engine);
+        register_capability_imports(&mut linker, &[Capability::Input]).unwrap();
+
+        let mut store = Store::new(&engine, {
+            let mut hs = HostState::new(
+                arena0_program::ExecutionProfile::current(),
+                CallKind::Dispatch,
+                Lifecycle::PreSession,
+                None,
+                vec![
+                    arena0_program::JsonSchemaDocument::new(serde_json::json!({
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "type": "null"
+                    }))
+                    .unwrap(),
+                ],
+            );
+            hs.lifecycle = stage;
+            hs
+        });
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        let request_input = instance
+            .get_typed_func::<(), ()>(&mut store, "call_request_input")
+            .unwrap();
+        (store, request_input)
     }
 
     #[test]
@@ -477,6 +444,20 @@ mod tests {
     }
 
     #[test]
+    fn request_input_records_declared_output_type() {
+        let (mut store, request_input) = instantiate_input_test_module(Lifecycle::Active);
+        request_input.call(&mut store, ()).unwrap();
+        assert_eq!(
+            store.data().effect_queue,
+            vec![Effect::Callout {
+                callout_index: 0,
+                context: b"null".to_vec(),
+                expected_type: Some("Choice".into()),
+            }]
+        );
+    }
+
+    #[test]
     fn sign_rejected_during_pre_session() {
         let (mut store, sign) =
             instantiate_sign_test_module(Lifecycle::PreSession, 0, vec![SignScheme::Ed25519]);
@@ -497,9 +478,7 @@ mod tests {
                 vec![Effect::Sign {
                     scheme: SignScheme::Ed25519,
                     data: Vec::new(),
-                    pending_label: None,
-                    expected_type: None,
-                    continuation_tag: None,
+                    expected_type: Some("Signature".into()),
                 }]
             );
         }

@@ -34,20 +34,13 @@ pub enum Event<M = Vec<u8>> {
         msg: M,
     },
     /// The controlling agent submitted input in response to a [`Callout`](crate::Effect::Callout).
-    InputReceived {
-        callout_index: u32,
-        data: Vec<u8>,
-        continuation_tag: Option<u32>,
-    },
+    InputReceived { callout_index: u32, data: Vec<u8> },
     /// A previously set timer fired.
     TimerFired,
     /// A previously set typed timer fired.
     TypedTimerFired { timer: TimerPayload },
     /// Completed [`Sign`](crate::Effect::Sign) effect.
-    Signed {
-        signature: Vec<u8>,
-        continuation_tag: Option<u32>,
-    },
+    Signed { signature: Vec<u8> },
     /// Run the program's reaction code after an agreed entry applied.
     React,
 }
@@ -76,21 +69,13 @@ impl Event<Vec<u8>> {
             Self::InputReceived {
                 callout_index,
                 data,
-                continuation_tag,
             } => Event::InputReceived {
                 callout_index,
                 data,
-                continuation_tag,
             },
             Self::TimerFired => Event::TimerFired,
             Self::TypedTimerFired { timer } => Event::TypedTimerFired { timer },
-            Self::Signed {
-                signature,
-                continuation_tag,
-            } => Event::Signed {
-                signature,
-                continuation_tag,
-            },
+            Self::Signed { signature } => Event::Signed { signature },
             Self::React => Event::React,
         })
     }
@@ -128,7 +113,6 @@ impl<M: BorshSerialize> BorshSerialize for Event<M> {
             Self::InputReceived {
                 callout_index,
                 data,
-                continuation_tag,
             } => {
                 BorshSerialize::serialize(&EVENT_INPUT_RECEIVED, writer)?;
                 BorshSerialize::serialize(callout_index, writer)?;
@@ -138,17 +122,14 @@ impl<M: BorshSerialize> BorshSerialize for Event<M> {
                     crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
                     "event input payload",
                 )?;
-                BorshSerialize::serialize(continuation_tag, writer)
+                Ok(())
             }
             Self::TimerFired => BorshSerialize::serialize(&EVENT_TIMER_FIRED, writer),
             Self::TypedTimerFired { timer } => {
                 BorshSerialize::serialize(&EVENT_TYPED_TIMER_FIRED, writer)?;
                 timer.serialize_bounded(writer)
             }
-            Self::Signed {
-                signature,
-                continuation_tag,
-            } => {
+            Self::Signed { signature } => {
                 BorshSerialize::serialize(&EVENT_SIGNED, writer)?;
                 serialize_bounded_bytes(
                     writer,
@@ -156,7 +137,7 @@ impl<M: BorshSerialize> BorshSerialize for Event<M> {
                     crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
                     "event signature payload",
                 )?;
-                BorshSerialize::serialize(continuation_tag, writer)
+                Ok(())
             }
             Self::React => BorshSerialize::serialize(&EVENT_REACT, writer),
         }
@@ -183,7 +164,6 @@ impl<M: BorshDeserialize> BorshDeserialize for Event<M> {
                     crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
                     "event input payload",
                 )?,
-                continuation_tag: borsh::BorshDeserialize::deserialize_reader(reader)?,
             }),
             EVENT_TIMER_FIRED => Ok(Self::TimerFired),
             EVENT_TYPED_TIMER_FIRED => Ok(Self::TypedTimerFired {
@@ -195,7 +175,6 @@ impl<M: BorshDeserialize> BorshDeserialize for Event<M> {
                     crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
                     "event signature payload",
                 )?,
-                continuation_tag: borsh::BorshDeserialize::deserialize_reader(reader)?,
             }),
             EVENT_REACT => Ok(Self::React),
             tag => Err(io::Error::new(
@@ -228,7 +207,6 @@ mod tests {
             Event::InputReceived {
                 callout_index: 0,
                 data: vec![4, 5, 6],
-                continuation_tag: None,
             },
             Event::TimerFired,
             Event::TypedTimerFired {
@@ -239,7 +217,6 @@ mod tests {
             },
             Event::Signed {
                 signature: vec![0xDD, 0xEE],
-                continuation_tag: None,
             },
             Event::React,
         ];

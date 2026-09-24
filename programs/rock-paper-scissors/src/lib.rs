@@ -78,11 +78,6 @@ pub enum Phase {
     Playing,
 }
 
-#[arena0::pending]
-pub enum Pending {
-    ChoosingMove,
-}
-
 /// Derived terminal receipt: a pure projection from final shared state.
 ///
 /// Computed in absolute participant order (`scores[0]` is participant 0), so
@@ -317,10 +312,7 @@ pub mod rock_paper_scissors {
         if ctx.commit_reveal().needs_commit() {
             let slot = ctx.me().index();
             let req = ctx.shared().choice_request(slot);
-            ctx.effects()
-                .callout(req)
-                .pending(Pending::ChoosingMove)
-                .dispatch();
+            ctx.effects().callout(req).dispatch();
         }
         Ok(Transition::Stay)
     }
@@ -480,10 +472,6 @@ mod tests {
         assert_eq!(callout.request.total_rounds, 3);
         assert_eq!(callout.request.your_score, 0);
         assert_eq!(callout.request.their_score, 0);
-        assert_eq!(
-            callout.pending_label.as_deref(),
-            Some(Pending::ChoosingMove.as_str())
-        );
         assert_eq!(
             callout.expected_type.as_deref(),
             Some(std::any::type_name::<Choice>())

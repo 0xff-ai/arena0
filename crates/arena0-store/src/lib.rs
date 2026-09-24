@@ -980,7 +980,7 @@ pub(crate) struct AuthenticatedFrame {
 
 /// Store-domain identity of one authenticated inbound frame.
 ///
-/// This is deliberately distinct from protocol [`arena0_protocol::execution::FrameId`] values used by
+/// This is deliberately distinct from protocol execution positions used by
 /// durable effects.  The authenticated source is part of the identity, so
 /// identical frame bytes arriving over two authenticated routes cannot occupy
 /// one another's inbox slot.

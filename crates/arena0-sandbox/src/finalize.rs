@@ -1,4 +1,4 @@
-//! ABI-21 Wasm finalization and structural validation.
+//! ABI-22 Wasm finalization and structural validation.
 //!
 //! Rust's wasm target emits one ordinary linear memory. The arena0 artifact
 //! boundary turns that memory into bounded work memory and appends the two state
@@ -125,7 +125,7 @@ pub(crate) fn inspect(binary: &[u8]) -> Result<ModuleShape, SandboxError> {
                         }
                     ) {
                         return Err(SandboxError::InvalidMetadata(
-                            "ABI-21 modules may only use active data segments in work memory"
+                            "ABI-22 modules may only use active data segments in work memory"
                                 .into(),
                         ));
                     }
@@ -137,7 +137,7 @@ pub(crate) fn inspect(binary: &[u8]) -> Result<ModuleShape, SandboxError> {
                         .map_err(|error| SandboxError::compilation_failed(error.to_string()))?;
                     if !matches!(element.kind, ElementKind::Active { .. }) {
                         return Err(SandboxError::InvalidMetadata(
-                            "ABI-21 modules may not contain passive or declared element segments"
+                            "ABI-22 modules may not contain passive or declared element segments"
                                 .into(),
                         ));
                     }
@@ -177,7 +177,7 @@ fn reject_operator(operator: Operator<'_>) -> Result<(), SandboxError> {
     };
     if let Some(reason) = reason {
         return Err(SandboxError::InvalidMetadata(format!(
-            "ABI-21 modules may not use {reason}"
+            "ABI-22 modules may not use {reason}"
         )));
     }
     Ok(())
@@ -231,34 +231,34 @@ fn mutable_global_name(index: u32) -> String {
     format!("{MUTABLE_GLOBAL_EXPORT_PREFIX}{index}")
 }
 
-/// Rewrite a raw ABI-21 module into the completed three-memory artifact with
+/// Rewrite a raw ABI-22 module into the completed three-memory artifact with
 /// a bounded work-memory maximum.
 pub(crate) fn finalize(binary: &[u8], profile: &ExecutionProfile) -> Result<Vec<u8>, SandboxError> {
     let shape = inspect(binary)?;
     if shape.imported_memories != 0 {
         return Err(SandboxError::InvalidMetadata(
-            "ABI-21 modules may not import linear memories".into(),
+            "ABI-22 modules may not import linear memories".into(),
         ));
     }
     if shape.imported_globals != 0 {
         return Err(SandboxError::InvalidMetadata(
-            "ABI-21 modules may not import mutable globals".into(),
+            "ABI-22 modules may not import mutable globals".into(),
         ));
     }
     if shape.imported_tables != 0 {
         return Err(SandboxError::InvalidMetadata(
-            "ABI-21 modules may not import tables".into(),
+            "ABI-22 modules may not import tables".into(),
         ));
     }
     if shape.defined_memories.len() != 1 || !shape.has_memory_section {
         return Err(SandboxError::InvalidMetadata(format!(
-            "raw ABI-21 module must define exactly one work memory, got {}",
+            "raw ABI-22 module must define exactly one work memory, got {}",
             shape.defined_memories.len()
         )));
     }
     if !shape.has_export_section {
         return Err(SandboxError::InvalidMetadata(
-            "raw ABI-21 module must have an export section".into(),
+            "raw ABI-22 module must have an export section".into(),
         ));
     }
     if !shape.exports_function(abi::exports::DISPATCH) {
@@ -267,7 +267,7 @@ pub(crate) fn finalize(binary: &[u8], profile: &ExecutionProfile) -> Result<Vec<
     for name in [abi::exports::SHARED_MEMORY, abi::exports::LOCAL_MEMORY] {
         if shape.exports.contains_key(name) {
             return Err(SandboxError::InvalidMetadata(format!(
-                "raw ABI-21 module already exports reserved memory name {name}"
+                "raw ABI-22 module already exports reserved memory name {name}"
             )));
         }
     }
@@ -277,7 +277,7 @@ pub(crate) fn finalize(binary: &[u8], profile: &ExecutionProfile) -> Result<Vec<
         .any(|name| name.starts_with(MUTABLE_GLOBAL_EXPORT_PREFIX))
     {
         return Err(SandboxError::InvalidMetadata(
-            "raw ABI-21 module already uses reserved mutable-global export names".into(),
+            "raw ABI-22 module already uses reserved mutable-global export names".into(),
         ));
     }
     let work_pages = shape.defined_memories[0].0;
@@ -289,7 +289,7 @@ pub(crate) fn finalize(binary: &[u8], profile: &ExecutionProfile) -> Result<Vec<
     let state_pages = pages_for_bytes(MAX_WASM_STATE_MEMORY_BYTES)?;
     if state_pages != 65 {
         return Err(SandboxError::InvalidMetadata(
-            "ABI-21 state memory capacity must be exactly 65 pages".into(),
+            "ABI-22 state memory capacity must be exactly 65 pages".into(),
         ));
     }
     let work_max_pages = profile_work_max_pages(profile);
@@ -303,7 +303,7 @@ pub(crate) fn finalize(binary: &[u8], profile: &ExecutionProfile) -> Result<Vec<
     }
     if !aggregate_memory_fits_profile(work_max_pages, state_pages, profile) {
         return Err(SandboxError::InvalidMetadata(
-            "ABI-21 memory aggregate exceeds the profile capacity".into(),
+            "ABI-22 memory aggregate exceeds the profile capacity".into(),
         ));
     }
 
@@ -367,7 +367,7 @@ impl Reencode for Finalizer {
             .map_err(wasm_encoder::reencode::Error::ParseError)?;
         if entries.len() != 1 {
             return Err(Self::user_error(
-                "raw ABI-21 module must define one work memory",
+                "raw ABI-22 module must define one work memory",
             ));
         }
         let original = entries[0];
@@ -409,7 +409,7 @@ impl Reencode for Finalizer {
     ) -> Result<TableType, wasm_encoder::reencode::Error<Self::Error>> {
         if table.table64 || table.shared || table.initial > u64::from(MAX_WASM_TABLE_ELEMENTS) {
             return Err(Self::user_error(
-                "table exceeds the fixed ABI-21 table contract",
+                "table exceeds the fixed ABI-22 table contract",
             ));
         }
         Ok(TableType {
@@ -437,7 +437,7 @@ impl Reencode for Finalizer {
             || export.name.starts_with(MUTABLE_GLOBAL_EXPORT_PREFIX)
         {
             return Err(Self::user_error(format!(
-                "raw module uses reserved ABI-21 export name {}",
+                "raw module uses reserved ABI-22 export name {}",
                 export.name
             )));
         }
@@ -475,7 +475,7 @@ impl Reencode for Finalizer {
 }
 
 /// Validate the completed module's exact memory/global/table shape after
-/// Wasmtime has parsed it with the ABI-21 feature set.
+/// Wasmtime has parsed it with the ABI-22 feature set.
 pub(crate) fn validate_finalized_shape(
     binary: &[u8],
     profile: &ExecutionProfile,
@@ -490,18 +490,18 @@ pub(crate) fn validate_finalized_shape(
         || profile.limits.max_memories != 3
     {
         return Err(SandboxError::InvalidMetadata(
-            "module is not a complete ABI-21 three-memory artifact".into(),
+            "module is not a complete ABI-22 three-memory artifact".into(),
         ));
     }
     let state_pages = pages_for_bytes(MAX_WASM_STATE_MEMORY_BYTES)?;
     let Some((work_pages, work_maximum)) = shape.defined_memories.first().copied() else {
         return Err(SandboxError::InvalidMetadata(
-            "ABI-21 artifact is missing work memory".into(),
+            "ABI-22 artifact is missing work memory".into(),
         ));
     };
     let Some(work_maximum) = work_maximum else {
         return Err(SandboxError::InvalidMetadata(
-            "ABI-21 work memory must declare a bounded maximum".into(),
+            "ABI-22 work memory must declare a bounded maximum".into(),
         ));
     };
     if work_pages == 0
@@ -511,7 +511,7 @@ pub(crate) fn validate_finalized_shape(
         || !prepared_work_capacity_fits_profile(work_maximum, profile)
     {
         return Err(SandboxError::InvalidMetadata(
-            "ABI-21 work memory minimum/maximum exceeds the profile capacity".into(),
+            "ABI-22 work memory minimum/maximum exceeds the profile capacity".into(),
         ));
     }
     if shape.defined_memories
@@ -522,13 +522,13 @@ pub(crate) fn validate_finalized_shape(
         ]
     {
         return Err(SandboxError::InvalidMetadata(
-            "ABI-21 memories do not match one bounded work and two fixed 65-page state memories"
+            "ABI-22 memories do not match one bounded work and two fixed 65-page state memories"
                 .into(),
         ));
     }
     if !aggregate_memory_fits_profile(work_maximum, state_pages, profile) {
         return Err(SandboxError::InvalidMetadata(
-            "ABI-21 memory aggregate exceeds the profile capacity".into(),
+            "ABI-22 memory aggregate exceeds the profile capacity".into(),
         ));
     }
     if shape.defined_tables.iter().any(|(initial, maximum)| {
@@ -536,7 +536,7 @@ pub(crate) fn validate_finalized_shape(
     }) || shape.defined_tables.len() as u64 > profile.limits.max_tables
     {
         return Err(SandboxError::InvalidMetadata(
-            "ABI-21 tables must have fixed maximum sizes".into(),
+            "ABI-22 tables must have fixed maximum sizes".into(),
         ));
     }
     let expected_memories = [
@@ -560,7 +560,7 @@ pub(crate) fn validate_finalized_shape(
         })
     {
         return Err(SandboxError::InvalidMetadata(
-            "ABI-21 work and state memory exports do not match their memories".into(),
+            "ABI-22 work and state memory exports do not match their memories".into(),
         ));
     }
     let mutable_exports_valid = shape
@@ -590,7 +590,7 @@ pub(crate) fn validate_finalized_shape(
         || !shape.exports_function(abi::exports::DISPATCH)
     {
         return Err(SandboxError::InvalidMetadata(
-            "ABI-21 mutable globals or dispatch export are incomplete".into(),
+            "ABI-22 mutable globals or dispatch export are incomplete".into(),
         ));
     }
     Ok(())

@@ -1,8 +1,8 @@
-//! Resident-compatible guest ABI emission for trait-form programs.
+//! Resident-compatible guest ABI emission for module-shell programs.
 //!
 //! This module owns only the generated ABI exports and their state restoration
-//! helpers. Trait parsing, associated-type defaults, and handler extraction stay
-//! in the sibling trait_form module.
+//! helpers. Associated-type defaults and handler extraction stay in the module
+//! shell expansion.
 
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
@@ -279,14 +279,7 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                 ::arena0::Event::InputReceived {
                     callout_index,
                     data,
-                    continuation_tag,
                 } => {
-                    if let Some(tag) = continuation_tag {
-                        <#program_ty as ::arena0::Program>::__arena0_restore_continuation(
-                            &mut ctx,
-                            tag,
-                        );
-                    }
                     let input = <#callout_ty as ::arena0::Arena0Callout>::from_raw(
                         callout_index,
                         data,
@@ -333,14 +326,7 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                 }
                 ::arena0::Event::Signed {
                     signature,
-                    continuation_tag,
                 } => {
-                    if let Some(tag) = continuation_tag {
-                        <#program_ty as ::arena0::Program>::__arena0_restore_continuation(
-                            &mut ctx,
-                            tag,
-                        );
-                    }
                     match <#program_ty as ::arena0::Program>::__arena0_on_signed(
                         &mut ctx,
                         signature,

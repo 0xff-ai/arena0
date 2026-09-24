@@ -7,15 +7,16 @@
 
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
-use syn::{Error, Ident, Item, ItemFn, ItemImpl, ItemMod, Result, Type, spanned::Spanned};
+use syn::visit::Visit;
+use syn::{
+    Error, Ident, ImplItem, Item, ItemFn, ItemImpl, ItemMod, Result, Type, spanned::Spanned,
+};
 
 use super::args::Arena0ProgramArgs;
-use super::capabilities::infer_effect_capabilities_from_module;
-use super::continuations::{
-    inject_module_continuation_items, inject_module_local_wrapper, lower_async_module_handlers,
+use super::capabilities::{
+    InferredEffectCapability, infer_effect_capabilities, infer_effect_capabilities_from_module,
 };
-use super::host_async::reject_disallowed_host_async_in_module;
-use super::trait_form::expand_arena0_program_with_inferred;
+use super::guest_abi::{GuestAbi, guest_abi};
 use super::{rewrite_context_type, to_pascal_case};
 
 #[allow(clippy::too_many_lines)]
@@ -34,7 +35,7 @@ pub(super) fn expand_arena0_program_module(
         ));
     };
 
-    reject_disallowed_host_async_in_module(items)?;
+    reject_async_module_handlers(items)?;
 
     let shared_ty: Type = if module_has_item_type(items, "Shared") {
         syn::parse_quote!(Shared)
@@ -52,29 +53,14 @@ pub(super) fn expand_arena0_program_module(
         syn::parse_quote!(())
     };
 
-    let continuations = lower_async_module_handlers(items, &program_ident)?;
     if module_has_fn(items, "on_message") && !module_has_fn(items, "writer") {
         return Err(Error::new(
             module.span(),
             "arena0::program modules with on_message must define writer(shared) -> Option<Participant> for agreed messages",
         ));
     }
-    let local_ty: Type = if continuations.is_empty() {
-        user_local_ty.clone()
-    } else {
-        syn::parse_quote!(__Arena0Local)
-    };
+    let local_ty = user_local_ty.clone();
     rewrite_bare_context_in_module(items, &shared_ty, &local_ty);
-    if !continuations.is_empty() {
-        inject_module_local_wrapper(items, &user_local_ty);
-        inject_module_continuation_items(
-            items,
-            &program_ident,
-            &shared_ty,
-            &local_ty,
-            continuations,
-        );
-    }
 
     let assoc_types = module_assoc_types(items, &shared_ty, &local_ty);
     let methods = module_handler_methods(items);
@@ -91,7 +77,7 @@ pub(super) fn expand_arena0_program_module(
         Vec::new()
     };
     let expanded_impl =
-        expand_arena0_program_with_inferred(args, impl_item, inferred_effect_capabilities, false)?;
+        expand_arena0_program_with_inferred(args, impl_item, inferred_effect_capabilities)?;
     let module_items = items.iter();
     let program_doc = format!(
         "Generated arena0 program type for the `{}` module shell.",
@@ -313,17 +299,6 @@ fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
             }
         });
     }
-    if module_has_fn(items, "__arena0_restore_continuation") {
-        methods.push(quote! {
-            #[doc(hidden)]
-            fn __arena0_restore_continuation(
-                ctx: &mut ::arena0::Context<Self::Shared, Self::Local>,
-                tag: u32,
-            ) {
-                self::__arena0_restore_continuation(ctx, tag)
-            }
-        });
-    }
     if let Some(timer_ty) = module_typed_timer_arg(items) {
         methods.push(quote! {
             #[doc(hidden)]
@@ -407,4 +382,282 @@ fn rewrite_bare_context_in_fn(function: &mut ItemFn, shared_ty: &Type, local_ty:
             rewrite_context_type(&mut pat_type.ty, shared_ty, local_ty);
         }
     }
+}
+
+/// Reject asynchronous handlers now that program dispatch is synchronous.
+fn reject_async_module_handlers(items: &[Item]) -> Result<()> {
+    for item in items {
+        let Item::Fn(function) = item else {
+            continue;
+        };
+        if let Some(asyncness) = function.sig.asyncness {
+            return Err(Error::new(
+                asyncness.span(),
+                "async handlers are not supported by arena0::program module shells; use synchronous handlers",
+            ));
+        }
+        let mut visitor = AsyncModuleVisitor { error: None };
+        visitor.visit_item_fn(function);
+        if let Some(error) = visitor.error {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+struct AsyncModuleVisitor {
+    error: Option<Error>,
+}
+
+impl AsyncModuleVisitor {
+    fn reject(&mut self, span: proc_macro2::Span, message: &'static str) {
+        if self.error.is_none() {
+            self.error = Some(Error::new(span, message));
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for AsyncModuleVisitor {
+    fn visit_expr_async(&mut self, node: &'ast syn::ExprAsync) {
+        self.reject(
+            node.async_token.span(),
+            "async blocks are not supported by arena0::program module shells",
+        );
+    }
+
+    fn visit_expr_await(&mut self, node: &'ast syn::ExprAwait) {
+        self.reject(
+            node.await_token.span(),
+            "await is not supported by arena0::program module shells",
+        );
+    }
+}
+
+/// Assemble the generated `Program` implementation and resident ABI exports.
+///
+/// Module shells use the shared resident ABI code generation; this helper is
+/// intentionally private to the shell expansion.
+#[allow(clippy::too_many_lines)]
+fn expand_arena0_program_with_inferred(
+    args: Arena0ProgramArgs,
+    item: ItemImpl,
+    extra_inferred_effect_capabilities: Vec<InferredEffectCapability>,
+) -> Result<TokenStream2> {
+    let program_ty = item.self_ty.clone();
+    let name = &args.name;
+    let version = &args.version;
+    let description = &args.description;
+    let display_name = args.display_name.as_ref().unwrap_or(name);
+    let participants = args.participants.to_tokens();
+    let capabilities = &args.capabilities;
+    let inferred_effect_capabilities = if args.capabilities_auto {
+        let mut inferred = infer_effect_capabilities(&item);
+        inferred.extend(extra_inferred_effect_capabilities);
+        inferred
+    } else {
+        Vec::new()
+    };
+    let inferred_effect_capability_tokens: Vec<_> = inferred_effect_capabilities
+        .iter()
+        .map(|capability| capability.capability.clone())
+        .collect();
+
+    let shared_ty = extract_assoc_type(&item, "Shared")?;
+    let has_local = extract_assoc_type(&item, "Local").is_ok();
+    let has_phase = extract_assoc_type(&item, "Phase").is_ok();
+    let has_message = extract_assoc_type(&item, "Message").is_ok();
+    let has_callout = extract_assoc_type(&item, "Callout").is_ok();
+    let has_input = extract_assoc_type(&item, "Input").is_ok();
+    let has_params = extract_assoc_type(&item, "Params").is_ok();
+    let has_outcome = extract_assoc_type(&item, "Outcome").is_ok();
+    let has_outcome_fn = item.items.iter().any(
+        |impl_item| matches!(impl_item, ImplItem::Fn(method) if method.sig.ident == "outcome"),
+    );
+
+    let local_ty: Type = if has_local {
+        extract_assoc_type(&item, "Local").unwrap()
+    } else {
+        syn::parse_quote!(())
+    };
+    let message_ty: Type = if has_message {
+        extract_assoc_type(&item, "Message").unwrap()
+    } else {
+        syn::parse_quote!(Vec<u8>)
+    };
+    let callout_ty: Type = if has_callout {
+        extract_assoc_type(&item, "Callout").unwrap()
+    } else {
+        syn::parse_quote!(())
+    };
+    if has_input {
+        let _ = extract_assoc_type(&item, "Input")?;
+    }
+    let params_ty: Type = if has_params {
+        extract_assoc_type(&item, "Params").unwrap()
+    } else {
+        syn::parse_quote!(())
+    };
+    let outcome_ty: Type = if has_outcome {
+        extract_assoc_type(&item, "Outcome").unwrap()
+    } else {
+        syn::parse_quote!(())
+    };
+    let mut item = item;
+
+    rewrite_bare_context(&mut item, &shared_ty, &local_ty);
+    let query_ty: Type = syn::parse_quote!(<#program_ty as ::arena0::ProgramQuery>::Query);
+    let query_impl = quote! {};
+    let (view_impl, _has_view) = extract_program_view_impl(&mut item, &program_ty, &shared_ty);
+
+    if !has_local {
+        item.items.push(syn::parse_quote! { type Local = (); });
+    }
+    if !has_phase {
+        item.items.push(
+            syn::parse_quote! { type Phase = <#shared_ty as ::arena0::PhasedSharedState>::Phase; },
+        );
+        item.items.push(syn::parse_quote! {
+            #[doc(hidden)]
+            fn __phase(shared: &Self::Shared) -> ::core::option::Option<Self::Phase> {
+                ::core::option::Option::Some(<#shared_ty as ::arena0::PhasedSharedState>::phase(shared))
+            }
+        });
+        item.items.push(syn::parse_quote! {
+            #[doc(hidden)]
+            fn __set_phase(shared: &mut Self::Shared, phase: Self::Phase) {
+                <#shared_ty as ::arena0::PhasedSharedState>::__set_phase(shared, phase);
+            }
+        });
+        item.items.push(syn::parse_quote! {
+            #[doc(hidden)]
+            fn __phase_decls() -> &'static [::arena0::PhaseDecl] {
+                <<#shared_ty as ::arena0::PhasedSharedState>::Phase as ::arena0::Arena0Phase>::DECLS
+            }
+        });
+    }
+    if !has_message {
+        item.items
+            .push(syn::parse_quote! { type Message = Vec<u8>; });
+    }
+    if !has_callout {
+        item.items.push(syn::parse_quote! { type Callout = (); });
+    }
+    if !has_input {
+        item.items.push(
+            syn::parse_quote! { type Input = <#callout_ty as ::arena0::Arena0Callout>::Response; },
+        );
+    }
+    if !has_params {
+        item.items.push(syn::parse_quote! { type Params = (); });
+    }
+    if !has_outcome {
+        item.items.push(syn::parse_quote! { type Outcome = (); });
+        if !has_outcome_fn {
+            item.items.push(syn::parse_quote! {
+                fn outcome(_shared: &Self::Shared) -> Self::Outcome {}
+            });
+        }
+    }
+
+    Ok(guest_abi(GuestAbi {
+        item,
+        query_impl,
+        view_impl,
+        program_ty,
+        shared_ty,
+        local_ty,
+        callout_ty,
+        message_ty,
+        params_ty,
+        outcome_ty,
+        query_ty,
+        name: name.clone(),
+        version: version.clone(),
+        description: description.clone(),
+        display_name: display_name.clone(),
+        participants,
+        capabilities: capabilities.clone(),
+        inferred_effect_capability_tokens,
+    }))
+}
+
+fn extract_program_view_impl(
+    item: &mut ItemImpl,
+    program_ty: &Type,
+    shared_ty: &Type,
+) -> (TokenStream2, bool) {
+    let mut retained = Vec::new();
+    let mut view_method = None;
+
+    for impl_item in std::mem::take(&mut item.items) {
+        match impl_item {
+            ImplItem::Fn(method) if method.sig.ident == "view" => view_method = Some(method),
+            other => retained.push(other),
+        }
+    }
+
+    item.items = retained;
+    let has_view = view_method.is_some();
+    let view_method = view_method.map_or_else(
+        || default_view_method(program_ty, shared_ty),
+        |method| quote! { #method },
+    );
+
+    (
+        quote! {
+            impl ::arena0::ProgramView for #program_ty {
+                #view_method
+            }
+        },
+        has_view,
+    )
+}
+
+fn default_view_method(program_ty: &Type, shared_ty: &Type) -> TokenStream2 {
+    quote! {
+        fn view(
+            shared: &#shared_ty,
+            _ensemble: &::arena0::Ensemble,
+            _viewport: &::arena0::Viewport,
+        ) -> ::arena0::View {
+            let mut view = ::arena0::View::new()
+                .state(::std::format!("{:#?}", shared));
+            if !<#program_ty as ::arena0::Program>::__phase_decls().is_empty() {
+                if let ::core::option::Option::Some(phase) =
+                    <#program_ty as ::arena0::Program>::__phase(shared)
+                {
+                    let phase_name =
+                        <<#program_ty as ::arena0::Program>::Phase as ::arena0::Arena0Phase>::as_str(phase);
+                    view = view.status_bar(phase_name);
+                }
+            }
+            view
+        }
+    }
+}
+
+fn rewrite_bare_context(item: &mut ItemImpl, shared_ty: &Type, local_ty: &Type) {
+    for impl_item in &mut item.items {
+        if let ImplItem::Fn(method) = impl_item {
+            for arg in &mut method.sig.inputs {
+                if let syn::FnArg::Typed(pat_type) = arg {
+                    rewrite_context_type(&mut pat_type.ty, shared_ty, local_ty);
+                }
+            }
+        }
+    }
+}
+
+fn extract_assoc_type(item: &ItemImpl, name: &str) -> Result<Type> {
+    for it in &item.items {
+        if let ImplItem::Type(ty) = it
+            && ty.ident == name
+        {
+            return Ok(ty.ty.clone());
+        }
+    }
+    Err(Error::new(
+        item.span(),
+        format!("missing associated type `{name}`"),
+    ))
 }

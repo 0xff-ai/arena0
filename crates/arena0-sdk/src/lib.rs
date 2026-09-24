@@ -39,12 +39,12 @@ extern crate self as arena0;
 pub const RESIDENT_ALLOCATOR_RESERVE_BYTES: usize = arena0_program::MIN_PREPARED_WORK_MEMORY_BYTES;
 
 pub use arena0_sdk_macros::{
-    callout, callouts, data, local, message, outcome, pending, phases, primitive, program, query,
-    state, test,
+    callout, callouts, data, local, message, outcome, phases, primitive, program, query, state,
+    test,
 };
 pub use context::{
-    ArenaFuture, CalloutBuilder, Context, Crypto, Effects, PrimitiveField, PrimitiveOutput,
-    PrimitiveOutputs, PrimitiveRoute, RawPrimitiveRoute, SignBuilder,
+    CalloutBuilder, Context, Crypto, Effects, PrimitiveField, PrimitiveOutput, PrimitiveOutputs,
+    PrimitiveRoute, RawPrimitiveRoute, SignBuilder,
 };
 #[doc(hidden)]
 pub use effects::{
@@ -67,9 +67,9 @@ pub use program::{
 };
 pub use sdk_prelude::prelude;
 pub use state::{
-    Arena0Callout, Arena0CalloutRequest, Arena0Pending, Arena0Phase, Arena0Query,
-    Arena0TypedCalloutRequest, CalloutSpec, LocalDebug, LocalState, ManagedPhase, PendingDecl,
-    PhaseDecl, PhasedSharedState, ProgramValue, SharedState,
+    Arena0Callout, Arena0CalloutRequest, Arena0Phase, Arena0Query, Arena0TypedCalloutRequest,
+    CalloutSpec, LocalDebug, LocalState, ManagedPhase, PhaseDecl, PhasedSharedState, ProgramValue,
+    SharedState,
 };
 pub use timer::{IntoTimerEffect, TimerSchedule, decode_timer_payload, timer_payload};
 pub use transition::{AbortReason, Transition};

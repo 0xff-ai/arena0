@@ -345,19 +345,6 @@ pub(crate) fn register_always_available(
         )
         .map_err(map_err)?;
 
-    linker
-        .func_wrap(
-            abi::HOST_MODULE,
-            imports::SET_CONTINUATION_TAG,
-            |mut caller: Caller<'_, HostState>, tag: u32| {
-                caller.begin_import("set_continuation_tag")?;
-                caller.reject_read_only("set_continuation_tag")?;
-                caller.data_mut().next_continuation_tag = Some(tag);
-                Ok(())
-            },
-        )
-        .map_err(map_err)?;
-
     Ok(())
 }
 

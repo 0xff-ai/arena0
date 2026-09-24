@@ -2,7 +2,7 @@
 //!
 //! We provide attribute macros (`#[arena0::program]`, `#[arena0::state]`, `#[arena0::primitive]`,
 //! `#[arena0::data]`, `#[arena0::outcome]`, `#[arena0::message]`, `#[arena0::local]`,
-//! `#[arena0::phases]`, `#[arena0::pending]`, `#[arena0::callouts]`, `#[arena0::callout]`,
+//! `#[arena0::phases]`, `#[arena0::callouts]`, `#[arena0::callout]`,
 //! `#[arena0::query]`). Together these generate the wasm ABI glue, metadata
 //! exports, state serialization, and typed callout/query enums that the arena0
 //! runtime expects. Programs re-export these through `arena0`; direct use is
@@ -11,7 +11,6 @@
 mod arena0_test;
 mod attr_callout;
 mod attr_local;
-mod attr_pending;
 mod attr_phases;
 mod attr_primitive;
 mod attr_query;
@@ -78,16 +77,6 @@ pub fn phases(_args: TokenStream, input: TokenStream) -> TokenStream {
     }
 }
 
-/// Generates local pending-label metadata, `Display`, and `ProgramValue` from
-/// a unit enum.
-#[proc_macro_attribute]
-pub fn pending(_args: TokenStream, input: TokenStream) -> TokenStream {
-    match attr_pending::expand_arena0_pending(parse_macro_input!(input as ItemEnum)) {
-        Ok(tokens) => tokens.into(),
-        Err(err) => err.to_compile_error().into(),
-    }
-}
-
 /// Generates typed `Callout` and `Input` enums with `Arena0Callout` glue.
 #[proc_macro_attribute]
 pub fn callouts(_args: TokenStream, input: TokenStream) -> TokenStream {
@@ -141,7 +130,7 @@ pub fn state(args: TokenStream, input: TokenStream) -> TokenStream {
     }
 }
 
-/// Generates wasm ABI exports, state storage, and metadata for a `Program` trait impl or module shell.
+/// Generates wasm ABI exports, state storage, and metadata for an inline program module shell.
 #[proc_macro_attribute]
 pub fn program(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as program::Arena0ProgramArgs);

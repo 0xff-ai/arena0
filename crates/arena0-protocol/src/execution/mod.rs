@@ -8,7 +8,6 @@ mod abort;
 mod binding;
 mod certificate;
 mod cursor;
-mod effect;
 mod error;
 mod outcome;
 mod pending;
@@ -52,7 +51,6 @@ pub use certificate::{
     ReceiptId, ReceiptKind, StopReport,
 };
 pub use cursor::{ExecutionVersion, StepCursor};
-pub use effect::FrameId;
 pub use error::ProtocolError;
 pub use outcome::TerminalOutcome;
 pub use pending::{PendingId, PendingIdParseError, pending_id};

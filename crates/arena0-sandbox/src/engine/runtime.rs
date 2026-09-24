@@ -908,7 +908,7 @@ mod resident_runtime_tests {
               (import "arena0" "state_write" (func $state_write (param i32 i32 i32)))
               {extra_imports}
               (memory (export "memory") 1)
-              (global (export "arena0_abi_version") i32 (i32.const 21))
+              (global (export "arena0_abi_version") i32 (i32.const 22))
               (global $counter (mut i32) (i32.const 0))
               (data (i32.const 1024) "sh")
               (data (i32.const 1100) "effect")
@@ -979,7 +979,7 @@ mod resident_runtime_tests {
           call $state_len
           drop
           i32.const 0
-          i32.const 2100
+          i32.const 2200
           i32.const 2
           call $state_read
           i32.const 1100
@@ -1058,7 +1058,7 @@ mod resident_runtime_tests {
           i32.const 1100
           i32.const 6
           call $log
-          i32.const 2100
+          i32.const 2200
           i32.const 2
           call $random
           i32.const 5000
@@ -1122,7 +1122,7 @@ mod resident_runtime_tests {
               (memory (export "memory") 1 1024)
               (memory (export "arena0_shared") 65 65)
               (memory (export "arena0_local") 65 65)
-              (global (export "arena0_abi_version") i32 (i32.const 21))
+              (global (export "arena0_abi_version") i32 (i32.const 22))
               (data (i32.const 32768) "\00")
               (func $pack (param $ptr i32) (param $len i32) (result i64)
                 local.get $ptr
@@ -1164,7 +1164,7 @@ mod resident_runtime_tests {
               (memory (export "memory") 1 1024)
               (memory (export "arena0_shared") 65 65)
               (memory (export "arena0_local") 65 65)
-              (global (export "arena0_abi_version") i32 (i32.const 21))
+              (global (export "arena0_abi_version") i32 (i32.const 22))
               (data (i32.const 32768) "\00")
               (func (export "arena0_alloc") (param i32) (result i32)
                 {allocator_body})

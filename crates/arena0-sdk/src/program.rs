@@ -46,12 +46,9 @@ pub type MessageApply<P> = Result<ApplyDecision<<P as Program>::Phase>, Protocol
 /// agreement boundary; a fault or deterministic rejection restores both state
 /// values and discards provisional effects.
 ///
-/// Module-shell programs may await arena-owned callouts inside async handlers.
-/// The program macro lowers `ctx.effects().callout(...).await?` into generated
-/// continuation state, and the callout answer resumes through the `on_input`
-/// dispatch path. Validation after such an await reports [`InputFault`] even if
-/// the source handler's visible signature returns [`ProgramFault`]; use
-/// `.retryable()?` when the answer should be retried.
+/// Module-shell programs use synchronous handlers. Callout and signing effects
+/// are emitted explicitly through their builders; answers are delivered through
+/// the `on_input` dispatch path.
 ///
 /// # Associated types
 ///
@@ -150,8 +147,6 @@ pub trait Program: Sized {
         Ok(Transition::Stay)
     }
 
-    #[doc(hidden)]
-    fn __arena0_restore_continuation(_ctx: &mut Context<Self::Shared, Self::Local>, _tag: u32) {}
     fn on_timer(
         _ctx: &mut Context<Self::Shared, Self::Local>,
     ) -> Result<ProgramTransition<Self>, ProgramFault> {

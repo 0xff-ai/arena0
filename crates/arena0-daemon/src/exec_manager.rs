@@ -841,7 +841,7 @@ impl Supervisor {
                     return state.lifecycle().is_terminal();
                 }
             }
-            SessionMessage::ReceiptPublished { .. } | SessionMessage::Notification { .. } => {}
+            SessionMessage::ReceiptPublished { .. } => {}
         }
         false
     }

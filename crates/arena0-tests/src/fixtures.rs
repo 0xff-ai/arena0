@@ -496,7 +496,7 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
           (import "arena0" "broadcast" (func $broadcast (param i32 i32)))
           {stop_import}
           (memory (export "memory") 1)
-          (global (export "arena0_abi_version") i32 (i32.const 21))
+          (global (export "arena0_abi_version") i32 (i32.const 22))
           (data (i32.const 2048) "{init}")
           (data (i32.const 32768) "{accepted}")
           (data (i32.const 32769) "{rejected}")

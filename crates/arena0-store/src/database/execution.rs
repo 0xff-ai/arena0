@@ -1604,26 +1604,13 @@ impl Database {
         let row = self.pending_effect_row(execution_id, pending)?;
         let operation_matches = match (event, &row.effect) {
             (
-                Event::InputReceived {
-                    callout_index,
-                    continuation_tag,
-                    ..
-                },
+                Event::InputReceived { callout_index, .. },
                 Effect::Callout {
                     callout_index: effect_index,
-                    continuation_tag: effect_tag,
                     ..
                 },
-            ) => callout_index == effect_index && continuation_tag == effect_tag,
-            (
-                Event::Signed {
-                    continuation_tag, ..
-                },
-                Effect::Sign {
-                    continuation_tag: effect_tag,
-                    ..
-                },
-            ) => continuation_tag == effect_tag,
+            ) => callout_index == effect_index,
+            (Event::Signed { .. }, Effect::Sign { .. }) => true,
             _ => false,
         };
         if !operation_matches {

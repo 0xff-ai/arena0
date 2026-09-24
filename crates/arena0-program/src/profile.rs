@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::{ABI_VERSION, CANONICAL_STATE_MEMORY_BYTES, Capability};
 
 /// Version of the canonical execution-profile representation.
-pub const EXECUTION_PROFILE_VERSION: u32 = 2;
+pub const EXECUTION_PROFILE_VERSION: u32 = 3;
 
 /// Maximum deterministic Wasm stack size.
 pub const MAX_WASM_STACK_BYTES: usize = 512 * 1024;

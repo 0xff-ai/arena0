@@ -724,8 +724,11 @@ async fn restart_drains_a_durable_callout_outbox() {
             pending_id: id,
             callout_index: 0,
             context,
+            expected_type,
             ..
-        } if id == pending_id && context == b"null"
+        } if id == pending_id
+            && context == b"null"
+            && expected_type.as_deref() == Some("bytes")
     ));
     drop(actor);
 
@@ -746,8 +749,11 @@ async fn restart_drains_a_durable_callout_outbox() {
             pending_id: id,
             callout_index: 0,
             context,
+            expected_type,
             ..
-        } if id == pending_id && context == b"null"
+        } if id == pending_id
+            && context == b"null"
+            && expected_type.as_deref() == Some("bytes")
     ));
     assert!(
         restarted
@@ -1350,7 +1356,6 @@ async fn crash_after_signature_application_is_idempotently_acknowledged() {
     let Effect::Sign {
         scheme,
         data: payload,
-        continuation_tag,
         ..
     } = effect
     else {
@@ -1374,7 +1379,7 @@ async fn crash_after_signature_application_is_idempotently_acknowledged() {
     );
     assert!(
         actor
-            .sign_and_resume(pending_id, &guest_data, continuation_tag)
+            .sign_and_resume(pending_id, &guest_data)
             .await
             .expect("apply signature before crash")
     );
@@ -1833,21 +1838,21 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
     let extra_imports = match mode {
         GuestMode::Timer => r#"(import "arena0" "set_timer" (func $set_timer (param i64)))"#,
         GuestMode::Callout | GuestMode::CalloutFault => {
-            r#"(import "arena0" "request_input_pending"
-            (func $request_input_pending (param i32 i32 i32 i32 i32 i32 i32)))"#
+            r#"(import "arena0" "request_input"
+            (func $request_input (param i32 i32 i32 i32 i32)))"#
         }
         GuestMode::CalloutRetryMessage => {
-            r#"(import "arena0" "request_input_pending"
-            (func $request_input_pending (param i32 i32 i32 i32 i32 i32 i32)))
+            r#"(import "arena0" "request_input"
+            (func $request_input (param i32 i32 i32 i32 i32)))
             (import "arena0" "retry_input" (func $retry_input (param i32 i32)))"#
         }
         GuestMode::Sign => {
-            r#"(import "arena0" "sign_pending"
-            (func $sign_pending (param i32 i32 i32 i32 i32 i32 i32)))"#
+            r#"(import "arena0" "sign"
+            (func $sign (param i32 i32 i32 i32 i32)))"#
         }
         GuestMode::SignThenBroadcast => {
-            r#"(import "arena0" "sign_pending"
-            (func $sign_pending (param i32 i32 i32 i32 i32 i32 i32)))
+            r#"(import "arena0" "sign"
+            (func $sign (param i32 i32 i32 i32 i32)))
             (import "arena0" "broadcast" (func $broadcast (param i32 i32)))"#
         }
         GuestMode::Broadcast => {
@@ -1883,16 +1888,12 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
               i32.const 1040
               i32.const 1
               call $state_write
-              i32.const 3
-              call $set_continuation_tag
               i32.const 0
               i32.const 1080
               i32.const 4
-              i32.const 1090
-              i32.const 4
-              i32.const 1100
-              i32.const 4
-              call $request_input_pending
+              i32.const 1070
+              i32.const 5
+              call $request_input
             "#
         }
         GuestMode::CalloutRetryMessage => {
@@ -1901,16 +1902,12 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
               i32.const 1040
               i32.const 1
               call $state_write
-              i32.const 3
-              call $set_continuation_tag
               i32.const 0
               i32.const 1080
               i32.const 4
-              i32.const 1090
-              i32.const 4
-              i32.const 1100
-              i32.const 4
-              call $request_input_pending
+              i32.const 1070
+              i32.const 5
+              call $request_input
             "#
         }
         GuestMode::Sign | GuestMode::SignThenBroadcast => {
@@ -1919,16 +1916,12 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
               i32.const 1040
               i32.const 1
               call $state_write
-              i32.const 7
-              call $set_continuation_tag
               i32.const 0
               i32.const 1050
               i32.const 3
-              i32.const 1060
-              i32.const 3
               i32.const 1070
               i32.const 5
-              call $sign_pending
+              call $sign
             "#
         }
         GuestMode::Broadcast => {
@@ -2018,9 +2011,8 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
           (import "arena0" "state_read" (func $state_read (param i32 i32 i32)))
           (import "arena0" "state_write" (func $state_write (param i32 i32 i32)))
           {extra_imports}
-          (import "arena0" "set_continuation_tag" (func $set_continuation_tag (param i32)))
           (memory (export "memory") 1)
-          (global (export "arena0_abi_version") i32 (i32.const 21))
+          (global (export "arena0_abi_version") i32 (i32.const 22))
           (data (i32.const 1024) "\01")
           (data (i32.const 1030) "\02")
           (data (i32.const 1040) "\09")

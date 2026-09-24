@@ -31,9 +31,7 @@ pub enum Effect {
     Callout {
         callout_index: u32,
         context: Vec<u8>,
-        pending_label: Option<String>,
         expected_type: Option<String>,
-        continuation_tag: Option<u32>,
     },
     /// Arm a one-shot timer.
     SetTimer {
@@ -44,9 +42,7 @@ pub enum Effect {
     Sign {
         scheme: SignScheme,
         data: Vec<u8>,
-        pending_label: Option<String>,
         expected_type: Option<String>,
-        continuation_tag: Option<u32>,
     },
     /// Terminate program execution immediately with an error.
     Fail { reason: String },
@@ -96,9 +92,7 @@ impl BorshSerialize for Effect {
             Self::Callout {
                 callout_index,
                 context,
-                pending_label,
                 expected_type,
-                continuation_tag,
             } => {
                 BorshSerialize::serialize(&EFFECT_CALLOUT, writer)?;
                 BorshSerialize::serialize(callout_index, writer)?;
@@ -110,17 +104,10 @@ impl BorshSerialize for Effect {
                 )?;
                 serialize_bounded_option_string(
                     writer,
-                    pending_label.as_deref(),
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "pending label",
-                )?;
-                serialize_bounded_option_string(
-                    writer,
                     expected_type.as_deref(),
                     crate::execution::MAX_TERMINAL_REASON_BYTES,
                     "expected type",
-                )?;
-                BorshSerialize::serialize(continuation_tag, writer)
+                )
             }
             Self::SetTimer { delay_ms, timer } => {
                 BorshSerialize::serialize(&EFFECT_SET_TIMER, writer)?;
@@ -130,9 +117,7 @@ impl BorshSerialize for Effect {
             Self::Sign {
                 scheme,
                 data,
-                pending_label,
                 expected_type,
-                continuation_tag,
             } => {
                 BorshSerialize::serialize(&EFFECT_SIGN, writer)?;
                 BorshSerialize::serialize(scheme, writer)?;
@@ -144,17 +129,10 @@ impl BorshSerialize for Effect {
                 )?;
                 serialize_bounded_option_string(
                     writer,
-                    pending_label.as_deref(),
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "pending label",
-                )?;
-                serialize_bounded_option_string(
-                    writer,
                     expected_type.as_deref(),
                     crate::execution::MAX_TERMINAL_REASON_BYTES,
                     "expected type",
-                )?;
-                BorshSerialize::serialize(continuation_tag, writer)
+                )
             }
             Self::Fail { reason } => {
                 BorshSerialize::serialize(&EFFECT_FAIL, writer)?;
@@ -209,17 +187,11 @@ impl BorshDeserialize for Effect {
                     crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
                     "callout context",
                 )?,
-                pending_label: read_bounded_option_string(
-                    reader,
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "pending label",
-                )?,
                 expected_type: read_bounded_option_string(
                     reader,
                     crate::execution::MAX_TERMINAL_REASON_BYTES,
                     "expected type",
                 )?,
-                continuation_tag: Option::<u32>::deserialize_reader(reader)?,
             }),
             EFFECT_SET_TIMER => Ok(Self::SetTimer {
                 delay_ms: u64::deserialize_reader(reader)?,
@@ -232,17 +204,11 @@ impl BorshDeserialize for Effect {
                     crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
                     "signature payload",
                 )?,
-                pending_label: read_bounded_option_string(
-                    reader,
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "pending label",
-                )?,
                 expected_type: read_bounded_option_string(
                     reader,
                     crate::execution::MAX_TERMINAL_REASON_BYTES,
                     "expected type",
                 )?,
-                continuation_tag: Option::<u32>::deserialize_reader(reader)?,
             }),
             EFFECT_FAIL => Ok(Self::Fail {
                 reason: read_bounded_string(
@@ -352,9 +318,7 @@ mod tests {
             Effect::Callout {
                 callout_index: 0,
                 context: vec![1, 2, 3],
-                pending_label: Some("thinking".into()),
                 expected_type: Some("Move".into()),
-                continuation_tag: None,
             },
             Effect::SetTimer {
                 delay_ms: 1000,
@@ -363,9 +327,7 @@ mod tests {
             Effect::Sign {
                 scheme: SignScheme::Ed25519,
                 data: vec![30, 40],
-                pending_label: Some("signing".into()),
                 expected_type: Some("Signature".into()),
-                continuation_tag: None,
             },
             Effect::Fail {
                 reason: "failed".into(),
@@ -394,18 +356,14 @@ mod tests {
         let effect = Effect::Callout {
             callout_index: 0,
             context: Vec::new(),
-            pending_label: Some("x".into()),
             expected_type: None,
-            continuation_tag: None,
         };
         let encoded = borsh::to_vec(&effect).expect("serialize");
         assert_eq!(Effect::try_from_slice(&encoded).expect("decode"), effect);
         let oversized = Effect::Callout {
             callout_index: 0,
             context: Vec::new(),
-            pending_label: Some("x".repeat(crate::execution::MAX_TERMINAL_REASON_BYTES + 1)),
-            expected_type: None,
-            continuation_tag: None,
+            expected_type: Some("x".repeat(crate::execution::MAX_TERMINAL_REASON_BYTES + 1)),
         };
         assert!(borsh::to_vec(&oversized).is_err());
     }

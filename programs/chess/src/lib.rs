@@ -133,11 +133,6 @@ pub mod chess {
         Move(String),
     }
 
-    #[arena0::pending]
-    pub enum Pending {
-        Thinking,
-    }
-
     // No terminal phase: in the outcome contract the session ends via
     // `Transition::End` (which derives the outcome and emits `SessionEnd`), not
     // by moving to a "finished" phase. `Playing` is the last program phase; the
@@ -464,7 +459,6 @@ pub mod chess {
         let legal_moves = state.legal_moves_string();
         ctx.effects()
             .callout(callouts::MakeMove { fen, legal_moves })
-            .pending(Pending::Thinking)
             .dispatch();
         Ok(Transition::Stay)
     }
@@ -899,7 +893,7 @@ mod tests {
         }
 
         #[arena0::test(Chess, ())]
-        fn invalid_awaited_move_is_retryable(h: ()) {
+        fn invalid_move_is_retryable(h: ()) {
             h.session_started(peer_a());
             play_move(&mut h, "e2e4");
             h.message(peer_a(), Message::Move("e7e5".to_string()));

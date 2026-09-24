@@ -298,7 +298,7 @@ mod tests {
             r#"
             (module
               (memory (export "memory") 1)
-              (global (export "arena0_abi_version") i32 (i32.const 21))
+              (global (export "arena0_abi_version") i32 (i32.const 22))
               (data (i32.const 64) "{metadata_data}")
               (func $pack (param $ptr i32) (param $len i32) (result i64)
                 local.get $ptr

@@ -1,14 +1,11 @@
 //! The `#[arena0::program]` attribute expansion.
 //!
-//! This module coordinates the two program forms and holds the codegen helpers
-//! shared between them. The seams live in submodules:
+//! This module coordinates the inline-module program form. The seams live in
+//! submodules:
 //!
 //! - [`args`]: attribute parsing and program metadata.
-//! - [`trait_form`]: `impl Program` expansion and handler extraction.
 //! - [`guest_abi`]: resident-compatible guest ABI export emission.
 //! - [`module_shell`]: inline-`mod` shell expansion.
-//! - [`continuations`]: lowering of `async` module-shell handlers.
-//! - [`host_async`]: rejection of host async/IO in module-shell handlers.
 //! - [`capabilities`]: effect-capability inference for `capabilities(auto)`.
 
 use proc_macro2::TokenStream as TokenStream2;
@@ -16,11 +13,8 @@ use syn::{Error, Item, Result, Type, spanned::Spanned};
 
 mod args;
 mod capabilities;
-mod continuations;
 mod guest_abi;
-mod host_async;
 mod module_shell;
-mod trait_form;
 
 #[cfg(test)]
 mod tests;
@@ -28,18 +22,20 @@ mod tests;
 use crate::util::to_pascal_case;
 pub(crate) use args::Arena0ProgramArgs;
 use module_shell::expand_arena0_program_module;
-use trait_form::expand_arena0_program;
 
 pub(crate) fn expand_arena0_program_item(
     args: Arena0ProgramArgs,
     item: Item,
 ) -> Result<TokenStream2> {
     match item {
-        Item::Impl(item) => expand_arena0_program(args, item),
         Item::Mod(item) => expand_arena0_program_module(args, item),
+        Item::Impl(item) => Err(Error::new(
+            item.span(),
+            "arena0::program only supports an inline module shell; impl Program blocks are no longer accepted",
+        )),
         other => Err(Error::new(
             other.span(),
-            "arena0::program can only annotate an impl Program block or an inline module shell",
+            "arena0::program can only annotate an inline module shell",
         )),
     }
 }

@@ -87,30 +87,19 @@ fn pending_from_effects(id: PendingId, effects: &[Effect]) -> Option<PendingReco
     effects.iter().find_map(|effect| match effect {
         Effect::Callout {
             callout_index,
-            pending_label,
             expected_type,
-            continuation_tag,
             ..
         } => Some(PendingRecord {
             id,
             operation: arena0_protocol::PendingOperation::Callout {
                 callout_index: *callout_index,
             },
-            label: pending_label.clone(),
             expected_type: expected_type.clone(),
-            continuation_tag: *continuation_tag,
         }),
-        Effect::Sign {
-            pending_label,
-            expected_type,
-            continuation_tag,
-            ..
-        } => Some(PendingRecord {
+        Effect::Sign { expected_type, .. } => Some(PendingRecord {
             id,
             operation: arena0_protocol::PendingOperation::Sign,
-            label: pending_label.clone(),
             expected_type: expected_type.clone().or_else(|| Some("Vec<u8>".into())),
-            continuation_tag: *continuation_tag,
         }),
         _ => None,
     })
@@ -662,14 +651,12 @@ impl<P: Program> TestHarness<P> {
             Event::InputReceived {
                 callout_index,
                 data,
-                continuation_tag,
             } => {
                 let input = P::Callout::from_raw(callout_index, data.clone());
                 let result = self.run_input(
                     Event::InputReceived {
                         callout_index,
                         data,
-                        continuation_tag,
                     },
                     |ctx| P::on_input(ctx, input),
                 );
@@ -688,21 +675,12 @@ impl<P: Program> TestHarness<P> {
                 ),
                 None,
             ),
-            Event::Signed {
-                signature,
-                continuation_tag,
-            } => {
+            Event::Signed { signature } => {
                 let result = self.run_program(
                     Event::Signed {
                         signature: signature.clone(),
-                        continuation_tag,
                     },
-                    |ctx| {
-                        if let Some(tag) = continuation_tag {
-                            P::__arena0_restore_continuation(ctx, tag);
-                        }
-                        P::__arena0_on_signed(ctx, signature)
-                    },
+                    |ctx| P::__arena0_on_signed(ctx, signature),
                 );
                 (result, None)
             }
@@ -801,7 +779,6 @@ where
             Event::InputReceived {
                 callout_index,
                 data,
-                continuation_tag: None,
             },
             |ctx| P::on_input(ctx, input),
         )
@@ -828,8 +805,7 @@ where
     /// Resolve a generated typed callout with an explicit pending id.
     ///
     /// Re-dispatches through the program's native `on_input` handler; the
-    /// continuation tag is not threaded (native harnesses don't restart, so
-    /// there is nothing to resume across).
+    /// Native harnesses re-dispatch directly, so no restart marker is needed.
     fn resolve_callout_with_pending_id<A>(
         &mut self,
         pending_id: Option<PendingId>,
@@ -850,7 +826,6 @@ where
             Event::InputReceived {
                 callout_index,
                 data,
-                continuation_tag: None,
             },
             |ctx| P::on_input(ctx, input),
         ))
@@ -869,7 +844,6 @@ where
         Ok(self.run_program(
             Event::Signed {
                 signature: signature.clone(),
-                continuation_tag: None,
             },
             |ctx| P::__arena0_on_signed(ctx, signature),
         ))
@@ -1056,9 +1030,7 @@ mod tests {
         PendingRecord {
             id: PendingId::new(id),
             operation: arena0_protocol::PendingOperation::Callout { callout_index },
-            label: Some("choosing".into()),
             expected_type: Some("()".into()),
-            continuation_tag: Some(7),
         }
     }
 

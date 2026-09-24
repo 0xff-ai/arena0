@@ -76,7 +76,6 @@ impl ExecutionActor {
                 Event::InputReceived {
                     callout_index,
                     data: data.into_bytes(),
-                    continuation_tag: pending.continuation_tag,
                 },
                 DispatchSource {
                     pending_id: Some(pending_id),
@@ -103,7 +102,6 @@ impl ExecutionActor {
         &mut self,
         pending_id: PendingId,
         data: &GuestSignData,
-        continuation_tag: Option<u32>,
     ) -> Result<bool, ExecError> {
         self.validate_guest_sign_data(pending_id, data)?;
 
@@ -112,8 +110,7 @@ impl ExecutionActor {
             SignScheme::Ed25519 => self.context.identity.sign(&signing_bytes).0.to_vec(),
             SignScheme::Bls => self.context.execution_key.sign(&signing_bytes).0.to_vec(),
         };
-        self.resume_signature(pending_id, continuation_tag, signature)
-            .await
+        self.resume_signature(pending_id, signature).await
     }
 
     fn validate_guest_sign_data(
@@ -152,7 +149,6 @@ impl ExecutionActor {
     async fn resume_signature(
         &mut self,
         pending_id: PendingId,
-        continuation_tag: Option<u32>,
         signature: Vec<u8>,
     ) -> Result<bool, ExecError> {
         if signature.len() > arena0_protocol::MAX_EFFECT_PAYLOAD_BYTES {
@@ -162,10 +158,7 @@ impl ExecutionActor {
         }
         let accepted = self
             .dispatch_event(
-                Event::Signed {
-                    signature,
-                    continuation_tag,
-                },
+                Event::Signed { signature },
                 DispatchSource {
                     pending_id: Some(pending_id),
                     ..DispatchSource::default()

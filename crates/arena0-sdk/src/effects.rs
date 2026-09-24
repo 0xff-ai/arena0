@@ -21,32 +21,19 @@ unsafe extern "C" {
     fn log(level: u32, msg_ptr: u32, msg_len: u32);
     fn random(buf_ptr: u32, buf_len: u32);
     fn broadcast(data_ptr: u32, data_len: u32);
-    fn request_input(variant_index: u32, context_ptr: u32, context_len: u32);
-    fn request_input_pending(
+    fn request_input(
         variant_index: u32,
         context_ptr: u32,
         context_len: u32,
-        label_ptr: u32,
-        label_len: u32,
         expected_ptr: u32,
         expected_len: u32,
     );
     fn set_timer(delay_ms: i64);
     fn set_typed_timer(delay_ms: i64, type_ptr: u32, type_len: u32, data_ptr: u32, data_len: u32);
-    fn sign(scheme: u32, data_ptr: u32, data_len: u32);
-    fn sign_pending(
-        scheme: u32,
-        data_ptr: u32,
-        data_len: u32,
-        label_ptr: u32,
-        label_len: u32,
-        expected_ptr: u32,
-        expected_len: u32,
-    );
+    fn sign(scheme: u32, data_ptr: u32, data_len: u32, expected_ptr: u32, expected_len: u32);
     fn end_session(result_ptr: u32, result_len: u32);
     fn abort_session(reason_ptr: u32, reason_len: u32);
     fn retry_input(reason_ptr: u32, reason_len: u32);
-    fn set_continuation_tag(tag: u32);
     fn state_len(kind: u32) -> u32;
     fn state_read(kind: u32, ptr: u32, len: u32);
     fn state_write(kind: u32, ptr: u32, len: u32);
@@ -143,40 +130,22 @@ pub(crate) fn host_broadcast(msg_bytes: &[u8]) {
     });
 }
 
-pub(crate) fn host_callout_raw(
-    callout_index: u32,
-    context: &[u8],
-    pending_label: Option<&str>,
-    expected_type: Option<&str>,
-    continuation_tag: Option<u32>,
-) {
+pub(crate) fn host_callout_raw(callout_index: u32, context: &[u8], expected_type: Option<&str>) {
     #[cfg(target_arch = "wasm32")]
     unsafe {
-        if let Some(tag) = continuation_tag {
-            set_continuation_tag(tag);
-        }
-        match (pending_label, expected_type) {
-            (None, None) => {
-                request_input(callout_index, context.as_ptr() as u32, context.len() as u32)
-            }
-            _ => request_input_pending(
-                callout_index,
-                context.as_ptr() as u32,
-                context.len() as u32,
-                pending_label.map_or(0, |s| s.as_ptr() as u32),
-                pending_label.map_or(0, str::len) as u32,
-                expected_type.map_or(0, |s| s.as_ptr() as u32),
-                expected_type.map_or(0, str::len) as u32,
-            ),
-        }
+        request_input(
+            callout_index,
+            context.as_ptr() as u32,
+            context.len() as u32,
+            expected_type.map_or(0, |value| value.as_ptr() as u32),
+            expected_type.map_or(0, str::len) as u32,
+        );
     }
     #[cfg(not(target_arch = "wasm32"))]
     crate::testing::push_effect(arena0_protocol::Effect::Callout {
         callout_index,
         context: context.to_vec(),
-        pending_label: pending_label.map(str::to_string),
         expected_type: expected_type.map(str::to_string),
-        continuation_tag,
     });
 }
 
@@ -201,42 +170,22 @@ pub(crate) fn host_set_timer_spec(spec: &TimerSpec) {
     });
 }
 
-pub(crate) fn host_sign(
-    scheme: SignScheme,
-    data: &[u8],
-    pending_label: Option<&str>,
-    expected_type: Option<&str>,
-    continuation_tag: Option<u32>,
-) {
+pub(crate) fn host_sign(scheme: SignScheme, data: &[u8], expected_type: Option<&str>) {
     #[cfg(target_arch = "wasm32")]
     unsafe {
-        if let Some(tag) = continuation_tag {
-            set_continuation_tag(tag);
-        }
-        match (pending_label, expected_type) {
-            (None, None) => sign(
-                sign_scheme_tag(scheme),
-                data.as_ptr() as u32,
-                data.len() as u32,
-            ),
-            _ => sign_pending(
-                sign_scheme_tag(scheme),
-                data.as_ptr() as u32,
-                data.len() as u32,
-                pending_label.map_or(0, |s| s.as_ptr() as u32),
-                pending_label.map_or(0, str::len) as u32,
-                expected_type.map_or(0, |s| s.as_ptr() as u32),
-                expected_type.map_or(0, str::len) as u32,
-            ),
-        }
+        sign(
+            sign_scheme_tag(scheme),
+            data.as_ptr() as u32,
+            data.len() as u32,
+            expected_type.map_or(0, |value| value.as_ptr() as u32),
+            expected_type.map_or(0, str::len) as u32,
+        );
     }
     #[cfg(not(target_arch = "wasm32"))]
     crate::testing::push_effect(arena0_protocol::Effect::Sign {
         scheme,
         data: data.to_vec(),
-        pending_label: pending_label.map(str::to_string),
         expected_type: expected_type.map(str::to_string),
-        continuation_tag,
     });
 }
 
