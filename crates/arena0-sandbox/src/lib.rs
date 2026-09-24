@@ -38,6 +38,8 @@ use arena0_protocol::Effect;
 pub struct DispatchCallResult {
     /// Whether the event was accepted or rejected.
     pub status: CallStatus,
+    /// Bounded guest reason when an input dispatch was rejected.
+    pub reason: Option<String>,
     /// Shared payload after an accepted dispatch, or the committed payload on
     /// rejection/failure recovery.
     pub shared: SharedStateBytes,

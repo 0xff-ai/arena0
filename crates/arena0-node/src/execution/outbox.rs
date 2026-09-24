@@ -260,10 +260,7 @@ impl ExecutionActor {
         effect: &Effect,
         item: &OutboxItem,
     ) -> Result<bool, OutboxDeliveryError> {
-        if matches!(
-            effect,
-            Effect::Callout { .. } | Effect::Sign { .. } | Effect::RetryInput { .. }
-        ) {
+        if matches!(effect, Effect::Callout { .. } | Effect::Sign { .. }) {
             let state = self.load_state().await?;
             if !matches!(state.status().receipt_work(), ReceiptWork::NotTerminal) {
                 // Every terminal boundary supersedes an older guest
@@ -327,53 +324,13 @@ impl ExecutionActor {
                 if !self.sign_and_resume(pending_id, &data).await? {
                     // A signing request is acknowledged only after its
                     // exact continuation was consumed. A frozen proposal or
-                    // a guest rejection leaves the same outbox row retryable.
+                    // a guest rejection leaves the same outbox row pending for
+                    // another delivery attempt.
                     return Err(OutboxDeliveryError::Retryable(ExecError::Unavailable(
                         "signature continuation was not consumed".into(),
                     )));
                 }
                 Ok(true)
-            }
-            Effect::RetryInput { .. } => {
-                let state = self.load_state().await?;
-                let Some(pending) = state.status().pending() else {
-                    return Err(ExecError::InvalidState(
-                        "retry effect has no pending continuation".into(),
-                    )
-                    .into());
-                };
-                let PendingOperation::Callout { callout_index } = pending.operation else {
-                    return Err(ExecError::InvalidState(
-                        "retry effect does not name a callout".into(),
-                    )
-                    .into());
-                };
-                let context = self
-                    .context
-                    .store
-                    .pending_requests()
-                    .await?
-                    .into_iter()
-                    .find_map(|request| match request {
-                        arena0_store::PendingRequest::Callout {
-                            pending_id,
-                            context,
-                            expected_type,
-                            ..
-                        } if pending_id == pending.id => Some((context, expected_type)),
-                        _ => None,
-                    });
-                let (context, request_type) = context.unwrap_or_default();
-                self.messages
-                    .send(callout_requested(
-                        pending.id,
-                        callout_index,
-                        context,
-                        request_type.or_else(|| pending.expected_type.clone()),
-                    ))
-                    .await
-                    .map_err(|_| ExecError::Unavailable("message receiver closed".into()))?;
-                Ok(false)
             }
             _ => Err(ExecError::InvalidState(
                 "non-deliverable effect reached the durable effect outbox".into(),

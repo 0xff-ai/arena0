@@ -294,6 +294,9 @@ impl ExecutionHandle {
                         format!("no pending {pending_id}"),
                     ));
                 }
+                Err(arena0_node::ExecError::InputRejected(reason)) => {
+                    return Err(ApiError::new(ApiErrorCode::InputRejected, reason));
+                }
                 Err(arena0_node::ExecError::AgreementPending) => {
                     // Agreement freezes guest dispatch but does not consume the
                     // callout. Keep the request at the daemon boundary while
@@ -304,10 +307,7 @@ impl ExecutionHandle {
                     }
                 }
                 Err(error) => {
-                    return Err(ApiError::new(
-                        ApiErrorCode::Execution,
-                        format!("input rejected: {error}"),
-                    ));
+                    return Err(ApiError::new(ApiErrorCode::Execution, error.to_string()));
                 }
             }
         }

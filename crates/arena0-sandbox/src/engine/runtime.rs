@@ -5,7 +5,7 @@ use arena0_program::{
     OutcomeOutput, QueryInput, QueryOutput, SharedStateBytes, ViewInput, ViewOutput, WriterInput,
     WriterOutput, abi,
 };
-use arena0_protocol::{Effect, Lifecycle};
+use arena0_protocol::Lifecycle;
 use borsh::{BorshDeserialize, BorshSerialize};
 use wasmtime::{Global, Instance, Memory, Store, StoreLimitsBuilder, Val};
 
@@ -529,11 +529,12 @@ impl ProgramInstance {
         // Restore before inspecting its candidate frames so malformed or
         // oversized guest writes cannot turn a normal rejection into a
         // sandbox error. Setup and dispatch observations are all provisional,
-        // including retry effects and replayable random bytes.
+        // including replayable random bytes.
         if output.status == CallStatus::Rejected {
             self.rollback_after_failure()?;
             return Ok(DispatchCallResult {
                 status: output.status,
+                reason: output.reason,
                 shared: self.committed_shared.clone(),
                 local: self.committed_local.clone(),
                 shared_hash: self.committed_shared_hash()?,
@@ -546,30 +547,11 @@ impl ProgramInstance {
             });
         }
 
-        let mut observations = self
+        let observations = self
             .store
             .data_mut()
             .finish_observations(fuel_used)
             .or_else(|error| self.rollback_error(error))?;
-
-        // Retry is an accepted control path whose state result is discarded.
-        // Decide it before reading candidate frames so a guest cannot turn a
-        // retry into a sandbox error by corrupting either canonical memory.
-        let retry_effect =
-            retry_effect(&observations.effects).or_else(|error| self.rollback_error(error))?;
-        if let Some(retry_effect) = retry_effect {
-            self.rollback_after_failure()?;
-            observations.effects = vec![retry_effect];
-            observations.logs.clear();
-            observations.random_draws.clear();
-            return Ok(DispatchCallResult {
-                status: output.status,
-                shared: self.committed_shared.clone(),
-                local: self.committed_local.clone(),
-                shared_hash: self.committed_shared_hash()?,
-                observations,
-            });
-        }
 
         // The state-validation boundary borrows the fixed memories directly:
         // one shared view supplies both the payload copy and its hash, and the
@@ -582,6 +564,7 @@ impl ProgramInstance {
             .or_else(|error| self.rollback_error(error))?;
         Ok(DispatchCallResult {
             status: output.status,
+            reason: output.reason,
             shared,
             local,
             shared_hash,
@@ -677,52 +660,6 @@ impl ProgramInstance {
             "shared",
         )?;
         Ok(arena0_protocol::StateHash::of(view.image).0)
-    }
-}
-
-fn retry_effect(effects: &[Effect]) -> Result<Option<Effect>, SandboxError> {
-    if !effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::RetryInput { .. }))
-    {
-        return Ok(None);
-    }
-    if effects.len() != 1 {
-        return Err(SandboxError::dispatch_failed(
-            "retry dispatch must emit exactly one retry effect",
-        ));
-    }
-    Ok(Some(effects[0].clone()))
-}
-
-#[cfg(test)]
-mod retry_effect_tests {
-    use super::*;
-
-    #[test]
-    fn retry_path_requires_exactly_one_retry_effect() {
-        let retry = Effect::RetryInput {
-            reason: "retry".into(),
-        };
-        assert_eq!(retry_effect(&[]).unwrap(), None);
-        assert_eq!(
-            retry_effect(std::slice::from_ref(&retry)).unwrap(),
-            Some(retry.clone())
-        );
-        assert!(matches!(
-            retry_effect(&[retry.clone(), retry]).unwrap_err(),
-            SandboxError::DispatchFailed(message) if message.contains("exactly one retry")
-        ));
-        assert!(matches!(
-            retry_effect(&[
-                Effect::Broadcast { data: Vec::new() },
-                Effect::RetryInput {
-                    reason: "retry".into(),
-                },
-            ])
-            .unwrap_err(),
-            SandboxError::DispatchFailed(message) if message.contains("exactly one retry")
-        ));
     }
 }
 
@@ -898,7 +835,7 @@ mod resident_runtime_tests {
         let definition = definition(capabilities);
         let metadata_bytes = definition.encode().unwrap();
         let metadata = wat_data(&metadata_bytes);
-        let output = wat_data(&[0]);
+        let output = wat_data(&[0, 0]);
         let initialize = wat_data(&[0; 8]);
         let wat = format!(
             r#"
@@ -912,7 +849,6 @@ mod resident_runtime_tests {
               (global $counter (mut i32) (i32.const 0))
               (data (i32.const 1024) "sh")
               (data (i32.const 1100) "effect")
-              (data (i32.const 1200) "retry")
               (data (i32.const 3000) "{initialize}")
               (data (i32.const 32768) "{output}")
               (data (i32.const 40000) "{metadata}")
@@ -986,7 +922,7 @@ mod resident_runtime_tests {
           i32.const 6
           call $broadcast
           i32.const 32768
-          i32.const 1
+          i32.const 2
           call $pack
         "#
     }
@@ -1001,7 +937,7 @@ mod resident_runtime_tests {
             unreachable
           end
           i32.const 32768
-          i32.const 1
+          i32.const 2
           call $pack
         "#
     }
@@ -1017,7 +953,7 @@ mod resident_runtime_tests {
           i32.const 1
           call $state_write
           i32.const 32768
-          i32.const 1
+          i32.const 2
           call $pack
         "#
     }
@@ -1036,7 +972,7 @@ mod resident_runtime_tests {
           i32.const 1
           i32.store8
           i32.const 32768
-          i32.const 1
+          i32.const 2
           call $pack
         "#
     }
@@ -1071,26 +1007,7 @@ mod resident_runtime_tests {
           i32.const 1
           i32.store8
           i32.const 32768
-          i32.const 1
-          call $pack
-        "#
-    }
-
-    fn retry_body() -> &'static str {
-        r#"
-          i32.const 0
-          i32.const 1024
           i32.const 2
-          call $state_write
-          i32.const 1
-          i32.const 1024
-          i32.const 2
-          call $state_write
-          i32.const 1200
-          i32.const 5
-          call $retry_input
-          i32.const 32768
-          i32.const 1
           call $pack
         "#
     }
@@ -1123,7 +1040,7 @@ mod resident_runtime_tests {
               (memory (export "arena0_shared") 65 65)
               (memory (export "arena0_local") 65 65)
               (global (export "arena0_abi_version") i32 (i32.const 22))
-              (data (i32.const 32768) "\00")
+              (data (i32.const 32768) "\00\00")
               (func $pack (param $ptr i32) (param $len i32) (result i64)
                 local.get $ptr
                 i64.extend_i32_u
@@ -1145,7 +1062,7 @@ mod resident_runtime_tests {
                 i32.const 1
                 i32.store8 1
                 i32.const 32768
-                i32.const 1
+                i32.const 2
                 call $pack)
               (func (export "arena0_writer") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_query") (param i32 i32) (result i64) i64.const 0)
@@ -1335,7 +1252,7 @@ mod resident_runtime_tests {
     }
 
     #[test]
-    fn resident_dispatch_rolls_back_both_states_for_reject_trap_and_retry() {
+    fn resident_dispatch_rolls_back_both_states_for_reject_and_trap() {
         let shared = arena0_program::SharedStateBytes::try_new(b"old".to_vec()).unwrap();
         let local = arena0_program::LocalStateBytes::try_new(b"keep".to_vec()).unwrap();
 
@@ -1355,23 +1272,6 @@ mod resident_runtime_tests {
         assert!(trapped.dispatch(call()).is_err());
         assert_eq!(trapped.committed_payloads().0.as_bytes(), b"old");
         assert_eq!(trapped.committed_payloads().1.as_bytes(), b"keep");
-
-        let mut retried = resident(
-            retry_body(),
-            Vec::new(),
-            r#"(import "arena0" "retry_input" (func $retry_input (param i32 i32)))"#,
-        );
-        retried.restore_payloads(shared, local).unwrap();
-        let result = retried.dispatch(call()).unwrap();
-        assert_eq!(result.status, arena0_program::CallStatus::Accepted);
-        assert_eq!(result.shared.as_bytes(), b"old");
-        assert_eq!(result.local.as_bytes(), b"keep");
-        assert_eq!(
-            result.observations.effects,
-            vec![Effect::RetryInput {
-                reason: "retry".into()
-            }]
-        );
     }
 
     #[test]

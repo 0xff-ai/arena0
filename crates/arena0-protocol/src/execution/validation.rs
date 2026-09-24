@@ -767,9 +767,7 @@ fn validate_effect(effect: &Effect) -> Result<(), ProtocolError> {
             outcome.len(),
             MAX_TERMINAL_OUTCOME_BYTES,
         ),
-        Effect::SessionAbort { reason }
-        | Effect::Fail { reason }
-        | Effect::RetryInput { reason } => {
+        Effect::SessionAbort { reason } | Effect::Fail { reason } => {
             ensure_payload("terminal reason", reason.len(), MAX_TERMINAL_REASON_BYTES)
         }
         Effect::Broadcast { data } => ensure_payload(

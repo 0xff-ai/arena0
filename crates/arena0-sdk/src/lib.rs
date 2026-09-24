@@ -53,10 +53,8 @@ pub use effects::{
     host_state_write as __host_state_write,
 };
 #[doc(hidden)]
-pub use effects::{
-    host_fail as __host_fail, host_log as __host_log, host_retry_input as __host_retry_input,
-};
-pub use fault::{InputFault, ProgramFault, ProtocolFault, Retryable};
+pub use effects::{host_fail as __host_fail, host_log as __host_log};
+pub use fault::{ProgramFault, ProtocolFault};
 #[doc(hidden)]
 #[cfg(target_arch = "wasm32")]
 pub use io_alloc::prepare_allocator as __prepare_allocator;
@@ -81,12 +79,12 @@ pub use arena0_program::{
     CapabilityImport, CapabilitySet, DispatchInput, DispatchOutput, ExecutionProfile,
     ExecutionProfileHash, HOST_MODULE, InitInput, InitializedState, JsonBytes, JsonBytesError,
     JsonSchemaDocument, JsonSchemaDocumentError, LocalStateBytes, MAX_CALL_ENVELOPE_BYTES,
-    MAX_LOCAL_STATE_BYTES, MessageSchema, OutcomeBytes, OutcomeBytesError, OutcomeInput,
-    OutcomeOutput, PROGRAM_DEFINITION_MAGIC, PROGRAM_DEFINITION_VERSION, PROGRAM_MAX_LEN,
-    ParticipantCount, ParticipantCountError, PrimitiveRouteSchema, ProgramDefinition,
-    ProgramDefinitionError, ProgramHash, ProgramMetadata, ProgramSchema, QueryInput, QueryOutput,
-    QuerySchema, SharedStateBytes, StateBytesError, StateSchema, ViewInput, ViewOutput,
-    WriterInput, WriterOutput, abi,
+    MAX_LOCAL_STATE_BYTES, MAX_REJECTION_REASON_BYTES, MessageSchema, OutcomeBytes,
+    OutcomeBytesError, OutcomeInput, OutcomeOutput, PROGRAM_DEFINITION_MAGIC,
+    PROGRAM_DEFINITION_VERSION, PROGRAM_MAX_LEN, ParticipantCount, ParticipantCountError,
+    PrimitiveRouteSchema, ProgramDefinition, ProgramDefinitionError, ProgramHash, ProgramMetadata,
+    ProgramSchema, QueryInput, QueryOutput, QuerySchema, SharedStateBytes, StateBytesError,
+    StateSchema, ViewInput, ViewOutput, WriterInput, WriterOutput, abi,
 };
 pub use arena0_protocol as types;
 pub use arena0_protocol::{
@@ -106,9 +104,20 @@ pub use serde_json;
 /// forwards agent JSON unchanged; only the guest's stock Serde impl for the
 /// concrete type interprets it.
 #[doc(hidden)]
+pub fn __parse_input_data<T: serde::de::DeserializeOwned>(data: &[u8]) -> anyhow::Result<T> {
+    serde_json::from_slice(data).map_err(Into::into)
+}
+
+/// Format and bound one guest input rejection reason before it crosses the ABI.
+#[doc(hidden)]
 #[must_use]
-pub fn __parse_input_data<T: serde::de::DeserializeOwned>(data: &[u8]) -> T {
-    serde_json::from_slice(data).expect("input data deserialization failed")
+pub fn __truncate_rejection_reason(error: &anyhow::Error) -> String {
+    let reason = format!("{error:#}");
+    let mut end = reason.len().min(MAX_REJECTION_REASON_BYTES);
+    while end > 0 && !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason[..end].to_owned()
 }
 
 /// Inverse of [`__parse_input_data`]: serialize a value to JSON event bytes.

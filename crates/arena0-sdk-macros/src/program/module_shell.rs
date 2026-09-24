@@ -320,7 +320,7 @@ fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
             fn on_input(
                 ctx: &mut ::arena0::Context<Self::Shared, Self::Local>,
                 input: Self::Input,
-            ) -> Result<::arena0::ProgramTransition<Self>, ::arena0::InputFault> {
+            ) -> ::arena0::anyhow::Result<::arena0::ProgramTransition<Self>> {
                 self::on_input(ctx, input)
             }
         });

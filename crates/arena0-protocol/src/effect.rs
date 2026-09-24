@@ -43,8 +43,6 @@ pub enum Effect {
     },
     /// Terminate program execution immediately with an error.
     Fail { reason: String },
-    /// Re-issue the pending callout after a retryable input fault.
-    RetryInput { reason: String },
 }
 
 const EFFECT_SESSION_END: u8 = 0;
@@ -54,7 +52,6 @@ const EFFECT_CALLOUT: u8 = 3;
 const EFFECT_SET_TIMER: u8 = 4;
 const EFFECT_SIGN: u8 = 5;
 const EFFECT_FAIL: u8 = 6;
-const EFFECT_RETRY_INPUT: u8 = 7;
 
 impl BorshSerialize for Effect {
     fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
@@ -140,15 +137,6 @@ impl BorshSerialize for Effect {
                     "failure reason",
                 )
             }
-            Self::RetryInput { reason } => {
-                BorshSerialize::serialize(&EFFECT_RETRY_INPUT, writer)?;
-                serialize_bounded_string(
-                    writer,
-                    reason,
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "retry reason",
-                )
-            }
         }
     }
 }
@@ -212,13 +200,6 @@ impl BorshDeserialize for Effect {
                     reader,
                     crate::execution::MAX_TERMINAL_REASON_BYTES,
                     "failure reason",
-                )?,
-            }),
-            EFFECT_RETRY_INPUT => Ok(Self::RetryInput {
-                reason: read_bounded_string(
-                    reader,
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "retry reason",
                 )?,
             }),
             tag => Err(io::Error::new(
@@ -302,9 +283,6 @@ mod tests {
             },
             Effect::Fail {
                 reason: "failed".into(),
-            },
-            Effect::RetryInput {
-                reason: "bad input".into(),
             },
         ];
 

@@ -11,9 +11,9 @@ use arena0_api::{
     HostRequest, ReceiptArtifact, Request, Response, ResponseOk,
 };
 use arena0_protocol::{ExecId, NegotiationTarget, Slot};
-use common::{HostTarget, call, call_daemon, created, daemon, drive, ok, rps_wasm};
+use common::{HostTarget, call, call_daemon, chess_wasm, created, daemon, drive, ok, rps_wasm};
 use tokio::io::BufReader;
-use tokio::net::UnixStream;
+use tokio::net::{UnixStream, unix::OwnedReadHalf, unix::OwnedWriteHalf};
 
 async fn next_from_either(
     target_a: &HostTarget,
@@ -216,6 +216,126 @@ async fn competing_callout_submissions_return_typed_conflict_and_execution_conti
         ResponseOk::Status(status) => assert_eq!(status.lifecycle(), ExecLifecycle::Completed),
         other => panic!("unexpected final status: {other:?}"),
     }
+}
+
+/// A program-level input rejection is a typed API error. It leaves the same
+/// pending callout available and does not publish an answered event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejected_input_is_typed_and_emits_no_answered_event() {
+    let d = daemon(&chess_wasm()).await;
+    let (mut events_a, _events_a_write) = subscribe_events(&d.host_a).await;
+    let (mut events_b, _events_b_write) = subscribe_events(&d.host_b).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (exec_a, negotiation_id) = match ok(call(
+        &d.host_a,
+        &HostRequest::ExecNew {
+            exec_id: ExecId([line!() as u8; 32]),
+            program: d.program_id.to_string(),
+            params: Some(serde_json::json!(null)),
+            ensemble: EnsembleSpec::Explicit {
+                peers: vec![d.peer_b],
+            },
+        },
+    )
+    .await)
+    {
+        ResponseOk::ExecCreated {
+            exec_id,
+            negotiation_id: Some(negotiation_id),
+            ..
+        } => (exec_id, negotiation_id),
+        other => panic!("unexpected creator response: {other:?}"),
+    };
+    let exec_b = created(
+        call(
+            &d.host_b,
+            &HostRequest::ExecNew {
+                exec_id: ExecId([line!() as u8; 32]),
+                program: d.program_id.to_string(),
+                params: Some(serde_json::json!(null)),
+                ensemble: EnsembleSpec::Join {
+                    target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
+                },
+            },
+        )
+        .await,
+    );
+
+    let (is_a, next) = next_from_either(&d.host_a, exec_a, &d.host_b, exec_b).await;
+    let (target, exec_id) = if is_a {
+        (&d.host_a, exec_a)
+    } else {
+        (&d.host_b, exec_b)
+    };
+    let pending_id = match ok(next) {
+        ResponseOk::Next(arena0_api::NextEvent::Callout { pending_id, .. }) => pending_id,
+        ResponseOk::Next(arena0_api::NextEvent::Failed { reason }) => {
+            panic!("execution failed before callout: {reason}")
+        }
+        other => panic!("unexpected event before callout: {other:?}"),
+    };
+
+    let events = if is_a { &mut events_a } else { &mut events_b };
+    loop {
+        let frame = read_event(events).await;
+        if matches!(
+            frame.data,
+            EventData::SessionCallout {
+                pending_id: event_pending_id,
+                ..
+            } if event_pending_id == pending_id
+        ) {
+            break;
+        }
+    }
+
+    let rejected = call(
+        target,
+        &HostRequest::ExecSubmit {
+            exec_id,
+            pending_id,
+            answer: Some(serde_json::json!("z9z9")),
+        },
+    )
+    .await
+    .expect_err("invalid chess input must be rejected");
+    assert_eq!(rejected.code, arena0_api::ApiErrorCode::InputRejected);
+    assert!(rejected.message.contains("illegal move"));
+
+    let next_pending_id = match ok(call(target, &HostRequest::ExecNext { exec_id }).await) {
+        ResponseOk::Next(arena0_api::NextEvent::Callout { pending_id, .. }) => pending_id,
+        other => panic!("unexpected event after rejection: {other:?}"),
+    };
+    assert_eq!(next_pending_id, pending_id);
+
+    let answered = tokio::time::timeout(
+        Duration::from_millis(250),
+        read_until_answered(events, pending_id),
+    )
+    .await;
+    assert!(
+        answered.is_err(),
+        "rejection must not emit callout_answered"
+    );
+
+    ok(call(
+        target,
+        &HostRequest::ExecSubmit {
+            exec_id,
+            pending_id,
+            answer: Some(serde_json::json!("e2e4")),
+        },
+    )
+    .await);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            read_until_answered(events, pending_id),
+        )
+        .await
+        .expect("accepted answer event timed out")
+    );
 }
 
 /// The other RPS Host answers first in the final round, then the human answers
@@ -694,6 +814,48 @@ async fn collect_frames_unix(target: HostTarget, filter: EventFilter) -> Vec<Eve
                 }
             }
             _ => return frames,
+        }
+    }
+}
+
+async fn subscribe_events(target: &HostTarget) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
+    let stream = UnixStream::connect(&target.socket).await.expect("connect");
+    let (read, mut write) = stream.into_split();
+    let mut read = BufReader::new(read);
+    let request = target.request(&HostRequest::EventsSubscribe {
+        filter: EventFilter {
+            include: vec![],
+            exclude: vec![],
+        },
+    });
+    arena0_api::frame::write_frame(&mut write, &request)
+        .await
+        .expect("write subscribe");
+    let _ack: Response = arena0_api::frame::read_frame(&mut read)
+        .await
+        .expect("read ack")
+        .expect("ack frame");
+    (read, write)
+}
+
+async fn read_event(reader: &mut BufReader<OwnedReadHalf>) -> EventFrame {
+    arena0_api::frame::read_frame(reader)
+        .await
+        .expect("read event")
+        .expect("event frame")
+}
+
+async fn read_until_answered(
+    reader: &mut BufReader<OwnedReadHalf>,
+    pending_id: arena0_protocol::PendingId,
+) -> bool {
+    loop {
+        if matches!(
+            read_event(reader).await.data,
+            EventData::SessionCalloutAnswered { pending_id: event_pending_id }
+                if event_pending_id == pending_id
+        ) {
+            return true;
         }
     }
 }

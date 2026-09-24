@@ -32,7 +32,6 @@ unsafe extern "C" {
     fn sign(scheme: u32, data_ptr: u32, data_len: u32, expected_ptr: u32, expected_len: u32);
     fn end_session(result_ptr: u32, result_len: u32);
     fn abort_session(reason_ptr: u32, reason_len: u32);
-    fn retry_input(reason_ptr: u32, reason_len: u32);
     fn state_len(kind: u32) -> u32;
     fn state_read(kind: u32, ptr: u32, len: u32);
     fn state_write(kind: u32, ptr: u32, len: u32);
@@ -215,19 +214,6 @@ pub fn host_fail(reason: &str) {
     }
     #[cfg(not(target_arch = "wasm32"))]
     crate::testing::push_effect(arena0_protocol::Effect::Fail {
-        reason: reason.to_string(),
-    });
-}
-
-pub fn host_retry_input(reason: &str) {
-    #[cfg(target_arch = "wasm32")]
-    // SAFETY: reason is a valid UTF-8 str; ptr and len are valid for the
-    // duration of the host call (synchronous, single-threaded Wasm).
-    unsafe {
-        retry_input(reason.as_ptr() as u32, reason.len() as u32);
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    crate::testing::push_effect(arena0_protocol::Effect::RetryInput {
         reason: reason.to_string(),
     });
 }

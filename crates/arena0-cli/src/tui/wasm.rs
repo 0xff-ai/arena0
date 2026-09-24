@@ -436,7 +436,6 @@ fn effect_label(effect: &arena0_client::api::EffectSummary) -> String {
         EffectKind::SetTimer => "set timer",
         EffectKind::Sign => "sign",
         EffectKind::Fail => "fail",
-        EffectKind::RetryInput => "retry input",
     };
     effect
         .payload_bytes

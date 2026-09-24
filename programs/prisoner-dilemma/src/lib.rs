@@ -361,9 +361,9 @@ pub mod prisoner_dilemma {
     fn on_input(
         ctx: &mut Context<Shared, Local>,
         input: Input,
-    ) -> Result<ProgramTransition<PrisonerDilemma>, InputFault> {
+    ) -> arena0::anyhow::Result<ProgramTransition<PrisonerDilemma>> {
         if ctx.shared().commit_reveal.expected_writer() != Some(ctx.me()) {
-            return Err(anyhow!("this participant does not own the next choice").into());
+            return Err(anyhow!("this participant does not own the next choice"));
         }
         let Input::Choose(choice) = input;
         ctx.commit_reveal().commit(choice)?.broadcast();

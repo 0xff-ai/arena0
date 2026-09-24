@@ -320,9 +320,9 @@ pub mod rock_paper_scissors {
     fn on_input(
         ctx: &mut Context<Shared, Local>,
         input: Input,
-    ) -> Result<ProgramTransition<RockPaperScissors>, InputFault> {
+    ) -> arena0::anyhow::Result<ProgramTransition<RockPaperScissors>> {
         if ctx.shared().commit_reveal.expected_writer() != Some(ctx.me()) {
-            return Err(anyhow!("this participant does not own the next choice").into());
+            return Err(anyhow!("this participant does not own the next choice"));
         }
         let Input::ChooseMove(choice) = input;
         ctx.commit_reveal().commit(choice)?.broadcast();

@@ -35,7 +35,7 @@ type Response = Result<ResponseOk, ApiError>;
 `ApiError` contains a stable category and a human-readable message. Categories
 are `NotFound`, `BadRequest`, `Ambiguous`, `Schema`, `Negotiation`,
 `Execution`, `Verification`, `Storage`, `Timeout`, `Internal`, and
-`CalloutNotPending`.
+`CalloutNotPending`, and `InputRejected`.
 
 ## Identity and custody
 
@@ -159,6 +159,14 @@ the next decision point; do not resubmit the stale answer or terminate an
 otherwise healthy execution. This category is also preserved for a stale
 answer already queued at the execution actor. Other validation, storage, and
 execution errors remain distinct.
+
+`exec.submit` returns `InputRejected` when the pending callout still belongs to
+the execution but the program rejects the answer. The response message carries
+the bounded program reason when one is available. The rejection does not change
+state, advance the event position, consume the `pending_id`, or emit
+`exec.session.callout_answered`; submit a corrected answer with the same
+`pending_id`. Invalid JSON or schema values are rejected at the API boundary
+with `Schema` before the program runs.
 
 `params`, callout answers, query values, and terminal projections are JSON.
 The daemon validates agent inputs against the program's public JSON Schema.

@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use arena0_crypto::bls::BlsSecretKey;
@@ -17,20 +16,17 @@ use arena0_protocol::{
     AbortKind, AbortOccurrence, Activation, ActivationData, Effect, Ensemble, Event, ExecFrame,
     ExecId, ExecutionAdmission, MessageId, NegotiationId, Offer, OfferData,
     ParticipantStepSignature, ParticipantTerminalSignature, PeerId, PeerIdSource, PendingOperation,
-    PreparedActivation, StateHash, StopCause, Ticket, TicketAction, TicketData, TicketHash,
+    PreparedActivation, StateHash, Ticket, TicketAction, TicketData, TicketHash,
 };
 use arena0_sandbox::{InitializeCall, LoadedProgram, Program, WasmtimeEngine};
 use arena0_store::{ApplyOutcome, OutboxPayloadKind, Store, StoreConfig};
+use arena0_transport::Transport;
 use arena0_transport::local::{LocalNetwork, LocalTransport};
-use arena0_transport::{
-    AcceptedExecStream, NegotiationTopic, RecvHandle, SendHandle, Transport, TransportError,
-};
-use bytes::Bytes;
 use tempfile::TempDir;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use super::ExecutionActor;
-use super::guest::DispatchSource;
+use super::guest::{DispatchOutcome, DispatchSource, SubmitInputError};
 use crate::context::ExecContext;
 
 const EXEC_ID: ExecId = ExecId([0x44; 32]);
@@ -61,7 +57,7 @@ enum GuestMode {
     Timer,
     Callout,
     CalloutFault,
-    CalloutRetryMessage,
+    CalloutReject,
     Sign,
     SignThenBroadcast,
     Broadcast,
@@ -80,118 +76,6 @@ struct Fixture {
     remote_salt: ExecutionSalt,
     local_transport: Arc<LocalTransport>,
     remote_transport: Arc<LocalTransport>,
-}
-
-/// Test transport that injects one terminal-classified stream-open failure,
-/// then delegates every operation to the real local transport. This exercises
-/// the actor's durable retry owner before an outbound send task exists.
-#[derive(Debug)]
-struct FailFirstExecTransport {
-    inner: Arc<LocalTransport>,
-    fail_next_open: AtomicBool,
-}
-
-impl FailFirstExecTransport {
-    fn new(inner: Arc<LocalTransport>) -> Self {
-        Self {
-            inner,
-            fail_next_open: AtomicBool::new(true),
-        }
-    }
-
-    fn injected_failure_was_used(&self) -> bool {
-        !self.fail_next_open.load(Ordering::Acquire)
-    }
-}
-
-#[async_trait::async_trait]
-impl Transport for FailFirstExecTransport {
-    async fn subscribe_program(
-        &self,
-        program_id: ProgramHash,
-        bootstrap: Vec<PeerId>,
-    ) -> Result<Box<dyn NegotiationTopic>, TransportError> {
-        self.inner.subscribe_program(program_id, bootstrap).await
-    }
-
-    async fn import_blob(
-        &self,
-        negotiation_id: NegotiationId,
-        bytes: Bytes,
-        max_bytes: u64,
-    ) -> Result<[u8; 32], TransportError> {
-        self.inner
-            .import_blob(negotiation_id, bytes, max_bytes)
-            .await
-    }
-
-    async fn fetch_blob(
-        &self,
-        negotiation_id: NegotiationId,
-        hash: [u8; 32],
-        declared_len: u64,
-        providers: Vec<PeerId>,
-        max_bytes: u64,
-    ) -> Result<(), TransportError> {
-        self.inner
-            .fetch_blob(negotiation_id, hash, declared_len, providers, max_bytes)
-            .await
-    }
-
-    async fn read_blob(&self, hash: [u8; 32], max_bytes: u64) -> Result<Bytes, TransportError> {
-        self.inner.read_blob(hash, max_bytes).await
-    }
-
-    async fn retain_session_blob(
-        &self,
-        session_id: arena0_protocol::SessionHash,
-        hash: [u8; 32],
-    ) -> Result<(), TransportError> {
-        self.inner.retain_session_blob(session_id, hash).await
-    }
-
-    async fn release_negotiation_blobs(
-        &self,
-        negotiation_id: NegotiationId,
-    ) -> Result<(), TransportError> {
-        self.inner.release_negotiation_blobs(negotiation_id).await
-    }
-
-    async fn release_session_blobs(
-        &self,
-        session_id: arena0_protocol::SessionHash,
-    ) -> Result<(), TransportError> {
-        self.inner.release_session_blobs(session_id).await
-    }
-
-    async fn open_exec(
-        &self,
-        peer: &PeerId,
-        session_hash: arena0_protocol::SessionHash,
-    ) -> Result<SendHandle, TransportError> {
-        if self.fail_next_open.swap(false, Ordering::AcqRel) {
-            return Err(TransportError::InvalidFrame(
-                "injected first terminal stream-open failure".into(),
-            ));
-        }
-        self.inner.open_exec(peer, session_hash).await
-    }
-
-    async fn accept_exec(&self) -> Result<AcceptedExecStream, TransportError> {
-        self.inner.accept_exec().await
-    }
-
-    async fn open_fetch(&self, peer: &PeerId) -> Result<SendHandle, TransportError> {
-        self.inner.open_fetch(peer).await
-    }
-
-    async fn accept_fetch(&self) -> Result<RecvHandle, TransportError> {
-        self.inner.accept_fetch().await
-    }
-
-    async fn close(&self) {
-        self.inner.close().await;
-    }
 }
 
 impl Fixture {
@@ -373,7 +257,7 @@ impl Fixture {
             )
             .await
             .expect("session start dispatch");
-        assert_eq!(accepted, Some(true));
+        assert_eq!(accepted, DispatchOutcome::Committed);
         actor
             .ensure_step_signature()
             .await
@@ -449,7 +333,7 @@ async fn stage_signature_request(actor: &mut ExecutionActor) -> arena0_protocol:
         .dispatch_event(Event::React, DispatchSource::default())
         .await
         .expect("dispatch sign request");
-    assert_eq!(accepted, Some(true));
+    assert_eq!(accepted, DispatchOutcome::Committed);
     let state = actor.load_state().await.expect("load signing state");
     let pending = state.status().pending().expect("pending sign");
     assert_eq!(pending.operation, PendingOperation::Sign);
@@ -650,7 +534,7 @@ async fn flat_dispatch_commits_local_state_in_the_resident() {
         .dispatch_event(Event::React, DispatchSource::default())
         .await
         .expect("dispatch local reaction");
-    assert_eq!(accepted, Some(true));
+    assert_eq!(accepted, DispatchOutcome::Committed);
     let state = actor.load_state().await.expect("load committed state");
     assert_eq!(state.local_state().as_bytes(), &[9]);
     let instance = actor.instance.as_ref().expect("resident instance");
@@ -667,7 +551,7 @@ async fn restart_resumes_a_durable_timer_and_accepted_inbox() {
             .dispatch_event(Event::React, DispatchSource::default())
             .await
             .expect("arm timer"),
-        Some(true)
+        DispatchOutcome::Committed
     );
     drop(actor);
 
@@ -731,7 +615,7 @@ async fn recovered_sdk_timers_dispatch_typed_and_unit_payloads() {
                 .dispatch_event(Event::React, DispatchSource::default())
                 .await
                 .expect("schedule timer"),
-            Some(true),
+            DispatchOutcome::Committed,
             "{stem} React dispatch"
         );
         drop(actor);
@@ -772,7 +656,7 @@ async fn restart_drains_a_durable_callout_outbox() {
                 .dispatch_event(Event::React, DispatchSource::default())
                 .await
                 .expect("dispatch callout"),
-            Some(true)
+            DispatchOutcome::Committed
         );
         actor
             .load_state()
@@ -836,48 +720,82 @@ async fn restart_drains_a_durable_callout_outbox() {
 }
 
 #[tokio::test]
-async fn unrecoverable_callout_answer_rolls_back_and_fails_actor() {
-    let fixture = Fixture::with_mode(false, GuestMode::CalloutFault).await;
-    let mut setup = fixture.prepare_active_actor().await;
-    fixture.commit_session_started(&mut setup).await;
-    drop(setup);
-
-    let flaky_transport = Arc::new(FailFirstExecTransport::new(Arc::clone(
-        &fixture.local_transport,
-    )));
-    let host = crate::Host::start(
-        Arc::clone(&fixture.local_keys),
-        Arc::clone(&flaky_transport) as Arc<dyn Transport + Sync>,
-        fixture.store.handle().clone(),
+async fn rejected_callout_answer_preserves_pending_continuation_until_valid_input() {
+    let fixture = Fixture::with_mode(false, GuestMode::CalloutReject).await;
+    let (messages, _observations) = mpsc::channel(32);
+    let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
+    fixture.commit_session_started(&mut actor).await;
+    assert_eq!(
+        actor
+            .dispatch_event(Event::React, DispatchSource::default())
+            .await
+            .expect("dispatch callout"),
+        DispatchOutcome::Committed
     );
-    let lifecycle = host.claim_execution(EXEC_ID).expect("lifecycle claim");
-    let mut spawned = host
-        .spawn(fixture.context(), lifecycle)
-        .expect("spawn actor");
 
-    let pending_id = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match spawned.message_rx.recv().await {
-                Some(crate::SessionMessage::CalloutRequested { pending_id, .. }) => {
-                    break pending_id;
-                }
-                Some(crate::SessionMessage::Failed { reason }) => {
-                    panic!("actor failed before callout answer: {reason}")
-                }
-                Some(_) => {}
-                None => panic!("observation channel closed before callout request"),
-            }
-        }
-    })
-    .await
-    .expect("callout request timeout");
+    let before = actor.load_state().await.expect("load pending state");
+    let pending_id = before.status().pending().expect("pending callout").id;
+    let result = actor
+        .submit_input(
+            pending_id,
+            0,
+            JsonBytes::try_new(b"null".to_vec()).expect("answer"),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(SubmitInputError::Expected(crate::ExecError::InputRejected(reason)))
+            if reason == "input handler rejected the answer"
+    ));
+
+    let after_rejection = actor.load_state().await.expect("load rejected state");
+    assert_eq!(after_rejection.version(), before.version());
+    assert_eq!(after_rejection.event_position(), before.event_position());
+    assert_eq!(after_rejection.shared_state(), before.shared_state());
+    assert_eq!(after_rejection.local_state(), before.local_state());
+    assert_eq!(
+        after_rejection
+            .status()
+            .pending()
+            .expect("pending after rejection")
+            .id,
+        pending_id
+    );
+    assert!(!after_rejection.status().is_terminal());
+
+    actor
+        .submit_input(
+            pending_id,
+            0,
+            JsonBytes::try_new(b"true".to_vec()).expect("valid answer"),
+        )
+        .await
+        .expect("valid answer after rejection");
+    let committed = actor.load_state().await.expect("load committed answer");
+    assert!(committed.status().pending().is_none());
+    assert!(!committed.status().is_terminal());
+}
+
+#[tokio::test]
+async fn input_handler_trap_rejects_without_ending_session() {
+    let fixture = Fixture::with_mode(false, GuestMode::CalloutFault).await;
+    let mut actor = fixture.prepare_active_actor().await;
+    fixture.commit_session_started(&mut actor).await;
+    assert_eq!(
+        actor
+            .dispatch_event(Event::React, DispatchSource::default())
+            .await
+            .expect("dispatch callout"),
+        DispatchOutcome::Committed
+    );
     let before = fixture
         .store
         .handle()
         .load_execution(EXEC_ID)
         .await
-        .expect("load state before fault")
-        .expect("execution before fault");
+        .expect("load state before trap")
+        .expect("execution before trap");
+    let pending_id = before.status().pending().expect("callout pending").id;
     assert_eq!(
         before
             .status()
@@ -889,108 +807,35 @@ async fn unrecoverable_callout_answer_rolls_back_and_fails_actor() {
     assert_eq!(before.shared_state().as_bytes(), &[] as &[u8]);
     assert_eq!(before.local_state().as_bytes(), &[9]);
 
-    let unsigned_peer_abort = AbortOccurrence::unsigned(
-        fixture.activation.session_hash(),
-        fixture.remote_keys.peer_id(),
-        AbortKind::Fail,
-        1,
-        "peer failed concurrently",
-        before.step_cursor(),
-    )
-    .expect("peer abort occurrence");
-    let peer_abort = ExecFrame::Abort {
-        occurrence: unsigned_peer_abort
-            .clone()
-            .with_signature(
-                fixture.remote_keys.sign(
-                    &unsigned_peer_abort
-                        .signing_bytes()
-                        .expect("peer abort signing bytes"),
-                ),
-            )
-            .expect("signed peer abort"),
-    };
-    let remote_transport = Arc::clone(&fixture.remote_transport);
-    let local_peer = fixture.local_keys.peer_id();
-    let session_id = fixture.activation.session_hash();
-    let terminal_receiver = tokio::spawn(async move {
-        let accepted = remote_transport
-            .accept_exec()
-            .await
-            .expect("accept failure stream");
-        let recv = accepted.into_parts().1;
-        let delivery = recv.recv_exec().await.expect("receive failure frame");
-        assert!(matches!(delivery.frame(), ExecFrame::Abort { .. }));
-
-        // Hold the local actor's Abort acknowledgement while sending the
-        // peer's own Abort in the other direction. The actor must keep its
-        // normal select loop alive to durably accept this inbound frame; a
-        // private terminal-delivery loop would deadlock here.
-        let reverse = remote_transport
-            .open_exec(&local_peer, session_id)
-            .await
-            .expect("open concurrent peer failure stream");
-        tokio::time::timeout(Duration::from_secs(5), reverse.send_exec(&peer_abort))
-            .await
-            .expect("actor stopped accepting inbound frames while delivering failure")
-            .expect("concurrent peer failure was durably accepted");
-        delivery
-            .acknowledge()
-            .expect("acknowledge durable failure responsibility");
-        recv
-    });
-    let (reply, response) = oneshot::channel();
-    spawned
-        .cmd_tx
-        .send(crate::ExecCommand::SubmitInput {
+    let result = actor
+        .submit_input(
             pending_id,
-            callout_index: 0,
-            data: JsonBytes::try_new(b"null".to_vec()).expect("answer"),
-            reply,
-        })
-        .await
-        .expect("submit answer");
-    let result = tokio::time::timeout(Duration::from_secs(5), response)
-        .await
-        .expect("answer response timeout")
-        .expect("answer response");
-    assert!(matches!(result, Err(crate::ExecError::Unavailable(_))));
-    let _terminal_stream = terminal_receiver
-        .await
-        .expect("failure receiver task completed");
-    assert!(flaky_transport.injected_failure_was_used());
-
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match spawned.message_rx.recv().await {
-                Some(crate::SessionMessage::Failed { .. }) => break,
-                Some(_) => {}
-                None => panic!("observation channel closed before failure"),
-            }
-        }
-    })
-    .await
-    .expect("durable failure observation timeout");
+            0,
+            JsonBytes::try_new(b"null".to_vec()).expect("answer"),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(SubmitInputError::Expected(crate::ExecError::InputRejected(reason)))
+            if reason.starts_with("input handler trapped:")
+    ));
 
     let after = fixture
         .store
         .handle()
         .load_execution(EXEC_ID)
         .await
-        .expect("load state after fault")
-        .expect("execution after fault");
+        .expect("load state after trap")
+        .expect("execution after trap");
     assert_eq!(after.shared_state(), before.shared_state());
     assert_eq!(after.local_state(), before.local_state());
-    assert!(after.status().is_terminal());
-    assert!(matches!(
-        after.status().terminal_cause(),
-        Some(StopCause::Authenticated(occurrence))
-            if occurrence.sender() == fixture.local_keys.peer_id()
-                && occurrence.kind() == AbortKind::Fail
-    ));
-
-    spawned.shutdown().await;
-    host.stop().await;
+    assert_eq!(after.version(), before.version());
+    assert_eq!(after.event_position(), before.event_position());
+    assert_eq!(
+        after.status().pending().expect("pending after trap").id,
+        pending_id
+    );
+    assert!(!after.status().is_terminal());
 }
 
 #[tokio::test]
@@ -1214,7 +1059,7 @@ async fn stale_abort_is_rejected_across_restart_and_signed_proposal_still_commit
             .dispatch_event(Event::React, DispatchSource::default())
             .await
             .expect("stage broadcast proposal"),
-        Some(true)
+        DispatchOutcome::Committed
     );
     actor
         .ensure_step_signature()
@@ -1302,56 +1147,6 @@ async fn stale_abort_is_rejected_across_restart_and_signed_proposal_still_commit
     let committed = restarted.load_state().await.expect("load committed state");
     assert!(committed.pending_shared().is_none());
     assert_eq!(committed.agreed_step(), 2);
-}
-
-#[tokio::test]
-async fn retry_input_from_message_preserves_callout_without_source_pending_id() {
-    let fixture = Fixture::with_mode(true, GuestMode::CalloutRetryMessage).await;
-    let mut actor = fixture.prepare_active_actor().await;
-    fixture.commit_session_started(&mut actor).await;
-    assert_eq!(
-        actor
-            .dispatch_event(Event::React, DispatchSource::default())
-            .await
-            .expect("dispatch callout"),
-        Some(true)
-    );
-    let before = actor.load_state().await.expect("load callout state");
-    let pending_id = before.status().pending().expect("callout pending").id;
-    // MessageReceived has no pending source id. RetryInput is nevertheless
-    // valid because the durable continuation is a Callout.
-    let source = fixture.remote_keys.peer_id();
-    let sequence = before.agreed_step();
-    let poststate = StateHash::of_shared(before.shared_state());
-    let data = vec![4, 5, 6];
-    let message_id = MessageId::derive(
-        before.binding().session_id(),
-        source,
-        sequence,
-        before.agreed_state(),
-        poststate,
-        &data,
-    );
-    let frame = ExecFrame::Message {
-        message_id,
-        seq: sequence,
-        prestate: before.agreed_state(),
-        data,
-        poststate,
-    };
-    assert!(
-        actor
-            .apply_message(source, frame, None)
-            .await
-            .expect("retry from message")
-    );
-    let after = actor.load_state().await.expect("load retried state");
-    assert_eq!(
-        after.status().pending().expect("callout preserved").id,
-        pending_id
-    );
-    assert_eq!(after.shared_state(), before.shared_state());
-    assert_eq!(after.local_state(), before.local_state());
 }
 
 #[tokio::test]
@@ -1725,7 +1520,7 @@ async fn broadcast_outbox_has_only_remote_destinations_and_no_self_apply() {
             .dispatch_event(Event::React, DispatchSource::default())
             .await
             .expect("dispatch broadcast"),
-        Some(true)
+        DispatchOutcome::Committed
     );
 
     let state = actor.load_state().await.expect("load broadcast proposal");
@@ -1857,8 +1652,9 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
     let capabilities = match mode {
         GuestMode::Plain | GuestMode::EndOnMessage => Vec::new(),
         GuestMode::Timer => vec![Capability::Timers],
-        GuestMode::Callout | GuestMode::CalloutFault => vec![Capability::Input],
-        GuestMode::CalloutRetryMessage => vec![Capability::Input],
+        GuestMode::Callout | GuestMode::CalloutFault | GuestMode::CalloutReject => {
+            vec![Capability::Input]
+        }
         GuestMode::Sign => vec![Capability::Sign {
             schemes: vec![SignScheme::Ed25519],
         }],
@@ -1871,7 +1667,7 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
         GuestMode::Broadcast => vec![Capability::Messaging],
     };
     let callouts = match mode {
-        GuestMode::Callout | GuestMode::CalloutFault | GuestMode::CalloutRetryMessage => {
+        GuestMode::Callout | GuestMode::CalloutFault | GuestMode::CalloutReject => {
             vec![CalloutSchema {
                 name: "request".into(),
                 prompt: "request".into(),
@@ -1909,14 +1705,9 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
         GuestMode::Timer => {
             r#"(import "arena0" "set_timer" (func $set_timer (param i64 i32 i32 i32 i32)))"#
         }
-        GuestMode::Callout | GuestMode::CalloutFault => {
+        GuestMode::Callout | GuestMode::CalloutFault | GuestMode::CalloutReject => {
             r#"(import "arena0" "request_input"
             (func $request_input (param i32 i32 i32 i32 i32)))"#
-        }
-        GuestMode::CalloutRetryMessage => {
-            r#"(import "arena0" "request_input"
-            (func $request_input (param i32 i32 i32 i32 i32)))
-            (import "arena0" "retry_input" (func $retry_input (param i32 i32)))"#
         }
         GuestMode::Sign => {
             r#"(import "arena0" "sign"
@@ -1958,21 +1749,7 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
               call $set_timer
             "#
         }
-        GuestMode::Callout | GuestMode::CalloutFault => {
-            r#"
-              i32.const 1
-              i32.const 1040
-              i32.const 1
-              call $state_write
-              i32.const 0
-              i32.const 1080
-              i32.const 4
-              i32.const 1070
-              i32.const 5
-              call $request_input
-            "#
-        }
-        GuestMode::CalloutRetryMessage => {
+        GuestMode::Callout | GuestMode::CalloutFault | GuestMode::CalloutReject => {
             r#"
               i32.const 1
               i32.const 1040
@@ -2028,16 +1805,26 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
               unreachable
             "#
         }
+        GuestMode::CalloutReject => {
+            r#"
+              local.get $event_ptr
+              i32.load8_u offset=9
+              i32.const 110
+              i32.eq
+              if
+                i32.const 32768
+                i32.const 1
+                i32.store8
+              else
+                i32.const 32768
+                i32.const 0
+                i32.store8
+              end
+            "#
+        }
         _ => "",
     };
     let message_body = match mode {
-        GuestMode::CalloutRetryMessage => {
-            r#"
-              i32.const 1050
-              i32.const 3
-              call $retry_input
-            "#
-        }
         GuestMode::EndOnMessage => {
             r#"
               i32.const 0
@@ -2114,7 +1901,7 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
           (data (i32.const 1140) "\08")
           (data (i32.const 2000) "{writer}")
           (data (i32.const 3000) "\00\00\00\00\00\00\00\00")
-          (data (i32.const 32768) "\00")
+          (data (i32.const 32768) "\00\00")
           (data (i32.const 40000) "{metadata}")
           (func $pack (param $ptr i32) (param $len i32) (result i64)
             local.get $ptr
@@ -2198,7 +1985,7 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
             end
             end
             i32.const 32768
-            i32.const 1
+            i32.const 2
             call $pack)
           (func (export "arena0_writer") (param i32 i32) (result i64)
             i32.const 2000

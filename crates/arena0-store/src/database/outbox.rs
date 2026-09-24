@@ -571,7 +571,7 @@ impl Database {
     ) -> Result<(), StoreError> {
         for (ordinal, effect) in effects {
             match effect {
-                Effect::Callout { .. } | Effect::Sign { .. } | Effect::RetryInput { .. } => {
+                Effect::Callout { .. } | Effect::Sign { .. } => {
                     let payload = borsh::to_vec(effect).map_err(|error| {
                         StoreError::Corruption(format!("outbox effect encode: {error}"))
                     })?;
@@ -668,10 +668,7 @@ impl Database {
                 "continuation effect outbox id",
             )?);
             let effect: Effect = decode_borsh(&row.get::<_, Vec<u8>>(1)?, "continuation effect")?;
-            if matches!(
-                effect,
-                Effect::Callout { .. } | Effect::Sign { .. } | Effect::RetryInput { .. }
-            ) {
+            if matches!(effect, Effect::Callout { .. } | Effect::Sign { .. }) {
                 effects.push((outbox_id, effect));
             }
         }
@@ -728,7 +725,7 @@ impl Database {
         Ok(())
     }
 
-    /// Retire every pending/leased Callout, Sign, and RetryInput row when the
+    /// Retire every pending/leased Callout and Sign row when the
     /// execution crosses a terminal boundary. These rows are local delivery
     /// attempts; retaining them after terminal completion could resurrect a
     /// continuation on restart. Protocol-frame rows remain untouched.
@@ -740,21 +737,6 @@ impl Database {
         let outbox_ids = effects
             .into_iter()
             .map(|(outbox_id, _)| outbox_id)
-            .collect::<Vec<_>>();
-        self.settle_effect_rows(execution_id, &outbox_ids, OutboxStatus::Cancelled)
-    }
-
-    /// Retire retry markers after the continuation they redeliver is
-    /// successfully consumed. The originating Callout/Sign is handled by
-    /// the caller because it must first validate the answer's exact pending
-    /// operation and identity.
-    pub(super) fn cancel_retry_effects(&mut self, execution_id: ExecId) -> Result<(), StoreError> {
-        let effects = self.unsettled_continuation_effects(execution_id)?;
-        let outbox_ids = effects
-            .into_iter()
-            .filter_map(|(outbox_id, effect)| {
-                matches!(effect, Effect::RetryInput { .. }).then_some(outbox_id)
-            })
             .collect::<Vec<_>>();
         self.settle_effect_rows(execution_id, &outbox_ids, OutboxStatus::Cancelled)
     }
@@ -1057,10 +1039,7 @@ fn validate_outbox_payload(kind: OutboxPayloadKind, payload: &[u8]) -> Result<()
                 });
             }
             let effect: Effect = decode_borsh(payload, "outbox effect")?;
-            if !matches!(
-                effect,
-                Effect::Callout { .. } | Effect::Sign { .. } | Effect::RetryInput { .. }
-            ) {
+            if !matches!(effect, Effect::Callout { .. } | Effect::Sign { .. }) {
                 return Err(StoreError::Corruption(
                     "outbox effect does not require external delivery".into(),
                 ));

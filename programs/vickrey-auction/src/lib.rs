@@ -429,16 +429,16 @@ pub mod vickrey_auction {
     fn on_input(
         ctx: &mut Context<Shared, Local>,
         input: Input,
-    ) -> Result<ProgramTransition<VickreyAuction>, InputFault> {
+    ) -> arena0::anyhow::Result<ProgramTransition<VickreyAuction>> {
         let Input::SubmitBid(amount) = input;
         if ctx.me().index() == 0 {
-            return Err(anyhow!("seller/coordinator cannot submit a bid").into());
+            return Err(anyhow!("seller/coordinator cannot submit a bid"));
         }
         if ctx.shared().phase() != Phase::Bidding {
-            return Err(anyhow!("bidding is closed").into());
+            return Err(anyhow!("bidding is closed"));
         }
         if ctx.shared().bids.expected_writer() != Some(ctx.me()) {
-            return Err(anyhow!("this participant does not own the next bid").into());
+            return Err(anyhow!("this participant does not own the next bid"));
         }
         ctx.bids().commit(amount)?.broadcast();
         Ok(Transition::Stay)

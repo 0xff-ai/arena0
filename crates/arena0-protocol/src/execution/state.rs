@@ -571,7 +571,7 @@ impl ExecutionState {
     ///
     /// The optional frame establishes a normalized broadcast. The boolean is
     /// true only when this dispatch consumes the current callout or signing
-    /// continuation instead of retrying it.
+    /// continuation rather than leaving it open.
     pub fn apply_dispatch(
         &mut self,
         event: &Event<Vec<u8>>,
@@ -1235,31 +1235,14 @@ fn validate_pending_dispatch(
     let continuation = effects.iter().any(|effect| {
         matches!(
             effect,
-            Effect::Callout { .. }
-                | Effect::Sign { .. }
-                | Effect::RetryInput { .. }
-                | Effect::SetTimer { .. }
+            Effect::Callout { .. } | Effect::Sign { .. } | Effect::SetTimer { .. }
         )
     });
     if lifecycle && continuation {
         return Err(ProtocolError::InvalidTerminalStatus);
     }
     let answer = matches!(event, Event::InputReceived { .. } | Event::Signed { .. });
-    let retries = effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::RetryInput { .. }));
     if !answer {
-        if retries {
-            let Some(current) = state.status.pending() else {
-                return Err(ProtocolError::PendingContinuationMismatch);
-            };
-            if !matches!(current.operation, PendingOperation::Callout { .. })
-                || pending_id.is_some_and(|id| id != current.id)
-            {
-                return Err(ProtocolError::PendingContinuationMismatch);
-            }
-            return Ok(false);
-        }
         if pending_id.is_some() {
             return Err(ProtocolError::PendingContinuationMismatch);
         }
@@ -1287,7 +1270,7 @@ fn validate_pending_dispatch(
     if !matches {
         return Err(ProtocolError::PendingContinuationMismatch);
     }
-    Ok(!retries)
+    Ok(true)
 }
 
 fn next_dispatch_status(
@@ -1312,19 +1295,11 @@ fn next_dispatch_status(
         return Err(ProtocolError::InvalidPendingContinuation);
     }
     let consumes_pending = matches!(event, Event::InputReceived { .. } | Event::Signed { .. });
-    let retries = effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::RetryInput { .. }));
     if let Some(next) = continuation.into_iter().next() {
-        if retries || (existing.is_some() && !consumes_pending) {
+        if existing.is_some() && !consumes_pending {
             return Err(ProtocolError::InvalidPendingContinuation);
         }
         return Ok(ExecutionStatus::waiting(next));
-    }
-    if retries {
-        return existing
-            .map(ExecutionStatus::waiting)
-            .ok_or(ProtocolError::PendingContinuationMismatch);
     }
     if !consumes_pending {
         return Ok(existing.map_or_else(ExecutionStatus::active, ExecutionStatus::waiting));

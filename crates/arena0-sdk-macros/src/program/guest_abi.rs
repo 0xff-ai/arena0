@@ -233,8 +233,7 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
             let raw_event: ::arena0::Event = ::arena0::borsh::from_slice(&input.event)
                 .expect("dispatch event deserialization failed");
             let mut ctx = __arena0_make_ctx(&input);
-            let mut store_state = true;
-            let status = match raw_event {
+            let (status, reason) = match raw_event {
                 ::arena0::Event::SessionStarted { ensemble } => {
                     ctx.__set_committed_ensemble(ensemble.clone());
                     match <#program_ty as ::arena0::Program>::on_session_started(
@@ -243,7 +242,7 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                     ) {
                         Ok(transition) => {
                             ctx.__apply_transition::<#program_ty>(transition);
-                            ::arena0::CallStatus::Accepted
+                            (::arena0::CallStatus::Accepted, None)
                         }
                         Err(::arena0::ProgramFault(error)) => {
                             panic!("session-start handler failed: {error:#}");
@@ -267,9 +266,11 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                     ) {
                         Ok(::arena0::ApplyDecision::Accept(transition)) => {
                             ctx.__apply_transition::<#program_ty>(transition);
-                            ::arena0::CallStatus::Accepted
+                            (::arena0::CallStatus::Accepted, None)
                         }
-                        Ok(::arena0::ApplyDecision::Reject) => ::arena0::CallStatus::Rejected,
+                        Ok(::arena0::ApplyDecision::Reject) => {
+                            (::arena0::CallStatus::Rejected, None)
+                        }
                         Err(error) => panic!("message handler failed: {error}"),
                     }
                 }
@@ -277,30 +278,33 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                     callout_index,
                     data,
                 } => {
-                    let input = <#callout_ty as ::arena0::Arena0Callout>::from_raw(
+                    match <#callout_ty as ::arena0::Arena0Callout>::from_raw(
                         callout_index,
                         data,
-                    );
-                    match <#program_ty as ::arena0::Program>::on_input(&mut ctx, input) {
-                        Ok(transition) => {
-                            ctx.__apply_transition::<#program_ty>(transition);
-                            ::arena0::CallStatus::Accepted
+                    ) {
+                        Ok(input) => {
+                            match <#program_ty as ::arena0::Program>::on_input(&mut ctx, input) {
+                                Ok(transition) => {
+                                    ctx.__apply_transition::<#program_ty>(transition);
+                                    (::arena0::CallStatus::Accepted, None)
+                                }
+                                Err(error) => (
+                                    ::arena0::CallStatus::Rejected,
+                                    Some(::arena0::__truncate_rejection_reason(&error)),
+                                ),
+                            }
                         }
-                        Err(::arena0::InputFault::Unrecoverable(error)) => {
-                            panic!("input handler failed: {error:#}");
-                        }
-                        Err(::arena0::InputFault::Retryable(error)) => {
-                            ::arena0::__host_retry_input(&format!("{error:#}"));
-                            store_state = false;
-                            ::arena0::CallStatus::Accepted
-                        }
+                        Err(error) => (
+                            ::arena0::CallStatus::Rejected,
+                            Some(::arena0::__truncate_rejection_reason(&error)),
+                        ),
                     }
                 }
                 ::arena0::Event::TimerFired { timer } => {
                     match <#program_ty as ::arena0::Program>::on_timer(&mut ctx, timer) {
                         Ok(transition) => {
                             ctx.__apply_transition::<#program_ty>(transition);
-                            ::arena0::CallStatus::Accepted
+                            (::arena0::CallStatus::Accepted, None)
                         }
                         Err(::arena0::ProgramFault(error)) => {
                             panic!("timer handler failed: {error:#}");
@@ -316,7 +320,7 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                     ) {
                         Ok(transition) => {
                             ctx.__apply_transition::<#program_ty>(transition);
-                            ::arena0::CallStatus::Accepted
+                            (::arena0::CallStatus::Accepted, None)
                         }
                         Err(::arena0::ProgramFault(error)) => {
                             panic!("signed handler failed: {error:#}");
@@ -327,7 +331,7 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                     match <#program_ty as ::arena0::Program>::on_react(&mut ctx) {
                         Ok(transition) => {
                             ctx.__apply_transition::<#program_ty>(transition);
-                            ::arena0::CallStatus::Accepted
+                            (::arena0::CallStatus::Accepted, None)
                         }
                         Err(::arena0::ProgramFault(error)) => {
                             panic!("react handler failed: {error:#}");
@@ -335,10 +339,10 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                     }
                 }
             };
-            if store_state && status == ::arena0::CallStatus::Accepted {
+            if status == ::arena0::CallStatus::Accepted {
                 __arena0_store_state(ctx);
             }
-            __arena0_write_result(&::arena0::DispatchOutput { status })
+            __arena0_write_result(&::arena0::DispatchOutput { status, reason })
         }
 
         #[unsafe(no_mangle)]

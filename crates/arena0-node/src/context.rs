@@ -35,6 +35,10 @@ pub enum ExecError {
     /// durable callout continuation.
     #[error("callout is no longer pending")]
     CalloutNotPending,
+    /// The guest rejected an agent answer without consuming the callout
+    /// continuation. The contained message is safe to expose to the caller.
+    #[error("callout answer rejected: {0}")]
+    InputRejected(String),
     /// A shared proposal is pending, so an input event was not consumed.
     #[error("execution is waiting for shared agreement; input was not consumed")]
     AgreementPending,

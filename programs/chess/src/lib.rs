@@ -466,19 +466,16 @@ pub mod chess {
     fn on_input(
         ctx: &mut Context<Shared, Local>,
         input: Input,
-    ) -> Result<ProgramTransition<Chess>, InputFault> {
+    ) -> arena0::anyhow::Result<ProgramTransition<Chess>> {
         let Input::MakeMove(text) = input;
         let move_str = text.trim();
         let from = ctx.me();
         if writer(ctx.shared()) != Some(from) {
-            return Err(InputFault::Retryable(anyhow!(
-                "this participant does not own the next move"
-            )));
+            return Err(anyhow!("this participant does not own the next move"));
         }
-        // A bad move is retryable. The originating event applies the move before
+        // A bad move is rejected. The originating event applies the move before
         // its broadcast; receivers apply the same helper at the message boundary.
-        let finished =
-            apply_move(ctx.shared_mut(), move_str).map_err(|e| InputFault::Retryable(e.into()))?;
+        let finished = apply_move(ctx.shared_mut(), move_str).map_err(|e| anyhow!(e))?;
         ctx.effects()
             .broadcast(&Message::Move(move_str.to_string()));
         Ok(if finished {
@@ -872,7 +869,7 @@ mod tests {
         fn invalid_move_rejected(h: ()) {
             h.session_started(peer_a());
             let fx = h.input(Input::MakeMove("z9z9".into()));
-            assert!(fx.has_input_fault());
+            assert!(fx.has_input_rejection());
             assert!(!fx.has_broadcast());
         }
 
@@ -893,13 +890,13 @@ mod tests {
         }
 
         #[arena0::test(Chess, ())]
-        fn invalid_move_is_retryable(h: ()) {
+        fn invalid_move_is_rejected(h: ()) {
             h.session_started(peer_a());
             play_move(&mut h, "e2e4");
             h.message(peer_a(), Message::Move("e7e5".to_string()));
 
             let fx = h.resolve_callout::<callouts::MakeMove>("z9z9".to_string());
-            assert!(matches!(fx.fault, FaultStatus::Retryable(_)));
+            assert!(matches!(fx.fault, FaultStatus::Rejected(_)));
             assert!(!fx.has_broadcast());
         }
 
@@ -999,7 +996,7 @@ mod tests {
             );
 
             let fx = h.input(Input::MakeMove("a2a3".into()));
-            assert!(fx.has_input_fault());
+            assert!(fx.has_input_rejection());
             assert!(!fx.has_broadcast());
         }
 
@@ -1007,7 +1004,7 @@ mod tests {
         fn move_too_short_rejected(h: ()) {
             h.session_started(peer_a());
             let fx = h.input(Input::MakeMove("e2".into()));
-            assert!(fx.has_input_fault());
+            assert!(fx.has_input_rejection());
             assert!(!fx.has_broadcast());
         }
 
@@ -1015,7 +1012,7 @@ mod tests {
         fn illegal_move_rejected(h: ()) {
             h.session_started(peer_a());
             let fx = h.input(Input::MakeMove("e1e3".into()));
-            assert!(fx.has_input_fault());
+            assert!(fx.has_input_rejection());
             assert!(!fx.has_broadcast());
         }
 

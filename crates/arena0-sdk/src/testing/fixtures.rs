@@ -14,8 +14,8 @@ use arena0_protocol::{
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::{
-    ApplyDecision, Arena0Callout, CalloutSpec, Context, InputFault, MessageApply, Program,
-    ProgramFault, ProgramTransition, ProgramView,
+    ApplyDecision, Arena0Callout, CalloutSpec, Context, MessageApply, Program, ProgramFault,
+    ProgramTransition, ProgramView,
 };
 
 use super::diagnostics::event_name;
@@ -77,9 +77,7 @@ fn fault_effects(fault: &FaultStatus) -> Vec<Effect> {
         FaultStatus::Abort(reason) => vec![Effect::Fail {
             reason: reason.clone(),
         }],
-        FaultStatus::Retryable(reason) => vec![Effect::RetryInput {
-            reason: reason.clone(),
-        }],
+        FaultStatus::Rejected(_) => Vec::new(),
     }
 }
 
@@ -392,6 +390,17 @@ impl<P: Program> TestHarness<P> {
         if failed {
             restore_shared(&mut shared, &pre_snapshot);
             restore_local(&mut local, &local_snapshot);
+            if matches!(&fault, FaultStatus::Rejected(_)) {
+                self.shared = shared;
+                self.local = local;
+                return HandlerResult {
+                    effects: Vec::new(),
+                    logs: Vec::new(),
+                    fault,
+                    records: Vec::new(),
+                    rejected: true,
+                };
+            }
             effects = fault_effects(&fault);
         }
         let post_state = shared_hash(&shared);
@@ -435,12 +444,9 @@ impl<P: Program> TestHarness<P> {
     fn run_input(
         &mut self,
         event: Event,
-        f: impl FnOnce(&mut Context<P::Shared, P::Local>) -> Result<ProgramTransition<P>, InputFault>,
+        f: impl FnOnce(&mut Context<P::Shared, P::Local>) -> anyhow::Result<ProgramTransition<P>>,
     ) -> HandlerResult {
-        self.run(event, f, |e| match e {
-            InputFault::Unrecoverable(e) => FaultStatus::Abort(format!("{e:#}")),
-            InputFault::Retryable(e) => FaultStatus::Retryable(format!("{e:#}")),
-        })
+        self.run(event, f, |e| FaultStatus::Rejected(format!("{e:#}")))
     }
     /// Run a message apply transactionally, mirroring the sandbox layer model:
     /// `Accept` commits both state values, while `Reject` restores both values
@@ -652,7 +658,16 @@ impl<P: Program> TestHarness<P> {
                 callout_index,
                 data,
             } => {
-                let input = P::Callout::from_raw(callout_index, data.clone());
+                let input = P::Callout::from_raw(callout_index, data.clone()).map_err(|error| {
+                    DivergenceDiagnostic::new_at(
+                        self.event_position,
+                        DivergenceKind::EventMismatch,
+                        "event.input",
+                        "valid callout input",
+                        error.to_string(),
+                    )
+                    .with_event(event_name(event))
+                })?;
                 let result = self.run_input(
                     Event::InputReceived {
                         callout_index,
@@ -955,7 +970,9 @@ mod tests {
             Vec::new()
         }
 
-        fn from_raw(_callout_index: u32, _data: Vec<u8>) -> Self::Response {}
+        fn from_raw(_callout_index: u32, _data: Vec<u8>) -> anyhow::Result<Self::Response> {
+            Ok(())
+        }
 
         fn to_event_data(_response: &Self::Response) -> (u32, Vec<u8>) {
             (0, Vec::new())
@@ -1004,11 +1021,11 @@ mod tests {
         fn on_input(
             ctx: &mut Context<Self::Shared, Self::Local>,
             _input: Self::Input,
-        ) -> Result<ProgramTransition<Self>, InputFault> {
+        ) -> anyhow::Result<ProgramTransition<Self>> {
             ctx.local_mut().value = 9;
-            ctx.log("provisional retry log");
+            ctx.log("provisional rejection log");
             ctx.effects().broadcast(&());
-            Err(InputFault::Retryable(anyhow!("try again")))
+            Err(anyhow!("try again"))
         }
     }
 
@@ -1063,7 +1080,7 @@ mod tests {
     }
 
     #[test]
-    fn retryable_input_rolls_back_shared_and_filters_effects() {
+    fn rejected_input_rolls_back_shared_without_a_trace_or_effect() {
         let mut h = TestHarness::<FaultyProgram>::new(());
         h.session_started(peer_b());
         h.pending.set_active(Some(pending(10, 0)));
@@ -1072,17 +1089,10 @@ mod tests {
 
         assert_eq!(h.shared().value, 0);
         assert_eq!(h.local().value, 0);
-        assert!(result.has_input_fault());
+        assert!(result.has_input_rejection());
         assert!(result.logs.is_empty());
-        assert!(matches!(
-            result.effects.as_slice(),
-            [Effect::RetryInput { .. }]
-        ));
-        assert!(result.records.len() == 1);
-        assert!(matches!(
-            result.records.first().map(|record| &record.event),
-            Some(Event::InputReceived { .. })
-        ));
+        assert!(result.effects.is_empty());
+        assert!(result.records.is_empty());
         assert_eq!(
             h.active_pending().map(|pending| pending.id),
             Some(PendingId::new(10))

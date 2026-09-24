@@ -140,6 +140,9 @@ pub enum ApiErrorCode {
     /// A callout answer raced with another answer and the pending callout is
     /// no longer available.
     CalloutNotPending,
+    /// The program rejected the submitted callout answer; execution remains
+    /// live and the same callout can be answered again.
+    InputRejected,
     /// A program handle resolved to more than one program.
     Ambiguous,
     /// A JSON value failed validation against the program's public schema.
@@ -318,7 +321,6 @@ pub enum EffectKind {
     SetTimer,
     Sign,
     Fail,
-    RetryInput,
 }
 
 /// A bounded summary of one durable Host-local event record.

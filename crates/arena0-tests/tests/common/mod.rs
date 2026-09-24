@@ -24,6 +24,11 @@ pub fn rps_wasm() -> Vec<u8> {
     arena0_tests::wasm::program_wasm("rock_paper_scissors")
 }
 
+/// The required chess guest artifact.
+pub fn chess_wasm() -> Vec<u8> {
+    arena0_tests::wasm::program_wasm("chess")
+}
+
 /// The required cumulative-sum guest artifact.
 pub fn cumulative_sum_wasm() -> Vec<u8> {
     arena0_tests::wasm::program_wasm("cumulative_sum")

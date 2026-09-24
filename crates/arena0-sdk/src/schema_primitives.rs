@@ -193,11 +193,11 @@ mod tests {
     fn callout_answers_cross_as_json() {
         let value = String::from("answer");
         let bytes = serde_json::to_vec(&value).expect("string JSON encoding");
-        let decoded: String = crate::__parse_input_data(&bytes);
+        let decoded: String = crate::__parse_input_data(&bytes).unwrap();
         assert_eq!(decoded, value);
         assert_eq!(crate::__serialize_input_data(&value), bytes);
 
-        let input = CalloutFixture::from_raw(0, bytes.clone());
+        let input = CalloutFixture::from_raw(0, bytes.clone()).unwrap();
         let CalloutFixtureInput::Choose(answer) = input;
         assert_eq!(answer, value);
 

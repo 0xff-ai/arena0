@@ -418,7 +418,7 @@ impl Database {
         validate_effect_payloads(&effects)?;
         let post_state = StateHash::of_shared(&shared);
         validate_dispatch_sources(
-            self, &state, &event, post_state, &effects, inbox_id, timer_id, pending_id,
+            self, &state, &event, post_state, inbox_id, timer_id, pending_id,
         )?;
         let mut next = state.clone();
         let (establishing_frame, closes_pending) = next.apply_dispatch(
@@ -1615,18 +1615,9 @@ impl Database {
             ));
         }
         if row.status == OutboxStatus::Acknowledged {
-            // The exact request may already have been acknowledged by the
-            // delivery worker. The answer still consumes every retry marker
-            // emitted while that same continuation remained pending.
-            self.cancel_retry_effects(execution_id)?;
             return Ok(());
         }
         self.acknowledge_effect_rows(execution_id, &[row.outbox_id])?;
-        // RetryInput is deliberately not a second continuation. It is a
-        // durable request to redeliver the one existing continuation, so the
-        // successful answer retires all of its pending/leased retry rows in
-        // this same transaction.
-        self.cancel_retry_effects(execution_id)?;
         Ok(())
     }
 }
@@ -1700,17 +1691,13 @@ fn validate_dispatch_sources(
     state: &ExecutionState,
     event: &Event<Vec<u8>>,
     post_state: StateHash,
-    effects: &[Effect],
     inbox_id: Option<InboxId>,
     timer_id: Option<TimerId>,
     pending_id: Option<PendingId>,
 ) -> Result<(), StoreError> {
     let inbox_applicable = matches!(event, Event::MessageReceived { .. });
     let timer_applicable = matches!(event, Event::TimerFired { .. });
-    let pending_applicable = matches!(event, Event::InputReceived { .. } | Event::Signed { .. })
-        || effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::RetryInput { .. }));
+    let pending_applicable = matches!(event, Event::InputReceived { .. } | Event::Signed { .. });
     if let Some(inbox_id) = inbox_id
         && !inbox_applicable
     {

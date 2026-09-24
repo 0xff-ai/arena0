@@ -37,13 +37,27 @@ pub(super) struct DispatchSource {
 /// A callout can become unavailable for an expected protocol reason (for
 /// example, a proposal froze the execution or another answer consumed the
 /// continuation), in which case the command reports the error and the actor
-/// remains live. Guest traps, invalid durable state, and store failures are
-/// fatal execution errors; the actor must return those to `run` so its normal
-/// failure boundary can authenticate and persist the stop.
+/// remains live. An input-handler trap is also an expected input rejection;
+/// traps from other guest events, invalid durable state, and store failures
+/// remain fatal execution errors and return to `run` so its normal failure
+/// boundary can authenticate and persist the stop.
 #[derive(Debug)]
 pub(super) enum SubmitInputError {
     Expected(ExecError),
     Fatal(ExecError),
+}
+
+/// Result of attempting to dispatch one event.
+///
+/// `Frozen` means that the durable execution boundary did not allow the
+/// event to run. `Rejected` is a guest-level rejection: its candidate state
+/// and observations are discarded, while the actor and the durable pending
+/// continuation remain live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum DispatchOutcome {
+    Committed,
+    Frozen,
+    Rejected { reason: Option<String> },
 }
 
 impl From<ExecError> for SubmitInputError {
@@ -83,14 +97,20 @@ impl ExecutionActor {
                 },
             )
             .await?;
-        if accepted == Some(true) {
-            self.progress().await?;
-        } else if accepted.is_none() {
-            // A deferred broadcast may have left a successor proposal in
-            // flight while this continuation is still pending. The answer
-            // was not consumed; surface that boundary to the caller so it
-            // can retry with the same pending id.
-            return Err(SubmitInputError::Expected(ExecError::AgreementPending));
+        match accepted {
+            DispatchOutcome::Committed => self.progress().await?,
+            DispatchOutcome::Frozen => {
+                // A deferred broadcast may have left a successor proposal in
+                // flight while this continuation is still pending. The
+                // answer was not consumed; surface that boundary to the
+                // caller so it can retry with the same pending id.
+                return Err(SubmitInputError::Expected(ExecError::AgreementPending));
+            }
+            DispatchOutcome::Rejected { reason } => {
+                return Err(SubmitInputError::Expected(ExecError::InputRejected(
+                    reason.unwrap_or_else(|| "input handler rejected the answer".into()),
+                )));
+            }
         }
         Ok(())
     }
@@ -169,7 +189,7 @@ impl ExecutionActor {
         // sign row after the continuation is durably consumed, then the outer
         // actor progress cycle drives any newly exposed proof or effect work.
         // Calling `progress` here would recurse through Sign delivery.
-        Ok(accepted == Some(true))
+        Ok(matches!(accepted, DispatchOutcome::Committed))
     }
 
     pub(super) async fn query(
@@ -222,7 +242,7 @@ impl ExecutionActor {
                 DispatchSource::default(),
             )
             .await?;
-        if accepted != Some(true) {
+        if !matches!(accepted, DispatchOutcome::Committed) {
             return Err(ExecError::InvalidState(
                 "session start was rejected by the guest handler".into(),
             ));
@@ -346,12 +366,12 @@ impl ExecutionActor {
             }
             Err(error) => return Err(error),
         };
-        if accepted == Some(false)
+        if matches!(accepted, DispatchOutcome::Rejected { .. })
             && let Some(inbox_id) = inbox_id
         {
             self.reject_inbound(inbox_id).await?;
         }
-        Ok(accepted == Some(true))
+        Ok(matches!(accepted, DispatchOutcome::Committed))
     }
 
     pub(super) fn writer_is(
@@ -376,37 +396,34 @@ impl ExecutionActor {
         Ok(writer.and_then(|participant| ensemble.peer_at(participant)))
     }
 
-    /// Dispatch one flat event and persist the complete result. `None` means
-    /// the actor is frozen behind a proposal, pending continuation, or
-    /// terminal boundary; a continuation source mismatch is also reported as
-    /// `None`. `Some(false)` is a guest rejection and `Some(true)`
-    /// is a committed event. No state, effect, timer, inbox, or pending fact
-    /// is committed for either non-accepted result. A compare-and-set mismatch
-    /// reloads the resident and retries with the recorded random draws from
-    /// the first invocation.
+    /// Dispatch one flat event and persist the complete result. A frozen
+    /// boundary leaves the event unconsumed, while a guest rejection discards
+    /// the candidate and preserves the durable continuation. A compare-and-
+    /// set mismatch reloads the resident and retries with the recorded random
+    /// draws from the first invocation.
     pub(super) async fn dispatch_event(
         &mut self,
         event: Event<Vec<u8>>,
         source: DispatchSource,
-    ) -> Result<Option<bool>, ExecError> {
+    ) -> Result<DispatchOutcome, ExecError> {
         let mut replay = None;
         for _ in 0..MAX_CAS_RETRIES {
             let state = self.load_state().await?;
             if state.status().is_terminal() {
-                return Ok(None);
+                return Ok(DispatchOutcome::Frozen);
             }
             if state.pending_shared().is_some() {
                 self.discard_candidate()?;
-                return Ok(None);
+                return Ok(DispatchOutcome::Frozen);
             }
             if matches!(&event, Event::InputReceived { .. } | Event::Signed { .. }) {
                 let Some(pending) = state.status().pending() else {
                     self.discard_candidate()?;
-                    return Ok(None);
+                    return Ok(DispatchOutcome::Frozen);
                 };
                 if source.pending_id != Some(pending.id) {
                     self.discard_candidate()?;
-                    return Ok(None);
+                    return Ok(DispatchOutcome::Frozen);
                 }
             }
             if !matches!(
@@ -414,7 +431,7 @@ impl ExecutionActor {
                 ExecutionStatus::Active | ExecutionStatus::Waiting { .. }
             ) {
                 self.discard_candidate()?;
-                return Ok(None);
+                return Ok(DispatchOutcome::Frozen);
             }
             self.reconcile_resident(&state)?;
 
@@ -436,13 +453,20 @@ impl ExecutionActor {
                     // the durable image also covers a future sandbox error
                     // path that cannot prove its own rollback.
                     self.instance = None;
-                    let _ = self.restore_resident(&state);
+                    self.restore_resident(&state)?;
+                    if matches!(&event, Event::InputReceived { .. }) {
+                        return Ok(DispatchOutcome::Rejected {
+                            reason: Some(format!("input handler trapped: {error}")),
+                        });
+                    }
                     return Err(error.into());
                 }
             };
             if result.status == CallStatus::Rejected {
                 self.discard_candidate()?;
-                return Ok(Some(false));
+                return Ok(DispatchOutcome::Rejected {
+                    reason: result.reason,
+                });
             }
 
             let candidate_hash = StateHash::of_shared(&result.shared);
@@ -531,19 +555,6 @@ impl ExecutionActor {
                     ));
                 }
             }
-            if effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::RetryInput { .. }))
-                && !state.status().pending().is_some_and(|pending| {
-                    matches!(pending.operation, PendingOperation::Callout { .. })
-                })
-            {
-                self.discard_candidate()?;
-                return Err(ExecError::InvalidState(
-                    "retry input effect requires a pending callout continuation".into(),
-                ));
-            }
-
             let terminal_outcome = match self.terminal_outcome(&result.shared, &effects) {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -603,14 +614,14 @@ impl ExecutionActor {
                         }
                     }
                     self.emit_trace_appended(agreed_step).await;
-                    return Ok(Some(true));
+                    return Ok(DispatchOutcome::Committed);
                 }
                 ApplyOutcome::AlreadyApplied
                 | ApplyOutcome::InboxAlreadyApplied { .. }
                 | ApplyOutcome::InboxAlreadyConsumed { .. } => {
                     self.discard_candidate()?;
                     self.reload_resident().await?;
-                    return Ok(Some(true));
+                    return Ok(DispatchOutcome::Committed);
                 }
                 ApplyOutcome::VersionMismatch { .. } => {
                     replay = Some(match RandomReplay::new(random_draws) {
@@ -726,7 +737,7 @@ impl ExecutionActor {
                     },
                 )
                 .await?;
-            if accepted.is_none() {
+            if matches!(accepted, DispatchOutcome::Frozen) {
                 // A proposal or pending continuation owns the guest; leave
                 // the timer durable for the next progress pass.
                 break;

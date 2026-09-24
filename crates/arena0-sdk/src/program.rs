@@ -6,8 +6,8 @@ use borsh::BorshDeserialize;
 use core::convert::Infallible;
 
 use crate::{
-    Arena0Callout, Arena0Phase, Arena0Query, Context, InputFault, LocalState, PhaseDecl,
-    PhasedSharedState, PrimitiveRouteSchema, ProgramFault, ProtocolFault, SharedState, Transition,
+    Arena0Callout, Arena0Phase, Arena0Query, Context, LocalState, PhaseDecl, PhasedSharedState,
+    PrimitiveRouteSchema, ProgramFault, ProtocolFault, SharedState, Transition,
 };
 
 pub type ProgramTransition<P> = Transition<<P as Program>::Phase>;
@@ -46,9 +46,9 @@ pub type MessageApply<P> = Result<ApplyDecision<<P as Program>::Phase>, Protocol
 /// agreement boundary; a fault or deterministic rejection restores both state
 /// values and discards provisional effects.
 ///
-/// Module-shell programs use synchronous handlers. Callout and signing effects
-/// are emitted explicitly through their builders; answers are delivered through
-/// the `on_input` dispatch path.
+/// Module-shell programs use synchronous handlers. Callout effects are emitted
+/// explicitly through their builders; answers are delivered through the
+/// `on_input` dispatch path.
 ///
 /// # Associated types
 ///
@@ -131,12 +131,12 @@ pub trait Program: Sized {
     ) -> MessageApply<Self> {
         Ok(ApplyDecision::Accept(Transition::Stay))
     }
-    /// Handler for a callout answer. It may update both state values and emit
-    /// effects; retryable faults preserve the pending input for another try.
+    /// Handler for a callout answer. An error rejects the answer and restores
+    /// both state memories without ending the session.
     fn on_input(
         _ctx: &mut Context<Self::Shared, Self::Local>,
         _input: Self::Input,
-    ) -> Result<ProgramTransition<Self>, InputFault> {
+    ) -> anyhow::Result<ProgramTransition<Self>> {
         Ok(Transition::Stay)
     }
     #[doc(hidden)]

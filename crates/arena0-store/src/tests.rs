@@ -2457,175 +2457,6 @@ async fn portable_events_stage_agreement_without_shared_state_delta() {
 }
 
 #[tokio::test]
-async fn unrelated_event_can_retry_an_existing_callout() {
-    let fixture = activation_fixture();
-    let directory = tempfile::tempdir().expect("tempdir");
-    let path = directory.path().join("store.sqlite");
-    let execution_id = ExecId([0xf2; 32]);
-    let store = create_execution(&path, &fixture, execution_id).await;
-    let mut writer = store
-        .handle()
-        .claim_execution(execution_id)
-        .expect("execution writer");
-    let callout = Effect::Callout {
-        callout_index: 0,
-        context: vec![0x31],
-        expected_type: None,
-    };
-    let state = store
-        .handle()
-        .load_execution(execution_id)
-        .await
-        .expect("load active")
-        .expect("active state");
-    writer
-        .commit_dispatch(
-            state.version(),
-            session_started_event(&fixture),
-            SharedStateBytes::try_new(vec![0]).expect("shared state"),
-            LocalStateBytes::try_new(Vec::new()).expect("local state"),
-            vec![callout],
-            None,
-            None,
-            None,
-            None,
-            7,
-        )
-        .await
-        .expect("stage callout");
-    let after_start = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
-    let pending = after_start.status().pending().expect("callout pending");
-    let pending_id = pending.id;
-    assert_eq!(pending_id, arena0_protocol::pending_id(execution_id, 0, 0));
-
-    writer
-        .commit_dispatch(
-            after_start.version(),
-            Event::React,
-            SharedStateBytes::try_new(vec![0]).expect("shared state"),
-            LocalStateBytes::try_new(Vec::new()).expect("local state"),
-            vec![Effect::RetryInput {
-                reason: "transient input fault".into(),
-            }],
-            None,
-            None,
-            None,
-            None,
-            10,
-        )
-        .await
-        .expect("retry from unrelated event");
-    let retried = store
-        .handle()
-        .load_execution(execution_id)
-        .await
-        .expect("load retried state")
-        .expect("retried state");
-    assert_eq!(retried.event_position(), 2);
-    assert_eq!(
-        retried.status().pending().expect("retained callout").id,
-        pending_id
-    );
-    let requests = store
-        .handle()
-        .list_pending_requests(execution_id)
-        .await
-        .expect("list retained callout");
-    assert!(matches!(
-        &requests[..],
-        [PendingRequest::Callout { pending_id: found, .. }] if *found == pending_id
-    ));
-
-    // The originating request must be acknowledged before its later retry
-    // marker can reach the causal head of the local lane. Leave that retry
-    // leased, then consume the continuation; the answer transaction retires
-    // both the exact request and every RetryInput marker for it.
-    let originating = loop {
-        let candidate = writer
-            .lease_next_outbox(11)
-            .await
-            .expect("lease originating callout")
-            .expect("originating callout");
-        if candidate.item.payload_kind == OutboxPayloadKind::Frame {
-            writer
-                .acknowledge_outbox(candidate.item.outbox_id, candidate.lease_id)
-                .await
-                .expect("ack preceding frame");
-            continue;
-        }
-        break candidate;
-    };
-    assert!(matches!(
-        borsh::from_slice::<Effect>(&originating.item.payload).expect("originating payload"),
-        Effect::Callout { .. }
-    ));
-    assert_eq!(
-        writer
-            .acknowledge_outbox(originating.item.outbox_id, originating.lease_id)
-            .await
-            .expect("ack originating callout"),
-        OutboxDeliveryOutcome::Acknowledged
-    );
-    let retry = writer
-        .lease_next_outbox(11)
-        .await
-        .expect("lease retry marker")
-        .expect("retry marker");
-    assert!(matches!(
-        borsh::from_slice::<Effect>(&retry.item.payload).expect("retry payload"),
-        Effect::RetryInput { .. }
-    ));
-    let answered = writer
-        .commit_dispatch(
-            retried.version(),
-            Event::InputReceived {
-                callout_index: 0,
-                data: vec![0x32],
-            },
-            SharedStateBytes::try_new(vec![0]).expect("answer shared state"),
-            LocalStateBytes::try_new(Vec::new()).expect("answer local state"),
-            Vec::new(),
-            None,
-            None,
-            None,
-            Some(pending_id),
-            12,
-        )
-        .await
-        .expect("consume callout answer");
-    assert!(matches!(
-        answered,
-        ApplyOutcome::Committed {
-            proposal_staged: false,
-            ..
-        }
-    ));
-    let answered_state = store
-        .handle()
-        .load_execution(execution_id)
-        .await
-        .expect("load answered state")
-        .expect("answered state");
-    assert!(answered_state.status().pending().is_none());
-    assert_eq!(
-        writer
-            .acknowledge_outbox(retry.item.outbox_id, retry.lease_id)
-            .await
-            .expect("late retry acknowledgement"),
-        OutboxDeliveryOutcome::AlreadyCancelled
-    );
-    assert!(
-        writer
-            .lease_next_outbox(12)
-            .await
-            .expect("no continuation effects remain")
-            .is_none()
-    );
-    drop(writer);
-    store.shutdown().await.expect("shutdown");
-}
-
-#[tokio::test]
 async fn terminal_agreement_retires_stale_continuation_effects() {
     let fixture = activation_fixture();
     let directory = tempfile::tempdir().expect("tempdir");
@@ -2664,8 +2495,8 @@ async fn terminal_agreement_retires_stale_continuation_effects() {
         .expect("stage callout");
     let waiting = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
 
-    // Leave the originating request leased while unrelated execution creates
-    // a retry marker. The terminal agreement below must retire both rows.
+    // Leave the originating request leased while the terminal agreement is
+    // staged. Terminal completion must retire the continuation row.
     let leased_callout = loop {
         let candidate = writer
             .lease_next_outbox(10)
@@ -2685,35 +2516,13 @@ async fn terminal_agreement_retires_stale_continuation_effects() {
         borsh::from_slice::<Effect>(&leased_callout.item.payload).expect("callout payload"),
         Effect::Callout { .. }
     ));
-    writer
-        .commit_dispatch(
-            waiting.version(),
-            Event::React,
-            SharedStateBytes::try_new(vec![0]).expect("retry shared state"),
-            LocalStateBytes::try_new(Vec::new()).expect("retry local state"),
-            vec![Effect::RetryInput {
-                reason: "temporary delivery fault".into(),
-            }],
-            None,
-            None,
-            None,
-            None,
-            11,
-        )
-        .await
-        .expect("persist retry marker");
-    let after_retry = store
-        .handle()
-        .load_execution(execution_id)
-        .await
-        .expect("load retry state")
-        .expect("retry state");
+    let after_waiting = waiting;
 
     let data = vec![0x51, 0x52];
-    let position = after_retry.agreed_step();
-    let pre_state = after_retry.agreed_state();
+    let position = after_waiting.agreed_step();
+    let pre_state = after_waiting.agreed_state();
     let message_id = MessageId::derive(
-        after_retry.binding().session_id(),
+        after_waiting.binding().session_id(),
         fixture.producer,
         position,
         pre_state,
@@ -2723,7 +2532,7 @@ async fn terminal_agreement_retires_stale_continuation_effects() {
     let outcome = vec![0x61, 0x62];
     writer
         .commit_dispatch(
-            after_retry.version(),
+            after_waiting.version(),
             Event::MessageReceived {
                 message_id,
                 from: fixture.producer,
@@ -2756,15 +2565,11 @@ async fn terminal_agreement_retires_stale_continuation_effects() {
     drop(writer);
     store.shutdown().await.expect("shutdown");
     let rows = local_continuation_rows(&path, execution_id);
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 1);
     assert!(rows.iter().all(|(status, _)| status == "cancelled"));
     assert!(
         rows.iter()
             .any(|(_, effect)| matches!(effect, Effect::Callout { .. }))
-    );
-    assert!(
-        rows.iter()
-            .any(|(_, effect)| matches!(effect, Effect::RetryInput { .. }))
     );
 }
 
@@ -2824,36 +2629,14 @@ async fn authenticated_stop_retires_stale_continuation_effects() {
         borsh::from_slice::<Effect>(&leased_callout.item.payload).expect("callout payload"),
         Effect::Callout { .. }
     ));
-    writer
-        .commit_dispatch(
-            waiting.version(),
-            Event::React,
-            SharedStateBytes::try_new(vec![0]).expect("retry shared state"),
-            LocalStateBytes::try_new(Vec::new()).expect("retry local state"),
-            vec![Effect::RetryInput {
-                reason: "temporary delivery fault".into(),
-            }],
-            None,
-            None,
-            None,
-            None,
-            11,
-        )
-        .await
-        .expect("persist retry marker");
-    let after_retry = store
-        .handle()
-        .load_execution(execution_id)
-        .await
-        .expect("load retry state")
-        .expect("retry state");
+    let after_waiting = waiting;
     let unsigned = AbortOccurrence::unsigned(
         fixture.activation.session_hash(),
         fixture.producer,
         AbortKind::Abort,
         94,
         "stop stale continuation",
-        after_retry.step_cursor(),
+        after_waiting.step_cursor(),
     )
     .expect("abort occurrence");
     let keys = NodeKeys::from_secret(SecretKey::from_bytes([1; 32]));
@@ -2862,7 +2645,7 @@ async fn authenticated_stop_retires_stale_continuation_effects() {
         .with_signature(keys.sign(&unsigned.signing_bytes().expect("abort bytes")))
         .expect("signed abort");
     writer
-        .stop_execution(after_retry.version(), occurrence, None, 12)
+        .stop_execution(after_waiting.version(), occurrence, None, 12)
         .await
         .expect("stop execution");
     let stopped = store
@@ -2876,15 +2659,11 @@ async fn authenticated_stop_retires_stale_continuation_effects() {
     drop(writer);
     store.shutdown().await.expect("shutdown");
     let rows = local_continuation_rows(&path, execution_id);
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 1);
     assert!(rows.iter().all(|(status, _)| status == "cancelled"));
     assert!(
         rows.iter()
             .any(|(_, effect)| matches!(effect, Effect::Callout { .. }))
-    );
-    assert!(
-        rows.iter()
-            .any(|(_, effect)| matches!(effect, Effect::RetryInput { .. }))
     );
 }
 
@@ -3044,42 +2823,6 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
             state.version(),
             Event::InputReceived {
                 callout_index: 0,
-                data: vec![0xff],
-            },
-            SharedStateBytes::try_new(vec![0]).expect("shared state"),
-            LocalStateBytes::try_new(vec![1]).expect("local state"),
-            vec![Effect::RetryInput {
-                reason: "try again".into(),
-            }],
-            None,
-            None,
-            None,
-            Some(pending_id),
-            23,
-        )
-        .await
-        .expect("retry callout");
-    assert_eq!(
-        store
-            .handle()
-            .list_pending_requests(execution_id)
-            .await
-            .expect("retained pending request")
-            .len(),
-        1
-    );
-
-    let state = store
-        .handle()
-        .load_execution(execution_id)
-        .await
-        .expect("load retried state")
-        .expect("retried state");
-    writer
-        .commit_dispatch(
-            state.version(),
-            Event::InputReceived {
-                callout_index: 0,
                 data: vec![0xfe],
             },
             SharedStateBytes::try_new(vec![0]).expect("shared state"),
@@ -3119,7 +2862,7 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
         )
         .await
         .expect("stage signing request");
-    let sign_effect_id = arena0_protocol::pending_id(execution_id, 3, 0);
+    let sign_effect_id = arena0_protocol::pending_id(execution_id, 2, 0);
     let requests = store
         .handle()
         .list_pending_requests(execution_id)
@@ -3133,7 +2876,7 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
             ..
         }] if *pending_id == sign_effect_id
             && data.execution_id() == execution_id
-            && data.event_position() == 3
+            && data.event_position() == 2
             && data.effect_index() == 0
             && data.payload() == [5, 6]
     ));
@@ -3175,9 +2918,9 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
         .read_event_summaries(execution_id, Some(0), 8)
         .await
         .expect("event inspection page");
-    assert_eq!(page.total(), 5);
+    assert_eq!(page.total(), 4);
     assert_eq!(page.next(), None);
-    assert_eq!(page.summaries().len(), 5);
+    assert_eq!(page.summaries().len(), 4);
     assert_eq!(page.summaries()[0].event_position, 0);
     assert_eq!(page.summaries()[0].agreed_steps, vec![0]);
     assert_eq!(page.summaries()[0].event, EventKind::SessionStarted);
@@ -3193,28 +2936,19 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
     assert_eq!(page.summaries()[1].agreed_steps, Vec::<u64>::new());
     assert_eq!(page.summaries()[1].event, EventKind::InputReceived);
     assert_eq!(page.summaries()[1].input_payload_bytes, Some(1));
-    assert_eq!(
-        page.summaries()[1].effects[0],
-        EffectSummary {
-            kind: EffectKind::RetryInput,
-            payload_bytes: Some(9),
-        }
-    );
+    assert!(page.summaries()[1].effects.is_empty());
     assert_eq!(page.summaries()[2].event_position, 2);
-    assert_eq!(page.summaries()[2].event, EventKind::InputReceived);
-    assert!(page.summaries()[2].effects.is_empty());
-    assert_eq!(page.summaries()[3].event_position, 3);
-    assert_eq!(page.summaries()[3].event, EventKind::React);
+    assert_eq!(page.summaries()[2].event, EventKind::React);
     assert_eq!(
-        page.summaries()[3].effects[0],
+        page.summaries()[2].effects[0],
         EffectSummary {
             kind: EffectKind::Sign,
             payload_bytes: Some(2),
         }
     );
-    assert_eq!(page.summaries()[4].event_position, 4);
-    assert_eq!(page.summaries()[4].event, EventKind::Signed);
-    assert!(page.summaries()[4].effects.is_empty());
+    assert_eq!(page.summaries()[3].event_position, 3);
+    assert_eq!(page.summaries()[3].event, EventKind::Signed);
+    assert!(page.summaries()[3].effects.is_empty());
     assert!(
         store
             .handle()

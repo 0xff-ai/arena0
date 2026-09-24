@@ -204,17 +204,15 @@ pub(crate) fn expand_arena0_callouts(item: ItemEnum) -> Result<TokenStream2> {
                     #response_ident::#variant_ident(output)
                 }
 
-                fn decode(input: P::Input) -> Result<Self::Output, ::arena0::InputFault> {
+                fn decode(input: P::Input) -> ::arena0::anyhow::Result<Self::Output> {
                     use ::arena0::anyhow::anyhow;
 
                     match input {
                         #response_ident::#variant_ident(value) => Ok(value),
-                        _ => Err(::arena0::InputFault::Unrecoverable(
-                            anyhow!(
-                                "expected input variant {} for callout {}",
-                                stringify!(#variant_ident),
-                                stringify!(#variant_ident),
-                            ),
+                        _ => Err(anyhow!(
+                            "expected input variant {} for callout {}",
+                            stringify!(#variant_ident),
+                            stringify!(#variant_ident),
                         )),
                     }
                 }
@@ -258,8 +256,8 @@ pub(crate) fn expand_arena0_callouts(item: ItemEnum) -> Result<TokenStream2> {
         // from_raw: build response variant
         from_raw_arms.push(quote! {
             #idx_u32 => {
-                let value: #output_ty = ::arena0::__parse_input_data(&data);
-                #response_ident::#variant_ident(value)
+                let value: #output_ty = ::arena0::__parse_input_data(&data)?;
+                Ok(#response_ident::#variant_ident(value))
             }
         });
 
@@ -347,10 +345,15 @@ pub(crate) fn expand_arena0_callouts(item: ItemEnum) -> Result<TokenStream2> {
                 vec![#(#schema_entries),*]
             }
 
-            fn from_raw(callout_index: u32, data: Vec<u8>) -> #response_ident {
+            fn from_raw(
+                callout_index: u32,
+                data: Vec<u8>,
+            ) -> ::arena0::anyhow::Result<#response_ident> {
                 match callout_index {
                     #(#from_raw_arms)*
-                    _ => panic!("unknown callout index: {callout_index}"),
+                    _ => Err(::arena0::anyhow::anyhow!(
+                        "unknown callout index: {callout_index}"
+                    )),
                 }
             }
 

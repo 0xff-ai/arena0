@@ -19,6 +19,8 @@ pub const HOST_MODULE: &str = "arena0";
 pub const MAX_CALL_PAYLOAD_BYTES: usize = crate::profile::MAX_INPUT_BYTES as usize;
 /// Maximum bytes in the committed session context carried into a dispatch.
 pub const MAX_SESSION_CONTEXT_BYTES: usize = 1024 * 1024;
+/// Maximum UTF-8 bytes returned as the reason for a rejected input dispatch.
+pub const MAX_REJECTION_REASON_BYTES: usize = 1024;
 
 /// Bounded, complete JSON bytes at an agent-facing request or projection boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -514,25 +516,61 @@ impl BorshDeserialize for DispatchInput {
 /// The only value returned in the guest result envelope for a mutating
 /// dispatch. Effects remain in the host's per-call effect queue and are never
 /// duplicated in guest-owned state bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchOutput {
     /// Whether the event was accepted or deterministically rejected.
     pub status: CallStatus,
+    /// Bounded program reason for an input rejection. Accepted dispatches and
+    /// deterministic peer-message rejections do not carry a reason.
+    pub reason: Option<String>,
 }
 
 impl BorshSerialize for DispatchOutput {
     fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
         let mut writer = EnvelopeWriter::new(writer);
-        self.status.serialize(&mut writer)
+        if self.status == CallStatus::Accepted && self.reason.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "accepted dispatch cannot carry a rejection reason",
+            ));
+        }
+        self.status.serialize(&mut writer)?;
+        match &self.reason {
+            Some(reason) => {
+                true.serialize(&mut writer)?;
+                write_bounded_vec(
+                    &mut writer,
+                    reason.as_bytes(),
+                    MAX_REJECTION_REASON_BYTES,
+                    "rejection reason",
+                )
+            }
+            None => false.serialize(&mut writer),
+        }
     }
 }
 
 impl BorshDeserialize for DispatchOutput {
     fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
         let mut reader = EnvelopeReader::new(reader);
-        Ok(Self {
-            status: CallStatus::deserialize_reader(&mut reader)?,
-        })
+        let status = CallStatus::deserialize_reader(&mut reader)?;
+        let has_reason = bool::deserialize_reader(&mut reader)?;
+        let reason = has_reason.then(|| {
+            read_bounded_vec(&mut reader, MAX_REJECTION_REASON_BYTES, "rejection reason").and_then(
+                |bytes| {
+                    String::from_utf8(bytes)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+                },
+            )
+        });
+        let reason = reason.transpose()?;
+        if status == CallStatus::Accepted && reason.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "accepted dispatch cannot carry a rejection reason",
+            ));
+        }
+        Ok(Self { status, reason })
     }
 }
 
@@ -866,8 +904,6 @@ pub mod imports {
     pub const END_SESSION: &str = "end_session";
     /// Abort the current session.
     pub const ABORT_SESSION: &str = "abort_session";
-    /// Signal retryable callout input error.
-    pub const RETRY_INPUT: &str = "retry_input";
 }
 
 impl Capability {
@@ -895,7 +931,6 @@ pub fn always_available_imports() -> &'static [&'static str] {
         imports::RANDOM,
         imports::END_SESSION,
         imports::ABORT_SESSION,
-        imports::RETRY_INPUT,
     ]
 }
 
@@ -912,7 +947,6 @@ pub fn all_effect_imports() -> &'static [&'static str] {
         imports::SIGN,
         imports::END_SESSION,
         imports::ABORT_SESSION,
-        imports::RETRY_INPUT,
     ]
 }
 
@@ -1003,6 +1037,50 @@ mod tests {
             CallStatus::Rejected
         );
         assert!(borsh::from_slice::<CallStatus>(&[2]).is_err());
+    }
+
+    #[test]
+    fn dispatch_output_round_trips_bounded_rejection_reason() {
+        for output in [
+            DispatchOutput {
+                status: CallStatus::Accepted,
+                reason: None,
+            },
+            DispatchOutput {
+                status: CallStatus::Rejected,
+                reason: None,
+            },
+            DispatchOutput {
+                status: CallStatus::Rejected,
+                reason: Some("invalid answer".into()),
+            },
+        ] {
+            let encoded = borsh::to_vec(&output).unwrap();
+            assert_eq!(
+                borsh::from_slice::<DispatchOutput>(&encoded).unwrap(),
+                output
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_output_rejects_invalid_reason_combinations_and_bounds() {
+        let accepted_with_reason = DispatchOutput {
+            status: CallStatus::Accepted,
+            reason: Some("unexpected".into()),
+        };
+        assert!(borsh::to_vec(&accepted_with_reason).is_err());
+
+        let oversized = DispatchOutput {
+            status: CallStatus::Rejected,
+            reason: Some("x".repeat(MAX_REJECTION_REASON_BYTES + 1)),
+        };
+        assert!(borsh::to_vec(&oversized).is_err());
+
+        let mut accepted_with_encoded_reason = vec![CallStatus::Accepted.tag(), 1];
+        accepted_with_encoded_reason.extend_from_slice(&1u32.to_le_bytes());
+        accepted_with_encoded_reason.push(b'x');
+        assert!(borsh::from_slice::<DispatchOutput>(&accepted_with_encoded_reason).is_err());
     }
 
     #[test]

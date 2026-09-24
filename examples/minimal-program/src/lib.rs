@@ -164,10 +164,10 @@ pub mod minimal_choice {
     fn on_input(
         ctx: &mut Context<Shared, Local>,
         input: Input,
-    ) -> Result<ProgramTransition<MinimalChoice>, InputFault> {
+    ) -> arena0::anyhow::Result<ProgramTransition<MinimalChoice>> {
         let from = ctx.me();
         if writer(ctx.shared()) != Some(from) {
-            return Err(anyhow!("this participant does not own the next choice").into());
+            return Err(anyhow!("this participant does not own the next choice"));
         }
         let Input::Choose(choice) = input;
         let transition = apply_choice(ctx.shared_mut(), from, choice);

@@ -330,21 +330,6 @@ pub(crate) fn register_always_available(
         )
         .map_err(map_err)?;
 
-    linker
-        .func_wrap(
-            abi::HOST_MODULE,
-            imports::RETRY_INPUT,
-            |mut caller: Caller<'_, HostState>, reason_ptr: u32, reason_len: u32| {
-                caller.begin_import("retry_input")?;
-                caller.reject_read_only("retry_input")?;
-                let reason = caller.read_guest_bytes(reason_ptr, reason_len, "retry_input")?;
-                caller.record_effect(Effect::RetryInput {
-                    reason: String::from_utf8_lossy(&reason).into_owned(),
-                })
-            },
-        )
-        .map_err(map_err)?;
-
     Ok(())
 }
 

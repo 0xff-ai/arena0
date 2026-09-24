@@ -21,10 +21,10 @@ use crate::{CalloutSpec, Program};
 pub enum FaultStatus {
     /// Handler returned Ok.
     None,
-    /// Session abort (ProgramFault::Abort or InputFault::Unrecoverable).
+    /// Session abort from a program fault.
     Abort(String),
-    /// Retryable input error (InputFault::Retryable, on_input only).
-    Retryable(String),
+    /// The input was rejected without consuming its callout continuation.
+    Rejected(String),
 }
 
 /// Why a harness-local pending continuation was closed.
@@ -123,9 +123,9 @@ impl std::error::Error for PendingHarnessError {}
 /// Shared exact-once ledger for pending callout and signing continuations.
 ///
 /// Native and Wasm harnesses differ in how they dispatch a result, but they
-/// must agree on stale ids, kind/index checks, retry preservation, and closed
-/// continuation history. This type owns that policy so both backends use the
-/// same transitions.
+/// must agree on stale ids, kind/index checks, rejected-input preservation,
+/// and closed continuation history. This type owns that policy so both
+/// backends use the same transitions.
 #[derive(Debug, Default)]
 pub struct PendingLedger {
     active: Option<PendingRecord>,
@@ -253,7 +253,7 @@ impl PendingLedger {
             return;
         }
 
-        if matches!(fault, FaultStatus::Retryable(_))
+        if matches!(fault, FaultStatus::Rejected(_))
             && previous_pending
                 .as_ref()
                 .is_some_and(|pending| pending.operation.kind() == PendingKind::Callout)
@@ -299,7 +299,7 @@ pub struct DispatchRecord {
     pub event_position: u64,
     /// Event delivered to the program.
     pub event: Event,
-    /// Effects emitted by this dispatch, including lifecycle and retry effects.
+    /// Effects emitted by this dispatch, including lifecycle effects.
     pub effects: Vec<Effect>,
     /// Shared hash before the dispatch.
     pub pre_state: StateHash,
@@ -493,8 +493,8 @@ impl HandlerResult {
     }
 
     #[must_use]
-    pub fn has_input_fault(&self) -> bool {
-        matches!(&self.fault, FaultStatus::Retryable(_))
+    pub fn has_input_rejection(&self) -> bool {
+        matches!(&self.fault, FaultStatus::Rejected(_))
     }
 
     #[must_use]

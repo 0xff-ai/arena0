@@ -690,7 +690,6 @@ pub enum EffectKind {
     SetTimer,
     Sign,
     Fail,
-    RetryInput,
 }
 
 /// A safe projection of one durable event record for local diagnostics.
@@ -806,10 +805,6 @@ impl EventRecordSummary {
                 },
                 Effect::Fail { reason } => EffectSummary {
                     kind: EffectKind::Fail,
-                    payload_bytes: Some(reason.len()),
-                },
-                Effect::RetryInput { reason } => EffectSummary {
-                    kind: EffectKind::RetryInput,
                     payload_bytes: Some(reason.len()),
                 },
             })

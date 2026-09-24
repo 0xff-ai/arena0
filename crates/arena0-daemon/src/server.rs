@@ -3768,7 +3768,6 @@ fn project_event_record_summary(
                     arena0_store::EffectKind::SetTimer => ApiEffectKind::SetTimer,
                     arena0_store::EffectKind::Sign => ApiEffectKind::Sign,
                     arena0_store::EffectKind::Fail => ApiEffectKind::Fail,
-                    arena0_store::EffectKind::RetryInput => ApiEffectKind::RetryInput,
                 },
                 payload_bytes,
             })

@@ -271,17 +271,16 @@ pub mod contract_net {
     fn on_input(
         ctx: &mut Context<Shared, Local>,
         input: Input,
-    ) -> Result<ProgramTransition<ContractNet>, InputFault> {
+    ) -> arena0::anyhow::Result<ProgramTransition<ContractNet>> {
         let Input::SubmitOffer(offer) = input;
         if ctx.shared().phase() != Phase::CollectingOffers
             || ctx.shared().expected_offer_writer() != Some(ctx.me())
         {
-            return Err(anyhow!("offer is not due from this participant").into());
+            return Err(anyhow!("offer is not due from this participant"));
         }
         offer
             .validate(&ctx.shared().tasks)
-            .map_err(|error| anyhow!(error))
-            .retryable()?;
+            .map_err(|error| anyhow!(error))?;
         let from = ctx.me();
         apply_offer(ctx.shared_mut(), from, offer.clone());
         ctx.effects().broadcast(&Message::Offer(offer));
@@ -671,14 +670,14 @@ mod tests {
             offer(&["rust"], 4, &[(0, 4)]),
         ];
 
-        // The input boundary classifies invalid local answers as retryable and
+        // The input boundary classifies invalid local answers as rejected and
         // does not mark the worker's offer as sent.
         let mut input_harness = TestHarness::<ContractNet>::with_peer_id(worker, params.clone());
         input_harness.session_started(coordinator);
         for offer in invalid.iter().cloned() {
             let before = input_harness.shared_hash();
             let result = input_harness.input(Input::SubmitOffer(offer));
-            assert!(matches!(result.fault, FaultStatus::Retryable(_)));
+            assert!(matches!(result.fault, FaultStatus::Rejected(_)));
             assert!(!result.has_broadcast());
             assert_eq!(input_harness.shared_hash(), before);
             assert!(!input_harness.local().offer_sent);
