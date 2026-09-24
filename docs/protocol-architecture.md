@@ -418,12 +418,43 @@ execution path.
 
 After `SessionStarted`, each Host's `ExecutionActor` owns one resident
 `ProgramInstance`. Every session source supplies the same flat `Event` type to
-`arena0_dispatch`: activation supplies `SessionStarted`, an accepted protocol
-message supplies `MessageReceived`, an agent answer supplies `InputReceived`, a
-timer supplies `TimerFired` with its typed payload, and normal progress supplies
-`React`. The `Context` exposes the participant's shared and local state. Any
-event may mutate either or both and may emit `SessionEnd`, `SessionAbort`,
-`Fail`, `Broadcast`, or `SetTimer`.
+`arena0_dispatch`: activation supplies `SessionStarted`, an agreed protocol
+message supplies `MessageReceived`, an agent answer supplies `InputReceived`,
+and a timer supplies `TimerFired` with its typed payload.
+
+`SessionStarted` and `MessageReceived` are agreed events. Every participant
+applies them at the same position, and they are the only events that change
+shared state or end the session. `InputReceived` and `TimerFired` are local
+events. They may change local state, but a local dispatch that changes shared
+state is rejected.
+
+Effects are validated when the guest emits them and applied only when the
+handler returns. Each effect host call checks the effect against the event
+kind and the effects already queued in the same dispatch, then queues it on
+the Host; nothing leaves the Host or changes durable state during the call.
+An accepted dispatch applies its queued effects: a local event applies them in
+its committed transition, and an agreed event stages them with its proposal
+and applies them when the step is certified. A rejection or trap discards the
+queue with the candidate state.
+
+- `Broadcast` is available to every event. It appends the message to this
+  participant's durable outgoing queue, which is bounded. When the queue is
+  full, the host call returns an error to the program and queues nothing.
+- `SetTimer` is available to every event, but not in the same dispatch as a
+  lifecycle effect.
+- `SessionEnd`, `SessionAbort`, and `Fail` are available only to agreed
+  events, at most one per dispatch. A lifecycle effect from a local event, a
+  second one, or one combined with `SetTimer` traps the dispatch.
+
+A participant authors the next agreed message only from its outgoing queue.
+When no proposal is staged and the `writer` projection over the agreed shared
+state selects this participant, the actor takes the oldest queued message and
+applies it through its own `MessageReceived` dispatch, exactly as every other
+participant will. If the result is accepted, the actor stages the proposal and
+sends the message with its pre-state and post-state hashes. If its own program
+rejects the message, the actor removes it from the queue and records a local
+error; the message never reaches a peer. A local handler that wants to end the
+session queues a message whose agreed handler ends it.
 
 After an accepted dispatch, the program's read-only `callout` function derives
 at most one open callout from the resulting state image. The runtime stores that
@@ -431,12 +462,11 @@ callout with the image in the committed execution record, or in the staged
 shared proposal until the proposal is certified. If the callout index and
 context are unchanged, the existing `PendingId` remains open; a different
 callout receives a new `PendingId`, and no callout withdraws the old one. A
-terminal status has no open callout. An open callout does not lock the actor:
-every event, including `React`, continues to dispatch, and `React` runs once
-per agreed step.
+terminal status has no open callout. Local events do not dispatch while a
+proposal is staged.
 
 Guest signing is a synchronous host call available only during local
-`InputReceived`, `TimerFired`, and `React` handlers. It is unavailable during
+`InputReceived` and `TimerFired` handlers. It is unavailable during
 `SessionStarted` and `MessageReceived` dispatches and during read-only
 projections. The call signs a versioned, execution-bound `GuestSignData`
 preimage containing the domain, version, session, program hash, execution ID,
@@ -447,25 +477,25 @@ signed bytes together with the signature. The supported schemes are
 deterministic, so a crash rerun produces the same signature.
 
 An answer must name the exact open `PendingId`. A mismatch returns
-`CalloutNotPending`. While a staged proposal carries the answer, the answered
-callout remains open and a resubmission returns `AgreementPending`. The Host
+`CalloutNotPending`. While a proposal is staged, an answer returns
+`AgreementPending` and the callout stays open. The Host
 checks the answer against the callout's output schema before dispatch. If the
 guest cannot decode it, rejects it, traps, or hits an input-handler resource
 limit, the actor restores both memories, persists nothing, keeps the same open
 callout, and returns `InputRejected` with the bounded program reason. Bad agent
 input never ends the session.
 
-The actor validates the dispatch result against the event's agreement boundary,
-then passes the accepted event, shared and local state images, and effects to a
-focused store method. Rejected events, guest traps, and bounded execution
+The actor rejects a local dispatch that changed shared state, then passes the
+accepted event, shared and local state images, and effects to a focused store
+method. Rejected events, guest traps, and bounded execution
 failures restore both state memories and persist no effects.
 
 Shared-state steps exchange `arena0_protocol::ExecFrame` values;
 `arena0-transport` converts them to the bounded raw values owned by
-`arena0-wire` for canonical framing and delivery. A `Broadcast` carries the
-message position and the producer's pre/post shared hashes. The producer does
-not process its own broadcast as a second event. A step is accepted only when
-all selected participants sign the same `StepCommitment`.
+`arena0-wire` for canonical framing and delivery. A message frame carries the
+message position and the author's pre/post shared hashes. The author applies
+its own message through the same dispatch as every receiver. A step is accepted
+only when all selected participants sign the same `StepCommitment`.
 
 `TraceEntry` format v2 is the portable public trace. Each entry records its
 step, the agreed `SessionStarted` or `MessageReceived` event, pre/post shared

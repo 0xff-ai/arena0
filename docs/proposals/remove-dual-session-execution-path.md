@@ -380,6 +380,13 @@ the cursor unless that peer's signature is already in the staged proposal.
 
 ### Agreement postconditions
 
+> **Superseded (2026-09-24).** Rules 1 and 4–6 below, and the `React` event,
+> are replaced by the effect model in `docs/protocol-architecture.md` §10:
+> effects are validated when emitted and applied when the handler returns,
+> only agreed events change shared state or end the session, broadcasts enter
+> a bounded outgoing queue, and the author applies its own message through the
+> same `MessageReceived` dispatch as every receiver.
+
 These checks defend the shared-state invariant without restricting which
 context a handler receives or which effect variants it may emit:
 

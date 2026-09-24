@@ -164,8 +164,9 @@ Each Host prepares its activation record before it signs. A Host starts executio
 
 Every agreed public transition binds the session, position, event, prior and
 next shared-state hashes, and the chain link. `SessionStarted` and
-`MessageReceived` are the portable trace events; `InputReceived`, `TimerFired`,
-and `React` are participant-specific events. Local state, effects, fuel, and
+`MessageReceived` are the portable trace events and the only events that change
+shared state or end the session; `InputReceived` and `TimerFired` are
+participant-specific events that change local state. Local state, effects, fuel, and
 entropy observations remain Host-local. The transition commits only after every
 activated participant signs the same `StepCommitment`.
 
@@ -181,18 +182,20 @@ persists results, and performs explicit effects.
 
 Each active execution owns one resident `ProgramInstance` with fixed,
 independent `arena0_shared` and `arena0_local` memories. Every session
-`Event` enters the same `arena0_dispatch`; its `Context` may mutate either or
-both memories and emit `SessionEnd`, `SessionAbort`, `Fail`, `Broadcast`, or
-`SetTimer`. Work memory, mutable globals, fuel, and per-dispatch observations
+`Event` enters the same `arena0_dispatch`. Agreed events may mutate both
+memories; local events may mutate only local memory. Each effect host call
+validates its effect when the guest emits it and queues it; the Host applies the
+queue only when the handler's result is accepted. A broadcast enters a bounded
+outgoing queue, and its author later applies it through its own
+`MessageReceived` dispatch like every other participant. Work memory, mutable globals, fuel, and per-dispatch observations
 reset to the resident baseline. After an accepted dispatch, the read-only
 `callout` function derives at most one open callout from the resulting state
-image; that callout is stored with the image or staged proposal. An open
-callout does not block other events, and `React` runs once per agreed step.
+image; that callout is stored with the image or staged proposal.
 Read-only initialization, writer, query, view, and outcome projections use
 fresh bounded instances and must not change guest state or emit effects.
 
 The synchronous `ctx.sign(...)` host call is available only to local
-`InputReceived`, `TimerFired`, and `React` handlers. It is unavailable to
+`InputReceived` and `TimerFired` handlers. It is unavailable to
 `SessionStarted`, `MessageReceived`, and read-only projections, and returns the
 exact signed bytes with the signature. The sign capability still gates access.
 
