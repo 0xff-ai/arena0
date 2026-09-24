@@ -489,9 +489,9 @@ cannot reproduce at its advertised post-state is a divergence. The participant
 that detects it records a Host-signed `Fail` occurrence at the agreed cursor;
 its peers receive that occurrence as an `Abort` frame. Invalid frames—wrong
 writer, wrong pre-state, stale position, or mismatched message identity—are
-dropped rather than treated as divergence. End and abort use
-`Effect::SessionEnd`/`SessionAbort` in the guest and `ExecFrame::End`/`Abort` on
-the execution wire.
+dropped rather than treated as divergence. The guest ends or aborts a session
+with `Effect::SessionEnd`/`SessionAbort`; a unilateral occurrence travels as
+`ExecFrame::Abort`.
 
 A participant accepts an authenticated peer abort or failure occurrence at its
 agreed cursor even after it has signed a staged proposal, unless that peer's
@@ -509,8 +509,7 @@ The execution actor owns the complete execution state and is the only writer.
 There are no inbox or outbox tables. Under N-of-N agreement, the actor stages
 step `s + 1` only after it has certified step `s`, so the most a peer can lack
 from this participant is the certificate for its last agreed step, its staged
-message and signature, its terminal signature or certificate, or its abort
-occurrence. Each item is already part of execution state.
+message and signature, or its abort occurrence. Each item is already part of execution state.
 
 The actor sends those current frames to each peer independently and tracks
 acknowledgements in memory. A restart reloads execution state and resends the
@@ -543,14 +542,24 @@ the event record, receiver-side last-applied sequence numbers committed with
 the handler result, and attachments pinned until acknowledgement. This note
 does not define that extension's wire or storage format.
 
-### Terminal proof and publication
+### Terminal evidence and publication
 
-`SessionEnd` starts internal terminal proof collection. Every participant signs
-the exact terminal commitment. Once the N-of-N certificate is complete, the
-store assembles and validates the portable evidence from durable activation,
-trace, outcome, and certificate records. One SQLite transaction publishes the
-artifact, its local execution relation, and terminal status. There is no
-separate producer seal or signing round.
+A step that emits `SessionEnd`, `SessionAbort`, or `Fail` always requires
+agreement. Its step commitment binds the trace entry, including the terminal
+effect and, for `SessionEnd`, the exact outcome bytes, together with the final
+shared state. Once that step is certified, every participant has signed
+everything the terminal claims, so the certified final step is the terminal
+evidence. There is no second terminal signing round, terminal commitment, or
+terminal certificate. The only way a participant can lack the terminal is the
+same as for any step: it lacks the final step certificate, which delivery
+sends. Certification of the final step and the terminal status are one
+transition, so an execution is never partly terminated.
+
+After certification the store assembles and validates the portable evidence
+from durable activation, trace, and outcome records. One SQLite transaction
+publishes the artifact, its local execution relation, and terminal status.
+Assembly uses only local durable facts, so it needs no peer and cannot be
+interrupted by one.
 
 The finished observation is emitted when the receipt is published, because that
 publication is a local fact. The actor remains alive while peers acknowledge
@@ -570,24 +579,23 @@ the actor merely because it observed the finished receipt.
 
 Both forms retain their signed terminal evidence; stopped artifacts have no
 outcome bytes. The artifact contains no exporting Host identity, timestamps,
-local execution IDs, or private state. Existing activation, step, and terminal
-signatures authenticate the evidence. A stop report additionally carries its
+local execution IDs, or private state. Existing activation and step signatures
+authenticate the evidence. A stop report additionally carries its
 originating participant's Ed25519-signed occurrence.
 
 `ExecutionStatus::receipt_work()` derives the remaining operation: not terminal,
-collecting signatures, assembling and publishing, published, or frozen
-incomplete. Live actor failures and startup recovery use one node-owned failure
-transition. Complete evidence is published without contacting a peer or running
-the guest; incomplete terminal agreement remains frozen. A crash before the
-assembly transaction retries it; a crash after publication retains the exact
+assembling and publishing, or published. Live actor failures and startup
+recovery use one node-owned failure transition. Terminal evidence is published
+without contacting a peer or running the guest. A crash before the assembly
+transaction retries it; a crash after publication retains the exact
 artifact and resumes final-frame delivery from execution state. The actor retires
 only after the durable delivery fact is present.
 
 ## 11. Receipts and verification
 
-`ReceiptId` is BLAKE3 over the domain `arena0/receipt/v3`, the receipt version
-3, and the exact versioned Borsh artifact bytes. It is independent of which
-Host exports those bytes. The Borsh artifact and body versions are 3. JSON uses
+`ReceiptId` is BLAKE3 over the domain `arena0/receipt/v4`, the receipt version
+4, and the exact versioned Borsh artifact bytes. It is independent of which
+Host exports those bytes. The Borsh artifact and body versions are 4. JSON uses
 the tagged shape
 `{"kind":"receipt"|"stop_report","body":...}`; decoding rejects a kind that
 disagrees with the authenticated terminal evidence. `ProofId` and producer-bound
@@ -607,8 +615,10 @@ proof evidence even when the canonical artifact is identical across Hosts.
 
 Portable/light verification is the only receipt verification boundary. It
 checks the activation binding, ordered v2 trace chain, full participant
-agreements, terminal evidence, and derived v3 receipt identity without loading
-the program. A completed result includes authenticated opaque `outcome_borsh`
+agreements, terminal evidence, and derived v4 receipt identity without loading
+the program. Completion evidence is a final trace entry whose certified
+terminal effect is `SessionEnd` and whose outcome bytes equal the receipt's
+outcome. A completed result includes authenticated opaque `outcome_borsh`
 bytes. A stopped result includes the exact `StopCause`, preserving the
 distinction between an authenticated unilateral report and a shared N-of-N
 stop. Verification does not execute Wasm and stops at these checks.
@@ -752,7 +762,7 @@ operational observation, not a semantic Host event or receipt fact.
 Operational timings use a separate opt-in `arena0::performance` tracing
 target. Debug records cover aggregate work such as state decode, dispatch work,
 SQLite transactions, and peer-frame sends. Trace records cover
-individual step and terminal signature applications. These records contain
+individual step signature applications. These records contain
 only correlation IDs, positions, sizes, counts, result classes, and monotonic
 elapsed microseconds. They are not `SystemEvent`, `HostEvent`, or `EventFrame`
 values, and they never enter protocol state or receipts. Protocol-level

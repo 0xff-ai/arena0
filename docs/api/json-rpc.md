@@ -233,12 +233,12 @@ local production and import facts independently yield `Produced`, `Imported`, or
 
 The earlier `{key:{session_id,producer}}` API and producer-sealed JSON format are
 replaced by these references and artifacts. Receipt artifact and body format,
-their `ReceiptId` domain, and the store schema are version 3; older evidence and
+their `ReceiptId` domain, and the store schema are version 4; older evidence and
 databases require their matching older release.
 
 `receipt.verify` performs portable/light verification only. It checks the
 activation binding, ordered v2 trace chain, N-of-N aggregate agreements,
-shared pre/post hashes, terminal evidence, and v3 receipt identity without
+shared pre/post hashes, terminal evidence, and v4 receipt identity without
 loading or executing Wasm. The Host keeps outcome Borsh bytes opaque, so a
 completed result contains authenticated `outcome_borsh`; a stopped result
 contains no outcome and instead carries the exact `Stopped { cause }`. There is

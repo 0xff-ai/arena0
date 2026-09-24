@@ -484,9 +484,8 @@ memories. If the store response is interrupted and the outcome is unknown, the
 actor reloads the authoritative execution record, committed memory images, and
 any `SharedProposal`, then restores the resident instance from that durable
 state. Proposed memories become live only after the store confirms the committed
-transition. An operational failure while terminal signatures are incomplete
-preserves the partial terminal proof as `Incomplete` and cancels active timers
-in the same transaction.
+transition. The certified final step is the terminal evidence, so there is no
+partial terminal state to preserve.
 
 ## Receipt and verification consequence
 
@@ -536,8 +535,8 @@ The target keeps one value for each session concept.
 | Durable delivery-effect records | current protocol frames held in execution state |
 | public/private cursors and commit tables | one event position plus the existing agreed-step position |
 
-`ExecutionState`, `SharedProposal`, `TraceEntry`, `StepCommitment`, step and
-terminal signatures, the open callout, timers, and current protocol frames
+`ExecutionState`, `SharedProposal`, `TraceEntry`, `StepCommitment`, step
+signatures, the open callout, timers, and current protocol frames
 remain because they own distinct runtime or proof responsibilities.
 
 ## Migration order
@@ -553,7 +552,7 @@ remain because they own distinct runtime or proof responsibilities.
    `TraceEntry` for advertised post-state hashes and participant-specific local
    results.
 5. Replace reducer plans with one complete transactional store record per actor
-   transition while retaining timers, terminal proof, and execution-state
+   transition while retaining timers, terminal evidence, and execution-state
    protocol frames.
 6. Rewrite the stored execution, ABI, and profile formats in place. There is no
    compatibility path or migration between the two state models.

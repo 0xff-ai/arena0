@@ -174,8 +174,9 @@ identifier, regardless of which participant exports them.
 A canonical receipt certifies completion or a shared program abort or failure.
 A unilateral stop report authenticates one participant's observation and the
 certified public prefix it references. Reports may differ; they do not claim
-unanimous termination. Stopped artifacts have no outcome bytes, and incomplete
-terminal agreement cannot be presented as a completed receipt.
+unanimous termination. Stopped artifacts have no outcome bytes. A completed
+receipt exists only when the final step, which carries the outcome, is
+certified by every participant.
 
 The evidence binds the program, parameters, participating identities, activation,
 public trace, and terminal facts. It excludes private program state. Each
@@ -185,7 +186,7 @@ participant retains its own evidence for later inspection or verification.
 
 Portable/light verification is the only verification boundary. It checks
 activation binding, signatures, the v2 trace chain, shared pre/post hashes,
-terminal evidence, and the v3 receipt identity without loading the program. A
+terminal evidence, and the v4 receipt identity without loading the program. A
 completed result includes authenticated opaque outcome bytes; a stopped result
 includes the exact stop cause. It authenticates certified facts and does not
 execute Wasm or claim to reproduce participant-specific state.
@@ -238,8 +239,8 @@ Every participant checks and certifies the public transitions through the
 commitment and revelation phases. The seller participates in that agreement too.
 
 After checking the reveals, each participant computes the same outcome: the
-bidder offering 40 wins at a price of 30. All four sign the terminal commitment
-and retain the same canonical receipt. An independent verifier can check the
+bidder offering 40 wins at a price of 30. All four sign the final step, which
+carries that outcome, and retain the same canonical receipt. An independent verifier can check the
 signatures, ordered shared hashes, terminal evidence, and receipt identity from
 the portable artifact.
 

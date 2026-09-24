@@ -153,8 +153,7 @@ local admission
     -> N-of-N activation
     -> local activation commit
     -> deterministic execution
-    -> N-of-N agreement on each public step
-    -> terminal proof
+    -> N-of-N agreement on each public step, including the terminal step
     -> atomic artifact publication
     -> canonical receipt or unilateral stop report
 ```
@@ -214,7 +213,7 @@ delivery lease.
 Under N-of-N agreement, a participant stages the next step only after
 certifying the previous step. Current protocol frames therefore remain in
 execution state: the last-step certificate, staged message and signature,
-terminal evidence, or abort occurrence. The actor sends each frame through its
+or abort occurrence. The actor sends each frame through its
 own bounded peer lane and tracks acknowledgements in memory. A receiver
 acknowledges a committed apply or duplicate/stale decision; a frame that is not
 yet applicable is retried without being stored. Restart reloads execution state
@@ -273,7 +272,7 @@ the actor merely because it observed the receipt.
 
 Portable/light verification is the only verification boundary. It checks the
 activation, identities, v2 trace chain, aggregate agreements, terminal
-evidence, and v3 receipt identity without loading Wasm. A completed result
+evidence, and v4 receipt identity without loading Wasm. A completed result
 contains authenticated opaque outcome bytes; a stopped result contains its
 exact stop cause. Verification never executes a second program pass.
 
