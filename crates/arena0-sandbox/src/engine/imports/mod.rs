@@ -20,7 +20,6 @@ pub(super) fn register_metadata_imports(
 ) -> Result<(), crate::SandboxError> {
     let capabilities = [
         Capability::Messaging,
-        Capability::Input,
         Capability::Timers,
         Capability::Sign {
             schemes: vec![SignScheme::Ed25519, SignScheme::Bls],
@@ -135,27 +134,6 @@ impl CallerExt for Caller<'_, HostState> {
     }
 
     fn record_effect(&mut self, effect: arena0_protocol::Effect) -> Result<(), wasmtime::Error> {
-        if let arena0_protocol::Effect::Callout {
-            callout_index,
-            context,
-            ..
-        } = &effect
-        {
-            let schema = self
-                .data()
-                .callout_inputs
-                .get(*callout_index as usize)
-                .ok_or_else(|| wasmtime::Error::msg("unknown callout schema index"))?;
-            let value: serde_json::Value = serde_json::from_slice(context).map_err(|error| {
-                wasmtime::Error::msg(format!("callout context is not JSON: {error}"))
-            })?;
-            let validator = jsonschema::validator_for(schema.as_value()).map_err(|error| {
-                wasmtime::Error::msg(format!("invalid callout schema: {error}"))
-            })?;
-            validator.validate(&value).map_err(|error| {
-                wasmtime::Error::msg(format!("callout context schema validation failed: {error}"))
-            })?;
-        }
         if !self.data().call_kind.allows_effects() {
             return Err(wasmtime::Error::msg(format!(
                 "effect {:?} is unavailable to {:?} calls",

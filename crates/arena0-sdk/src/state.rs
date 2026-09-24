@@ -219,11 +219,6 @@ pub trait Arena0Callout: 'static {
 pub trait Arena0CalloutRequest: serde::Serialize {
     /// The discriminant index identifying this request variant.
     fn callout_index(&self) -> u32;
-
-    /// Expected output type name for typed callout diagnostics.
-    fn expected_type_name(&self) -> Option<&'static str> {
-        None
-    }
 }
 
 /// Request-level output contract for generated callout structs.

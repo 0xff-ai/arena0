@@ -136,16 +136,11 @@ pub mod minimal_choice {
         Ok(Transition::To(Phase::Choosing))
     }
 
-    fn on_react(
-        ctx: &mut Context<Shared, Local>,
-    ) -> Result<ProgramTransition<MinimalChoice>, ProgramFault> {
-        if writer(ctx.shared()) == Some(ctx.me()) {
+    fn callout(ctx: &Context<Shared, Local>) -> Option<Callout> {
+        (writer(ctx.shared()) == Some(ctx.me())).then(|| {
             let previous = ctx.shared().choices.iter().flatten().next().copied();
-            ctx.effects()
-                .callout(callouts::Choose { previous })
-                .dispatch();
-        }
-        Ok(Transition::Stay)
+            callouts::Choose { previous }.into()
+        })
     }
 
     fn on_message(

@@ -3,11 +3,10 @@
 //! program tests, so test code can drive lifecycle dispatch and inspect the
 //! resulting [`HandlerResult`].
 
+use arena0_protocol::PendingId;
 use arena0_protocol::{
-    DivergenceDiagnostic, DivergenceKind, Effect, Event, PeerId, PendingKind, PendingRecord,
-    StateHash,
+    DivergenceDiagnostic, DivergenceKind, Effect, Event, OpenCallout, PeerId, StateHash,
 };
-use arena0_protocol::{PendingId, PendingOperation};
 use borsh::BorshSerialize;
 
 use crate::{CalloutSpec, Program};
@@ -36,10 +35,10 @@ pub enum ClosedPendingReason {
     Cancelled,
 }
 
-/// Closed pending continuation retained for exact-once diagnostics in tests.
+/// Closed pending callout retained for exact-once diagnostics in tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClosedPendingRecord {
-    pub pending: PendingRecord,
+    pub pending: OpenCallout,
     pub reason: ClosedPendingReason,
 }
 
@@ -62,13 +61,9 @@ pub enum PendingHarnessError {
         submitted_id: PendingId,
         pending_id: PendingId,
     },
-    PendingKindMismatch {
-        submitted: PendingKind,
-        pending: PendingKind,
-    },
     CalloutIndexMismatch {
-        submitted: Option<u32>,
-        pending: Option<u32>,
+        submitted: u32,
+        pending: u32,
     },
 }
 
@@ -102,12 +97,6 @@ impl std::fmt::Display for PendingHarnessError {
                 f,
                 "pending_id mismatch: submitted {submitted_id}, pending {pending_id}"
             ),
-            Self::PendingKindMismatch { submitted, pending } => {
-                write!(
-                    f,
-                    "pending kind mismatch: submitted {submitted:?}, pending {pending:?}"
-                )
-            }
             Self::CalloutIndexMismatch { submitted, pending } => {
                 write!(
                     f,
@@ -123,59 +112,59 @@ impl std::error::Error for PendingHarnessError {}
 /// Shared exact-once ledger for pending callout continuations.
 ///
 /// Native and Wasm harnesses differ in how they dispatch a result, but they
-/// must agree on stale ids, kind/index checks, rejected-input preservation,
+/// must agree on stale ids, callout-index checks, rejected-input preservation,
 /// and closed continuation history. This type owns that policy so both
 /// backends use the same transitions.
 #[derive(Debug, Default)]
 pub struct PendingLedger {
-    active: Option<PendingRecord>,
+    active: Option<OpenCallout>,
     closed: Vec<ClosedPendingRecord>,
 }
 
 impl PendingLedger {
-    /// Create a ledger with an optionally restored active continuation.
+    /// Create a ledger with an optionally restored active callout.
     #[must_use]
-    pub fn with_active(active: Option<PendingRecord>) -> Self {
+    pub fn with_active(active: Option<OpenCallout>) -> Self {
         Self {
             active,
             closed: Vec::new(),
         }
     }
 
-    /// Clear the active continuation and its closed-history diagnostics.
+    /// Clear the active callout and its closed-history diagnostics.
     pub fn clear(&mut self) {
         self.active = None;
         self.closed.clear();
     }
 
-    /// Set the active continuation, primarily for snapshot-based test setup.
-    pub fn set_active(&mut self, active: Option<PendingRecord>) {
+    /// Set the active callout, primarily for snapshot-based test setup.
+    pub fn set_active(&mut self, active: Option<OpenCallout>) {
         self.active = active;
     }
 
-    /// Return the currently active continuation, if any.
+    /// Return the currently active callout, if any.
     #[must_use]
-    pub fn active(&self) -> Option<&PendingRecord> {
+    pub fn active(&self) -> Option<&OpenCallout> {
         self.active.as_ref()
     }
 
-    /// Return closed continuation diagnostics retained by this ledger.
+    /// Return closed callout diagnostics retained by this ledger.
     #[must_use]
     pub fn closed(&self) -> &[ClosedPendingRecord] {
         &self.closed
     }
 
-    /// Record a closed continuation for a focused ledger test.
-    pub fn record_closed(&mut self, pending: PendingRecord, reason: ClosedPendingReason) {
+    /// Record a closed callout for a focused ledger test.
+    pub fn record_closed(&mut self, pending: OpenCallout, reason: ClosedPendingReason) {
         self.closed.push(ClosedPendingRecord { pending, reason });
     }
 
-    /// Validate a submitted continuation result against the active/closed
-    /// state, preserving the harness error distinctions.
+    /// Validate a submitted answer's identity and callout index against the
+    /// active/closed state, preserving the harness error distinctions.
     pub fn validate(
         &self,
         pending_id: Option<PendingId>,
-        operation: PendingOperation,
+        callout_index: u32,
     ) -> Result<(), PendingHarnessError> {
         let Some(active) = self.active.as_ref() else {
             if let Some(submitted_id) = pending_id
@@ -214,70 +203,43 @@ impl PendingLedger {
             }
         }
 
-        if operation.kind() != active.operation.kind() {
-            return Err(PendingHarnessError::PendingKindMismatch {
-                submitted: operation.kind(),
-                pending: active.operation.kind(),
-            });
-        }
-
-        let (
-            PendingOperation::Callout {
-                callout_index: submitted,
-            },
-            PendingOperation::Callout {
-                callout_index: pending,
-            },
-        ) = (operation, active.operation);
-        if submitted != pending {
+        if callout_index != active.callout_index {
             return Err(PendingHarnessError::CalloutIndexMismatch {
-                submitted: Some(submitted),
-                pending: Some(pending),
+                submitted: callout_index,
+                pending: active.callout_index,
             });
         }
 
         Ok(())
     }
 
-    /// Apply the pending transition produced by one handler invocation.
+    /// Apply the callout transition produced by one handler invocation.
     pub fn update(
         &mut self,
-        previous_pending: Option<PendingRecord>,
+        previous_pending: Option<OpenCallout>,
         pending_close: Option<ClosedPendingReason>,
         fault: &FaultStatus,
-        new_pending: Option<PendingRecord>,
+        new_pending: Option<OpenCallout>,
     ) {
-        if let Some(new_pending) = new_pending {
-            self.active = Some(new_pending);
-            return;
-        }
-
-        if matches!(fault, FaultStatus::Rejected(_))
-            && previous_pending
-                .as_ref()
-                .is_some_and(|pending| pending.operation.kind() == PendingKind::Callout)
-        {
+        if matches!(fault, FaultStatus::Rejected(_)) {
             self.active = previous_pending;
             return;
         }
 
-        if let Some(previous_pending) = previous_pending {
-            if pending_close.is_some() || matches!(fault, FaultStatus::Abort(_)) {
-                let reason = if matches!(fault, FaultStatus::None) {
-                    pending_close.unwrap_or(ClosedPendingReason::Cancelled)
-                } else {
-                    ClosedPendingReason::Cancelled
-                };
-                self.closed.push(ClosedPendingRecord {
-                    pending: previous_pending,
-                    reason,
-                });
+        if let Some(previous_pending) = previous_pending
+            && new_pending.as_ref().map(|pending| pending.id) != Some(previous_pending.id)
+        {
+            let reason = if matches!(fault, FaultStatus::None) {
+                pending_close.unwrap_or(ClosedPendingReason::Cancelled)
             } else {
-                self.active = Some(previous_pending);
-                return;
-            }
+                ClosedPendingReason::Cancelled
+            };
+            self.closed.push(ClosedPendingRecord {
+                pending: previous_pending,
+                reason,
+            });
         }
-        self.active = None;
+        self.active = new_pending;
     }
 }
 
@@ -304,8 +266,8 @@ pub struct DispatchRecord {
     pub pre_state: StateHash,
     /// Shared hash after the dispatch or rollback.
     pub post_state: StateHash,
-    /// Continuation metadata created by this dispatch, if it suspended.
-    pub pending: Option<PendingRecord>,
+    /// Open callout left by this dispatch, if the program asked a question.
+    pub pending: Option<OpenCallout>,
 }
 
 impl DispatchRecord {
@@ -318,6 +280,12 @@ impl DispatchRecord {
                 Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. }
             )
         })
+    }
+
+    /// The open callout derived from the resulting state, if any.
+    #[must_use]
+    pub fn open_callout(&self) -> Option<&OpenCallout> {
+        self.pending.as_ref()
     }
 
     /// Verify the native event-position sequence and shared-state hash chain.
@@ -443,11 +411,10 @@ pub struct HandlerResult {
     pub rejected: bool,
 }
 
-/// A typed callout effect captured from a handler invocation.
+/// A typed open callout captured from a handler invocation.
 #[derive(Debug, Clone)]
 pub struct TypedCalloutRecord<A> {
     pub request: A,
-    pub expected_type: Option<String>,
 }
 
 impl HandlerResult {
@@ -459,12 +426,12 @@ impl HandlerResult {
             .any(|e| matches!(e, Effect::Broadcast { .. }))
     }
 
-    /// True if any effect is a `Callout`.
+    /// True if the invocation left an open callout.
     #[must_use]
     pub fn has_callout(&self) -> bool {
-        self.effects
-            .iter()
-            .any(|e| matches!(e, Effect::Callout { .. }))
+        self.records
+            .last()
+            .is_some_and(|record| record.pending.is_some())
     }
 
     /// True if any effect is a `SessionEnd`.
@@ -505,29 +472,23 @@ impl HandlerResult {
             .collect()
     }
 
-    /// Collect `Callout` effects matching a concrete generated callout request type.
+    /// Return the final open callout if it matches the generated request type.
     #[must_use]
     pub fn typed_callouts<P, A>(&self) -> Vec<TypedCalloutRecord<A>>
     where
         P: Program,
         A: CalloutSpec<P> + serde::de::DeserializeOwned,
     {
-        self.effects
-            .iter()
-            .filter_map(|e| match e {
-                Effect::Callout {
-                    callout_index,
-                    context,
-                    expected_type,
-                    ..
-                } if *callout_index == A::CALLOUT_INDEX => {
-                    let request = serde_json::from_slice(context).ok()?;
-                    Some(TypedCalloutRecord {
-                        request,
-                        expected_type: expected_type.clone(),
-                    })
+        self.records
+            .last()
+            .into_iter()
+            .filter_map(|record| {
+                let callout = record.pending.as_ref()?;
+                if callout.callout_index != A::CALLOUT_INDEX {
+                    return None;
                 }
-                _ => None,
+                let request = serde_json::from_slice(&callout.context).ok()?;
+                Some(TypedCalloutRecord { request })
             })
             .collect()
     }
@@ -571,7 +532,7 @@ pub fn __dispatch_record(
     effects: Vec<Effect>,
     pre_state: StateHash,
     post_state: StateHash,
-    pending: Option<PendingRecord>,
+    pending: Option<OpenCallout>,
 ) -> DispatchRecord {
     DispatchRecord {
         event_position,
@@ -616,13 +577,13 @@ where
         self.typed_timer(crate::timer_payload(timer))
     }
 
-    /// Currently active pending continuation, if the last step suspended.
-    fn active_pending(&self) -> Option<&PendingRecord>;
+    /// Currently open callout, if the last step left one.
+    fn active_pending(&self) -> Option<&OpenCallout>;
 
     /// Resolve a generated typed callout with an explicit pending id.
     ///
-    /// Backend-specific because each implementation owns its pending
-    /// continuation representation and dispatch path.
+    /// Backend-specific because each implementation owns its open-callout
+    /// representation and dispatch path.
     fn resolve_callout_with_pending_id<A>(
         &mut self,
         pending_id: Option<PendingId>,
@@ -640,7 +601,7 @@ where
             .expect("pending callout validation failed")
     }
 
-    /// Resolve a generated typed callout after validating the active pending id.
+    /// Resolve a generated typed callout after validating the open callout id.
     fn try_resolve_callout<A>(
         &mut self,
         output: A::Output,

@@ -10,10 +10,8 @@ use std::io;
 
 use crate::TimerPayload;
 use crate::bounded::{
-    read_bytes as read_bounded_bytes, read_option_string as read_bounded_option_string,
-    read_string as read_bounded_string, write_bytes as serialize_bounded_bytes,
-    write_option_string as serialize_bounded_option_string,
-    write_string as serialize_bounded_string,
+    read_bytes as read_bounded_bytes, read_string as read_bounded_string,
+    write_bytes as serialize_bounded_bytes, write_string as serialize_bounded_string,
 };
 
 /// A side effect requested by a program during one event dispatch.
@@ -25,12 +23,6 @@ pub enum Effect {
     SessionAbort { reason: String },
     /// Broadcast an opaque program message to the session participants.
     Broadcast { data: Vec<u8> },
-    /// Call out to the controlling agent or an external actor for input.
-    Callout {
-        callout_index: u32,
-        context: Vec<u8>,
-        expected_type: Option<String>,
-    },
     /// Arm a one-shot timer with its payload.
     SetTimer { delay_ms: u64, timer: TimerPayload },
     /// Terminate program execution immediately with an error.
@@ -40,9 +32,8 @@ pub enum Effect {
 const EFFECT_SESSION_END: u8 = 0;
 const EFFECT_SESSION_ABORT: u8 = 1;
 const EFFECT_BROADCAST: u8 = 2;
-const EFFECT_CALLOUT: u8 = 3;
-const EFFECT_SET_TIMER: u8 = 4;
-const EFFECT_FAIL: u8 = 5;
+const EFFECT_SET_TIMER: u8 = 3;
+const EFFECT_FAIL: u8 = 4;
 
 impl BorshSerialize for Effect {
     fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
@@ -72,26 +63,6 @@ impl BorshSerialize for Effect {
                     data,
                     crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
                     "broadcast payload",
-                )
-            }
-            Self::Callout {
-                callout_index,
-                context,
-                expected_type,
-            } => {
-                BorshSerialize::serialize(&EFFECT_CALLOUT, writer)?;
-                BorshSerialize::serialize(callout_index, writer)?;
-                serialize_bounded_bytes(
-                    writer,
-                    context,
-                    crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
-                    "callout context",
-                )?;
-                serialize_bounded_option_string(
-                    writer,
-                    expected_type.as_deref(),
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "expected type",
                 )
             }
             Self::SetTimer { delay_ms, timer } => {
@@ -134,19 +105,6 @@ impl BorshDeserialize for Effect {
                     reader,
                     crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
                     "broadcast payload",
-                )?,
-            }),
-            EFFECT_CALLOUT => Ok(Self::Callout {
-                callout_index: u32::deserialize_reader(reader)?,
-                context: read_bounded_bytes(
-                    reader,
-                    crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
-                    "callout context",
-                )?,
-                expected_type: read_bounded_option_string(
-                    reader,
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "expected type",
                 )?,
             }),
             EFFECT_SET_TIMER => Ok(Self::SetTimer {
@@ -225,11 +183,6 @@ mod tests {
             Effect::Broadcast {
                 data: vec![1, 2, 3],
             },
-            Effect::Callout {
-                callout_index: 0,
-                context: vec![1, 2, 3],
-                expected_type: Some("Move".into()),
-            },
             Effect::SetTimer {
                 delay_ms: 1000,
                 timer: TimerPayload::unit(),
@@ -251,22 +204,5 @@ mod tests {
     #[test]
     fn unknown_effect_tags_are_rejected() {
         assert!(borsh::from_slice::<Effect>(&[0xff]).is_err());
-    }
-
-    #[test]
-    fn callout_optional_strings_are_bounded() {
-        let effect = Effect::Callout {
-            callout_index: 0,
-            context: Vec::new(),
-            expected_type: None,
-        };
-        let encoded = borsh::to_vec(&effect).expect("serialize");
-        assert_eq!(Effect::try_from_slice(&encoded).expect("decode"), effect);
-        let oversized = Effect::Callout {
-            callout_index: 0,
-            context: Vec::new(),
-            expected_type: Some("x".repeat(crate::execution::MAX_TERMINAL_REASON_BYTES + 1)),
-        };
-        assert!(borsh::to_vec(&oversized).is_err());
     }
 }

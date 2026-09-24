@@ -348,16 +348,8 @@ pub mod vickrey_auction {
                     if ctx.shared().bids.is_complete() {
                         return Ok(settle_bids(ctx.shared_mut())?);
                     }
-                } else if ctx.bids().needs_commit() {
-                    if ctx.me().index() == 0 {
-                        ctx.bids().commit_with_salt(0, [0; 32])?.broadcast();
-                    } else {
-                        let request = callouts::SubmitBid {
-                            item: ctx.shared().item.clone(),
-                            reserve: ctx.shared().reserve,
-                        };
-                        ctx.effects().callout(request).dispatch();
-                    }
+                } else if ctx.bids().needs_commit() && ctx.me().index() == 0 {
+                    ctx.bids().commit_with_salt(0, [0; 32])?.broadcast();
                 }
             }
             Phase::TieBreak => {
@@ -383,6 +375,20 @@ pub mod vickrey_auction {
             }
         }
         Ok(Transition::Stay)
+    }
+
+    fn callout(ctx: &Context<Shared, Local>) -> Option<Callout> {
+        (ctx.shared().phase() == Phase::Bidding
+            && ctx.me().index() != 0
+            && ctx.shared().bids.expected_writer() == Some(ctx.me())
+            && ctx.shared().bids.needs_commit(&ctx.local().bids))
+        .then(|| {
+            callouts::SubmitBid {
+                item: ctx.shared().item.clone(),
+                reserve: ctx.shared().reserve,
+            }
+            .into()
+        })
     }
 
     fn on_message(

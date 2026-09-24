@@ -11,7 +11,8 @@ pub use runtime::ProgramInstance;
 use std::sync::Arc;
 
 use arena0_program::{
-    ExecutionProfile, LocalStateBytes, MAX_WASM_STACK_BYTES, ProgramHash, SharedStateBytes,
+    CalloutRequest, ExecutionProfile, LocalStateBytes, MAX_WASM_STACK_BYTES, ProgramHash,
+    SharedStateBytes,
 };
 use arena0_protocol::Effect;
 use moka::sync::Cache;
@@ -397,9 +398,55 @@ pub(crate) fn max_output(profile: &ExecutionProfile) -> usize {
     profile.limits.max_output_bytes as usize
 }
 
+/// Validate one derived callout context against the program's declared input
+/// schema for that callout index. The index and JSON shape are guest-produced,
+/// so a mismatch is a dispatch failure rather than an agent rejection.
+pub(crate) fn validate_callout_context(
+    callout_inputs: &[arena0_program::JsonSchemaDocument],
+    callout: &CalloutRequest,
+) -> Result<(), SandboxError> {
+    let schema = callout_inputs
+        .get(callout.callout_index as usize)
+        .ok_or_else(|| SandboxError::dispatch_failed("unknown callout schema index"))?;
+    let value: serde_json::Value = serde_json::from_slice(&callout.context).map_err(|error| {
+        SandboxError::dispatch_failed(format!("callout context is not JSON: {error}"))
+    })?;
+    let validator = jsonschema::validator_for(schema.as_value()).map_err(|error| {
+        SandboxError::dispatch_failed(format!("invalid callout schema: {error}"))
+    })?;
+    validator
+        .validate(&value)
+        .map_err(|_| SandboxError::dispatch_failed("callout context schema validation failed"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derived_callout_requires_a_declared_index_and_valid_context() {
+        let schemas = vec![
+            arena0_program::JsonSchemaDocument::new(serde_json::json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object", "required": ["round"],
+                "properties": { "round": { "type": "integer" } }
+            }))
+            .unwrap(),
+        ];
+        let mut request = CalloutRequest {
+            callout_index: 0,
+            context: br#"{"round":1}"#.to_vec(),
+        };
+        assert!(validate_callout_context(&schemas, &request).is_ok());
+        request.callout_index = 1;
+        assert!(validate_callout_context(&schemas, &request).is_err());
+        request.callout_index = 0;
+        request.context = br#"{"round":"private-value"}"#.to_vec();
+        let error = validate_callout_context(&schemas, &request).unwrap_err();
+        assert!(!error.to_string().contains("private-value"));
+        request.context = b"{".to_vec();
+        assert!(validate_callout_context(&schemas, &request).is_err());
+    }
 
     #[test]
     fn call_kinds_expose_only_their_declared_effect_surface() {

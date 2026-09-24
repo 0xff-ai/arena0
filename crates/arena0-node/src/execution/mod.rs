@@ -59,6 +59,9 @@ struct ExecutionActor {
     /// them again for a new observer; ticker progress must not duplicate them
     /// within one actor lifetime.
     terminal_emitted: bool,
+    /// Last open-callout identity announced to the observer. A restart starts
+    /// empty so the committed callout is announced once again.
+    announced_callout: Option<arena0_protocol::PendingId>,
 }
 
 /// A leased remote outbox effect whose transport acknowledgement is being
@@ -78,13 +81,11 @@ fn callout_requested(
     pending_id: arena0_protocol::PendingId,
     callout_index: u32,
     context: Vec<u8>,
-    expected_type: Option<String>,
 ) -> SessionMessage {
     SessionMessage::CalloutRequested {
         pending_id,
         callout_index,
         context,
-        expected_type,
     }
 }
 

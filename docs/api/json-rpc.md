@@ -160,6 +160,15 @@ otherwise healthy execution. This category is also preserved for a stale
 answer already queued at the execution actor. Other validation, storage, and
 execution errors remain distinct.
 
+Callouts are derived from committed program state. After a non-answer event,
+the same callout index and context retain their `pending_id`. An accepted answer
+consumes its ID; even an identical next question receives a new ID. The program
+can replace or withdraw a question after any accepted event. While an answered
+result is staged for agreement, the committed callout stays visible. A duplicate
+submission waits for agreement and then returns `CalloutNotPending`.
+`pending_callout` in `exec.status` contains only
+`pending_id` and `callout_index`.
+
 `exec.submit` returns `InputRejected` when the pending callout still belongs to
 the execution but the program rejects the answer. The response message carries
 the bounded program reason when one is available. The rejection does not change

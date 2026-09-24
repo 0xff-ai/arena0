@@ -1,7 +1,7 @@
 //! Inference of effect capabilities from handler bodies.
 //!
 //! Owns the `syn::visit` pass that scans handler bodies for `ctx.effects()`
-//! calls (`send`/`broadcast`, `callout`, `set_timer`, ...) and synchronous
+//! calls (`send`/`broadcast`, `set_timer`, ...) and synchronous
 //! `ctx.sign(...)` calls, and derives the `Capability` set declared in program
 //! metadata when `capabilities(auto)` is set. This is the capability-inference
 //! seam.
@@ -15,7 +15,6 @@ use syn::{Expr, Item, ItemFn, Pat, Type};
 #[derive(Default)]
 struct EffectCapabilityVisitor {
     messaging: bool,
-    input: bool,
     timers: bool,
     sign_ed25519: bool,
     sign_bls: bool,
@@ -68,7 +67,6 @@ impl<'ast> Visit<'ast> for EffectCapabilityVisitor {
         if receiver_is_effect_handle(&node.receiver, &self.effect_bindings) {
             match node.method.to_string().as_str() {
                 "send" | "broadcast" => self.messaging = true,
-                "callout" => self.input = true,
                 "set_timer" => self.timers = true,
                 _ => {}
             }
@@ -202,11 +200,6 @@ fn inferred_effect_capabilities(visitor: EffectCapabilityVisitor) -> Vec<Inferre
     if visitor.messaging {
         capabilities.push(InferredEffectCapability {
             capability: quote! { ::arena0::Capability::Messaging },
-        });
-    }
-    if visitor.input {
-        capabilities.push(InferredEffectCapability {
-            capability: quote! { ::arena0::Capability::Input },
         });
     }
     if visitor.timers {

@@ -1,5 +1,4 @@
-//! Capability-gated host function registration (messaging, input, timers, and
-//! sign).
+//! Capability-gated host function registration (messaging, timers, and sign).
 
 use arena0_crypto::SignScheme;
 use arena0_program::Capability;
@@ -20,7 +19,6 @@ pub(crate) fn register_capability_imports(
     for capability in capabilities {
         match capability {
             Capability::Messaging => register_messaging(linker)?,
-            Capability::Input => register_input(linker)?,
             Capability::Timers => register_timers(linker)?,
             Capability::Sign { schemes } => sign_schemes.extend(schemes.iter().copied()),
         }
@@ -62,39 +60,6 @@ fn register_messaging(linker: &mut Linker<HostState>) -> Result<(), SandboxError
                 caller.reject_read_only("broadcast")?;
                 let data = caller.read_guest_bytes(data_ptr, data_len, "broadcast:data")?;
                 caller.record_effect(Effect::Broadcast { data })
-            },
-        )
-        .map_err(map_err)?;
-    Ok(())
-}
-
-fn register_input(linker: &mut Linker<HostState>) -> Result<(), SandboxError> {
-    linker
-        .func_wrap(
-            abi::HOST_MODULE,
-            imports::REQUEST_INPUT,
-            |mut caller: Caller<'_, HostState>,
-             variant_index: u32,
-             context_ptr: u32,
-             context_len: u32,
-             expected_ptr: u32,
-             expected_len: u32| {
-                caller.begin_import("request_input")?;
-                caller.reject_if_lifecycle_disallowed("request_input", &[Lifecycle::Active])?;
-                caller.reject_read_only("request_input")?;
-                let context =
-                    caller.read_guest_bytes(context_ptr, context_len, "request_input:context")?;
-                let expected_type = read_optional_guest_string(
-                    &mut caller,
-                    expected_ptr,
-                    expected_len,
-                    "request_input:expected_type",
-                )?;
-                caller.record_effect(Effect::Callout {
-                    callout_index: variant_index,
-                    context,
-                    expected_type,
-                })
             },
         )
         .map_err(map_err)?;
@@ -186,21 +151,6 @@ fn register_sign(
         )
         .map_err(map_err)?;
     Ok(())
-}
-
-fn read_optional_guest_string(
-    caller: &mut Caller<'_, HostState>,
-    ptr: u32,
-    len: u32,
-    label: &str,
-) -> Result<Option<String>, wasmtime::Error> {
-    if len == 0 {
-        return Ok(None);
-    }
-    let bytes = caller.read_guest_bytes(ptr, len, label)?;
-    String::from_utf8(bytes)
-        .map(Some)
-        .map_err(|error| wasmtime::Error::msg(format!("{label}: invalid UTF-8: {error}")))
 }
 
 fn reject_if_sign_scheme_disallowed(
@@ -345,57 +295,6 @@ mod tests {
         }
     }
 
-    fn instantiate_input_test_module(
-        stage: Lifecycle,
-    ) -> (Store<HostState>, wasmtime::TypedFunc<(), ()>) {
-        let engine = Engine::default();
-        let module = Module::new(
-            &engine,
-            r#"
-                (module
-                  (import "arena0" "request_input"
-                    (func $request_input (param i32 i32 i32 i32 i32)))
-                  (memory (export "memory") 1)
-                  (data (i32.const 0) "null")
-                  (data (i32.const 8) "Choice")
-                  (func (export "call_request_input")
-                    i32.const 0
-                    i32.const 0
-                    i32.const 4
-                    i32.const 8
-                    i32.const 6
-                    call $request_input))
-            "#,
-        )
-        .unwrap();
-
-        let mut linker = Linker::new(&engine);
-        register_capability_imports(&mut linker, &[Capability::Input]).unwrap();
-
-        let mut store = Store::new(&engine, {
-            let mut hs = HostState::new(
-                arena0_program::ExecutionProfile::current(),
-                CallKind::Dispatch,
-                Lifecycle::PreSession,
-                None,
-                vec![
-                    arena0_program::JsonSchemaDocument::new(serde_json::json!({
-                        "$schema": "https://json-schema.org/draft/2020-12/schema",
-                        "type": "null"
-                    }))
-                    .unwrap(),
-                ],
-            );
-            hs.lifecycle = stage;
-            hs
-        });
-        let instance = linker.instantiate(&mut store, &module).unwrap();
-        let request_input = instance
-            .get_typed_func::<(), ()>(&mut store, "call_request_input")
-            .unwrap();
-        (store, request_input)
-    }
-
     #[test]
     fn set_timer_allowed_during_pre_session() {
         let (mut store, set_timer) = instantiate_timer_test_module(Lifecycle::PreSession);
@@ -417,20 +316,6 @@ mod tests {
         let (mut store, set_timer) = instantiate_timer_test_module(Lifecycle::Completed);
         assert!(set_timer.call(&mut store, ()).is_err());
         assert!(store.data().effect_queue.is_empty());
-    }
-
-    #[test]
-    fn request_input_records_declared_output_type() {
-        let (mut store, request_input) = instantiate_input_test_module(Lifecycle::Active);
-        request_input.call(&mut store, ()).unwrap();
-        assert_eq!(
-            store.data().effect_queue,
-            vec![Effect::Callout {
-                callout_index: 0,
-                context: b"null".to_vec(),
-                expected_type: Some("Choice".into()),
-            }]
-        );
     }
 
     #[test]

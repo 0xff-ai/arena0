@@ -424,9 +424,8 @@ pub mod chess {
         }
     }
 
-    /// Position-0 boundary: set up the starting board and the turn order. Shared
-    /// handler, so it issues no callout; asking the mover for a move is
-    /// `on_react`'s job.
+    /// Position-0 boundary: set up the starting board and the turn order. The resulting
+    /// state determines the mover's question.
     fn on_session_started(
         ctx: &mut Context<Shared, Local>,
     ) -> Result<ProgramTransition<Chess>, ProgramFault> {
@@ -440,27 +439,22 @@ pub mod chess {
         Ok(Transition::To(Phase::Playing))
     }
 
-    /// Local decision hook: when it is this node's turn, ask the agent for a move.
-    fn on_react(
-        ctx: &mut Context<Shared, Local>,
-    ) -> Result<ProgramTransition<Chess>, ProgramFault> {
+    /// Ask the participant whose turn it is for a legal move.
+    fn callout(ctx: &Context<Shared, Local>) -> Option<Callout> {
         let state = ctx.shared();
         if state.phase() != Phase::Playing || state.status != Status::InProgress {
-            return Ok(Transition::Stay);
+            return None;
         }
         let is_my_turn = state
             .turns
             .as_ref()
             .is_some_and(|turns| turns.current() == ctx.me());
         if !is_my_turn {
-            return Ok(Transition::Stay);
+            return None;
         }
         let fen = state.fen.clone();
         let legal_moves = state.legal_moves_string();
-        ctx.effects()
-            .callout(callouts::MakeMove { fen, legal_moves })
-            .dispatch();
-        Ok(Transition::Stay)
+        Some(callouts::MakeMove { fen, legal_moves }.into())
     }
 
     fn on_input(
@@ -501,7 +495,7 @@ pub mod chess {
         if finished {
             return Ok(ApplyDecision::Accept(Transition::End));
         }
-        // The next mover's callout is issued by `on_react`.
+        // The resulting turn determines the next mover's callout.
         Ok(ApplyDecision::Accept(Transition::Stay))
     }
 

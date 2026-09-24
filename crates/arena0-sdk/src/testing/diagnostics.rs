@@ -162,7 +162,6 @@ fn append_trace_summary(out: &mut String, label: &str, trace: &[DispatchRecord])
 fn effect_name(effect: &Effect) -> &'static str {
     match effect {
         Effect::Broadcast { .. } => "Broadcast",
-        Effect::Callout { .. } => "Callout",
         Effect::SetTimer { .. } => "SetTimer",
         Effect::SessionEnd { .. } => "SessionEnd",
         Effect::SessionAbort { .. } => "SessionAbort",

@@ -209,9 +209,16 @@ async fn competing_callout_submissions_return_typed_conflict_and_execution_conti
         .into_iter()
         .find_map(Result::err)
         .expect("one competing answer is rejected");
-    assert_eq!(conflict.code, arena0_api::ApiErrorCode::CalloutNotPending);
+    assert!(matches!(
+        conflict.code,
+        arena0_api::ApiErrorCode::CalloutNotPending
+    ));
 
     let (_session_a, _session_b) = tokio::join!(drive(&d.host_a, exec_a), drive(&d.host_b, exec_b));
+    assert_eq!(
+        call(target, &request).await.unwrap_err().code,
+        arena0_api::ApiErrorCode::CalloutNotPending
+    );
     match ok(call(&d.host_a, &HostRequest::ExecStatus { exec_id: exec_a }).await) {
         ResponseOk::Status(status) => assert_eq!(status.lifecycle(), ExecLifecycle::Completed),
         other => panic!("unexpected final status: {other:?}"),
@@ -380,6 +387,7 @@ async fn stale_callout_after_terminal_is_typed_conflict_and_missing_exec_is_not_
         .await,
     );
 
+    let mut answered = std::collections::HashSet::new();
     let (human_target, human_exec, final_pending) = loop {
         let (is_a, response) = next_from_either(&d.host_a, exec_a, &d.host_b, exec_b).await;
         let next = ok(response);
@@ -391,6 +399,10 @@ async fn stale_callout_after_terminal_is_typed_conflict_and_missing_exec_is_not_
         else {
             panic!("expected RPS callout, got {next:?}");
         };
+        if answered.contains(&pending_id) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            continue;
+        }
         let round = context
             .get("round")
             .and_then(serde_json::Value::as_u64)
@@ -406,6 +418,8 @@ async fn stale_callout_after_terminal_is_typed_conflict_and_missing_exec_is_not_
             },
         )
         .await);
+
+        answered.insert(pending_id);
 
         if round == 3 {
             let human_target = if is_a { &d.host_b } else { &d.host_a };

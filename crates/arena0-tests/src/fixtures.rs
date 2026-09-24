@@ -483,8 +483,8 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
     };
     let metadata = definition.encode().expect("ordering metadata");
     let init = wat_data(&[0, 0, 0, 0, 0, 0, 0, 0]);
-    let accepted = wat_data(&[0, 0]);
-    let rejected = wat_data(&[1, 0]);
+    let accepted = wat_data(&[0, 0, 0]);
+    let rejected = wat_data(&[1, 0, 0]);
     let writer = wat_data(&[1, 1]);
     let outcome = wat_data(&[0, 0, 0, 0, 4, 0, 0, 0, b'n', b'u', b'l', b'l']);
     let query = wat_data(&[0, 0, 0, 0, 4, 0, 0, 0, b'n', b'u', b'l', b'l']);
@@ -499,7 +499,7 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
           (global (export "arena0_abi_version") i32 (i32.const 22))
           (data (i32.const 2048) "{init}")
           (data (i32.const 32768) "{accepted}")
-          (data (i32.const 32770) "{rejected}")
+          (data (i32.const 32772) "{rejected}")
           (data (i32.const 8192) "{writer}")
           (data (i32.const 10240) "{outcome}")
           (data (i32.const 12288) "{query}")
@@ -547,7 +547,7 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
         dispatch_export = if matches!(behavior, OrderingBehavior::Fail) {
             r#"(func (export "arena0_dispatch") (param i32 i32) (result i64)
             i32.const 10248 i32.const 4 call $fail
-            i32.const 32768 i32.const 2 call $pack)"#
+            i32.const 32768 i32.const 3 call $pack)"#
         } else if matches!(behavior, OrderingBehavior::RejectMessage) {
             r#"(func (export "arena0_dispatch") (param $input_ptr i32) (param i32) (result i64)
             (local $session_len i32)
@@ -578,16 +578,16 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
               i32.const 1
               i32.eq
               if (result i64)
-                i32.const 32770 i32.const 2 call $pack
+                i32.const 32772 i32.const 3 call $pack
               else
-                i32.const 32768 i32.const 2 call $pack
+                i32.const 32768 i32.const 3 call $pack
               end
             else
-              i32.const 32768 i32.const 2 call $pack
+              i32.const 32768 i32.const 3 call $pack
             end)"#
         } else {
             r#"(func (export "arena0_dispatch") (param i32 i32) (result i64)
-            i32.const 32768 i32.const 2 call $pack)"#
+            i32.const 32768 i32.const 3 call $pack)"#
         },
         writer = writer,
         outcome = outcome,

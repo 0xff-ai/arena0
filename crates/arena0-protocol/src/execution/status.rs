@@ -11,24 +11,23 @@ use serde::{Deserialize, Serialize};
 use crate::TraceEntry;
 use crate::bounded::read_string as read_bounded_string;
 use crate::exec::ExecLifecycle;
-use crate::trace::{PendingRecord, StepCommitment, TerminalCommitment};
+use crate::trace::{StepCommitment, TerminalCommitment};
 
 use super::{
     AbortKind, AbortOccurrence, ExecutionBinding, MAX_PROOF_SIGNATURES, MAX_TERMINAL_REASON_BYTES,
     ParticipantTerminalSignature, ProtocolError, ReceiptId, StepCursor, TerminalCertificate,
-    TerminalOutcome, ensure_payload, validate_pending_record, validate_terminal_progress,
+    TerminalOutcome, ensure_payload, validate_terminal_progress,
 };
 
-/// The one persisted owner of execution progress, waiting continuations,
+/// The one persisted owner of execution lifecycle progress,
 /// terminal proof progress, and terminal causes/proof identities.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum ExecutionStatus {
     /// Activation is committed but the host has not injected SessionStarted.
     Activating,
-    /// The execution is runnable and has no stored continuation.
+    /// The execution is runnable. Any open callout is stored separately with
+    /// the resulting state image, not inside this status.
     Active,
-    /// A continuation is awaiting a callout answer.
-    Waiting { pending: PendingRecord },
     /// Successful terminal proof collection is in progress.
     TerminalProof { proof: Box<TerminalProof> },
     /// A complete terminal proof and canonical receipt were published.
@@ -109,20 +108,16 @@ impl BorshSerialize for ExecutionStatus {
         match self {
             Self::Activating => BorshSerialize::serialize(&0u8, writer),
             Self::Active => BorshSerialize::serialize(&1u8, writer),
-            Self::Waiting { pending } => {
-                BorshSerialize::serialize(&2u8, writer)?;
-                BorshSerialize::serialize(pending, writer)
-            }
             Self::TerminalProof { proof } => {
-                BorshSerialize::serialize(&3u8, writer)?;
+                BorshSerialize::serialize(&2u8, writer)?;
                 BorshSerialize::serialize(proof, writer)
             }
             Self::Completed { proof } => {
-                BorshSerialize::serialize(&4u8, writer)?;
+                BorshSerialize::serialize(&3u8, writer)?;
                 BorshSerialize::serialize(proof, writer)
             }
             Self::Stopped { cause } => {
-                BorshSerialize::serialize(&5u8, writer)?;
+                BorshSerialize::serialize(&4u8, writer)?;
                 BorshSerialize::serialize(cause, writer)
             }
             Self::Incomplete { proof, reason } => {
@@ -132,12 +127,12 @@ impl BorshSerialize for ExecutionStatus {
                         "incomplete reason exceeds bound",
                     ));
                 }
-                BorshSerialize::serialize(&6u8, writer)?;
+                BorshSerialize::serialize(&5u8, writer)?;
                 BorshSerialize::serialize(proof, writer)?;
                 BorshSerialize::serialize(reason, writer)
             }
             Self::StoppedPublished { cause, receipt_id } => {
-                BorshSerialize::serialize(&7u8, writer)?;
+                BorshSerialize::serialize(&6u8, writer)?;
                 BorshSerialize::serialize(cause, writer)?;
                 BorshSerialize::serialize(receipt_id, writer)
             }
@@ -150,19 +145,16 @@ impl BorshDeserialize for ExecutionStatus {
         match u8::deserialize_reader(reader)? {
             0 => Ok(Self::Activating),
             1 => Ok(Self::Active),
-            2 => Ok(Self::Waiting {
-                pending: PendingRecord::deserialize_reader(reader)?,
-            }),
-            3 => Ok(Self::TerminalProof {
+            2 => Ok(Self::TerminalProof {
                 proof: Box::<TerminalProof>::deserialize_reader(reader)?,
             }),
-            4 => Ok(Self::Completed {
+            3 => Ok(Self::Completed {
                 proof: PublishedProof::deserialize_reader(reader)?,
             }),
-            5 => Ok(Self::Stopped {
+            4 => Ok(Self::Stopped {
                 cause: StopCause::deserialize_reader(reader)?,
             }),
-            6 => Ok(Self::Incomplete {
+            5 => Ok(Self::Incomplete {
                 proof: Box::<TerminalProof>::deserialize_reader(reader)?,
                 reason: read_bounded_string(
                     reader,
@@ -170,7 +162,7 @@ impl BorshDeserialize for ExecutionStatus {
                     "incomplete reason",
                 )?,
             }),
-            7 => Ok(Self::StoppedPublished {
+            6 => Ok(Self::StoppedPublished {
                 cause: StopCause::deserialize_reader(reader)?,
 
                 receipt_id: ReceiptId::deserialize_reader(reader)?,
@@ -386,7 +378,7 @@ impl ExecutionStatus {
     #[must_use]
     pub fn receipt_work(&self) -> ReceiptWork {
         match self {
-            Self::Activating | Self::Active | Self::Waiting { .. } => ReceiptWork::NotTerminal,
+            Self::Activating | Self::Active => ReceiptWork::NotTerminal,
             Self::Stopped { .. } => ReceiptWork::Assemble,
             Self::Completed { .. } | Self::StoppedPublished { .. } => ReceiptWork::Published,
             Self::Incomplete { .. } => ReceiptWork::Incomplete,
@@ -404,7 +396,6 @@ impl ExecutionStatus {
         match self {
             Self::Activating => ExecLifecycle::Activating,
             Self::Active => ExecLifecycle::Active,
-            Self::Waiting { .. } => ExecLifecycle::Waiting,
             Self::TerminalProof { .. } => ExecLifecycle::Active,
             Self::Completed { .. } => ExecLifecycle::Completed,
             Self::Stopped { cause } => match cause.kind() {
@@ -422,10 +413,7 @@ impl ExecutionStatus {
     /// Whether this status can accept a local or peer execution input.
     #[must_use]
     pub const fn is_runnable(&self) -> bool {
-        matches!(
-            self,
-            Self::Active | Self::Waiting { .. } | Self::TerminalProof { .. }
-        )
+        matches!(self, Self::Active | Self::TerminalProof { .. })
     }
 
     /// Whether this status is terminal and cannot accept further progress.
@@ -440,15 +428,6 @@ impl ExecutionStatus {
         )
     }
 
-    /// Borrow the stored continuation, if any.
-    #[must_use]
-    pub const fn pending(&self) -> Option<&PendingRecord> {
-        match self {
-            Self::Waiting { pending } => Some(pending),
-            _ => None,
-        }
-    }
-
     /// Borrow terminal proof progress, including incomplete proof evidence.
     #[must_use]
     pub(crate) fn terminal_proof(&self) -> Option<&TerminalProof> {
@@ -457,7 +436,6 @@ impl ExecutionStatus {
             Self::Completed { .. }
             | Self::Activating
             | Self::Active
-            | Self::Waiting { .. }
             | Self::Stopped { .. }
             | Self::StoppedPublished { .. } => None,
         }
@@ -479,10 +457,6 @@ impl ExecutionStatus {
             Self::Stopped { cause } | Self::StoppedPublished { cause, .. } => Some(cause),
             _ => None,
         }
-    }
-
-    pub fn waiting(pending: PendingRecord) -> Self {
-        Self::Waiting { pending }
     }
 
     pub const fn active() -> Self {
@@ -629,10 +603,6 @@ impl ExecutionStatus {
     ) -> Result<(), ProtocolError> {
         match self {
             Self::Activating | Self::Active => Ok(()),
-            Self::Waiting { pending } => {
-                validate_pending_record(pending)?;
-                Ok(())
-            }
             Self::TerminalProof { proof } => validate_terminal_progress(binding, agreed, proof),
             Self::Completed { proof } => {
                 let progress = TerminalProof::Certified {

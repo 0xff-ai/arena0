@@ -21,6 +21,8 @@ pub const MAX_CALL_PAYLOAD_BYTES: usize = crate::profile::MAX_INPUT_BYTES as usi
 pub const MAX_SESSION_CONTEXT_BYTES: usize = 1024 * 1024;
 /// Maximum UTF-8 bytes returned as the reason for a rejected input dispatch.
 pub const MAX_REJECTION_REASON_BYTES: usize = 1024;
+/// Maximum bytes in the JSON context of one derived open callout.
+pub const MAX_CALLOUT_CONTEXT_BYTES: usize = 64 * 1024;
 /// Host bytes a synchronous `sign` call adds around the guest payload: the
 /// `GuestSignData` header, the two `Vec<u8>` length prefixes of the returned
 /// `(signed_bytes, signature)` pair, and a 64-byte Ed25519 signature. A guest
@@ -518,6 +520,42 @@ impl BorshDeserialize for DispatchInput {
     }
 }
 
+/// The one open callout derived from program state after an accepted dispatch.
+///
+/// The program returns at most one request per dispatch; the host stores it
+/// with the resulting state image and never treats it as a lock. `context` is
+/// the stock-Serde JSON projection of the typed callout request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalloutRequest {
+    /// Program-local callout variant index.
+    pub callout_index: u32,
+    /// Agent-facing JSON context for that callout.
+    pub context: Vec<u8>,
+}
+
+impl BorshSerialize for CalloutRequest {
+    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
+        let mut writer = EnvelopeWriter::new(writer);
+        self.callout_index.serialize(&mut writer)?;
+        write_bounded_vec(
+            &mut writer,
+            &self.context,
+            MAX_CALLOUT_CONTEXT_BYTES,
+            "callout context",
+        )
+    }
+}
+
+impl BorshDeserialize for CalloutRequest {
+    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
+        let mut reader = EnvelopeReader::new(reader);
+        Ok(Self {
+            callout_index: u32::deserialize_reader(&mut reader)?,
+            context: read_bounded_vec(&mut reader, MAX_CALLOUT_CONTEXT_BYTES, "callout context")?,
+        })
+    }
+}
+
 /// The only value returned in the guest result envelope for a mutating
 /// dispatch. Effects remain in the host's per-call effect queue and are never
 /// duplicated in guest-owned state bytes.
@@ -528,6 +566,9 @@ pub struct DispatchOutput {
     /// Bounded program reason for an input rejection. Accepted dispatches and
     /// deterministic peer-message rejections do not carry a reason.
     pub reason: Option<String>,
+    /// The single open callout derived from the accepted post-state, if any.
+    /// A rejected dispatch has no callout.
+    pub callout: Option<CalloutRequest>,
 }
 
 impl BorshSerialize for DispatchOutput {
@@ -539,6 +580,12 @@ impl BorshSerialize for DispatchOutput {
                 "accepted dispatch cannot carry a rejection reason",
             ));
         }
+        if self.status == CallStatus::Rejected && self.callout.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rejected dispatch cannot carry an open callout",
+            ));
+        }
         self.status.serialize(&mut writer)?;
         match &self.reason {
             Some(reason) => {
@@ -548,7 +595,14 @@ impl BorshSerialize for DispatchOutput {
                     reason.as_bytes(),
                     MAX_REJECTION_REASON_BYTES,
                     "rejection reason",
-                )
+                )?;
+            }
+            None => false.serialize(&mut writer)?,
+        }
+        match &self.callout {
+            Some(callout) => {
+                true.serialize(&mut writer)?;
+                callout.serialize(&mut writer)
             }
             None => false.serialize(&mut writer),
         }
@@ -569,13 +623,26 @@ impl BorshDeserialize for DispatchOutput {
             )
         });
         let reason = reason.transpose()?;
+        let callout = bool::deserialize_reader(&mut reader)?
+            .then(|| CalloutRequest::deserialize_reader(&mut reader))
+            .transpose()?;
         if status == CallStatus::Accepted && reason.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "accepted dispatch cannot carry a rejection reason",
             ));
         }
-        Ok(Self { status, reason })
+        if status == CallStatus::Rejected && callout.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "rejected dispatch cannot carry an open callout",
+            ));
+        }
+        Ok(Self {
+            status,
+            reason,
+            callout,
+        })
     }
 }
 
@@ -899,8 +966,6 @@ pub mod imports {
     pub const RANDOM: &str = "random";
     /// Broadcast a binary message to every participant.
     pub const BROADCAST: &str = "broadcast";
-    /// Request input from the controlling agent.
-    pub const REQUEST_INPUT: &str = "request_input";
     /// Start a one-shot timer with a typed payload.
     pub const SET_TIMER: &str = "set_timer";
     /// Sign one guest payload with the node's key.
@@ -917,7 +982,6 @@ impl Capability {
     pub fn imports(&self) -> &'static [&'static str] {
         match self {
             Self::Messaging => &[imports::BROADCAST],
-            Self::Input => &[imports::REQUEST_INPUT],
             Self::Timers => &[imports::SET_TIMER],
             Self::Sign { .. } => &[imports::SIGN],
         }
@@ -947,7 +1011,6 @@ pub fn all_effect_imports() -> &'static [&'static str] {
         imports::LOG,
         imports::RANDOM,
         imports::BROADCAST,
-        imports::REQUEST_INPUT,
         imports::SET_TIMER,
         imports::SIGN,
         imports::END_SESSION,
@@ -964,7 +1027,6 @@ mod tests {
     #[test]
     fn imports_for_each_capability() {
         assert_eq!(Capability::Messaging.imports(), &["broadcast"]);
-        assert_eq!(Capability::Input.imports(), &["request_input"]);
         assert_eq!(Capability::Timers.imports(), &["set_timer"]);
         assert_eq!(
             Capability::Sign {
@@ -988,7 +1050,6 @@ mod tests {
         let all_effects: HashSet<&str> = all_effect_imports().iter().copied().collect();
         for capability in [
             Capability::Messaging,
-            Capability::Input,
             Capability::Timers,
             Capability::Sign {
                 schemes: vec![SignScheme::Ed25519],
@@ -1061,14 +1122,25 @@ mod tests {
             DispatchOutput {
                 status: CallStatus::Accepted,
                 reason: None,
+                callout: None,
+            },
+            DispatchOutput {
+                status: CallStatus::Accepted,
+                reason: None,
+                callout: Some(CalloutRequest {
+                    callout_index: 1,
+                    context: br#"{"prompt":"choose"}"#.to_vec(),
+                }),
             },
             DispatchOutput {
                 status: CallStatus::Rejected,
                 reason: None,
+                callout: None,
             },
             DispatchOutput {
                 status: CallStatus::Rejected,
                 reason: Some("invalid answer".into()),
+                callout: None,
             },
         ] {
             let encoded = borsh::to_vec(&output).unwrap();
@@ -1084,14 +1156,36 @@ mod tests {
         let accepted_with_reason = DispatchOutput {
             status: CallStatus::Accepted,
             reason: Some("unexpected".into()),
+            callout: None,
         };
         assert!(borsh::to_vec(&accepted_with_reason).is_err());
+
+        let rejected_with_callout = DispatchOutput {
+            status: CallStatus::Rejected,
+            reason: None,
+            callout: Some(CalloutRequest {
+                callout_index: 0,
+                context: Vec::new(),
+            }),
+        };
+        assert!(borsh::to_vec(&rejected_with_callout).is_err());
 
         let oversized = DispatchOutput {
             status: CallStatus::Rejected,
             reason: Some("x".repeat(MAX_REJECTION_REASON_BYTES + 1)),
+            callout: None,
         };
         assert!(borsh::to_vec(&oversized).is_err());
+
+        let oversized_context = DispatchOutput {
+            status: CallStatus::Accepted,
+            reason: None,
+            callout: Some(CalloutRequest {
+                callout_index: 0,
+                context: vec![b' '; MAX_CALLOUT_CONTEXT_BYTES + 1],
+            }),
+        };
+        assert!(borsh::to_vec(&oversized_context).is_err());
 
         let mut accepted_with_encoded_reason = vec![CallStatus::Accepted.tag(), 1];
         accepted_with_encoded_reason.extend_from_slice(&1u32.to_le_bytes());

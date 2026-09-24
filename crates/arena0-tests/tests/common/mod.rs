@@ -105,9 +105,14 @@ pub async fn drive_script(
     script: &[serde_json::Value],
 ) -> SessionHash {
     let mut cursor = 0;
+    let mut answered = None;
     loop {
         match ok(call(target, &HostRequest::ExecNext { exec_id }).await) {
             ResponseOk::Next(NextEvent::Callout { pending_id, .. }) => {
+                if answered == Some(pending_id) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
                 let answer = if script.is_empty() {
                     serde_json::json!("Rock")
                 } else {
@@ -116,8 +121,7 @@ pub async fn drive_script(
                         .unwrap_or_else(|| panic!("script exhausted at callout {cursor}"))
                         .clone()
                 };
-                cursor += 1;
-                ok(call(
+                let result = call(
                     target,
                     &HostRequest::ExecSubmit {
                         exec_id,
@@ -125,7 +129,19 @@ pub async fn drive_script(
                         answer: Some(answer),
                     },
                 )
-                .await);
+                .await;
+                match result {
+                    Ok(ResponseOk::Ack) => {
+                        cursor += 1;
+                        answered = Some(pending_id);
+                    }
+                    Err(error)
+                        if matches!(error.code, arena0_api::ApiErrorCode::CalloutNotPending) =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    other => panic!("unexpected submit result: {other:?}"),
+                }
             }
             ResponseOk::Next(NextEvent::Completed { session_id, .. }) => return session_id,
             ResponseOk::Next(NextEvent::Failed { reason }) => {

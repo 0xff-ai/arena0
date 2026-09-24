@@ -78,12 +78,10 @@ impl From<arena0_transport::TransportError> for ExecError {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum ExecCommand {
-    /// Submit a validated JSON answer to a pending program callout.
+    /// Submit a validated JSON answer to the open program callout.
     SubmitInput {
-        /// The durable continuation identity being answered.
+        /// The open callout identity being answered.
         pending_id: PendingId,
-        /// The advertised callout variant being answered.
-        callout_index: u32,
         /// Complete agent-facing JSON input.
         data: JsonBytes,
         /// Command result.
@@ -140,12 +138,11 @@ pub enum SessionMessage {
         session_id: SessionHash,
         ensemble: Ensemble,
     },
-    /// A durable callout is ready for an agent answer.
+    /// The committed open callout is ready for an agent answer.
     CalloutRequested {
         pending_id: PendingId,
         callout_index: u32,
         context: Vec<u8>,
-        expected_type: Option<String>,
     },
     /// A final receipt was durably published locally.
     ReceiptPublished { receipt: ReceiptArtifact },

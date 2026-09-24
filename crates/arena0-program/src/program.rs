@@ -246,8 +246,6 @@ pub enum ProgramDefinitionError {
 pub enum Capability {
     /// Send and receive binary messages to/from peers.
     Messaging,
-    /// Request input from the controlling agent.
-    Input,
     /// Set one-shot timers.
     Timers,
     /// Sign data with the given schemes.

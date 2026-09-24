@@ -14,7 +14,7 @@ pub use commitment::{
     SignerSet, StepCommitment, StepSig, TERMINAL_DOMAIN, TerminalCommitment,
 };
 pub use divergence::{DivergenceDiagnostic, DivergenceKind, JsonDiffExt};
-pub use entry::{PendingKind, PendingOperation, PendingRecord, TraceEntry};
+pub use entry::TraceEntry;
 pub use header::{ReceiptTermination, SessionHeader};
 
 /// Trace schema version for state-machine step records.

@@ -53,7 +53,7 @@ pub use certificate::{
 pub use cursor::{ExecutionVersion, StepCursor};
 pub use error::ProtocolError;
 pub use outcome::TerminalOutcome;
-pub use pending::{PendingId, PendingIdParseError, pending_id};
+pub use pending::{OpenCallout, PendingId, PendingIdParseError, pending_id};
 pub use signing::GuestSignData;
 pub use state::{ExecutionState, SharedProposal, StepCertificate, TerminalCertificate};
 pub use status::{ExecutionStatus, PublishedProof, ReceiptWork, StopCause, TerminalProof};
@@ -61,6 +61,6 @@ pub use timer::TimerId;
 pub use timer_firing::TimerFiring;
 
 pub(crate) use validation::{
-    ensure_encoded, ensure_payload, validate_effects, validate_pending_record, validate_proposal,
-    validate_receipt_body, validate_receipt_body_shape, validate_terminal_progress,
+    ensure_encoded, ensure_payload, validate_effects, validate_proposal, validate_receipt_body,
+    validate_receipt_body_shape, validate_terminal_progress,
 };

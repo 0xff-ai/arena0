@@ -1,8 +1,8 @@
 use arena0_crypto::BlsPublicKey;
 
 use crate::trace::{
-    AggregateAttestation, PendingOperation, PendingRecord, ReceiptTermination, SessionTerminal,
-    StepCommitment, TRACE_FORMAT_VERSION, TerminalCommitment, TraceEntry,
+    AggregateAttestation, ReceiptTermination, SessionTerminal, StepCommitment,
+    TRACE_FORMAT_VERSION, TerminalCommitment, TraceEntry,
 };
 use crate::{Effect, Ensemble, Event, MessageId, OutcomeHash, StateHash};
 
@@ -142,7 +142,7 @@ fn validate_proposal_status(
     status: &super::ExecutionStatus,
 ) -> Result<(), ProtocolError> {
     match (&entry.terminal, status) {
-        (None, super::ExecutionStatus::Active | super::ExecutionStatus::Waiting { .. }) => Ok(()),
+        (None, super::ExecutionStatus::Active) => Ok(()),
         (None, _) => Err(ProtocolError::InvalidTerminalStatus),
         (
             Some(Effect::SessionAbort { reason }),
@@ -700,20 +700,6 @@ pub(crate) fn validate_shared_entry(
     Ok(())
 }
 
-pub(crate) fn validate_pending_record(pending: &PendingRecord) -> Result<(), ProtocolError> {
-    if pending
-        .expected_type
-        .as_ref()
-        .is_some_and(|value| value.len() > MAX_TERMINAL_REASON_BYTES)
-    {
-        return Err(ProtocolError::InvalidPendingContinuation);
-    }
-    match pending.operation {
-        PendingOperation::Callout { .. } => {}
-    }
-    Ok(())
-}
-
 pub(crate) fn validate_effects(effects: &[(u32, Effect)]) -> Result<(), ProtocolError> {
     if effects.len() > MAX_EFFECTS {
         return Err(ProtocolError::CollectionTooLarge {
@@ -750,13 +736,6 @@ pub(crate) fn validate_effects(effects: &[(u32, Effect)]) -> Result<(), Protocol
         encoded.len(),
         arena0_program::MAX_EFFECT_BYTES as usize,
     )?;
-    let pending_count = effects
-        .iter()
-        .filter(|(_, effect)| matches!(effect, Effect::Callout { .. }))
-        .count();
-    if pending_count > 1 {
-        return Err(ProtocolError::InvalidPendingContinuation);
-    }
     Ok(())
 }
 
@@ -775,21 +754,6 @@ fn validate_effect(effect: &Effect) -> Result<(), ProtocolError> {
             data.len(),
             super::MAX_EFFECT_PAYLOAD_BYTES,
         ),
-        Effect::Callout {
-            context,
-            expected_type,
-            ..
-        } => {
-            ensure_payload(
-                "callout context",
-                context.len(),
-                super::MAX_EFFECT_PAYLOAD_BYTES,
-            )?;
-            if let Some(expected) = expected_type {
-                ensure_payload("expected type", expected.len(), MAX_TERMINAL_REASON_BYTES)?;
-            }
-            Ok(())
-        }
         Effect::SetTimer { timer, .. } => {
             ensure_payload(
                 "timer type name",

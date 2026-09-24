@@ -182,7 +182,7 @@ CREATE TABLE outbox (
     event_position INTEGER NOT NULL CHECK (event_position >= 0),
     ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
     destination BLOB CHECK (destination IS NULL OR length(destination) = 32),
-    payload_kind TEXT NOT NULL CHECK (payload_kind IN ('effect', 'frame')),
+    payload_kind TEXT NOT NULL CHECK (payload_kind = 'frame'),
     payload BLOB NOT NULL,
     attempts INTEGER NOT NULL CHECK (attempts >= 0),
     status TEXT NOT NULL CHECK (status IN ('pending', 'leased', 'acknowledged', 'cancelled')),

@@ -8,8 +8,8 @@ use std::cell::RefCell;
 
 use arena0_protocol::trace::JsonDiffExt;
 use arena0_protocol::{
-    DivergenceDiagnostic, DivergenceKind, Effect, Ensemble, Event, MessageId, Participant, PeerId,
-    PendingRecord, StateHash, View, Viewport,
+    DivergenceDiagnostic, DivergenceKind, Effect, Ensemble, Event, MessageId, OpenCallout,
+    Participant, PeerId, StateHash, View, Viewport,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 
@@ -81,20 +81,27 @@ fn fault_effects(fault: &FaultStatus) -> Vec<Effect> {
     }
 }
 
-fn pending_from_effects(id: PendingId, effects: &[Effect]) -> Option<PendingRecord> {
-    effects.iter().find_map(|effect| match effect {
-        Effect::Callout {
-            callout_index,
-            expected_type,
-            ..
-        } => Some(PendingRecord {
-            id,
-            operation: arena0_protocol::PendingOperation::Callout {
-                callout_index: *callout_index,
-            },
-            expected_type: expected_type.clone(),
-        }),
-        _ => None,
+fn derive_open_callout<C>(
+    previous: Option<&OpenCallout>,
+    id: PendingId,
+    request: Option<C>,
+) -> Option<OpenCallout>
+where
+    C: crate::Arena0CalloutRequest + serde::Serialize,
+{
+    let request = request?;
+    let callout_index = request.callout_index();
+    let context = serde_json::to_vec(&request).expect("callout context serialization failed");
+    if let Some(previous) = previous
+        && previous.callout_index == callout_index
+        && previous.context == context
+    {
+        return Some(previous.clone());
+    }
+    Some(OpenCallout {
+        id,
+        callout_index,
+        context,
     })
 }
 
@@ -369,6 +376,7 @@ impl<P: Program> TestHarness<P> {
             }
         };
 
+        let callout_request = if failed { None } else { P::callout(&ctx) };
         let (mut shared, mut local, _) = ctx.__into_parts();
         let mut effects = drain_effects();
         let logs = if failed {
@@ -400,7 +408,19 @@ impl<P: Program> TestHarness<P> {
         self.shared = shared;
         self.local = local;
 
-        let pending = pending_from_effects(PendingId::new(self.event_position), &effects);
+        let terminal = effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. }
+            )
+        });
+        let pending = derive_open_callout(
+            previous_pending
+                .as_ref()
+                .filter(|_| !matches!(event, Event::InputReceived { .. })),
+            PendingId::new(self.event_position),
+            if terminal { None } else { callout_request },
+        );
         let record = __dispatch_record(
             self.event_position,
             event,
@@ -486,6 +506,11 @@ impl<P: Program> TestHarness<P> {
             }
         };
 
+        let callout_request = if failed || rejected {
+            None
+        } else {
+            P::callout(&ctx)
+        };
         let (mut shared, mut local, _) = ctx.__into_parts();
         let mut effects = drain_effects();
 
@@ -523,7 +548,19 @@ impl<P: Program> TestHarness<P> {
         self.shared = shared;
         self.local = local;
 
-        let pending = pending_from_effects(PendingId::new(self.event_position), &effects);
+        let terminal = effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. }
+            )
+        });
+        let pending = derive_open_callout(
+            previous_pending
+                .as_ref()
+                .filter(|_| !matches!(event, Event::InputReceived { .. })),
+            PendingId::new(self.event_position),
+            if terminal { None } else { callout_request },
+        );
         let record = __dispatch_record(
             self.event_position,
             event,
@@ -561,11 +598,7 @@ impl<P: Program> TestHarness<P> {
 
     fn with_react(&mut self, result: HandlerResult) -> HandlerResult {
         let terminal = result.records.iter().any(DispatchRecord::is_terminal);
-        if !matches!(result.fault, FaultStatus::None)
-            || result.rejected
-            || terminal
-            || self.pending.active().is_some()
-        {
+        if !matches!(result.fault, FaultStatus::None) || result.rejected || terminal {
             return result;
         }
         let react = self.react();
@@ -792,8 +825,8 @@ where
         )
     }
 
-    /// Currently active pending continuation, if the last step suspended.
-    fn active_pending(&self) -> Option<&PendingRecord> {
+    /// Currently open callout, if the last step left one.
+    fn active_pending(&self) -> Option<&OpenCallout> {
         self.pending.active()
     }
 
@@ -809,12 +842,7 @@ where
     where
         A: CalloutSpec<P>,
     {
-        self.pending.validate(
-            pending_id,
-            arena0_protocol::PendingOperation::Callout {
-                callout_index: A::CALLOUT_INDEX,
-            },
-        )?;
+        self.pending.validate(pending_id, A::CALLOUT_INDEX)?;
         let input = A::into_input(output);
         let (callout_index, data) = P::Callout::to_event_data(&input);
         Ok(self.run_input(
@@ -846,7 +874,10 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::{ManagedPhase, PhasedSharedState, ProgramQuery, ProgramValue, SharedState};
+    use crate::{
+        Arena0CalloutRequest, ManagedPhase, PhasedSharedState, ProgramQuery, ProgramValue,
+        SharedState,
+    };
     use anyhow::anyhow;
 
     use super::super::orchestration::{DeliveryAction, DeliverySchedule};
@@ -926,6 +957,7 @@ mod tests {
         }
     }
 
+    #[derive(serde::Serialize)]
     struct FaultyCallout;
 
     impl Arena0Callout for FaultyCallout {
@@ -942,6 +974,12 @@ mod tests {
 
         fn to_event_data(_response: &Self::Response) -> (u32, Vec<u8>) {
             (0, Vec::new())
+        }
+    }
+
+    impl Arena0CalloutRequest for FaultyCallout {
+        fn callout_index(&self) -> u32 {
+            0
         }
     }
 
@@ -1005,11 +1043,11 @@ mod tests {
         PeerId([2; 32])
     }
 
-    fn pending(id: u64, callout_index: u32) -> PendingRecord {
-        PendingRecord {
+    fn pending(id: u64, callout_index: u32) -> OpenCallout {
+        OpenCallout {
             id: PendingId::new(id),
-            operation: arena0_protocol::PendingOperation::Callout { callout_index },
-            expected_type: Some("()".into()),
+            callout_index,
+            context: vec![b'n', b'u', b'l', b'l'],
         }
     }
 
@@ -1071,33 +1109,16 @@ mod tests {
         let mut h = TestHarness::<FaultyProgram>::new(());
         h.pending.set_active(Some(pending(10, 1)));
 
-        h.pending
-            .validate(
-                Some(PendingId::new(10)),
-                arena0_protocol::PendingOperation::Callout { callout_index: 1 },
-            )
-            .unwrap();
-        let err = h
-            .pending
-            .validate(
-                Some(PendingId::new(10)),
-                arena0_protocol::PendingOperation::Callout { callout_index: 2 },
-            )
-            .unwrap_err();
+        h.pending.validate(Some(PendingId::new(10)), 1).unwrap();
+        let err = h.pending.validate(Some(PendingId::new(10)), 2).unwrap_err();
         assert_eq!(
             err,
             PendingHarnessError::CalloutIndexMismatch {
-                submitted: Some(2),
-                pending: Some(1),
+                submitted: 2,
+                pending: 1,
             }
         );
-        let err = h
-            .pending
-            .validate(
-                Some(PendingId::new(9)),
-                arena0_protocol::PendingOperation::Callout { callout_index: 1 },
-            )
-            .unwrap_err();
+        let err = h.pending.validate(Some(PendingId::new(9)), 1).unwrap_err();
         assert_eq!(
             err,
             PendingHarnessError::Stale {
@@ -1109,13 +1130,7 @@ mod tests {
         h.pending
             .record_closed(pending(10, 1), ClosedPendingReason::Resolved);
         h.pending.set_active(None);
-        let err = h
-            .pending
-            .validate(
-                Some(PendingId::new(10)),
-                arena0_protocol::PendingOperation::Callout { callout_index: 1 },
-            )
-            .unwrap_err();
+        let err = h.pending.validate(Some(PendingId::new(10)), 1).unwrap_err();
         assert_eq!(
             err,
             PendingHarnessError::Closed {

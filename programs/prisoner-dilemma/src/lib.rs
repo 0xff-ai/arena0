@@ -290,8 +290,7 @@ pub mod prisoner_dilemma {
         }
     }
 
-    /// Position-0 boundary: set the match length. The session-start handler issues no
-    /// callout and broadcasts nothing. The commit-reveal primitive starts from its
+    /// Position-0 boundary: set the match length. The session-start handler broadcasts nothing. The commit-reveal primitive starts from its
     /// `Default`.
     fn on_session_started(
         ctx: &mut Context<Shared, Local>,
@@ -301,7 +300,7 @@ pub mod prisoner_dilemma {
     }
 
     /// Local decision hook: broadcast the owed reveal once every commit is in,
-    /// otherwise ask the agent for this round's move when one is still owed.
+    /// The callout projection asks for any missing local move.
     fn on_react(
         ctx: &mut Context<Shared, Local>,
     ) -> Result<ProgramTransition<PrisonerDilemma>, ProgramFault> {
@@ -323,12 +322,16 @@ pub mod prisoner_dilemma {
             }
             return Ok(Transition::Stay);
         }
-        if ctx.commit_reveal().needs_commit() {
-            let slot = ctx.me().index();
-            let req = ctx.shared().choice_request(slot);
-            ctx.effects().callout(req).dispatch();
-        }
         Ok(Transition::Stay)
+    }
+
+    fn callout(ctx: &Context<Shared, Local>) -> Option<Callout> {
+        (ctx.shared().commit_reveal.expected_writer() == Some(ctx.me())
+            && ctx
+                .shared()
+                .commit_reveal
+                .needs_commit(&ctx.local().commit_reveal))
+        .then(|| ctx.shared().choice_request(ctx.me().index()).into())
     }
 
     fn on_message(
@@ -354,7 +357,7 @@ pub mod prisoner_dilemma {
         if finished {
             return Ok(ApplyDecision::Accept(Transition::End));
         }
-        // The next round's callout is issued by `on_react` (needs_commit after reset).
+        // The reset state determines the next round's callout.
         Ok(ApplyDecision::Accept(Transition::Stay))
     }
 

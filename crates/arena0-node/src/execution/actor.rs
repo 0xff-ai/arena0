@@ -11,7 +11,6 @@ use arena0_protocol::{
     Committed, Ensemble, ExecLifecycle, ExecutionState, PeerIdSource, ReceiptWork, TicketAction,
 };
 use arena0_sandbox::{InitializeCall, ProgramInstance};
-use arena0_store::PendingRequest;
 use arena0_transport::RecvHandle;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -21,9 +20,7 @@ use crate::Host;
 use crate::context::{ActorContext, ExecCommand, ExecError, InboundStreamPayload, SpawnedExec};
 
 use super::guest::SubmitInputError;
-use super::{
-    COMMAND_CAPACITY, ExecutionActor, PROGRESS_INTERVAL, STREAM_CAPACITY, callout_requested, now_ms,
-};
+use super::{COMMAND_CAPACITY, ExecutionActor, PROGRESS_INTERVAL, STREAM_CAPACITY, now_ms};
 
 /// Spawn one actor and one concurrent reader supervisor.
 #[must_use]
@@ -40,6 +37,7 @@ pub(crate) fn spawn_execution(context: ActorContext, host: Arc<Host>) -> Spawned
         inflight_send: None,
         session_started_emitted: false,
         terminal_emitted: false,
+        announced_callout: None,
     };
     let actor_task = tokio::spawn(actor.run(command_rx));
     let stream_task = tokio::spawn(forward_streams(stream_rx, command_tx.clone()));
@@ -179,11 +177,10 @@ impl ExecutionActor {
         match command {
             ExecCommand::SubmitInput {
                 pending_id,
-                callout_index,
                 data,
                 reply,
             } => {
-                let result = self.submit_input(pending_id, callout_index, data).await;
+                let result = self.submit_input(pending_id, data).await;
                 match result {
                     Ok(()) => {
                         let _ = reply.send(Ok(()));
@@ -249,21 +246,6 @@ impl ExecutionActor {
         let state = self.load_state().await?;
         self.restore_resident(&state)?;
 
-        // An acknowledged callout may have reached the observer immediately
-        // before the actor crashed, leaving the durable continuation waiting
-        // for an answer while its outbox row is no longer pending. Capture
-        // that projection before the normal outbox drain; rows that are still
-        // pending/leased will be delivered by the drain itself.
-        let replay_requests = self
-            .context
-            .store
-            .pending_requests()
-            .await?
-            .into_iter()
-            .filter(|request| matches!(request, PendingRequest::Callout { .. }))
-            .filter(|request| request.status() == arena0_store::OutboxStatus::Acknowledged)
-            .collect::<Vec<_>>();
-
         let state = self.load_state().await?;
 
         if state.status().lifecycle() == ExecLifecycle::Activating {
@@ -273,35 +255,7 @@ impl ExecutionActor {
             self.activate_execution(state.version()).await?;
         }
 
-        self.progress().await?;
-        self.emit_recovered_pending_requests(&replay_requests).await
-    }
-
-    /// Re-emit an agent request whose durable outbox effect was acknowledged
-    /// before the previous actor lifetime could receive its answer.
-    async fn emit_recovered_pending_requests(
-        &self,
-        requests: &[PendingRequest],
-    ) -> Result<(), ExecError> {
-        for request in requests {
-            let PendingRequest::Callout {
-                pending_id,
-                callout_index,
-                context,
-                expected_type,
-                ..
-            } = request;
-            self.messages
-                .send(callout_requested(
-                    *pending_id,
-                    *callout_index,
-                    context.clone(),
-                    expected_type.clone(),
-                ))
-                .await
-                .map_err(|_| ExecError::Unavailable("message receiver closed".into()))?;
-        }
-        Ok(())
+        self.progress().await
     }
 
     pub(super) async fn ensure_execution(&mut self) -> Result<(), ExecError> {
@@ -423,7 +377,6 @@ impl ExecutionActor {
         } else if state.terminal_pending() {
             self.ensure_terminal_signature().await?;
         } else if state.status().lifecycle() == ExecLifecycle::Active
-            && state.status().pending().is_none()
             && state.agreed_step() > 0
             && state.last_reacted_step() != Some(state.agreed_step() - 1)
         {
@@ -433,7 +386,32 @@ impl ExecutionActor {
             )
             .await?;
         }
+        self.announce_callout().await?;
         self.drain_outbox_report().await?;
+        Ok(())
+    }
+
+    /// Announce the committed open callout when its identity changes.
+    ///
+    /// The open callout is durable in the execution aggregate, so this is only
+    /// an observer-facing notification. A restart starts with no announcement
+    /// and therefore re-announces the current callout once.
+    async fn announce_callout(&mut self) -> Result<(), ExecError> {
+        let state = self.load_state().await?;
+        let Some(open) = state.callout() else {
+            return Ok(());
+        };
+        if self.announced_callout == Some(open.id) {
+            return Ok(());
+        }
+        let pending_id = open.id;
+        let callout_index = open.callout_index;
+        let context = open.context.clone();
+        self.messages
+            .send(super::callout_requested(pending_id, callout_index, context))
+            .await
+            .map_err(|_| ExecError::Unavailable("message receiver closed".into()))?;
+        self.announced_callout = Some(pending_id);
         Ok(())
     }
 

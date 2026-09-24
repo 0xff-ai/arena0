@@ -375,6 +375,7 @@ impl Database {
         inbox_id: Option<InboxId>,
         timer_id: Option<TimerId>,
         pending_id: Option<PendingId>,
+        callout: Option<arena0_program::CalloutRequest>,
         now_ms: u64,
     ) -> Result<ApplyOutcome, StoreError> {
         self.transaction(|store| {
@@ -389,6 +390,7 @@ impl Database {
                 inbox_id,
                 timer_id,
                 pending_id,
+                callout,
                 now_ms,
             )
         })
@@ -407,6 +409,7 @@ impl Database {
         inbox_id: Option<InboxId>,
         timer_id: Option<TimerId>,
         pending_id: Option<PendingId>,
+        callout: Option<arena0_program::CalloutRequest>,
         now_ms: u64,
     ) -> Result<ApplyOutcome, StoreError> {
         let state = self
@@ -421,13 +424,14 @@ impl Database {
             self, &state, &event, post_state, inbox_id, timer_id, pending_id,
         )?;
         let mut next = state.clone();
-        let (establishing_frame, closes_pending) = next.apply_dispatch(
+        let establishing_frame = next.apply_dispatch(
             &event,
             shared,
             local,
             &effects,
             terminal_outcome,
             pending_id,
+            callout,
         )?;
         if let Some(outcome) = self.inbox_replay_outcome(&state, inbox_id)? {
             return Ok(outcome);
@@ -476,13 +480,6 @@ impl Database {
             } else {
                 self.mark_inbox_applied(execution_id, inbox_id, next.version())?;
             }
-        }
-        if closes_pending {
-            self.acknowledge_pending_effect(
-                execution_id,
-                pending_id.expect("pending answer was validated"),
-                &event,
-            )?;
         }
         if let Some(timer_id) = timer_id {
             self.consume_timer(execution_id, timer_id)?;
@@ -598,12 +595,6 @@ impl Database {
                 state,
                 now_ms,
             )?;
-        }
-        if !matches!(
-            next.status().receipt_work(),
-            arena0_protocol::ReceiptWork::NotTerminal
-        ) {
-            self.cancel_terminal_effects(execution_id)?;
         }
         if let Some(inbox_id) = inbox_id {
             self.mark_inbox_consumed(execution_id, inbox_id, now_ms)?;
@@ -764,7 +755,6 @@ impl Database {
                 now_ms,
             )?;
         }
-        self.cancel_terminal_effects(execution_id)?;
         if let Some(inbox_id) = inbox_id {
             self.mark_inbox_consumed(execution_id, inbox_id, now_ms)?;
         }
@@ -809,7 +799,6 @@ impl Database {
         next.interrupt_terminal(reason)?;
         self.cancel_active_timers(execution_id)?;
         self.persist_state_cas(&state, &next, now_ms)?;
-        self.cancel_terminal_effects(execution_id)?;
         self.cache_pending(next.clone())?;
         Ok(ApplyOutcome::Committed {
             agreed_step: None,
@@ -848,7 +837,6 @@ impl Database {
         next.publish_receipt(artifact.clone())?;
         self.persist_state_cas(&state, &next, now_ms)?;
         self.persist_terminal_publication(execution_id, next.version(), &artifact, now_ms)?;
-        self.cancel_terminal_effects(execution_id)?;
         self.cache_pending(next.clone())?;
         Ok(ApplyOutcome::Committed {
             agreed_step: None,
@@ -1584,41 +1572,6 @@ impl Database {
         )?;
         Ok(())
     }
-
-    /// Close the exact durable request that supplied a continuation answer.
-    /// The row is identified by the protocol's `(execution,event,ordinal)`
-    /// pending identity, not by the current event position or by whichever
-    /// request happens to be first in the outbox. Clearing a live lease here
-    /// makes the dispatch transaction the acknowledgement point; a later
-    /// explicit delivery acknowledgement is consequently idempotent.
-    fn acknowledge_pending_effect(
-        &mut self,
-        execution_id: ExecId,
-        pending: PendingId,
-        event: &Event<Vec<u8>>,
-    ) -> Result<(), StoreError> {
-        let row = self.pending_effect_row(execution_id, pending)?;
-        let operation_matches = match (event, &row.effect) {
-            (
-                Event::InputReceived { callout_index, .. },
-                Effect::Callout {
-                    callout_index: effect_index,
-                    ..
-                },
-            ) => callout_index == effect_index,
-            _ => false,
-        };
-        if !operation_matches {
-            return Err(StoreError::Protocol(
-                ProtocolError::PendingContinuationMismatch,
-            ));
-        }
-        if row.status == OutboxStatus::Acknowledged {
-            return Ok(());
-        }
-        self.acknowledge_effect_rows(execution_id, &[row.outbox_id])?;
-        Ok(())
-    }
 }
 
 fn validate_effect_payloads(effects: &[Effect]) -> Result<(), StoreError> {
@@ -1712,15 +1665,13 @@ fn validate_dispatch_sources(
     }
     if pending_id.is_some() && !pending_applicable {
         return Err(StoreError::Corruption(
-            "pending id supplied for a non-continuation event".into(),
+            "pending id supplied for an event other than InputReceived".into(),
         ));
     }
     let answer = matches!(event, Event::InputReceived { .. });
-    if (answer || pending_id.is_some())
-        && pending_id != state.status().pending().map(|pending| pending.id)
-    {
+    if (answer || pending_id.is_some()) && pending_id != state.callout().map(|callout| callout.id) {
         return Err(StoreError::Corruption(
-            "continuation pending id does not match status".into(),
+            "callout pending id does not match the open callout".into(),
         ));
     }
     if let Some(timer_id) = timer_id {

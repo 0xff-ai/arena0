@@ -431,7 +431,6 @@ fn effect_label(effect: &arena0_client::api::EffectSummary) -> String {
         EffectKind::SessionEnd => "session end",
         EffectKind::SessionAbort => "session abort",
         EffectKind::Broadcast => "broadcast",
-        EffectKind::Callout => "callout",
         EffectKind::SetTimer => "set timer",
         EffectKind::Fail => "fail",
     };

@@ -2251,6 +2251,7 @@ mod tests {
             }
             assert!(activated, "MCP-driven executions did not activate");
             let mut sessions = [Value::Null, Value::Null];
+            let mut answered = [Value::Null, Value::Null];
             for _ in 0..100 {
                 for index in 0..2 {
                     if !sessions[index].is_null() { continue; }
@@ -2260,10 +2261,21 @@ mod tests {
                     match event["event"].as_str() {
                         Some("waiting") => {},
                         Some("callout") => {
-                            call_mcp_tool(&clients[index], "answer_callout", serde_json::json!({
+                            if answered[index] == event["pending_id"] {
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                                continue;
+                            }
+                            let result = call_mcp_tool_result(&clients[index], "answer_callout", serde_json::json!({
                                 "token": tokens[index], "execution": executions[index],
                                 "pending_id": event["pending_id"], "answer": "Rock"
                             })).await;
+                            if result.is_error == Some(true) {
+                                let error = result.structured_content.expect("structured error");
+                                assert!(matches!(error["code"].as_str(), Some("CalloutNotPending")), "{error}");
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            } else {
+                                answered[index] = event["pending_id"].clone();
+                            }
                         }
                         Some("completed") => sessions[index] = event["session"].clone(),
                         _ => panic!("unexpected execution event"),

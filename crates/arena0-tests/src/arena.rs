@@ -949,14 +949,10 @@ impl Expect<'_> {
             self.run.drain_events();
             let participant = &mut self.run.participants[self.participant];
             let pending = participant.events.iter().find_map(|event| match event {
-                SessionMessage::CalloutRequested {
-                    pending_id,
-                    callout_index,
-                    ..
-                } => Some((*pending_id, *callout_index)),
+                SessionMessage::CalloutRequested { pending_id, .. } => Some(*pending_id),
                 _ => None,
             });
-            if let Some((pending_id, callout_index)) = pending {
+            if let Some(pending_id) = pending {
                 participant
                     .events
                     .retain(|event| !matches!(event, SessionMessage::CalloutRequested { .. }));
@@ -966,7 +962,6 @@ impl Expect<'_> {
                     .cmd_tx
                     .send(ExecCommand::SubmitInput {
                         pending_id,
-                        callout_index,
                         data: json.clone(),
                         reply: tx,
                     })

@@ -515,6 +515,13 @@ impl ProgramInstance {
         let output = self
             .decode_resident_result(returned.0, returned.1)
             .or_else(|error| self.rollback_error(error))?;
+        if output.status == CallStatus::Accepted
+            && let Some(callout) = &output.callout
+            && let Err(error) =
+                super::validate_callout_context(&self.store.data().callout_inputs, callout)
+        {
+            return self.rollback_error(error);
+        }
         {
             let mut guest = Guest::new(&mut self.store, &self.instance);
             if let Err(error) = guest
@@ -539,6 +546,7 @@ impl ProgramInstance {
             return Ok(DispatchCallResult {
                 status: output.status,
                 reason: output.reason,
+                callout: None,
                 shared: self.committed_shared.clone(),
                 local: self.committed_local.clone(),
                 shared_hash: self.committed_shared_hash()?,
@@ -569,6 +577,7 @@ impl ProgramInstance {
         Ok(DispatchCallResult {
             status: output.status,
             reason: output.reason,
+            callout: output.callout,
             shared,
             local,
             shared_hash,
@@ -839,7 +848,7 @@ mod resident_runtime_tests {
         let definition = definition(capabilities);
         let metadata_bytes = definition.encode().unwrap();
         let metadata = wat_data(&metadata_bytes);
-        let output = wat_data(&[0, 0]);
+        let output = wat_data(&[0, 0, 0]);
         let initialize = wat_data(&[0; 8]);
         let wat = format!(
             r#"
@@ -926,7 +935,7 @@ mod resident_runtime_tests {
           i32.const 6
           call $broadcast
           i32.const 32768
-          i32.const 2
+          i32.const 3
           call $pack
         "#
     }
@@ -941,7 +950,7 @@ mod resident_runtime_tests {
             unreachable
           end
           i32.const 32768
-          i32.const 2
+          i32.const 3
           call $pack
         "#
     }
@@ -957,7 +966,7 @@ mod resident_runtime_tests {
           i32.const 1
           call $state_write
           i32.const 32768
-          i32.const 2
+          i32.const 3
           call $pack
         "#
     }
@@ -976,7 +985,7 @@ mod resident_runtime_tests {
           i32.const 1
           i32.store8
           i32.const 32768
-          i32.const 2
+          i32.const 3
           call $pack
         "#
     }
@@ -1011,7 +1020,7 @@ mod resident_runtime_tests {
           i32.const 1
           i32.store8
           i32.const 32768
-          i32.const 2
+          i32.const 3
           call $pack
         "#
     }
@@ -1044,7 +1053,7 @@ mod resident_runtime_tests {
               (memory (export "arena0_shared") 65 65)
               (memory (export "arena0_local") 65 65)
               (global (export "arena0_abi_version") i32 (i32.const 22))
-              (data (i32.const 32768) "\00\00")
+              (data (i32.const 32768) "\00\00\00")
               (func $pack (param $ptr i32) (param $len i32) (result i64)
                 local.get $ptr
                 i64.extend_i32_u
@@ -1066,7 +1075,7 @@ mod resident_runtime_tests {
                 i32.const 1
                 i32.store8 1
                 i32.const 32768
-                i32.const 2
+                i32.const 3
                 call $pack)
               (func (export "arena0_writer") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_query") (param i32 i32) (result i64) i64.const 0)

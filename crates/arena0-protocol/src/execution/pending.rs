@@ -1,4 +1,4 @@
-//! Typed identities for durable execution continuations.
+//! The durable open callout and its identity.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -8,7 +8,9 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// The stable identity of one pending execution continuation.
+use crate::bounded::{read_bytes as read_bounded_bytes, write_bytes as write_bounded_bytes};
+
+/// The stable identity of one open callout.
 ///
 /// The protocol stores this value as an unsigned 64-bit integer so its
 /// deterministic Borsh representation remains compact. JSON surfaces encode
@@ -43,22 +45,56 @@ impl PendingId {
     }
 }
 
-/// Derive a continuation identity from the execution event position and the
-/// effect ordinal that created it. Event position is the only execution
-/// coordinate; there is no private record sequence.
+/// The single open callout derived from program state.
+///
+/// After every accepted dispatch the program's read-only `callout` function
+/// computes at most one open callout from the resulting state image. The host
+/// stores it with that image, so the callout is never emitted as an effect and
+/// never acts as a lock.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct OpenCallout {
+    /// Stable identity of this open callout.
+    pub id: PendingId,
+    /// Program-local callout variant index.
+    pub callout_index: u32,
+    /// Agent-facing JSON context for that callout.
+    pub context: Vec<u8>,
+}
+
+impl BorshSerialize for OpenCallout {
+    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        BorshSerialize::serialize(&self.id, writer)?;
+        BorshSerialize::serialize(&self.callout_index, writer)?;
+        write_bounded_bytes(
+            writer,
+            &self.context,
+            arena0_program::MAX_CALLOUT_CONTEXT_BYTES,
+            "callout context",
+        )
+    }
+}
+
+impl BorshDeserialize for OpenCallout {
+    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        Ok(Self {
+            id: PendingId::deserialize_reader(reader)?,
+            callout_index: u32::deserialize_reader(reader)?,
+            context: read_bounded_bytes(
+                reader,
+                arena0_program::MAX_CALLOUT_CONTEXT_BYTES,
+                "callout context",
+            )?,
+        })
+    }
+}
+
+/// Derive a callout identity from the execution event position that
+/// produced it. Event position is the only execution coordinate; there is no
+/// private record sequence.
 #[must_use]
-pub fn pending_id(
-    execution_id: crate::ExecId,
-    event_position: u64,
-    effect_index: u32,
-) -> PendingId {
-    let bytes = borsh::to_vec(&(
-        b"arena0/pending/v2",
-        execution_id,
-        event_position,
-        effect_index,
-    ))
-    .expect("pending id preimage is serializable");
+pub fn pending_id(execution_id: crate::ExecId, event_position: u64) -> PendingId {
+    let bytes = borsh::to_vec(&(b"arena0/pending/v3", execution_id, event_position))
+        .expect("pending id preimage is serializable");
     let digest = blake3::hash(&bytes);
     PendingId::new(u64::from_le_bytes(
         digest.as_bytes()[..8]

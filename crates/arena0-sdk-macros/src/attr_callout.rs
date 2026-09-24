@@ -98,7 +98,7 @@ pub(crate) fn expand_arena0_callouts(item: ItemEnum) -> Result<TokenStream2> {
         let response_variant_doc =
             format!("Input response for the `{name}` callout, carrying `{output_ty_name}`.");
         let request_struct_doc = format!(
-            "Typed request payload for callout `{name}`. Dispatch it with `ctx.effects().callout(callouts::{name} {{ ... }}).dispatch()`; the response reaches `on_input` as `{output_ty_name}`."
+            "Typed request payload for callout `{name}`. Return it from `callout(ctx)`; the response reaches `on_input` as `{output_ty_name}`."
         );
 
         // Response variant: VariantName(OutputType)
@@ -174,10 +174,6 @@ pub(crate) fn expand_arena0_callouts(item: ItemEnum) -> Result<TokenStream2> {
             impl ::arena0::Arena0CalloutRequest for callouts::#variant_ident {
                 fn callout_index(&self) -> u32 {
                     #idx_u32
-                }
-
-                fn expected_type_name(&self) -> Option<&'static str> {
-                    Some(::core::any::type_name::<#output_ty>())
                 }
             }
 

@@ -2157,16 +2157,6 @@ impl HostService {
             .load_execution(exec_id)
             .await
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
-        let pending = if state.is_some() {
-            self.store
-                .list_pending_requests(exec_id)
-                .await
-                .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
-                .into_iter()
-                .find(|request| matches!(request, arena0_store::PendingRequest::Callout { .. }))
-        } else {
-            None
-        };
         let receipt_available = if let Some(state) = &state {
             self.store
                 .load_receipt(state.binding().session_id())
@@ -2176,15 +2166,8 @@ impl HostService {
         } else {
             false
         };
-        project_exec_status_facts(
-            self.peer_id,
-            request,
-            activation,
-            state,
-            pending,
-            receipt_available,
-        )
-        .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))
+        project_exec_status_facts(self.peer_id, request, activation, state, receipt_available)
+            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))
     }
 
     async fn active_execution_count(&self) -> Result<usize, ApiError> {
@@ -2253,14 +2236,7 @@ impl HostService {
                 "execution has no live driver",
             ));
         };
-        if let Some(event) = project_durable_next(
-            state,
-            self.store
-                .list_pending_requests(exec_id)
-                .await
-                .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?,
-            &schema,
-        )? {
+        if let Some(event) = project_durable_next(state, &schema)? {
             return Ok(NextProjection::Ready(event));
         }
         Err(ApiError::new(
@@ -3368,17 +3344,14 @@ impl HostService {
     ) -> Result<Option<u32>, ApiError> {
         Ok(self
             .store
-            .list_pending_requests(exec_id)
+            .load_execution(exec_id)
             .await
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
-            .into_iter()
-            .find_map(|request| match request {
-                arena0_store::PendingRequest::Callout {
-                    pending_id: id,
-                    callout_index,
-                    ..
-                } if id == pending_id => Some(callout_index),
-                _ => None,
+            .and_then(|state| {
+                state
+                    .callout()
+                    .filter(|callout| callout.id == pending_id)
+                    .map(|callout| callout.callout_index)
             }))
     }
 
@@ -3605,25 +3578,11 @@ fn project_exec_status_facts(
     request: ExecutionRequest,
     activation: Option<ActivationRecord>,
     state: Option<arena0_protocol::execution::ExecutionState>,
-    pending: Option<arena0_store::PendingRequest>,
     receipt_available: bool,
 ) -> anyhow::Result<ExecStatus> {
     let exec_id = request.execution_id();
     let program_id = request.program_hash();
     let negotiation_id = request.negotiation_id();
-    let pending_callout = pending.map(|request| {
-        let arena0_store::PendingRequest::Callout {
-            pending_id,
-            callout_index,
-            expected_type,
-            ..
-        } = request;
-        PendingCalloutStatus {
-            pending_id,
-            callout_index,
-            expected_type,
-        }
-    });
     let session_status = |state: &arena0_protocol::execution::ExecutionState| {
         let activation = state.binding().activation();
         SessionStatus {
@@ -3636,7 +3595,10 @@ fn project_exec_status_facts(
                 .filter(|peer| *peer != peer_id)
                 .collect(),
             participants: activation.tickets().len(),
-            pending_callout: pending_callout.clone(),
+            pending_callout: state.callout().map(|callout| PendingCalloutStatus {
+                pending_id: callout.id,
+                callout_index: callout.callout_index,
+            }),
             receipt_available,
         }
     };
@@ -3646,11 +3608,11 @@ fn project_exec_status_facts(
             ExecutionStatus::Activating => ExecStatusState::Activating {
                 session_id: Some(state.binding().session_id()),
             },
-            ExecutionStatus::Active
-            | ExecutionStatus::Waiting { .. }
-            | ExecutionStatus::TerminalProof { .. } => ExecStatusState::Active {
-                session: session_status(&state),
-            },
+            ExecutionStatus::Active | ExecutionStatus::TerminalProof { .. } => {
+                ExecStatusState::Active {
+                    session: session_status(&state),
+                }
+            }
             ExecutionStatus::Completed { .. } => ExecStatusState::Completed {
                 session: session_status(&state),
             },
@@ -3764,7 +3726,6 @@ fn project_event_record_summary(
                     arena0_store::EffectKind::SessionEnd => ApiEffectKind::SessionEnd,
                     arena0_store::EffectKind::SessionAbort => ApiEffectKind::SessionAbort,
                     arena0_store::EffectKind::Broadcast => ApiEffectKind::Broadcast,
-                    arena0_store::EffectKind::Callout => ApiEffectKind::Callout,
                     arena0_store::EffectKind::SetTimer => ApiEffectKind::SetTimer,
                     arena0_store::EffectKind::Fail => ApiEffectKind::Fail,
                 },
@@ -4275,7 +4236,7 @@ mod tests {
             event: arena0_store::EventKind::InputReceived,
             input_payload_bytes: Some(2),
             effects: vec![arena0_store::EffectSummary {
-                kind: arena0_store::EffectKind::Callout,
+                kind: arena0_store::EffectKind::Broadcast,
                 payload_bytes: Some(8),
             }],
         };
@@ -4284,7 +4245,7 @@ mod tests {
         assert_eq!(projected.agreed_steps, vec![3]);
         assert_eq!(projected.event, ApiEventKind::InputReceived);
         assert_eq!(projected.input_payload_bytes, Some(2));
-        assert_eq!(projected.effects[0].kind, ApiEffectKind::Callout);
+        assert_eq!(projected.effects[0].kind, ApiEffectKind::Broadcast);
         assert_eq!(projected.effects[0].payload_bytes, Some(8));
         let encoded = serde_json::to_value(projected).expect("projection JSON");
         assert!(encoded.get("data").is_none());
@@ -4995,15 +4956,9 @@ mod tests {
             .await
             .expect("load prepared activation")
             .expect("prepared activation exists");
-        let prepared_status = project_exec_status_facts(
-            peer,
-            request.clone(),
-            Some(prepared_record),
-            None,
-            None,
-            false,
-        )
-        .expect("project prepared status");
+        let prepared_status =
+            project_exec_status_facts(peer, request.clone(), Some(prepared_record), None, false)
+                .expect("project prepared status");
         assert!(matches!(
             prepared_status.state,
             ExecStatusState::Activating { session_id: None }
@@ -5042,15 +4997,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![peer, other]
         );
-        let committed_status = project_exec_status_facts(
-            peer,
-            request,
-            Some(committed_record.clone()),
-            None,
-            None,
-            false,
-        )
-        .expect("project committed status");
+        let committed_status =
+            project_exec_status_facts(peer, request, Some(committed_record.clone()), None, false)
+                .expect("project committed status");
         assert!(matches!(
             committed_status.state,
             ExecStatusState::Activating {
@@ -5082,15 +5031,9 @@ mod tests {
             .await
             .expect("load failed request")
             .expect("failed request exists");
-        let failed_status = project_exec_status_facts(
-            peer,
-            failed_request,
-            Some(committed_record),
-            None,
-            None,
-            false,
-        )
-        .expect("project post-commit failure");
+        let failed_status =
+            project_exec_status_facts(peer, failed_request, Some(committed_record), None, false)
+                .expect("project post-commit failure");
         assert!(matches!(
             failed_status.state,
             ExecStatusState::Failed {

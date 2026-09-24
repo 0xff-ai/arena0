@@ -21,13 +21,6 @@ unsafe extern "C" {
     fn log(level: u32, msg_ptr: u32, msg_len: u32);
     fn random(buf_ptr: u32, buf_len: u32);
     fn broadcast(data_ptr: u32, data_len: u32);
-    fn request_input(
-        variant_index: u32,
-        context_ptr: u32,
-        context_len: u32,
-        expected_ptr: u32,
-        expected_len: u32,
-    );
     fn set_timer(delay_ms: u64, type_ptr: u32, type_len: u32, data_ptr: u32, data_len: u32);
     fn sign(scheme: u32, data_ptr: u32, data_len: u32, out_ptr: u32, out_cap: u32) -> u32;
     fn end_session(result_ptr: u32, result_len: u32);
@@ -125,25 +118,6 @@ pub(crate) fn host_broadcast(msg_bytes: &[u8]) {
     #[cfg(not(target_arch = "wasm32"))]
     crate::testing::push_effect(arena0_protocol::Effect::Broadcast {
         data: msg_bytes.to_vec(),
-    });
-}
-
-pub(crate) fn host_callout_raw(callout_index: u32, context: &[u8], expected_type: Option<&str>) {
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
-        request_input(
-            callout_index,
-            context.as_ptr() as u32,
-            context.len() as u32,
-            expected_type.map_or(0, |value| value.as_ptr() as u32),
-            expected_type.map_or(0, str::len) as u32,
-        );
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    crate::testing::push_effect(arena0_protocol::Effect::Callout {
-        callout_index,
-        context: context.to_vec(),
-        expected_type: expected_type.map(str::to_string),
     });
 }
 

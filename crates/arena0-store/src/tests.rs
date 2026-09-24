@@ -104,30 +104,6 @@ fn session_started_event(fixture: &ActivationFixture) -> Event<Vec<u8>> {
     Event::SessionStarted { ensemble }
 }
 
-fn local_continuation_rows(path: &Path, execution_id: ExecId) -> Vec<(String, Effect)> {
-    let connection = Connection::open(path).expect("inspect database");
-    let mut statement = connection
-        .prepare(
-            "SELECT status, payload
-             FROM outbox
-             WHERE execution_id = ?1 AND destination IS NULL
-               AND payload_kind = 'effect'
-             ORDER BY event_position, version, ordinal, outbox_id",
-        )
-        .expect("prepare continuation rows");
-    let mut rows = statement
-        .query(rusqlite::params![execution_id.0.to_vec()])
-        .expect("query continuation rows");
-    let mut result = Vec::new();
-    while let Some(row) = rows.next().expect("read continuation row") {
-        let status = row.get::<_, String>(0).expect("continuation status");
-        let payload = row.get::<_, Vec<u8>>(1).expect("continuation payload");
-        let effect = borsh::from_slice::<Effect>(&payload).expect("decode continuation effect");
-        result.push((status, effect));
-    }
-    result
-}
-
 async fn sign_step(
     store: &Store,
     fixture: &ActivationFixture,
@@ -260,6 +236,7 @@ async fn certify_terminal(store: &Store, fixture: &ActivationFixture, execution_
             local,
             effects,
             terminal_outcome,
+            None,
             None,
             None,
             None,
@@ -1153,6 +1130,83 @@ async fn queue_byte_budget_rejects_before_enqueue() {
     store.shutdown().await.expect("shutdown");
 }
 
+#[tokio::test]
+async fn dispatch_callout_counts_against_queue_budget_before_enqueue() {
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("store.sqlite");
+    let execution_id = ExecId([0x76; 32]);
+    let store = create_execution(&path, &fixture, execution_id).await;
+    store.shutdown().await.unwrap();
+    let budget = 4096;
+    let store =
+        Store::open(StoreConfig::new(&path, fixture.producer).with_queue_bytes(budget)).unwrap();
+    let before = store
+        .handle()
+        .load_execution(execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut writer = store.handle().claim_execution(execution_id).unwrap();
+    let callout = arena0_program::CalloutRequest {
+        callout_index: 0,
+        context: serde_json::to_vec(&"x".repeat(8192)).unwrap(),
+    };
+    let result = writer
+        .commit_dispatch(
+            before.version(),
+            session_started_event(&fixture),
+            before.shared_state().clone(),
+            before.local_state().clone(),
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            Some(callout),
+            7,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(StoreError::CommandTooLarge { required, capacity })
+        if required > budget && capacity == budget)
+    );
+    assert_eq!(
+        store
+            .handle()
+            .load_execution(execution_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    // The same dispatch without its callout fits and reaches the real store operation.
+    assert!(matches!(
+        writer
+            .commit_dispatch(
+                before.version(),
+                session_started_event(&fixture),
+                before.shared_state().clone(),
+                before.local_state().clone(),
+                vec![],
+                None,
+                None,
+                None,
+                None,
+                None,
+                7,
+            )
+            .await
+            .unwrap(),
+        ApplyOutcome::Committed {
+            proposal_staged: true,
+            ..
+        }
+    ));
+    drop(writer);
+    store.shutdown().await.unwrap();
+}
+
 #[test]
 fn default_queue_budget_covers_maximal_program_command() {
     let directory = tempfile::tempdir().expect("tempdir");
@@ -1545,10 +1599,9 @@ async fn activation_prepare_commit_is_idempotent_and_recoverable() {
         .await
         .expect("load active")
         .expect("active state");
-    let callout = Effect::Callout {
+    let callout = arena0_program::CalloutRequest {
         callout_index: 0,
         context: vec![0xaa],
-        expected_type: None,
     };
     assert!(matches!(
         writer
@@ -1557,17 +1610,15 @@ async fn activation_prepare_commit_is_idempotent_and_recoverable() {
                 session_started_event(&fixture),
                 SharedStateBytes::try_new(vec![0]).expect("shared state"),
                 LocalStateBytes::try_new(Vec::new()).expect("local state"),
-                vec![
-                    Effect::SetTimer {
-                        delay_ms: 10,
-                        timer: TimerPayload::unit(),
-                    },
-                    callout,
-                ],
+                vec![Effect::SetTimer {
+                    delay_ms: 10,
+                    timer: TimerPayload::unit(),
+                },],
                 None,
                 None,
                 None,
                 None,
+                Some(callout),
                 9,
             )
             .await
@@ -1631,29 +1682,8 @@ async fn activation_prepare_commit_is_idempotent_and_recoverable() {
             OutboxDeliveryOutcome::Acknowledged
         );
     }
-    let first = writer
-        .lease_next_outbox(11)
-        .await
-        .expect("lease callout")
-        .expect("callout item");
-    assert_eq!(first.item.event_position, 0);
-    assert_eq!(first.item.ordinal, 1);
-    assert_eq!(first.item.payload_kind, OutboxPayloadKind::Effect);
-    assert!(matches!(
-        borsh::from_slice::<Effect>(&first.item.payload).expect("callout effect"),
-        Effect::Callout {
-            callout_index: 0,
-            context,
-            ..
-        } if context == [0xaa]
-    ));
-    assert_eq!(
-        writer
-            .acknowledge_outbox(first.item.outbox_id, first.lease_id)
-            .await
-            .expect("ack callout"),
-        OutboxDeliveryOutcome::Acknowledged
-    );
+    let recovered = reopened.handle().load_execution(id).await.unwrap().unwrap();
+    assert_eq!(recovered.callout().unwrap().context, vec![0xaa]);
     assert!(
         writer
             .lease_next_outbox(11)
@@ -1689,18 +1719,15 @@ async fn deferred_broadcast_commits_two_steps_at_one_event_position() {
                 session_started_event(&fixture),
                 SharedStateBytes::try_new(vec![0]).expect("shared state"),
                 LocalStateBytes::try_new(Vec::new()).expect("local state"),
-                vec![
-                    Effect::Callout {
-                        callout_index: 0,
-                        context: vec![3],
-                        expected_type: None,
-                    },
-                    Effect::Broadcast { data: vec![7, 8] },
-                ],
+                vec![Effect::Broadcast { data: vec![7, 8] },],
                 None,
                 None,
                 None,
                 None,
+                Some(arena0_program::CalloutRequest {
+                    callout_index: 0,
+                    context: vec![3],
+                }),
                 7,
             )
             .await
@@ -1777,9 +1804,8 @@ async fn deferred_broadcast_commits_two_steps_at_one_event_position() {
     assert!(after_successor.pending_shared().is_none());
 
     let mut signatures = 0;
-    let mut callout = false;
     let mut broadcast = false;
-    for _ in 0..3 {
+    for _ in 0..2 {
         let leased = writer
             .lease_next_outbox(11)
             .await
@@ -1787,19 +1813,6 @@ async fn deferred_broadcast_commits_two_steps_at_one_event_position() {
             .expect("outbox row");
         assert_eq!(leased.item.event_position, 0);
         match leased.item.payload_kind {
-            OutboxPayloadKind::Effect => {
-                assert_eq!(leased.item.destination, None);
-                assert_eq!(leased.item.ordinal, 0);
-                assert!(matches!(
-                    borsh::from_slice::<Effect>(&leased.item.payload).expect("callout payload"),
-                    Effect::Callout {
-                        callout_index: 0,
-                        context,
-                        ..
-                    } if context == [3]
-                ));
-                callout = true;
-            }
             OutboxPayloadKind::Frame => {
                 assert_eq!(leased.item.destination, Some(other_peer(&fixture)));
                 match borsh::from_slice::<ExecFrame>(&leased.item.payload).expect("frame payload") {
@@ -1814,7 +1827,7 @@ async fn deferred_broadcast_commits_two_steps_at_one_event_position() {
                         data,
                         ..
                     } => {
-                        assert_eq!(leased.item.ordinal, 2);
+                        assert_eq!(leased.item.ordinal, 1);
                         assert_eq!(seq, 1);
                         assert_eq!(prestate, after_first.agreed_state());
                         assert_eq!(poststate, after_first.agreed_state());
@@ -1836,7 +1849,7 @@ async fn deferred_broadcast_commits_two_steps_at_one_event_position() {
         );
     }
     assert_eq!(signatures, 1);
-    assert!(callout);
+    assert_eq!(after_successor.callout().unwrap().context, vec![3]);
     assert!(broadcast);
     assert!(
         writer
@@ -1891,6 +1904,7 @@ async fn pending_proposal_leases_frames_but_withholds_local_effects() {
             None,
             None,
             None,
+            None,
             7,
         )
         .await
@@ -1910,10 +1924,9 @@ async fn pending_proposal_leases_frames_but_withholds_local_effects() {
         .await
         .expect("ack initial signature");
 
-    let callout = Effect::Callout {
+    let callout = arena0_program::CalloutRequest {
         callout_index: 0,
         context: vec![0x51],
-        expected_type: None,
     };
     let broadcast = vec![0x61, 0x62];
     writer
@@ -1922,16 +1935,14 @@ async fn pending_proposal_leases_frames_but_withholds_local_effects() {
             Event::React,
             SharedStateBytes::try_new(vec![0]).expect("shared state"),
             LocalStateBytes::try_new(Vec::new()).expect("local state"),
-            vec![
-                callout,
-                Effect::Broadcast {
-                    data: broadcast.clone(),
-                },
-            ],
+            vec![Effect::Broadcast {
+                data: broadcast.clone(),
+            }],
             None,
             None,
             None,
             None,
+            Some(callout),
             10,
         )
         .await
@@ -1948,7 +1959,7 @@ async fn pending_proposal_leases_frames_but_withholds_local_effects() {
         establishing.item.event_position,
         after_start.event_position()
     );
-    assert_eq!(establishing.item.ordinal, 2);
+    assert_eq!(establishing.item.ordinal, 1);
     assert!(matches!(
         borsh::from_slice::<ExecFrame>(&establishing.item.payload).expect("frame payload"),
         ExecFrame::Message { data, .. } if data == broadcast
@@ -1968,34 +1979,11 @@ async fn pending_proposal_leases_frames_but_withholds_local_effects() {
     let committed = sign_step(&store, &fixture, execution_id, &mut writer, 12, 13).await;
     assert!(committed.pending_shared().is_none());
     assert_eq!(
-        committed.status().pending().expect("callout pending").id,
-        arena0_protocol::pending_id(execution_id, after_start.event_position(), 0)
+        committed.callout().expect("callout pending").id,
+        arena0_protocol::pending_id(execution_id, after_start.event_position())
     );
 
-    let mut found_callout = false;
-    for _ in 0..2 {
-        let Some(leased) = writer
-            .lease_next_outbox(13)
-            .await
-            .expect("lease committed outbox")
-        else {
-            break;
-        };
-        if leased.item.payload_kind == OutboxPayloadKind::Effect {
-            assert_eq!(leased.item.event_position, after_start.event_position());
-            assert_eq!(leased.item.ordinal, 0);
-            assert!(matches!(
-                borsh::from_slice::<Effect>(&leased.item.payload).expect("callout payload"),
-                Effect::Callout { context, .. } if context == vec![0x51]
-            ));
-            found_callout = true;
-        }
-        writer
-            .acknowledge_outbox(leased.item.outbox_id, leased.lease_id)
-            .await
-            .expect("ack committed outbox");
-    }
-    assert!(found_callout, "callout becomes leasable after agreement");
+    assert_eq!(committed.callout().unwrap().context, vec![0x51]);
     drop(writer);
     store.shutdown().await.expect("shutdown");
 }
@@ -2028,6 +2016,7 @@ async fn interrupt_terminal_freezes_proof_and_cancels_timers_after_restart() {
                 delay_ms: 100,
                 timer: TimerPayload::unit(),
             }],
+            None,
             None,
             None,
             None,
@@ -2070,6 +2059,7 @@ async fn interrupt_terminal_freezes_proof_and_cancels_timers_after_restart() {
                 outcome: outcome.clone(),
             }],
             Some(TerminalOutcome::new(outcome, br#"null"#.to_vec()).expect("outcome")),
+            None,
             None,
             None,
             None,
@@ -2173,6 +2163,7 @@ async fn stopping_an_unsigned_proposal_cancels_exact_frames_and_recovers() {
             None,
             None,
             None,
+            None,
             7,
         )
         .await
@@ -2204,6 +2195,7 @@ async fn stopping_an_unsigned_proposal_cancels_exact_frames_and_recovers() {
                 SharedStateBytes::try_new(vec![0]).expect("shared state"),
                 LocalStateBytes::try_new(Vec::new()).expect("local state"),
                 vec![Effect::Broadcast { data: data.clone() }],
+                None,
                 None,
                 None,
                 None,
@@ -2381,6 +2373,7 @@ async fn portable_events_stage_agreement_without_shared_state_delta() {
                 None,
                 None,
                 None,
+                None,
                 7,
             )
             .await
@@ -2424,6 +2417,7 @@ async fn portable_events_stage_agreement_without_shared_state_delta() {
                 None,
                 None,
                 None,
+                None,
                 10,
             )
             .await
@@ -2457,7 +2451,7 @@ async fn portable_events_stage_agreement_without_shared_state_delta() {
 }
 
 #[tokio::test]
-async fn terminal_agreement_retires_stale_continuation_effects() {
+async fn terminal_agreement_clears_open_callout() {
     let fixture = activation_fixture();
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("store.sqlite");
@@ -2467,10 +2461,9 @@ async fn terminal_agreement_retires_stale_continuation_effects() {
         .handle()
         .claim_execution(execution_id)
         .expect("execution writer");
-    let callout = Effect::Callout {
+    let callout = arena0_program::CalloutRequest {
         callout_index: 0,
         context: vec![0x41],
-        expected_type: None,
     };
     let state = store
         .handle()
@@ -2484,38 +2477,19 @@ async fn terminal_agreement_retires_stale_continuation_effects() {
             session_started_event(&fixture),
             SharedStateBytes::try_new(vec![0]).expect("shared state"),
             LocalStateBytes::try_new(Vec::new()).expect("local state"),
-            vec![callout],
+            vec![],
             None,
             None,
             None,
             None,
+            Some(callout),
             7,
         )
         .await
         .expect("stage callout");
     let waiting = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
 
-    // Leave the originating request leased while the terminal agreement is
-    // staged. Terminal completion must retire the continuation row.
-    let leased_callout = loop {
-        let candidate = writer
-            .lease_next_outbox(10)
-            .await
-            .expect("lease callout")
-            .expect("callout row");
-        if candidate.item.payload_kind == OutboxPayloadKind::Frame {
-            writer
-                .acknowledge_outbox(candidate.item.outbox_id, candidate.lease_id)
-                .await
-                .expect("ack preceding frame");
-            continue;
-        }
-        break candidate;
-    };
-    assert!(matches!(
-        borsh::from_slice::<Effect>(&leased_callout.item.payload).expect("callout payload"),
-        Effect::Callout { .. }
-    ));
+    assert!(waiting.callout().is_some());
     let after_waiting = waiting;
 
     let data = vec![0x51, 0x52];
@@ -2549,6 +2523,7 @@ async fn terminal_agreement_retires_stale_continuation_effects() {
             None,
             None,
             None,
+            None,
             12,
         )
         .await
@@ -2562,19 +2537,19 @@ async fn terminal_agreement_retires_stale_continuation_effects() {
     assert!(staged.pending_shared().is_some());
     sign_step(&store, &fixture, execution_id, &mut writer, 13, 14).await;
 
+    let state = store
+        .handle()
+        .load_execution(execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(state.callout().is_none());
     drop(writer);
     store.shutdown().await.expect("shutdown");
-    let rows = local_continuation_rows(&path, execution_id);
-    assert_eq!(rows.len(), 1);
-    assert!(rows.iter().all(|(status, _)| status == "cancelled"));
-    assert!(
-        rows.iter()
-            .any(|(_, effect)| matches!(effect, Effect::Callout { .. }))
-    );
 }
 
 #[tokio::test]
-async fn authenticated_stop_retires_stale_continuation_effects() {
+async fn authenticated_stop_clears_open_callout() {
     let fixture = activation_fixture();
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("store.sqlite");
@@ -2596,39 +2571,21 @@ async fn authenticated_stop_retires_stale_continuation_effects() {
             session_started_event(&fixture),
             SharedStateBytes::try_new(vec![0]).expect("shared state"),
             LocalStateBytes::try_new(Vec::new()).expect("local state"),
-            vec![Effect::Callout {
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            Some(arena0_program::CalloutRequest {
                 callout_index: 0,
                 context: vec![0x71],
-                expected_type: None,
-            }],
-            None,
-            None,
-            None,
-            None,
+            }),
             7,
         )
         .await
         .expect("stage callout");
     let waiting = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
-    let leased_callout = loop {
-        let candidate = writer
-            .lease_next_outbox(10)
-            .await
-            .expect("lease callout")
-            .expect("callout row");
-        if candidate.item.payload_kind == OutboxPayloadKind::Frame {
-            writer
-                .acknowledge_outbox(candidate.item.outbox_id, candidate.lease_id)
-                .await
-                .expect("ack preceding frame");
-            continue;
-        }
-        break candidate;
-    };
-    assert!(matches!(
-        borsh::from_slice::<Effect>(&leased_callout.item.payload).expect("callout payload"),
-        Effect::Callout { .. }
-    ));
+    assert!(waiting.callout().is_some());
     let after_waiting = waiting;
     let unsigned = AbortOccurrence::unsigned(
         fixture.activation.session_hash(),
@@ -2656,19 +2613,19 @@ async fn authenticated_stop_retires_stale_continuation_effects() {
         .expect("stopped state");
     assert!(stopped.status().terminal_cause().is_some());
 
+    let state = store
+        .handle()
+        .load_execution(execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(state.callout().is_none());
     drop(writer);
     store.shutdown().await.expect("shutdown");
-    let rows = local_continuation_rows(&path, execution_id);
-    assert_eq!(rows.len(), 1);
-    assert!(rows.iter().all(|(status, _)| status == "cancelled"));
-    assert!(
-        rows.iter()
-            .any(|(_, effect)| matches!(effect, Effect::Callout { .. }))
-    );
 }
 
 #[tokio::test]
-async fn consumed_pending_request_is_hidden_while_dispatch_proposal_is_staged() {
+async fn answered_callout_stays_open_while_dispatch_proposal_is_staged() {
     let fixture = activation_fixture();
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("store.sqlite");
@@ -2679,10 +2636,9 @@ async fn consumed_pending_request_is_hidden_while_dispatch_proposal_is_staged() 
         .claim_execution(execution_id)
         .expect("execution writer");
 
-    let callout = Effect::Callout {
+    let callout = arena0_program::CalloutRequest {
         callout_index: 0,
         context: vec![0x91],
-        expected_type: None,
     };
     let state = store
         .handle()
@@ -2696,17 +2652,18 @@ async fn consumed_pending_request_is_hidden_while_dispatch_proposal_is_staged() 
             session_started_event(&fixture),
             SharedStateBytes::try_new(vec![0]).expect("shared state"),
             LocalStateBytes::try_new(Vec::new()).expect("local state"),
-            vec![callout],
+            vec![],
             None,
             None,
             None,
             None,
+            Some(callout),
             7,
         )
         .await
         .expect("stage callout");
     let waiting = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
-    let pending_id = waiting.status().pending().expect("pending callout").id;
+    let pending_id = waiting.callout().expect("pending callout").id;
 
     writer
         .commit_dispatch(
@@ -2722,6 +2679,7 @@ async fn consumed_pending_request_is_hidden_while_dispatch_proposal_is_staged() 
             None,
             None,
             Some(pending_id),
+            None,
             10,
         )
         .await
@@ -2737,18 +2695,10 @@ async fn consumed_pending_request_is_hidden_while_dispatch_proposal_is_staged() 
         proposed
             .pending_shared()
             .expect("proposal")
-            .status()
-            .pending()
+            .callout()
             .is_none()
     );
-    assert!(
-        store
-            .handle()
-            .list_pending_requests(execution_id)
-            .await
-            .expect("list pending requests")
-            .is_empty()
-    );
+    assert_eq!(proposed.callout(), waiting.callout());
 
     drop(writer);
     store.shutdown().await.expect("shutdown");
@@ -2766,10 +2716,9 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
         .claim_execution(execution_id)
         .expect("execution writer");
 
-    let callout = Effect::Callout {
+    let callout = arena0_program::CalloutRequest {
         callout_index: 0,
         context: vec![3, 4],
-        expected_type: Some("u8".into()),
     };
     let state = store
         .handle()
@@ -2783,34 +2732,29 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
             session_started_event(&fixture),
             SharedStateBytes::try_new(vec![0]).expect("shared state"),
             LocalStateBytes::try_new(Vec::new()).expect("local state"),
-            vec![callout],
+            vec![],
             None,
             None,
             None,
             None,
+            Some(callout),
             20,
         )
         .await
         .expect("stage callout");
     sign_step(&store, &fixture, execution_id, &mut writer, 21, 22).await;
-    let pending_id = arena0_protocol::pending_id(execution_id, 0, 0);
+    let pending_id = arena0_protocol::pending_id(execution_id, 0);
 
-    let requests = store
+    let committed = store
         .handle()
-        .list_pending_requests(execution_id)
+        .load_execution(execution_id)
         .await
-        .expect("pending callout request");
-    assert_eq!(requests.len(), 1);
-    assert!(matches!(
-        &requests[0],
-        PendingRequest::Callout {
-            pending_id: found,
-            callout_index: 0,
-            context,
-            expected_type: Some(expected),
-            ..
-        } if *found == pending_id && context == &vec![3, 4] && expected == "u8"
-    ));
+        .unwrap()
+        .unwrap();
+    let request = committed.callout().unwrap();
+    assert_eq!(request.id, pending_id);
+    assert_eq!(request.callout_index, 0);
+    assert_eq!(request.context, vec![3, 4]);
 
     let state = store
         .handle()
@@ -2832,6 +2776,7 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
             None,
             None,
             Some(pending_id),
+            None,
             24,
         )
         .await
@@ -2859,26 +2804,13 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
     assert_eq!(page.summaries()[0].agreed_steps, vec![0]);
     assert_eq!(page.summaries()[0].event, EventKind::SessionStarted);
     assert_eq!(page.summaries()[0].input_payload_bytes, None);
-    assert_eq!(
-        page.summaries()[0].effects[0],
-        EffectSummary {
-            kind: EffectKind::Callout,
-            payload_bytes: Some(2),
-        }
-    );
+    assert!(page.summaries()[0].effects.is_empty());
     assert_eq!(page.summaries()[1].event_position, 1);
     assert_eq!(page.summaries()[1].agreed_steps, Vec::<u64>::new());
     assert_eq!(page.summaries()[1].event, EventKind::InputReceived);
     assert_eq!(page.summaries()[1].input_payload_bytes, Some(1));
     assert!(page.summaries()[1].effects.is_empty());
-    assert!(
-        store
-            .handle()
-            .list_pending_requests(execution_id)
-            .await
-            .expect("no pending request after consumption")
-            .is_empty()
-    );
+    assert!(final_state.callout().is_none());
     store.shutdown().await.expect("shutdown");
 }
 
@@ -2909,6 +2841,7 @@ async fn accepted_inbound_signature_survives_restart_and_applies_once() {
             local,
             effects,
             terminal_outcome,
+            None,
             None,
             None,
             None,

@@ -46,8 +46,8 @@ pub type MessageApply<P> = Result<ApplyDecision<<P as Program>::Phase>, Protocol
 /// agreement boundary; a fault or deterministic rejection restores both state
 /// values and discards provisional effects.
 ///
-/// Module-shell programs use synchronous handlers. Callout effects are emitted
-/// explicitly through their builders; answers are delivered through the
+/// Module-shell programs use synchronous handlers. The open callout is derived
+/// from state by [`Program::callout`]; answers are delivered through the
 /// `on_input` dispatch path.
 ///
 /// # Associated types
@@ -72,7 +72,7 @@ pub trait Program: Sized {
         + BorshDeserialize
         + borsh::BorshSchema
         + crate::ProgramValue;
-    type Callout: Arena0Callout<Response = Self::Input>;
+    type Callout: Arena0Callout<Response = Self::Input> + crate::Arena0CalloutRequest;
     type Input: borsh::BorshSerialize + BorshDeserialize + crate::ProgramValue + 'static;
     type Params: serde::de::DeserializeOwned + serde::Serialize + crate::ProgramValue;
     type Outcome: crate::ProgramValue
@@ -145,6 +145,21 @@ pub trait Program: Sized {
         _timer: TimerPayload,
     ) -> Result<ProgramTransition<Self>, ProgramFault> {
         Ok(Transition::Stay)
+    }
+
+    /// Derive the single open callout implied by the current state.
+    ///
+    /// The Host calls this after every accepted dispatch, before the resulting
+    /// state image is recorded. Returning the same request (index and context)
+    /// keeps the current open callout and its `PendingId` after a non-answer
+    /// event. An accepted answer consumes its ID, so even an identical next
+    /// question receives a new ID. Returning a
+    /// different request replaces it with a new one; returning `None`
+    /// withdraws it. A terminal transition has no callout regardless of this
+    /// result. The callout is computed from state only; it must not depend on
+    /// the dispatch that produced the state.
+    fn callout(_ctx: &Context<Self::Shared, Self::Local>) -> Option<Self::Callout> {
+        None
     }
 
     #[doc(hidden)]

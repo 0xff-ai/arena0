@@ -20,7 +20,7 @@ use arena0_protocol::{
     View,
 };
 use arena0_sandbox::Program;
-use arena0_store::{PendingRequest, StoreHandle};
+use arena0_store::StoreHandle;
 use arena0_transport::Transport;
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot, watch};
 use tokio::time::Instant;
@@ -203,19 +203,14 @@ impl ExecutionHandle {
         &self,
         schema: &ProgramSchema,
     ) -> Result<Option<NextEvent>, ApiError> {
-        let state = self
+        let Some(state) = self
             .execution()
             .await
-            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
-        let Some(state) = state else {
+            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
+        else {
             return Ok(None);
         };
-        let pending = self
-            .store
-            .list_pending_requests(self.exec_id)
-            .await
-            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
-        project_durable_next(state, pending, schema)
+        project_durable_next(state, schema)
     }
 
     pub(crate) async fn wait_for_change(&self) {
@@ -249,32 +244,26 @@ impl ExecutionHandle {
         pending_id: PendingId,
         data: arena0_program::JsonBytes,
     ) -> Result<(), ApiError> {
-        let callout_index = self
-            .store
-            .list_pending_requests(self.exec_id)
+        let callout_matches = self
+            .execution()
             .await
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
-            .into_iter()
-            .find_map(|request| match request {
-                PendingRequest::Callout {
-                    pending_id: id,
-                    callout_index,
-                    ..
-                } if id == pending_id => Some(callout_index),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                ApiError::new(
-                    ApiErrorCode::CalloutNotPending,
-                    format!("no pending {pending_id}"),
-                )
-            })?;
+            .is_some_and(|state| {
+                state
+                    .callout()
+                    .is_some_and(|callout| callout.id == pending_id)
+            });
+        if !callout_matches {
+            return Err(ApiError::new(
+                ApiErrorCode::CalloutNotPending,
+                format!("no pending {pending_id}"),
+            ));
+        }
         loop {
             let (reply, rx) = oneshot::channel();
             self.running()?
                 .send(ExecCommand::SubmitInput {
                     pending_id,
-                    callout_index,
                     data: data.clone(),
                     reply,
                 })
@@ -467,15 +456,11 @@ struct CalloutProjection {
 }
 
 fn project_callout(
-    request: PendingRequest,
+    pending_id: PendingId,
+    callout_index: u32,
+    context: &[u8],
     schema: &ProgramSchema,
 ) -> anyhow::Result<CalloutProjection> {
-    let PendingRequest::Callout {
-        pending_id,
-        callout_index,
-        context,
-        ..
-    } = request;
     let callout = schema
         .callouts
         .get(usize::try_from(callout_index).context("callout index overflow")?)
@@ -486,24 +471,22 @@ fn project_callout(
         name: callout.name.clone(),
         prompt: callout.prompt.clone(),
         schema: callout.output.clone(),
-        context: serde_json::from_slice(&context).context("decode callout context")?,
+        context: serde_json::from_slice(context).context("decode callout context")?,
     })
 }
 
 /// Project one durable execution event without requiring a live actor. This
-/// keeps terminal rows and acknowledged callouts observable across a restart.
+/// keeps terminal rows and the committed open callout observable across a
+/// restart.
 pub(crate) fn project_durable_next(
     state: ExecutionState,
-    pending: Vec<PendingRequest>,
     schema: &ProgramSchema,
 ) -> Result<Option<NextEvent>, ApiError> {
-    if let Some(request) = pending
-        .into_iter()
-        .find(|request| matches!(request, PendingRequest::Callout { .. }))
-    {
-        let projection = project_callout(request, schema).map_err(|error| {
-            ApiError::new(ApiErrorCode::Storage, format!("project callout: {error}"))
-        })?;
+    if let Some(open) = state.callout() {
+        let projection = project_callout(open.id, open.callout_index, &open.context, schema)
+            .map_err(|error| {
+                ApiError::new(ApiErrorCode::Storage, format!("project callout: {error}"))
+            })?;
         return Ok(Some(NextEvent::Callout {
             pending_id: projection.pending_id,
             callout_index: projection.callout_index,
@@ -735,21 +718,7 @@ impl Supervisor {
                 });
             }
             SessionMessage::CalloutRequested { pending_id, .. } => {
-                let request = self
-                    .entry
-                    .store
-                    .list_pending_requests(self.entry.exec_id)
-                    .await
-                    .ok()
-                    .and_then(|requests| {
-                        requests.into_iter().find(|request| {
-                            request.pending_id() == pending_id
-                                && matches!(request, PendingRequest::Callout { .. })
-                        })
-                    });
-                if let Some(request) = request
-                    && let Ok(Some((source, projection))) = self.project_callout(request).await
-                {
+                if let Ok(Some((source, projection))) = self.project_callout(pending_id).await {
                     let CalloutProjection {
                         pending_id,
                         callout_index,
@@ -845,15 +814,26 @@ impl Supervisor {
 
     async fn project_callout(
         &mut self,
-        request: PendingRequest,
+        pending_id: PendingId,
     ) -> anyhow::Result<Option<(EventSource, CalloutProjection)>> {
+        let Some(state) = self.entry.execution().await? else {
+            return Ok(None);
+        };
+        let Some(open) = state.callout().filter(|open| open.id == pending_id) else {
+            return Ok(None);
+        };
         let program_id = self.entry.program_id().await?;
         let Some(stored) = self.entry.store.load_program(program_id).await? else {
             return Ok(None);
         };
         let program =
             Program::try_from(stored.wasm().to_vec()).context("parse execution program")?;
-        let event = project_callout(request, &program.definition().schema)?;
+        let event = project_callout(
+            pending_id,
+            open.callout_index,
+            &open.context,
+            &program.definition().schema,
+        )?;
         let source = self.entry.event_source().await?;
         Ok(Some((source, event)))
     }

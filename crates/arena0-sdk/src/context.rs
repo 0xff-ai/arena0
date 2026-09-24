@@ -2,7 +2,7 @@
 //!
 //! [`Context`] owns shared and participant-local state, transport identity, and
 //! session identity.
-//! [`Effects`] provides host side-effect methods (broadcast, timer, callout, etc.).
+//! [`Effects`] provides host side-effect methods (broadcast, timer, etc.).
 //! Effects are emitted through an effect handle:
 //!
 //! ```ignore
@@ -20,7 +20,7 @@ use std::marker::PhantomData;
 
 use crate::effects;
 use crate::timer::IntoTimerEffect;
-use crate::{Arena0TypedCalloutRequest, Program, Transition};
+use crate::{Program, Transition};
 
 /// Dispatch context passed to every mutating handler.
 ///
@@ -406,7 +406,7 @@ impl<Shared, Local> Context<Shared, Local> {
     /// produces the same signature. Available only in local handlers
     /// (`InputReceived`, `TimerFired`, `React`) whose program declared a `Sign`
     /// capability for the requested scheme.
-    pub fn sign(&self, scheme: SignScheme, payload: &[u8]) -> Signed {
+    pub fn sign(&mut self, scheme: SignScheme, payload: &[u8]) -> Signed {
         let (signed_bytes, signature) = effects::host_guest_sign(scheme, payload);
         Signed {
             signed_bytes,
@@ -417,24 +417,11 @@ impl<Shared, Local> Context<Shared, Local> {
 
 /// Host side-effect handle passed to [`Context::effects`].
 ///
-/// Provides methods to broadcast messages, set timers, and request callouts.
-/// Lifecycle transitions belong to the enclosing [`Context`], not this effect
-/// handle. The handle does not expose program state to the caller.
+/// Provides methods to broadcast messages and set timers. Lifecycle
+/// transitions belong to the enclosing [`Context`], not this effect handle.
+/// The handle does not expose program state to the caller.
 pub struct Effects<'a, Shared> {
     _marker: PhantomData<&'a Shared>,
-}
-
-/// Owned callout effect builder.
-///
-/// The builder captures request bytes without retaining a mutable borrow of
-/// [`Context`]. Programs call [`dispatch`](Self::dispatch) explicitly.
-#[derive(Debug, Clone)]
-#[must_use = "callout builders must be dispatched"]
-pub struct CalloutBuilder<T = ()> {
-    callout_index: u32,
-    context: Vec<u8>,
-    expected_type: Option<String>,
-    _output: PhantomData<fn() -> T>,
 }
 
 /// Exact bytes and signature returned by one synchronous guest signing call.
@@ -543,23 +530,6 @@ impl Crypto {
 impl<Shared: std::fmt::Debug> std::fmt::Debug for Effects<'_, Shared> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Effects").finish_non_exhaustive()
-    }
-}
-
-impl<T> CalloutBuilder<T> {
-    /// Override the expected output type name recorded for diagnostics.
-    pub fn expected_type(mut self, expected_type: impl Into<String>) -> Self {
-        self.expected_type = Some(expected_type.into());
-        self
-    }
-
-    /// Emit the callout effect.
-    pub fn dispatch(self) {
-        effects::host_callout_raw(
-            self.callout_index,
-            &self.context,
-            self.expected_type.as_deref(),
-        );
     }
 }
 
@@ -722,19 +692,6 @@ impl<Shared> Effects<'_, Shared> {
         effects::host_broadcast(&msg_bytes);
     }
 
-    /// Build a callout effect.
-    pub fn callout<A>(&mut self, req: A) -> CalloutBuilder<A::Output>
-    where
-        A: Arena0TypedCalloutRequest + serde::Serialize,
-    {
-        CalloutBuilder {
-            callout_index: req.callout_index(),
-            context: serde_json::to_vec(&req).expect("callout context serialization failed"),
-            expected_type: req.expected_type_name().map(str::to_string),
-            _output: PhantomData,
-        }
-    }
-
     /// Schedule a timer.
     ///
     /// Untyped timers use a delay and the unit marker:
@@ -769,54 +726,9 @@ mod tests {
         Context::__new(TestState::default(), (), PeerId([0; 32]))
     }
 
-    #[derive(serde::Serialize)]
-    struct TestCallout;
-
-    impl crate::Arena0CalloutRequest for TestCallout {
-        fn callout_index(&self) -> u32 {
-            7
-        }
-
-        fn expected_type_name(&self) -> Option<&'static str> {
-            Some("test::Output")
-        }
-    }
-
-    impl crate::Arena0TypedCalloutRequest for TestCallout {
-        type Output = String;
-    }
-
-    fn assert_test_callout(effect: &arena0_protocol::Effect) {
-        match effect {
-            arena0_protocol::Effect::Callout {
-                callout_index,
-                expected_type,
-                ..
-            } => {
-                assert_eq!(*callout_index, 7);
-                assert_eq!(expected_type.as_deref(), Some("test::Output"));
-            }
-            other => panic!("expected callout effect, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn callout_builder_preserves_expected_type() {
-        let mut ctx = make_ctx();
-        crate::testing::drain_effects();
-
-        ctx.effects()
-            .callout(TestCallout)
-            .expected_type("test::Output")
-            .dispatch();
-        let effects = crate::testing::drain_effects();
-        assert_eq!(effects.len(), 1);
-        assert_test_callout(&effects[0]);
-    }
-
     #[test]
     fn synchronous_sign_returns_the_payload_and_a_deterministic_signature() {
-        let ctx = make_ctx();
+        let mut ctx = make_ctx();
 
         let signed = ctx.sign(SignScheme::Ed25519, b"payload");
         assert_eq!(signed.signed_bytes, b"payload");

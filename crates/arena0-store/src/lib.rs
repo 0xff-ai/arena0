@@ -11,7 +11,7 @@
 //! recovery projections needed for scheduling. Protocol constructors remain
 //! authoritative for state and certificate validation.
 
-use arena0_protocol::{Effect, Event, PendingId, pending_id};
+use arena0_protocol::{Effect, Event, PendingId};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
@@ -27,7 +27,6 @@ use arena0_protocol::execution::{
     ExecutionState, ExecutionStatus, ExecutionVersion, ParticipantStepSignature,
     ParticipantTerminalSignature, ReceiptArtifact, ReceiptId, TimerId,
 };
-use arena0_protocol::trace::PendingRecord;
 use arena0_protocol::{
     AbortOccurrence, Activation, ExecFrame, ExecId, ExecLifecycle, ExecutionAdmission,
     LocalStateBytes, MessageId, NegotiationTarget, PeerId, PreparedActivation, ProtocolError,
@@ -685,7 +684,6 @@ pub enum EffectKind {
     SessionEnd,
     SessionAbort,
     Broadcast,
-    Callout,
     SetTimer,
     Fail,
 }
@@ -787,10 +785,6 @@ impl EventRecordSummary {
                 Effect::Broadcast { data } => EffectSummary {
                     kind: EffectKind::Broadcast,
                     payload_bytes: Some(data.len()),
-                },
-                Effect::Callout { context, .. } => EffectSummary {
-                    kind: EffectKind::Callout,
-                    payload_bytes: Some(context.len()),
                 },
                 Effect::SetTimer { timer, .. } => EffectSummary {
                     kind: EffectKind::SetTimer,
@@ -1056,20 +1050,15 @@ pub enum OutboxStatus {
     /// This is distinct from `Acknowledged`: cancellation is a local durable
     /// disposition, not evidence that a receiver accepted the payload. For a
     /// protocol frame this is permitted only before this Host's signature
-    /// exists; local continuation effects are cancelled when their request is
-    /// consumed, replaced, or made obsolete by a terminal boundary.
+    /// exists.
     Cancelled,
 }
 
 /// Storage classification for one outbox payload.
 ///
-/// The payload bytes are either a canonical program [`Effect`] or a
-/// canonical protocol [`ExecFrame`]. Keeping this as a scalar classification
-/// avoids reintroducing a second protocol effect sum type while allowing the
-/// delivery worker to route frames and local work independently.
+/// The payload bytes encode a canonical protocol [`ExecFrame`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboxPayloadKind {
-    Effect,
     Frame,
 }
 
@@ -1087,9 +1076,9 @@ pub struct OutboxItem {
     pub event_position: u64,
     /// Position within the originating event's effect/frame list.
     pub ordinal: u32,
-    /// Destination for a protocol frame; `None` for local program effects.
+    /// Destination for a protocol frame.
     pub destination: Option<PeerId>,
-    /// Whether `payload` contains a program effect or protocol frame.
+    /// Encoding of the protocol frame in `payload`.
     pub payload_kind: OutboxPayloadKind,
     /// Canonical Borsh payload. Decode according to `payload_kind`.
     pub payload: Vec<u8>,
@@ -1165,58 +1154,6 @@ impl StoredReceipt {
     #[must_use]
     pub const fn is_imported(&self) -> bool {
         self.provenance.is_imported()
-    }
-}
-
-/// Durable agent-facing work that remains relevant to the current pending
-/// continuation after an actor restart.
-///
-/// Outbox rows are retained after acknowledgement, so the store can recover
-/// a request whose message was delivered immediately before a process crash.
-/// The projection includes the original callout context; no daemon-side copy is
-/// needed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PendingRequest {
-    /// A typed JSON callout waiting for its agent answer.
-    Callout {
-        /// Durable outbox identity carrying the original request.
-        outbox_id: OutboxId,
-        /// Current delivery state of that outbox row.
-        status: OutboxStatus,
-        /// Pending continuation identity.
-        pending_id: PendingId,
-        /// Program-local callout variant.
-        callout_index: u32,
-        /// Exact guest-produced callout context bytes.
-        context: Vec<u8>,
-        /// Generated expected result type, when available.
-        expected_type: Option<String>,
-    },
-}
-
-impl PendingRequest {
-    /// Return the durable outbox identity carrying this request.
-    #[must_use]
-    pub const fn outbox_id(&self) -> OutboxId {
-        match self {
-            Self::Callout { outbox_id, .. } => *outbox_id,
-        }
-    }
-
-    /// Return the delivery state of the retained outbox row.
-    #[must_use]
-    pub const fn status(&self) -> OutboxStatus {
-        match self {
-            Self::Callout { status, .. } => *status,
-        }
-    }
-
-    /// Return the pending continuation identity.
-    #[must_use]
-    pub const fn pending_id(&self) -> PendingId {
-        match self {
-            Self::Callout { pending_id, .. } => *pending_id,
-        }
     }
 }
 
@@ -1414,6 +1351,7 @@ enum Command {
         inbox_id: Option<InboxId>,
         timer_id: Option<TimerId>,
         pending_id: Option<PendingId>,
+        callout: Option<arena0_program::CalloutRequest>,
         now_ms: u64,
         reply: oneshot::Sender<Result<ApplyOutcome, StoreError>>,
     },
@@ -1464,10 +1402,6 @@ enum Command {
         execution_id: ExecId,
         limit: usize,
         reply: oneshot::Sender<Result<Vec<PendingInboxItem>, StoreError>>,
-    },
-    ListPendingRequests {
-        execution_id: ExecId,
-        reply: oneshot::Sender<Result<Vec<PendingRequest>, StoreError>>,
     },
     ReadTrace {
         execution_id: ExecId,
@@ -1877,23 +1811,6 @@ impl StoreHandle {
         .await
     }
 
-    /// Load the exact pending agent request for one execution.
-    ///
-    /// This is a read projection and does not claim the execution writer. It
-    /// is available on the cloneable handle because the daemon's API and
-    /// supervisor observe an actor's durable continuation while the actor
-    /// owns the non-clone [`ExecutionStore`].
-    pub async fn list_pending_requests(
-        &self,
-        execution_id: ExecId,
-    ) -> Result<Vec<PendingRequest>, StoreError> {
-        self.request(512, |reply| Command::ListPendingRequests {
-            execution_id,
-            reply,
-        })
-        .await
-    }
-
     /// Read a bounded public trace range from the durable execution.
     ///
     /// The owner validates the complete trace before selecting the requested
@@ -2258,19 +2175,6 @@ impl ExecutionStore {
             .await
     }
 
-    /// Load the current agent-facing request, including its original durable
-    /// payload. Acknowledged request outbox rows are retained specifically so
-    /// restart recovery can re-emit a request that was delivered before the
-    /// consumer submitted its answer.
-    pub async fn pending_requests(&self) -> Result<Vec<PendingRequest>, StoreError> {
-        self.handle
-            .request(512, |reply| Command::ListPendingRequests {
-                execution_id: self.execution_id,
-                reply,
-            })
-            .await
-    }
-
     /// Insert the initial execution aggregate from typed genesis inputs.
     ///
     /// The execution id comes from this capability, and the protocol
@@ -2343,10 +2247,17 @@ impl ExecutionStore {
         inbox_id: Option<InboxId>,
         timer_id: Option<TimerId>,
         pending_id: Option<PendingId>,
+        callout: Option<arena0_program::CalloutRequest>,
         now_ms: u64,
     ) -> Result<ApplyOutcome, StoreError> {
         let event_cost = event_bytes(&event)?.len();
         let effect_cost = effects_bytes(&effects)?.len();
+        let callout_cost = callout
+            .as_ref()
+            .map(borsh::to_vec)
+            .transpose()
+            .map_err(|error| StoreError::Corruption(format!("callout encode: {error}")))?
+            .map_or(0, |bytes| bytes.len());
         let terminal_cost = terminal_outcome
             .as_ref()
             .map(borsh::to_vec)
@@ -2356,6 +2267,7 @@ impl ExecutionStore {
         let cost = self.handle.command_cost(
             event_cost
                 .saturating_add(effect_cost)
+                .saturating_add(callout_cost)
                 .saturating_add(shared.as_bytes().len())
                 .saturating_add(local.as_bytes().len())
                 .saturating_add(terminal_cost),
@@ -2374,6 +2286,7 @@ impl ExecutionStore {
                 inbox_id,
                 timer_id,
                 pending_id,
+                callout,
                 now_ms,
                 reply,
             })

@@ -208,6 +208,7 @@ fn dispatch_command(database: &mut Database, command: Command) {
             inbox_id,
             timer_id,
             pending_id,
+            callout,
             now_ms,
             reply,
         } => {
@@ -222,6 +223,7 @@ fn dispatch_command(database: &mut Database, command: Command) {
                 inbox_id,
                 timer_id,
                 pending_id,
+                callout,
                 now_ms,
             ));
         }
@@ -309,12 +311,6 @@ fn dispatch_command(database: &mut Database, command: Command) {
             reply,
         } => {
             let _ = reply.send(database.list_pending_inbox(execution_id, limit));
-        }
-        Command::ListPendingRequests {
-            execution_id,
-            reply,
-        } => {
-            let _ = reply.send(database.list_pending_requests(execution_id));
         }
         Command::ReadTrace {
             execution_id,

@@ -323,10 +323,26 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                     }
                 }
             };
+            let callout = if status == ::arena0::CallStatus::Accepted {
+                <#program_ty as ::arena0::Program>::callout(&ctx).map(|callout| {
+                    let context = ::arena0::serde_json::to_vec(&callout)
+                        .expect("callout context serialization failed");
+                    ::arena0::CalloutRequest {
+                        callout_index: ::arena0::Arena0CalloutRequest::callout_index(&callout),
+                        context,
+                    }
+                })
+            } else {
+                None
+            };
             if status == ::arena0::CallStatus::Accepted {
                 __arena0_store_state(ctx);
             }
-            __arena0_write_result(&::arena0::DispatchOutput { status, reason })
+            __arena0_write_result(&::arena0::DispatchOutput {
+                status,
+                reason,
+                callout,
+            })
         }
 
         #[unsafe(no_mangle)]

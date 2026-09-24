@@ -10,11 +10,10 @@
 use std::time::Instant;
 
 use crate::context::ExecError;
-use arena0_protocol::{Effect, ExecFrame, PendingOperation, ReceiptWork};
-use arena0_store::OutboxPayloadKind;
+use arena0_protocol::ExecFrame;
 use arena0_transport::TransportError;
 
-use super::{ExecutionActor, InflightSend, callout_requested, now_ms};
+use super::{ExecutionActor, InflightSend, now_ms};
 
 const PERFORMANCE_TARGET: &str = "arena0::performance";
 
@@ -123,34 +122,26 @@ impl ExecutionActor {
             };
             count = count.saturating_add(1);
             let item = leased.item;
-            let result = match item.payload_kind {
-                OutboxPayloadKind::Frame => {
-                    let frame = decode_frame(&item.payload)?;
-                    let destination = item.destination.ok_or_else(|| {
-                        OutboxDeliveryError::Terminal(ExecError::InvalidState(
-                            "protocol frame outbox row has no destination".into(),
-                        ))
-                    })?;
-                    match self
-                        .start_outbound_send(item.outbox_id, leased.lease_id, destination, frame)
-                        .await
-                    {
-                        Ok(()) => {
-                            // Keep the lease in flight until this receiver
-                            // acknowledges durable responsibility. The store
-                            // creates one row per remote destination.
-                            return Ok(OutboxDrainSummary {
-                                count,
-                                result_class: "send_started",
-                            });
-                        }
-                        Err(error) => Err(error),
-                    }
+            let frame = decode_frame(&item.payload)?;
+            let destination = item.destination.ok_or_else(|| {
+                OutboxDeliveryError::Terminal(ExecError::InvalidState(
+                    "protocol frame outbox row has no destination".into(),
+                ))
+            })?;
+            let result = match self
+                .start_outbound_send(item.outbox_id, leased.lease_id, destination, frame)
+                .await
+            {
+                Ok(()) => {
+                    // Keep the lease in flight until this receiver
+                    // acknowledges durable responsibility. The store
+                    // creates one row per remote destination.
+                    return Ok(OutboxDrainSummary {
+                        count,
+                        result_class: "send_started",
+                    });
                 }
-                OutboxPayloadKind::Effect => {
-                    let effect = decode_effect(&item.payload)?;
-                    self.deliver_effect(&effect).await
-                }
+                Err(error) => Err(error),
             };
 
             match result {
@@ -243,60 +234,6 @@ impl ExecutionActor {
         }
     }
 
-    async fn deliver_effect(&mut self, effect: &Effect) -> Result<(), OutboxDeliveryError> {
-        if matches!(effect, Effect::Callout { .. }) {
-            let state = self.load_state().await?;
-            if !matches!(state.status().receipt_work(), ReceiptWork::NotTerminal) {
-                // Every terminal boundary supersedes an older guest
-                // continuation. This includes successful terminal-proof
-                // collection, not only an authenticated stop.
-                return Ok(());
-            }
-        }
-        match effect {
-            Effect::Callout {
-                callout_index,
-                context,
-                expected_type,
-                ..
-            } => {
-                let state = self.load_state().await?;
-                let Some(pending) = state.status().pending() else {
-                    return Err(ExecError::InvalidState(
-                        "callout effect has no pending continuation".into(),
-                    )
-                    .into());
-                };
-                if pending.operation
-                    != (PendingOperation::Callout {
-                        callout_index: *callout_index,
-                    })
-                {
-                    return Err(ExecError::InvalidState(
-                        "callout effect does not match pending continuation".into(),
-                    )
-                    .into());
-                }
-                self.messages
-                    .send(callout_requested(
-                        pending.id,
-                        *callout_index,
-                        context.clone(),
-                        expected_type
-                            .clone()
-                            .or_else(|| pending.expected_type.clone()),
-                    ))
-                    .await
-                    .map_err(|_| ExecError::Unavailable("message receiver closed".into()))?;
-                Ok(())
-            }
-            _ => Err(ExecError::InvalidState(
-                "non-deliverable effect reached the durable effect outbox".into(),
-            )
-            .into()),
-        }
-    }
-
     async fn send_handle(
         &mut self,
         destination: arena0_protocol::PeerId,
@@ -313,11 +250,6 @@ impl ExecutionActor {
         self.send_streams.insert(destination, handle.clone());
         Ok(handle)
     }
-}
-
-fn decode_effect(payload: &[u8]) -> Result<Effect, ExecError> {
-    borsh::from_slice(payload)
-        .map_err(|error| ExecError::InvalidState(format!("durable effect decode failed: {error}")))
 }
 
 fn decode_frame(payload: &[u8]) -> Result<ExecFrame, ExecError> {

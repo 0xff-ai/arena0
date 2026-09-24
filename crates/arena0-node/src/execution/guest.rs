@@ -14,7 +14,7 @@ use arena0_protocol::execution::GuestSignData;
 use arena0_protocol::{
     Committed, Effect, Ensemble, Event, ExecFrame, ExecLifecycle, ExecutionState, ExecutionStatus,
     MessageId, ParticipantStepSignature, ParticipantTerminalSignature, PeerIdSource, PendingId,
-    PendingOperation, SessionHash, StateHash, TerminalOutcome,
+    SessionHash, StateHash, TerminalOutcome,
 };
 use arena0_sandbox::{
     DispatchCall, GuestSigner, OutcomeCall, QueryCall, RandomReplay, ViewCall, WriterCall,
@@ -26,7 +26,7 @@ use super::{ExecutionActor, MAX_CAS_RETRIES, MAX_TIMER_BATCH, now_ms};
 
 /// Durable identities owned by the source of an event. The store validates
 /// that only the applicable identity is present and that it matches its
-/// authoritative inbox, timer, or pending-continuation row.
+/// authoritative inbox, timer, or committed open callout.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct DispatchSource {
     pub(super) inbox_id: Option<InboxId>,
@@ -116,18 +116,16 @@ impl ExecutionActor {
     pub(super) async fn submit_input(
         &mut self,
         pending_id: PendingId,
-        callout_index: u32,
         data: JsonBytes,
     ) -> Result<(), SubmitInputError> {
         let state = self.load_state().await?;
-        let Some(pending) = state.status().pending() else {
+        let Some(open) = state.callout() else {
             return Err(SubmitInputError::Expected(ExecError::CalloutNotPending));
         };
-        if pending.id != pending_id
-            || pending.operation != (PendingOperation::Callout { callout_index })
-        {
+        if open.id != pending_id {
             return Err(SubmitInputError::Expected(ExecError::CalloutNotPending));
         }
+        let callout_index = open.callout_index;
         let accepted = self
             .dispatch_event(
                 Event::InputReceived {
@@ -139,7 +137,11 @@ impl ExecutionActor {
                     ..DispatchSource::default()
                 },
             )
-            .await?;
+            .await
+            .map_err(|error| match error {
+                ExecError::CalloutNotPending => SubmitInputError::Expected(error),
+                _ => SubmitInputError::Fatal(error),
+            })?;
         match accepted {
             DispatchOutcome::Committed => self.progress().await?,
             DispatchOutcome::Frozen => {
@@ -375,6 +377,14 @@ impl ExecutionActor {
         let mut replay = None;
         for _ in 0..MAX_CAS_RETRIES {
             let state = self.load_state().await?;
+            if let Event::InputReceived { callout_index, .. } = &event
+                && !state.callout().is_some_and(|open| {
+                    source.pending_id == Some(open.id) && *callout_index == open.callout_index
+                })
+            {
+                self.discard_candidate()?;
+                return Err(ExecError::CalloutNotPending);
+            }
             if state.status().is_terminal() {
                 return Ok(DispatchOutcome::Frozen);
             }
@@ -382,20 +392,7 @@ impl ExecutionActor {
                 self.discard_candidate()?;
                 return Ok(DispatchOutcome::Frozen);
             }
-            if matches!(&event, Event::InputReceived { .. }) {
-                let Some(pending) = state.status().pending() else {
-                    self.discard_candidate()?;
-                    return Ok(DispatchOutcome::Frozen);
-                };
-                if source.pending_id != Some(pending.id) {
-                    self.discard_candidate()?;
-                    return Ok(DispatchOutcome::Frozen);
-                }
-            }
-            if !matches!(
-                state.status(),
-                ExecutionStatus::Active | ExecutionStatus::Waiting { .. }
-            ) {
+            if !matches!(state.status(), ExecutionStatus::Active) {
                 self.discard_candidate()?;
                 return Ok(DispatchOutcome::Frozen);
             }
@@ -562,6 +559,7 @@ impl ExecutionActor {
                     source.inbox_id,
                     source.timer_id,
                     source.pending_id,
+                    result.callout,
                     now_ms(),
                 )
                 .await;
@@ -723,7 +721,7 @@ impl ExecutionActor {
                 )
                 .await?;
             if matches!(accepted, DispatchOutcome::Frozen) {
-                // A proposal or pending continuation owns the guest; leave
+                // A staged proposal or terminal boundary freezes the guest; leave
                 // the timer durable for the next progress pass.
                 break;
             }

@@ -1,121 +1,6 @@
 use super::*;
 
-pub(super) struct PendingEffectRow {
-    pub(super) outbox_id: OutboxId,
-    pub(super) status: OutboxStatus,
-    pub(super) effect: Effect,
-}
-
 impl Database {
-    /// Recover the one agent-facing request for the current continuation.
-    /// Acknowledged rows remain durable so recovery needs no second request log.
-    pub(super) fn list_pending_requests(
-        &mut self,
-        execution_id: ExecId,
-    ) -> Result<Vec<PendingRequest>, StoreError> {
-        let state = self
-            .load_execution_in_transaction(execution_id)?
-            .ok_or(StoreError::ExecutionNotFound(execution_id))?;
-        let Some(pending) = state.status().pending() else {
-            return Ok(Vec::new());
-        };
-        // The committed status can still expose the previous continuation
-        // while a dispatch proposal is staged. A proposal that consumes or
-        // replaces that continuation has not released its replacement
-        // effect yet, so projecting the committed request here would invite
-        // a duplicate answer. An unrelated proposal may retain the exact
-        // pending record and remains safe to expose.
-        if state
-            .pending_shared()
-            .is_some_and(|proposal| proposal.status().pending() != Some(pending))
-        {
-            return Ok(Vec::new());
-        }
-        let row = self.pending_effect_row(execution_id, pending.id)?;
-        let derived = PendingRecord::from_effect(pending.id, &row.effect).ok_or_else(|| {
-            StoreError::Corruption("pending identity names an effect without a continuation".into())
-        })?;
-        if &derived != pending {
-            return Err(StoreError::Corruption(
-                "durable request disagrees with pending continuation".into(),
-            ));
-        }
-        let mut response_bytes = 0;
-        let request = match row.effect {
-            Effect::Callout {
-                callout_index,
-                context,
-                expected_type,
-                ..
-            } => {
-                account_response(
-                    &mut response_bytes,
-                    context
-                        .len()
-                        .checked_add(128)
-                        .ok_or(StoreError::CommandTooLarge {
-                            required: usize::MAX,
-                            capacity: MAX_RESPONSE_BYTES,
-                        })?,
-                )?;
-                PendingRequest::Callout {
-                    outbox_id: row.outbox_id,
-                    status: row.status,
-                    pending_id: pending.id,
-                    callout_index,
-                    context,
-                    expected_type,
-                }
-            }
-            _ => {
-                return Err(StoreError::Corruption(
-                    "pending identity names the wrong effect kind".into(),
-                ));
-            }
-        };
-        Ok(vec![request])
-    }
-
-    pub(super) fn pending_effect_row(
-        &mut self,
-        execution_id: ExecId,
-        pending: PendingId,
-    ) -> Result<PendingEffectRow, StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT outbox_id, event_position, ordinal, status, payload
-             FROM outbox
-             WHERE execution_id = ?1 AND destination IS NULL
-               AND payload_kind = 'effect'
-             ORDER BY event_position, version, ordinal, outbox_id",
-        )?;
-        let mut rows = statement.query(params![execution_id.0.to_vec()])?;
-        let mut matched = None;
-        while let Some(row) = rows.next()? {
-            let event_position = sqlite_i64(row.get::<_, i64>(1)?)?;
-            let ordinal = u32::try_from(sqlite_i64(row.get::<_, i64>(2)?)?)
-                .map_err(|_| StoreError::Corruption("pending effect ordinal exceeds u32".into()))?;
-            if pending_id(execution_id, event_position, ordinal) != pending {
-                continue;
-            }
-            if matched.is_some() {
-                return Err(StoreError::Corruption(
-                    "pending identity names multiple durable effects".into(),
-                ));
-            }
-            matched = Some(PendingEffectRow {
-                outbox_id: OutboxId::from_bytes(array32(
-                    &row.get::<_, Vec<u8>>(0)?,
-                    "pending effect outbox id",
-                )?),
-                status: parse_outbox_status(&row.get::<_, String>(3)?)?,
-                effect: decode_borsh(&row.get::<_, Vec<u8>>(4)?, "pending effect")?,
-            });
-        }
-        matched.ok_or_else(|| {
-            StoreError::Corruption("pending continuation has no durable originating effect".into())
-        })
-    }
-
     pub(super) fn lease_next_outbox(
         &mut self,
         execution_id: ExecId,
@@ -129,18 +14,11 @@ impl Database {
         execution_id: ExecId,
         now_ms: u64,
     ) -> Result<Option<LeasedOutbox>, StoreError> {
-        let state = self
-            .load_execution_in_transaction(execution_id)?
+        self.load_execution_in_transaction(execution_id)?
             .ok_or(StoreError::ExecutionNotFound(execution_id))?;
         self.recover_expired_leases_in_transaction(Some(execution_id), now_ms)?;
-        // A staged shared proposal owns the next event until agreement. Its
-        // local guest effects must remain withheld; only protocol frames are
-        // eligible so peers can still complete the proposal. Once the
-        // proposal clears, the same query exposes the durable effects.
-        let proposal_staged = state.pending_shared().is_some();
         // Only the causal head of each destination lane is eligible. A live
-        // lease or retry delay for one peer cannot block another peer or the
-        // local-effect lane.
+        // lease or retry delay for one peer cannot block another peer.
         let row = self
             .connection
             .query_row(
@@ -150,7 +28,6 @@ impl Database {
              FROM outbox AS o
              WHERE o.execution_id = ?1 AND o.status = 'pending'
                AND o.available_at_ms <= ?2
-               AND (?3 = 0 OR o.payload_kind = 'frame')
                AND NOT EXISTS (
                  SELECT 1 FROM outbox AS prior
                  WHERE prior.execution_id = o.execution_id
@@ -168,11 +45,7 @@ impl Database {
                )
              ORDER BY o.event_position, o.version, o.ordinal, o.outbox_id
              LIMIT 1",
-                params![
-                    execution_id.0.to_vec(),
-                    sqlite_u64(now_ms)?,
-                    if proposal_staged { 1_i64 } else { 0_i64 },
-                ],
+                params![execution_id.0.to_vec(), sqlite_u64(now_ms)?],
                 |row| {
                     Ok((
                         row.get::<_, Vec<u8>>(0)?,
@@ -535,21 +408,6 @@ impl Database {
     ) -> Result<(), StoreError> {
         for (ordinal, effect) in effects {
             match effect {
-                Effect::Callout { .. } => {
-                    let payload = borsh::to_vec(effect).map_err(|error| {
-                        StoreError::Corruption(format!("outbox effect encode: {error}"))
-                    })?;
-                    self.insert_outbox(
-                        execution_id,
-                        event_position,
-                        version,
-                        *ordinal,
-                        None,
-                        OutboxPayloadKind::Effect,
-                        payload,
-                        now_ms,
-                    )?;
-                }
                 Effect::SetTimer { delay_ms, timer } => self.persist_timer(
                     execution_id,
                     event_position,
@@ -606,103 +464,6 @@ impl Database {
             }
         }
         Ok(())
-    }
-
-    /// Decode all still-deliverable local continuation effects for one
-    /// execution. The payload is intentionally decoded before status changes:
-    /// malformed durable bytes must fail closed instead of being silently
-    /// retired by a terminal transition.
-    fn unsettled_continuation_effects(
-        &mut self,
-        execution_id: ExecId,
-    ) -> Result<Vec<(OutboxId, Effect)>, StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT outbox_id, payload
-             FROM outbox
-             WHERE execution_id = ?1 AND destination IS NULL
-               AND payload_kind = 'effect'
-               AND status IN ('pending', 'leased')
-             ORDER BY event_position, version, ordinal, outbox_id",
-        )?;
-        let mut rows = statement.query(params![execution_id.0.to_vec()])?;
-        let mut effects = Vec::new();
-        while let Some(row) = rows.next()? {
-            let outbox_id = OutboxId::from_bytes(array32(
-                &row.get::<_, Vec<u8>>(0)?,
-                "continuation effect outbox id",
-            )?);
-            let effect: Effect = decode_borsh(&row.get::<_, Vec<u8>>(1)?, "continuation effect")?;
-            if matches!(effect, Effect::Callout { .. }) {
-                effects.push((outbox_id, effect));
-            }
-        }
-        drop(rows);
-        drop(statement);
-        Ok(effects)
-    }
-
-    /// Acknowledge selected local effect rows while preserving their durable
-    /// history. Callers select and decode rows before invoking this helper;
-    /// the compare-and-set keeps a concurrent or corrupt status change from
-    /// being mistaken for a successful retirement.
-    pub(super) fn acknowledge_effect_rows(
-        &mut self,
-        execution_id: ExecId,
-        outbox_ids: &[OutboxId],
-    ) -> Result<(), StoreError> {
-        self.settle_effect_rows(execution_id, outbox_ids, OutboxStatus::Acknowledged)
-    }
-
-    fn settle_effect_rows(
-        &mut self,
-        execution_id: ExecId,
-        outbox_ids: &[OutboxId],
-        status: OutboxStatus,
-    ) -> Result<(), StoreError> {
-        let status = match status {
-            OutboxStatus::Acknowledged => "acknowledged",
-            OutboxStatus::Cancelled => "cancelled",
-            OutboxStatus::Pending | OutboxStatus::Leased => {
-                return Err(StoreError::Corruption(
-                    "continuation effect settlement requires a terminal outbox status".into(),
-                ));
-            }
-        };
-        for outbox_id in outbox_ids {
-            let changed = self.connection.execute(
-                "UPDATE outbox SET status = ?1, lease_id = NULL,
-                        lease_until_ms = NULL, last_error = NULL
-                 WHERE execution_id = ?2 AND outbox_id = ?3
-                   AND status IN ('pending', 'leased')",
-                params![
-                    status,
-                    execution_id.0.to_vec(),
-                    outbox_id.as_bytes().to_vec()
-                ],
-            )?;
-            if changed != 1 {
-                return Err(StoreError::Corruption(
-                    "continuation effect acknowledgement compare-and-set failed".into(),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Retire every pending/leased Callout row when the
-    /// execution crosses a terminal boundary. These rows are local delivery
-    /// attempts; retaining them after terminal completion could resurrect a
-    /// continuation on restart. Protocol-frame rows remain untouched.
-    pub(super) fn cancel_terminal_effects(
-        &mut self,
-        execution_id: ExecId,
-    ) -> Result<(), StoreError> {
-        let effects = self.unsettled_continuation_effects(execution_id)?;
-        let outbox_ids = effects
-            .into_iter()
-            .map(|(outbox_id, _)| outbox_id)
-            .collect::<Vec<_>>();
-        self.settle_effect_rows(execution_id, &outbox_ids, OutboxStatus::Cancelled)
     }
 
     /// Mark only protocol frames that identify the exact pending proposal as
@@ -978,7 +739,6 @@ impl Database {
 
 fn parse_payload_kind(value: &str) -> Result<OutboxPayloadKind, StoreError> {
     match value {
-        "effect" => Ok(OutboxPayloadKind::Effect),
         "frame" => Ok(OutboxPayloadKind::Frame),
         _ => Err(StoreError::Corruption(format!(
             "unknown outbox payload kind {value}"
@@ -988,27 +748,12 @@ fn parse_payload_kind(value: &str) -> Result<OutboxPayloadKind, StoreError> {
 
 const fn payload_kind_sql(kind: OutboxPayloadKind) -> &'static str {
     match kind {
-        OutboxPayloadKind::Effect => "effect",
         OutboxPayloadKind::Frame => "frame",
     }
 }
 
 fn validate_outbox_payload(kind: OutboxPayloadKind, payload: &[u8]) -> Result<(), StoreError> {
     match kind {
-        OutboxPayloadKind::Effect => {
-            if payload.len() > arena0_program::MAX_EFFECT_BYTES as usize {
-                return Err(StoreError::CommandTooLarge {
-                    required: payload.len(),
-                    capacity: arena0_program::MAX_EFFECT_BYTES as usize,
-                });
-            }
-            let effect: Effect = decode_borsh(payload, "outbox effect")?;
-            if !matches!(effect, Effect::Callout { .. }) {
-                return Err(StoreError::Corruption(
-                    "outbox effect does not require external delivery".into(),
-                ));
-            }
-        }
         OutboxPayloadKind::Frame => {
             if payload.len() > MAX_FRAME_BYTES {
                 return Err(StoreError::CommandTooLarge {

@@ -1464,6 +1464,7 @@ async fn drive_loop(
     tui: Option<TuiHandle>,
     progress: &RunProgress,
 ) -> anyhow::Result<HostTerminal> {
+    let mut answered = None;
     loop {
         let request = HostRequest::ExecNext { exec_id };
         let next = tokio::select! {
@@ -1482,6 +1483,15 @@ async fn drive_loop(
                 context,
                 ..
             }) => {
+                if answered == Some(pending_id) {
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_millis(25)) => {}
+                        () = wait_for_cancel(cancelled) => {
+                            bail!("coordinated run cancelled while awaiting agreement for {exec_id}")
+                        }
+                    }
+                    continue;
+                }
                 let answer = driver.answer(
                     DriverAnswerContext {
                         host,
@@ -1529,6 +1539,7 @@ async fn drive_loop(
                         bail!("coordinated run cancelled while submitting driver answer for {exec_id}")
                     }
                 }
+                answered = Some(pending_id);
             }
             ResponseOk::Next(NextEvent::Completed {
                 session_id,
@@ -2720,6 +2731,78 @@ mod tests {
         assert!(
             matches!(requests.as_slice(), [HostRequest::ExecNext { .. }, HostRequest::ExecSubmit { pending_id: id, .. }, HostRequest::ExecNext { .. }] if *id == pending_id)
         );
+    }
+
+    #[tokio::test]
+    async fn driver_answers_same_question_with_new_id_and_suppresses_answered_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("answer-agreement.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let exec_id = ExecId([0x83; 32]);
+        let session_id = SessionHash([0x84; 32]);
+        let pending_id = PendingId::new(18);
+        let callout = ResponseOk::Next(NextEvent::Callout {
+            pending_id,
+            callout_index: 0,
+            name: "Decide".into(),
+            prompt: "Choose".into(),
+            schema: arena0_client::program::JsonSchemaDocument::new(schema(
+                json!({"type":"string", "enum":["yes"]}),
+            ))
+            .unwrap(),
+            context: Value::Null,
+        });
+        let next_id = PendingId::new(19);
+        let mut reasked = callout.clone();
+        if let ResponseOk::Next(NextEvent::Callout { pending_id, .. }) = &mut reasked {
+            *pending_id = next_id;
+        }
+        let server = tokio::spawn(serve_script(
+            listener,
+            host("host-01"),
+            vec![
+                Ok(callout.clone()),
+                Ok(ResponseOk::Ack),
+                Ok(callout),
+                Ok(reasked),
+                Ok(ResponseOk::Ack),
+                Ok(ResponseOk::Next(NextEvent::Completed {
+                    session_id,
+                    outcome: None,
+                })),
+            ],
+        ));
+        let (_cancel, cancelled) = watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            drive_to_terminal(
+                host("host-01"),
+                DaemonClient::new(socket),
+                exec_id,
+                DriverSpec::Builtin("first-allowed".into()),
+                cancelled,
+                None,
+                test_progress(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            result,
+            HostTerminal::Completed {
+                session_id,
+                outcome: None
+            }
+        );
+        let requests = server.await.unwrap();
+        assert!(matches!(requests.as_slice(), [
+            HostRequest::ExecNext { .. },
+            HostRequest::ExecSubmit { pending_id: first, answer: first_answer, .. },
+            HostRequest::ExecNext { .. }, HostRequest::ExecNext { .. },
+            HostRequest::ExecSubmit { pending_id: second, answer: second_answer, .. },
+            HostRequest::ExecNext { .. },
+        ] if *first == pending_id && *second == next_id && first_answer == second_answer));
     }
 
     #[tokio::test]

@@ -230,19 +230,7 @@ pub mod contract_net {
                     return Ok(Transition::To(Phase::ReviewingProposal));
                 }
             }
-            Phase::CollectingOffers => {
-                if !ctx.local().offer_sent {
-                    let tasks = ctx.shared().tasks.clone();
-                    let maximum_capacity = tasks.len() as u16;
-                    ctx.effects()
-                        .callout(callouts::SubmitOffer {
-                            tasks,
-                            maximum_capacity,
-                            maximum_cost: MAX_COST,
-                        })
-                        .dispatch();
-                }
-            }
+            Phase::CollectingOffers => {}
             Phase::ReviewingProposal => {
                 let expected_plan = ctx.shared().plan();
                 let Some(proposal) = ctx.shared().agreement.proposal() else {
@@ -266,6 +254,23 @@ pub mod contract_net {
             }
         }
         Ok(Transition::Stay)
+    }
+
+    fn callout(ctx: &Context<Shared, Local>) -> Option<Callout> {
+        (ctx.shared().phase() == Phase::CollectingOffers
+            && ctx.me() != COORDINATOR
+            && ctx.shared().expected_writer() == Some(ctx.me())
+            && !ctx.local().offer_sent)
+            .then(|| {
+                let tasks = ctx.shared().tasks.clone();
+                let maximum_capacity = tasks.len() as u16;
+                callouts::SubmitOffer {
+                    tasks,
+                    maximum_capacity,
+                    maximum_cost: MAX_COST,
+                }
+                .into()
+            })
     }
 
     fn on_input(

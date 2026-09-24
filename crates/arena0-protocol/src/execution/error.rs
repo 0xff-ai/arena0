@@ -143,12 +143,13 @@ pub enum ProtocolError {
     /// The Borsh outcome differs from SessionEnd's bytes.
     #[error("terminal outcome Borsh bytes do not match the SessionEnd effect")]
     OutcomeProjectionMismatch,
-    /// A local answer did not identify the stored continuation.
-    #[error("continuation does not match the pending continuation")]
-    PendingContinuationMismatch,
-    /// A continuation effect is malformed.
-    #[error("continuation effect is invalid")]
-    InvalidPendingContinuation,
+    /// A local answer did not identify the open callout, or a non-answer
+    /// dispatch supplied a callout identity.
+    #[error("dispatch does not match the open callout")]
+    CalloutMismatch,
+    /// An open callout exists on a status or proposal that cannot carry one.
+    #[error("open callout requires an active execution status")]
+    InvalidCalloutState,
     /// Terminal proof is already complete.
     #[error("terminal proof is already published")]
     TerminalAlreadyPublished,

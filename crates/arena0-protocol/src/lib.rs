@@ -59,7 +59,7 @@ pub use execution::{
     ExecutionBinding, ExecutionState, ExecutionStatus, ExecutionVersion, MAX_ACTIVE_TIMERS,
     MAX_EFFECT_PAYLOAD_BYTES, MAX_EFFECTS, MAX_EXECUTION_STATE_BYTES, MAX_PROOF_SIGNATURES,
     MAX_RECEIPT_BYTES, MAX_TERMINAL_OUTCOME_BYTES, MAX_TERMINAL_REASON_BYTES,
-    MAX_TIMER_PAYLOAD_BYTES, MAX_TRACE_ENTRY_BYTES, ParticipantStepSignature,
+    MAX_TIMER_PAYLOAD_BYTES, MAX_TRACE_ENTRY_BYTES, OpenCallout, ParticipantStepSignature,
     ParticipantTerminalSignature, PendingId, PendingIdParseError, ProtocolError, PublishedProof,
     Receipt, ReceiptArtifact, ReceiptBody, ReceiptId, ReceiptKind, ReceiptWork, SharedProposal,
     StepCertificate, StepCursor, StopCause, StopReport, TerminalCertificate, TerminalOutcome,
@@ -90,8 +90,7 @@ pub use terminal::TerminalResult;
 pub use timer::{TimerPayload, TimerSpec};
 pub use trace::{
     AggregateAttestation, AttestationError, CHAIN_START, DivergenceDiagnostic, DivergenceKind,
-    PendingKind, PendingOperation, PendingRecord, ReceiptTermination, STEP_COMMIT_DOMAIN,
-    SessionHeader, SessionTerminal, SignerSet, StepCommitment, StepSig, TERMINAL_DOMAIN,
-    TRACE_FORMAT_VERSION, TerminalCommitment, TraceEntry,
+    ReceiptTermination, STEP_COMMIT_DOMAIN, SessionHeader, SessionTerminal, SignerSet,
+    StepCommitment, StepSig, TERMINAL_DOMAIN, TRACE_FORMAT_VERSION, TerminalCommitment, TraceEntry,
 };
 pub use view::{ColorDepth, Slot, View, Viewport};

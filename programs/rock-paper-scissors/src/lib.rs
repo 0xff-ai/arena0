@@ -272,9 +272,8 @@ pub mod rock_paper_scissors {
         }
     }
 
-    /// Position-0 boundary: seed the match. The session-start handler issues no
-    /// callout and broadcasts nothing; asking the agent for a move is `on_react`'s
-    /// job. The commit-reveal primitive starts from its `Default`.
+    /// Position-0 boundary: seed the match. The session-start handler broadcasts nothing.
+    /// The resulting state determines the first question. The commit-reveal primitive starts from its `Default`.
     fn on_session_started(
         ctx: &mut Context<Shared, Local>,
     ) -> Result<ProgramTransition<RockPaperScissors>, ProgramFault> {
@@ -286,7 +285,7 @@ pub mod rock_paper_scissors {
     }
 
     /// Local decision hook. Broadcasts the owed reveal once every commit is in,
-    /// otherwise asks the agent for this round's move when one is still owed.
+    /// The callout projection asks for any missing local move.
     fn on_react(
         ctx: &mut Context<Shared, Local>,
     ) -> Result<ProgramTransition<RockPaperScissors>, ProgramFault> {
@@ -309,12 +308,16 @@ pub mod rock_paper_scissors {
             }
             return Ok(Transition::Stay);
         }
-        if ctx.commit_reveal().needs_commit() {
-            let slot = ctx.me().index();
-            let req = ctx.shared().choice_request(slot);
-            ctx.effects().callout(req).dispatch();
-        }
         Ok(Transition::Stay)
+    }
+
+    fn callout(ctx: &Context<Shared, Local>) -> Option<Callout> {
+        (ctx.shared().commit_reveal.expected_writer() == Some(ctx.me())
+            && ctx
+                .shared()
+                .commit_reveal
+                .needs_commit(&ctx.local().commit_reveal))
+        .then(|| ctx.shared().choice_request(ctx.me().index()).into())
     }
 
     fn on_input(
@@ -355,7 +358,7 @@ pub mod rock_paper_scissors {
         if finished {
             return Ok(ApplyDecision::Accept(Transition::End));
         }
-        // The next round's callout is issued by `on_react` (needs_commit after reset).
+        // The reset state determines the next round's callout.
         Ok(ApplyDecision::Accept(Transition::Stay))
     }
 
@@ -472,10 +475,6 @@ mod tests {
         assert_eq!(callout.request.total_rounds, 3);
         assert_eq!(callout.request.your_score, 0);
         assert_eq!(callout.request.their_score, 0);
-        assert_eq!(
-            callout.expected_type.as_deref(),
-            Some(std::any::type_name::<Choice>())
-        );
     }
 
     #[arena0::test(RockPaperScissors, ())]

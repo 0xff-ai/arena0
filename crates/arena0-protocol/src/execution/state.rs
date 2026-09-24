@@ -1,4 +1,4 @@
-use arena0_program::{LocalStateBytes, SharedStateBytes};
+use arena0_program::{CalloutRequest, LocalStateBytes, SharedStateBytes};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
@@ -8,12 +8,11 @@ use std::time::Instant;
 use crate::exec::ExecLifecycle;
 use crate::negotiation::Activation;
 use crate::trace::{
-    AggregateAttestation, PendingOperation, PendingRecord, StepCommitment, TRACE_FORMAT_VERSION,
-    TerminalCommitment, TraceEntry,
+    AggregateAttestation, StepCommitment, TRACE_FORMAT_VERSION, TerminalCommitment, TraceEntry,
 };
 use crate::{
-    Effect, Event, ExecFrame, ExecId, MessageId, OutcomeHash, PeerId, PendingId, StateHash,
-    pending_id,
+    Effect, Event, ExecFrame, ExecId, MessageId, OpenCallout, OutcomeHash, PeerId, PendingId,
+    StateHash, pending_id,
 };
 
 use super::{
@@ -46,6 +45,8 @@ pub struct SharedProposal {
     pub(crate) effects: Vec<(u32, Effect)>,
     pub(crate) event_position: u64,
     pub(crate) status: ExecutionStatus,
+    /// The open callout this proposal installs when it is certified.
+    pub(crate) callout: Option<OpenCallout>,
     pub(crate) signatures: Vec<ParticipantStepSignature>,
 }
 
@@ -60,6 +61,7 @@ impl SharedProposal {
         effects: Vec<(u32, Effect)>,
         event_position: u64,
         status: ExecutionStatus,
+        callout: Option<OpenCallout>,
         signatures: Vec<ParticipantStepSignature>,
     ) -> Result<Self, ProtocolError> {
         if effects.len() > MAX_EFFECTS {
@@ -78,6 +80,7 @@ impl SharedProposal {
             effects,
             event_position,
             status,
+            callout,
             signatures,
         };
         Ok(proposal)
@@ -117,6 +120,12 @@ impl SharedProposal {
     #[must_use]
     pub const fn status(&self) -> &ExecutionStatus {
         &self.status
+    }
+
+    /// Borrow the open callout to install when this proposal commits.
+    #[must_use]
+    pub const fn callout(&self) -> Option<&OpenCallout> {
+        self.callout.as_ref()
     }
 
     /// Borrow immutable collected participant signatures.
@@ -254,6 +263,7 @@ pub struct ExecutionState {
     pub(crate) shared_state: SharedStateBytes,
     pub(crate) local_state: LocalStateBytes,
     pub(crate) proposal: Option<SharedProposal>,
+    pub(crate) callout: Option<OpenCallout>,
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
@@ -271,6 +281,7 @@ struct ExecutionStateBody {
     shared_state: SharedStateBytes,
     local_state: LocalStateBytes,
     proposal: Option<SharedProposal>,
+    callout: Option<OpenCallout>,
 }
 
 impl BorshSerialize for ExecutionState {
@@ -311,6 +322,7 @@ impl ExecutionState {
             shared_state: self.shared_state.clone(),
             local_state: self.local_state.clone(),
             proposal: self.proposal.clone(),
+            callout: self.callout.clone(),
         }
     }
 
@@ -329,6 +341,7 @@ impl ExecutionState {
             shared_state: body.shared_state,
             local_state: body.local_state,
             proposal: body.proposal,
+            callout: body.callout,
         };
         state.validate_recovered()?;
         Ok(state)
@@ -380,6 +393,7 @@ impl ExecutionState {
             shared_state,
             local_state,
             proposal: None,
+            callout: None,
         })
     }
 
@@ -402,8 +416,14 @@ impl ExecutionState {
     }
 
     /// Return the public lifecycle projection.
+    ///
+    /// An active execution with an open callout projects as `Waiting`; that
+    /// fact is derived here rather than persisted in [`ExecutionStatus`].
     #[must_use]
     pub const fn lifecycle(&self) -> ExecLifecycle {
+        if matches!(self.status, ExecutionStatus::Active) && self.callout.is_some() {
+            return ExecLifecycle::Waiting;
+        }
         self.status.lifecycle()
     }
 
@@ -411,6 +431,12 @@ impl ExecutionState {
     #[must_use]
     pub const fn status(&self) -> &ExecutionStatus {
         &self.status
+    }
+
+    /// Borrow the committed open callout, if any.
+    #[must_use]
+    pub const fn callout(&self) -> Option<&OpenCallout> {
+        self.callout.as_ref()
     }
 
     /// Return the receipt identity retained by a published terminal status.
@@ -421,7 +447,6 @@ impl ExecutionState {
             ExecutionStatus::StoppedPublished { receipt_id, .. } => Some(*receipt_id),
             ExecutionStatus::Activating
             | ExecutionStatus::Active
-            | ExecutionStatus::Waiting { .. }
             | ExecutionStatus::TerminalProof { .. }
             | ExecutionStatus::Stopped { .. }
             | ExecutionStatus::Incomplete { .. } => None,
@@ -564,14 +589,14 @@ impl ExecutionState {
     /// Apply the pure protocol part of one accepted guest dispatch.
     ///
     /// The state decides whether the result installs immediately or stages a
-    /// shared proposal, derives the next status, normalizes an establishing
-    /// broadcast, and advances the version. The caller remains responsible
-    /// for validating its durable source and atomically persisting this state,
-    /// the returned establishing frame, and the original effects.
+    /// shared proposal, derives the next status and open callout, normalizes
+    /// an establishing broadcast, and advances the version. The caller remains
+    /// responsible for validating its durable source and atomically persisting
+    /// this state, the returned establishing frame, and the original effects.
     ///
-    /// The optional frame establishes a normalized broadcast. The boolean is
-    /// true only when this dispatch consumes the current callout or signing
-    /// continuation rather than leaving it open.
+    /// The optional frame establishes a normalized broadcast. `callout` is the
+    /// one request the program derived from the accepted post-state.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_dispatch(
         &mut self,
         event: &Event<Vec<u8>>,
@@ -580,7 +605,8 @@ impl ExecutionState {
         effects: &[Effect],
         terminal_outcome: Option<TerminalOutcome>,
         pending_id: Option<PendingId>,
-    ) -> Result<(Option<(u32, ExecFrame)>, bool), ProtocolError> {
+        callout: Option<CalloutRequest>,
+    ) -> Result<Option<(u32, ExecFrame)>, ProtocolError> {
         if self.proposal.is_some() {
             return Err(ProtocolError::SharedProposalExists);
         }
@@ -589,6 +615,13 @@ impl ExecutionState {
         let indexed_effects = indexed_dispatch_effects(effects)?;
         validate_effects(&indexed_effects)?;
         let lifecycle = dispatch_lifecycle_effect(effects)?;
+        if lifecycle.is_some()
+            && effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::SetTimer { .. }))
+        {
+            return Err(ProtocolError::InvalidTerminalStatus);
+        }
         let broadcast_index = effects
             .iter()
             .position(|effect| matches!(effect, Effect::Broadcast { .. }));
@@ -601,21 +634,23 @@ impl ExecutionState {
             || broadcast_index.is_some()
             || lifecycle.is_some();
         let reacted_step = reacted_step(self, event)?;
-        let closes_pending = validate_pending_dispatch(self, event, pending_id, effects)?;
+        validate_callout_dispatch(self, event, pending_id)?;
 
         if !requires_agreement {
             if terminal_outcome.is_some() {
                 return Err(ProtocolError::TerminalOutcomeMismatch);
             }
-            let status = next_dispatch_status(self, event, event_position, effects)?;
+            let status = ExecutionStatus::active();
+            let next_callout = next_open_callout(self, event, event_position, &status, callout);
             self.install_dispatch(
                 event_position,
                 shared_state,
                 local_state,
                 status,
+                next_callout,
                 reacted_step,
             )?;
-            return Ok((None, closes_pending));
+            return Ok(None);
         }
 
         let (trace_event, proposal_effects, establishing_frame) =
@@ -638,15 +673,8 @@ impl ExecutionState {
         };
         let commitment =
             StepCommitment::for_entry(self.binding.session_id(), &entry, self.agreed_link);
-        let status = proposal_status(
-            self,
-            event,
-            event_position,
-            &entry,
-            &commitment,
-            effects,
-            terminal_outcome,
-        )?;
+        let status = proposal_status(self, &entry, &commitment, terminal_outcome)?;
+        let next_callout = next_open_callout(self, event, event_position, &status, callout);
         let proposal = SharedProposal::new(
             commitment,
             entry,
@@ -655,15 +683,16 @@ impl ExecutionState {
             proposal_effects,
             event_position,
             status,
+            next_callout,
             Vec::new(),
         )?;
         self.stage_proposal(proposal, reacted_step)?;
-        Ok((establishing_frame, closes_pending))
+        Ok(establishing_frame)
     }
 
     /// Install one accepted dispatch that does not require shared agreement.
     ///
-    /// Such a dispatch may replace either memory and may leave a continuation,
+    /// Such a dispatch may replace either memory and may leave a callout open,
     /// but its shared payload must hash to the current agreed shared state. A
     /// dispatch that changes that hash belongs in [`Self::stage_proposal`].
     /// `reacted_step` records a `React` dispatch in the same durable mutation;
@@ -674,24 +703,19 @@ impl ExecutionState {
         shared_state: SharedStateBytes,
         local_state: LocalStateBytes,
         status: ExecutionStatus,
+        callout: Option<OpenCallout>,
         reacted_step: Option<u64>,
     ) -> Result<(), ProtocolError> {
         if self.proposal.is_some() {
             return Err(ProtocolError::SharedProposalExists);
         }
-        if !matches!(
-            self.status,
-            ExecutionStatus::Active | ExecutionStatus::Waiting { .. }
-        ) {
+        if !matches!(self.status, ExecutionStatus::Active) {
             return Err(ProtocolError::IllegalLifecycle {
                 current: self.lifecycle(),
                 event: "dispatch",
             });
         }
-        if !matches!(
-            status,
-            ExecutionStatus::Active | ExecutionStatus::Waiting { .. }
-        ) {
+        if !matches!(status, ExecutionStatus::Active) {
             return Err(ProtocolError::InvalidTerminalStatus);
         }
         if event_position != self.event_position {
@@ -719,6 +743,7 @@ impl ExecutionState {
         next.shared_state = shared_state;
         next.local_state = local_state;
         next.status = status;
+        next.callout = callout;
         if let Some(step) = reacted_step {
             next.last_reacted_step = Some(step);
         }
@@ -742,10 +767,7 @@ impl ExecutionState {
         if self.proposal.is_some() {
             return Err(ProtocolError::SharedProposalExists);
         }
-        if !matches!(
-            self.status,
-            ExecutionStatus::Active | ExecutionStatus::Waiting { .. }
-        ) {
+        if !matches!(self.status, ExecutionStatus::Active) {
             return Err(ProtocolError::IllegalLifecycle {
                 current: self.lifecycle(),
                 event: "shared proposal",
@@ -874,6 +896,7 @@ impl ExecutionState {
         self.shared_state = committed.shared_state.clone();
         self.local_state = committed.local_state.clone();
         self.status = committed.status.clone();
+        self.callout = committed.callout.clone();
         self.proposal = expected_successor;
         Ok(committed)
     }
@@ -942,6 +965,7 @@ impl ExecutionState {
             Vec::new(),
             proposal.event_position,
             proposal.status.clone(),
+            proposal.callout.clone(),
             Vec::new(),
         )?))
     }
@@ -1001,6 +1025,7 @@ impl ExecutionState {
 
         let mut next = self.clone();
         next.proposal = None;
+        next.callout = None;
         next.status = ExecutionStatus::stopped(occurrence)?;
         next.bump_version()?;
         next.validate_recovered()?;
@@ -1020,6 +1045,7 @@ impl ExecutionState {
             .clone();
         let mut next = self.clone();
         next.status = ExecutionStatus::incomplete(proof, reason)?;
+        next.callout = None;
         next.bump_version()?;
         next.validate_recovered()?;
         *self = next;
@@ -1066,6 +1092,7 @@ impl ExecutionState {
 
         let mut next = self.clone();
         next.status = status;
+        next.callout = None;
         next.bump_version()?;
         next.validate_recovered()?;
         *self = next;
@@ -1156,6 +1183,9 @@ impl ExecutionState {
         }
         self.status
             .validate_binding(&self.binding, self.step_cursor())?;
+        if !matches!(self.status, ExecutionStatus::Active) && self.callout.is_some() {
+            return Err(ProtocolError::InvalidCalloutState);
+        }
         if self.status.is_terminal() && self.proposal.is_some() {
             return Err(ProtocolError::InvalidCertificate(
                 "terminal execution cannot retain a shared proposal".into(),
@@ -1177,6 +1207,10 @@ impl ExecutionState {
                 proposal.event_position,
                 proposal,
             )?;
+            if !matches!(proposal.status(), ExecutionStatus::Active) && proposal.callout().is_some()
+            {
+                return Err(ProtocolError::InvalidCalloutState);
+            }
         }
         Ok(())
     }
@@ -1220,87 +1254,65 @@ fn dispatch_lifecycle_effect(effects: &[Effect]) -> Result<Option<Effect>, Proto
     Ok(lifecycle)
 }
 
-fn validate_pending_dispatch(
+fn validate_callout_dispatch(
     state: &ExecutionState,
     event: &Event<Vec<u8>>,
     pending_id: Option<PendingId>,
-    effects: &[Effect],
-) -> Result<bool, ProtocolError> {
-    let lifecycle = effects.iter().any(|effect| {
-        matches!(
-            effect,
-            Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. }
-        )
-    });
-    let continuation = effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::Callout { .. } | Effect::SetTimer { .. }));
-    if lifecycle && continuation {
-        return Err(ProtocolError::InvalidTerminalStatus);
-    }
+) -> Result<(), ProtocolError> {
     let answer = matches!(event, Event::InputReceived { .. });
     if !answer {
         if pending_id.is_some() {
-            return Err(ProtocolError::PendingContinuationMismatch);
+            return Err(ProtocolError::CalloutMismatch);
         }
-        return Ok(false);
+        return Ok(());
     }
-    let Some(pending_id) = pending_id else {
-        return Err(ProtocolError::PendingContinuationMismatch);
-    };
-    let Some(current) = state.status.pending() else {
-        return Err(ProtocolError::PendingContinuationMismatch);
-    };
-    if current.id != pending_id {
-        return Err(ProtocolError::PendingContinuationMismatch);
+    let answer_id = pending_id.ok_or(ProtocolError::CalloutMismatch)?;
+    let open = state
+        .callout
+        .as_ref()
+        .ok_or(ProtocolError::CalloutMismatch)?;
+    if open.id != answer_id {
+        return Err(ProtocolError::CalloutMismatch);
     }
-    let matches = match (event, current.operation) {
-        (
-            Event::InputReceived { callout_index, .. },
-            PendingOperation::Callout {
-                callout_index: expected_index,
-            },
-        ) => *callout_index == expected_index,
-        _ => false,
+    let Event::InputReceived { callout_index, .. } = event else {
+        return Err(ProtocolError::CalloutMismatch);
     };
-    if !matches {
-        return Err(ProtocolError::PendingContinuationMismatch);
+    if *callout_index != open.callout_index {
+        return Err(ProtocolError::CalloutMismatch);
     }
-    Ok(true)
+    Ok(())
 }
 
-fn next_dispatch_status(
+/// Derive the open callout installed with a dispatch result.
+///
+/// A terminal result has none. Otherwise the program's request keeps the
+/// current identity for a non-answer event when it repeats the same index and context, replaces it
+/// with a fresh event-position identity when it differs, and withdraws it when
+/// the program asks nothing. An accepted answer consumes its identity, even
+/// when the resulting question has the same index and context.
+fn next_open_callout(
     state: &ExecutionState,
     event: &Event<Vec<u8>>,
     event_position: u64,
-    effects: &[Effect],
-) -> Result<ExecutionStatus, ProtocolError> {
-    let existing = state.status.pending().cloned();
-    let continuation = effects
-        .iter()
-        .enumerate()
-        .filter(|(_, effect)| matches!(effect, Effect::Callout { .. }))
-        .map(|(index, effect)| {
-            let ordinal =
-                u32::try_from(index).map_err(|_| ProtocolError::InvalidPendingContinuation)?;
-            let id = pending_id(state.execution_id, event_position, ordinal);
-            PendingRecord::from_effect(id, effect).ok_or(ProtocolError::InvalidPendingContinuation)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if continuation.len() > 1 {
-        return Err(ProtocolError::InvalidPendingContinuation);
+    status: &ExecutionStatus,
+    callout: Option<CalloutRequest>,
+) -> Option<OpenCallout> {
+    if !matches!(status, ExecutionStatus::Active) {
+        return None;
     }
-    let consumes_pending = matches!(event, Event::InputReceived { .. });
-    if let Some(next) = continuation.into_iter().next() {
-        if existing.is_some() && !consumes_pending {
-            return Err(ProtocolError::InvalidPendingContinuation);
-        }
-        return Ok(ExecutionStatus::waiting(next));
+    let request = callout?;
+    if let Some(current) = &state.callout
+        && !matches!(event, Event::InputReceived { .. })
+        && current.callout_index == request.callout_index
+        && current.context == request.context
+    {
+        return Some(current.clone());
     }
-    if !consumes_pending {
-        return Ok(existing.map_or_else(ExecutionStatus::active, ExecutionStatus::waiting));
-    }
-    Ok(ExecutionStatus::active())
+    Some(OpenCallout {
+        id: pending_id(state.execution_id, event_position),
+        callout_index: request.callout_index,
+        context: request.context,
+    })
 }
 
 fn reacted_step(
@@ -1378,14 +1390,10 @@ fn normalize_proposal_event(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn proposal_status(
     state: &ExecutionState,
-    event: &Event<Vec<u8>>,
-    event_position: u64,
     entry: &TraceEntry,
     commitment: &StepCommitment,
-    effects: &[Effect],
     terminal_outcome: Option<TerminalOutcome>,
 ) -> Result<ExecutionStatus, ProtocolError> {
     if let Some(terminal) = &entry.terminal {
@@ -1420,7 +1428,7 @@ fn proposal_status(
     if terminal_outcome.is_some() {
         return Err(ProtocolError::TerminalOutcomeMismatch);
     }
-    next_dispatch_status(state, event, event_position, effects)
+    Ok(ExecutionStatus::active())
 }
 
 #[cfg(test)]
@@ -1437,8 +1445,7 @@ mod tests {
     use crate::trace::{AggregateAttestation, CHAIN_START, TRACE_FORMAT_VERSION};
     use crate::{
         AbortKind, AbortOccurrence, Ensemble, Event, LocalStateBytes, MessageId, NegotiationId,
-        PendingOperation, PendingRecord, SharedStateBytes, StateHash, StopCause, TicketAction,
-        TraceEntry, pending_id,
+        OpenCallout, SharedStateBytes, StateHash, StopCause, TicketAction, TraceEntry, pending_id,
     };
 
     struct Fixture {
@@ -1603,9 +1610,285 @@ mod tests {
             Vec::new(),
             state.event_position(),
             ExecutionStatus::active(),
+            None,
             Vec::new(),
         )
         .expect("valid proposal")
+    }
+
+    #[test]
+    fn dispatch_derives_callout_identity_and_withdrawal() {
+        let fixture = fixture();
+        let mut state = active_state(&fixture);
+        let event = Event::TimerFired {
+            timer: crate::TimerPayload::unit(),
+        };
+        let request = CalloutRequest {
+            callout_index: 0,
+            context: b"null".to_vec(),
+        };
+        let first_position = state.event_position();
+        state
+            .apply_dispatch(
+                &event,
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[],
+                None,
+                None,
+                Some(request.clone()),
+            )
+            .unwrap();
+        let first = state.callout().unwrap().clone();
+        assert_eq!(first.id, pending_id(state.execution_id(), first_position));
+        assert_eq!(state.lifecycle(), ExecLifecycle::Waiting);
+        state
+            .apply_dispatch(
+                &event,
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[],
+                None,
+                None,
+                Some(request.clone()),
+            )
+            .unwrap();
+        assert_eq!(state.callout(), Some(&first));
+        let answer_position = state.event_position();
+        let answer = Event::InputReceived {
+            callout_index: first.callout_index,
+            data: vec![],
+        };
+        state
+            .apply_dispatch(
+                &answer,
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[],
+                None,
+                Some(first.id),
+                Some(request.clone()),
+            )
+            .unwrap();
+        let reasked = state.callout().unwrap().clone();
+        assert_eq!(reasked.callout_index, first.callout_index);
+        assert_eq!(reasked.context, first.context);
+        assert_ne!(reasked.id, first.id);
+        assert_eq!(
+            reasked.id,
+            pending_id(state.execution_id(), answer_position)
+        );
+        let before_replay = state.clone();
+        assert_eq!(
+            state.apply_dispatch(
+                &answer,
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[],
+                None,
+                Some(first.id),
+                Some(request.clone())
+            ),
+            Err(ProtocolError::CalloutMismatch)
+        );
+        assert_eq!(state, before_replay);
+        for replacement in [
+            CalloutRequest {
+                callout_index: 1,
+                ..request
+            },
+            CalloutRequest {
+                callout_index: 1,
+                context: b"true".to_vec(),
+            },
+        ] {
+            let previous = state.callout().unwrap().id;
+            let position = state.event_position();
+            state
+                .apply_dispatch(
+                    &event,
+                    state.shared_state().clone(),
+                    state.local_state().clone(),
+                    &[],
+                    None,
+                    None,
+                    Some(replacement),
+                )
+                .unwrap();
+            assert_ne!(state.callout().unwrap().id, previous);
+            assert_eq!(
+                state.callout().unwrap().id,
+                pending_id(state.execution_id(), position)
+            );
+        }
+        state
+            .apply_dispatch(
+                &event,
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(state.callout().is_none());
+        assert_eq!(state.lifecycle(), ExecLifecycle::Active);
+    }
+
+    #[test]
+    fn input_requires_the_exact_open_callout() {
+        let fixture = fixture();
+        let mut state = active_state(&fixture);
+        let timer = Event::TimerFired {
+            timer: crate::TimerPayload::unit(),
+        };
+        state
+            .apply_dispatch(
+                &timer,
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[],
+                None,
+                None,
+                Some(CalloutRequest {
+                    callout_index: 2,
+                    context: vec![],
+                }),
+            )
+            .unwrap();
+        let id = state.callout().unwrap().id;
+        for (event, answer_id) in [
+            (
+                Event::InputReceived {
+                    callout_index: 2,
+                    data: vec![],
+                },
+                None,
+            ),
+            (
+                Event::InputReceived {
+                    callout_index: 2,
+                    data: vec![],
+                },
+                Some(PendingId::new(id.get().wrapping_add(1))),
+            ),
+            (
+                Event::InputReceived {
+                    callout_index: 1,
+                    data: vec![],
+                },
+                Some(id),
+            ),
+            (timer, Some(id)),
+        ] {
+            let before = state.clone();
+            assert_eq!(
+                state.apply_dispatch(
+                    &event,
+                    state.shared_state().clone(),
+                    state.local_state().clone(),
+                    &[],
+                    None,
+                    answer_id,
+                    None
+                ),
+                Err(ProtocolError::CalloutMismatch)
+            );
+            assert_eq!(state, before);
+        }
+        state
+            .apply_dispatch(
+                &Event::InputReceived {
+                    callout_index: 2,
+                    data: vec![],
+                },
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[],
+                None,
+                Some(id),
+                None,
+            )
+            .unwrap();
+        assert!(state.callout().is_none());
+    }
+
+    #[test]
+    fn certification_installs_callout_and_terminal_clears_it() {
+        let fixture = fixture();
+        let mut state = active_state(&fixture);
+        let ensemble =
+            Ensemble::from_peers(fixture.participants.iter().map(|(peer, _)| *peer).collect())
+                .unwrap();
+        let request = CalloutRequest {
+            callout_index: 0,
+            context: b"null".to_vec(),
+        };
+        state
+            .apply_dispatch(
+                &Event::SessionStarted { ensemble },
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[],
+                None,
+                None,
+                Some(request.clone()),
+            )
+            .unwrap();
+        assert!(state.callout().is_none());
+        let proposal = state.pending_shared().unwrap().clone();
+        assert!(proposal.callout().is_some());
+        for (peer, key) in &fixture.participants {
+            state
+                .add_step_signature(ParticipantStepSignature::new(
+                    *peer,
+                    proposal.commitment().step,
+                    key.sign(&proposal.commitment().signing_bytes()),
+                ))
+                .unwrap();
+        }
+        assert_eq!(state.callout(), proposal.callout());
+        let open = state.callout().cloned();
+        let outcome = TerminalOutcome::new(vec![], b"null".to_vec()).unwrap();
+        let event = proposal_for(
+            &fixture,
+            &state,
+            state.shared_state().clone(),
+            state.local_state().clone(),
+        )
+        .entry()
+        .event
+        .clone();
+        state
+            .apply_dispatch(
+                &event,
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[Effect::SessionEnd { outcome: vec![] }],
+                Some(outcome),
+                None,
+                Some(request),
+            )
+            .unwrap();
+        assert_eq!(state.callout(), open.as_ref());
+        let proposal = state.pending_shared().unwrap().clone();
+        assert!(proposal.callout().is_none());
+        for (peer, key) in &fixture.participants {
+            state
+                .add_step_signature(ParticipantStepSignature::new(
+                    *peer,
+                    proposal.commitment().step,
+                    key.sign(&proposal.commitment().signing_bytes()),
+                ))
+                .unwrap();
+        }
+        assert!(state.callout().is_none());
+        state.callout = open;
+        assert_eq!(
+            state.validate_recovered(),
+            Err(ProtocolError::InvalidCalloutState)
+        );
     }
 
     #[test]
@@ -1682,10 +1965,10 @@ mod tests {
         assert_eq!(state.status(), &ExecutionStatus::Active);
         assert_eq!(state.version(), ExecutionVersion::new(1));
 
-        let pending = PendingRecord {
-            id: pending_id(state.execution_id(), state.event_position(), 0),
-            operation: PendingOperation::Callout { callout_index: 0 },
-            expected_type: Some("bytes".into()),
+        let pending = OpenCallout {
+            id: pending_id(state.execution_id(), state.event_position()),
+            callout_index: 0,
+            context: b"null".to_vec(),
         };
         let local = LocalStateBytes::try_new(vec![0xa0, 0xa1]).expect("bounded local state");
         state
@@ -1693,14 +1976,15 @@ mod tests {
                 state.event_position(),
                 fixture.initial.clone(),
                 local.clone(),
-                ExecutionStatus::waiting(pending),
+                ExecutionStatus::active(),
+                Some(pending),
                 None,
             )
             .expect("dispatch installation");
         assert_eq!(state.event_position(), 1);
         assert_eq!(state.shared_state(), &fixture.initial);
         assert_eq!(state.local_state(), &local);
-        assert!(state.status().pending().is_some());
+        assert!(state.callout().is_some());
         assert_eq!(state.version(), ExecutionVersion::new(2));
 
         let before = state.clone();
@@ -1710,6 +1994,7 @@ mod tests {
                 fixture.initial.clone(),
                 local,
                 ExecutionStatus::active(),
+                None,
                 None,
             )
             .expect_err("wrong event coordinate must be rejected");

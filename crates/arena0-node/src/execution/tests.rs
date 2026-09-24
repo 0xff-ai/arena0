@@ -15,8 +15,8 @@ use arena0_protocol::execution::GuestSignData;
 use arena0_protocol::{
     AbortKind, AbortOccurrence, Activation, ActivationData, Ensemble, Event, ExecFrame, ExecId,
     ExecutionAdmission, MessageId, NegotiationId, Offer, OfferData, ParticipantStepSignature,
-    ParticipantTerminalSignature, PeerId, PeerIdSource, PreparedActivation, StateHash, Ticket,
-    TicketAction, TicketData, TicketHash,
+    ParticipantTerminalSignature, PeerId, PeerIdSource, PendingId, PreparedActivation, StateHash,
+    Ticket, TicketAction, TicketData, TicketHash,
 };
 use arena0_sandbox::{InitializeCall, LoadedProgram, Program, WasmtimeEngine};
 use arena0_store::{ApplyOutcome, OutboxPayloadKind, Store, StoreConfig};
@@ -224,6 +224,7 @@ impl Fixture {
             inflight_send: None,
             session_started_emitted: false,
             terminal_emitted: false,
+            announced_callout: None,
         }
     }
 
@@ -634,7 +635,7 @@ async fn recovered_sdk_timers_dispatch_typed_and_unit_payloads() {
 }
 
 #[tokio::test]
-async fn restart_drains_a_durable_callout_outbox() {
+async fn restart_reannounces_committed_callout_once() {
     let fixture = Fixture::with_mode(false, GuestMode::Callout).await;
     let (first_messages, mut first_observations) = mpsc::channel(8);
     let mut actor = fixture
@@ -653,32 +654,29 @@ async fn restart_drains_a_durable_callout_outbox() {
             .load_state()
             .await
             .expect("load callout state")
-            .status()
-            .pending()
+            .callout()
             .expect("pending callout")
             .id
     };
-    actor
-        .drain_outbox_report()
-        .await
-        .expect("deliver initial callout");
+    actor.progress().await.expect("deliver initial callout");
+    let initial = std::iter::from_fn(|| first_observations.try_recv().ok())
+        .find(|message| matches!(message, crate::SessionMessage::CalloutRequested { .. }))
+        .expect("initial callout message");
     assert!(matches!(
-        first_observations.recv().await.expect("initial callout message"),
+        initial,
         crate::SessionMessage::CalloutRequested {
             pending_id: id,
             callout_index: 0,
             context,
-            expected_type,
             ..
         } if id == pending_id
             && context == b"null"
-            && expected_type.as_deref() == Some("bytes")
     ));
     drop(actor);
 
     let (messages, mut observations) = mpsc::channel(8);
     let mut restarted = fixture.actor_with_messages(messages);
-    restarted.recover().await.expect("recover callout outbox");
+    restarted.recover().await.expect("recover open callout");
     let mut found = None;
     while let Ok(message) = observations.try_recv() {
         if let crate::SessionMessage::CalloutRequested { .. } = message {
@@ -687,17 +685,22 @@ async fn restart_drains_a_durable_callout_outbox() {
         }
     }
     let message = found.expect("recovered callout message");
+    restarted.progress().await.expect("repeat progress");
+    while let Ok(message) = observations.try_recv() {
+        assert!(!matches!(
+            message,
+            crate::SessionMessage::CalloutRequested { .. }
+        ));
+    }
     assert!(matches!(
         message,
         crate::SessionMessage::CalloutRequested {
             pending_id: id,
             callout_index: 0,
             context,
-            expected_type,
             ..
         } if id == pending_id
             && context == b"null"
-            && expected_type.as_deref() == Some("bytes")
     ));
     assert!(
         restarted
@@ -708,6 +711,90 @@ async fn restart_drains_a_durable_callout_outbox() {
             .expect("load outbox")
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn react_runs_with_an_open_callout_and_replaces_the_question() {
+    let fixture = Fixture::with_mode(false, GuestMode::Callout).await;
+    let (messages, _observations) = mpsc::channel(32);
+    let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
+    fixture.commit_session_started(&mut actor).await;
+    assert_eq!(
+        actor
+            .dispatch_event(
+                Event::TimerFired {
+                    timer: arena0_protocol::TimerPayload::unit()
+                },
+                DispatchSource::default(),
+            )
+            .await
+            .unwrap(),
+        DispatchOutcome::Committed
+    );
+    let before = actor.load_state().await.unwrap();
+    let first = before.callout().unwrap().clone();
+    assert_eq!(first.context, b"true");
+    actor.progress().await.unwrap();
+    let after = actor.load_state().await.unwrap();
+    assert_eq!(after.last_reacted_step(), Some(after.agreed_step() - 1));
+    assert_eq!(after.callout().unwrap().context, b"null");
+    assert_ne!(after.callout().unwrap().id, first.id);
+    assert!(!after.status().is_terminal());
+    assert!(matches!(
+        actor
+            .submit_input(first.id, JsonBytes::try_new(b"null".to_vec()).unwrap())
+            .await,
+        Err(SubmitInputError::Expected(
+            crate::ExecError::CalloutNotPending
+        ))
+    ));
+}
+
+#[tokio::test]
+async fn staged_result_preserves_callout_and_reports_agreement_pending() {
+    let fixture = Fixture::with_mode(true, GuestMode::Callout).await;
+    let mut actor = fixture.prepare_active_actor().await;
+    fixture.commit_session_started(&mut actor).await;
+    let answer = JsonBytes::try_new(b"null".to_vec()).unwrap();
+    assert!(matches!(
+        actor.submit_input(PendingId::new(0), answer.clone()).await,
+        Err(SubmitInputError::Expected(
+            crate::ExecError::CalloutNotPending
+        ))
+    ));
+    actor
+        .dispatch_event(Event::React, DispatchSource::default())
+        .await
+        .unwrap();
+    let before = actor.load_state().await.unwrap();
+    let open = before.callout().unwrap().clone();
+    let source = fixture.remote_keys.peer_id();
+    let frame = message_frame(&before, source, before.agreed_step(), vec![1, 2, 3]);
+    actor
+        .context
+        .store
+        .accept_inbound(source, frame, 14)
+        .await
+        .unwrap();
+    actor.resolve_pending_inbox().await.unwrap();
+    let staged = actor.load_state().await.unwrap();
+    assert!(staged.pending_shared().is_some());
+    assert_eq!(staged.callout(), Some(&open));
+    assert!(matches!(
+        actor.submit_input(open.id, answer.clone()).await,
+        Err(SubmitInputError::Expected(
+            crate::ExecError::AgreementPending
+        ))
+    ));
+    assert!(matches!(
+        actor
+            .submit_input(PendingId::new(open.id.get().wrapping_add(1)), answer)
+            .await,
+        Err(SubmitInputError::Expected(
+            crate::ExecError::CalloutNotPending
+        ))
+    ));
+    assert_eq!(actor.load_state().await.unwrap(), staged);
 }
 
 #[tokio::test]
@@ -725,11 +812,10 @@ async fn rejected_callout_answer_preserves_pending_continuation_until_valid_inpu
     );
 
     let before = actor.load_state().await.expect("load pending state");
-    let pending_id = before.status().pending().expect("pending callout").id;
+    let pending_id = before.callout().expect("pending callout").id;
     let result = actor
         .submit_input(
             pending_id,
-            0,
             JsonBytes::try_new(b"null".to_vec()).expect("answer"),
         )
         .await;
@@ -744,10 +830,10 @@ async fn rejected_callout_answer_preserves_pending_continuation_until_valid_inpu
     assert_eq!(after_rejection.event_position(), before.event_position());
     assert_eq!(after_rejection.shared_state(), before.shared_state());
     assert_eq!(after_rejection.local_state(), before.local_state());
+    assert_eq!(after_rejection.callout(), before.callout());
     assert_eq!(
         after_rejection
-            .status()
-            .pending()
+            .callout()
             .expect("pending after rejection")
             .id,
         pending_id
@@ -757,13 +843,12 @@ async fn rejected_callout_answer_preserves_pending_continuation_until_valid_inpu
     actor
         .submit_input(
             pending_id,
-            0,
             JsonBytes::try_new(b"true".to_vec()).expect("valid answer"),
         )
         .await
         .expect("valid answer after rejection");
     let committed = actor.load_state().await.expect("load committed answer");
-    assert!(committed.status().pending().is_none());
+    assert!(committed.callout().is_none());
     assert!(!committed.status().is_terminal());
 }
 
@@ -786,13 +871,9 @@ async fn input_handler_trap_rejects_without_ending_session() {
         .await
         .expect("load state before trap")
         .expect("execution before trap");
-    let pending_id = before.status().pending().expect("callout pending").id;
+    let pending_id = before.callout().expect("callout pending").id;
     assert_eq!(
-        before
-            .status()
-            .pending()
-            .expect("callout remains pending")
-            .id,
+        before.callout().expect("callout remains pending").id,
         pending_id
     );
     assert_eq!(before.shared_state().as_bytes(), &[] as &[u8]);
@@ -801,7 +882,6 @@ async fn input_handler_trap_rejects_without_ending_session() {
     let result = actor
         .submit_input(
             pending_id,
-            0,
             JsonBytes::try_new(b"null".to_vec()).expect("answer"),
         )
         .await;
@@ -823,10 +903,8 @@ async fn input_handler_trap_rejects_without_ending_session() {
     assert_eq!(after.local_state(), before.local_state());
     assert_eq!(after.version(), before.version());
     assert_eq!(after.event_position(), before.event_position());
-    assert_eq!(
-        after.status().pending().expect("pending after trap").id,
-        pending_id
-    );
+    assert_eq!(after.callout(), before.callout());
+    assert_eq!(after.callout().expect("pending after trap").id, pending_id);
     assert!(!after.status().is_terminal());
 }
 
@@ -1531,9 +1609,7 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
     let capabilities = match mode {
         GuestMode::Plain | GuestMode::EndOnMessage => Vec::new(),
         GuestMode::Timer => vec![Capability::Timers],
-        GuestMode::Callout | GuestMode::CalloutFault | GuestMode::CalloutReject => {
-            vec![Capability::Input]
-        }
+        GuestMode::Callout | GuestMode::CalloutFault | GuestMode::CalloutReject => Vec::new(),
         GuestMode::LocalSign | GuestMode::SignOnMessage => vec![Capability::Sign {
             schemes: vec![SignScheme::Ed25519],
         }],
@@ -1544,7 +1620,7 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
             vec![CalloutSchema {
                 name: "request".into(),
                 prompt: "request".into(),
-                input: unit.clone(),
+                input: JsonSchemaDocument::new(serde_json::json!({"$schema": "https://json-schema.org/draft/2020-12/schema", "type": ["null", "boolean"]})).unwrap(),
                 output: unit.clone(),
             }]
         }
@@ -1578,10 +1654,7 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
         GuestMode::Timer => {
             r#"(import "arena0" "set_timer" (func $set_timer (param i64 i32 i32 i32 i32)))"#
         }
-        GuestMode::Callout | GuestMode::CalloutFault | GuestMode::CalloutReject => {
-            r#"(import "arena0" "request_input"
-            (func $request_input (param i32 i32 i32 i32 i32)))"#
-        }
+        GuestMode::Callout | GuestMode::CalloutFault | GuestMode::CalloutReject => "",
         GuestMode::LocalSign | GuestMode::SignOnMessage => {
             r#"(import "arena0" "sign"
             (func $sign (param i32 i32 i32 i32 i32) (result i32)))"#
@@ -1623,12 +1696,10 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
               i32.const 1040
               i32.const 1
               call $state_write
-              i32.const 0
-              i32.const 1080
-              i32.const 4
-              i32.const 1070
-              i32.const 5
-              call $request_input
+              i32.const 33000
+              i32.const 15
+              call $pack
+              return
             "#
         }
         GuestMode::LocalSign => {
@@ -1740,6 +1811,14 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
         }
     };
     let timer_body = match mode {
+        GuestMode::Callout => {
+            r#"
+              i32.const 33100
+              i32.const 15
+              call $pack
+              return
+            "#
+        }
         GuestMode::Timer => {
             r#"
               i32.const 1
@@ -1773,7 +1852,9 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
           (data (i32.const 1140) "\08")
           (data (i32.const 2000) "{writer}")
           (data (i32.const 3000) "\00\00\00\00\00\00\00\00")
-          (data (i32.const 32768) "\00\00")
+          (data (i32.const 32768) "\00\00\00")
+          (data (i32.const 33000) "\00\00\01\00\00\00\00\04\00\00\00null")
+          (data (i32.const 33100) "\00\00\01\00\00\00\00\04\00\00\00true")
           (data (i32.const 40000) "{metadata}")
           (func $pack (param $ptr i32) (param $len i32) (result i64)
             local.get $ptr
@@ -1849,7 +1930,7 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
             end
             end
             i32.const 32768
-            i32.const 2
+            i32.const 3
             call $pack)
           (func (export "arena0_writer") (param i32 i32) (result i64)
             i32.const 2000

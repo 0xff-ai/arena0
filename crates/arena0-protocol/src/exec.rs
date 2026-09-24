@@ -16,7 +16,7 @@ pub enum ExecLifecycle {
     Negotiating,
     /// The committed activation is proposed and participants are ratifying it.
     Activating,
-    /// Execution is waiting for a private continuation answer or timer resume.
+    /// Execution has an open callout; other events continue dispatching.
     Waiting,
     /// The session was confirmed and started; execution is running.
     Active,

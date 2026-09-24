@@ -32,7 +32,9 @@ pub use signing::GuestSigner;
 mod program;
 pub use program::Program;
 
-use arena0_program::{CallStatus, JsonBytes, LocalStateBytes, OutcomeBytes, SharedStateBytes};
+use arena0_program::{
+    CallStatus, CalloutRequest, JsonBytes, LocalStateBytes, OutcomeBytes, SharedStateBytes,
+};
 use arena0_protocol::Effect;
 
 /// Complete result of one resident dispatch.
@@ -42,6 +44,8 @@ pub struct DispatchCallResult {
     pub status: CallStatus,
     /// Bounded guest reason when an input dispatch was rejected.
     pub reason: Option<String>,
+    /// The single open callout derived from an accepted post-state, if any.
+    pub callout: Option<CalloutRequest>,
     /// Shared payload after an accepted dispatch, or the committed payload on
     /// rejection/failure recovery.
     pub shared: SharedStateBytes,

@@ -130,7 +130,6 @@ impl ImportSemantics {
     pub fn current() -> Self {
         let capability_imports = [
             Capability::Messaging,
-            Capability::Input,
             Capability::Timers,
             Capability::Sign {
                 schemes: vec![arena0_crypto::SignScheme::Ed25519],

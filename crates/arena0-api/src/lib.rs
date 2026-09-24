@@ -313,7 +313,6 @@ mod tests {
                     pending_callout: Some(PendingCalloutStatus {
                         pending_id: PendingId::new(11),
                         callout_index: 1,
-                        expected_type: Some("Move".into()),
                     }),
                     receipt_available: false,
                 },

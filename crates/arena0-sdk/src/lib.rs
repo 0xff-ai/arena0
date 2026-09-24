@@ -43,8 +43,8 @@ pub use arena0_sdk_macros::{
     test,
 };
 pub use context::{
-    CalloutBuilder, Context, Crypto, Effects, PrimitiveField, PrimitiveOutput, PrimitiveOutputs,
-    PrimitiveRoute, RawPrimitiveRoute, Signed,
+    Context, Crypto, Effects, PrimitiveField, PrimitiveOutput, PrimitiveOutputs, PrimitiveRoute,
+    RawPrimitiveRoute, Signed,
 };
 #[doc(hidden)]
 pub use effects::{
@@ -75,8 +75,8 @@ pub use transition::{AbortReason, Transition};
 pub use anyhow;
 pub use arena0_crypto::{HashAlgorithm, SignScheme};
 pub use arena0_program::{
-    ABI_VERSION, AbiEnvelopeError, BorshSchemaDocument, CallStatus, CalloutSchema, Capability,
-    CapabilityImport, CapabilitySet, DispatchInput, DispatchOutput, ExecutionProfile,
+    ABI_VERSION, AbiEnvelopeError, BorshSchemaDocument, CallStatus, CalloutRequest, CalloutSchema,
+    Capability, CapabilityImport, CapabilitySet, DispatchInput, DispatchOutput, ExecutionProfile,
     ExecutionProfileHash, HOST_MODULE, InitInput, InitializedState, JsonBytes, JsonBytesError,
     JsonSchemaDocument, JsonSchemaDocumentError, LocalStateBytes, MAX_CALL_ENVELOPE_BYTES,
     MAX_LOCAL_STATE_BYTES, MAX_REJECTION_REASON_BYTES, MessageSchema, OutcomeBytes,
@@ -89,8 +89,8 @@ pub use arena0_program::{
 pub use arena0_protocol as types;
 pub use arena0_protocol::{
     Committed, DisconnectReason, DivergenceDiagnostic, DivergenceKind, Effect, Ensemble,
-    EnsembleError, Event, LogLevel, Open, Participant, PeerId, PendingKind, PendingRecord,
-    SessionHash, StateHash, TimerPayload, TimerSpec, TraceEntry, View, Viewport,
+    EnsembleError, Event, LogLevel, Open, Participant, PeerId, SessionHash, StateHash,
+    TimerPayload, TimerSpec, TraceEntry, View, Viewport,
 };
 pub use blake3;
 pub use borsh;
@@ -141,12 +141,6 @@ macro_rules! __arena0_capability_vec {
         capabilities
     }};
     (Messaging) => { ::std::vec![$crate::Capability::Messaging] };
-    (Input, $($rest:tt)*) => {{
-        let mut capabilities = ::std::vec![$crate::Capability::Input];
-        capabilities.extend($crate::__arena0_capability_vec!($($rest)*));
-        capabilities
-    }};
-    (Input) => { ::std::vec![$crate::Capability::Input] };
     (Timers, $($rest:tt)*) => {{
         let mut capabilities = ::std::vec![$crate::Capability::Timers];
         capabilities.extend($crate::__arena0_capability_vec!($($rest)*));

@@ -325,6 +325,15 @@ fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
             }
         });
     }
+    if module_has_fn(items, "callout") {
+        methods.push(quote! {
+            fn callout(
+                ctx: &::arena0::Context<Self::Shared, Self::Local>,
+            ) -> ::core::option::Option<Self::Callout> {
+                self::callout(ctx)
+            }
+        });
+    }
     if let Some(timer_ty) = module_typed_timer_arg(items) {
         methods.push(quote! {
             fn on_timer(

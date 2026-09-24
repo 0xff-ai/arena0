@@ -316,7 +316,6 @@ pub enum EffectKind {
     SessionEnd,
     SessionAbort,
     Broadcast,
-    Callout,
     SetTimer,
     Fail,
 }
@@ -344,13 +343,12 @@ pub enum SessionProgress {
     Started { session: SessionStatus },
 }
 
-/// The public identity of an agent-visible pending callout.
+/// The public identity of an agent-visible open callout.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PendingCalloutStatus {
     pub pending_id: PendingId,
     pub callout_index: u32,
-    pub expected_type: Option<String>,
 }
 
 impl ExecStatus {
