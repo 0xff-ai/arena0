@@ -553,13 +553,6 @@ fn validate_exec_route(
                 ));
             }
         }
-        DomainExecFrame::End { commitment, .. } => {
-            if commitment.session_id != session_hash {
-                return Err(TransportError::ProtocolMismatch(
-                    "terminal signature does not match the execution stream session".into(),
-                ));
-            }
-        }
         DomainExecFrame::Abort { occurrence } => {
             if occurrence.session_id() != session_hash {
                 return Err(TransportError::ProtocolMismatch(

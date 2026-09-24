@@ -6,7 +6,7 @@
 //! through their focused store operations. It never invokes a second generic
 //! execution-input pipeline.
 
-use arena0_protocol::{ExecFrame, ParticipantStepSignature, ParticipantTerminalSignature};
+use arena0_protocol::{ExecFrame, ParticipantStepSignature};
 use arena0_store::{ApplyOutcome, InboxAcceptOutcome, PendingInboxItem, StoreError};
 use arena0_transport::{ExecDelivery, ExecDeliveryRejection};
 
@@ -89,13 +89,6 @@ impl ExecutionActor {
                 self.resolve_step_signature(item, commitment, signature)
                     .await?;
             }
-            ExecFrame::End {
-                commitment,
-                signature,
-            } => {
-                self.resolve_terminal_signature(item, commitment, signature)
-                    .await?;
-            }
             ExecFrame::Abort { occurrence } => {
                 self.resolve_abort(item, occurrence).await?;
             }
@@ -162,39 +155,6 @@ impl ExecutionActor {
                 self.reload_resident().await?;
             }
         }
-        Ok(())
-    }
-
-    async fn resolve_terminal_signature(
-        &mut self,
-        item: PendingInboxItem,
-        commitment: arena0_protocol::TerminalCommitment,
-        signature: arena0_crypto::BlsSignature,
-    ) -> Result<(), ExecError> {
-        let state = self.load_state().await?;
-        let Some(expected) = state.pending_terminal() else {
-            if state.status().is_terminal() {
-                self.reject_inbound(item.inbox_id()).await?;
-            }
-            return Ok(());
-        };
-        if expected != &commitment {
-            self.reject_inbound(item.inbox_id()).await?;
-            return Ok(());
-        }
-        let participant = ParticipantTerminalSignature::new(item.source(), signature);
-        let outcome = self
-            .context
-            .store
-            .commit_terminal_signature(
-                state.version(),
-                participant,
-                Some(item.inbox_id()),
-                now_ms(),
-            )
-            .await;
-        self.settle_inbox_store_result(item.inbox_id(), outcome)
-            .await?;
         Ok(())
     }
 

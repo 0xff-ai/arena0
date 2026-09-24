@@ -243,22 +243,6 @@ fn dispatch_command(database: &mut Database, command: Command) {
                 now_ms,
             ));
         }
-        Command::CommitTerminalSignature {
-            execution_id,
-            expected_version,
-            signature,
-            inbox_id,
-            now_ms,
-            reply,
-        } => {
-            let _ = reply.send(database.commit_terminal_signature(
-                execution_id,
-                expected_version,
-                signature,
-                inbox_id,
-                now_ms,
-            ));
-        }
         Command::Stop {
             execution_id,
             expected_version,
@@ -272,20 +256,6 @@ fn dispatch_command(database: &mut Database, command: Command) {
                 expected_version,
                 occurrence,
                 inbox_id,
-                now_ms,
-            ));
-        }
-        Command::InterruptTerminal {
-            execution_id,
-            expected_version,
-            reason,
-            now_ms,
-            reply,
-        } => {
-            let _ = reply.send(database.interrupt_terminal(
-                execution_id,
-                expected_version,
-                reason,
                 now_ms,
             ));
         }

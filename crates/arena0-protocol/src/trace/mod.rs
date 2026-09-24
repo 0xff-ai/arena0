@@ -10,8 +10,8 @@ mod entry;
 mod header;
 
 pub use commitment::{
-    AggregateAttestation, AttestationError, CHAIN_START, STEP_COMMIT_DOMAIN, SessionTerminal,
-    SignerSet, StepCommitment, StepSig, TERMINAL_DOMAIN, TerminalCommitment,
+    AggregateAttestation, AttestationError, CHAIN_START, STEP_COMMIT_DOMAIN, SignerSet,
+    StepCommitment, StepSig,
 };
 pub use divergence::{DivergenceDiagnostic, DivergenceKind, JsonDiffExt};
 pub use entry::TraceEntry;

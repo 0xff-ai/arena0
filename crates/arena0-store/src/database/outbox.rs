@@ -793,6 +793,6 @@ fn frame_matches_proposal(frame: &ExecFrame, proposal: &arena0_protocol::SharedP
                 && *poststate == proposal.entry().post_state
                 && data == msg
         }
-        ExecFrame::End { .. } | ExecFrame::Abort { .. } => false,
+        ExecFrame::Abort { .. } => false,
     }
 }

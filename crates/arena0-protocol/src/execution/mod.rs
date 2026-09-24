@@ -47,20 +47,20 @@ pub const MAX_RECEIPT_TRACE_ENTRIES: usize = 65_536;
 pub use abort::{ABORT_OCCURRENCE_DOMAIN, ABORT_OCCURRENCE_VERSION, AbortKind, AbortOccurrence};
 pub use binding::ExecutionBinding;
 pub use certificate::{
-    ParticipantStepSignature, ParticipantTerminalSignature, Receipt, ReceiptArtifact, ReceiptBody,
-    ReceiptId, ReceiptKind, StopReport,
+    ParticipantStepSignature, Receipt, ReceiptArtifact, ReceiptBody, ReceiptId, ReceiptKind,
+    StopReport,
 };
 pub use cursor::{ExecutionVersion, StepCursor};
 pub use error::ProtocolError;
 pub use outcome::TerminalOutcome;
 pub use pending::{OpenCallout, PendingId, PendingIdParseError, pending_id};
 pub use signing::GuestSignData;
-pub use state::{ExecutionState, SharedProposal, StepCertificate, TerminalCertificate};
-pub use status::{ExecutionStatus, PublishedProof, ReceiptWork, StopCause, TerminalProof};
+pub use state::{ExecutionState, SharedProposal, StepCertificate};
+pub use status::{ExecutionStatus, ReceiptWork, StopCause};
 pub use timer::TimerId;
 pub use timer_firing::TimerFiring;
 
 pub(crate) use validation::{
     ensure_encoded, ensure_payload, validate_effects, validate_proposal, validate_receipt_body,
-    validate_receipt_body_shape, validate_terminal_progress,
+    validate_receipt_body_shape,
 };

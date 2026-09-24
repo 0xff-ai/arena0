@@ -559,7 +559,12 @@ After certification the store assembles and validates the portable evidence
 from durable activation, trace, and outcome records. One SQLite transaction
 publishes the artifact, its local execution relation, and terminal status.
 Assembly uses only local durable facts, so it needs no peer and cannot be
-interrupted by one.
+interrupted by one. Every participant checks the receipt budget before a step
+can be certified: a step whose entry would make the receipt exceed its byte or
+entry bound, after reserving room for terminal evidence, is never staged, and
+the participant ends the session through the Host-signed `Fail` path at the
+agreed cursor. The certified prefix therefore always fits a publishable
+artifact.
 
 The finished observation is emitted when the receipt is published, because that
 publication is a local fact. The actor remains alive while peers acknowledge

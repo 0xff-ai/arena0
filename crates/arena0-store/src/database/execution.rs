@@ -607,76 +607,6 @@ impl Database {
         })
     }
 
-    pub(super) fn commit_terminal_signature(
-        &mut self,
-        execution_id: ExecId,
-        expected: ExecutionVersion,
-        signature: ParticipantTerminalSignature,
-        inbox_id: Option<InboxId>,
-        now_ms: u64,
-    ) -> Result<ApplyOutcome, StoreError> {
-        self.transaction(|store| {
-            store.commit_terminal_signature_in_transaction(
-                execution_id,
-                expected,
-                signature,
-                inbox_id,
-                now_ms,
-            )
-        })
-    }
-
-    fn commit_terminal_signature_in_transaction(
-        &mut self,
-        execution_id: ExecId,
-        expected: ExecutionVersion,
-        signature: ParticipantTerminalSignature,
-        inbox_id: Option<InboxId>,
-        now_ms: u64,
-    ) -> Result<ApplyOutcome, StoreError> {
-        let state = self
-            .load_execution_in_transaction(execution_id)?
-            .ok_or(StoreError::ExecutionNotFound(execution_id))?;
-        if state.version() != expected {
-            return self.version_mismatch(state, expected);
-        }
-        self.validate_terminal_inbox(&state, &signature, inbox_id)?;
-        if let Some(outcome) = self.inbox_replay_outcome(&state, inbox_id)? {
-            return Ok(outcome);
-        }
-        if let ExecutionStatus::TerminalProof { proof } = state.status()
-            && proof.pending_parts().is_some_and(|(_, _, signatures)| {
-                signatures.iter().any(|existing| existing == &signature)
-            })
-        {
-            if let Some(inbox_id) = inbox_id {
-                self.mark_inbox_consumed(execution_id, inbox_id, now_ms)?;
-            }
-            return Ok(ApplyOutcome::AlreadyApplied);
-        }
-        let local_frame = inbox_id
-            .is_none()
-            .then(|| {
-                state.pending_terminal().map(|commitment| ExecFrame::End {
-                    commitment: commitment.clone(),
-                    signature: signature.signature(),
-                })
-            })
-            .flatten();
-        let mut next = state.clone();
-        next.add_terminal_signature(signature)?;
-        self.persist_signature(
-            execution_id,
-            &state,
-            next,
-            state.event_position(),
-            local_frame,
-            inbox_id,
-            now_ms,
-            None,
-        )
-    }
-
     pub(super) fn stop_execution(
         &mut self,
         execution_id: ExecId,
@@ -765,47 +695,6 @@ impl Database {
         })
     }
 
-    pub(super) fn interrupt_terminal(
-        &mut self,
-        execution_id: ExecId,
-        expected: ExecutionVersion,
-        reason: String,
-        now_ms: u64,
-    ) -> Result<ApplyOutcome, StoreError> {
-        self.transaction(|store| {
-            store.interrupt_terminal_in_transaction(execution_id, expected, reason, now_ms)
-        })
-    }
-
-    fn interrupt_terminal_in_transaction(
-        &mut self,
-        execution_id: ExecId,
-        expected: ExecutionVersion,
-        reason: String,
-        now_ms: u64,
-    ) -> Result<ApplyOutcome, StoreError> {
-        let state = self
-            .load_execution_in_transaction(execution_id)?
-            .ok_or(StoreError::ExecutionNotFound(execution_id))?;
-        if state.version() != expected {
-            return self.version_mismatch(state, expected);
-        }
-
-        // The protocol mutator both checks that a proof is in progress and
-        // preserves that proof in the resulting Incomplete status. Timer
-        // rows are store-owned, so clear every active timer in this same
-        // transaction before the state CAS becomes visible.
-        let mut next = state.clone();
-        next.interrupt_terminal(reason)?;
-        self.cancel_active_timers(execution_id)?;
-        self.persist_state_cas(&state, &next, now_ms)?;
-        self.cache_pending(next.clone())?;
-        Ok(ApplyOutcome::Committed {
-            agreed_step: None,
-            proposal_staged: false,
-        })
-    }
-
     pub(super) fn publish_terminal(
         &mut self,
         execution_id: ExecId,
@@ -860,17 +749,13 @@ impl Database {
                 cause: cause.clone(),
             }
         } else {
-            let certificate = state
-                .terminal_certificate()
-                .ok_or(StoreError::Protocol(ProtocolError::TerminalProofMissing))?;
-            arena0_protocol::ReceiptTermination::Completed {
-                terminal: arena0_protocol::SessionTerminal {
-                    final_step: certificate.commitment().final_step,
-                    final_state: certificate.commitment().final_state,
-                    outcome_hash: certificate.commitment().outcome_hash,
-                    agreement: certificate.agreement().clone(),
-                },
+            if !matches!(
+                state.status(),
+                ExecutionStatus::Ended { .. } | ExecutionStatus::Completed { .. }
+            ) {
+                return Err(StoreError::Protocol(ProtocolError::InvalidTerminalStatus));
             }
+            arena0_protocol::ReceiptTermination::Completed
         };
         let outcome = state
             .terminal_outcome()
@@ -1037,6 +922,7 @@ impl Database {
         let mut trace = Vec::with_capacity(raw.len());
         let mut cursor_state = state.binding().activation().offer().data().initial_state;
         let mut cursor_link = arena0_protocol::CHAIN_START;
+        let mut trace_bytes = 0u64;
         for (index, (step, origin_event_position, version, artifact, entry_hash)) in
             raw.into_iter().enumerate()
         {
@@ -1104,9 +990,13 @@ impl Database {
                 .map_err(|error| StoreError::Corruption(format!("agreed signature: {error}")))?;
             cursor_state = entry.post_state;
             cursor_link = commitment.link_hash();
+            trace_bytes += borsh::object_length(&entry)
+                .map_err(|error| StoreError::Corruption(format!("trace size: {error}")))?
+                as u64;
             trace.push(entry);
         }
         if trace.len() as u64 != state.agreed_step()
+            || trace_bytes != state.trace_bytes()
             || cursor_state != state.agreed_state()
             || cursor_link != state.agreed_link()
         {
@@ -1354,44 +1244,6 @@ impl Database {
         Ok(())
     }
 
-    fn validate_terminal_inbox(
-        &mut self,
-        state: &ExecutionState,
-        signature: &ParticipantTerminalSignature,
-        inbox_id: Option<InboxId>,
-    ) -> Result<(), StoreError> {
-        let Some(inbox_id) = inbox_id else {
-            if signature.participant() != self.host_id || state.producer() != self.host_id {
-                return Err(StoreError::UnauthenticatedSource(
-                    "local terminal evidence is not authored by this Host".into(),
-                ));
-            }
-            return Ok(());
-        };
-        let (source, stored, status, _) =
-            self.load_inbox_fact(state.execution_id(), inbox_id, state)?;
-        let ExecFrame::End {
-            commitment,
-            signature: frame_signature,
-        } = decode_stored_frame(&stored)?
-        else {
-            return Err(StoreError::InboxInputMismatch {
-                inbox_id,
-                part_index: 0,
-            });
-        };
-        if source != signature.participant()
-            || frame_signature != signature.signature()
-            || (status == InboxStatus::Accepted && state.pending_terminal() != Some(&commitment))
-        {
-            return Err(StoreError::InboxInputMismatch {
-                inbox_id,
-                part_index: 0,
-            });
-        }
-        Ok(())
-    }
-
     fn validate_abort_inbox(
         &mut self,
         state: &ExecutionState,
@@ -1558,18 +1410,6 @@ impl Database {
                 "timer consume compare-and-set failed".into(),
             ));
         }
-        Ok(())
-    }
-
-    /// Cancel all active timers while the execution is being frozen. Timer
-    /// rows are the scheduling authority, so this deletion must share the
-    /// terminal state CAS transaction; otherwise a restart could enqueue work
-    /// for an execution whose proof is already incomplete.
-    fn cancel_active_timers(&mut self, execution_id: ExecId) -> Result<(), StoreError> {
-        self.connection.execute(
-            "DELETE FROM active_timers WHERE execution_id = ?1",
-            params![execution_id.0.to_vec()],
-        )?;
         Ok(())
     }
 }

@@ -184,8 +184,7 @@ impl Host {
     ///
     /// The execution aggregate remains the authority after activation commit.
     /// This method therefore signs a `Fail` occurrence against the current
-    /// public cursor, or interrupts an in-flight terminal proof when an abort
-    /// occurrence is no longer legal. The supplied writer is consumed so the
+    /// public cursor, or preserves certified terminal evidence for publication. The supplied writer is consumed so the
     /// recovery pass cannot leave a failed execution claimed as live.
     pub async fn fail_recovered_execution(
         &self,

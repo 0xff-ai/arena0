@@ -24,14 +24,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arena0_crypto::{BlsSignature, ExecutionSalt};
 use arena0_program::{JsonBytes, ProgramHash};
 use arena0_protocol::execution::{
-    ExecutionState, ExecutionStatus, ExecutionVersion, ParticipantStepSignature,
-    ParticipantTerminalSignature, ReceiptArtifact, ReceiptId, TimerId,
+    ExecutionState, ExecutionStatus, ExecutionVersion, ParticipantStepSignature, ReceiptArtifact,
+    ReceiptId, TimerId,
 };
 use arena0_protocol::{
     AbortOccurrence, Activation, ExecFrame, ExecId, ExecLifecycle, ExecutionAdmission,
     LocalStateBytes, MessageId, NegotiationTarget, PeerId, PreparedActivation, ProtocolError,
-    SessionHash, SharedStateBytes, StateHash, StepCommitment, TerminalCommitment, TerminalOutcome,
-    TimerPayload,
+    SessionHash, SharedStateBytes, StateHash, StepCommitment, TerminalOutcome, TimerPayload,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -47,7 +46,7 @@ use lock::{
     OwnerLock, acquire_process_lock, configure_connection, initialize_schema, prepare_database_file,
 };
 
-const SCHEMA_VERSION: u64 = 3;
+const SCHEMA_VERSION: u64 = 4;
 const ENVELOPE_VERSION: u16 = 2;
 const ENVELOPE_MAGIC: [u8; 8] = *b"AR0STOR1";
 const ENVELOPE_DOMAIN: &[u8] = b"arena0/store-envelope/v2";
@@ -1363,26 +1362,11 @@ enum Command {
         now_ms: u64,
         reply: oneshot::Sender<Result<ApplyOutcome, StoreError>>,
     },
-    CommitTerminalSignature {
-        execution_id: ExecId,
-        expected_version: ExecutionVersion,
-        signature: ParticipantTerminalSignature,
-        inbox_id: Option<InboxId>,
-        now_ms: u64,
-        reply: oneshot::Sender<Result<ApplyOutcome, StoreError>>,
-    },
     Stop {
         execution_id: ExecId,
         expected_version: ExecutionVersion,
         occurrence: arena0_protocol::AbortOccurrence,
         inbox_id: Option<InboxId>,
-        now_ms: u64,
-        reply: oneshot::Sender<Result<ApplyOutcome, StoreError>>,
-    },
-    InterruptTerminal {
-        execution_id: ExecId,
-        expected_version: ExecutionVersion,
-        reason: String,
         now_ms: u64,
         reply: oneshot::Sender<Result<ApplyOutcome, StoreError>>,
     },
@@ -2320,35 +2304,6 @@ impl ExecutionStore {
             .await
     }
 
-    /// Record one participant signature over the pending terminal commitment.
-    pub async fn commit_terminal_signature(
-        &mut self,
-        expected_version: ExecutionVersion,
-        signature: ParticipantTerminalSignature,
-        inbox_id: Option<InboxId>,
-        now_ms: u64,
-    ) -> Result<ApplyOutcome, StoreError> {
-        let cost = self.handle.command_cost(
-            borsh::to_vec(&signature)
-                .map_err(|error| {
-                    StoreError::Corruption(format!("terminal signature encode: {error}"))
-                })?
-                .len(),
-            1,
-            512,
-        )?;
-        self.handle
-            .request(cost, |reply| Command::CommitTerminalSignature {
-                execution_id: self.execution_id,
-                expected_version,
-                signature,
-                inbox_id,
-                now_ms,
-                reply,
-            })
-            .await
-    }
-
     /// Commit one authenticated unilateral stop occurrence.
     pub async fn stop_execution(
         &mut self,
@@ -2372,31 +2327,6 @@ impl ExecutionStore {
                 expected_version,
                 occurrence,
                 inbox_id,
-                now_ms,
-                reply,
-            })
-            .await
-    }
-
-    /// Freeze an in-flight terminal proof after an interrupted publication.
-    ///
-    /// The proof remains durable for inspection and recovery, but the
-    /// execution becomes incomplete and its active timers are cancelled by
-    /// the same store transaction. The protocol owns proof/reason validation;
-    /// the store owns the compare-and-set and timer rows.
-    pub async fn interrupt_terminal(
-        &mut self,
-        expected_version: ExecutionVersion,
-        reason: impl Into<String>,
-        now_ms: u64,
-    ) -> Result<ApplyOutcome, StoreError> {
-        let reason = bounded_reason(reason.into())?;
-        let cost = self.handle.command_cost(reason.len(), 1, 512)?;
-        self.handle
-            .request(cost, |reply| Command::InterruptTerminal {
-                execution_id: self.execution_id,
-                expected_version,
-                reason,
                 now_ms,
                 reply,
             })

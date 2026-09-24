@@ -30,10 +30,8 @@ pub const PROTO_EXEC: u8 = 0x02;
 pub const EXEC_KIND_MESSAGE: u8 = 0x00;
 /// Typed execution message kind for [`ExecFrame::StepSignature`].
 pub const EXEC_KIND_STEP_SIGNATURE: u8 = 0x01;
-/// Typed execution message kind for [`ExecFrame::End`].
-pub const EXEC_KIND_END: u8 = 0x02;
 /// Typed execution message kind for [`ExecFrame::Abort`].
-pub const EXEC_KIND_ABORT: u8 = 0x03;
+pub const EXEC_KIND_ABORT: u8 = 0x02;
 
 /// Stable version-1 terminal kind tag carried by an abort occurrence.
 pub const ABORT_KIND_ABORT: u8 = 0x00;
@@ -78,21 +76,6 @@ pub struct WireStepCommitment {
     pub post_state: StateHashBytes,
     /// Chain link to the previous step.
     pub link: [u8; 32],
-}
-
-/// The raw fixed-width representation of a protocol terminal commitment.
-#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct WireTerminalCommitment {
-    /// Commitment domain-separation tag.
-    pub domain: [u8; 24],
-    /// Session this terminal belongs to.
-    pub session_id: SessionHashBytes,
-    /// Final public trace position.
-    pub final_step: u64,
-    /// Shared state hash at completion.
-    pub final_state: StateHashBytes,
-    /// Hash of the terminal outcome bytes.
-    pub outcome_hash: [u8; 32],
 }
 
 /// The exact agreed cursor authenticated by an abort occurrence.
@@ -244,13 +227,6 @@ pub enum ExecFrame {
         /// BLS signature over the canonical commitment bytes.
         signature: BlsSignature,
     },
-    /// One participant's signature over one exact terminal commitment.
-    End {
-        /// The complete terminal commitment covered by `signature`.
-        commitment: WireTerminalCommitment,
-        /// BLS signature over the canonical commitment bytes.
-        signature: BlsSignature,
-    },
     /// Unilateral termination.
     Abort {
         /// Signed, session-bound occurrence.
@@ -284,14 +260,6 @@ impl BorshSerialize for ExecFrame {
                 BorshSerialize::serialize(commitment, writer)?;
                 BorshSerialize::serialize(signature, writer)
             }
-            Self::End {
-                commitment,
-                signature,
-            } => {
-                BorshSerialize::serialize(&EXEC_KIND_END, writer)?;
-                BorshSerialize::serialize(commitment, writer)?;
-                BorshSerialize::serialize(signature, writer)
-            }
             Self::Abort { occurrence } => {
                 BorshSerialize::serialize(&EXEC_KIND_ABORT, writer)?;
                 BorshSerialize::serialize(occurrence, writer)
@@ -312,10 +280,6 @@ impl BorshDeserialize for ExecFrame {
             }),
             EXEC_KIND_STEP_SIGNATURE => Ok(Self::StepSignature {
                 commitment: WireStepCommitment::deserialize_reader(reader)?,
-                signature: BlsSignature::deserialize_reader(reader)?,
-            }),
-            EXEC_KIND_END => Ok(Self::End {
-                commitment: WireTerminalCommitment::deserialize_reader(reader)?,
                 signature: BlsSignature::deserialize_reader(reader)?,
             }),
             EXEC_KIND_ABORT => Ok(Self::Abort {

@@ -5,13 +5,12 @@ use arena0_wire::{
     ABORT_KIND_ABORT, ABORT_KIND_FAIL, ExecFrame as WireExecFrame, MAX_EXEC_MESSAGE_BYTES,
     MAX_EXEC_REASON_BYTES, MessageIdBytes, PeerIdBytes, SessionHashBytes, StateHashBytes,
     WireAbortCoordinate, WireAbortOccurrence, WireError, WireStepCommitment,
-    WireTerminalCommitment,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 use std::io;
 use thiserror::Error;
 
-use crate::trace::{StepCommitment, TerminalCommitment};
+use crate::trace::StepCommitment;
 use crate::{AbortKind, AbortOccurrence, MessageId, SessionHash, StateHash};
 
 /// A validated execution fact used by protocol machinery.
@@ -38,13 +37,6 @@ pub enum ExecFrame {
     StepSignature {
         /// The complete commitment covered by `signature`.
         commitment: StepCommitment,
-        /// BLS signature over the canonical commitment bytes.
-        signature: BlsSignature,
-    },
-    /// One participant's signature over one exact terminal commitment.
-    End {
-        /// The complete terminal commitment covered by `signature`.
-        commitment: TerminalCommitment,
         /// BLS signature over the canonical commitment bytes.
         signature: BlsSignature,
     },
@@ -97,13 +89,6 @@ impl TryFrom<WireExecFrame> for ExecFrame {
                 commitment: step_commitment_from_wire(commitment)?,
                 signature,
             },
-            WireExecFrame::End {
-                commitment,
-                signature,
-            } => Self::End {
-                commitment: terminal_commitment_from_wire(commitment)?,
-                signature,
-            },
             WireExecFrame::Abort { occurrence } => {
                 let occurrence = abort_from_wire(occurrence)?;
                 Self::Abort { occurrence }
@@ -138,13 +123,6 @@ impl TryFrom<&ExecFrame> for WireExecFrame {
                 signature,
             } => Self::StepSignature {
                 commitment: step_commitment_to_wire(commitment)?,
-                signature: *signature,
-            },
-            ExecFrame::End {
-                commitment,
-                signature,
-            } => Self::End {
-                commitment: terminal_commitment_to_wire(commitment)?,
                 signature: *signature,
             },
             ExecFrame::Abort { occurrence } => Self::Abort {
@@ -212,41 +190,6 @@ fn step_commitment_to_wire(
         pre_state: StateHashBytes(commitment.pre_state.0),
         post_state: StateHashBytes(commitment.post_state.0),
         link: commitment.link,
-    })
-}
-
-fn terminal_commitment_from_wire(
-    raw: WireTerminalCommitment,
-) -> Result<TerminalCommitment, ExecFrameError> {
-    let commitment = TerminalCommitment {
-        domain: raw.domain,
-        session_id: SessionHash(raw.session_id.0),
-        final_step: raw.final_step,
-        final_state: StateHash(raw.final_state.0),
-        outcome_hash: crate::OutcomeHash(raw.outcome_hash),
-    };
-    if commitment.domain != crate::TERMINAL_DOMAIN {
-        return Err(ExecFrameError::Commitment(
-            "terminal commitment has an unknown domain".into(),
-        ));
-    }
-    Ok(commitment)
-}
-
-fn terminal_commitment_to_wire(
-    commitment: &TerminalCommitment,
-) -> Result<WireTerminalCommitment, ExecFrameError> {
-    if commitment.domain != crate::TERMINAL_DOMAIN {
-        return Err(ExecFrameError::Commitment(
-            "terminal commitment has an unknown domain".into(),
-        ));
-    }
-    Ok(WireTerminalCommitment {
-        domain: commitment.domain,
-        session_id: SessionHashBytes(commitment.session_id.0),
-        final_step: commitment.final_step,
-        final_state: StateHashBytes(commitment.final_state.0),
-        outcome_hash: commitment.outcome_hash.0,
     })
 }
 
@@ -357,19 +300,6 @@ mod tests {
         }
     }
 
-    fn end_frame() -> ExecFrame {
-        ExecFrame::End {
-            commitment: TerminalCommitment {
-                domain: crate::TERMINAL_DOMAIN,
-                session_id: SessionHash([1; 32]),
-                final_step: 9,
-                final_state: StateHash([2; 32]),
-                outcome_hash: crate::OutcomeHash([3; 32]),
-            },
-            signature: BlsSignature([4; 48]),
-        }
-    }
-
     fn abort_frame() -> ExecFrame {
         let occurrence = AbortOccurrence::new(
             SessionHash([1; 32]),
@@ -397,12 +327,7 @@ mod tests {
 
     #[test]
     fn borsh_roundtrips_every_execution_frame_variant_using_wire_encoding() {
-        for frame in [
-            message_frame(),
-            step_signature_frame(),
-            end_frame(),
-            abort_frame(),
-        ] {
+        for frame in [message_frame(), step_signature_frame(), abort_frame()] {
             assert_roundtrip(frame);
         }
     }

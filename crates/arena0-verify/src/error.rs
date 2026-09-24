@@ -6,7 +6,7 @@ pub enum VerifyError {
     /// The input exceeded the protocol's encoded receipt bound.
     #[error("authenticated artifact is {actual} bytes; maximum is {max}")]
     ReceiptTooLarge { actual: usize, max: usize },
-    /// The encoded receipt was not a bounded, version-3 wire value.
+    /// The encoded receipt was not a bounded, version-4 wire value.
     #[error("invalid authenticated artifact: {0}")]
     ReceiptDecode(String),
     /// The receipt failed a protocol or certificate invariant.
@@ -30,21 +30,12 @@ pub enum VerifyError {
     /// A public entry lacks one or more committed participant signatures.
     #[error("public entry {step} lacks a full participant agreement")]
     MissingParticipantAgreement { step: u64 },
-    /// The terminal certificate is absent.
-    #[error("receipt has no signed terminal certificate")]
-    MissingTerminal,
-    /// A terminal certificate field disagrees with the final public entry.
-    #[error("signed terminal field `{field}` does not match the final public entry")]
-    TerminalMismatch { field: &'static str },
     /// The trace carries terminal evidence before its final entry.
     #[error("terminal evidence at step {step} is not the final entry")]
     TerminalNotLast { step: u64 },
     /// The final public entry is not a single successful session end.
     #[error("final public entry has no single SessionEnd outcome")]
     OutcomeMissing,
-    /// The terminal's outcome hash is not the hash of the receipt outcome.
-    #[error("receipt outcome does not match the terminal outcome hash")]
-    OutcomeHashMismatch,
 }
 
 /// Keep cryptographic implementation details out of the public error text.

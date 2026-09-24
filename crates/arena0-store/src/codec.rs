@@ -212,11 +212,7 @@ pub(crate) fn canonical_frame_shape(frame: &ExecFrame) -> Result<StoredFrame, St
             commitment,
             signature,
         } => (1, borsh::to_vec(&(commitment, signature))),
-        ExecFrame::End {
-            commitment,
-            signature,
-        } => (2, borsh::to_vec(&(commitment, signature))),
-        ExecFrame::Abort { occurrence } => (3, borsh::to_vec(occurrence)),
+        ExecFrame::Abort { occurrence } => (2, borsh::to_vec(occurrence)),
     };
     let payload =
         payload.map_err(|error| StoreError::Corruption(format!("inbox frame encode: {error}")))?;
@@ -262,15 +258,7 @@ pub(crate) fn decode_stored_frame(stored: &StoredFrame) -> Result<ExecFrame, Sto
                 signature,
             }
         }
-        2 => {
-            let (commitment, signature): (TerminalCommitment, BlsSignature) =
-                decode_borsh(&stored.payload, "inbox terminal signature")?;
-            ExecFrame::End {
-                commitment,
-                signature,
-            }
-        }
-        3 => ExecFrame::Abort {
+        2 => ExecFrame::Abort {
             occurrence: decode_borsh(&stored.payload, "inbox abort frame")?,
         },
         tag => {
@@ -323,13 +311,6 @@ pub(crate) fn canonical_frame(
             if commitment.session_id != state.binding().session_id() {
                 return Err(StoreError::UnauthenticatedSource(
                     "step signature names another session".into(),
-                ));
-            }
-        }
-        ExecFrame::End { commitment, .. } => {
-            if commitment.session_id != state.binding().session_id() {
-                return Err(StoreError::UnauthenticatedSource(
-                    "terminal signature names another session".into(),
                 ));
             }
         }
@@ -421,7 +402,6 @@ pub(crate) fn lifecycle_tag(lifecycle: ExecLifecycle) -> i64 {
         ExecLifecycle::Active => 3,
         ExecLifecycle::Completed => 4,
         ExecLifecycle::Aborted => 5,
-        ExecLifecycle::Incomplete => 6,
         ExecLifecycle::Failed => 7,
     }
 }

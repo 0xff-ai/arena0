@@ -14,8 +14,8 @@ use arena0_program::{
 use arena0_protocol::execution::GuestSignData;
 use arena0_protocol::{
     AbortKind, AbortOccurrence, Activation, ActivationData, Ensemble, Event, ExecFrame, ExecId,
-    ExecutionAdmission, MessageId, NegotiationId, Offer, OfferData, ParticipantStepSignature,
-    ParticipantTerminalSignature, PeerId, PeerIdSource, PendingId, PreparedActivation, StateHash,
+    ExecutionAdmission, ExecutionStatus, MessageId, NegotiationId, Offer, OfferData,
+    ParticipantStepSignature, PeerId, PeerIdSource, PendingId, PreparedActivation, StateHash,
     Ticket, TicketAction, TicketData, TicketHash,
 };
 use arena0_sandbox::{InitializeCall, LoadedProgram, Program, WasmtimeEngine};
@@ -1190,7 +1190,135 @@ async fn input_handler_trap_rejects_without_ending_session() {
 }
 
 #[tokio::test]
-async fn terminal_observation_waits_for_final_end_delivery() {
+async fn receipt_budget_failure_publishes_a_stop_report_that_survives_restart() {
+    let fixture = Fixture::new(true).await;
+    let mut actor = fixture.prepare_active_actor().await;
+    fixture.commit_session_started(&mut actor).await;
+    loop {
+        let before = actor.load_state().await.expect("agreed prefix");
+        let frame = message_frame(
+            &before,
+            fixture.remote_keys.peer_id(),
+            before.agreed_step(),
+            vec![1; arena0_protocol::MAX_EFFECT_PAYLOAD_BYTES],
+        );
+        actor
+            .context
+            .store
+            .accept_inbound(
+                fixture.remote_keys.peer_id(),
+                frame.clone(),
+                super::now_ms(),
+            )
+            .await
+            .expect("accept writer message");
+        let inbox = actor
+            .context
+            .store
+            .list_pending_inbox(8)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.frame() == &frame)
+            .unwrap();
+        let result = actor
+            .apply_message(fixture.remote_keys.peer_id(), frame, Some(inbox.inbox_id()))
+            .await;
+        if let Err(error @ crate::ExecError::ReceiptBudgetExhausted { .. }) = result {
+            assert_eq!(actor.load_state().await.unwrap(), before);
+            assert!(before.agreed_step() > 1);
+            assert!(actor.fail_terminal(error).await);
+            break;
+        }
+        assert!(result.expect("dispatch within budget"));
+        actor
+            .ensure_step_signature()
+            .await
+            .expect("local signature");
+        let staged = actor.load_state().await.unwrap();
+        let commitment = staged.pending_shared().unwrap().commitment().clone();
+        actor
+            .context
+            .store
+            .accept_inbound(
+                fixture.remote_keys.peer_id(),
+                ExecFrame::StepSignature {
+                    signature: fixture
+                        .remote_execution_key()
+                        .sign(&commitment.signing_bytes()),
+                    commitment,
+                },
+                super::now_ms(),
+            )
+            .await
+            .expect("accept peer signature");
+        actor.resolve_pending_inbox().await.expect("certify step");
+        assert!(actor.load_state().await.unwrap().pending_shared().is_none());
+        fixture.clear_outbox(&mut actor).await;
+    }
+    let stopped = actor.load_state().await.unwrap();
+    let receipt_id = stopped
+        .published_receipt_id()
+        .expect("published failure report");
+    let stored = fixture
+        .store
+        .handle()
+        .load_receipt_by_id(receipt_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.receipt.kind(),
+        arena0_protocol::ReceiptKind::StopReport
+    );
+    let arena0_protocol::ReceiptTermination::Stopped {
+        cause: arena0_protocol::StopCause::Authenticated(occurrence),
+    } = stored.receipt.body().termination()
+    else {
+        panic!("authenticated failure")
+    };
+    assert_eq!(occurrence.kind(), AbortKind::Fail);
+    assert_eq!(
+        occurrence.reason(),
+        format!("receipt budget exhausted at step {}", stopped.agreed_step())
+    );
+    assert_eq!(*occurrence.coordinate(), stopped.step_cursor());
+    let bytes = stored.receipt.encode().expect("bounded stop report");
+    assert!(bytes.len() <= arena0_protocol::MAX_RECEIPT_BYTES);
+    arena0_protocol::ReceiptArtifact::decode(&bytes).expect("authenticated prefix verifies");
+    drop(actor);
+    fixture.store.shutdown().await.expect("shutdown");
+    let reopened = Store::open(StoreConfig::new(
+        fixture._directory.path().join("execution.sqlite"),
+        fixture.local_keys.peer_id(),
+    ))
+    .expect("reopen bounded report");
+    assert_eq!(
+        reopened
+            .handle()
+            .load_execution(EXEC_ID)
+            .await
+            .unwrap()
+            .unwrap(),
+        stopped
+    );
+    assert_eq!(
+        reopened
+            .handle()
+            .load_receipt_by_id(receipt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .receipt
+            .encode()
+            .unwrap(),
+        bytes,
+    );
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn terminal_observation_waits_for_final_step_delivery() {
     let fixture = Fixture::with_mode(true, GuestMode::EndOnMessage).await;
     let (messages, mut observations) = mpsc::channel(8);
     let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
@@ -1259,62 +1387,24 @@ async fn terminal_observation_waits_for_final_end_delivery() {
         .await
         .expect("promote terminal-step memories");
 
-    actor
-        .ensure_terminal_signature()
-        .await
-        .expect("commit local terminal signature");
-    let state = actor
-        .load_state()
-        .await
-        .expect("load pending terminal proof");
-    let commitment = state
-        .pending_terminal()
-        .expect("pending terminal commitment")
-        .clone();
-    let remote_signature = ParticipantTerminalSignature::new(
-        fixture.remote_keys.peer_id(),
-        fixture
-            .remote_execution_key()
-            .sign(&commitment.signing_bytes()),
+    let ended = actor.load_state().await.expect("load certified end");
+    assert!(matches!(ended.status(), ExecutionStatus::Ended { .. }));
+    assert!(
+        actor
+            .fail_terminal(crate::ExecError::Unavailable("peer disconnected".into()))
+            .await
     );
-    actor
-        .context
-        .store
-        .accept_inbound(
-            fixture.remote_keys.peer_id(),
-            ExecFrame::End {
-                commitment,
-                signature: remote_signature.signature(),
-            },
-            20,
-        )
-        .await
-        .expect("accept remote terminal signature");
-    let inbox = actor
-        .context
-        .store
-        .list_pending_inbox(8)
-        .await
-        .expect("list terminal inbox")
-        .into_iter()
-        .next()
-        .expect("remote terminal signature inbox");
-    actor
-        .context
-        .store
-        .commit_terminal_signature(
-            state.version(),
-            remote_signature,
-            Some(inbox.inbox_id()),
-            20,
-        )
-        .await
-        .expect("commit remote terminal signature");
+    let published = actor.load_state().await.expect("load preserved completion");
+    assert!(matches!(
+        published.status(),
+        ExecutionStatus::Completed { .. }
+    ));
+    assert_eq!(published.terminal_outcome(), ended.terminal_outcome());
 
     // Receipt publication may finish locally, but progress must retain the
-    // actor's final End send and withhold terminal observations until the
+    // actor's final step-signature send and withhold terminal observations until the
     // remote transport grants durable responsibility.
-    actor.progress().await.expect("start final End delivery");
+    actor.progress().await.expect("start final step delivery");
     assert!(actor.inflight_send.is_some());
     assert!(
         actor
@@ -1330,7 +1420,7 @@ async fn terminal_observation_waits_for_final_end_delivery() {
         .remote_transport
         .accept_exec()
         .await
-        .expect("accept final End stream");
+        .expect("accept final step stream");
     let recv = accepted.into_parts().1;
     let step_delivery = recv
         .recv_exec()
@@ -1355,24 +1445,6 @@ async fn terminal_observation_waits_for_final_end_delivery() {
         .settle_inflight_send(joined)
         .await
         .expect("settle terminal-step delivery");
-    actor.progress().await.expect("start final End delivery");
-    let end_delivery = recv.recv_exec().await.expect("receive final End");
-    assert!(matches!(end_delivery.frame(), ExecFrame::End { .. }));
-    assert!(observations.try_recv().is_err());
-    end_delivery
-        .acknowledge()
-        .expect("acknowledge durable End responsibility");
-
-    let joined = actor
-        .inflight_send
-        .as_mut()
-        .expect("in-flight send")
-        .wait()
-        .await;
-    actor
-        .settle_inflight_send(joined)
-        .await
-        .expect("settle final End delivery");
     actor
         .progress()
         .await

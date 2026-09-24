@@ -512,9 +512,6 @@ pub(crate) fn project_durable_next(
                 reason: cause.reason().to_owned(),
             }))
         }
-        ExecutionStatus::Incomplete { reason, .. } => Ok(Some(NextEvent::Failed {
-            reason: reason.clone(),
-        })),
         _ => Ok(None),
     }
 }

@@ -13,8 +13,8 @@ use arena0_program::{CallStatus, JsonBytes, ProgramHash};
 use arena0_protocol::execution::GuestSignData;
 use arena0_protocol::{
     Committed, Effect, Ensemble, Event, ExecFrame, ExecLifecycle, ExecutionState, ExecutionStatus,
-    MessageId, ParticipantStepSignature, ParticipantTerminalSignature, PeerIdSource, PendingId,
-    SessionHash, StateHash, TerminalOutcome,
+    MessageId, ParticipantStepSignature, PeerIdSource, PendingId, SessionHash, StateHash,
+    TerminalOutcome,
 };
 use arena0_sandbox::{
     DispatchCall, GuestSigner, OutcomeCall, QueryCall, RandomReplay, ViewCall, WriterCall,
@@ -787,39 +787,5 @@ impl ExecutionActor {
             .messages
             .send(SessionMessage::TraceAppended { step })
             .await;
-    }
-
-    pub(super) async fn ensure_terminal_signature(&mut self) -> Result<(), ExecError> {
-        for _ in 0..MAX_CAS_RETRIES {
-            let state = self.load_state().await?;
-            let Some(commitment) = state.pending_terminal().cloned() else {
-                return Ok(());
-            };
-            let signature = ParticipantTerminalSignature::new(
-                self.context.identity.peer_id(),
-                self.context.execution_key.sign(&commitment.signing_bytes()),
-            );
-            let outcome = self
-                .context
-                .store
-                .commit_terminal_signature(state.version(), signature, None, now_ms())
-                .await;
-            let outcome = match outcome {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    self.restore_after_store_error().await;
-                    return Err(error.into());
-                }
-            };
-            match outcome {
-                ApplyOutcome::Committed { .. } | ApplyOutcome::AlreadyApplied => return Ok(()),
-                ApplyOutcome::InboxAlreadyApplied { .. }
-                | ApplyOutcome::InboxAlreadyConsumed { .. } => return Ok(()),
-                ApplyOutcome::VersionMismatch { .. } => {}
-            }
-        }
-        Err(ExecError::Unavailable(
-            "terminal signature CAS retry limit exceeded".into(),
-        ))
     }
 }

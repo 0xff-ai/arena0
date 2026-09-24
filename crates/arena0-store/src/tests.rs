@@ -7,9 +7,9 @@ use arena0_program::{
 use arena0_protocol::{
     AbortKind, AbortOccurrence, ActivationData, Effect, Ensemble, Event, ExecFrame, ExecutionState,
     ExecutionVersion, MessageId, NegotiationId, NegotiationTarget, Offer, OfferData,
-    ParticipantStepSignature, ParticipantTerminalSignature, PreparedActivation, ReceiptArtifact,
-    ReceiptTermination, SessionHeader, SessionTerminal, StateHash, StepCursor, TerminalOutcome,
-    Ticket, TicketAction, TicketData, TimerPayload,
+    ParticipantStepSignature, PreparedActivation, ReceiptArtifact, ReceiptTermination,
+    SessionHeader, StateHash, StepCursor, TerminalOutcome, Ticket, TicketAction, TicketData,
+    TimerPayload,
 };
 use std::path::Path;
 
@@ -245,87 +245,13 @@ async fn certify_terminal(store: &Store, fixture: &ActivationFixture, execution_
         .await
         .expect("proposal");
     sign_step(store, fixture, execution_id, &mut writer, 8, 9).await;
-    let producer_bls = BlsSecretKey::from_seed(&[11; 32]).expect("producer bls");
-    let other_bls = BlsSecretKey::from_seed(&[12; 32]).expect("other bls");
     let state = store
         .handle()
         .load_execution(execution_id)
         .await
-        .expect("load terminal pending")
-        .expect("terminal state");
-    let terminal_commitment = state
-        .pending_terminal()
-        .expect("terminal commitment")
-        .clone();
-    writer
-        .commit_terminal_signature(
-            state.version(),
-            ParticipantTerminalSignature::new(
-                fixture.producer,
-                producer_bls.sign(&terminal_commitment.signing_bytes()),
-            ),
-            None,
-            10,
-        )
-        .await
-        .expect("producer terminal signature");
-    let state = store
-        .handle()
-        .load_execution(execution_id)
-        .await
-        .expect("load signed terminal")
-        .expect("signed terminal state");
-    let remote = other_peer(fixture);
-    let remote_signature = other_bls.sign(&terminal_commitment.signing_bytes());
-    let remote_frame = ExecFrame::End {
-        commitment: terminal_commitment.clone(),
-        signature: remote_signature,
-    };
-    assert!(matches!(
-        writer
-            .commit_terminal_signature(
-                state.version(),
-                ParticipantTerminalSignature::new(remote, remote_signature),
-                None,
-                11,
-            )
-            .await,
-        Err(StoreError::UnauthenticatedSource(_))
-    ));
-    assert_eq!(
-        writer
-            .accept_inbound(remote, remote_frame.clone(), 11)
-            .await
-            .expect("accept peer terminal signature"),
-        InboxAcceptOutcome::Accepted
-    );
-    let inbox_id = store
-        .handle()
-        .list_pending_inbox(execution_id, 8)
-        .await
-        .expect("list peer terminal signature")
-        .into_iter()
-        .find(|item| item.source() == remote && item.frame() == &remote_frame)
-        .map(|item| item.inbox_id())
-        .expect("peer terminal signature inbox");
-    writer
-        .commit_terminal_signature(
-            state.version(),
-            ParticipantTerminalSignature::new(remote, remote_signature),
-            Some(inbox_id),
-            11,
-        )
-        .await
-        .expect("peer terminal signature");
-    assert!(
-        store
-            .handle()
-            .list_pending_inbox(execution_id, 8)
-            .await
-            .expect("list consumed terminal evidence")
-            .is_empty()
-    );
-    drop(writer);
+        .unwrap()
+        .unwrap();
+    assert!(matches!(state.status(), ExecutionStatus::Ended { .. }));
 }
 
 async fn publish_receipt(
@@ -392,28 +318,9 @@ fn receipt_with_different_content(receipt: &ReceiptArtifact) -> ReceiptArtifact 
         ],
     )
     .expect("agreement");
-    let terminal_commitment = arena0_protocol::TerminalCommitment::new(
-        receipt.body().header().session_hash(),
-        trace[0].step,
-        trace[0].post_state,
-        arena0_protocol::OutcomeHash::of(&changed_outcome),
-    );
-    let terminal = SessionTerminal {
-        final_step: terminal_commitment.final_step,
-        final_state: terminal_commitment.final_state,
-        outcome_hash: terminal_commitment.outcome_hash,
-        agreement: arena0_protocol::AggregateAttestation::from_signatures(
-            arena0_protocol::SignerSet::full(2).expect("signer set"),
-            &[
-                producer_bls.sign(&terminal_commitment.signing_bytes()),
-                other_bls.sign(&terminal_commitment.signing_bytes()),
-            ],
-        )
-        .expect("terminal agreement"),
-    };
     let header = SessionHeader::new(
         receipt.body().header().activation.clone(),
-        ReceiptTermination::Completed { terminal },
+        ReceiptTermination::Completed,
     );
     let body = arena0_protocol::ReceiptBody::new(
         header,
@@ -1834,7 +1741,7 @@ async fn deferred_broadcast_commits_two_steps_at_one_event_position() {
                         assert_eq!(data, vec![7, 8]);
                         broadcast = true;
                     }
-                    ExecFrame::End { .. } | ExecFrame::Abort { .. } => {
+                    ExecFrame::Abort { .. } => {
                         panic!("unexpected terminal frame")
                     }
                 }
@@ -1986,152 +1893,6 @@ async fn pending_proposal_leases_frames_but_withholds_local_effects() {
     assert_eq!(committed.callout().unwrap().context, vec![0x51]);
     drop(writer);
     store.shutdown().await.expect("shutdown");
-}
-
-#[tokio::test]
-async fn interrupt_terminal_freezes_proof_and_cancels_timers_after_restart() {
-    let fixture = activation_fixture();
-    let directory = tempfile::tempdir().expect("tempdir");
-    let path = directory.path().join("store.sqlite");
-    let execution_id = ExecId([0xf4; 32]);
-    let store = create_execution(&path, &fixture, execution_id).await;
-    let mut writer = store
-        .handle()
-        .claim_execution(execution_id)
-        .expect("execution writer");
-
-    let state = store
-        .handle()
-        .load_execution(execution_id)
-        .await
-        .expect("load active")
-        .expect("active state");
-    writer
-        .commit_dispatch(
-            state.version(),
-            session_started_event(&fixture),
-            SharedStateBytes::try_new(vec![0]).expect("shared state"),
-            LocalStateBytes::try_new(Vec::new()).expect("local state"),
-            vec![Effect::SetTimer {
-                delay_ms: 100,
-                timer: TimerPayload::unit(),
-            }],
-            None,
-            None,
-            None,
-            None,
-            None,
-            7,
-        )
-        .await
-        .expect("stage timer event");
-    let after_start = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
-    assert_eq!(
-        writer.due_timers(200, 8).await.expect("active timer").len(),
-        1
-    );
-
-    let position = after_start.agreed_step();
-    let pre_state = after_start.agreed_state();
-    let data = vec![0x71, 0x72];
-    let message_id = MessageId::derive(
-        after_start.binding().session_id(),
-        fixture.producer,
-        position,
-        pre_state,
-        pre_state,
-        &data,
-    );
-    let outcome = vec![0x81, 0x82];
-    writer
-        .commit_dispatch(
-            after_start.version(),
-            Event::MessageReceived {
-                message_id,
-                from: fixture.producer,
-                position,
-                pre_state,
-                msg: data,
-            },
-            SharedStateBytes::try_new(vec![0]).expect("shared state"),
-            LocalStateBytes::try_new(Vec::new()).expect("local state"),
-            vec![Effect::SessionEnd {
-                outcome: outcome.clone(),
-            }],
-            Some(TerminalOutcome::new(outcome, br#"null"#.to_vec()).expect("outcome")),
-            None,
-            None,
-            None,
-            None,
-            10,
-        )
-        .await
-        .expect("stage terminal proof");
-    let terminal = sign_step(&store, &fixture, execution_id, &mut writer, 11, 12).await;
-    assert!(terminal.terminal_pending());
-    let commitment = terminal
-        .pending_terminal()
-        .expect("pending terminal commitment")
-        .clone();
-    assert_eq!(
-        writer
-            .due_timers(200, 8)
-            .await
-            .expect("timer before interrupt")
-            .len(),
-        1
-    );
-
-    assert!(matches!(
-        writer
-            .interrupt_terminal(terminal.version(), "operator interrupted", 13)
-            .await
-            .expect("interrupt terminal"),
-        ApplyOutcome::Committed {
-            proposal_staged: false,
-            ..
-        }
-    ));
-    let interrupted = store
-        .handle()
-        .load_execution(execution_id)
-        .await
-        .expect("load interrupted state")
-        .expect("interrupted state");
-    assert_eq!(interrupted.lifecycle(), ExecLifecycle::Incomplete);
-    assert_eq!(interrupted.pending_terminal(), Some(&commitment));
-    assert!(
-        writer
-            .due_timers(200, 8)
-            .await
-            .expect("timers after interrupt")
-            .is_empty()
-    );
-    drop(writer);
-    store.shutdown().await.expect("shutdown before restart");
-
-    let reopened = Store::open(StoreConfig::new(&path, fixture.producer)).expect("reopen");
-    let recovered = reopened
-        .handle()
-        .load_execution(execution_id)
-        .await
-        .expect("load recovered interrupted state")
-        .expect("recovered interrupted state");
-    assert_eq!(recovered.lifecycle(), ExecLifecycle::Incomplete);
-    assert_eq!(recovered.pending_terminal(), Some(&commitment));
-    let recovered_writer = reopened
-        .handle()
-        .claim_execution(execution_id)
-        .expect("recovered execution writer");
-    assert!(
-        recovered_writer
-            .due_timers(200, 8)
-            .await
-            .expect("timers after restart")
-            .is_empty()
-    );
-    drop(recovered_writer);
-    reopened.shutdown().await.expect("shutdown after restart");
 }
 
 #[tokio::test]
@@ -3184,7 +2945,7 @@ async fn receipt_is_published_from_durable_rows_after_restart() {
     certify_terminal(&store, &fixture, execution_id).await;
     store.shutdown().await.expect("shutdown before assembly");
 
-    // The terminal certificate and all agreed trace rows are durable before
+    // The certified final step and all agreed trace rows are durable before
     // publication is requested. This exercises restart recovery rather than
     // an in-memory execution shortcut.
     let store = Store::open(StoreConfig::new(&path, fixture.producer)).expect("reopen");

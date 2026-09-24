@@ -357,16 +357,15 @@ impl ExecutionActor {
         let state = loop {
             let state = self.load_state().await?;
             match state.status().receipt_work() {
-                ReceiptWork::NotTerminal | ReceiptWork::CollectSignatures if drove_events => {
+                ReceiptWork::NotTerminal if drove_events => {
                     break state;
                 }
-                ReceiptWork::NotTerminal | ReceiptWork::CollectSignatures => {
+                ReceiptWork::NotTerminal => {
                     self.ensure_session_started().await?;
                     self.resolve_pending_inbox().await?;
                     self.fire_due_timers().await?;
                     drove_events = true;
                 }
-                ReceiptWork::Incomplete => return Ok(()),
                 ReceiptWork::Assemble | ReceiptWork::Published => {
                     return self.progress_terminal_boundary().await;
                 }
@@ -374,8 +373,6 @@ impl ExecutionActor {
         };
         if state.pending_shared().is_some() {
             self.ensure_step_signature().await?;
-        } else if state.terminal_pending() {
-            self.ensure_terminal_signature().await?;
         } else if state.status().lifecycle() == ExecLifecycle::Active
             && state.agreed_step() > 0
             && state.last_reacted_step() != Some(state.agreed_step() - 1)

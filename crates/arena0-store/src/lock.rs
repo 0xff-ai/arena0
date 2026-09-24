@@ -247,18 +247,20 @@ mod tests {
 
     #[test]
     fn rejects_an_unknown_schema_version() {
-        let connection = Connection::open_in_memory().expect("database");
-        connection
-            .pragma_update(
-                None,
-                "user_version",
-                sqlite_u64(SCHEMA_VERSION + 1).expect("schema version fits i64"),
-            )
-            .expect("future schema version");
+        for unsupported in [SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
+            let connection = Connection::open_in_memory().expect("database");
+            connection
+                .pragma_update(
+                    None,
+                    "user_version",
+                    sqlite_u64(unsupported).expect("schema version fits i64"),
+                )
+                .expect("unsupported schema version");
 
-        assert!(matches!(
-            initialize_schema(&connection),
-            Err(StoreError::UnsupportedSchema(version)) if version == SCHEMA_VERSION + 1
-        ));
+            assert!(matches!(
+                initialize_schema(&connection),
+                Err(StoreError::UnsupportedSchema(version)) if version == unsupported
+            ));
+        }
     }
 }

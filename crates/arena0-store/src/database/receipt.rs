@@ -369,16 +369,11 @@ impl Database {
             ));
         }
         match receipt.body().termination() {
-            arena0_protocol::ReceiptTermination::Completed { terminal } => {
-                let certificate = state.terminal_certificate().ok_or_else(|| {
-                    StoreError::Corruption("completed receipt has no execution certificate".into())
-                })?;
+            arena0_protocol::ReceiptTermination::Completed => {
                 let outcome = state.terminal_outcome().ok_or_else(|| {
                     StoreError::Corruption("completed receipt has no execution outcome".into())
                 })?;
-                if terminal.agreement != *certificate.agreement()
-                    || receipt.body().outcome() != outcome.borsh()
-                {
+                if receipt.body().outcome() != outcome.borsh() {
                     return Err(StoreError::Corruption(
                         "receipt completion does not match execution evidence".into(),
                     ));

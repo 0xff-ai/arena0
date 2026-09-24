@@ -26,9 +26,9 @@ impl Database {
                     OR (e.lifecycle IN (5, 7) AND NOT EXISTS (
                         SELECT 1 FROM receipt_productions AS p
                         WHERE p.execution_id = r.execution_id))
-                    OR (e.lifecycle <> 6 AND EXISTS (SELECT 1 FROM outbox AS o
+                    OR EXISTS (SELECT 1 FROM outbox AS o
                         WHERE o.execution_id = r.execution_id
-                          AND o.status <> 'acknowledged')))
+                          AND o.status <> 'acknowledged'))
              ORDER BY r.created_order ASC
              LIMIT ?2",
         )?;

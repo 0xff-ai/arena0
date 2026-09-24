@@ -3,24 +3,6 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
-use crate::id::id_type;
-
-id_type!(
-    /// `blake3` of the borsh-encoded typed `Outcome` bytes. Binding this hash into
-    /// the signed terminal ties the receipt to the completion aggregate, so a
-    /// relabeled outcome is caught. Construct with [`Hash::of`].
-    pub struct Hash,
-    Default
-);
-
-impl Hash {
-    /// Hash the outcome bytes (the borsh-encoded typed `Outcome`).
-    #[must_use]
-    pub fn of(bytes: &[u8]) -> Self {
-        Self(*blake3::hash(bytes).as_bytes())
-    }
-}
-
 /// How a session ended, with its outcome or reported reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub enum SessionTermination {

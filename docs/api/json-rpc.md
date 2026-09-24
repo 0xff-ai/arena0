@@ -203,9 +203,10 @@ inbox status, and outbox rows in one SQLite transaction. Protocol frame outbox
 rows are per destination; a producer does not process its own broadcast.
 Outbox delivery uses leases and retries, and expired leases are recovered when
 the store opens. A pending callout retains its `pending_id` and guest context
-across a restart, so `exec.next` can return the same callout again. Terminal
-proof collection is internal; the socket exposes the terminal result and the
-authenticated portable artifact.
+across a restart, so `exec.next` can return the same callout again. A certified
+final `SessionEnd` step authenticates completion and its outcome bytes. Receipt
+assembly and publication use that durable evidence; the socket exposes the
+terminal result and the authenticated portable artifact.
 
 ## Receipts
 

@@ -27,32 +27,22 @@ impl ExecutionActor {
             arena0_protocol::MAX_TERMINAL_REASON_BYTES,
         );
         match self.context.store.load_execution().await {
-            Ok(Some(_)) => match fail_execution(
+            Ok(Some(state)) => match fail_execution(
                 &mut self.context.store,
                 &self.context.identity,
                 reason.clone(),
             )
             .await
             {
-                Ok(outcome) => {
-                    let incomplete = self.load_state().await.is_ok_and(|state| {
-                        matches!(state.status().receipt_work(), ReceiptWork::Incomplete)
-                    });
-                    if matches!(outcome, FailureOutcome::Recorded) && incomplete {
-                        let _ = self.messages.send(SessionMessage::Failed { reason }).await;
-                    }
-                    // Published and assembling terminals return to `run`, whose
-                    // existing select loop owns inbound frames, outbox sends,
-                    // durable retries, and the eventual terminal observation.
-                    !incomplete
-                }
+                Ok(_) => true,
                 Err(error) => {
                     tracing::error!(
                         exec_id = %self.context.exec_id,
                         %error,
                         "unable to durably record execution failure"
                     );
-                    false
+                    // A certified end remains publishable; the actor retries local assembly.
+                    matches!(state.status().receipt_work(), ReceiptWork::Assemble)
                 }
             },
             Ok(None) => match self
@@ -175,7 +165,7 @@ impl ExecutionActor {
             .await
             .map_err(|_| ExecError::Unavailable("message receiver closed".into()))?;
         let message = match receipt.body().termination() {
-            ReceiptTermination::Completed { .. } => SessionMessage::Completed {
+            ReceiptTermination::Completed => SessionMessage::Completed {
                 result: receipt.body().outcome().to_vec(),
                 result_json: state.terminal_outcome_json().map(ToOwned::to_owned),
             },
@@ -215,10 +205,7 @@ pub(crate) async fn finalize_receipt(store: &mut ExecutionStore) -> Result<(), E
             .await?
             .ok_or(ExecError::NotFound(store.execution_id()))?;
         match state.status().receipt_work() {
-            ReceiptWork::NotTerminal
-            | ReceiptWork::CollectSignatures
-            | ReceiptWork::Published
-            | ReceiptWork::Incomplete => return Ok(()),
+            ReceiptWork::NotTerminal | ReceiptWork::Published => return Ok(()),
             ReceiptWork::Assemble => match store.publish_terminal(state.version(), now_ms()).await?
             {
                 ApplyOutcome::Committed { .. }
@@ -242,8 +229,7 @@ pub(crate) enum FailureOutcome {
 }
 
 /// Record one producer-authenticated failure for a live actor or startup
-/// recovery. A terminal proof in progress cannot be replaced by an abort; it
-/// is frozen as incomplete so its partial agreement remains inspectable.
+/// recovery. Certified terminal evidence is preserved for local publication.
 pub(crate) async fn fail_execution(
     store: &mut ExecutionStore,
     identity: &NodeKeys,
@@ -265,25 +251,8 @@ pub(crate) async fn fail_execution(
                 finalize_receipt(store).await?;
                 return Ok(FailureOutcome::TerminalPreserved);
             }
-            ReceiptWork::Published | ReceiptWork::Incomplete => {
+            ReceiptWork::Published => {
                 return Ok(FailureOutcome::TerminalPreserved);
-            }
-            ReceiptWork::CollectSignatures => {
-                match store
-                    .interrupt_terminal(state.version(), reason.clone(), now_ms())
-                    .await?
-                {
-                    ApplyOutcome::Committed { .. } | ApplyOutcome::AlreadyApplied => {
-                        return Ok(FailureOutcome::Recorded);
-                    }
-                    ApplyOutcome::InboxAlreadyApplied { .. }
-                    | ApplyOutcome::InboxAlreadyConsumed { .. } => {
-                        return Err(ExecError::InvalidState(
-                            "local terminal interruption unexpectedly carried inbox state".into(),
-                        ));
-                    }
-                    ApplyOutcome::VersionMismatch { .. } => continue,
-                }
             }
             ReceiptWork::NotTerminal => {
                 let unsigned = AbortOccurrence::unsigned(

@@ -668,7 +668,6 @@ impl Run {
                                             } => {
                                                 format!("step-signature@{}", commitment.step)
                                             }
-                                            arena0_protocol::ExecFrame::End { .. } => "end".into(),
                                             arena0_protocol::ExecFrame::Abort { .. } => {
                                                 "abort".into()
                                             }
@@ -702,14 +701,13 @@ impl Run {
                             })
                             .unwrap_or_default();
                         format!(
-                            "lifecycle={:?} version={} step={} event_position={} reacted={:?} proposal_step={:?} shared_signatures={signatures:?} terminal_pending={}",
+                            "lifecycle={:?} version={} step={} event_position={} reacted={:?} proposal_step={:?} shared_signatures={signatures:?}",
                             state.lifecycle(),
                             state.version(),
                             state.agreed_step(),
                             state.event_position(),
                             state.last_reacted_step(),
                             state.pending_shared().map(|proposal| proposal.commitment().step),
-                            state.terminal_pending(),
                         )
                     });
                     let trace = match loaded_state.as_ref() {
@@ -819,7 +817,7 @@ impl Run {
             .filter(|receipt| {
                 matches!(
                     receipt.body().termination(),
-                    arena0_protocol::ReceiptTermination::Completed { .. }
+                    arena0_protocol::ReceiptTermination::Completed
                 )
             })
             .map(|receipt| receipt.body().outcome().to_vec())

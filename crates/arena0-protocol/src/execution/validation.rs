@@ -1,16 +1,14 @@
 use arena0_crypto::BlsPublicKey;
 
 use crate::trace::{
-    AggregateAttestation, ReceiptTermination, SessionTerminal, StepCommitment,
-    TRACE_FORMAT_VERSION, TerminalCommitment, TraceEntry,
+    AggregateAttestation, ReceiptTermination, StepCommitment, TRACE_FORMAT_VERSION, TraceEntry,
 };
-use crate::{Effect, Ensemble, Event, MessageId, OutcomeHash, StateHash};
+use crate::{Effect, Ensemble, Event, MessageId, StateHash};
 
 use super::{
     AbortKind, ExecutionBinding, MAX_EFFECTS, MAX_RECEIPT_BYTES, MAX_TERMINAL_OUTCOME_BYTES,
     MAX_TERMINAL_REASON_BYTES, MAX_TIMER_PAYLOAD_BYTES, MAX_TRACE_ENTRY_BYTES, ProtocolError,
-    ReceiptBody, SharedProposal, StepCursor, StopCause, TerminalCertificate, TerminalOutcome,
-    TerminalProof,
+    ReceiptBody, SharedProposal, StepCursor, StopCause,
 };
 
 /// Validate an encoded value's total size without decoding it first.
@@ -166,25 +164,12 @@ fn validate_proposal_status(
                     },
             },
         ) if actual_commitment == commitment && actual_reason == reason => Ok(()),
-        (Some(Effect::SessionEnd { outcome }), super::ExecutionStatus::TerminalProof { proof }) => {
-            let (terminal_commitment, terminal_outcome) = match proof.as_ref() {
-                super::TerminalProof::Pending {
-                    commitment,
-                    outcome,
-                    ..
-                }
-                | super::TerminalProof::Certified {
-                    certificate: super::TerminalCertificate { commitment, .. },
-                    outcome,
-                } => (commitment, outcome),
-            };
-            let expected = TerminalCommitment::new(
-                commitment.session_id,
-                commitment.step,
-                commitment.post_state,
-                OutcomeHash::of(outcome),
-            );
-            if terminal_commitment == &expected && terminal_outcome.borsh() == outcome.as_slice() {
+        (
+            Some(Effect::SessionEnd { outcome }),
+            super::ExecutionStatus::Ended { outcome: actual },
+        ) => {
+            actual.validate()?;
+            if actual.borsh() == outcome.as_slice() {
                 Ok(())
             } else {
                 Err(ProtocolError::TerminalOutcomeMismatch)
@@ -221,118 +206,6 @@ fn validate_step_signature_order(
     Ok(())
 }
 
-pub(crate) fn validate_terminal_progress(
-    binding: &ExecutionBinding,
-    agreed: StepCursor,
-    terminal: &TerminalProof,
-) -> Result<(), ProtocolError> {
-    if let Some((commitment, outcome, signatures)) = terminal.pending_parts() {
-        validate_terminal_outcome(commitment, outcome)?;
-        if commitment.domain != crate::TERMINAL_DOMAIN
-            || commitment.session_id != binding.session_id()
-            || commitment.final_step >= agreed.next_step()
-            || commitment.final_state != agreed.state_hash()
-        {
-            return Err(ProtocolError::InvalidCertificate(
-                "pending terminal commitment is inconsistent".into(),
-            ));
-        }
-        if signatures.len() > binding.activation.tickets().len() {
-            return Err(ProtocolError::CollectionTooLarge {
-                kind: "terminal signatures",
-                actual: signatures.len(),
-                max: binding.activation.tickets().len(),
-            });
-        }
-        for signature in signatures {
-            let key = binding.participant_key(&signature.participant())?;
-            let valid = key
-                .verify(&commitment.signing_bytes(), &signature.signature())
-                .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
-            if !valid {
-                return Err(ProtocolError::InvalidTerminalSignature {
-                    participant: signature.participant(),
-                });
-            }
-        }
-        return validate_terminal_signature_order(signatures);
-    }
-
-    if let Some((certificate, outcome)) = terminal.certified_parts() {
-        validate_terminal_outcome(&certificate.commitment, outcome)?;
-        return validate_terminal_certificate(binding, agreed, certificate);
-    }
-    Err(ProtocolError::InvalidCertificate(
-        "unknown terminal proof state".into(),
-    ))
-}
-
-fn validate_terminal_signature_order(
-    signatures: &[super::ParticipantTerminalSignature],
-) -> Result<(), ProtocolError> {
-    for pair in signatures.windows(2) {
-        if pair[0].participant() >= pair[1].participant() {
-            if pair[0].participant() == pair[1].participant() {
-                return Err(if pair[0].signature() == pair[1].signature() {
-                    ProtocolError::DuplicateTerminalSignature {
-                        participant: pair[0].participant(),
-                    }
-                } else {
-                    ProtocolError::ConflictingTerminalSignature {
-                        participant: pair[0].participant(),
-                    }
-                });
-            }
-            return Err(ProtocolError::InvalidCertificate(
-                "pending terminal signatures are not canonical".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_terminal_certificate(
-    binding: &ExecutionBinding,
-    agreed: StepCursor,
-    certificate: &TerminalCertificate,
-) -> Result<(), ProtocolError> {
-    if certificate.commitment.domain != crate::TERMINAL_DOMAIN
-        || certificate.commitment.session_id != binding.session_id()
-        || certificate.commitment.final_step >= agreed.next_step()
-        || certificate.commitment.final_state != agreed.state_hash()
-    {
-        return Err(ProtocolError::InvalidCertificate(
-            "terminal certificate is inconsistent with agreed state".into(),
-        ));
-    }
-    let participants = binding.participant_keys()?;
-    if !certificate.agreement.signers.is_full(participants.len()) {
-        return Err(ProtocolError::IncompleteProof {
-            actual: certificate.agreement.signers.count(),
-            expected: participants.len(),
-        });
-    }
-    certificate
-        .agreement
-        .verify_signatures(
-            certificate.commitment.final_step,
-            &certificate.commitment.signing_bytes(),
-            &participants.iter().map(|(_, key)| *key).collect::<Vec<_>>(),
-        )
-        .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))
-}
-
-fn validate_terminal_outcome(
-    commitment: &crate::trace::TerminalCommitment,
-    outcome: &TerminalOutcome,
-) -> Result<(), ProtocolError> {
-    outcome.validate()?;
-    if commitment.outcome_hash != OutcomeHash::of(outcome.borsh()) {
-        return Err(ProtocolError::OutcomeProjectionMismatch);
-    }
-    Ok(())
-}
-
 /// Validate receipt structure independently of its binding.
 pub(crate) fn validate_receipt_body_shape(body: &ReceiptBody) -> Result<(), ProtocolError> {
     let encoded =
@@ -349,7 +222,7 @@ pub(crate) fn validate_receipt_body_shape(body: &ReceiptBody) -> Result<(), Prot
         validate_trace_entry(entry)?;
     }
     match body.termination() {
-        ReceiptTermination::Completed { .. } => {}
+        ReceiptTermination::Completed => {}
         ReceiptTermination::Stopped { cause } => {
             cause.validate()?;
             if !body.outcome().is_empty() {
@@ -381,13 +254,9 @@ pub(crate) fn validate_receipt_body(
     let participants = binding.participant_keys()?;
     let participant_keys = participants.iter().map(|(_, key)| *key).collect::<Vec<_>>();
     match &header.terminal {
-        ReceiptTermination::Completed { terminal } => validate_completed_receipt(
-            binding,
-            body,
-            terminal,
-            &participant_keys,
-            participants.len(),
-        ),
+        ReceiptTermination::Completed => {
+            validate_completed_receipt(binding, body, &participant_keys, participants.len())
+        }
         ReceiptTermination::Stopped { cause } => {
             validate_stopped_receipt(binding, body, cause, &participant_keys, participants.len())
         }
@@ -397,34 +266,9 @@ pub(crate) fn validate_receipt_body(
 fn validate_completed_receipt(
     binding: &ExecutionBinding,
     body: &ReceiptBody,
-    terminal: &SessionTerminal,
     participant_keys: &[BlsPublicKey],
     participant_count: usize,
 ) -> Result<(), ProtocolError> {
-    if body.trace().is_empty()
-        || terminal.final_step
-            != u64::try_from(body.trace().len() - 1)
-                .map_err(|_| ProtocolError::ReceiptBodyMismatch)?
-        || terminal.outcome_hash != OutcomeHash::of(body.outcome())
-        || terminal.agreement.signers.count() != participant_count
-        || !terminal.agreement.signers.is_full(participant_count)
-    {
-        return Err(ProtocolError::ReceiptBodyMismatch);
-    }
-    let commitment = crate::TerminalCommitment::new(
-        binding.session_id(),
-        terminal.final_step,
-        terminal.final_state,
-        terminal.outcome_hash,
-    );
-    terminal
-        .agreement
-        .verify_signatures(
-            terminal.final_step,
-            &commitment.signing_bytes(),
-            participant_keys,
-        )
-        .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
     validate_receipt_trace(
         binding,
         body.trace(),
@@ -432,7 +276,6 @@ fn validate_completed_receipt(
         participant_count,
         ReceiptTraceTerminal::Completed {
             outcome: body.outcome(),
-            final_state: terminal.final_state,
         },
     )
     .map(|_| ())
@@ -496,15 +339,9 @@ fn validate_stopped_receipt(
 }
 
 enum ReceiptTraceTerminal<'a> {
-    Completed {
-        outcome: &'a [u8],
-        final_state: StateHash,
-    },
+    Completed { outcome: &'a [u8] },
     Authenticated,
-    Stopped {
-        kind: AbortKind,
-        reason: &'a str,
-    },
+    Stopped { kind: AbortKind, reason: &'a str },
 }
 
 fn validate_receipt_trace(
@@ -551,16 +388,12 @@ fn validate_receipt_trace(
 
     let final_entry = trace.last();
     match terminal {
-        ReceiptTraceTerminal::Completed {
-            outcome,
-            final_state,
-        } => {
+        ReceiptTraceTerminal::Completed { outcome } => {
             let Some(entry) = final_entry else {
                 return Err(ProtocolError::ReceiptBodyMismatch);
             };
             if !matches!(entry.terminal, Some(Effect::SessionEnd { .. }))
                 || entry.completed_outcome() != Some(outcome)
-                || entry.post_state != final_state
             {
                 return Err(ProtocolError::TerminalTraceMismatch);
             }

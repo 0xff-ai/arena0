@@ -6,11 +6,11 @@ use std::io;
 use crate::PeerId;
 use crate::bounded::{read_bytes as read_bounded_bytes, write_bytes};
 use crate::negotiation::MAX_PARAMS_LEN;
-use crate::trace::{AggregateAttestation, SessionHeader, StepSig, TerminalCommitment, TraceEntry};
+use crate::trace::{AggregateAttestation, SessionHeader, StepSig, TraceEntry};
 
 use super::{
     ExecutionBinding, MAX_RECEIPT_BYTES, ProtocolError, SharedProposal, StepCertificate,
-    TerminalCertificate, ensure_payload,
+    ensure_payload,
 };
 
 impl StepCertificate {
@@ -73,62 +73,6 @@ impl StepCertificate {
     }
 }
 
-impl TerminalCertificate {
-    /// Build an activation-bound N-of-N certificate for a terminal commitment.
-    pub fn from_signatures(
-        binding: &ExecutionBinding,
-        commitment: &TerminalCommitment,
-        signatures: &[ParticipantTerminalSignature],
-    ) -> Result<Self, ProtocolError> {
-        let participants = binding.participant_keys()?;
-        if signatures.len() != participants.len() {
-            return Err(ProtocolError::IncompleteProof {
-                actual: signatures.len(),
-                expected: participants.len(),
-            });
-        }
-
-        let mut collected = Vec::with_capacity(participants.len());
-        let mut signer_set = crate::SignerSet::with_capacity(participants.len());
-        for (index, (participant, key)) in participants.iter().enumerate() {
-            let Some(signature) = signatures
-                .iter()
-                .find(|signature| signature.participant == *participant)
-            else {
-                return Err(ProtocolError::IncompleteProof {
-                    actual: signatures.len(),
-                    expected: participants.len(),
-                });
-            };
-            let valid = key
-                .verify(&commitment.signing_bytes(), &signature.signature)
-                .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
-            if !valid {
-                return Err(ProtocolError::InvalidTerminalSignature {
-                    participant: *participant,
-                });
-            }
-            signer_set.set(index);
-            collected.push(signature.signature);
-        }
-
-        let agreement = AggregateAttestation::from_signatures(signer_set, &collected)
-            .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
-        agreement
-            .verify_signatures(
-                commitment.final_step,
-                &commitment.signing_bytes(),
-                &participants.iter().map(|(_, key)| *key).collect::<Vec<_>>(),
-            )
-            .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
-
-        Ok(Self {
-            commitment: commitment.clone(),
-            agreement,
-        })
-    }
-}
-
 /// Bounded portable evidence assembled from authoritative activation and trace rows.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct ReceiptBody {
@@ -153,8 +97,8 @@ impl<'de> Deserialize<'de> for ReceiptBody {
     }
 }
 
-const RECEIPT_BODY_VERSION: u8 = 3;
-const RECEIPT_VERSION: u8 = 3;
+const RECEIPT_BODY_VERSION: u8 = 4;
+const RECEIPT_VERSION: u8 = 4;
 
 impl ReceiptBody {
     /// Assemble a receipt body from its portable proof fields.
@@ -309,7 +253,7 @@ impl ReceiptId {
             borsh::to_vec(body).map_err(|error| ProtocolError::Serialization(error.to_string()))?;
         ensure_payload("receipt body", bytes.len(), MAX_RECEIPT_BYTES)?;
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"arena0/receipt/v3");
+        hasher.update(b"arena0/receipt/v4");
         hasher.update(&[RECEIPT_VERSION]);
         hasher.update(&bytes);
         Ok(Self(*hasher.finalize().as_bytes()))
@@ -417,6 +361,69 @@ impl<'de> Deserialize<'de> for ReceiptArtifact {
 }
 
 impl ReceiptArtifact {
+    /// Reserve the largest empty-trace artifact for this activation. The trace
+    /// budget adds certified entries to this size, so even a maximal outcome
+    /// or authenticated failure reason remains publishable at the boundary.
+    /// These unsigned shapes are used only by the real encoders for sizing.
+    pub(crate) fn reserved_overhead(binding: &ExecutionBinding) -> Result<u64, ProtocolError> {
+        use super::{AbortKind, AbortOccurrence, StepCursor, StopCause};
+        use crate::{ReceiptTermination, StepCommitment};
+
+        let activation = binding.activation();
+        let initial = activation.offer().data().initial_state;
+        let reason = "x".repeat(super::MAX_TERMINAL_REASON_BYTES);
+        let occurrence = AbortOccurrence::unsigned(
+            binding.session_id(),
+            activation.tickets()[0].data.signer,
+            AbortKind::Fail,
+            0,
+            reason.clone(),
+            StepCursor::new(0, initial, crate::CHAIN_START),
+        )?;
+        let shared = StopCause::Shared {
+            kind: AbortKind::Fail,
+            commitment: StepCommitment {
+                domain: crate::STEP_COMMIT_DOMAIN,
+                session_id: binding.session_id(),
+                step: 0,
+                entry_hash: [0; 32],
+                pre_state: initial,
+                post_state: initial,
+                link: crate::CHAIN_START,
+            },
+            reason,
+        };
+        let mut largest = 0;
+        for (terminal, outcome) in [
+            (
+                ReceiptTermination::Completed,
+                vec![0; super::MAX_TERMINAL_OUTCOME_BYTES],
+            ),
+            (
+                ReceiptTermination::Stopped {
+                    cause: StopCause::Authenticated(occurrence),
+                },
+                vec![],
+            ),
+            (ReceiptTermination::Stopped { cause: shared }, vec![]),
+        ] {
+            let body = ReceiptBody {
+                header: SessionHeader::new(activation.clone(), terminal),
+                outcome,
+                params: activation.offer().data().params.as_bytes().to_vec(),
+                trace: Vec::new(),
+            };
+            let shape = Self::Receipt(Receipt {
+                body,
+                id: ReceiptId::from_bytes([0; 32]),
+            });
+            let size = borsh::object_length(&shape)
+                .map_err(|error| ProtocolError::Serialization(error.to_string()))?;
+            largest = largest.max(size as u64);
+        }
+        Ok(largest)
+    }
+
     /// Authenticate all evidence and classify its terminal guarantee.
     pub fn new(body: ReceiptBody) -> Result<Self, ProtocolError> {
         let binding = super::ExecutionBinding::new(body.header().activation.clone())?;
@@ -526,35 +533,5 @@ impl ParticipantStepSignature {
     #[must_use]
     pub const fn signature(&self) -> &StepSig {
         &self.signature
-    }
-}
-
-/// A signature from one participant over the terminal commitment.
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct ParticipantTerminalSignature {
-    pub(crate) participant: PeerId,
-    pub(crate) signature: BlsSignature,
-}
-
-impl ParticipantTerminalSignature {
-    /// Construct a participant-labelled terminal signature.
-    #[must_use]
-    pub const fn new(participant: PeerId, signature: BlsSignature) -> Self {
-        Self {
-            participant,
-            signature,
-        }
-    }
-
-    /// Return the participant identity.
-    #[must_use]
-    pub const fn participant(&self) -> PeerId {
-        self.participant
-    }
-
-    /// Return the signature bytes.
-    #[must_use]
-    pub const fn signature(&self) -> BlsSignature {
-        self.signature
     }
 }

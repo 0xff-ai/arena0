@@ -42,6 +42,9 @@ pub enum ExecError {
     /// A valid writer message was rejected or did not reproduce its post-state.
     #[error("{0}")]
     Diverged(String),
+    /// The next agreed step would exceed the portable evidence budget.
+    #[error("receipt budget exhausted at step {step}")]
+    ReceiptBudgetExhausted { step: u64 },
     /// A shared proposal is pending, so an input event was not consumed.
     #[error("execution is waiting for shared agreement; input was not consumed")]
     AgreementPending,
@@ -61,12 +64,21 @@ impl From<arena0_sandbox::SandboxError> for ExecError {
 
 impl From<arena0_protocol::ProtocolError> for ExecError {
     fn from(error: arena0_protocol::ProtocolError) -> Self {
+        if let arena0_protocol::ProtocolError::ReceiptBudgetExhausted { step } = error {
+            return Self::ReceiptBudgetExhausted { step };
+        }
         Self::InvalidState(error.to_string())
     }
 }
 
 impl From<StoreError> for ExecError {
     fn from(error: StoreError) -> Self {
+        if let StoreError::Protocol(arena0_protocol::ProtocolError::ReceiptBudgetExhausted {
+            step,
+        }) = error
+        {
+            return Self::ReceiptBudgetExhausted { step };
+        }
         Self::Unavailable(error.to_string())
     }
 }

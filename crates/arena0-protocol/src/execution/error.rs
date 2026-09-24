@@ -92,26 +92,18 @@ pub enum ProtocolError {
     /// A duplicate step signature conflicted with prior content.
     #[error("conflicting step signature from {participant}")]
     ConflictingStepSignature { participant: PeerId },
-    /// A terminal signature did not verify.
-    #[error("terminal signature from {participant} is invalid")]
-    InvalidTerminalSignature { participant: PeerId },
-    /// A duplicate terminal signature repeated the same content.
-    #[error("duplicate terminal signature from {participant}")]
-    DuplicateTerminalSignature { participant: PeerId },
-    /// A duplicate terminal signature conflicted with prior content.
-    #[error("conflicting terminal signature from {participant}")]
-    ConflictingTerminalSignature { participant: PeerId },
     /// A proof did not contain all activation participants.
     #[error("proof has {actual} signatures; expected {expected}")]
     IncompleteProof { actual: usize, expected: usize },
+    /// Another certified entry would leave insufficient room for a receipt
+    /// or an authenticated stop report over the agreed prefix.
+    #[error("receipt budget exhausted at step {step}")]
+    ReceiptBudgetExhausted { step: u64 },
     /// Aggregate construction or verification failed.
     #[error("invalid proof certificate: {0}")]
     InvalidCertificate(String),
-    /// Terminal proof is missing.
-    #[error("terminal proof is not pending")]
-    TerminalProofMissing,
     /// A complete receipt body does not match the execution binding.
-    #[error("receipt body does not match the execution binding or terminal certificate")]
+    #[error("receipt body does not match the execution binding or terminal evidence")]
     ReceiptBodyMismatch,
     /// A guest signing request is malformed or lacks its kernel binding.
     #[error("invalid guest signing request")]
@@ -129,7 +121,7 @@ pub enum ProtocolError {
     #[error("execution abort occurrence is not activation-authenticated")]
     UnauthenticatedAbort,
     /// A complete receipt trace does not contain the expected terminal edge.
-    #[error("receipt trace does not match terminal proof")]
+    #[error("receipt trace does not match terminal evidence")]
     TerminalTraceMismatch,
     /// The guest's agent-facing JSON outcome was malformed.
     #[error("invalid terminal outcome JSON projection: {0}")]
@@ -150,8 +142,8 @@ pub enum ProtocolError {
     /// An open callout exists on a status or proposal that cannot carry one.
     #[error("open callout requires an active execution status")]
     InvalidCalloutState,
-    /// Terminal proof is already complete.
-    #[error("terminal proof is already published")]
+    /// A receipt has already been published.
+    #[error("terminal evidence is already published")]
     TerminalAlreadyPublished,
     /// Durable terminal status is missing or inconsistent.
     #[error("durable terminal status is invalid or inconsistent")]
@@ -159,9 +151,6 @@ pub enum ProtocolError {
     /// A step contained more than one lifecycle effect.
     #[error("trace entry contains multiple terminal effects")]
     MultipleTerminalEffects,
-    /// A non-terminal step appeared after terminal proof preparation.
-    #[error("terminal proof is pending and cannot accept another step")]
-    TerminalProofPending,
     /// The execution already has terminal lifecycle.
     #[error("execution is terminal")]
     AlreadyTerminal,

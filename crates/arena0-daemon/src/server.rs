@@ -2554,10 +2554,9 @@ impl HostService {
                 .terminate("execution creation cancelled before acknowledgement".to_owned())
                 .await
                 .map(|()| ResponseOk::Ack),
-            ExecLifecycle::Completed
-            | ExecLifecycle::Aborted
-            | ExecLifecycle::Incomplete
-            | ExecLifecycle::Failed => Ok(ResponseOk::Ack),
+            ExecLifecycle::Completed | ExecLifecycle::Aborted | ExecLifecycle::Failed => {
+                Ok(ResponseOk::Ack)
+            }
         }
     }
 
@@ -2634,8 +2633,7 @@ impl HostService {
                 | ExecLifecycle::Waiting
                 | ExecLifecycle::Active
                 | ExecLifecycle::Completed
-                | ExecLifecycle::Aborted
-                | ExecLifecycle::Incomplete => {
+                | ExecLifecycle::Aborted => {
                     return Err(ApiError::new(
                         ApiErrorCode::Negotiation,
                         "ticket is no longer revocable",
@@ -3608,11 +3606,9 @@ fn project_exec_status_facts(
             ExecutionStatus::Activating => ExecStatusState::Activating {
                 session_id: Some(state.binding().session_id()),
             },
-            ExecutionStatus::Active | ExecutionStatus::TerminalProof { .. } => {
-                ExecStatusState::Active {
-                    session: session_status(&state),
-                }
-            }
+            ExecutionStatus::Active | ExecutionStatus::Ended { .. } => ExecStatusState::Active {
+                session: session_status(&state),
+            },
             ExecutionStatus::Completed { .. } => ExecStatusState::Completed {
                 session: session_status(&state),
             },
@@ -3630,11 +3626,6 @@ fn project_exec_status_facts(
                     }
                 }
             }
-            ExecutionStatus::Incomplete { .. } => ExecStatusState::Failed {
-                session: Some(SessionProgress::Started {
-                    session: session_status(&state),
-                }),
-            },
         },
         None if request.failure().is_some() => ExecStatusState::Failed {
             session: activation.as_ref().and_then(|record| {
@@ -3759,13 +3750,10 @@ fn receipt_list_entry(stored: arena0_store::StoredReceipt) -> arena0_api::Receip
         session_id: stored.receipt.body().header().session_hash(),
         kind: stored.receipt.kind(),
         program_id: stored.receipt.body().header().program_hash(),
-        completed: stored
-            .receipt
-            .body()
-            .header()
-            .terminal
-            .completed()
-            .is_some(),
+        completed: matches!(
+            stored.receipt.body().termination(),
+            arena0_protocol::ReceiptTermination::Completed
+        ),
         provenance,
     }
 }

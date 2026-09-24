@@ -226,7 +226,6 @@ mod tests {
         EXEC_KIND_ABORT, EXEC_KIND_MESSAGE, ExecFrame, FetchFrame, MAX_EXEC_REASON_BYTES,
         MAX_FETCH_RESPONSE_BYTES, MessageIdBytes, PeerIdBytes, SessionHashBytes, StateHashBytes,
         StreamProtocol, WireAbortCoordinate, WireAbortOccurrence, WireError, WireStepCommitment,
-        WireTerminalCommitment,
     };
     use arena0_crypto::BlsSignature;
     use borsh::BorshSerialize;
@@ -242,10 +241,6 @@ mod tests {
         },
         StepSignature {
             commitment: WireStepCommitment,
-            signature: BlsSignature,
-        },
-        End {
-            commitment: WireTerminalCommitment,
             signature: BlsSignature,
         },
         Abort {
@@ -308,16 +303,6 @@ mod tests {
         }
     }
 
-    fn terminal_commitment() -> WireTerminalCommitment {
-        WireTerminalCommitment {
-            domain: *b"arena0/terminal/v1\0\0\0\0\0\0",
-            session_id: SessionHashBytes([0x11; 32]),
-            final_step: 3,
-            final_state: StateHashBytes([0x44; 32]),
-            outcome_hash: [0x66; 32],
-        }
-    }
-
     #[test]
     fn payload_too_large() {
         let message = ExecFrame::Message {
@@ -358,9 +343,7 @@ mod tests {
     #[test]
     fn frames_preserve_borsh_layout_and_round_trip() {
         let step_commitment = step_commitment();
-        let terminal_commitment = terminal_commitment();
         let step_signature = BlsSignature([0xCC; 48]);
-        let terminal_signature = BlsSignature([0xDD; 48]);
         let frames = [
             (
                 ExecFrame::Message {
@@ -386,16 +369,6 @@ mod tests {
                 DerivedExecFrame::StepSignature {
                     commitment: step_commitment,
                     signature: step_signature,
-                },
-            ),
-            (
-                ExecFrame::End {
-                    commitment: terminal_commitment.clone(),
-                    signature: terminal_signature,
-                },
-                DerivedExecFrame::End {
-                    commitment: terminal_commitment,
-                    signature: terminal_signature,
                 },
             ),
             (

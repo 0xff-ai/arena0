@@ -37,7 +37,6 @@ pub mod view;
 pub use exec::Id as ExecId;
 pub use message::Id as MessageId;
 pub use negotiation::Id as NegotiationId;
-pub use outcome::Hash as OutcomeHash;
 pub use peer::Id as PeerId;
 pub use peer::IdSource as PeerIdSource;
 pub use session::Hash as SessionHash;
@@ -60,10 +59,9 @@ pub use execution::{
     MAX_EFFECT_PAYLOAD_BYTES, MAX_EFFECTS, MAX_EXECUTION_STATE_BYTES, MAX_PROOF_SIGNATURES,
     MAX_RECEIPT_BYTES, MAX_TERMINAL_OUTCOME_BYTES, MAX_TERMINAL_REASON_BYTES,
     MAX_TIMER_PAYLOAD_BYTES, MAX_TRACE_ENTRY_BYTES, OpenCallout, ParticipantStepSignature,
-    ParticipantTerminalSignature, PendingId, PendingIdParseError, ProtocolError, PublishedProof,
-    Receipt, ReceiptArtifact, ReceiptBody, ReceiptId, ReceiptKind, ReceiptWork, SharedProposal,
-    StepCertificate, StepCursor, StopCause, StopReport, TerminalCertificate, TerminalOutcome,
-    TerminalProof, TimerFiring, TimerId, pending_id,
+    PendingId, PendingIdParseError, ProtocolError, Receipt, ReceiptArtifact, ReceiptBody,
+    ReceiptId, ReceiptKind, ReceiptWork, SharedProposal, StepCertificate, StepCursor, StopCause,
+    StopReport, TerminalOutcome, TimerFiring, TimerId, pending_id,
 };
 pub use fetch_frame::{FetchFrame, FetchFrameError};
 pub use id::IdParseError;
@@ -90,7 +88,7 @@ pub use terminal::TerminalResult;
 pub use timer::{TimerPayload, TimerSpec};
 pub use trace::{
     AggregateAttestation, AttestationError, CHAIN_START, DivergenceDiagnostic, DivergenceKind,
-    ReceiptTermination, STEP_COMMIT_DOMAIN, SessionHeader, SessionTerminal, SignerSet,
-    StepCommitment, StepSig, TERMINAL_DOMAIN, TRACE_FORMAT_VERSION, TerminalCommitment, TraceEntry,
+    ReceiptTermination, STEP_COMMIT_DOMAIN, SessionHeader, SignerSet, StepCommitment, StepSig,
+    TRACE_FORMAT_VERSION, TraceEntry,
 };
 pub use view::{ColorDepth, Slot, View, Viewport};

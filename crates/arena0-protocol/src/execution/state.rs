@@ -7,19 +7,17 @@ use std::time::Instant;
 
 use crate::exec::ExecLifecycle;
 use crate::negotiation::Activation;
-use crate::trace::{
-    AggregateAttestation, StepCommitment, TRACE_FORMAT_VERSION, TerminalCommitment, TraceEntry,
-};
+use crate::trace::{AggregateAttestation, StepCommitment, TRACE_FORMAT_VERSION, TraceEntry};
 use crate::{
-    Effect, Event, ExecFrame, ExecId, MessageId, OpenCallout, OutcomeHash, PeerId, PendingId,
-    StateHash, pending_id,
+    Effect, Event, ExecFrame, ExecId, MessageId, OpenCallout, PeerId, PendingId, StateHash,
+    pending_id,
 };
 
 use super::{
     ExecutionBinding, ExecutionStatus, ExecutionVersion, MAX_EFFECTS, MAX_EXECUTION_STATE_BYTES,
     MAX_PROOF_SIGNATURES, ParticipantStepSignature, ProtocolError, ReceiptArtifact, ReceiptId,
-    StepCursor, TerminalOutcome, TerminalProof, ensure_encoded, validate_effects,
-    validate_proposal, validate_receipt_body,
+    StepCursor, TerminalOutcome, ensure_encoded, validate_effects, validate_proposal,
+    validate_receipt_body,
 };
 
 /// A shared step waiting for N-of-N signatures.
@@ -221,27 +219,6 @@ impl StepCertificate {
     }
 }
 
-/// An activation-bound N-of-N certificate for the successful terminal.
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct TerminalCertificate {
-    pub(crate) commitment: TerminalCommitment,
-    pub(crate) agreement: AggregateAttestation,
-}
-
-impl TerminalCertificate {
-    /// Borrow the terminal commitment.
-    #[must_use]
-    pub const fn commitment(&self) -> &TerminalCommitment {
-        &self.commitment
-    }
-
-    /// Borrow the N-of-N aggregate agreement.
-    #[must_use]
-    pub const fn agreement(&self) -> &AggregateAttestation {
-        &self.agreement
-    }
-}
-
 /// The one durable execution aggregate.
 ///
 /// `event_position` is the next monotonic event coordinate. `agreed_step` is
@@ -257,6 +234,11 @@ pub struct ExecutionState {
     pub(crate) version: ExecutionVersion,
     pub(crate) event_position: u64,
     pub(crate) agreed_step: u64,
+    /// Sum of canonical encodings of certified entries, including agreements.
+    pub(crate) trace_bytes: u64,
+    /// Derived once from activation when constructing or decoding the aggregate.
+    #[serde(skip)]
+    receipt_overhead: u64,
     pub(crate) agreed_state: StateHash,
     pub(crate) agreed_link: [u8; 32],
     pub(crate) last_reacted_step: Option<u64>,
@@ -275,6 +257,7 @@ struct ExecutionStateBody {
     version: ExecutionVersion,
     event_position: u64,
     agreed_step: u64,
+    trace_bytes: u64,
     agreed_state: StateHash,
     agreed_link: [u8; 32],
     last_reacted_step: Option<u64>,
@@ -316,6 +299,7 @@ impl ExecutionState {
             version: self.version,
             event_position: self.event_position,
             agreed_step: self.agreed_step,
+            trace_bytes: self.trace_bytes,
             agreed_state: self.agreed_state,
             agreed_link: self.agreed_link,
             last_reacted_step: self.last_reacted_step,
@@ -327,6 +311,7 @@ impl ExecutionState {
     }
 
     fn from_body(body: ExecutionStateBody) -> Result<Self, ProtocolError> {
+        let receipt_overhead = ReceiptArtifact::reserved_overhead(&body.binding)?;
         let state = Self {
             execution_id: body.execution_id,
             binding: body.binding,
@@ -335,6 +320,8 @@ impl ExecutionState {
             version: body.version,
             event_position: body.event_position,
             agreed_step: body.agreed_step,
+            trace_bytes: body.trace_bytes,
+            receipt_overhead,
             agreed_state: body.agreed_state,
             agreed_link: body.agreed_link,
             last_reacted_step: body.last_reacted_step,
@@ -365,6 +352,10 @@ impl ExecutionState {
         local_state: LocalStateBytes,
     ) -> Result<Self, ProtocolError> {
         let binding = ExecutionBinding::new(activation)?;
+        let receipt_overhead = ReceiptArtifact::reserved_overhead(&binding)?;
+        if receipt_overhead > super::MAX_RECEIPT_BYTES as u64 {
+            return Err(ProtocolError::ReceiptBudgetExhausted { step: 0 });
+        }
         if !binding
             .activation
             .tickets()
@@ -387,6 +378,8 @@ impl ExecutionState {
             version: ExecutionVersion::ZERO,
             event_position: 0,
             agreed_step: cursor.next_step(),
+            trace_bytes: 0,
+            receipt_overhead,
             agreed_state: cursor.state_hash(),
             agreed_link: cursor.chain_hash(),
             last_reacted_step: None,
@@ -443,13 +436,12 @@ impl ExecutionState {
     #[must_use]
     pub const fn published_receipt_id(&self) -> Option<ReceiptId> {
         match &self.status {
-            ExecutionStatus::Completed { proof } => Some(proof.receipt_id),
+            ExecutionStatus::Completed { receipt_id, .. } => Some(*receipt_id),
             ExecutionStatus::StoppedPublished { receipt_id, .. } => Some(*receipt_id),
             ExecutionStatus::Activating
             | ExecutionStatus::Active
-            | ExecutionStatus::TerminalProof { .. }
-            | ExecutionStatus::Stopped { .. }
-            | ExecutionStatus::Incomplete { .. } => None,
+            | ExecutionStatus::Ended { .. }
+            | ExecutionStatus::Stopped { .. } => None,
         }
     }
 
@@ -463,6 +455,63 @@ impl ExecutionState {
     #[must_use]
     pub const fn agreed_step(&self) -> u64 {
         self.agreed_step
+    }
+
+    /// Canonical encoded size of the certified public trace, excluding framing.
+    #[must_use]
+    pub const fn trace_bytes(&self) -> u64 {
+        self.trace_bytes
+    }
+
+    /// Return the prospective trace size with an N-of-N agreement on this
+    /// entry. Signature bytes have fixed width; the full signer bitmap must
+    /// be counted even while the proposal's agreement is still empty.
+    fn check_receipt_budget(&self, entry: &TraceEntry) -> Result<u64, ProtocolError> {
+        self.check_receipt_entries(&[entry])
+    }
+
+    /// Reserve every entry this proposal will stage, including a deferred
+    /// broadcast and both full agreements. Recovery and signature acceptance
+    /// enforce the same rule as dispatch so no signer becomes bound to a
+    /// proposal whose successor cannot fit in a publishable receipt.
+    fn check_proposal_receipt_budget(
+        &self,
+        proposal: &SharedProposal,
+    ) -> Result<(), ProtocolError> {
+        if let Some(successor) = self.deferred_broadcast_successor(proposal)? {
+            self.check_receipt_entries(&[&proposal.entry, &successor.entry])?;
+        } else {
+            self.check_receipt_budget(&proposal.entry)?;
+        }
+        Ok(())
+    }
+
+    fn check_receipt_entries(&self, entries: &[&TraceEntry]) -> Result<u64, ProtocolError> {
+        let exhausted = || ProtocolError::ReceiptBudgetExhausted {
+            step: self.agreed_step,
+        };
+        let mut trace_bytes = self.trace_bytes;
+        for entry in entries {
+            let mut certified = (*entry).clone();
+            certified.agreement.signers =
+                crate::SignerSet::full(self.binding.activation().tickets().len())
+                    .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
+            let bytes = borsh::object_length(&certified)
+                .map_err(|error| ProtocolError::Serialization(error.to_string()))?
+                as u64;
+            trace_bytes = trace_bytes.checked_add(bytes).ok_or_else(exhausted)?;
+        }
+        if self
+            .agreed_step
+            .checked_add(entries.len() as u64)
+            .is_none_or(|count| count > super::MAX_RECEIPT_TRACE_ENTRIES as u64)
+            || trace_bytes
+                .checked_add(self.receipt_overhead)
+                .is_none_or(|total| total > super::MAX_RECEIPT_BYTES as u64)
+        {
+            return Err(exhausted());
+        }
+        Ok(trace_bytes)
     }
 
     /// Return the shared hash at the last agreed step.
@@ -513,44 +562,14 @@ impl ExecutionState {
         self.proposal.as_ref()
     }
 
-    /// Whether terminal proof has started.
-    #[must_use]
-    pub fn terminal_pending(&self) -> bool {
-        matches!(
-            self.status.terminal_proof(),
-            Some(TerminalProof::Pending { .. })
-        )
-    }
-
-    /// Borrow the terminal commitment while signatures are being collected.
-    #[must_use]
-    pub fn pending_terminal(&self) -> Option<&TerminalCommitment> {
-        match self.status.terminal_proof() {
-            Some(TerminalProof::Pending { commitment, .. }) => Some(commitment),
-            _ => None,
-        }
-    }
-
-    /// Borrow the terminal certificate once it has been formed.
-    #[must_use]
-    pub fn terminal_certificate(&self) -> Option<&TerminalCertificate> {
-        match self.status.terminal_proof() {
-            Some(TerminalProof::Certified { certificate, .. }) => Some(certificate),
-            Some(TerminalProof::Pending { .. }) => None,
-            None => self
-                .status
-                .published_proof()
-                .map(|proof| &proof.certificate),
-        }
-    }
-
     /// Borrow the guest-produced terminal outcome projection, if any.
     #[must_use]
     pub fn terminal_outcome(&self) -> Option<&TerminalOutcome> {
-        match self.status.terminal_proof() {
-            Some(TerminalProof::Pending { outcome, .. })
-            | Some(TerminalProof::Certified { outcome, .. }) => Some(outcome),
-            None => self.status.published_proof().map(|proof| &proof.outcome),
+        match &self.status {
+            ExecutionStatus::Ended { outcome } | ExecutionStatus::Completed { outcome, .. } => {
+                Some(outcome)
+            }
+            _ => None,
         }
     }
 
@@ -673,7 +692,7 @@ impl ExecutionState {
         };
         let commitment =
             StepCommitment::for_entry(self.binding.session_id(), &entry, self.agreed_link);
-        let status = proposal_status(self, &entry, &commitment, terminal_outcome)?;
+        let status = proposal_status(&entry, &commitment, terminal_outcome)?;
         let next_callout = next_open_callout(self, event, event_position, &status, callout);
         let proposal = SharedProposal::new(
             commitment,
@@ -796,6 +815,7 @@ impl ExecutionState {
             self.event_position,
             &proposal,
         )?;
+        self.check_proposal_receipt_budget(&proposal)?;
         let mut next = self.clone();
         next.event_position = next_event_position;
         if let Some(step) = reacted_step {
@@ -818,6 +838,12 @@ impl ExecutionState {
         &mut self,
         signature: ParticipantStepSignature,
     ) -> Result<Option<SharedProposal>, ProtocolError> {
+        // Defend the staging invariant before retaining any signature.
+        self.check_proposal_receipt_budget(
+            self.proposal
+                .as_ref()
+                .ok_or(ProtocolError::SharedProposalMissing)?,
+        )?;
         let mut next = self.clone();
         {
             let binding = &next.binding;
@@ -884,13 +910,17 @@ impl ExecutionState {
             )
             .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
         let next = self.step_cursor().advance(&certificate.commitment)?;
-        let expected_successor = self.deferred_broadcast_successor()?;
+        let trace_bytes = self.check_receipt_budget(&proposal.entry)?;
+        let expected_successor = self.deferred_broadcast_successor(proposal)?;
+        // Tripwire for the reservation made when the origin was staged.
+        self.check_proposal_receipt_budget(proposal)?;
         let mut committed = self
             .proposal
             .take()
             .ok_or(ProtocolError::SharedProposalMissing)?;
         committed.entry.agreement = certificate.agreement.clone();
         self.agreed_step = next.next_step();
+        self.trace_bytes = trace_bytes;
         self.agreed_state = next.state_hash();
         self.agreed_link = next.chain_hash();
         self.shared_state = committed.shared_state.clone();
@@ -908,11 +938,10 @@ impl ExecutionState {
     /// position, carries the just-committed memories and status, and has no
     /// effects of its own. The state machine installs this successor itself
     /// when the originating proposal reaches N-of-N agreement.
-    fn deferred_broadcast_successor(&self) -> Result<Option<SharedProposal>, ProtocolError> {
-        let proposal = self
-            .proposal
-            .as_ref()
-            .ok_or(ProtocolError::SharedProposalMissing)?;
+    fn deferred_broadcast_successor(
+        &self,
+        proposal: &SharedProposal,
+    ) -> Result<Option<SharedProposal>, ProtocolError> {
         let Some(data) = proposal
             .effects
             .iter()
@@ -970,26 +999,6 @@ impl ExecutionState {
         )?))
     }
 
-    /// Add one checked terminal signature and advance proof progress.
-    ///
-    /// The returned flag is `true` when the signature completes the N-of-N
-    /// certificate. The status owns the proof transition; this method owns the
-    /// aggregate version and validates the resulting cross-field state before
-    /// publishing it to the caller.
-    pub fn add_terminal_signature(
-        &mut self,
-        signature: super::ParticipantTerminalSignature,
-    ) -> Result<bool, ProtocolError> {
-        let mut next = self.clone();
-        let complete = next
-            .status
-            .add_terminal_signature(&next.binding, signature)?;
-        next.bump_version()?;
-        next.validate_recovered()?;
-        *self = next;
-        Ok(complete)
-    }
-
     /// Accept an authenticated stop at the current agreed cursor.
     pub fn stop(&mut self, occurrence: super::AbortOccurrence) -> Result<(), ProtocolError> {
         occurrence.validate_for_session(self.binding.session_id())?;
@@ -1011,9 +1020,6 @@ impl ExecutionState {
         if self.status.is_terminal() {
             return Err(ProtocolError::AlreadyTerminal);
         }
-        if self.status.terminal_proof().is_some() {
-            return Err(ProtocolError::TerminalProofPending);
-        }
         if self.proposal.as_ref().is_some_and(|proposal| {
             proposal
                 .signatures()
@@ -1033,50 +1039,35 @@ impl ExecutionState {
         Ok(())
     }
 
-    /// Freeze in-flight terminal proof when publication is interrupted.
-    pub fn interrupt_terminal(&mut self, reason: String) -> Result<(), ProtocolError> {
-        if self.status.is_terminal() {
-            return Err(ProtocolError::AlreadyTerminal);
-        }
-        let proof = self
-            .status
-            .terminal_proof()
-            .ok_or(ProtocolError::TerminalProofMissing)?
-            .clone();
-        let mut next = self.clone();
-        next.status = ExecutionStatus::incomplete(proof, reason)?;
-        next.callout = None;
-        next.bump_version()?;
-        next.validate_recovered()?;
-        *self = next;
-        Ok(())
-    }
-
     /// Publish a validated receipt artifact for terminal execution.
     pub fn publish_receipt(&mut self, artifact: ReceiptArtifact) -> Result<(), ProtocolError> {
         validate_receipt_body(&self.binding, artifact.body())?;
         let body = artifact.body();
         let status = match (&self.status, body.termination()) {
-            (
-                ExecutionStatus::TerminalProof { proof },
-                crate::ReceiptTermination::Completed { terminal },
-            ) => {
-                let (certificate, outcome) = proof
-                    .certified_parts()
-                    .ok_or(ProtocolError::TerminalProofMissing)?;
-                if terminal.final_step != certificate.commitment().final_step
-                    || terminal.final_state != certificate.commitment().final_state
-                    || terminal.outcome_hash != certificate.commitment().outcome_hash
-                    || terminal.agreement != *certificate.agreement()
-                    || body.outcome() != outcome.borsh()
+            (ExecutionStatus::Ended { outcome }, crate::ReceiptTermination::Completed) => {
+                let last = body
+                    .trace()
+                    .last()
+                    .ok_or(ProtocolError::ReceiptBodyMismatch)?;
+                let commitment = StepCommitment::for_entry(
+                    self.binding.session_id(),
+                    last,
+                    body.trace().iter().take(body.trace().len() - 1).fold(
+                        crate::CHAIN_START,
+                        |link, entry| {
+                            StepCommitment::for_entry(self.binding.session_id(), entry, link)
+                                .link_hash()
+                        },
+                    ),
+                );
+                if body.outcome() != outcome.borsh()
+                    || last.step.checked_add(1) != Some(self.agreed_step)
+                    || last.post_state != self.agreed_state
+                    || commitment.link_hash() != self.agreed_link
                 {
                     return Err(ProtocolError::ReceiptBodyMismatch);
                 }
-                ExecutionStatus::completed(
-                    certificate.clone(),
-                    outcome.clone(),
-                    artifact.receipt_id(),
-                )
+                ExecutionStatus::completed(outcome.clone(), artifact.receipt_id())
             }
             (
                 ExecutionStatus::Stopped { cause },
@@ -1175,6 +1166,17 @@ impl ExecutionState {
         {
             return Err(ProtocolError::StateHashMismatch);
         }
+        if (self.agreed_step == 0) != (self.trace_bytes == 0)
+            || self.agreed_step > super::MAX_RECEIPT_TRACE_ENTRIES as u64
+            || self
+                .trace_bytes
+                .checked_add(self.receipt_overhead)
+                .is_none_or(|total| total > super::MAX_RECEIPT_BYTES as u64)
+        {
+            return Err(ProtocolError::ReceiptBudgetExhausted {
+                step: self.agreed_step,
+            });
+        }
         if self
             .last_reacted_step
             .is_some_and(|step| step >= self.agreed_step)
@@ -1207,6 +1209,7 @@ impl ExecutionState {
                 proposal.event_position,
                 proposal,
             )?;
+            self.check_proposal_receipt_budget(proposal)?;
             if !matches!(proposal.status(), ExecutionStatus::Active) && proposal.callout().is_some()
             {
                 return Err(ProtocolError::InvalidCalloutState);
@@ -1391,7 +1394,6 @@ fn normalize_proposal_event(
 }
 
 fn proposal_status(
-    state: &ExecutionState,
     entry: &TraceEntry,
     commitment: &StepCommitment,
     terminal_outcome: Option<TerminalOutcome>,
@@ -1405,15 +1407,7 @@ fn proposal_status(
                 if outcome.borsh() != effect_outcome.as_slice() {
                     return Err(ProtocolError::OutcomeProjectionMismatch);
                 }
-                let terminal_commitment = TerminalCommitment::new(
-                    state.binding.session_id(),
-                    entry.step,
-                    entry.post_state,
-                    OutcomeHash::of(outcome.borsh()),
-                );
-                return Ok(ExecutionStatus::from_terminal_proof(
-                    TerminalProof::pending(terminal_commitment, outcome, Vec::new()),
-                ));
+                return Ok(ExecutionStatus::Ended { outcome });
             }
             Effect::SessionAbort { .. } | Effect::Fail { .. } => {
                 if terminal_outcome.is_some() {
@@ -1812,6 +1806,317 @@ mod tests {
             )
             .unwrap();
         assert!(state.callout().is_none());
+    }
+
+    #[test]
+    fn receipt_budget_refuses_the_next_step_without_changing_the_certified_prefix() {
+        let fixture = fixture();
+        let mut state = active_state(&fixture);
+        let mut encoded_trace_bytes = 0;
+        loop {
+            let mut event = proposal_for(
+                &fixture,
+                &state,
+                state.shared_state().clone(),
+                state.local_state().clone(),
+            )
+            .entry()
+            .event
+            .clone();
+            if let Event::MessageReceived {
+                message_id,
+                from,
+                position,
+                pre_state,
+                msg,
+            } = &mut event
+            {
+                *msg = vec![1; super::super::MAX_EFFECT_PAYLOAD_BYTES];
+                *message_id = MessageId::derive(
+                    fixture.activation.session_hash(),
+                    *from,
+                    *position,
+                    *pre_state,
+                    state.agreed_state(),
+                    msg,
+                );
+            }
+            let before = state.clone();
+            let result = state.apply_dispatch(
+                &event,
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[],
+                None,
+                None,
+                None,
+            );
+            if let Err(ProtocolError::ReceiptBudgetExhausted { step }) = result {
+                assert_eq!(step, before.agreed_step());
+                assert_eq!(state, before);
+                assert!(state.agreed_step() > 1);
+                // The small originating event fits on its own, but its
+                // deferred broadcast would not. Refuse the entire dispatch
+                // before either entry can be staged or signed.
+                let small_event = proposal_for(
+                    &fixture,
+                    &state,
+                    state.shared_state().clone(),
+                    state.local_state().clone(),
+                )
+                .entry()
+                .event
+                .clone();
+                let mut without_broadcast = state.clone();
+                without_broadcast
+                    .apply_dispatch(
+                        &small_event,
+                        state.shared_state().clone(),
+                        state.local_state().clone(),
+                        &[],
+                        None,
+                        None,
+                        None,
+                    )
+                    .expect("originating entry still fits");
+                assert!(matches!(
+                    state.apply_dispatch(
+                        &small_event,
+                        state.shared_state().clone(),
+                        state.local_state().clone(),
+                        &[Effect::Broadcast {
+                            data: vec![1; super::super::MAX_EFFECT_PAYLOAD_BYTES],
+                        }],
+                        None,
+                        None,
+                        None,
+                    ),
+                    Err(ProtocolError::ReceiptBudgetExhausted { step })
+                        if step == before.agreed_step()
+                ));
+                assert_eq!(state, before);
+                assert_recovery_rejects_over_budget_broadcast(&fixture, &state, &small_event);
+                // A terminal step is subject to the same check; it cannot
+                // certify an outcome that leaves local assembly impossible.
+                assert!(matches!(
+                    state.apply_dispatch(
+                        &event,
+                        state.shared_state().clone(),
+                        state.local_state().clone(),
+                        &[Effect::SessionEnd { outcome: vec![] }],
+                        Some(TerminalOutcome::new(vec![], b"null".to_vec()).unwrap()),
+                        None,
+                        None,
+                    ),
+                    Err(ProtocolError::ReceiptBudgetExhausted { .. })
+                ));
+                assert_eq!(state, before);
+                assert_eq!(
+                    ExecutionState::decode(&state.encode().unwrap()).unwrap(),
+                    state
+                );
+                break;
+            }
+            result.unwrap();
+            let commitment = state.pending_shared().unwrap().commitment().clone();
+            for (peer, key) in &fixture.participants {
+                if let Some(committed) = state
+                    .add_step_signature(ParticipantStepSignature::new(
+                        *peer,
+                        commitment.step,
+                        key.sign(&commitment.signing_bytes()),
+                    ))
+                    .unwrap()
+                {
+                    encoded_trace_bytes += borsh::object_length(committed.entry()).unwrap() as u64;
+                }
+            }
+            assert_eq!(state.trace_bytes(), encoded_trace_bytes);
+            assert!(state.pending_shared().is_none());
+        }
+    }
+
+    fn assert_recovery_rejects_over_budget_broadcast(
+        fixture: &Fixture,
+        prefix: &ExecutionState,
+        event: &Event<Vec<u8>>,
+    ) {
+        let mut state = prefix.clone();
+        state
+            .apply_dispatch(
+                event,
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[Effect::Broadcast { data: vec![1] }],
+                None,
+                None,
+                None,
+            )
+            .expect("small deferred broadcast fits");
+        assert_eq!(
+            ExecutionState::decode(&state.encode().unwrap()).unwrap(),
+            state
+        );
+        assert_eq!(
+            serde_json::from_slice::<ExecutionState>(&serde_json::to_vec(&state).unwrap()).unwrap(),
+            state
+        );
+
+        // Corrupt only the retained payload. The certified prefix and its
+        // byte counter remain authentic; the missing reservation is the
+        // sole reason both aggregate decode boundaries must reject it.
+        state.proposal.as_mut().unwrap().effects[0].1 = Effect::Broadcast {
+            data: vec![1; super::super::MAX_EFFECT_PAYLOAD_BYTES],
+        };
+        let expected_error = format!("receipt budget exhausted at step {}", state.agreed_step());
+        let borsh_error = ExecutionState::decode(&state.encode().unwrap()).unwrap_err();
+        assert!(borsh_error.to_string().contains(&expected_error));
+        let serde_error =
+            serde_json::from_slice::<ExecutionState>(&serde_json::to_vec(&state).unwrap())
+                .unwrap_err();
+        assert!(serde_error.to_string().contains(&expected_error));
+
+        // Even an invalid in-memory aggregate must fail before retaining
+        // the first signature, leaving its signer free to authenticate Fail.
+        let before = state.clone();
+        let commitment = state.pending_shared().unwrap().commitment();
+        let (peer, key) = &fixture.participants[0];
+        let signature = ParticipantStepSignature::new(
+            *peer,
+            commitment.step,
+            key.sign(&commitment.signing_bytes()),
+        );
+        assert!(matches!(
+            state.add_step_signature(signature),
+            Err(ProtocolError::ReceiptBudgetExhausted { step }) if step == prefix.agreed_step()
+        ));
+        assert_eq!(state, before);
+        assert!(state.pending_shared().unwrap().signatures().is_empty());
+    }
+
+    #[test]
+    fn certified_session_end_is_complete_receipt_evidence() {
+        let fixture = fixture();
+        let mut state = active_state(&fixture);
+        let ensemble =
+            Ensemble::from_peers(fixture.participants.iter().map(|(peer, _)| *peer).collect())
+                .unwrap();
+        let outcome = TerminalOutcome::new(vec![7], b"7".to_vec()).unwrap();
+        let mut trace = Vec::new();
+        for (event, effects, projection) in [
+            (Event::SessionStarted { ensemble }, vec![], None),
+            (
+                Event::React,
+                vec![
+                    Effect::Broadcast { data: vec![1] },
+                    Effect::SessionEnd { outcome: vec![7] },
+                ],
+                Some(outcome.clone()),
+            ),
+        ] {
+            state
+                .apply_dispatch(
+                    &event,
+                    state.shared_state().clone(),
+                    state.local_state().clone(),
+                    &effects,
+                    projection,
+                    None,
+                    None,
+                )
+                .unwrap();
+            // Even an unchanged shared image requires agreement for SessionEnd.
+            assert_eq!(state.status(), &ExecutionStatus::Active);
+            let commitment = state.pending_shared().unwrap().commitment().clone();
+            for (index, (peer, key)) in fixture.participants.iter().enumerate() {
+                let committed = state
+                    .add_step_signature(ParticipantStepSignature::new(
+                        *peer,
+                        commitment.step,
+                        key.sign(&commitment.signing_bytes()),
+                    ))
+                    .unwrap();
+                if index + 1 < fixture.participants.len() {
+                    assert!(committed.is_none());
+                    assert_eq!(state.status(), &ExecutionStatus::Active);
+                }
+                if let Some(committed) = committed {
+                    trace.push(committed.entry().clone());
+                }
+            }
+        }
+        assert_eq!(
+            state.status(),
+            &ExecutionStatus::Ended {
+                outcome: outcome.clone()
+            }
+        );
+        assert_eq!(state.lifecycle(), ExecLifecycle::Active);
+        assert!(matches!(
+            state.status().receipt_work(),
+            super::super::ReceiptWork::Assemble
+        ));
+        assert!(state.pending_shared().is_none());
+        assert_eq!(
+            ExecutionState::decode(&state.encode().unwrap()).unwrap(),
+            state
+        );
+
+        let body = |entries: Vec<TraceEntry>, bytes: Vec<u8>| {
+            crate::ReceiptBody::new(
+                crate::SessionHeader::new(
+                    fixture.activation.clone(),
+                    crate::ReceiptTermination::Completed,
+                ),
+                bytes,
+                fixture.activation.offer().data().params.as_bytes().to_vec(),
+                entries,
+            )
+            .unwrap()
+        };
+        let artifact = ReceiptArtifact::new(body(trace.clone(), vec![7])).unwrap();
+        assert!(ReceiptArtifact::new(body(trace.clone(), vec![8])).is_err());
+        assert!(ReceiptArtifact::new(body(trace[..1].to_vec(), vec![7])).is_err());
+        let mut uncertified = trace.clone();
+        uncertified.last_mut().unwrap().agreement = AggregateAttestation::empty();
+        assert!(ReceiptArtifact::new(body(uncertified, vec![7])).is_err());
+
+        // A validly signed different terminal kind cannot claim completion.
+        let mut stopped = trace.clone();
+        stopped.last_mut().unwrap().terminal = Some(Effect::SessionAbort {
+            reason: "stop".into(),
+        });
+        let previous = StepCommitment::for_entry(
+            fixture.activation.session_hash(),
+            &stopped[0],
+            crate::CHAIN_START,
+        );
+        let commitment = StepCommitment::for_entry(
+            fixture.activation.session_hash(),
+            &stopped[1],
+            previous.link_hash(),
+        );
+        let signatures = fixture
+            .participants
+            .iter()
+            .map(|(_, key)| key.sign(&commitment.signing_bytes()))
+            .collect::<Vec<_>>();
+        stopped[1].agreement = AggregateAttestation::from_signatures(
+            crate::SignerSet::full(fixture.participants.len()).unwrap(),
+            &signatures,
+        )
+        .unwrap();
+        assert!(ReceiptArtifact::new(body(stopped, vec![7])).is_err());
+
+        state.publish_receipt(artifact.clone()).unwrap();
+        assert_eq!(
+            state.status(),
+            &ExecutionStatus::Completed {
+                outcome,
+                receipt_id: artifact.receipt_id(),
+            }
+        );
+        assert_eq!(state.lifecycle(), ExecLifecycle::Completed);
     }
 
     #[test]
@@ -2242,7 +2547,7 @@ mod tests {
             .stage_proposal(proposal, None)
             .expect("proposal with deferred broadcast");
         let successor = state
-            .deferred_broadcast_successor()
+            .deferred_broadcast_successor(state.pending_shared().unwrap())
             .expect("successor construction")
             .expect("retained broadcast");
         assert_eq!(successor.event_position(), 0);

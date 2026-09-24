@@ -70,7 +70,7 @@ fn project_verified(receipt: &ReceiptArtifact) -> Result<LightVerified, VerifyEr
     ensemble.sort_unstable();
     let session_id = activation.session_hash();
     let terminal = match &body.header().terminal {
-        ReceiptTermination::Completed { .. } => LightVerifiedTerminal::Completed {
+        ReceiptTermination::Completed => LightVerifiedTerminal::Completed {
             outcome_borsh: body.outcome().to_vec(),
         },
         ReceiptTermination::Stopped { cause } => LightVerifiedTerminal::Stopped {
@@ -95,9 +95,9 @@ pub(crate) mod tests {
     use arena0_program::ExecutionProfile;
     use arena0_protocol::{
         Activation, AggregateAttestation, CHAIN_START, Committed, Effect, Ensemble, Event,
-        MessageId, Offer, OfferData, OutcomeHash, PreparedActivation, ReceiptBody, SessionHeader,
-        SessionTerminal, SignerSet, StateHash, StepCommitment, TRACE_FORMAT_VERSION,
-        TerminalCommitment, Ticket, TicketAction, TicketData, TraceEntry,
+        MessageId, Offer, OfferData, PreparedActivation, ReceiptBody, SessionHeader, SignerSet,
+        StateHash, StepCommitment, TRACE_FORMAT_VERSION, Ticket, TicketAction, TicketData,
+        TraceEntry,
     };
 
     fn fixture() -> Vec<u8> {
@@ -264,28 +264,8 @@ pub(crate) mod tests {
             .expect("step aggregate");
             entries.push(second);
         }
-        let terminal_commitment = TerminalCommitment::new(
-            session,
-            if two_steps { 1 } else { 0 },
-            final_state,
-            OutcomeHash::of(&outcome),
-        );
-        let terminal_signatures = participants
-            .iter()
-            .map(|(_, _, execution)| execution.sign(&terminal_commitment.signing_bytes()))
-            .collect::<Vec<_>>();
-        let terminal = SessionTerminal {
-            final_step: if two_steps { 1 } else { 0 },
-            final_state,
-            outcome_hash: OutcomeHash::of(&outcome),
-            agreement: AggregateAttestation::from_signatures(
-                SignerSet::full(participants.len()).expect("full signer set"),
-                &terminal_signatures,
-            )
-            .expect("terminal aggregate"),
-        };
         let body = ReceiptBody::new(
-            SessionHeader::new(activation, ReceiptTermination::Completed { terminal }),
+            SessionHeader::new(activation, ReceiptTermination::Completed),
             outcome,
             params,
             entries,
@@ -325,9 +305,9 @@ pub(crate) mod tests {
     #[test]
     fn obsolete_receipt_and_body_versions_are_rejected() {
         let original = fixture();
-        for offset in [0, 1] {
+        for (offset, version) in [(0, 2), (1, 2), (0, 3), (1, 3)] {
             let mut bytes = original.clone();
-            bytes[offset] = 2;
+            bytes[offset] = version;
             assert!(
                 verify_light(&bytes).is_err(),
                 "obsolete version at {offset}"

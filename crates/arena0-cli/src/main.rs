@@ -1877,7 +1877,7 @@ fn render_receipt(receipt: &arena0_client::protocol::ReceiptArtifact) {
     println!(
         "  terminal {}",
         match receipt.body().termination() {
-            ReceiptTermination::Completed { .. } => "completed",
+            ReceiptTermination::Completed => "completed",
             ReceiptTermination::Stopped { .. } => "stopped",
         }
     );

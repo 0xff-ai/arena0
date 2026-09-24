@@ -2969,10 +2969,7 @@ fn lifecycle_rank(lifecycle: ExecLifecycle) -> u8 {
         ExecLifecycle::Activating => 1,
         ExecLifecycle::Waiting => 2,
         ExecLifecycle::Active => 3,
-        ExecLifecycle::Completed
-        | ExecLifecycle::Aborted
-        | ExecLifecycle::Incomplete
-        | ExecLifecycle::Failed => 4,
+        ExecLifecycle::Completed | ExecLifecycle::Aborted | ExecLifecycle::Failed => 4,
     }
 }
 
@@ -3817,7 +3814,6 @@ fn render_hosts(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
                     ExecLifecycle::Active => "ACTIVE",
                     ExecLifecycle::Completed => "COMPLETE",
                     ExecLifecycle::Aborted => "ABORTED",
-                    ExecLifecycle::Incomplete => "INCOMPLETE",
                     ExecLifecycle::Failed => "FAILED",
                 });
         let step = state
@@ -4250,9 +4246,7 @@ fn passive_hints(state: &ScreenState, width: u16) -> String {
 fn lifecycle_style(state: &ScreenState) -> Style {
     match state.lifecycle() {
         ExecLifecycle::Completed => state.palette.success(),
-        ExecLifecycle::Aborted | ExecLifecycle::Incomplete | ExecLifecycle::Failed => {
-            state.palette.error()
-        }
+        ExecLifecycle::Aborted | ExecLifecycle::Failed => state.palette.error(),
         ExecLifecycle::Negotiating
         | ExecLifecycle::Activating
         | ExecLifecycle::Waiting
