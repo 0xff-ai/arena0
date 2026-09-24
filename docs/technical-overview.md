@@ -264,11 +264,13 @@ execution. Unilateral stops produce distinct authenticated reports. Both are
 exported through `ReceiptArtifact` and addressed by a content-derived `ReceiptId`.
 The store owns local production and import provenance separately from the bytes.
 
-Receipt publication emits the finished observation as a local fact. The actor
-then remains alive until every peer acknowledges its final frames, records the
-durable `final frames delivered` fact, and retires. Startup resumes a finished
-execution only when that fact is missing; the daemon supervisor does not stop
-the actor merely because it observed the receipt.
+Receipt publication emits the finished observation as a local fact. The
+execution's end phase then moves from `Open` to `Ending`: the actor sends its
+terminal evidence to each peer until that peer confirms the same conclusion,
+and retires at `Ended`, when every peer has confirmed or the end-confirmation
+window elapses. Startup resumes executions that are still `Ending`; a frame
+from a peer that never confirmed wakes a retired execution. The daemon
+supervisor does not stop the actor merely because it observed the receipt.
 
 Portable/light verification is the only verification boundary. It checks the
 activation, identities, v2 trace chain, aggregate agreements, terminal

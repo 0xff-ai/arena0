@@ -567,11 +567,33 @@ agreed cursor. The certified prefix therefore always fits a publishable
 artifact.
 
 The finished observation is emitted when the receipt is published, because that
-publication is a local fact. The actor remains alive while peers acknowledge
-its final frames. After every final frame is acknowledged, it records one
-durable `final frames delivered` fact and retires. Startup resumes a finished
-execution only when that fact is missing; the daemon supervisor does not stop
-the actor merely because it observed the finished receipt.
+publication is a local fact. Ending the session with peers is a separate,
+explicit phase of each participant's execution state, much like a TCP close
+handshake. The phase is `Open` while the session runs. The transition that
+makes the execution terminal moves it to `Ending`, which holds the peers that
+have not yet confirmed the conclusion. It becomes `Ended` once that set is
+empty or the end-confirmation window elapses, and `Ended` keeps any peers that
+never confirmed. The phase is local: it never enters a commitment or receipt.
+
+While `Ending`, the actor sends its terminal evidence, the final step
+certificate or the stop occurrence it adopted, to each unconfirmed peer. One
+persisted transition confirms a peer when it acknowledges that frame, because a
+receiver acknowledges only after durably applying it, or when the peer's own
+terminal evidence arrives and reaches the same conclusion: the same completed
+outcome, or a stop at the same agreed cursor. Every participant must reach the
+same conclusion, so a rejection or a conflicting conclusion never confirms a
+peer. The actor records an invariant error without payload, stops sending to
+that peer, and keeps serving the others. A receiver never rejects authentic
+terminal evidence: a final step certificate that verifies carries the
+receiver's own signature, so it is applied, deferred with `not yet`, or
+acknowledged as already applied.
+
+The actor retires at `Ended`. Startup resumes executions that are still
+`Ending`. An `Ended` execution with unconfirmed peers is dormant, not
+abandoned: an authenticated frame for it from one of those peers resumes the
+actor, which sends its terminal evidence again. A frame from a confirmed peer
+for a retired execution is acknowledged as stale. The daemon supervisor does
+not stop the actor because it observed the finished receipt.
 
 `ReceiptArtifact` distinguishes two guarantees:
 
@@ -673,10 +695,9 @@ therefore remain observable after their live driver is removed and after a
 daemon restart. A nonterminal execution that cannot be truthfully resumed is
 durably marked failed during startup. A prepared, uncommitted activation stays
 eligible for activation recovery. Public terminal status does not retire an
-execution by itself: after receipt publication the actor remains alive until
-every peer acknowledges its final frames and the actor records the durable
-`final frames delivered` fact. Startup resumes a finished execution only when
-that fact is missing. The daemon supervisor does not stop the actor merely
+execution by itself: after receipt publication the actor remains alive while
+the execution is `Ending` and retires at `Ended`. Startup resumes executions
+that are still `Ending`. The daemon supervisor does not stop the actor merely
 because it observed the finished receipt.
 
 The daemon serializes provisioning through a bounded queue and admits at most

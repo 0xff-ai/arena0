@@ -468,9 +468,9 @@ is updated in the same transaction as the transition; after restart, the actor
 reads due timers from execution state and supplies one typed `TimerFired` event.
 
 Publishing the receipt is the observer-visible completion boundary. The actor
-then remains alive until every peer acknowledges its final frames, records one
-durable `final frames delivered` fact, and retires. Startup resumes a finished
-execution only when that fact is missing; the daemon supervisor does not stop
+then remains alive while the execution's end phase is `Ending`, until every
+peer confirms the same conclusion, and retires at `Ended`. Startup resumes an
+execution that is still `Ending`; the daemon supervisor does not stop
 the actor merely because it observed the finished receipt.
 
 The event record is immutable evidence: execution identity, event position,
@@ -618,10 +618,11 @@ real actor and store boundaries:
   frame that is not yet applicable receives a retryable `not yet` response and
   is not stored. The producer does not process its own broadcast as
   `MessageReceived`.
-- local receipt publication emits the finished observation immediately, then
-  keeps the actor alive until every final frame is acknowledged and the durable
-  `final frames delivered` fact is recorded. The supervisor does not stop the
-  actor on publication alone.
+- local receipt publication emits the finished observation immediately. The
+  end phase is `Ending` until every peer confirms the same conclusion (by
+  acknowledging the terminal evidence or sending its own) or the
+  end-confirmation window elapses; the actor retires at `Ended`. The supervisor
+  does not stop the actor on publication alone.
 - a peer abort or failure occurrence at the agreed cursor is accepted after
   local signing unless that peer signed the staged proposal; a participant's
   own stop remains refused after it signs.
