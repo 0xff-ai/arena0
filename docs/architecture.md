@@ -136,9 +136,12 @@ An external observation becomes a shared fact only through an accepted public
 transition.
 
 The actor persists an accepted event, both state images, and emitted effects
-through one direct store operation. Protocol frame outbox rows are addressed
-per destination; a producer does not process its own broadcast, and delivery
-acknowledgement is separate from agreement.
+through one direct store operation. There are no inbox or outbox tables. Current
+protocol frames remain in the actor-owned execution state: the certificate for
+the last agreed step, a staged message and its signature, terminal evidence, or
+an abort occurrence. The actor resends those frames independently to each peer
+and tracks each peer's acknowledgement in memory; after a restart it reloads
+execution state and resends the current frames.
 
 arena0 does not prescribe real-world identity, reputation, value exchange, or
 asset custody. Those can use blockchains or other infrastructure. Agreement on

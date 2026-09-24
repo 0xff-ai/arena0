@@ -13,14 +13,15 @@ Wasm instance owned by the `ExecutionActor`.
 Shared state and local state remain different because they have different
 visibility and agreement rules. They are not different kinds of transition.
 Every session `Event` receives one `Context`, may read and mutate both states,
-and may emit any existing `Effect`. The Host hashes only the shared Wasm
-memory. Agreement is applied after dispatch when the shared result belongs to
-a session step; it is not encoded in separate guest entry points, context
-types, event types, effect types, deltas, or commit paths.
+and may emit `SessionEnd`, `SessionAbort`, `Fail`, `Broadcast`, or `SetTimer`.
+The Host hashes only the shared Wasm memory. Agreement is applied after dispatch
+when the shared result belongs to a session step; it is not encoded in separate
+guest entry points, context types, event types, effect types, deltas, or commit
+paths.
 
 The design reuses the existing session terms and types: `Event`, `Effect`,
 `ExecutionActor`, `ExecutionState`, `SharedProposal`, `TraceEntry`,
-`StepCommitment`, and the inbox, outbox, and timer tables. It does not add a
+`StepCommitment`, and the execution record's timer state. It does not add a
 second protocol vocabulary for the transient result of a dispatch.
 
 ## Scope boundary
@@ -34,51 +35,36 @@ place. This proposal adds no guest negotiation events or effects and does not
 move negotiation into the program. A later proposal may reconsider that
 boundary without blocking removal of the dual session path.
 
-The participant set, `writer` projection, N-of-N step agreement, durable
-inbox, durable outbox, timer table, and terminal proof remain. Remote transport
-and participant discovery are also outside this change.
+The participant set, `writer` projection, N-of-N step agreement, timer state,
+and terminal proof remain. Remote transport and participant discovery are also
+outside this change.
 
 ## Current path to remove
 
-The implementation starts with a flat guest `Event` and `Effect`, then splits
-both before invoking Wasm:
-
-```text
-CURRENT
-
-Event
-  ├── PublicEvent  -> SharedCall -> arena0_shared -> SharedDelta
-  │                                             -> ProposeShared
-  └── PrivateEvent -> LocalCall  -> arena0_local  -> PrivateDelta
-                                                -> Private
-
-ExecutionInput -> pure reducer -> CommitPlan
-                              -> TimerMutation
-                              -> DurableEffect[]
-```
-
-The split appears in each layer:
+Before the change, the runtime split one session event into separate public and
+private guest calls, then reconstructed a transition plan outside the actor.
+The split appeared in each layer:
 
 | Layer | Current split |
 |---|---|
-| SDK | `SharedContext` versus `Context`; shared callbacks cannot access local state, identity, randomness, or effects |
-| Protocol | `PublicEvent` versus `PrivateEvent`; `PublicEffect` versus `PrivateEffect`; `SharedDelta` versus `PrivateDelta` |
-| ABI | `arena0_shared` versus `arena0_local`; `SharedInput`/`SharedOutput` versus `LocalInput`/`LocalOutput` |
-| Sandbox | `SharedCall`/`SharedCallResult` and `LocalCall`/`LocalCallResult`; `apply_shared` and `apply_local` |
+| SDK | separate shared and local contexts; shared callbacks cannot access local state, identity, randomness, or effects |
+| Protocol | separate public and private events, effects, deltas, and commit branches |
+| ABI | separate shared and local state calls and result records |
+| Sandbox | separate shared and local dispatch paths |
 | Actor | session start and messages use the shared path; input, timers, signatures, and reactions use the local path |
 | Store | public and private commits, cursors, records, and reducer branches |
 
 This split forces a program such as chess to validate a callout response in
-`on_input`, emit `Effect::Broadcast`, wait for the Host to deliver that
-broadcast back to itself, and mutate shared state only in `on_message`. The
-causal operation is spread across two Wasm calls, an outbox row, a self-send,
-and two protocol record types.
+`on_input`, emit a broadcast, wait for the Host to deliver that broadcast back
+to itself, and mutate shared state only in `on_message`. The causal operation
+is spread across two Wasm calls, a self-send, and two protocol record types.
 
 That detour is an architectural restriction, not a property required by
 shared-state agreement. A callout response can update shared state, update
-local state, emit a message, arm a timer, and request another callout in one
-program dispatch. Other participants can apply the message and check that
-their shared memory reaches the advertised hash.
+local state, emit a message, and arm a timer in one program dispatch. The
+read-only `callout` function then derives the next question from the resulting
+state. Other participants can apply the message and check that their shared
+memory reaches the advertised hash.
 
 ## One session event path
 
@@ -89,51 +75,43 @@ Event
   -> ExecutionActor
   -> arena0_dispatch
        Context { shared, local, participant, session, entropy, effects }
-  -> shared memory + local memory + Effect[]
+  -> shared memory + local memory + Effect[] + derived callout
   -> validate shared hash and agreement requirements
   -> atomic store boundary
-  -> durable delivery
+  -> current-frame delivery
 ```
 
 `ExecutionActor` remains the serial owner of one participant's execution. All
-session event sources enqueue the existing `Event` type:
+session event sources use the same `Event` type:
 
-- committed activation enqueues `SessionStarted`;
-- an accepted broadcast frame enqueues `MessageReceived`;
-- a callout answer enqueues `InputReceived`;
-- a timer enqueues `TimerFired` or `TypedTimerFired`;
-- a completed signing request enqueues `Signed`;
-- normal program progress enqueues `React`.
+- committed activation supplies `SessionStarted`;
+- an accepted broadcast frame supplies `MessageReceived`;
+- a callout answer supplies `InputReceived`;
+- a timer supplies one `TimerFired` event with a typed payload;
+- normal program progress supplies `React`.
 
 No source chooses a shared or local call. The actor gives every event to the
-same Wasm export with the same context and the same limits. A rejected event or
-guest failure restores both memories and emits no effect.
+same Wasm export with the same context and the same limits. An accepted
+dispatch derives at most one open callout from the resulting state. A rejected
+event or guest failure restores both memories and emits no effect.
 
 `React` remains an ordinary event. It is useful when a committed step makes a
 participant eligible to act without an external input. The change is that a
 reaction may now mutate shared state directly and emit a broadcast in the same
-dispatch.
+dispatch. It runs once per agreed step even when a callout is open; a callout
+is not a lock. The read-only `callout` function computes at most one callout
+from the accepted post-dispatch state. An unchanged index and context retain
+the same `PendingId`, a changed callout gets a new one, and no callout
+withdraws it. Terminal state always has no open callout.
 
 ### SDK surface
 
-The program keeps its existing `Shared`, `Local`, `Phase`, `Message`, `Input`,
-`Callout`, `Params`, and `Outcome` associated types. Transition callbacks all
-receive one context and can return the existing `Transition` values:
+The program keeps its `Shared`, `Local`, `Phase`, `Message`, `Input`, `Callout`,
+`Params`, and `Outcome` associated types. Every mutating callback receives one
+context over shared and local state. The input callback returns a plain error
+when the answer is invalid:
 
 ```rust
-// CURRENT
-fn on_message(
-    ctx: &mut SharedContext<Self::Shared>,
-    from: Participant,
-    message: Self::Message,
-) -> MessageApply<Self>;
-
-fn on_input(
-    ctx: &mut Context<Self::Shared, Self::Local>,
-    input: Self::Input,
-) -> Result<(), InputFault>;
-
-// PROPOSED
 fn on_message(
     ctx: &mut Context<Self::Shared, Self::Local>,
     from: Participant,
@@ -143,13 +121,23 @@ fn on_message(
 fn on_input(
     ctx: &mut Context<Self::Shared, Self::Local>,
     input: Self::Input,
-) -> Result<ProgramTransition<Self>, InputFault>;
+) -> anyhow::Result<ProgramTransition<Self>>;
+
+fn on_timer(
+    ctx: &mut Context<Self::Shared, Self::Local>,
+    timer: TimerPayload,
+) -> ProgramTransition<Self>;
+
+fn callout(
+    ctx: &Context<Self::Shared, Self::Local>,
+) -> Option<Self::Callout>;
 ```
 
-The same change applies to `on_session_started`, `on_react`, `on_timer`, the
-typed timer route, and the signing continuation. `Context` exposes mutable
-access to shared and local state together with the existing participant,
-session, entropy, and effect APIs. Its state access is explicit:
+`on_timer` is the one timer callback; the timer payload is the unit value for an
+untyped timer. `callout` is read-only and runs after an accepted dispatch.
+`Context` exposes mutable access to shared and local state together with the
+existing participant, session, entropy, and effect APIs. Its state access is
+explicit:
 
 ```rust
 fn shared(&self) -> &Shared;
@@ -160,11 +148,17 @@ fn state_mut(&mut self) -> (&mut Shared, &mut Local);
 ```
 
 Every successful event callback can return `Transition::Stay`,
-`Transition::To`, `Transition::End`, or `Transition::Abort`. Typed input faults
-remain available for retry behavior, and `MessageApply` retains message
-accept/reject behavior. This makes lifecycle effects available from every
-event without adding lifecycle methods to the effect handle. `SharedContext`
-is removed.
+`Transition::To`, `Transition::End`, or `Transition::Abort`. An `on_input`
+error rejects the answer, restores both state memories, and leaves the current
+callout open; it is not a retry effect and does not end the session.
+`MessageApply` retains message accept/reject behavior. Lifecycle effects remain
+available from every event without adding lifecycle methods to the effect
+handle. Guest signing is a synchronous `ctx.sign(scheme, payload)` call that
+is available only in `InputReceived`, `TimerFired`, and `React` handlers. It
+builds a versioned, execution-bound `GuestSignData` value and returns the exact
+signed bytes and signature. The supported schemes are deterministic, so a
+crash rerun produces the same signature. Signing is unavailable to
+`SessionStarted`, `MessageReceived`, and read-only projections.
 
 The macro still provides typed callback routing. It decodes the flat `Event`,
 decodes the program-owned message or input bytes for the selected callback,
@@ -172,12 +166,17 @@ and encodes the resulting states and effects. Program authors do not need to
 manually decode an enum of opaque byte payloads. The generated router has one
 mutating ABI export: `arena0_dispatch`.
 
+Handlers complete synchronously within that dispatch. The guest ABI does not
+lower asynchronous functions into resumable session work.
+
 `initialize`, `writer`, `query`, `view`, and `outcome` remain projections or
 pre-session operations rather than session event paths. Initialization receives
 `&mut Shared` directly. Read-only projections receive `&Shared` and their
 existing explicit arguments; they run against memory snapshots and cannot emit
-effects. This removes the remaining `SharedContext` consumers without using
-those operations to recreate a second mutating path.
+effects. The `callout` function is a read-only function over both resulting
+shared and local memories. The runtime invokes it after an accepted dispatch
+and before storing that result; it may derive at most one open callout and
+cannot emit effects or mutate either memory.
 
 ### Program structure
 
@@ -187,7 +186,7 @@ The receiver applies that message in `on_message`. Both callbacks can call the
 same program helper:
 
 ```rust
-fn on_input(ctx: &mut Context, input: Input) -> Result<Transition<Phase>, InputFault> {
+fn on_input(ctx: &mut Context, input: Input) -> anyhow::Result<Transition<Phase>> {
     let message = Message::from(input);
     apply_message(ctx, ctx.me(), &message)?;
     ctx.effects().broadcast(&message);
@@ -207,6 +206,16 @@ fn on_message(
 The originating participant does not receive its own broadcast as a second
 program event. Its state change already happened in the event that emitted the
 broadcast.
+
+The runtime invokes `callout` after the handler accepts the transition. It
+serializes the returned callout as bounded JSON context and validates that
+context against the program's input schema. An answer must name the exact open
+`PendingId`; a mismatch returns `CalloutNotPending`. If decoding, `on_input`,
+the input handler, or its resource limits reject the answer, the runtime
+restores both memories, persists nothing, keeps the same ID open, and returns
+`InputRejected` with the bounded reason. While an answered result is staged for
+agreement, the callout remains open and a resubmission returns
+`AgreementPending`.
 
 ## Wasm instance and memory
 
@@ -306,9 +315,10 @@ and host-call counters also reset for every dispatch. Only `arena0_shared` and
 `arena0_local` survive from one event to the next.
 
 On recovery, the actor instantiates the exact program, restores the persisted
-shared and local memories, restores any existing `SharedProposal`, and resumes
-the durable inbox and outbox. Recovery restores those durable images directly;
-it does not rerun earlier events to reconstruct live state.
+shared and local memories, restores any existing `SharedProposal`, timers,
+terminal evidence, and current protocol frames, and resends those frames.
+Recovery restores those durable images directly; it does not rerun earlier
+events to reconstruct live state.
 
 The sandbox initialization result stores the bounded shared-state payload.
 Negotiation reconstructs the fixed canonical `arena0_shared` image—length
@@ -351,24 +361,22 @@ not enter the portable receipt.
 
 The existing `SharedProposal` remains the durable state awaiting step
 signatures. It is extended to hold the post-dispatch shared memory, this
-participant's post-dispatch local memory, and this participant's effects. When
-the N-of-N aggregate arrives, one transaction promotes both memories and
-releases the effects that were not needed to collect signatures. If agreement
-does not complete, the remaining effects are not delivered; the proposal is
-retained or the execution enters the existing safe stop flow.
+participant's post-dispatch local memory, this participant's effects, and the
+derived open callout. When the N-of-N aggregate arrives, one transaction
+promotes both memories and installs that callout with them. A deferred broadcast
+successor carries the same derived callout until it is certified. If agreement
+does not complete, the proposal remains the current execution state or the
+execution enters the authenticated stop flow.
 
 The proposal is prepared before this Host publishes its signature. Once the
-store contains a `SharedProposal`, the actor restores the resident Wasm
-memories to their last committed images, projections continue to read those
-committed images, and later session events remain queued. Signature, aggregate,
-and stop frames may still progress. When the proposal commits, the actor loads
-its stored post-dispatch memories. A timeout does not authorize a different
-proposal at the same position. Before this Host signs, an authenticated stop
-may clear the proposal and cancels only the outbox frames derived from that
-proposal. Cancellation is a distinct durable disposition, not a delivery
-acknowledgement. After this Host signs, the proposal is irrevocable: a peer may
-already be able to assemble N-of-N agreement, so the execution retains the
-proposal and rejects a competing stop at that cursor.
+store contains a `SharedProposal`, projections continue to read the last
+committed images until certification. A participant signs only after the
+proposal is durable. A timeout does not authorize a different proposal at the
+same position. Before this Host signs, an authenticated stop may clear the
+proposal. After this Host signs, the proposal is irrevocable: a peer may
+already be able to assemble N-of-N agreement, so the execution refuses its own
+stop at that cursor. It still accepts an authenticated peer abort or failure at
+the cursor unless that peer's signature is already in the staged proposal.
 
 ### Agreement postconditions
 
@@ -410,105 +418,73 @@ context a handler receives or which effect variants it may emit:
    its local memory and other effects immediately.
 9. Effects emitted while a step awaits signatures remain with the
    `SharedProposal`. The broadcast needed to obtain signatures for that same
-   proposal is the only program effect delivered before commitment. A
-   broadcast staged by an already-applied step is delivered only after that
-   step commits.
+   proposal is the current staged message. A broadcast staged by an already-
+   applied step is delivered only after that step commits.
 
-Every event may still mutate either state and emit any existing `Effect`.
+Every event may still mutate either state and emit the five defined effects.
 These rules reject results that cannot be assigned an unambiguous agreement
 boundary. They do not restore event-specific context types or separate Wasm
 entry points.
 
 ## Persistence without the reducer pipeline
 
-The actor already serializes event handling and owns the live execution
-capability. It can validate and persist the result directly instead of
-constructing `ExecutionInput`, calling a pure reducer, and interpreting a
-`CommitPlan`.
+The actor serializes event handling, owns the live execution capability, and
+is the only writer of that execution's data. It validates a dispatch and hands
+the complete transition record to the store instead of constructing a second
+reducer plan.
 
-For an event that does not require signatures, one SQLite transaction:
+For a transition that does not stage a shared proposal, one SQLite transaction:
 
-1. compares the expected execution version;
+1. checks the expected execution version as a corruption tripwire;
 2. writes the shared and local memory images;
-3. writes the accepted event and emitted `Effect` values;
-4. arms or consumes timer rows;
-5. writes outbox rows for effects that require delivery;
-6. marks the durable inbox item applied;
-7. advances `ExecutionState`.
+3. writes the accepted event, emitted effects, timer changes, and callout;
+4. advances `ExecutionState` and any terminal proof facts.
 
-For an agreed step, the same store boundary first writes `SharedProposal` and
-the broadcast frame needed to collect signatures. A later signature update
-either retains the proposal or atomically commits both memories and releases
-its effects after N-of-N agreement.
+For an agreed step, the same store boundary writes the `SharedProposal`, its
+post-dispatch memories, effects, derived callout, and current protocol frames.
+When N-of-N agreement is certified, one transaction promotes the proposal and
+installs its callout with the committed memories. A participant signs only
+after the proposal is durable.
 
-The proposal transaction also owns the initiating inbox row, any consumed
-timer or pending callout/signing continuation, the event position, both
-post-dispatch memory images, any replacement pending continuation, the exact
-`StepCommitment`, and the protocol outbox rows. Recovery can therefore tell
-that the initiating event has already run even though its memories are not yet
-committed. The store also retains whether `React` has run after an agreed step,
-so removing the private cursor cannot cause a reaction to run twice.
+There are no inbox or outbox tables, leases, store owner thread, command queue,
+write-through working set, or compare-and-set retry loop. The version check
+detects a corrupted or unexpectedly changed record; it does not coordinate
+competing execution writers. The actor remains the sole authority for applying
+the protocol transition.
 
-While a proposal is staged, outbox leasing exposes only protocol frames needed
-to finish its agreement. Local program effects remain durable but unavailable
-for delivery until the proposal clears. Likewise, the pending-request
-projection hides a committed continuation when the staged proposal consumes or
-replaces it; a replacement request is not visible until its producing proposal
-commits. An unchanged callout may remain pending behind an unrelated proposal.
-The actor reports that agreement wait as an expected typed result. The daemon
-may retain and retry only that same submission while the serialized actor
-continues processing inbound signatures, rather than treating every temporary
-dependency failure as permission to replay agent input.
+While a proposal is staged, projections read the last committed memories and
+the proposal retains its complete post-dispatch record. Current frames are
+resent independently to each peer. A receiver acknowledges a frame after its
+committed apply or a duplicate/stale decision; a frame that is not yet
+applicable receives a retryable `not yet` response and is not stored. An
+answered callout remains open while its result awaits agreement, so a
+resubmission returns `AgreementPending` rather than dispatching the answer a
+second time.
 
-The durable inbox, outbox, timer rows, leases, compare-and-set version, and
-single SQLite transaction remain. They provide crash recovery and exactly-once
-state advancement. They do not require a second semantic effect enum.
+Program effects are part of the transition record. A broadcast staged by an
+already-applied step becomes current only after that step commits, and the
+producer does not apply its own broadcast as a second guest event. Timer state
+is updated in the same transaction as the transition; after restart, the actor
+reads due timers from execution state and supplies one typed `TimerFired` event.
 
-Program effects are stored as `Effect` with their event position and effect
-index. Destination and lease columns remain store metadata. Protocol frames
-such as step signatures remain protocol frames in the transport outbox; they
-are stored as one durable row per destination, and the producer is excluded
-from its own broadcast deliveries. They are not guest effects. This removes
-`TimerMutation` and `DurableEffect` from the program transition pipeline while
-preserving durable delivery.
+Publishing the receipt is the observer-visible completion boundary. The actor
+then remains alive until every peer acknowledges its final frames, records one
+durable `final frames delivered` fact, and retires. Startup resumes a finished
+execution only when that fact is missing; the daemon supervisor does not stop
+the actor merely because it observed the finished receipt.
 
-`RetryInput` reissues the one callout that is already pending; it does not name
-or create a second continuation. When an answer consumes that continuation,
-the same transaction acknowledges the originating `Callout` and cancels every
-undelivered `RetryInput` row that referred to it. Entering any terminal status
-likewise cancels obsolete `Callout`, `Sign`, and `RetryInput` rows without
-deleting their history or claiming that delivery occurred.
-
-Publishing a receipt is not yet the observer-visible completion boundary. The
-actor first settles every pending or leased protocol-frame outbox row for that
-execution, including its final `End`, `Abort`, or signature frame. Only then
-does it emit `ReceiptPublished` and the terminal session message. This ordering
-prevents the supervisor from shutting down the sole delivery owner while a
-peer still lacks the terminal evidence.
-
-A Host-local fatal failure uses the same actor loop while terminal delivery is
-outstanding. The actor continues accepting inbound peer frames, retrying its
-durable outbox, and advancing terminal proof; it does not enter a private
-blocking delivery loop. A transport setup failure is therefore retried from
-the durable row, and a peer can acknowledge or contribute terminal evidence
-while this Host's own final frame is still awaiting acknowledgement.
-
-The event row is immutable evidence: execution identity, event position,
-event, effects, and digest are written once. Proposal signatures, agreed steps,
-terminal evidence, pending continuations, and outbox delivery disposition each
-remain in their existing authoritative records rather than being mirrored as a
-mutable event status or version.
+The event record is immutable evidence: execution identity, event position,
+event, effects, derived callout, and digest are written once. Proposal
+signatures, agreed steps, terminal evidence, and final-frame acknowledgement
+remain in their authoritative execution-state records rather than being
+mirrored as a mutable event status.
 
 After a confirmed transaction rollback, the actor restores both pre-dispatch
 memories. If the store response is interrupted and the outcome is unknown, the
-actor does not assume rollback: it reloads the authoritative execution version,
-committed memory images, and any `SharedProposal`, then restores the resident
-instance from that durable state. Proposed memories become live only after the
-store confirms the committed version. If a committed process stops before
-delivery, the outbox and timer tables resume the work after restart.
-
-An operational failure while terminal signatures are still incomplete cannot
-replace that proof with an abort at the same cursor. A focused store operation
+actor reloads the authoritative execution record, committed memory images, and
+any `SharedProposal`, then restores the resident instance from that durable
+state. Proposed memories become live only after the store confirms the committed
+transition. An operational failure while terminal signatures are incomplete
 preserves the partial terminal proof as `Incomplete` and cancels active timers
 in the same transaction.
 
@@ -536,7 +512,7 @@ records remain available only to that Host's diagnostics.
 
 Changing `TraceEntry` changes its entry hash and the bytes covered by
 `StepCommitment`. The implementation therefore uses explicit version boundaries:
-ABI 21, execution profile 2, `TraceEntry` format 2, the v3 step-commitment
+ABI 22, execution profile 3, `TraceEntry` format 2, the v3 step-commitment
 domain, receipt artifact/body 3, and the v3 receipt-identity domain. Wire,
 trace, receipt, and proof decoders reject unsupported versions; old and new
 signatures must never verify under the same version.
@@ -547,23 +523,21 @@ The target keeps one value for each session concept.
 
 | Remove | Keep or revise |
 |---|---|
-| `SharedContext` | `Context` with mutable shared and local state |
-| `PublicEvent`, `PrivateEvent` | `Event` |
-| `PublicEffect`, `PrivateEffect` | `Effect` |
-| `SharedCall`, `LocalCall` | one sandbox dispatch call |
-| `SharedCallResult`, `LocalCallResult` | one accepted/rejected dispatch result |
-| `apply_shared`, `apply_local` | `arena0_dispatch` through the actor-owned instance |
+| Separate shared and local contexts | `Context` with mutable shared and local state |
+| Separate public and private events | one `Event` |
+| Separate public and private effects | one `Effect` vocabulary |
+| Separate shared and local calls | one sandbox dispatch call |
+| Separate dispatch results | one accepted/rejected dispatch result |
+| Separate dispatch functions | `arena0_dispatch` through the actor-owned instance |
 | shared/local function exports | shared/local memory exports |
-| `SharedDelta`, `PrivateDelta`, `PrivateCause`, `PrivateContext` | direct validation of the dispatch result |
-| `ExecutionInput` | actor methods for activation, event dispatch, signatures, and stop |
-| `CommitPlan` | one transactional store operation per actor action |
-| `TimerMutation` | direct timer-table updates from `Effect::SetTimer` |
-| `DurableEffect` | persisted `Effect` rows plus protocol-frame outbox rows |
-| `PrivateCommit`, `PrivateRecord` | local event/effect rows owned by the Host store |
+| Separate state deltas and private commit records | direct validation of the dispatch result |
+| Pure reducer input and commit plan | one transactional store operation per actor action |
+| Timer mutation plan | direct timer-state updates from `SetTimer` |
+| Durable delivery-effect records | current protocol frames held in execution state |
 | public/private cursors and commit tables | one event position plus the existing agreed-step position |
 
 `ExecutionState`, `SharedProposal`, `TraceEntry`, `StepCommitment`, step and
-terminal signatures, pending continuations, timers, inbox rows, and outbox rows
+terminal signatures, the open callout, timers, and current protocol frames
 remain because they own distinct runtime or proof responsibilities.
 
 ## Migration order
@@ -578,12 +552,12 @@ remain because they own distinct runtime or proof responsibilities.
 4. Extend broadcast frames, `SharedProposal`, `StepCommitment`, and
    `TraceEntry` for advertised post-state hashes and participant-specific local
    results.
-5. Replace reducer plans with focused transactional store methods while
-   retaining the durable inbox, outbox, timers, leases, and version checks.
-6. Migrate stored executions at the ABI boundary or reject pre-change active
-   executions explicitly. Do not attempt to resume one execution across both
-   state models.
-7. Delete the split types, exports, reducer branches, database tables, and
+5. Replace reducer plans with one complete transactional store record per actor
+   transition while retaining timers, terminal proof, and execution-state
+   protocol frames.
+6. Rewrite the stored execution, ABI, and profile formats in place. There is no
+   compatibility path or migration between the two state models.
+7. Delete the split types, exports, reducer branches, delivery tables, and
    self-apply broadcast path after all callers use the single path.
 8. Keep `docs/protocol-architecture.md`, `docs/technical-overview.md`, SDK
    documentation, receipt documentation, actor lifecycle notes, and independent
@@ -595,14 +569,18 @@ remain because they own distinct runtime or proof responsibilities.
 The refactor is complete when the following behavior is covered through the
 real actor and store boundaries:
 
-- `InputReceived` mutates shared and local state, emits `Broadcast` and
-  `Callout`, reaches N-of-N agreement, commits both memories, and delivers the
-  callout under one stable pending ID. Delivery may retry until acknowledged,
-  but only one continuation result is accepted.
-- `MessageReceived` mutates both states and emits any existing effect without
+- `InputReceived` mutates shared and local state, emits `Broadcast` when the
+  program needs to inform peers, reaches N-of-N agreement, and derives its
+  callout from the resulting state. An unchanged callout keeps one stable
+  `PendingId`; a changed callout gets a new ID.
+- `MessageReceived` mutates both states and emits any defined effect without
   entering a separate local call.
-- timer, signature, and reaction events use the same dispatch and can produce
-  the same state and effect combinations.
+- the one typed `TimerFired` event and `React` use the same dispatch and can
+  produce the same state and effect combinations; `React` continues while a
+  callout is open and runs once per agreed step.
+- synchronous guest signing succeeds only in `InputReceived`, `TimerFired`,
+  and `React` handlers, returns the exact signed bytes and signature, and is
+  unavailable in `SessionStarted`, `MessageReceived`, and projections.
 - a receiver that computes a different shared post-state hash withholds its
   signature and does not commit either memory or deliver effects.
 - an event that is not already applying an agreed step and changes shared
@@ -617,31 +595,37 @@ real actor and store boundaries:
   memory unchanged.
 - a broadcast emitted by `MessageReceived` begins only after the current step
   commits and cannot smuggle another shared-state change into that step.
+- a rejected answer—decode error, plain `on_input` error, guest trap, or input
+  handler resource limit—returns `InputRejected`, persists nothing, restores
+  both memories, keeps the same open `PendingId`, and allows a later valid
+  answer to commit without ending the session.
+- an answer with the wrong `PendingId` returns `CalloutNotPending`; a
+  resubmission while the answered result is staged returns `AgreementPending`.
+  A later accepted dispatch can replace the open callout without ending the
+  session.
+- an authenticated writer-message rejection, trap, or post-state mismatch is
+  divergence: the detecting participant records a Host-signed `Fail` occurrence
+  and peers receive it as `Abort`. Wrong-writer, stale, pre-state, or message
+  identity mismatches are dropped instead.
 - rejected events, guest traps, fuel exhaustion, and failed store commits
-  restore both memories.
-- an unrecoverable guest input fault restores both memories and enters the same
-  durable authenticated failure path as an unrecoverable fault from any other
-  event; returning the command error to its caller does not suppress failure
-  ownership in the actor.
-- an interrupted store response reloads the durable version and memory images
-  before another event runs.
-- while `SharedProposal` exists, later session events remain queued and
-  projections read the last committed memories.
-- restart from each durable boundary restores the two memories, pending
-  continuations, `SharedProposal`, timers, inbox, and outbox without rerunning
-  earlier events.
-- consuming or replacing a callout also retires every undelivered `RetryInput`
-  for that callout, so delayed delivery cannot target a later continuation.
-- local receipt publication does not emit terminal observer messages until the
-  final protocol-frame outbox rows have been durably acknowledged or cancelled.
-- a Host-local fatal failure retries a failed terminal transport setup through
-  the durable outbox while the normal actor loop continues accepting peer
-  terminal frames, including when the peer withholds this Host's acknowledgement
-  until its own reverse-direction frame is accepted.
-- a producer does not process its own broadcast as `MessageReceived`.
-- stopping an unsigned proposal cancels its exact undelivered protocol frames,
-  while late acknowledgement or retry is idempotent; a proposal carrying this
-  Host's signature cannot be stopped.
-- no active code path constructs `PublicEvent`, `PrivateEvent`, `PublicEffect`,
-  `PrivateEffect`, `SharedCall`, `LocalCall`, `ExecutionInput`, `CommitPlan`,
-  `TimerMutation`, or `DurableEffect`.
+  restore both memories; an interrupted store response reloads the durable
+  execution record before another event runs.
+- `SharedProposal` stores its complete post-dispatch record and derived
+  callout; projections read the last committed memories until certification.
+- restart restores the two memories, `SharedProposal`, timers, open callout,
+  terminal evidence, and current protocol frames without rerunning earlier
+  events. The actor resends those frames independently to each peer.
+- a receiver acknowledges a committed apply or duplicate/stale decision. A
+  frame that is not yet applicable receives a retryable `not yet` response and
+  is not stored. The producer does not process its own broadcast as
+  `MessageReceived`.
+- local receipt publication emits the finished observation immediately, then
+  keeps the actor alive until every final frame is acknowledged and the durable
+  `final frames delivered` fact is recorded. The supervisor does not stop the
+  actor on publication alone.
+- a peer abort or failure occurrence at the agreed cursor is accepted after
+  local signing unless that peer signed the staged proposal; a participant's
+  own stop remains refused after it signs.
+- the actor is the only execution-data writer and persists one complete record
+  per transition; no store owner thread, working-set cache, command queue,
+  inbox, outbox, or delivery lease is needed.

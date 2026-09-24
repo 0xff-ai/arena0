@@ -51,12 +51,23 @@ Shared state contains what all participants certify. Local state can hold a
 private strategy or unrevealed value. Keep secrets out of public messages,
 views, and outcomes until the interaction requires disclosure.
 
-A callout asks an agent or human for input. The answer enters the program as an
-`InputReceived` event. Validate it against the current state, then update local
-or shared state and emit any required effects in that same dispatch. If the
-result changes shared state for the other participants, emit a program message
-that they apply as `MessageReceived`; the receiver validates the message
-against its own state before signing the advertised shared result.
+A callout is derived from program state. Define one read-only `callout` function
+that returns at most one callout for the current state; after every accepted
+dispatch, the runtime stores that result with the state image. The same callout
+index and context keep the same `PendingId`, a different callout replaces it
+with a new ID, and `None` withdraws it. A terminal state has no open callout,
+and an open callout does not prevent other events from dispatching.
+
+An answer names the exact open `PendingId` and enters the program as an
+`InputReceived` event. The Host validates the answer against the callout's
+output schema, then the guest decodes it fallibly. `on_input` returns a plain
+`anyhow::Result<ProgramTransition<Self>>`; an error rejects the answer without
+persisting state, keeps the same callout open, and returns the bounded reason as
+`InputRejected`. A valid handler can update local or shared state and emit the
+effects for that dispatch. If the result changes shared state for the other
+participants, emit a program message that they apply as `MessageReceived`; the
+receiver validates the message against its own state before signing the
+advertised shared result.
 
 ## Handler lifecycle
 
@@ -66,10 +77,11 @@ The minimal program demonstrates the full path:
 | --- | --- |
 | `writer` | Select who may author the next shared action. |
 | `on_session_started` | Initialize the active session through the same dispatch context. |
-| `on_react` | Handle a `React` event and request input or perform program work. |
-| `on_input` | Validate the answer, mutate either state, and emit any effects. |
+| `on_react` | Handle a `React` event and perform program work; any resulting callout is derived from state. |
+| `on_input` | Validate the answer, mutate either state, and emit any effects; return an error to reject it. |
 | `on_message` | Accept or reject the message and mutate either state. |
-| `on_timer` | Handle a timer event using the same context and effect rules. |
+| `on_timer` | Handle one typed `TimerFired` event using the same context and effect rules. |
+| `callout` | Derive the current open callout from a read-only state image. |
 | `outcome` | Derive the terminal result from shared state. |
 | `view` | Render the current program state without changing it. |
 
@@ -77,6 +89,12 @@ When both choices have been accepted, the callback returns a terminal
 transition. `SessionStarted` and `MessageReceived` provide the portable public
 agreement path; the protocol certifies the shared execution and terminal
 evidence. The program defines the outcome; it does not assemble its own receipt.
+
+Guest signing is synchronous. In `InputReceived`, `TimerFired`, and `React`
+handlers, `ctx.sign(scheme, payload)` returns a `Signed` value containing the
+exact signed bytes and signature. The call is unavailable during
+`SessionStarted`, `MessageReceived`, and read-only projections. Declaring the
+`Sign` capability is still required before a handler can use it.
 
 ## Interfaces and encoding
 
@@ -91,10 +109,13 @@ projection, not an alternate execution format or part of the signed commitment.
 
 ## Effects and capabilities
 
-Request interaction through explicit effects and declared capabilities. Any
-event callback may emit those effects, and the runtime performs permitted
-effects after accepting the corresponding execution work. Programs have no
-ambient access to the network, filesystem, credentials, or clock.
+Request runtime work through the explicit `SessionEnd`, `SessionAbort`, `Fail`,
+`Broadcast`, and `SetTimer` effects. Any event callback may emit those effects,
+and the runtime performs permitted effects after accepting the corresponding
+execution work. Programs have no ambient access to the network, filesystem,
+credentials, or clock. Callouts are state projections and signing is a
+synchronous host call; neither is an effect. `SetTimer` carries a typed
+`TimerPayload`; an untyped timer uses the unit payload.
 
 An agent may use external tools or model inference to answer a callout. The
 program must decide which answers are valid and how accepted observations enter

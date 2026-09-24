@@ -308,22 +308,15 @@ durable commit. The ordering is part of the protocol, not a property of the
 local supervisor.
 
 The execution record is the durable authority for the local `ExecLifecycle`,
-queue position, session binding, pending continuation, and terminal projection.
-Activation facts remain owned by the permanent activation record. The
-execution aggregate materializes its public cursor, and store reconciliation
-validates every persisted aggregate and checks that cursor against the durable
-trace before the store owner becomes available. While that exclusive owner is
-alive, it carries the validated execution aggregates as a write-through
-working set with a fixed 64 MiB encoded-state budget. Least-recently-used
-entries leave memory when the budget fills. A miss loads and fully validates
-the SQLite row and its projections. A proposed execution replaces its entry only
-after the SQLite transaction commits, and rollback discards the proposal. Restart
-reconstructs entries from SQLite, so the working set is never an independent
-durability authority. `ExecutionHandle`
-retains only the durable `ExecId` and process-local command, notification, and
-negotiation capabilities for work that is currently live. Every observable
-execution fact is loaded from this store-owned durable projection or written
-through to SQLite.
+public cursor, session binding, open callout, staged proposal, and terminal
+projection. Activation facts remain owned by the permanent activation record.
+The execution actor is the only writer of an execution's data: it owns the
+committed state, applies protocol transitions, and hands complete records to
+the store. The store validates the expected version as a corruption tripwire
+and persists the record in one SQLite transaction per transition. It does not
+own a working set, a write-through cache, a command queue, or a compare-and-set
+retry loop. If persistence fails, the actor restores its resident state from
+the last committed record before it attempts another transition.
 
 Startup recovery pages the durable request order using request roots and
 fixed-size row metadata only. It never embeds an activation or execution
@@ -335,26 +328,20 @@ activation or execution cannot be reconstructed is failed through the same
 durable request or authenticated execution boundary before recovery continues.
 
 Before recording the execution request, `arena0-node::Host` claims one
-exclusive `ExecutionStore` writer. Its state-changing methods require `&mut
-self`, so the type checker carries that ownership through request persistence
-and negotiation into one private `ExecutionActor` after the activation commit.
-The actor is the only live owner of the loaded guest, execution signer, and
-transport capabilities for that `ExecId`. API handlers and supervisors send
-commands to the actor or read durable projections; they do not hold a second
-mutable execution object. The Host rejects a second live claim, and dropping
-the claim permits a recovery actor to resume the same execution.
+exclusive writer for the execution. That ownership continues through
+negotiation and activation into one private `ExecutionActor`. The actor owns
+the loaded guest, execution signer, transport capabilities, and committed
+execution state for that `ExecId`. API handlers and supervisors do not hold a
+second mutable execution object. The Host rejects a second live claim, and
+dropping the claim permits a recovery actor to resume the same execution.
 
-`arena0-store::Store` opens one SQLite database and one blocking owner thread
-for each Host. A process lock prevents two owners from writing the same file.
-The asynchronous `StoreHandle` uses bounded item and byte budgets. The
-exclusive `ExecutionStore` scopes execution mutations to one `ExecId`; catalog,
-receipt, and recovery reads use the cloneable handle. SQLite transactions write
-the execution aggregate, accepted event and occurrence identities, shared and
-local state images, effects, terminal proof rows, inbox, outbox, active timers,
-and receipt artifacts as one authoritative store. The owner publishes a
-committed execution aggregate
-to its validated working set only after the corresponding transaction commits;
-failed transactions cannot change subsequent reads.
+`arena0-store::Store` opens one SQLite database for each Host. A process lock
+prevents two processes from writing the same file. The actor supplies complete
+transition records; SQLite persists the execution aggregate, accepted event and
+occurrence identities, shared and local state images, effects, terminal proof
+rows, active timers, and receipt artifacts in one authoritative transaction.
+The store does not receive individual effect commands or lease delivery work,
+and a failed transaction cannot change later reads.
 
 ## 9. Guest boundary
 
@@ -382,8 +369,8 @@ receipt params and outcomes, remain opaque bytes to the Host.
 Program import validates every required guest export before the artifact enters
 the Host's program catalog. The canonical list of names and signatures is
 `arena0_sandbox::validation::REQUIRED_FUNC_EXPORTS`, and the ABI is
-`ABI_VERSION = 21`.
-The execution profile is version 2 and binds the fixed shared/local memories,
+`ABI_VERSION = 22`.
+The execution profile is version 3 and binds the fixed shared/local memories,
 resident dispatch semantics, resource limits, and engine identity used by the
 Host. Activation carries its profile hash, so a Host rejects a different
 execution environment before the session starts.
@@ -432,10 +419,41 @@ execution path.
 After `SessionStarted`, each Host's `ExecutionActor` owns one resident
 `ProgramInstance`. Every session source supplies the same flat `Event` type to
 `arena0_dispatch`: activation supplies `SessionStarted`, an accepted protocol
-message supplies `MessageReceived`, and callout answers, timers, signatures,
-and reactions supply their corresponding event. The `Context` exposes the
-participant's shared and local state. Any event may mutate either or both and
-may emit any `Effect`.
+message supplies `MessageReceived`, an agent answer supplies `InputReceived`, a
+timer supplies `TimerFired` with its typed payload, and normal progress supplies
+`React`. The `Context` exposes the participant's shared and local state. Any
+event may mutate either or both and may emit `SessionEnd`, `SessionAbort`,
+`Fail`, `Broadcast`, or `SetTimer`.
+
+After an accepted dispatch, the program's read-only `callout` function derives
+at most one open callout from the resulting state image. The runtime stores that
+callout with the image in the committed execution record, or in the staged
+shared proposal until the proposal is certified. If the callout index and
+context are unchanged, the existing `PendingId` remains open; a different
+callout receives a new `PendingId`, and no callout withdraws the old one. A
+terminal status has no open callout. An open callout does not lock the actor:
+every event, including `React`, continues to dispatch, and `React` runs once
+per agreed step.
+
+Guest signing is a synchronous host call available only during local
+`InputReceived`, `TimerFired`, and `React` handlers. It is unavailable during
+`SessionStarted` and `MessageReceived` dispatches and during read-only
+projections. The call signs a versioned, execution-bound `GuestSignData`
+preimage containing the domain, version, session, program hash, execution ID,
+event position, per-dispatch call ordinal, scheme, and payload. Ed25519 uses
+the participant identity; BLS uses its execution key. A declared
+`Sign { schemes }` capability gates each scheme. The call returns the exact
+signed bytes together with the signature. The supported schemes are
+deterministic, so a crash rerun produces the same signature.
+
+An answer must name the exact open `PendingId`. A mismatch returns
+`CalloutNotPending`. While a staged proposal carries the answer, the answered
+callout remains open and a resubmission returns `AgreementPending`. The Host
+checks the answer against the callout's output schema before dispatch. If the
+guest cannot decode it, rejects it, traps, or hits an input-handler resource
+limit, the actor restores both memories, persists nothing, keeps the same open
+callout, and returns `InputRejected` with the bounded program reason. Bad agent
+input never ends the session.
 
 The actor validates the dispatch result against the event's agreement boundary,
 then passes the accepted event, shared and local state images, and effects to a
@@ -458,72 +476,87 @@ normalizes the aggregate out of its signed content; `StepCommitment` uses the
 v3 step-commit domain and binds that entry hash, both shared hashes, and the
 chain link.
 
-A guest dispatch returns its state images and effects atomically to the actor;
-these values cannot be queried later as mutable "last call" state. The actor
-uses direct store methods to persist the accepted event, both state images,
-effects, timers, inbox status, and any outbox rows in one SQLite transaction.
-A failed compare-and-set leaves the proposed result uncommitted, and the actor
-restores the resident instance from the last committed images.
+A guest dispatch returns its state images, effects, and derived callout
+atomically to the actor; these values cannot be queried later as mutable "last
+call" state. The actor hands the complete transition record to the store, which
+persists the accepted event, both state images, effects, timers, and callout in
+one SQLite transaction. A failed version check or transaction leaves the
+proposed result uncommitted, and the actor restores the resident instance from
+the last committed images.
 
-State disagreement, malformed frames, invalid aggregates, sandbox limit
-failures, or guest failures abort at the failing edge. End and abort use
+An authenticated writer message that the receiving program rejects, traps, or
+cannot reproduce at its advertised post-state is a divergence. The participant
+that detects it records a Host-signed `Fail` occurrence at the agreed cursor;
+its peers receive that occurrence as an `Abort` frame. Invalid frames—wrong
+writer, wrong pre-state, stale position, or mismatched message identity—are
+dropped rather than treated as divergence. End and abort use
 `Effect::SessionEnd`/`SessionAbort` in the guest and `ExecFrame::End`/`Abort` on
 the execution wire.
+
+A participant accepts an authenticated peer abort or failure occurrence at its
+agreed cursor even after it has signed a staged proposal, unless that peer's
+own signature is already in the proposal. It still refuses its own stop after
+signing, because a certificate for the staged step may already be possible.
 
 Only the complete canonical `arena0_shared` memory image enters the public
 state commitment. It contains the bounded length prefix, Borsh payload, and
 zero-filled remainder. The fixed `arena0_local` image persists for this Host
 but is never part of `StateHash`, a `StepCommitment`, or portable receipt bytes.
 
-### Durable delivery and continuation
+### Durable delivery
 
-The store accepts an authenticated inbound frame into the execution's inbox
-before the transport acknowledges responsibility. Inbox rows retain the frame,
-authenticated source, and digest. The actor later resolves a message, step
-signature, terminal signature, or abort through the same event/commit boundary.
-A frame is marked `applied` in the transaction that accepts its event, or
-`consumed` when the actor rejects it as stale or inapplicable. Restart scans
-accepted inbox rows before new network work.
+The execution actor owns the complete execution state and is the only writer.
+There are no inbox or outbox tables. Under N-of-N agreement, the actor stages
+step `s + 1` only after it has certified step `s`, so the most a peer can lack
+from this participant is the certificate for its last agreed step, its staged
+message and signature, its terminal signature or certificate, or its abort
+occurrence. Each item is already part of execution state.
 
-Protocol frames enter a durable outbox with one row per destination, frame, and
-causal position. A producer never receives its own broadcast row. The actor
-leases each destination row independently, acknowledges it only after that
-delivery boundary succeeds, and retries failures after a delay. The store
-reclaims expired leases when it opens and before it leases work, so a process
-crash cannot lose a frame or acknowledge one destination twice. Program effects
-are persisted with their dispatch and delivered through the corresponding
-durable effect boundary; delivery is not itself agreement.
+The actor sends those current frames to each peer independently and tracks
+acknowledgements in memory. A restart reloads execution state and resends the
+current frames. Signature frames carry the commitment, signer set, and
+aggregate certificate once it is available, so a participant never signs the
+same commitment again. A participant signs only after its proposal is durable.
+A receiver acknowledges a frame after applying it in its committed transition
+or deciding that it is a duplicate or stale frame. A frame that cannot yet be
+applied receives a retryable `not yet` response and is not stored. A message is
+applied once its proposal is durably staged. Each peer has its own bounded send
+lane and send deadline, so one unresponsive peer cannot stall the others.
 
-Timer mutations are committed with the execution version. The actor reads due
-timers from SQLite and applies each firing as a normal `Event` dispatch. A timer
-is not valid merely because an in-memory task remembers it.
+Timer mutations are committed with the execution transition. The actor reads
+due timers from the execution record and applies each firing as one
+`TimerFired` event carrying a typed `TimerPayload`; an in-memory task is never
+the timer's authority.
 
-Callout requests are pending continuations with a durable outbox context and
-`pending_id`. The actor emits the callout only after the outbox effect is
-durable. An agent answer enters the actor command queue and clears the matching
-continuation through one durable commit. If the actor restarts
-after delivering a callout, recovery reads the acknowledged outbox context and
-re-emits the same callout. Guest signing requests stay inside the actor; the
-actor uses the Host's custodied Ed25519 or execution BLS key and resumes the
-matching continuation without an agent-facing signing method.
+The open callout is stored with the committed state image or staged proposal.
+Its `PendingId` is derived from the execution and event position and is encoded
+as a little-endian `u64` in Borsh and a decimal JSON string. The runtime
+announces the current open callout from execution state. A callout answer names
+that exact ID; the actor keeps the callout open while its answered result awaits
+agreement and replaces it only when the resulting state derives a different
+index or context.
 
-`PendingId` names that continuation throughout protocol, store, actor, and API
-values. Its Borsh encoding is a little-endian `u64`; JSON encodes it as a decimal
-string. A `PendingRecord` contains that identity, a `PendingOperation`, and the
-optional label, expected type, and continuation tag. The operation is either
-`Callout { callout_index: u32 }` or `Sign`. Its Borsh tags are 0 followed by the
-callout index, or 1 with no index. There is no separate optional callout-index
-field or stored operation-kind flag. String bounds remain enforced at durable
-and guest boundaries.
+Direct messages are a future delivery extension. It would use per-recipient
+sequence numbers, a small queue of unacknowledged sends whose payload remains in
+the event record, receiver-side last-applied sequence numbers committed with
+the handler result, and attachments pinned until acknowledgement. This note
+does not define that extension's wire or storage format.
 
 ### Terminal proof and publication
 
 `SessionEnd` starts internal terminal proof collection. Every participant signs
 the exact terminal commitment. Once the N-of-N certificate is complete, the
 store assembles and validates the portable evidence from durable activation,
-trace, outcome, and certificate rows. One SQLite transaction publishes the
-artifact, its local execution relation, terminal status, and durable outbox
-effect. There is no separate producer seal or signing round.
+trace, outcome, and certificate records. One SQLite transaction publishes the
+artifact, its local execution relation, and terminal status. There is no
+separate producer seal or signing round.
+
+The finished observation is emitted when the receipt is published, because that
+publication is a local fact. The actor remains alive while peers acknowledge
+its final frames. After every final frame is acknowledged, it records one
+durable `final frames delivered` fact and retires. Startup resumes a finished
+execution only when that fact is missing; the daemon supervisor does not stop
+the actor merely because it observed the finished receipt.
 
 `ReceiptArtifact` distinguishes two guarantees:
 
@@ -545,8 +578,9 @@ collecting signatures, assembling and publishing, published, or frozen
 incomplete. Live actor failures and startup recovery use one node-owned failure
 transition. Complete evidence is published without contacting a peer or running
 the guest; incomplete terminal agreement remains frozen. A crash before the
-assembly transaction retries it; a crash after commit retains the exact artifact
-and resumes durable outbox delivery.
+assembly transaction retries it; a crash after publication retains the exact
+artifact and resumes final-frame delivery from execution state. The actor retires
+only after the durable delivery fact is present.
 
 ## 11. Receipts and verification
 
@@ -578,7 +612,7 @@ bytes. A stopped result includes the exact `StopCause`, preserving the
 distinction between an authenticated unilateral report and a shared N-of-N
 stop. Verification does not execute Wasm and stops at these checks.
 
-This release uses store schema version 3 and rejects earlier databases with an
+This release uses store schema version 4 and rejects earlier databases with an
 unsupported-schema error. It does not rewrite or delete old evidence. Version-1
 producer-sealed receipts are also rejected; they must be inspected with the
 matching older release. Automatic migration is not provided.
@@ -622,12 +656,12 @@ the durable execution record. Completed, aborted, and failed executions
 therefore remain observable after their live driver is removed and after a
 daemon restart. A nonterminal execution that cannot be truthfully resumed is
 durably marked failed during startup. A prepared, uncommitted activation stays
-eligible for activation recovery. Public terminal status does not end recovery:
-stopped executions without a produced receipt and terminal executions with
-unacknowledged outbox work remain eligible. Each Host assembles and persists its
-local receipt from durable evidence before attempting further delivery. An
-unavailable guest or peer cannot prevent that local proof from being persisted;
-outbox delivery remains durable and ordered independently.
+eligible for activation recovery. Public terminal status does not retire an
+execution by itself: after receipt publication the actor remains alive until
+every peer acknowledges its final frames and the actor records the durable
+`final frames delivered` fact. Startup resumes a finished execution only when
+that fact is missing. The daemon supervisor does not stop the actor merely
+because it observed the finished receipt.
 
 The daemon serializes provisioning through a bounded queue and admits at most
 64 local Hosts independently of each execution's exact participant set. It
@@ -666,13 +700,15 @@ Ensemble. It owns subscriptions and presentation only, and detaching never
 stops the daemon or its executions. Executions are keyed by Host and local
 execution ID; negotiation and session identities group multiparty views.
 
-A monitor may submit one pending callout answer through the ordinary
-`exec.submit` operation. Reading or editing a callout grants no ownership or
-reservation. The execution actor serializes competing answers; the losing
-submission reports `CalloutNotPending`, and a local driver continues to its
-next decision point. Schema, storage, and other execution failures retain their
-own error categories. A lost submission response is an unknown outcome and
-must not trigger automatic resubmission.
+A monitor may submit one answer for the open callout through the ordinary
+`exec.submit` operation. The answer must name the exact open `PendingId`;
+reading a callout grants no ownership or reservation. The execution actor
+serializes competing answers. A stale or losing submission reports
+`CalloutNotPending`; a resubmission while the answered result is staged reports
+`AgreementPending`. The Host validates the answer against the callout schema,
+and a program rejection or input-handler trap returns `InputRejected` without
+ending the session. A lost submission response is an unknown outcome and must
+not trigger automatic resubmission.
 
 The workspace projects the typed program catalog and lets a human select one
 program, an admitted Host count, a CLI-local human control choice for one or
@@ -714,7 +750,7 @@ operational observation, not a semantic Host event or receipt fact.
 
 Operational timings use a separate opt-in `arena0::performance` tracing
 target. Debug records cover aggregate work such as state decode, dispatch work,
-SQLite transactions, and outbox drains. Trace records cover
+SQLite transactions, and peer-frame sends. Trace records cover
 individual step and terminal signature applications. These records contain
 only correlation IDs, positions, sizes, counts, result classes, and monotonic
 elapsed microseconds. They are not `SystemEvent`, `HostEvent`, or `EventFrame`
