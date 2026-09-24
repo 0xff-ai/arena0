@@ -28,8 +28,7 @@ unsafe extern "C" {
         expected_ptr: u32,
         expected_len: u32,
     );
-    fn set_timer(delay_ms: i64);
-    fn set_typed_timer(delay_ms: i64, type_ptr: u32, type_len: u32, data_ptr: u32, data_len: u32);
+    fn set_timer(delay_ms: u64, type_ptr: u32, type_len: u32, data_ptr: u32, data_len: u32);
     fn sign(scheme: u32, data_ptr: u32, data_len: u32, expected_ptr: u32, expected_len: u32);
     fn end_session(result_ptr: u32, result_len: u32);
     fn abort_session(reason_ptr: u32, reason_len: u32);
@@ -152,16 +151,14 @@ pub(crate) fn host_callout_raw(callout_index: u32, context: &[u8], expected_type
 pub(crate) fn host_set_timer_spec(spec: &TimerSpec) {
     #[cfg(target_arch = "wasm32")]
     unsafe {
-        match &spec.payload {
-            Some(arena0_protocol::TimerPayload { type_name, data }) => set_typed_timer(
-                spec.delay_ms as i64,
-                type_name.as_ptr() as u32,
-                type_name.len() as u32,
-                data.as_ptr() as u32,
-                data.len() as u32,
-            ),
-            None => set_timer(spec.delay_ms as i64),
-        }
+        let arena0_protocol::TimerPayload { type_name, data } = &spec.payload;
+        set_timer(
+            spec.delay_ms,
+            type_name.as_ptr() as u32,
+            type_name.len() as u32,
+            data.as_ptr() as u32,
+            data.len() as u32,
+        );
     }
     #[cfg(not(target_arch = "wasm32"))]
     crate::testing::push_effect(arena0_protocol::Effect::SetTimer {

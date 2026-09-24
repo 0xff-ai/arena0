@@ -15,6 +15,15 @@ pub struct TimerPayload {
 }
 
 impl TimerPayload {
+    /// Construct the payload used by an untyped timer.
+    #[must_use]
+    pub fn unit() -> Self {
+        Self {
+            type_name: std::any::type_name::<()>().to_owned(),
+            data: Vec::new(),
+        }
+    }
+
     pub(crate) fn serialize_bounded<W: std::io::Write>(
         &self,
         writer: &mut W,
@@ -56,8 +65,8 @@ impl TimerPayload {
 pub struct TimerSpec {
     /// Delay before first firing, in milliseconds.
     pub delay_ms: u64,
-    /// Optional typed timer payload.
-    pub payload: Option<TimerPayload>,
+    /// Timer payload, including the unit payload for an untyped timer.
+    pub payload: TimerPayload,
 }
 
 impl TimerSpec {
@@ -66,16 +75,13 @@ impl TimerSpec {
     pub fn untyped(delay_ms: u64) -> Self {
         Self {
             delay_ms,
-            payload: None,
+            payload: TimerPayload::unit(),
         }
     }
 
     /// Build a typed timer request.
     #[must_use]
     pub fn typed(delay_ms: u64, payload: TimerPayload) -> Self {
-        Self {
-            delay_ms,
-            payload: Some(payload),
-        }
+        Self { delay_ms, payload }
     }
 }

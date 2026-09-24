@@ -805,6 +805,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "timer-dispatch-typed"
+version = "0.1.0"
+dependencies = [
+ "arena0-sdk",
+ "borsh",
+ "serde",
+]
+
+[[package]]
+name = "timer-dispatch-unit"
+version = "0.1.0"
+dependencies = [
+ "arena0-sdk",
+ "borsh",
+ "serde",
+]
+
+[[package]]
 name = "tiny-keccak"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -9,7 +9,7 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use std::collections::HashSet;
 use syn::visit::Visit;
-use syn::{Expr, Item, ItemImpl, Pat};
+use syn::{Expr, Item, Pat};
 
 #[derive(Default)]
 struct EffectCapabilityVisitor {
@@ -71,12 +71,6 @@ fn receiver_is_effect_handle(expr: &Expr, effect_bindings: &HashSet<String>) -> 
         Expr::Paren(paren) => receiver_is_effect_handle(&paren.expr, effect_bindings),
         _ => false,
     }
-}
-
-pub(super) fn infer_effect_capabilities(item: &ItemImpl) -> Vec<InferredEffectCapability> {
-    let mut visitor = EffectCapabilityVisitor::default();
-    visitor.visit_item_impl(item);
-    inferred_effect_capabilities(visitor)
 }
 
 pub(super) fn infer_effect_capabilities_from_module(

@@ -294,7 +294,6 @@ pub enum EventKind {
     MessageReceived,
     InputReceived,
     TimerFired,
-    TypedTimerFired,
     Signed,
     React,
 }

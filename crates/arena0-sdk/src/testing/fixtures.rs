@@ -662,16 +662,12 @@ impl<P: Program> TestHarness<P> {
                 );
                 (result, None)
             }
-            Event::TimerFired => (
-                self.run_program(Event::TimerFired, |ctx| P::on_timer(ctx)),
-                None,
-            ),
-            Event::TypedTimerFired { timer } => (
+            Event::TimerFired { timer } => (
                 self.run_program(
-                    Event::TypedTimerFired {
+                    Event::TimerFired {
                         timer: timer.clone(),
                     },
-                    |ctx| P::__arena0_on_typed_timer(ctx, timer),
+                    |ctx| P::on_timer(ctx, timer),
                 ),
                 None,
             ),
@@ -785,15 +781,15 @@ where
     }
 
     fn timer(&mut self) -> HandlerResult {
-        self.run_program(Event::TimerFired, |ctx| P::on_timer(ctx))
+        self.typed_timer(crate::TimerPayload::unit())
     }
 
     fn typed_timer(&mut self, timer: crate::TimerPayload) -> HandlerResult {
         self.run_program(
-            Event::TypedTimerFired {
+            Event::TimerFired {
                 timer: timer.clone(),
             },
-            |ctx| P::__arena0_on_typed_timer(ctx, timer),
+            |ctx| P::on_timer(ctx, timer),
         )
     }
 

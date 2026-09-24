@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -9,7 +10,7 @@ use arena0_crypto::{
 };
 use arena0_program::{
     CalloutSchema, Capability, JsonBytes, JsonSchemaDocument, ProgramDefinition, ProgramHash,
-    ProgramMetadata, ProgramSchema, SharedStateBytes, StateSchema,
+    ProgramMetadata, ProgramSchema, StateSchema,
 };
 use arena0_protocol::execution::GuestSignData;
 use arena0_protocol::{
@@ -18,7 +19,7 @@ use arena0_protocol::{
     ParticipantStepSignature, ParticipantTerminalSignature, PeerId, PeerIdSource, PendingOperation,
     PreparedActivation, StateHash, StopCause, Ticket, TicketAction, TicketData, TicketHash,
 };
-use arena0_sandbox::{LoadedProgram, Program, WasmtimeEngine};
+use arena0_sandbox::{InitializeCall, LoadedProgram, Program, WasmtimeEngine};
 use arena0_store::{ApplyOutcome, OutboxPayloadKind, Store, StoreConfig};
 use arena0_transport::local::{LocalNetwork, LocalTransport};
 use arena0_transport::{
@@ -34,6 +35,18 @@ use crate::context::ExecContext;
 
 const EXEC_ID: ExecId = ExecId([0x44; 32]);
 const NEGOTIATION_ID: NegotiationId = NegotiationId([0x11; 32]);
+
+fn guest_wasm(stem: &str) -> Vec<u8> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../programs/target/wasm32-unknown-unknown/release")
+        .join(format!("{stem}.wasm"));
+    std::fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "cannot read required timer guest {}: {error}; run `just build-programs`",
+            path.display()
+        )
+    })
+}
 
 #[test]
 fn terminal_reason_truncation_preserves_utf8_boundaries() {
@@ -187,32 +200,49 @@ impl Fixture {
     }
 
     async fn with_mode(remote_is_writer: bool, mode: GuestMode) -> Self {
+        let local_keys = NodeKeys::from_secret(SecretKey::from_bytes([1; 32]));
+        let remote_keys = NodeKeys::from_secret(SecretKey::from_bytes([2; 32]));
+        let ensemble = Ensemble::from_peers(vec![local_keys.peer_id(), remote_keys.peer_id()])
+            .expect("ensemble");
+        let writer_peer = if remote_is_writer {
+            remote_keys.peer_id()
+        } else {
+            local_keys.peer_id()
+        };
+        let writer = ensemble
+            .participant_of(&writer_peer)
+            .expect("writer participant")
+            .index() as u8;
+        Self::from_wasm(test_wasm(Some(writer), mode)).await
+    }
+
+    async fn with_guest(stem: &str) -> Self {
+        Self::from_wasm(guest_wasm(stem)).await
+    }
+
+    async fn from_wasm(wasm: Vec<u8>) -> Self {
         let local_keys = Arc::new(NodeKeys::from_secret(SecretKey::from_bytes([1; 32])));
         let remote_keys = Arc::new(NodeKeys::from_secret(SecretKey::from_bytes([2; 32])));
         let local_peer = local_keys.peer_id();
         let remote_peer = remote_keys.peer_id();
         let local_salt = ExecutionSalt::try_from_bytes([9; 32]).expect("non-zero test salt");
         let remote_salt = ExecutionSalt::try_from_bytes([10; 32]).expect("non-zero test salt");
-        let ensemble = Ensemble::from_peers(vec![local_peer, remote_peer]).expect("ensemble");
-        let writer_peer = if remote_is_writer {
-            remote_peer
-        } else {
-            local_peer
-        };
-        let writer = ensemble
-            .participant_of(&writer_peer)
-            .expect("writer participant")
-            .index() as u8;
-        let wasm = test_wasm(Some(writer), mode);
         let program = Program::parse(wasm.clone()).expect("program");
+        let params = JsonBytes::try_new(b"null".to_vec()).expect("params");
+        let initialized = WasmtimeEngine::new()
+            .expect("sandbox engine")
+            .load(&program)
+            .expect("loaded program")
+            .initialize(InitializeCall::new(params.clone()))
+            .expect("initialize program");
         let activation = activation(
             program.hash(),
             local_keys.as_ref(),
             remote_keys.as_ref(),
             &local_salt,
             &remote_salt,
+            StateHash::of_shared(&initialized.shared),
         );
-        let params = JsonBytes::try_new(b"null".to_vec()).expect("params");
         let directory = tempfile::tempdir().expect("temporary store directory");
         let path = directory.path().join("execution.sqlite");
         let store = Store::open(StoreConfig::new(path, local_peer)).expect("store");
@@ -658,6 +688,7 @@ async fn restart_resumes_a_durable_timer_and_accepted_inbox() {
     );
 
     let state = restarted.load_state().await.expect("load state");
+    assert_eq!(state.local_state().as_bytes(), &[8]);
     let source = fixture.remote_keys.peer_id();
     let frame = message_frame(&state, source, state.agreed_step(), vec![1, 2, 3]);
     restarted
@@ -687,6 +718,44 @@ async fn restart_resumes_a_durable_timer_and_accepted_inbox() {
         .expect("load resolved state")
         .expect("resolved state");
     assert!(resolved.pending_shared().is_some());
+}
+
+#[tokio::test]
+async fn recovered_sdk_timers_dispatch_typed_and_unit_payloads() {
+    for stem in ["timer_dispatch_typed", "timer_dispatch_unit"] {
+        let fixture = Fixture::with_guest(stem).await;
+        let mut actor = fixture.prepare_active_actor().await;
+        fixture.commit_session_started(&mut actor).await;
+        assert_eq!(
+            actor
+                .dispatch_event(Event::React, DispatchSource::default())
+                .await
+                .expect("schedule timer"),
+            Some(true),
+            "{stem} React dispatch"
+        );
+        drop(actor);
+
+        let (messages, _observations) = mpsc::channel(8);
+        let mut restarted = fixture.actor_with_messages(messages);
+        restarted
+            .fire_due_timers()
+            .await
+            .expect("fire recovered timer");
+
+        let state = restarted.load_state().await.expect("load timer state");
+        assert_eq!(state.local_state().as_bytes(), &[1], "{stem} timer handler");
+        assert!(
+            restarted
+                .context
+                .store
+                .due_timers(super::now_ms(), 16)
+                .await
+                .expect("load timers")
+                .is_empty(),
+            "{stem} timer row"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1707,6 +1776,7 @@ fn activation(
     remote_keys: &NodeKeys,
     local_salt: &ExecutionSalt,
     remote_salt: &ExecutionSalt,
+    initial_state: StateHash,
 ) -> Activation {
     let local_peer = local_keys.peer_id();
     let remote_peer = remote_keys.peer_id();
@@ -1720,7 +1790,7 @@ fn activation(
         2,
         // StateHash commits the canonical fixed-width state-memory image, not
         // the semantic payload bytes alone.
-        StateHash::of_shared(&SharedStateBytes::try_new(Vec::new()).expect("empty shared state")),
+        initial_state,
         1_000_000,
     )
     .expect("offer data");
@@ -1836,7 +1906,9 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
     let metadata = definition.encode().expect("metadata");
     let writer = writer.map_or_else(|| vec![0], |index| vec![1, index]);
     let extra_imports = match mode {
-        GuestMode::Timer => r#"(import "arena0" "set_timer" (func $set_timer (param i64)))"#,
+        GuestMode::Timer => {
+            r#"(import "arena0" "set_timer" (func $set_timer (param i64 i32 i32 i32 i32)))"#
+        }
         GuestMode::Callout | GuestMode::CalloutFault => {
             r#"(import "arena0" "request_input"
             (func $request_input (param i32 i32 i32 i32 i32)))"#
@@ -1879,6 +1951,10 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
               i32.const 1
               call $state_write
               i64.const 0
+              i32.const 1090
+              i32.const 4
+              i32.const 1070
+              i32.const 5
               call $set_timer
             "#
         }
@@ -2004,6 +2080,17 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
         }
         _ => "",
     };
+    let timer_body = match mode {
+        GuestMode::Timer => {
+            r#"
+              i32.const 1
+              i32.const 1140
+              i32.const 1
+              call $state_write
+            "#
+        }
+        _ => "",
+    };
     let wat = format!(
         r#"
         (module
@@ -2024,6 +2111,7 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
           (data (i32.const 1100) "null")
           (data (i32.const 1110) "broadcast")
           (data (i32.const 1120) "\00\00\00\00\04\00\00\00null")
+          (data (i32.const 1140) "\08")
           (data (i32.const 2000) "{writer}")
           (data (i32.const 3000) "\00\00\00\00\00\00\00\00")
           (data (i32.const 32768) "\00")
@@ -2065,6 +2153,13 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
             local.set $event_ptr
             local.get $event_ptr
             i32.load8_u
+            i32.const 3
+            i32.eq
+            if
+              {timer_body}
+            else
+            local.get $event_ptr
+            i32.load8_u
             i32.eqz
             if
               {session_started_body}
@@ -2076,12 +2171,12 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
               if
                 {message_body}
               else
-                local.get $event_ptr
-                i32.load8_u
-                i32.const 5
-                i32.eq
-                if
-                  {signed_body}
+               local.get $event_ptr
+               i32.load8_u
+               i32.const 4
+               i32.eq
+               if
+                 {signed_body}
                 else
                   local.get $event_ptr
                   i32.load8_u
@@ -2090,16 +2185,17 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
                   if
                     {input_fault_body}
                   else
-                    local.get $event_ptr
-                    i32.load8_u
-                    i32.const 6
-                    i32.eq
-                    if
-                      {react_body}
+                     local.get $event_ptr
+                     i32.load8_u
+                     i32.const 5
+                     i32.eq
+                     if
+                       {react_body}
                     end
                   end
                 end
               end
+            end
             end
             i32.const 32768
             i32.const 1
@@ -2129,6 +2225,7 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
         signed_body = signed_body,
         input_fault_body = input_fault_body,
         message_body = message_body,
+        timer_body = timer_body,
     );
     let raw = wat::parse_str(wat).expect("wat");
     WasmtimeEngine::new()

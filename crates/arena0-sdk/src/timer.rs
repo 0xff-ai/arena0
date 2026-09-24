@@ -115,7 +115,7 @@ mod tests {
         let spec = (Timer::TurnDeadline, Duration::from_secs(2)).into_timer_spec();
 
         assert_eq!(spec.delay_ms, 2000);
-        let payload = spec.payload.expect("typed timer payload");
+        let payload = spec.payload;
         assert_eq!(payload.type_name, std::any::type_name::<Timer>());
         assert_eq!(
             decode_timer_payload::<Timer>(payload).unwrap(),

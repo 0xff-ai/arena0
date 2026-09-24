@@ -81,8 +81,7 @@ impl TraceEntry {
         match &self.event {
             Event::SessionStarted { .. } | Event::MessageReceived { .. } => {}
             Event::InputReceived { .. }
-            | Event::TimerFired
-            | Event::TypedTimerFired { .. }
+            | Event::TimerFired { .. }
             | Event::Signed { .. }
             | Event::React => {
                 return Err(io::Error::new(

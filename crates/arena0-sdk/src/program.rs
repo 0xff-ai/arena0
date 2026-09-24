@@ -149,15 +149,9 @@ pub trait Program: Sized {
 
     fn on_timer(
         _ctx: &mut Context<Self::Shared, Self::Local>,
-    ) -> Result<ProgramTransition<Self>, ProgramFault> {
-        Ok(Transition::Stay)
-    }
-    #[doc(hidden)]
-    fn __arena0_on_typed_timer(
-        ctx: &mut Context<Self::Shared, Self::Local>,
         _timer: TimerPayload,
     ) -> Result<ProgramTransition<Self>, ProgramFault> {
-        Self::on_timer(ctx)
+        Ok(Transition::Stay)
     }
 
     #[doc(hidden)]

@@ -1359,8 +1359,7 @@ fn normalize_proposal_event(
         && matches!(
             event,
             Event::InputReceived { .. }
-                | Event::TimerFired
-                | Event::TypedTimerFired { .. }
+                | Event::TimerFired { .. }
                 | Event::Signed { .. }
                 | Event::React
         )

@@ -1,0 +1,15 @@
+[package]
+name = "timer-dispatch-typed"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+arena0-sdk = { path = "../../crates/arena0-sdk" }
+borsh = { version = "1.6", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }

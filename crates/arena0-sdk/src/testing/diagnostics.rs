@@ -179,8 +179,7 @@ pub(super) fn event_name(event: &Event) -> &'static str {
         Event::SessionStarted { .. } => "SessionStarted",
         Event::MessageReceived { .. } => "MessageReceived",
         Event::InputReceived { .. } => "InputReceived",
-        Event::TimerFired => "TimerFired",
-        Event::TypedTimerFired { .. } => "TypedTimerFired",
+        Event::TimerFired { .. } => "TimerFired",
         Event::Signed { .. } => "Signed",
         Event::React => "React",
     }

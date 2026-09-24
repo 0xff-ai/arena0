@@ -1518,11 +1518,10 @@ impl Database {
                 &row.get::<_, Vec<u8>>(2)?,
                 MAX_TIMER_RECORD_BYTES,
             )?;
-            let timer: Option<TimerPayload> = decode_borsh(&payload, "timer payload")?;
-            if timer.as_ref().is_some_and(|timer| {
-                timer.type_name.len() > arena0_protocol::MAX_TERMINAL_REASON_BYTES
-                    || timer.data.len() > arena0_protocol::MAX_TIMER_PAYLOAD_BYTES
-            }) {
+            let timer: TimerPayload = decode_borsh(&payload, "timer payload")?;
+            if timer.type_name.len() > arena0_protocol::MAX_TERMINAL_REASON_BYTES
+                || timer.data.len() > arena0_protocol::MAX_TIMER_PAYLOAD_BYTES
+            {
                 return Err(StoreError::Corruption(
                     "timer payload exceeds bounds".into(),
                 ));
@@ -1552,12 +1551,9 @@ impl Database {
         let payload =
             payload.ok_or_else(|| StoreError::Corruption("timer source is not active".into()))?;
         let payload = open_envelope(EnvelopeKind::Timer, &payload, MAX_TIMER_RECORD_BYTES)?;
-        let timer: Option<TimerPayload> = decode_borsh(&payload, "timer payload")?;
+        let timer: TimerPayload = decode_borsh(&payload, "timer payload")?;
         match event {
-            Event::TimerFired if timer.is_none() => Ok(()),
-            Event::TypedTimerFired { timer: expected } if timer.as_ref() == Some(expected) => {
-                Ok(())
-            }
+            Event::TimerFired { timer: expected } if timer == *expected => Ok(()),
             _ => Err(StoreError::Corruption(
                 "timer event does not match active timer".into(),
             )),
@@ -1710,7 +1706,7 @@ fn validate_dispatch_sources(
     pending_id: Option<PendingId>,
 ) -> Result<(), StoreError> {
     let inbox_applicable = matches!(event, Event::MessageReceived { .. });
-    let timer_applicable = matches!(event, Event::TimerFired | Event::TypedTimerFired { .. });
+    let timer_applicable = matches!(event, Event::TimerFired { .. });
     let pending_applicable = matches!(event, Event::InputReceived { .. } | Event::Signed { .. })
         || effects
             .iter()

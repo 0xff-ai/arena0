@@ -6,11 +6,10 @@
 
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use syn::{ItemImpl, Type};
+use syn::Type;
 
 pub(super) struct GuestAbi {
-    pub(super) item: ItemImpl,
-    pub(super) query_impl: TokenStream2,
+    pub(super) program_impl: TokenStream2,
     pub(super) view_impl: TokenStream2,
     pub(super) program_ty: Box<Type>,
     pub(super) shared_ty: Type,
@@ -31,8 +30,7 @@ pub(super) struct GuestAbi {
 
 pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
     let GuestAbi {
-        item,
-        query_impl,
+        program_impl,
         view_impl,
         program_ty,
         shared_ty,
@@ -52,8 +50,7 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
     } = input;
 
     quote! {
-        #item
-        #query_impl
+        #program_impl
         #view_impl
 
         #[cfg(target_arch = "wasm32")]
@@ -299,28 +296,14 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                         }
                     }
                 }
-                ::arena0::Event::TimerFired => {
-                    match <#program_ty as ::arena0::Program>::on_timer(&mut ctx) {
+                ::arena0::Event::TimerFired { timer } => {
+                    match <#program_ty as ::arena0::Program>::on_timer(&mut ctx, timer) {
                         Ok(transition) => {
                             ctx.__apply_transition::<#program_ty>(transition);
                             ::arena0::CallStatus::Accepted
                         }
                         Err(::arena0::ProgramFault(error)) => {
                             panic!("timer handler failed: {error:#}");
-                        }
-                    }
-                }
-                ::arena0::Event::TypedTimerFired { timer } => {
-                    match <#program_ty as ::arena0::Program>::__arena0_on_typed_timer(
-                        &mut ctx,
-                        timer,
-                    ) {
-                        Ok(transition) => {
-                            ctx.__apply_transition::<#program_ty>(transition);
-                            ::arena0::CallStatus::Accepted
-                        }
-                        Err(::arena0::ProgramFault(error)) => {
-                            panic!("typed-timer handler failed: {error:#}");
                         }
                     }
                 }

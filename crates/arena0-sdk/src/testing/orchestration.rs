@@ -119,12 +119,12 @@ where
         self.dispatch_participant(participant, |harness| harness.input(input))
     }
 
-    /// Dispatch an untyped timer event to one participant and queue any emitted messages.
+    /// Dispatch a unit-payload timer event to one participant and queue any emitted messages.
     pub fn timer(&mut self, participant: Participant) -> HandlerResult {
         self.dispatch_participant(participant, TestHarness::timer)
     }
 
-    /// Dispatch a typed timer event to one participant and queue any emitted messages.
+    /// Dispatch a timer event with a program payload to one participant and queue any emitted messages.
     pub fn timer_value<T>(&mut self, participant: Participant, timer: T) -> HandlerResult
     where
         T: borsh::BorshSerialize + borsh::BorshDeserialize + Clone + 'static,
@@ -444,7 +444,7 @@ enum ScenarioStep<P: Program> {
     },
     Timer {
         participant: Participant,
-        timer: Option<crate::TimerPayload>,
+        timer: crate::TimerPayload,
     },
     DeliverAll,
     DropNext,
@@ -496,7 +496,7 @@ where
     pub fn timer(mut self, participant: Participant) -> Self {
         self.steps.push(ScenarioStep::Timer {
             participant,
-            timer: None,
+            timer: crate::TimerPayload::unit(),
         });
         self
     }
@@ -509,7 +509,7 @@ where
     {
         self.steps.push(ScenarioStep::Timer {
             participant,
-            timer: Some(crate::timer_payload(timer)),
+            timer: crate::timer_payload(timer),
         });
         self
     }
@@ -595,14 +595,9 @@ where
                 ScenarioStep::Message { from, msg } => {
                     pair.message(from, msg);
                 }
-                ScenarioStep::Timer { participant, timer } => match timer {
-                    Some(timer) => {
-                        pair.typed_timer(participant, timer);
-                    }
-                    None => {
-                        pair.timer(participant);
-                    }
-                },
+                ScenarioStep::Timer { participant, timer } => {
+                    pair.typed_timer(participant, timer);
+                }
                 ScenarioStep::DeliverAll => pair.deliver_all(),
                 ScenarioStep::DropNext => {
                     pair.drop_next_message();

@@ -9,7 +9,7 @@ use arena0_protocol::{
     ExecutionVersion, MessageId, NegotiationId, NegotiationTarget, Offer, OfferData,
     ParticipantStepSignature, ParticipantTerminalSignature, PreparedActivation, ReceiptArtifact,
     ReceiptTermination, SessionHeader, SessionTerminal, StateHash, StepCursor, TerminalOutcome,
-    Ticket, TicketAction, TicketData,
+    Ticket, TicketAction, TicketData, TimerPayload,
 };
 use std::path::Path;
 
@@ -1560,7 +1560,7 @@ async fn activation_prepare_commit_is_idempotent_and_recoverable() {
                 vec![
                     Effect::SetTimer {
                         delay_ms: 10,
-                        timer: None,
+                        timer: TimerPayload::unit(),
                     },
                     callout,
                 ],
@@ -2026,7 +2026,7 @@ async fn interrupt_terminal_freezes_proof_and_cancels_timers_after_restart() {
             LocalStateBytes::try_new(Vec::new()).expect("local state"),
             vec![Effect::SetTimer {
                 delay_ms: 100,
-                timer: None,
+                timer: TimerPayload::unit(),
             }],
             None,
             None,

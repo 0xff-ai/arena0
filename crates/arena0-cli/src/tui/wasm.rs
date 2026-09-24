@@ -422,7 +422,6 @@ pub(super) fn event_name(kind: EventKind) -> &'static str {
         EventKind::MessageReceived => "message received",
         EventKind::InputReceived => "input received",
         EventKind::TimerFired => "timer fired",
-        EventKind::TypedTimerFired => "typed timer fired",
         EventKind::Signed => "signed",
         EventKind::React => "react",
     }

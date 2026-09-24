@@ -858,10 +858,8 @@ pub mod imports {
     pub const BROADCAST: &str = "broadcast";
     /// Request input from the controlling agent.
     pub const REQUEST_INPUT: &str = "request_input";
-    /// Start an untyped one-shot timer.
+    /// Start a one-shot timer with a typed payload.
     pub const SET_TIMER: &str = "set_timer";
-    /// Start a typed one-shot timer.
-    pub const SET_TYPED_TIMER: &str = "set_typed_timer";
     /// Sign data with the node's key.
     pub const SIGN: &str = "sign";
     /// End the current session successfully.
@@ -879,7 +877,7 @@ impl Capability {
         match self {
             Self::Messaging => &[imports::BROADCAST],
             Self::Input => &[imports::REQUEST_INPUT],
-            Self::Timers => &[imports::SET_TIMER, imports::SET_TYPED_TIMER],
+            Self::Timers => &[imports::SET_TIMER],
             Self::Sign { .. } => &[imports::SIGN],
         }
     }
@@ -911,7 +909,6 @@ pub fn all_effect_imports() -> &'static [&'static str] {
         imports::BROADCAST,
         imports::REQUEST_INPUT,
         imports::SET_TIMER,
-        imports::SET_TYPED_TIMER,
         imports::SIGN,
         imports::END_SESSION,
         imports::ABORT_SESSION,
@@ -929,10 +926,7 @@ mod tests {
     fn imports_for_each_capability() {
         assert_eq!(Capability::Messaging.imports(), &["broadcast"]);
         assert_eq!(Capability::Input.imports(), &["request_input"]);
-        assert_eq!(
-            Capability::Timers.imports(),
-            &["set_timer", "set_typed_timer"]
-        );
+        assert_eq!(Capability::Timers.imports(), &["set_timer"]);
         assert_eq!(
             Capability::Sign {
                 schemes: vec![SignScheme::Ed25519]

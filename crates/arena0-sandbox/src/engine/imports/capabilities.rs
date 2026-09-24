@@ -106,45 +106,26 @@ fn register_timers(linker: &mut Linker<HostState>) -> Result<(), SandboxError> {
         .func_wrap(
             abi::HOST_MODULE,
             imports::SET_TIMER,
-            |mut caller: Caller<'_, HostState>, delay_ms: u64| {
-                caller.begin_import("set_timer")?;
-                caller.reject_if_lifecycle_disallowed(
-                    "set_timer",
-                    &[Lifecycle::PreSession, Lifecycle::Active],
-                )?;
-                caller.reject_read_only("set_timer")?;
-                caller.record_effect(Effect::SetTimer {
-                    delay_ms,
-                    timer: None,
-                })
-            },
-        )
-        .map_err(map_err)?;
-    linker
-        .func_wrap(
-            abi::HOST_MODULE,
-            imports::SET_TYPED_TIMER,
             |mut caller: Caller<'_, HostState>,
              delay_ms: u64,
              type_ptr: u32,
              type_len: u32,
              data_ptr: u32,
              data_len: u32| {
-                caller.begin_import("set_typed_timer")?;
+                caller.begin_import("set_timer")?;
                 caller.reject_if_lifecycle_disallowed(
-                    "set_typed_timer",
+                    "set_timer",
                     &[Lifecycle::PreSession, Lifecycle::Active],
                 )?;
-                caller.reject_read_only("set_typed_timer")?;
-                let type_bytes =
-                    caller.read_guest_bytes(type_ptr, type_len, "set_typed_timer:type")?;
+                caller.reject_read_only("set_timer")?;
+                let type_bytes = caller.read_guest_bytes(type_ptr, type_len, "set_timer:type")?;
                 let type_name = String::from_utf8(type_bytes).map_err(|e| {
-                    wasmtime::Error::msg(format!("set_typed_timer: invalid type name: {e}"))
+                    wasmtime::Error::msg(format!("set_timer: invalid type name: {e}"))
                 })?;
-                let data = caller.read_guest_bytes(data_ptr, data_len, "set_typed_timer:data")?;
+                let data = caller.read_guest_bytes(data_ptr, data_len, "set_timer:data")?;
                 caller.record_effect(Effect::SetTimer {
                     delay_ms,
-                    timer: Some(TimerPayload { type_name, data }),
+                    timer: TimerPayload { type_name, data },
                 })
             },
         )
@@ -227,15 +208,23 @@ mod tests {
 
     fn instantiate_timer_test_module(
         stage: Lifecycle,
-    ) -> (Store<HostState>, wasmtime::TypedFunc<u64, ()>) {
+    ) -> (Store<HostState>, wasmtime::TypedFunc<(), ()>) {
         let engine = Engine::default();
         let module = Module::new(
             &engine,
             r#"
                 (module
-                  (import "arena0" "set_timer" (func $set_timer (param i64)))
-                  (func (export "call_set_timer") (param i64)
-                    local.get 0
+                  (import "arena0" "set_timer"
+                    (func $set_timer (param i64 i32 i32 i32 i32)))
+                  (memory (export "memory") 1)
+                  (data (i32.const 0) "Timer")
+                  (data (i32.const 8) "abc")
+                  (func (export "call_set_timer")
+                    i64.const 25
+                    i32.const 0
+                    i32.const 5
+                    i32.const 8
+                    i32.const 3
                     call $set_timer))
             "#,
         )
@@ -257,51 +246,7 @@ mod tests {
         });
         let instance = linker.instantiate(&mut store, &module).unwrap();
         let set_timer = instance
-            .get_typed_func::<u64, ()>(&mut store, "call_set_timer")
-            .unwrap();
-        (store, set_timer)
-    }
-
-    fn instantiate_typed_timer_test_module(
-        stage: Lifecycle,
-    ) -> (Store<HostState>, wasmtime::TypedFunc<(), ()>) {
-        let engine = Engine::default();
-        let module = Module::new(
-            &engine,
-            r#"
-                (module
-                  (import "arena0" "set_typed_timer" (func $set_typed_timer (param i64 i32 i32 i32 i32)))
-                  (memory (export "memory") 1)
-                  (data (i32.const 0) "Timer")
-                  (data (i32.const 8) "abc")
-                  (func (export "call_set_typed_timer")
-                    i64.const 25
-                    i32.const 0
-                    i32.const 5
-                    i32.const 8
-                    i32.const 3
-                    call $set_typed_timer))
-            "#,
-        )
-        .unwrap();
-
-        let mut linker = Linker::new(&engine);
-        register_capability_imports(&mut linker, &[Capability::Timers]).unwrap();
-
-        let mut store = Store::new(&engine, {
-            let mut hs = HostState::new(
-                arena0_program::ExecutionProfile::current(),
-                CallKind::Dispatch,
-                Lifecycle::PreSession,
-                None,
-                Vec::new(),
-            );
-            hs.lifecycle = stage;
-            hs
-        });
-        let instance = linker.instantiate(&mut store, &module).unwrap();
-        let set_timer = instance
-            .get_typed_func::<(), ()>(&mut store, "call_set_typed_timer")
+            .get_typed_func::<(), ()>(&mut store, "call_set_timer")
             .unwrap();
         (store, set_timer)
     }
@@ -410,12 +355,15 @@ mod tests {
     #[test]
     fn set_timer_allowed_during_pre_session() {
         let (mut store, set_timer) = instantiate_timer_test_module(Lifecycle::PreSession);
-        set_timer.call(&mut store, 25).unwrap();
+        set_timer.call(&mut store, ()).unwrap();
         assert_eq!(
             store.data().effect_queue,
             vec![Effect::SetTimer {
                 delay_ms: 25,
-                timer: None,
+                timer: TimerPayload {
+                    type_name: "Timer".into(),
+                    data: b"abc".to_vec(),
+                },
             }]
         );
     }
@@ -423,24 +371,8 @@ mod tests {
     #[test]
     fn set_timer_rejected_after_finish() {
         let (mut store, set_timer) = instantiate_timer_test_module(Lifecycle::Completed);
-        assert!(set_timer.call(&mut store, 25).is_err());
+        assert!(set_timer.call(&mut store, ()).is_err());
         assert!(store.data().effect_queue.is_empty());
-    }
-
-    #[test]
-    fn typed_timer_records_payload() {
-        let (mut store, set_timer) = instantiate_typed_timer_test_module(Lifecycle::Active);
-        set_timer.call(&mut store, ()).unwrap();
-        assert_eq!(
-            store.data().effect_queue,
-            vec![Effect::SetTimer {
-                delay_ms: 25,
-                timer: Some(TimerPayload {
-                    type_name: "Timer".into(),
-                    data: b"abc".to_vec(),
-                }),
-            }]
-        );
     }
 
     #[test]

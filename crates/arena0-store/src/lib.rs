@@ -64,9 +64,9 @@ const DEFAULT_RETRY_DELAY_MS: u64 = 1_000;
 const MAX_ERROR_BYTES: usize = 4 * 1024;
 const MAX_ADMISSION_BYTES: usize = 4 * 1024;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
-// Timer rows store the complete `Option<TimerPayload>` (including the type
-// name), not just its value bytes. Keep the envelope bound large enough for
-// both protocol components plus their Borsh length prefixes.
+// Timer rows store the complete `TimerPayload` (including the type name), not
+// just its value bytes. Keep the envelope bound large enough for both protocol
+// components plus their Borsh length prefixes.
 const MAX_TIMER_RECORD_BYTES: usize =
     arena0_protocol::MAX_TIMER_PAYLOAD_BYTES + arena0_protocol::MAX_TERMINAL_REASON_BYTES + 16;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
@@ -668,7 +668,6 @@ pub enum EventKind {
     MessageReceived,
     InputReceived,
     TimerFired,
-    TypedTimerFired,
     Signed,
     React,
 }
@@ -774,10 +773,7 @@ impl EventRecordSummary {
             Event::SessionStarted { .. } => (EventKind::SessionStarted, None),
             Event::MessageReceived { msg, .. } => (EventKind::MessageReceived, Some(msg.len())),
             Event::InputReceived { data, .. } => (EventKind::InputReceived, Some(data.len())),
-            Event::TimerFired => (EventKind::TimerFired, None),
-            Event::TypedTimerFired { timer } => {
-                (EventKind::TypedTimerFired, Some(timer.data.len()))
-            }
+            Event::TimerFired { timer } => (EventKind::TimerFired, Some(timer.data.len())),
             Event::Signed { signature, .. } => (EventKind::Signed, Some(signature.len())),
             Event::React => (EventKind::React, None),
         };
@@ -802,7 +798,7 @@ impl EventRecordSummary {
                 },
                 Effect::SetTimer { timer, .. } => EffectSummary {
                     kind: EffectKind::SetTimer,
-                    payload_bytes: timer.as_ref().map(|timer| timer.data.len()),
+                    payload_bytes: Some(timer.data.len()),
                 },
                 Effect::Sign { data, .. } => EffectSummary {
                     kind: EffectKind::Sign,
@@ -1152,8 +1148,8 @@ pub struct ActiveTimer {
     pub timer_id: TimerId,
     /// Absolute due time.
     pub deadline_ms: u64,
-    /// Exact optional typed timer payload emitted by the program.
-    pub timer: Option<TimerPayload>,
+    /// Exact typed timer payload emitted by the program.
+    pub timer: TimerPayload,
     /// Version that armed the timer.
     pub armed_version: ExecutionVersion,
 }

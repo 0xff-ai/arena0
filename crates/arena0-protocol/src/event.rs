@@ -33,12 +33,10 @@ pub enum Event<M = Vec<u8>> {
         pre_state: StateHash,
         msg: M,
     },
-    /// The controlling agent submitted input in response to a [`Callout`](crate::Effect::Callout).
+    /// The controlling agent submitted input in response to a callout.
     InputReceived { callout_index: u32, data: Vec<u8> },
-    /// A previously set timer fired.
-    TimerFired,
-    /// A previously set typed timer fired.
-    TypedTimerFired { timer: TimerPayload },
+    /// A previously set timer fired with its scheduled payload.
+    TimerFired { timer: TimerPayload },
     /// Completed [`Sign`](crate::Effect::Sign) effect.
     Signed { signature: Vec<u8> },
     /// Run the program's reaction code after an agreed entry applied.
@@ -73,8 +71,7 @@ impl Event<Vec<u8>> {
                 callout_index,
                 data,
             },
-            Self::TimerFired => Event::TimerFired,
-            Self::TypedTimerFired { timer } => Event::TypedTimerFired { timer },
+            Self::TimerFired { timer } => Event::TimerFired { timer },
             Self::Signed { signature } => Event::Signed { signature },
             Self::React => Event::React,
         })
@@ -85,9 +82,8 @@ const EVENT_SESSION_STARTED: u8 = 0;
 const EVENT_MESSAGE_RECEIVED: u8 = 1;
 const EVENT_INPUT_RECEIVED: u8 = 2;
 const EVENT_TIMER_FIRED: u8 = 3;
-const EVENT_TYPED_TIMER_FIRED: u8 = 4;
-const EVENT_SIGNED: u8 = 5;
-const EVENT_REACT: u8 = 6;
+const EVENT_SIGNED: u8 = 4;
+const EVENT_REACT: u8 = 5;
 
 impl<M: BorshSerialize> BorshSerialize for Event<M> {
     fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
@@ -124,9 +120,8 @@ impl<M: BorshSerialize> BorshSerialize for Event<M> {
                 )?;
                 Ok(())
             }
-            Self::TimerFired => BorshSerialize::serialize(&EVENT_TIMER_FIRED, writer),
-            Self::TypedTimerFired { timer } => {
-                BorshSerialize::serialize(&EVENT_TYPED_TIMER_FIRED, writer)?;
+            Self::TimerFired { timer } => {
+                BorshSerialize::serialize(&EVENT_TIMER_FIRED, writer)?;
                 timer.serialize_bounded(writer)
             }
             Self::Signed { signature } => {
@@ -165,8 +160,7 @@ impl<M: BorshDeserialize> BorshDeserialize for Event<M> {
                     "event input payload",
                 )?,
             }),
-            EVENT_TIMER_FIRED => Ok(Self::TimerFired),
-            EVENT_TYPED_TIMER_FIRED => Ok(Self::TypedTimerFired {
+            EVENT_TIMER_FIRED => Ok(Self::TimerFired {
                 timer: TimerPayload::deserialize_bounded(reader)?,
             }),
             EVENT_SIGNED => Ok(Self::Signed {
@@ -208,8 +202,7 @@ mod tests {
                 callout_index: 0,
                 data: vec![4, 5, 6],
             },
-            Event::TimerFired,
-            Event::TypedTimerFired {
+            Event::TimerFired {
                 timer: TimerPayload {
                     type_name: "Timer".into(),
                     data: vec![7],
@@ -240,43 +233,42 @@ mod tests {
             pre_state: StateHash([3; 32]),
             msg: Vec::new(),
         };
-        let timer: Event<Vec<u8>> = Event::TimerFired;
+        let timer: Event<Vec<u8>> = Event::TimerFired {
+            timer: TimerPayload::unit(),
+        };
         let raw_react: Event<Vec<u8>> = Event::React;
         assert_eq!(borsh::to_vec(&start).unwrap()[0], 0);
         assert_eq!(borsh::to_vec(&message).unwrap()[0], 1);
         assert_eq!(borsh::to_vec(&timer).unwrap()[0], 3);
-        assert_eq!(borsh::to_vec(&raw_react).unwrap()[0], 6);
+        assert_eq!(borsh::to_vec(&raw_react).unwrap()[0], 5);
         assert!(borsh::from_slice::<Event<Vec<u8>>>(&[0xff]).is_err());
     }
 
     #[test]
-    fn typed_timer_encodings_keep_bounds_across_events_and_effects() {
+    fn timer_encodings_keep_bounds_across_events_and_effects() {
         let timer = TimerPayload {
             type_name: "T".into(),
             data: vec![7],
         };
-        let event: Event<Vec<u8>> = Event::TypedTimerFired {
+        let event: Event<Vec<u8>> = Event::TimerFired {
             timer: timer.clone(),
         };
-        let event_bytes = [4, 1, 0, 0, 0, b'T', 1, 0, 0, 0, 7];
+        let event_bytes = [3, 1, 0, 0, 0, b'T', 1, 0, 0, 0, 7];
         assert_eq!(borsh::to_vec(&event).unwrap(), event_bytes);
         assert_eq!(Event::try_from_slice(&event_bytes).unwrap(), event);
 
         let effect = crate::Effect::SetTimer {
             delay_ms: 0,
-            timer: Some(timer.clone()),
+            timer: timer.clone(),
         };
-        let mut effect_bytes = vec![4, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let mut effect_bytes = vec![4, 0, 0, 0, 0, 0, 0, 0, 0];
         effect_bytes.extend_from_slice(&event_bytes[1..]);
         assert_eq!(borsh::to_vec(&effect).unwrap(), effect_bytes);
         assert_eq!(
             crate::Effect::try_from_slice(&effect_bytes).unwrap(),
             effect
         );
-        let raw_effect = crate::Effect::SetTimer {
-            delay_ms: 0,
-            timer: Some(timer),
-        };
+        let raw_effect = crate::Effect::SetTimer { delay_ms: 0, timer };
         effect_bytes[0] = 4;
         assert_eq!(borsh::to_vec(&raw_effect).unwrap(), effect_bytes);
         assert_eq!(
@@ -294,7 +286,7 @@ mod tests {
             oversized_name.to_vec(),
             [0u32.to_le_bytes(), oversized_data].concat(),
         ] {
-            let mut encoded = vec![4];
+            let mut encoded = vec![3];
             encoded.extend_from_slice(&payload);
             assert_eq!(
                 Event::<Vec<u8>>::try_from_slice(&encoded)
@@ -302,7 +294,7 @@ mod tests {
                     .kind(),
                 io::ErrorKind::InvalidData
             );
-            encoded = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+            encoded = vec![4, 0, 0, 0, 0, 0, 0, 0, 0];
             encoded.extend_from_slice(&payload);
             assert_eq!(
                 crate::Effect::try_from_slice(&encoded).unwrap_err().kind(),

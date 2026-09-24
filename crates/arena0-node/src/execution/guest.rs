@@ -716,10 +716,7 @@ impl ExecutionActor {
             .due_timers(now_ms(), MAX_TIMER_BATCH)
             .await?;
         for timer in timers {
-            let event = match timer.timer {
-                None => Event::TimerFired,
-                Some(timer) => Event::TypedTimerFired { timer },
-            };
+            let event = Event::TimerFired { timer: timer.timer };
             let accepted = self
                 .dispatch_event(
                     event,

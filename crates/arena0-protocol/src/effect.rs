@@ -33,11 +33,8 @@ pub enum Effect {
         context: Vec<u8>,
         expected_type: Option<String>,
     },
-    /// Arm a one-shot timer.
-    SetTimer {
-        delay_ms: u64,
-        timer: Option<TimerPayload>,
-    },
+    /// Arm a one-shot timer with its payload.
+    SetTimer { delay_ms: u64, timer: TimerPayload },
     /// Request a host signature.
     Sign {
         scheme: SignScheme,
@@ -112,7 +109,7 @@ impl BorshSerialize for Effect {
             Self::SetTimer { delay_ms, timer } => {
                 BorshSerialize::serialize(&EFFECT_SET_TIMER, writer)?;
                 BorshSerialize::serialize(delay_ms, writer)?;
-                serialize_bounded_option_timer(writer, timer.as_ref())
+                timer.serialize_bounded(writer)
             }
             Self::Sign {
                 scheme,
@@ -195,7 +192,7 @@ impl BorshDeserialize for Effect {
             }),
             EFFECT_SET_TIMER => Ok(Self::SetTimer {
                 delay_ms: u64::deserialize_reader(reader)?,
-                timer: read_bounded_option_timer(reader)?,
+                timer: TimerPayload::deserialize_bounded(reader)?,
             }),
             EFFECT_SIGN => Ok(Self::Sign {
                 scheme: SignScheme::deserialize_reader(reader)?,
@@ -229,32 +226,6 @@ impl BorshDeserialize for Effect {
                 format!("unknown effect tag {tag}"),
             )),
         }
-    }
-}
-
-fn serialize_bounded_option_timer<W: borsh::io::Write>(
-    writer: &mut W,
-    timer: Option<&TimerPayload>,
-) -> io::Result<()> {
-    match timer {
-        None => BorshSerialize::serialize(&0u8, writer),
-        Some(timer) => {
-            BorshSerialize::serialize(&1u8, writer)?;
-            timer.serialize_bounded(writer)
-        }
-    }
-}
-
-fn read_bounded_option_timer<R: borsh::io::Read>(
-    reader: &mut R,
-) -> io::Result<Option<TimerPayload>> {
-    match u8::deserialize_reader(reader)? {
-        0 => Ok(None),
-        1 => TimerPayload::deserialize_bounded(reader).map(Some),
-        tag => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unknown optional timer tag {tag}"),
-        )),
     }
 }
 
@@ -322,7 +293,7 @@ mod tests {
             },
             Effect::SetTimer {
                 delay_ms: 1000,
-                timer: None,
+                timer: TimerPayload::unit(),
             },
             Effect::Sign {
                 scheme: SignScheme::Ed25519,

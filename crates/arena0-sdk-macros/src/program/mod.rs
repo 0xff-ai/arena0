@@ -31,7 +31,7 @@ pub(crate) fn expand_arena0_program_item(
         Item::Mod(item) => expand_arena0_program_module(args, item),
         Item::Impl(item) => Err(Error::new(
             item.span(),
-            "arena0::program only supports an inline module shell; impl Program blocks are no longer accepted",
+            "arena0::program annotates an inline module shell",
         )),
         other => Err(Error::new(
             other.span(),

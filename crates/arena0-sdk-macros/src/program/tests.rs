@@ -1,9 +1,8 @@
 //! Unit tests for the inline-module `#[arena0::program]` expansion.
 
 use super::args::{Arena0ProgramArgs, ParticipantCountArgs};
-use super::capabilities::infer_effect_capabilities;
 use super::expand_arena0_program_item;
-use syn::{Item, ItemImpl};
+use syn::Item;
 
 fn args() -> Arena0ProgramArgs {
     syn::parse_str(r#"name = "test", version = "1.0.0", description = "test", participants = 2"#)
@@ -66,10 +65,9 @@ fn rejects_impl_program_form() {
     };
 
     let error = expand_arena0_program_item(args(), item).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("only supports an inline module shell")
+    assert_eq!(
+        error.to_string(),
+        "arena0::program annotates an inline module shell"
     );
 }
 
@@ -234,60 +232,9 @@ fn module_shell_wires_typed_timer_handler() {
     .unwrap();
     let expanded = expand_arena0_program_item(args, item).unwrap().to_string();
 
-    assert!(expanded.contains("__arena0_on_typed_timer"));
+    assert!(expanded.contains("fn on_timer"));
     assert!(expanded.contains("decode_timer_payload"));
     assert!(expanded.contains("Capability :: Timers"));
-}
-
-#[test]
-fn module_shell_rejects_async_handlers() {
-    let item: Item = syn::parse_quote! {
-        pub mod ping {
-            use arena0::prelude::*;
-
-            #[arena0::state(max = 256)]
-            pub struct Shared {
-                round: u64,
-            }
-
-            async fn on_timer(_ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
-                Ok(Transition::Stay)
-            }
-        }
-    };
-
-    let error = expand_arena0_program_item(args(), item).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("async handlers are not supported")
-    );
-}
-
-#[test]
-fn module_shell_rejects_await_expressions() {
-    let item: Item = syn::parse_quote! {
-        pub mod ping {
-            use arena0::prelude::*;
-
-            #[arena0::state(max = 256)]
-            pub struct Shared {
-                round: u64,
-            }
-
-            fn on_timer(_ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
-                let _ = future.await;
-                Ok(Transition::Stay)
-            }
-        }
-    };
-
-    let error = expand_arena0_program_item(args(), item).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("await is not supported by arena0::program module shells")
-    );
 }
 
 #[test]
@@ -308,71 +255,4 @@ fn detects_auto_capability_argument() {
     .unwrap();
 
     assert!(args.capabilities_auto);
-}
-
-#[test]
-fn infers_direct_effect_capabilities_from_handlers() {
-    let item: ItemImpl = syn::parse_quote! {
-        impl Program for TestProgram {
-            type Shared = Shared;
-            type Local = ();
-            type Message = Vec<u8>;
-            type Callout = ();
-            type Input = ();
-            type Params = ();
-            type Query = ();
-
-            fn initialize(_shared: &mut Shared, _params: ()) -> Result<(), ProgramFault> {
-                Ok(())
-            }
-
-            fn on_react(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
-                let mut fx = ctx.effects();
-                fx.callout(());
-                fx.set_timer(1, ());
-                fx.sign(SignScheme::Ed25519, vec![1, 2, 3]);
-                Ok(Transition::Stay)
-            }
-
-            fn on_input(ctx: &mut Context, _input: ()) -> Result<Transition<Phase>, InputFault> {
-                ctx.effects().send(ctx.other(), vec![]);
-                Ok(Transition::Stay)
-            }
-        }
-    };
-
-    let inferred = infer_effect_capabilities(&item);
-    let rendered = inferred
-        .iter()
-        .map(|capability| capability.capability.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(rendered.contains("Capability :: Messaging"));
-    assert!(rendered.contains("Capability :: Input"));
-    assert!(rendered.contains("Capability :: Timers"));
-    assert!(rendered.contains("Capability :: Sign"));
-    assert!(rendered.contains("SignScheme :: Ed25519"));
-}
-
-#[test]
-fn effect_capability_inference_ignores_unrelated_method_names() {
-    let item: ItemImpl = syn::parse_quote! {
-        impl Program for TestProgram {
-            type Shared = Shared;
-            type Local = ();
-            type Message = Vec<u8>;
-            type Callout = ();
-            type Input = ();
-            type Params = ();
-            type Query = ();
-
-            fn initialize(_shared: &mut Shared, _params: ()) -> Result<(), ProgramFault> {
-                formatter.sign();
-                mailbox.send(vec![]);
-                Ok(())
-            }
-        }
-    };
-
-    assert!(infer_effect_capabilities(&item).is_empty());
 }

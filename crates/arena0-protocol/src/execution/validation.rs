@@ -793,15 +793,12 @@ fn validate_effect(effect: &Effect) -> Result<(), ProtocolError> {
             Ok(())
         }
         Effect::SetTimer { timer, .. } => {
-            if let Some(timer) = timer {
-                ensure_payload(
-                    "timer type name",
-                    timer.type_name.len(),
-                    MAX_TERMINAL_REASON_BYTES,
-                )?;
-                ensure_payload("timer data", timer.data.len(), MAX_TIMER_PAYLOAD_BYTES)?;
-            }
-            Ok(())
+            ensure_payload(
+                "timer type name",
+                timer.type_name.len(),
+                MAX_TERMINAL_REASON_BYTES,
+            )?;
+            ensure_payload("timer data", timer.data.len(), MAX_TIMER_PAYLOAD_BYTES)
         }
         Effect::Sign {
             data,

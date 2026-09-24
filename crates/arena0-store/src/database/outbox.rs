@@ -957,7 +957,7 @@ impl Database {
         version: ExecutionVersion,
         ordinal: u32,
         delay_ms: u64,
-        timer: &Option<TimerPayload>,
+        timer: &TimerPayload,
         now_ms: u64,
     ) -> Result<(), StoreError> {
         let label = borsh::to_vec(&(execution_id, event_position, ordinal))
