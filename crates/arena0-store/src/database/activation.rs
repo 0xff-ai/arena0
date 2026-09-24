@@ -1,7 +1,7 @@
 use super::*;
 
 impl Database {
-    pub(super) fn prepare_activation(
+    pub(crate) fn prepare_activation(
         &mut self,
         execution_id: ExecId,
         prepared: PreparedActivation,
@@ -63,7 +63,7 @@ impl Database {
         })
     }
 
-    pub(crate) fn ensure_program_registered(
+    pub(super) fn ensure_program_registered(
         &mut self,
         hash: ProgramHash,
     ) -> Result<(), StoreError> {
@@ -83,7 +83,7 @@ impl Database {
         Ok(())
     }
 
-    pub(super) fn commit_activation(
+    pub(crate) fn commit_activation(
         &mut self,
         execution_id: ExecId,
         activation: Activation,
@@ -155,7 +155,7 @@ impl Database {
         Ok(CommitActivationOutcome::Committed(Box::new(incoming)))
     }
 
-    pub(super) fn load_activation(
+    pub(crate) fn load_activation(
         &mut self,
         execution_id: ExecId,
     ) -> Result<Option<ActivationRecord>, StoreError> {

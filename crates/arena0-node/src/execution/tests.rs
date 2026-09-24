@@ -19,7 +19,7 @@ use arena0_protocol::{
     Ticket, TicketAction, TicketData, TicketHash,
 };
 use arena0_sandbox::{InitializeCall, LoadedProgram, Program, WasmtimeEngine};
-use arena0_store::{ApplyOutcome, OutboxPayloadKind, Store, StoreConfig};
+use arena0_store::{Change, OutboxPayloadKind, Store, StoreConfig};
 use arena0_transport::Transport;
 use arena0_transport::local::{LocalNetwork, LocalTransport};
 use tempfile::TempDir;
@@ -241,16 +241,24 @@ impl Fixture {
         ExecutionKey::derive(&self.remote_salt, &EXEC_ID.0, &NEGOTIATION_ID.0).expect("remote key")
     }
 
-    fn actor_with_messages(&self, messages: mpsc::Sender<crate::SessionMessage>) -> ExecutionActor {
+    async fn actor_with_messages(
+        &self,
+        messages: mpsc::Sender<crate::SessionMessage>,
+    ) -> ExecutionActor {
+        let mut context = self.context().bind(
+            Arc::clone(&self.local_keys),
+            self.store
+                .handle()
+                .claim_execution(EXEC_ID)
+                .expect("execution writer"),
+            self.local_transport.clone() as Arc<dyn Transport + Sync>,
+        );
+        let state = ExecutionActor::ensure_execution(&mut context)
+            .await
+            .expect("execution");
         ExecutionActor {
-            context: self.context().bind(
-                Arc::clone(&self.local_keys),
-                self.store
-                    .handle()
-                    .claim_execution(EXEC_ID)
-                    .expect("execution writer"),
-                self.local_transport.clone() as Arc<dyn Transport + Sync>,
-            ),
+            context,
+            state,
             instance: None,
             messages,
             send_streams: HashMap::new(),
@@ -270,17 +278,15 @@ impl Fixture {
         &self,
         messages: mpsc::Sender<crate::SessionMessage>,
     ) -> ExecutionActor {
-        let mut actor = self.actor_with_messages(messages);
-        actor.ensure_execution().await.expect("execution");
-        let state = actor.load_state().await.expect("load activating state");
-        let outcome = actor
-            .context
-            .store
-            .activate(state.version(), 4)
+        let mut actor = self.actor_with_messages(messages).await;
+        let state = actor.state.clone();
+        let mut next = state.clone();
+        next.activate().expect("activate");
+        actor
+            .persist(next, Change::Activate)
             .await
-            .expect("activate");
-        assert!(matches!(outcome, ApplyOutcome::Committed { .. }));
-        actor.reload_resident().await.expect("restore resident");
+            .expect("persist activation");
+        actor.reconcile_resident().expect("restore resident");
         actor
     }
 
@@ -299,7 +305,7 @@ impl Fixture {
             .ensure_step_signature()
             .await
             .expect("local session signature");
-        let state = actor.load_state().await.expect("load session proposal");
+        let state = actor.state.clone();
         let proposal = state
             .pending_shared()
             .expect("pending session proposal")
@@ -324,26 +330,10 @@ impl Fixture {
             .into_iter()
             .next()
             .expect("remote session signature inbox");
-        let outcome = actor
-            .context
-            .store
-            .commit_step_signature(
-                state.version(),
-                ParticipantStepSignature::new(
-                    self.remote_keys.peer_id(),
-                    proposal.step,
-                    self.remote_execution_key().sign(&proposal.signing_bytes()),
-                ),
-                Some(inbox.inbox_id()),
-                11,
-            )
+        actor
+            .resolve_inbox_item(inbox)
             .await
             .expect("remote session signature");
-        assert!(matches!(outcome, ApplyOutcome::Committed { .. }));
-        actor
-            .reload_resident()
-            .await
-            .expect("promote session state");
         self.clear_outbox(actor).await;
     }
 
@@ -474,7 +464,7 @@ async fn valid_writer_message_divergence_preserves_the_unconsumed_inbox() {
         let (messages, _observations) = mpsc::channel(8);
         let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
         fixture.commit_session_started(&mut actor).await;
-        let before = actor.load_state().await.expect("active state");
+        let before = actor.state.clone();
         let source = fixture.remote_keys.peer_id();
         // The identity is valid even when the advertised result is wrong.
         let poststate = before.agreed_state();
@@ -506,7 +496,7 @@ async fn valid_writer_message_divergence_preserves_the_unconsumed_inbox() {
         assert!(reason.starts_with("diverged at step 1:"), "{reason}");
         assert!(reason.contains(cause), "{reason}");
         assert!(reason.len() <= arena0_protocol::MAX_TERMINAL_REASON_BYTES);
-        assert_eq!(actor.load_state().await.expect("unchanged state"), before);
+        assert_eq!(actor.state.clone(), before);
         assert_eq!(
             actor
                 .context
@@ -521,7 +511,7 @@ async fn valid_writer_message_divergence_preserves_the_unconsumed_inbox() {
             actor.fail_terminal(error).await,
             "failure must permit final delivery"
         );
-        let stopped = actor.load_state().await.expect("failed state");
+        let stopped = actor.state.clone();
         assert!(stopped.status().is_terminal());
         assert_eq!(stopped.step_cursor(), before.step_cursor());
     }
@@ -534,7 +524,7 @@ async fn invalid_messages_are_dropped_before_the_guest_can_diverge() {
         let (messages, _observations) = mpsc::channel(8);
         let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
         fixture.commit_session_started(&mut actor).await;
-        let before = actor.load_state().await.expect("active state");
+        let before = actor.state.clone();
         let source = fixture.remote_keys.peer_id();
         let seq = if invalid == "stale" {
             before.agreed_step() - 1
@@ -590,11 +580,7 @@ async fn invalid_messages_are_dropped_before_the_guest_can_diverge() {
                 .await
                 .expect("drop invalid frame");
         }
-        assert_eq!(
-            actor.load_state().await.expect("unchanged state"),
-            before,
-            "{invalid}"
-        );
+        assert_eq!(actor.state.clone(), before, "{invalid}");
         assert!(
             actor
                 .context
@@ -628,7 +614,7 @@ async fn peer_divergence_ends_the_writer_after_it_signed_its_proposal() {
                 .ensure_step_signature()
                 .await
                 .expect("sign writer proposal");
-            let state = actor.load_state().await.expect("signed proposal");
+            let state = actor.state.clone();
             let signatures = state
                 .pending_shared()
                 .expect("staged proposal")
@@ -808,7 +794,7 @@ async fn flat_dispatch_commits_local_state_in_the_resident() {
         .await
         .expect("dispatch local reaction");
     assert_eq!(accepted, DispatchOutcome::Committed);
-    let state = actor.load_state().await.expect("load committed state");
+    let state = actor.state.clone();
     assert_eq!(state.local_state().as_bytes(), &[9]);
     let instance = actor.instance.as_ref().expect("resident instance");
     assert_eq!(instance.committed_payloads().1.as_bytes(), &[9]);
@@ -829,7 +815,7 @@ async fn restart_resumes_a_durable_timer_and_accepted_inbox() {
     drop(actor);
 
     let (messages, _observations) = mpsc::channel(32);
-    let mut restarted = fixture.actor_with_messages(messages);
+    let mut restarted = fixture.actor_with_messages(messages).await;
     restarted
         .fire_due_timers()
         .await
@@ -844,7 +830,7 @@ async fn restart_resumes_a_durable_timer_and_accepted_inbox() {
             .is_empty()
     );
 
-    let state = restarted.load_state().await.expect("load state");
+    let state = restarted.state.clone();
     assert_eq!(state.local_state().as_bytes(), &[8]);
     let source = fixture.remote_keys.peer_id();
     let frame = message_frame(&state, source, state.agreed_step(), vec![1, 2, 3]);
@@ -894,13 +880,13 @@ async fn recovered_sdk_timers_dispatch_typed_and_unit_payloads() {
         drop(actor);
 
         let (messages, _observations) = mpsc::channel(8);
-        let mut restarted = fixture.actor_with_messages(messages);
+        let mut restarted = fixture.actor_with_messages(messages).await;
         restarted
             .fire_due_timers()
             .await
             .expect("fire recovered timer");
 
-        let state = restarted.load_state().await.expect("load timer state");
+        let state = restarted.state.clone();
         assert_eq!(state.local_state().as_bytes(), &[1], "{stem} timer handler");
         assert!(
             restarted
@@ -931,13 +917,7 @@ async fn restart_reannounces_committed_callout_once() {
                 .expect("dispatch callout"),
             DispatchOutcome::Committed
         );
-        actor
-            .load_state()
-            .await
-            .expect("load callout state")
-            .callout()
-            .expect("pending callout")
-            .id
+        actor.state.clone().callout().expect("pending callout").id
     };
     actor.progress().await.expect("deliver initial callout");
     let initial = std::iter::from_fn(|| first_observations.try_recv().ok())
@@ -956,7 +936,7 @@ async fn restart_reannounces_committed_callout_once() {
     drop(actor);
 
     let (messages, mut observations) = mpsc::channel(8);
-    let mut restarted = fixture.actor_with_messages(messages);
+    let mut restarted = fixture.actor_with_messages(messages).await;
     restarted.recover().await.expect("recover open callout");
     let mut found = None;
     while let Ok(message) = observations.try_recv() {
@@ -1012,11 +992,11 @@ async fn react_runs_with_an_open_callout_and_replaces_the_question() {
             .unwrap(),
         DispatchOutcome::Committed
     );
-    let before = actor.load_state().await.unwrap();
+    let before = actor.state.clone();
     let first = before.callout().unwrap().clone();
     assert_eq!(first.context, b"true");
     actor.progress().await.unwrap();
-    let after = actor.load_state().await.unwrap();
+    let after = actor.state.clone();
     assert_eq!(after.last_reacted_step(), Some(after.agreed_step() - 1));
     assert_eq!(after.callout().unwrap().context, b"null");
     assert_ne!(after.callout().unwrap().id, first.id);
@@ -1047,7 +1027,7 @@ async fn staged_result_preserves_callout_and_reports_agreement_pending() {
         .dispatch_event(Event::React, DispatchSource::default())
         .await
         .unwrap();
-    let before = actor.load_state().await.unwrap();
+    let before = actor.state.clone();
     let open = before.callout().unwrap().clone();
     let source = fixture.remote_keys.peer_id();
     let frame = message_frame(&before, source, before.agreed_step(), vec![1, 2, 3]);
@@ -1058,7 +1038,7 @@ async fn staged_result_preserves_callout_and_reports_agreement_pending() {
         .await
         .unwrap();
     actor.resolve_pending_inbox().await.unwrap();
-    let staged = actor.load_state().await.unwrap();
+    let staged = actor.state.clone();
     assert!(staged.pending_shared().is_some());
     assert_eq!(staged.callout(), Some(&open));
     assert!(matches!(
@@ -1075,7 +1055,7 @@ async fn staged_result_preserves_callout_and_reports_agreement_pending() {
             crate::ExecError::CalloutNotPending
         ))
     ));
-    assert_eq!(actor.load_state().await.unwrap(), staged);
+    assert_eq!(actor.state.clone(), staged);
 }
 
 #[tokio::test]
@@ -1092,7 +1072,7 @@ async fn rejected_callout_answer_preserves_pending_continuation_until_valid_inpu
         DispatchOutcome::Committed
     );
 
-    let before = actor.load_state().await.expect("load pending state");
+    let before = actor.state.clone();
     let pending_id = before.callout().expect("pending callout").id;
     let result = actor
         .submit_input(
@@ -1106,7 +1086,7 @@ async fn rejected_callout_answer_preserves_pending_continuation_until_valid_inpu
             if reason == "input handler rejected the answer"
     ));
 
-    let after_rejection = actor.load_state().await.expect("load rejected state");
+    let after_rejection = actor.state.clone();
     assert_eq!(after_rejection.version(), before.version());
     assert_eq!(after_rejection.event_position(), before.event_position());
     assert_eq!(after_rejection.shared_state(), before.shared_state());
@@ -1128,7 +1108,7 @@ async fn rejected_callout_answer_preserves_pending_continuation_until_valid_inpu
         )
         .await
         .expect("valid answer after rejection");
-    let committed = actor.load_state().await.expect("load committed answer");
+    let committed = actor.state.clone();
     assert!(committed.callout().is_none());
     assert!(!committed.status().is_terminal());
 }
@@ -1195,7 +1175,7 @@ async fn receipt_budget_failure_publishes_a_stop_report_that_survives_restart() 
     let mut actor = fixture.prepare_active_actor().await;
     fixture.commit_session_started(&mut actor).await;
     loop {
-        let before = actor.load_state().await.expect("agreed prefix");
+        let before = actor.state.clone();
         let frame = message_frame(
             &before,
             fixture.remote_keys.peer_id(),
@@ -1225,7 +1205,7 @@ async fn receipt_budget_failure_publishes_a_stop_report_that_survives_restart() 
             .apply_message(fixture.remote_keys.peer_id(), frame, Some(inbox.inbox_id()))
             .await;
         if let Err(error @ crate::ExecError::ReceiptBudgetExhausted { .. }) = result {
-            assert_eq!(actor.load_state().await.unwrap(), before);
+            assert_eq!(actor.state.clone(), before);
             assert!(before.agreed_step() > 1);
             assert!(actor.fail_terminal(error).await);
             break;
@@ -1235,7 +1215,7 @@ async fn receipt_budget_failure_publishes_a_stop_report_that_survives_restart() 
             .ensure_step_signature()
             .await
             .expect("local signature");
-        let staged = actor.load_state().await.unwrap();
+        let staged = actor.state.clone();
         let commitment = staged.pending_shared().unwrap().commitment().clone();
         actor
             .context
@@ -1253,10 +1233,10 @@ async fn receipt_budget_failure_publishes_a_stop_report_that_survives_restart() 
             .await
             .expect("accept peer signature");
         actor.resolve_pending_inbox().await.expect("certify step");
-        assert!(actor.load_state().await.unwrap().pending_shared().is_none());
+        assert!(actor.state.clone().pending_shared().is_none());
         fixture.clear_outbox(&mut actor).await;
     }
-    let stopped = actor.load_state().await.unwrap();
+    let stopped = actor.state.clone();
     let receipt_id = stopped
         .published_receipt_id()
         .expect("published failure report");
@@ -1323,8 +1303,12 @@ async fn terminal_observation_waits_for_final_step_delivery() {
     let (messages, mut observations) = mpsc::channel(8);
     let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
     fixture.commit_session_started(&mut actor).await;
+    assert!(matches!(
+        observations.try_recv(),
+        Ok(crate::SessionMessage::TraceAppended { step: 0 })
+    ));
 
-    let state = actor.load_state().await.expect("load active state");
+    let state = actor.state.clone();
     let frame = message_frame(
         &state,
         fixture.remote_keys.peer_id(),
@@ -1341,12 +1325,13 @@ async fn terminal_observation_waits_for_final_step_delivery() {
         .ensure_step_signature()
         .await
         .expect("commit local terminal-step signature");
-    let state = actor.load_state().await.expect("load terminal proposal");
+    let state = actor.state.clone();
     let proposal = state
         .pending_shared()
         .expect("terminal proposal")
         .commitment()
         .clone();
+    let proposal_step = proposal.step;
     let remote_step = ParticipantStepSignature::new(
         fixture.remote_keys.peer_id(),
         proposal.step,
@@ -1377,24 +1362,24 @@ async fn terminal_observation_waits_for_final_step_delivery() {
         .next()
         .expect("remote terminal-step signature inbox");
     actor
-        .context
-        .store
-        .commit_step_signature(state.version(), remote_step, Some(inbox.inbox_id()), 19)
+        .resolve_inbox_item(inbox)
         .await
         .expect("commit remote terminal-step signature");
+    assert!(
+        matches!(observations.try_recv(), Ok(crate::SessionMessage::TraceAppended { step }) if step == proposal_step)
+    );
     actor
-        .reload_resident()
-        .await
+        .reconcile_resident()
         .expect("promote terminal-step memories");
 
-    let ended = actor.load_state().await.expect("load certified end");
+    let ended = actor.state.clone();
     assert!(matches!(ended.status(), ExecutionStatus::Ended { .. }));
     assert!(
         actor
             .fail_terminal(crate::ExecError::Unavailable("peer disconnected".into()))
             .await
     );
-    let published = actor.load_state().await.expect("load preserved completion");
+    let published = actor.state.clone();
     assert!(matches!(
         published.status(),
         ExecutionStatus::Completed { .. }
@@ -1471,11 +1456,7 @@ async fn terminal_observation_waits_for_final_step_delivery() {
 async fn stale_abort_is_rejected_across_restart_and_signed_proposal_still_commits() {
     let fixture = Fixture::with_mode(false, GuestMode::Broadcast).await;
     let mut actor = fixture.prepare_active_actor().await;
-    let stale_cursor = actor
-        .load_state()
-        .await
-        .expect("load pre-session state")
-        .step_cursor();
+    let stale_cursor = actor.state.clone().step_cursor();
     fixture.commit_session_started(&mut actor).await;
     assert_eq!(
         actor
@@ -1488,7 +1469,7 @@ async fn stale_abort_is_rejected_across_restart_and_signed_proposal_still_commit
         .ensure_step_signature()
         .await
         .expect("sign local proposal");
-    let proposed = actor.load_state().await.expect("load signed proposal");
+    let proposed = actor.state.clone();
     let proposal = proposed
         .pending_shared()
         .expect("pending proposal after local signature");
@@ -1525,7 +1506,7 @@ async fn stale_abort_is_rejected_across_restart_and_signed_proposal_still_commit
     drop(actor);
 
     let (messages, _observations) = mpsc::channel(32);
-    let mut restarted = fixture.actor_with_messages(messages);
+    let mut restarted = fixture.actor_with_messages(messages).await;
     restarted.recover().await.expect("recover signed proposal");
     assert!(
         restarted
@@ -1536,10 +1517,7 @@ async fn stale_abort_is_rejected_across_restart_and_signed_proposal_still_commit
             .expect("list inbox after recovery")
             .is_empty()
     );
-    let recovered = restarted
-        .load_state()
-        .await
-        .expect("load recovered proposal");
+    let recovered = restarted.state.clone();
     assert_eq!(
         recovered
             .pending_shared()
@@ -1567,7 +1545,7 @@ async fn stale_abort_is_rejected_across_restart_and_signed_proposal_still_commit
         .resolve_pending_inbox()
         .await
         .expect("commit final signature");
-    let committed = restarted.load_state().await.expect("load committed state");
+    let committed = restarted.state.clone();
     assert!(committed.pending_shared().is_none());
     assert_eq!(committed.agreed_step(), 2);
 }
@@ -1578,11 +1556,7 @@ async fn react_handler_signs_with_the_participant_identity_key() {
     let (messages, _observations) = mpsc::channel(8);
     let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
     fixture.commit_session_started(&mut actor).await;
-    let position = actor
-        .load_state()
-        .await
-        .expect("load pre-sign state")
-        .event_position();
+    let position = actor.state.clone().event_position();
     assert_eq!(
         actor
             .dispatch_event(Event::React, DispatchSource::default())
@@ -1590,7 +1564,7 @@ async fn react_handler_signs_with_the_participant_identity_key() {
             .expect("dispatch local sign"),
         DispatchOutcome::Committed
     );
-    let state = actor.load_state().await.expect("load signed state");
+    let state = actor.state.clone();
     let (signed_bytes, signature): (Vec<u8>, Vec<u8>) =
         borsh::from_slice(state.local_state().as_bytes()).expect("decode sign result");
     let expected = GuestSignData::new(
@@ -1625,7 +1599,7 @@ async fn message_handler_cannot_sign() {
     let (messages, _observations) = mpsc::channel(8);
     let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
     fixture.commit_session_started(&mut actor).await;
-    let state = actor.load_state().await.expect("load active state");
+    let state = actor.state.clone();
     let source = fixture.local_keys.peer_id();
     let sequence = state.agreed_step();
     let frame = message_frame(&state, source, sequence, vec![4, 5, 6]);
@@ -1646,7 +1620,7 @@ async fn inbound_transport_ack_follows_durable_acceptance() {
     let (messages, _observations) = mpsc::channel(32);
     let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
     fixture.commit_session_started(&mut actor).await;
-    let state = actor.load_state().await.expect("load active state");
+    let state = actor.state.clone();
     let source = fixture.remote_keys.peer_id();
     let sequence = state.agreed_step() + 1;
     let frame = message_frame(&state, source, sequence, vec![4, 5, 6]);
@@ -1696,7 +1670,7 @@ async fn future_step_signature_waits_behind_the_current_proposal() {
     let mut actor = fixture.prepare_active_actor().await;
     fixture.commit_session_started(&mut actor).await;
 
-    let state = actor.load_state().await.expect("load session state");
+    let state = actor.state.clone();
     let source = fixture.remote_keys.peer_id();
     let sequence = state.agreed_step();
     assert!(
@@ -1710,7 +1684,7 @@ async fn future_step_signature_waits_behind_the_current_proposal() {
             .expect("stage current proposal")
     );
 
-    let state = actor.load_state().await.expect("load current proposal");
+    let state = actor.state.clone();
     let mut future_commitment = state
         .pending_shared()
         .expect("current proposal")
@@ -1749,8 +1723,12 @@ async fn trace_observation_waits_for_the_certified_step() {
     let (messages, mut observations) = mpsc::channel(8);
     let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
     fixture.commit_session_started(&mut actor).await;
+    assert!(matches!(
+        observations.try_recv(),
+        Ok(crate::SessionMessage::TraceAppended { step: 0 })
+    ));
 
-    let state = actor.load_state().await.expect("load session state");
+    let state = actor.state.clone();
     let source = fixture.remote_keys.peer_id();
     let sequence = state.agreed_step();
     assert!(
@@ -1778,9 +1756,8 @@ async fn trace_observation_waits_for_the_certified_step() {
     );
 
     let proposal = actor
-        .load_state()
-        .await
-        .expect("load partial proposal")
+        .state
+        .clone()
         .pending_shared()
         .expect("pending proposal")
         .commitment()
@@ -1813,7 +1790,7 @@ async fn trace_observation_waits_for_the_certified_step() {
         observations.try_recv().is_err(),
         "one certified commit must emit exactly one step"
     );
-    let state = actor.load_state().await.expect("load certified state");
+    let state = actor.state.clone();
     assert_eq!(state.agreed_step(), sequence + 1);
 }
 
@@ -1822,10 +1799,7 @@ async fn broadcast_outbox_has_only_remote_destinations_and_no_self_apply() {
     let fixture = Fixture::with_mode(false, GuestMode::Broadcast).await;
     let mut actor = fixture.prepare_active_actor().await;
     fixture.commit_session_started(&mut actor).await;
-    let before = actor
-        .load_state()
-        .await
-        .expect("load state before broadcast");
+    let before = actor.state.clone();
     assert_eq!(
         actor
             .dispatch_event(Event::React, DispatchSource::default())
@@ -1834,7 +1808,7 @@ async fn broadcast_outbox_has_only_remote_destinations_and_no_self_apply() {
         DispatchOutcome::Committed
     );
 
-    let state = actor.load_state().await.expect("load broadcast proposal");
+    let state = actor.state.clone();
     assert!(state.pending_shared().is_some());
     assert_eq!(state.agreed_step(), before.agreed_step());
     let leased = actor
@@ -2369,4 +2343,69 @@ fn wat_data(bytes: &[u8]) -> String {
         .map(|byte| format!("\\{byte:02x}"))
         .collect::<Vec<_>>()
         .join("")
+}
+
+#[tokio::test]
+async fn failed_persist_reloads_state_and_restores_resident_before_next_dispatch() {
+    let fixture = Fixture::new(false).await;
+    let mut actor = fixture.prepare_active_actor().await;
+    fixture.commit_session_started(&mut actor).await;
+    let before = actor.state.clone();
+    // Advance the durable owner without installing its result in the actor.
+    // A subsequent guest dispatch must hit the version tripwire and recover.
+    let mut durable = before.clone();
+    durable
+        .apply_dispatch(
+            &Event::TimerFired {
+                timer: arena0_protocol::TimerPayload::unit(),
+            },
+            before.shared_state().clone(),
+            arena0_program::LocalStateBytes::try_new(vec![7]).unwrap(),
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    actor
+        .context
+        .store
+        .persist(arena0_store::TransitionRecord {
+            expected: before.version(),
+            next: durable.clone(),
+            change: Change::Dispatch {
+                event: Event::TimerFired {
+                    timer: arena0_protocol::TimerPayload::unit(),
+                },
+                effects: vec![],
+                timer_id: None,
+                inbox_id: None,
+            },
+            now_ms: super::now_ms(),
+        })
+        .await
+        .unwrap();
+    let result = actor
+        .dispatch_event(Event::React, DispatchSource::default())
+        .await;
+    assert!(
+        result.is_err(),
+        "stale actor must not overwrite durable state"
+    );
+    assert_eq!(actor.state, durable);
+    let resident = actor.instance.as_ref().unwrap().committed_payloads();
+    assert_eq!(resident.0, durable.shared_state());
+    assert_eq!(resident.1, durable.local_state());
+    assert_eq!(
+        actor
+            .dispatch_event(Event::React, DispatchSource::default())
+            .await
+            .unwrap(),
+        DispatchOutcome::Committed
+    );
+    assert_eq!(actor.state.local_state().as_bytes(), &[9]);
+    assert_eq!(
+        actor.context.store.load_execution().await.unwrap().unwrap(),
+        actor.state
+    );
 }

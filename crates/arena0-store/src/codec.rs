@@ -117,18 +117,6 @@ pub(crate) fn decode_borsh<T: BorshDeserialize>(
         .map_err(|error| StoreError::Corruption(format!("{field} decode: {error}")))
 }
 
-pub(crate) fn encoded_len<T: BorshSerialize>(value: &T, max: usize) -> Result<usize, StoreError> {
-    let bytes = borsh::to_vec(value)
-        .map_err(|error| StoreError::Corruption(format!("value encode: {error}")))?;
-    if bytes.len() > max {
-        return Err(StoreError::CommandTooLarge {
-            required: bytes.len(),
-            capacity: max,
-        });
-    }
-    Ok(bytes.len())
-}
-
 pub(crate) fn activation_bytes(activation: &Activation) -> Result<Vec<u8>, StoreError> {
     borsh::to_vec(activation)
         .map_err(|error| StoreError::Corruption(format!("activation encode: {error}")))
@@ -167,12 +155,6 @@ pub(crate) fn decode_execution_salt(encoded: &[u8]) -> Result<ExecutionSalt, Sto
 pub(crate) fn max_program_bytes() -> Result<usize, StoreError> {
     usize::try_from(arena0_program::PROGRAM_MAX_LEN)
         .map_err(|_| StoreError::InvalidConfiguration("program size bound does not fit usize"))
-}
-
-pub(crate) fn frame_bytes(frame: &AuthenticatedFrame) -> Result<Vec<u8>, StoreError> {
-    let stored = canonical_frame_shape(&frame.frame)?;
-    borsh::to_vec(&stored)
-        .map_err(|error| StoreError::Corruption(format!("inbox frame encode: {error}")))
 }
 
 pub(crate) fn inbox_identity_bytes(

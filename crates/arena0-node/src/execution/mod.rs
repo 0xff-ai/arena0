@@ -2,7 +2,7 @@
 //!
 //! One private [`ExecutionActor`] owns the live guest and transport handles
 //! for an execution. The SQLite [`arena0_store::ExecutionStore`] remains the
-//! sole owner of durable protocol state; the sibling modules below organize
+//! persistence boundary for actor-computed state; the sibling modules below organize
 //! the actor by lifecycle and effect boundary.
 
 use std::collections::HashMap;
@@ -30,7 +30,6 @@ const STREAM_CAPACITY: usize = 64;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_TIMER_BATCH: usize = 16;
 const MAX_INBOX_BATCH: usize = 64;
-const MAX_CAS_RETRIES: usize = 8;
 
 /// Sole live owner of one loaded guest and its external capabilities.
 ///
@@ -38,6 +37,7 @@ const MAX_CAS_RETRIES: usize = 8;
 /// command and observation handles created by `spawn_execution`.
 struct ExecutionActor {
     context: ActorContext,
+    state: arena0_protocol::ExecutionState,
     /// The sole live Wasm instance for this execution.  The compiled
     /// `LoadedProgram` stays in `ActorContext` and may be shared by other
     /// actors, but this instance is execution-local and is only entered by

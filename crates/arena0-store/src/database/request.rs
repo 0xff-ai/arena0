@@ -1,7 +1,7 @@
 use super::*;
 
 impl Database {
-    pub(super) fn create_execution_request(
+    pub(crate) fn create_execution_request(
         &mut self,
         execution_id: ExecId,
         program_hash: ProgramHash,
@@ -55,14 +55,14 @@ impl Database {
         })
     }
 
-    pub(super) fn load_execution_request(
+    pub(crate) fn load_execution_request(
         &mut self,
         execution_id: ExecId,
     ) -> Result<Option<ExecutionRequest>, StoreError> {
         self.load_execution_request_in_transaction(execution_id)
     }
 
-    pub(super) fn bind_join_target(
+    pub(crate) fn bind_join_target(
         &mut self,
         execution_id: ExecId,
         target: NegotiationTarget,
@@ -178,7 +178,7 @@ impl Database {
         .transpose()
     }
 
-    pub(super) fn list_execution_requests(
+    pub(crate) fn list_execution_requests(
         &mut self,
         limit: usize,
     ) -> Result<Vec<ExecutionRequest>, StoreError> {
@@ -226,7 +226,7 @@ impl Database {
             .collect()
     }
 
-    pub(super) fn record_execution_request_failure(
+    pub(crate) fn record_execution_request_failure(
         &mut self,
         execution_id: ExecId,
         reason: String,

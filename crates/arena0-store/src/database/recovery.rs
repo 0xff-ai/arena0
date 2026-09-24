@@ -1,7 +1,7 @@
 use super::*;
 
 impl Database {
-    pub(super) fn list_recovery_candidates(
+    pub(crate) fn list_recovery_candidates(
         &mut self,
         cursor: RecoveryCursor,
         limit: usize,

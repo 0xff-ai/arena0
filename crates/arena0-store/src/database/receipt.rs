@@ -38,7 +38,7 @@ impl Database {
 
     /// Resolve this Host's own publication, including a unilateral stop report.
     /// Imported evidence for the same session cannot replace that local fact.
-    pub(super) fn load_receipt(
+    pub(crate) fn load_receipt(
         &mut self,
         session_id: SessionHash,
     ) -> Result<Option<StoredReceipt>, StoreError> {
@@ -52,7 +52,7 @@ impl Database {
         }
     }
 
-    pub(super) fn load_receipt_by_id(
+    pub(crate) fn load_receipt_by_id(
         &mut self,
         receipt_id: ReceiptId,
     ) -> Result<Option<StoredReceipt>, StoreError> {
@@ -132,7 +132,7 @@ impl Database {
             .transpose()
     }
 
-    pub(super) fn list_receipts(&mut self, limit: usize) -> Result<Vec<StoredReceipt>, StoreError> {
+    pub(crate) fn list_receipts(&mut self, limit: usize) -> Result<Vec<StoredReceipt>, StoreError> {
         let limit = i64::try_from(limit)
             .map_err(|_| StoreError::InvalidConfiguration("receipt limit is too large"))?;
         let mut statement = self
@@ -156,7 +156,7 @@ impl Database {
             .collect()
     }
 
-    pub(super) fn import_receipt(
+    pub(crate) fn import_receipt(
         &mut self,
         receipt: ReceiptArtifact,
         now_ms: u64,

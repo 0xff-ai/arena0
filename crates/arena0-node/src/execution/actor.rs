@@ -11,6 +11,7 @@ use arena0_protocol::{
     Committed, Ensemble, ExecLifecycle, ExecutionState, PeerIdSource, ReceiptWork, TicketAction,
 };
 use arena0_sandbox::{InitializeCall, ProgramInstance};
+use arena0_store::{Change, TransitionRecord};
 use arena0_transport::RecvHandle;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -29,17 +30,53 @@ pub(crate) fn spawn_execution(context: ActorContext, host: Arc<Host>) -> Spawned
     let (message_tx, message_rx) = mpsc::channel(COMMAND_CAPACITY);
     let (stream_tx, stream_rx) = mpsc::channel(STREAM_CAPACITY);
 
-    let actor = ExecutionActor {
-        context,
-        instance: None,
-        messages: message_tx,
-        send_streams: HashMap::new(),
-        inflight_send: None,
-        session_started_emitted: false,
-        terminal_emitted: false,
-        announced_callout: None,
-    };
-    let actor_task = tokio::spawn(actor.run(command_rx));
+    let actor_task = tokio::spawn(async move {
+        let mut context = context;
+        let (state, startup_error) = match ExecutionActor::ensure_execution(&mut context).await {
+            Ok(state) => (state, None),
+            Err(error) => {
+                // An existing execution still owns durable frame obligations.
+                // Keep the actor alive to publish and drain them on failure.
+                match context.store.load_execution().await {
+                    Ok(Some(state)) => (state, Some(error)),
+                    result => {
+                        let reason = super::truncate_reason(
+                            error.to_string(),
+                            arena0_protocol::MAX_TERMINAL_REASON_BYTES,
+                        );
+                        let recorded = match result {
+                            Ok(None) => context
+                                .store
+                                .record_execution_request_failure(reason.clone())
+                                .await
+                                .map(|_| ()),
+                            Err(error) => Err(error),
+                            Ok(Some(_)) => unreachable!(),
+                        };
+                        if let Err(error) = recorded {
+                            tracing::error!(exec_id = %context.exec_id, %error, "unable to record startup failure");
+                        }
+                        let _ = message_tx
+                            .send(crate::context::SessionMessage::Failed { reason })
+                            .await;
+                        return;
+                    }
+                }
+            }
+        };
+        let actor = ExecutionActor {
+            context,
+            state,
+            instance: None,
+            messages: message_tx,
+            send_streams: HashMap::new(),
+            inflight_send: None,
+            session_started_emitted: false,
+            terminal_emitted: false,
+            announced_callout: None,
+        };
+        actor.run(command_rx, startup_error).await;
+    });
     let stream_task = tokio::spawn(forward_streams(stream_rx, command_tx.clone()));
 
     SpawnedExec::new(
@@ -111,8 +148,15 @@ impl std::fmt::Debug for ExecutionActor {
 }
 
 impl ExecutionActor {
-    async fn run(mut self, mut commands: mpsc::Receiver<ExecCommand>) {
-        let recovered = self.recover().await;
+    async fn run(
+        mut self,
+        mut commands: mpsc::Receiver<ExecCommand>,
+        startup_error: Option<ExecError>,
+    ) {
+        let recovered = match startup_error {
+            Some(error) => Err(error),
+            None => self.recover().await,
+        };
         if !self.continue_after(recovered).await {
             return;
         }
@@ -210,12 +254,12 @@ impl ExecutionActor {
                 query,
                 reply,
             } => {
-                let result = self.query(query_index, query).await;
+                let result = self.query(query_index, query);
                 let _ = reply.send(result);
                 Ok(())
             }
             ExecCommand::View { viewport, reply } => {
-                let result = self.view(viewport).await;
+                let result = self.view(viewport);
                 let _ = reply.send(result);
                 Ok(())
             }
@@ -237,51 +281,48 @@ impl ExecutionActor {
 
     pub(super) async fn recover(&mut self) -> Result<(), ExecError> {
         self.context.store.recover_expired_leases(now_ms()).await?;
-        self.ensure_execution().await?;
 
         // Construct the resident only after the execution aggregate exists.
         // Recovery always starts from the committed state images; a pending
         // proposal remains durable evidence and is deliberately not installed
         // as live guest state while signatures are outstanding.
-        let state = self.load_state().await?;
-        self.restore_resident(&state)?;
-
-        let state = self.load_state().await?;
+        self.restore_resident()?;
+        let state = &self.state;
 
         if state.status().lifecycle() == ExecLifecycle::Activating {
-            // Activation is a store-owned lifecycle transition.  The direct
-            // store API supplies this operation once the execution writer has
-            // adopted the flat dispatch contract.
-            self.activate_execution(state.version()).await?;
+            let mut next = self.state.clone();
+            next.activate()?;
+            self.persist(next, Change::Activate).await?;
         }
 
         self.progress().await
     }
 
-    pub(super) async fn ensure_execution(&mut self) -> Result<(), ExecError> {
-        if self.context.identity.peer_id() != self.context.producer {
+    pub(super) async fn ensure_execution(
+        context: &mut ActorContext,
+    ) -> Result<ExecutionState, ExecError> {
+        if context.identity.peer_id() != context.producer {
             return Err(ExecError::InvalidState(
                 "actor identity and producer identity differ".into(),
             ));
         }
-        let request = self
-            .context
+        let request = context
             .store
             .load_execution_request()
             .await?
             .ok_or_else(|| {
                 ExecError::InvalidState("execution request is not durably recorded".into())
             })?;
-        if request.program_hash() != self.context.program.program().hash()
+        if request.program_hash() != context.program.program().hash()
             || request
                 .params()
-                .is_some_and(|params| params != &self.context.params)
+                .is_some_and(|params| params != &context.params)
         {
             return Err(ExecError::InvalidState(
                 "actor program or parameters differ from durable request".into(),
             ));
         }
-        let activation = self.context.store.load_activation().await?.ok_or_else(|| {
+        let activation = context.store.load_activation().await?.ok_or_else(|| {
             ExecError::InvalidState("execution activation is not durably committed".into())
         })?;
         let Some(durable_activation) = activation.activation() else {
@@ -289,7 +330,7 @@ impl ExecutionActor {
                 "execution activation is only prepared".into(),
             ));
         };
-        if durable_activation != &self.context.activation {
+        if durable_activation != &context.activation {
             return Err(ExecError::InvalidState(
                 "actor activation differs from durable activation".into(),
             ));
@@ -299,7 +340,7 @@ impl ExecutionActor {
                 .params()
                 .is_some_and(|params| durable_activation.offer().data().params != *params)
             || durable_activation.offer().data().execution_profile
-                != self.context.program.profile().hash()
+                != context.program.profile().hash()
         {
             return Err(ExecError::InvalidState(
                 "durable activation terms differ from the execution request or local profile"
@@ -309,7 +350,7 @@ impl ExecutionActor {
         let Some(local_ticket) = durable_activation
             .tickets()
             .iter()
-            .find(|ticket| ticket.data.signer == self.context.producer)
+            .find(|ticket| ticket.data.signer == context.producer)
         else {
             return Err(ExecError::InvalidState(
                 "durable activation has no ticket for the local producer".into(),
@@ -320,42 +361,45 @@ impl ExecutionActor {
                 "local producer ticket is not active".into(),
             ));
         };
-        if *execution_bls != self.context.execution_key.public_key() {
+        if *execution_bls != context.execution_key.public_key() {
             return Err(ExecError::InvalidState(
                 "execution signer does not match the local activation ticket".into(),
             ));
         }
-        if let Some(state) = self.context.store.load_execution().await? {
-            if state.producer() != self.context.producer
-                || state.binding().activation() != &self.context.activation
+        if let Some(state) = context.store.load_execution().await? {
+            if state.producer() != context.producer
+                || state.binding().activation() != &context.activation
             {
                 return Err(ExecError::InvalidState(
                     "durable execution binding differs from actor context".into(),
                 ));
             }
-            return Ok(());
+            return Ok(state);
         }
-        let initialized = self
-            .context
+        let initialized = context
             .program
-            .initialize(InitializeCall::new(self.context.params.clone()))?;
-        self.context
+            .initialize(InitializeCall::new(context.params.clone()))?;
+        context
             .store
             .create_execution(
-                self.context.activation.clone(),
-                self.context.producer,
+                context.activation.clone(),
+                context.producer,
                 initialized.shared,
                 initialized.local,
                 now_ms(),
             )
             .await?;
-        Ok(())
+        context
+            .store
+            .load_execution()
+            .await?
+            .ok_or(ExecError::NotFound(context.exec_id))
     }
 
     pub(super) async fn progress(&mut self) -> Result<(), ExecError> {
         let mut drove_events = false;
         let state = loop {
-            let state = self.load_state().await?;
+            let state = &self.state;
             match state.status().receipt_work() {
                 ReceiptWork::NotTerminal if drove_events => {
                     break state;
@@ -394,7 +438,7 @@ impl ExecutionActor {
     /// an observer-facing notification. A restart starts with no announcement
     /// and therefore re-announces the current callout once.
     async fn announce_callout(&mut self) -> Result<(), ExecError> {
-        let state = self.load_state().await?;
+        let state = &self.state;
         let Some(open) = state.callout() else {
             return Ok(());
         };
@@ -417,7 +461,7 @@ impl ExecutionActor {
     /// is published: an in-flight send is leased and a delayed retry is still
     /// pending, so either must settle before this actor reports completion.
     pub(super) async fn progress_terminal_boundary(&mut self) -> Result<(), ExecError> {
-        super::terminal::finalize_receipt(&mut self.context.store).await?;
+        self.finalize_receipt().await?;
         self.drain_outbox_report().await?;
         if self.context.store.has_unsettled_frames().await? {
             return Ok(());
@@ -425,23 +469,45 @@ impl ExecutionActor {
         self.emit_published_terminal().await
     }
 
-    pub(super) async fn load_state(&self) -> Result<ExecutionState, ExecError> {
-        self.context
-            .store
-            .load_execution()
-            .await?
-            .ok_or(ExecError::NotFound(self.context.exec_id))
+    pub(super) async fn persist(
+        &mut self,
+        next: ExecutionState,
+        change: Change,
+    ) -> Result<(), ExecError> {
+        let record = TransitionRecord {
+            expected: self.state.version(),
+            next: next.clone(),
+            change,
+            now_ms: now_ms(),
+        };
+        match self.context.store.persist(record).await {
+            Ok(()) => {
+                self.state = next;
+                Ok(())
+            }
+            Err(error) => {
+                self.instance = None;
+                self.state = self
+                    .context
+                    .store
+                    .load_execution()
+                    .await?
+                    .ok_or(ExecError::NotFound(self.context.exec_id))?;
+                self.restore_resident()?;
+                Err(error.into())
+            }
+        }
     }
 
     /// Construct or replace the execution-local resident from committed
     /// durable images.  Replacing the instance is required after an unknown
     /// store outcome; continuing with its candidate memory could duplicate a
     /// committed effect.
-    pub(super) fn restore_resident(&mut self, state: &ExecutionState) -> Result<(), ExecError> {
-        let instance = self
-            .context
-            .program
-            .resident(state.shared_state().clone(), state.local_state().clone())?;
+    pub(super) fn restore_resident(&mut self) -> Result<(), ExecError> {
+        let instance = self.context.program.resident(
+            self.state.shared_state().clone(),
+            self.state.local_state().clone(),
+        )?;
         self.instance = Some(instance);
         Ok(())
     }
@@ -450,19 +516,6 @@ impl ExecutionActor {
         self.instance.as_mut().ok_or_else(|| {
             ExecError::InvalidState("execution resident has not been initialized".into())
         })
-    }
-
-    /// Activate the durable aggregate.  This method is intentionally kept as
-    /// a node seam while the store owns the focused lifecycle transition.
-    async fn activate_execution(
-        &mut self,
-        expected_version: arena0_protocol::ExecutionVersion,
-    ) -> Result<(), ExecError> {
-        self.context
-            .store
-            .activate(expected_version, now_ms())
-            .await?;
-        Ok(())
     }
 
     pub(super) fn ensemble(&self) -> Ensemble<Committed> {

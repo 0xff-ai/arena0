@@ -1,7 +1,7 @@
 use super::*;
 
 impl Database {
-    pub(super) fn lease_next_outbox(
+    pub(crate) fn lease_next_outbox(
         &mut self,
         execution_id: ExecId,
         now_ms: u64,
@@ -14,8 +14,7 @@ impl Database {
         execution_id: ExecId,
         now_ms: u64,
     ) -> Result<Option<LeasedOutbox>, StoreError> {
-        self.load_execution_in_transaction(execution_id)?
-            .ok_or(StoreError::ExecutionNotFound(execution_id))?;
+        self.require_execution(execution_id)?;
         self.recover_expired_leases_in_transaction(Some(execution_id), now_ms)?;
         // Only the causal head of each destination lane is eligible. A live
         // lease or retry delay for one peer cannot block another peer.
@@ -156,13 +155,11 @@ impl Database {
     /// Return whether protocol-frame delivery for this execution is still
     /// unsettled. Acknowledged and cancelled rows are retained as delivery
     /// history, so only pending and leased rows count here.
-    pub(super) fn has_unsettled_frames(
+    pub(crate) fn has_unsettled_frames(
         &mut self,
         execution_id: ExecId,
     ) -> Result<bool, StoreError> {
-        let _ = self
-            .load_execution(execution_id)?
-            .ok_or(StoreError::ExecutionNotFound(execution_id))?;
+        self.require_execution(execution_id)?;
         let unsettled = self.connection.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM outbox
@@ -182,7 +179,7 @@ impl Database {
         }
     }
 
-    pub(super) fn acknowledge_outbox(
+    pub(crate) fn acknowledge_outbox(
         &mut self,
         execution_id: ExecId,
         outbox_id: OutboxId,
@@ -238,7 +235,7 @@ impl Database {
         }
     }
 
-    pub(super) fn retry_outbox(
+    pub(crate) fn retry_outbox(
         &mut self,
         execution_id: ExecId,
         outbox_id: OutboxId,
@@ -314,7 +311,7 @@ impl Database {
         }
     }
 
-    pub(super) fn recover_expired_leases(
+    pub(crate) fn recover_expired_leases(
         &mut self,
         execution_id: ExecId,
         now_ms: u64,
@@ -324,7 +321,7 @@ impl Database {
         })
     }
 
-    pub(super) fn recover_all_expired_leases(
+    pub(crate) fn recover_all_expired_leases(
         &mut self,
         now_ms: u64,
     ) -> Result<RecoveryReport, StoreError> {
@@ -356,15 +353,13 @@ impl Database {
         })
     }
 
-    pub(super) fn due_timers(
+    pub(crate) fn due_timers(
         &mut self,
         execution_id: ExecId,
         now_ms: u64,
         limit: usize,
     ) -> Result<Vec<ActiveTimer>, StoreError> {
-        let _ = self
-            .load_execution(execution_id)?
-            .ok_or(StoreError::ExecutionNotFound(execution_id))?;
+        self.require_execution(execution_id)?;
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -476,7 +471,7 @@ impl Database {
     pub(super) fn cancel_proposal_frames(
         &mut self,
         execution_id: ExecId,
-        proposal: &arena0_protocol::SharedProposal,
+        cursor: arena0_protocol::StepCursor,
     ) -> Result<(), StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT outbox_id, payload, status
@@ -493,7 +488,7 @@ impl Database {
             )?);
             let payload = row.get::<_, Vec<u8>>(1)?;
             let frame: ExecFrame = decode_borsh(&payload, "proposal frame")?;
-            if frame_matches_proposal(&frame, proposal) {
+            if frame_at_cursor(&frame, cursor) {
                 matching.push(outbox_id);
             }
         }
@@ -767,31 +762,18 @@ fn validate_outbox_payload(kind: OutboxPayloadKind, payload: &[u8]) -> Result<()
     Ok(())
 }
 
-fn frame_matches_proposal(frame: &ExecFrame, proposal: &arena0_protocol::SharedProposal) -> bool {
+// Stop clears the staged proposal from the resulting state. Its agreed
+// cursor still identifies every uncommitted frame to cancel; frames from
+// earlier certified steps must remain delivery obligations.
+fn frame_at_cursor(frame: &ExecFrame, cursor: arena0_protocol::StepCursor) -> bool {
     match frame {
-        ExecFrame::StepSignature { commitment, .. } => commitment == proposal.commitment(),
-        ExecFrame::Message {
-            message_id,
-            seq,
-            prestate,
-            poststate,
-            data,
-        } => {
-            let arena0_protocol::Event::MessageReceived {
-                message_id: expected_id,
-                position,
-                pre_state,
-                msg,
-                ..
-            } = &proposal.entry().event
-            else {
-                return false;
-            };
-            *message_id == *expected_id
-                && *seq == *position
-                && *prestate == *pre_state
-                && *poststate == proposal.entry().post_state
-                && data == msg
+        ExecFrame::StepSignature { commitment, .. } => {
+            commitment.step == cursor.next_step()
+                && commitment.pre_state == cursor.state_hash()
+                && commitment.link == cursor.chain_hash()
+        }
+        ExecFrame::Message { seq, prestate, .. } => {
+            *seq == cursor.next_step() && *prestate == cursor.state_hash()
         }
         ExecFrame::Abort { .. } => false,
     }

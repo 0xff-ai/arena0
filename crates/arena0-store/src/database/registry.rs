@@ -3,7 +3,7 @@ use arena0_crypto::CryptoError;
 use zeroize::Zeroizing;
 
 impl Database {
-    pub(super) fn load_or_create_execution_salt(
+    pub(crate) fn load_or_create_execution_salt(
         &mut self,
         execution_id: ExecId,
         now_ms: u64,
@@ -50,7 +50,7 @@ impl Database {
         })
     }
 
-    pub(super) fn register_program(
+    pub(crate) fn register_program(
         &mut self,
         hash: ProgramHash,
         wasm: Vec<u8>,
@@ -102,7 +102,7 @@ impl Database {
         Ok(ProgramStoreOutcome::Stored)
     }
 
-    pub(super) fn load_program(
+    pub(crate) fn load_program(
         &mut self,
         hash: ProgramHash,
     ) -> Result<Option<StoredProgram>, StoreError> {
@@ -126,7 +126,7 @@ impl Database {
         Ok(Some(StoredProgram { hash, wasm }))
     }
 
-    pub(super) fn list_programs(&mut self, limit: usize) -> Result<Vec<ProgramHash>, StoreError> {
+    pub(crate) fn list_programs(&mut self, limit: usize) -> Result<Vec<ProgramHash>, StoreError> {
         let limit = i64::try_from(limit)
             .map_err(|_| StoreError::InvalidConfiguration("program limit is too large"))?;
         let mut statement = self.connection.prepare(
@@ -146,7 +146,7 @@ impl Database {
         Ok(hashes)
     }
 
-    pub(super) fn remove_program(
+    pub(crate) fn remove_program(
         &mut self,
         hash: ProgramHash,
         now_ms: u64,

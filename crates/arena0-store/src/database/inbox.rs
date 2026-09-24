@@ -16,7 +16,7 @@ struct ValidatedInboxFrame {
 }
 
 impl Database {
-    pub(super) fn accept_inbound(
+    pub(crate) fn accept_inbound(
         &mut self,
         execution_id: ExecId,
         frame: AuthenticatedFrame,
@@ -70,14 +70,12 @@ impl Database {
         Ok(InboxAcceptOutcome::Accepted)
     }
 
-    pub(super) fn list_pending_inbox(
+    pub(crate) fn list_pending_inbox(
         &mut self,
         execution_id: ExecId,
         limit: usize,
     ) -> Result<Vec<PendingInboxItem>, StoreError> {
-        let state = self
-            .load_execution(execution_id)?
-            .ok_or(StoreError::ExecutionNotFound(execution_id))?;
+        self.require_execution(execution_id)?;
         let limit = i64::try_from(limit)
             .map_err(|_| StoreError::InvalidConfiguration("inbox limit is too large"))?;
         let mut statement = self.connection.prepare("SELECT inbox_id, source, digest, frame FROM inbox WHERE execution_id = ?1 AND status = 'accepted' ORDER BY inbox_id LIMIT ?2")?;
@@ -93,6 +91,12 @@ impl Database {
         }
         drop(rows);
         drop(statement);
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        let state = self
+            .load_execution(execution_id)?
+            .ok_or(StoreError::ExecutionNotFound(execution_id))?;
         let mut response_bytes = 0;
         values
             .into_iter()
@@ -119,7 +123,7 @@ impl Database {
             .collect()
     }
 
-    pub(super) fn reject_inbound(
+    pub(crate) fn reject_inbound(
         &mut self,
         execution_id: ExecId,
         inbox_id: InboxId,

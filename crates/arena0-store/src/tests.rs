@@ -73,8 +73,7 @@ async fn create_execution(path: &Path, fixture: &ActivationFixture, execution_id
         )
         .await
         .expect("execution");
-    writer
-        .activate(ExecutionVersion::ZERO, 6)
+    activate_record(&mut writer, ExecutionVersion::ZERO, 6)
         .await
         .expect("activate");
     drop(writer);
@@ -125,19 +124,19 @@ async fn sign_step(
         .clone();
     let producer_bls = BlsSecretKey::from_seed(&[11; 32]).expect("producer bls");
     let other_bls = BlsSecretKey::from_seed(&[12; 32]).expect("other bls");
-    writer
-        .commit_step_signature(
-            state.version(),
-            ParticipantStepSignature::new(
-                fixture.producer,
-                commitment.step,
-                producer_bls.sign(&commitment.signing_bytes()),
-            ),
-            None,
-            first_now_ms,
-        )
-        .await
-        .expect("producer step signature");
+    signature_record(
+        writer,
+        state.version(),
+        ParticipantStepSignature::new(
+            fixture.producer,
+            commitment.step,
+            producer_bls.sign(&commitment.signing_bytes()),
+        ),
+        None,
+        first_now_ms,
+    )
+    .await
+    .expect("producer step signature");
     let state = store
         .handle()
         .load_execution(execution_id)
@@ -150,17 +149,6 @@ async fn sign_step(
         commitment: commitment.clone(),
         signature: remote_signature,
     };
-    assert!(matches!(
-        writer
-            .commit_step_signature(
-                state.version(),
-                ParticipantStepSignature::new(remote, commitment.step, remote_signature),
-                None,
-                second_now_ms,
-            )
-            .await,
-        Err(StoreError::UnauthenticatedSource(_))
-    ));
     assert_eq!(
         writer
             .accept_inbound(remote, remote_frame.clone(), second_now_ms)
@@ -177,15 +165,15 @@ async fn sign_step(
         .find(|item| item.source() == remote && item.frame() == &remote_frame)
         .map(|item| item.inbox_id())
         .expect("peer step signature inbox");
-    writer
-        .commit_step_signature(
-            state.version(),
-            ParticipantStepSignature::new(remote, commitment.step, remote_signature),
-            Some(inbox_id),
-            second_now_ms,
-        )
-        .await
-        .expect("peer step signature");
+    signature_record(
+        writer,
+        state.version(),
+        ParticipantStepSignature::new(remote, commitment.step, remote_signature),
+        Some(inbox_id),
+        second_now_ms,
+    )
+    .await
+    .expect("peer step signature");
     store
         .handle()
         .load_execution(execution_id)
@@ -228,22 +216,22 @@ async fn certify_terminal(store: &Store, fixture: &ActivationFixture, execution_
         .expect("load active")
         .expect("active state");
     let (event, shared, local, effects, terminal_outcome) = terminal_dispatch(fixture);
-    writer
-        .commit_dispatch(
-            state.version(),
-            event,
-            shared,
-            local,
-            effects,
-            terminal_outcome,
-            None,
-            None,
-            None,
-            None,
-            7,
-        )
-        .await
-        .expect("proposal");
+    dispatch_record(
+        &mut writer,
+        state.version(),
+        event,
+        shared,
+        local,
+        effects,
+        terminal_outcome,
+        None,
+        None,
+        None,
+        None,
+        7,
+    )
+    .await
+    .expect("proposal");
     sign_step(store, fixture, execution_id, &mut writer, 8, 9).await;
     let state = store
         .handle()
@@ -254,29 +242,10 @@ async fn certify_terminal(store: &Store, fixture: &ActivationFixture, execution_
     assert!(matches!(state.status(), ExecutionStatus::Ended { .. }));
 }
 
-async fn publish_receipt(
-    store: &Store,
-    fixture: &ActivationFixture,
-    execution_id: ExecId,
-) -> ReceiptArtifact {
-    let mut writer = store
-        .handle()
-        .claim_execution(execution_id)
-        .expect("execution writer");
-    let state = store
-        .handle()
-        .load_execution(execution_id)
-        .await
-        .expect("load terminal")
-        .expect("terminal state");
-    writer
-        .publish_terminal(state.version(), 13)
-        .await
-        .expect("publish");
-    let key = fixture.activation.session_hash();
+async fn load_published_receipt(store: &Store, fixture: &ActivationFixture) -> ReceiptArtifact {
     store
         .handle()
-        .load_receipt(key)
+        .load_receipt(fixture.activation.session_hash())
         .await
         .expect("load receipt")
         .expect("receipt")
@@ -288,13 +257,13 @@ async fn publish_current(
     writer: &mut ExecutionStore,
     execution_id: ExecId,
     now_ms: u64,
-) -> Result<ApplyOutcome, StoreError> {
+) -> Result<ExecutionState, StoreError> {
     let state = store
         .handle()
         .load_execution(execution_id)
         .await?
         .ok_or(StoreError::ExecutionNotFound(execution_id))?;
-    writer.publish_terminal(state.version(), now_ms).await
+    publication_record(writer, state.version(), now_ms).await
 }
 
 fn receipt_with_different_content(receipt: &ReceiptArtifact) -> ReceiptArtifact {
@@ -419,7 +388,7 @@ fn explicit_admission(local: PeerId, negotiation_id: NegotiationId) -> Execution
 }
 
 #[tokio::test]
-async fn sqlite_owner_survives_reopen() {
+async fn shutdown_closes_handles_and_releases_process_lock() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("store.sqlite");
     let config = StoreConfig::new(&path, host(1));
@@ -428,9 +397,63 @@ async fn sqlite_owner_survives_reopen() {
         Store::open(config.clone()),
         Err(StoreError::AlreadyOwned { .. })
     ));
+    let handle = store.handle().clone();
+    let writer = handle.claim_execution(ExecId([1; 32])).expect("claim");
     store.shutdown().await.expect("shutdown");
+    assert!(matches!(
+        handle.load_user_agent().await,
+        Err(StoreError::Closed)
+    ));
+    assert!(matches!(
+        writer.load_execution().await,
+        Err(StoreError::Closed)
+    ));
     let reopened = Store::open(config).expect("reopen");
     reopened.shutdown().await.expect("shutdown reopened");
+}
+
+#[tokio::test]
+async fn failed_rollback_closes_store_calls() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("store.sqlite");
+    let store = Store::open(StoreConfig::new(&path, host(1))).expect("open");
+    let handle = store.handle().clone();
+    let (program, _) = handle.register_program(vec![1], 1).await.expect("program");
+    let mut writer = handle.claim_execution(ExecId([1; 32])).expect("claim");
+    let connection = Connection::open(&path).expect("fault injection connection");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER abort_request BEFORE INSERT ON exec_requests
+             BEGIN SELECT RAISE(ROLLBACK, 'injected rollback'); END;",
+        )
+        .expect("rollback trigger");
+
+    let result = writer
+        .create_execution_request(
+            program,
+            Some(JsonBytes::try_new(b"{}".to_vec()).expect("params")),
+            explicit_admission(host(1), NegotiationId([1; 32])),
+            2,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(StoreError::Corruption(reason)) if reason.contains("rollback failed"))
+    );
+    assert!(matches!(
+        handle.load_user_agent().await,
+        Err(StoreError::Closed)
+    ));
+    assert!(matches!(
+        writer.load_execution().await,
+        Err(StoreError::Closed)
+    ));
+    let count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM exec_requests", [], |row| row.get(0))
+        .expect("request count");
+    assert_eq!(count, 0);
+    drop(connection);
+    store.shutdown().await.expect("shutdown poisoned store");
+    let _reservation = Store::reserve(&path).expect("shutdown releases poisoned store lock");
 }
 
 #[tokio::test]
@@ -461,8 +484,8 @@ async fn reservation_holds_lock_before_open_and_releases_failed_open() {
 
     let reservation = Store::reserve(&path).expect("reserve after open failure");
     assert!(matches!(
-        reservation.open(StoreConfig::new(&path, host(1)).with_queue_capacity(0)),
-        Err(StoreError::InvalidConfiguration(_))
+        reservation.open(StoreConfig::new(&path, host(2))),
+        Err(StoreError::IdentityMismatch { .. })
     ));
     let store = Store::reserve(&path)
         .expect("failed open must release reservation")
@@ -1016,113 +1039,6 @@ async fn registry_remove_retains_content_and_reactivate_is_exact() {
     store.shutdown().await.expect("shutdown");
 }
 
-#[tokio::test]
-async fn queue_byte_budget_rejects_before_enqueue() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let config =
-        StoreConfig::new(directory.path().join("store.sqlite"), host(5)).with_queue_bytes(32);
-    let store = Store::open(config).expect("open");
-    let (reply, _response) = oneshot::channel();
-    let result = store
-        .handle()
-        .send(
-            Command::LoadExecution {
-                execution_id: ExecId([1; 32]),
-                reply,
-            },
-            33,
-        )
-        .await;
-    assert!(matches!(result, Err(StoreError::CommandTooLarge { .. })));
-    store.shutdown().await.expect("shutdown");
-}
-
-#[tokio::test]
-async fn dispatch_callout_counts_against_queue_budget_before_enqueue() {
-    let fixture = activation_fixture();
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("store.sqlite");
-    let execution_id = ExecId([0x76; 32]);
-    let store = create_execution(&path, &fixture, execution_id).await;
-    store.shutdown().await.unwrap();
-    let budget = 4096;
-    let store =
-        Store::open(StoreConfig::new(&path, fixture.producer).with_queue_bytes(budget)).unwrap();
-    let before = store
-        .handle()
-        .load_execution(execution_id)
-        .await
-        .unwrap()
-        .unwrap();
-    let mut writer = store.handle().claim_execution(execution_id).unwrap();
-    let callout = arena0_program::CalloutRequest {
-        callout_index: 0,
-        context: serde_json::to_vec(&"x".repeat(8192)).unwrap(),
-    };
-    let result = writer
-        .commit_dispatch(
-            before.version(),
-            session_started_event(&fixture),
-            before.shared_state().clone(),
-            before.local_state().clone(),
-            vec![],
-            None,
-            None,
-            None,
-            None,
-            Some(callout),
-            7,
-        )
-        .await;
-    assert!(
-        matches!(result, Err(StoreError::CommandTooLarge { required, capacity })
-        if required > budget && capacity == budget)
-    );
-    assert_eq!(
-        store
-            .handle()
-            .load_execution(execution_id)
-            .await
-            .unwrap()
-            .unwrap(),
-        before
-    );
-    // The same dispatch without its callout fits and reaches the real store operation.
-    assert!(matches!(
-        writer
-            .commit_dispatch(
-                before.version(),
-                session_started_event(&fixture),
-                before.shared_state().clone(),
-                before.local_state().clone(),
-                vec![],
-                None,
-                None,
-                None,
-                None,
-                None,
-                7,
-            )
-            .await
-            .unwrap(),
-        ApplyOutcome::Committed {
-            proposal_staged: true,
-            ..
-        }
-    ));
-    drop(writer);
-    store.shutdown().await.unwrap();
-}
-
-#[test]
-fn default_queue_budget_covers_maximal_program_command() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let config = StoreConfig::new(directory.path().join("store.sqlite"), host(5));
-    let maximal_program = usize::try_from(arena0_program::PROGRAM_MAX_LEN).expect("usize");
-    let required = maximal_program + 512;
-    assert!(config.queue_bytes >= required);
-}
-
 #[test]
 fn envelopes_reject_wrong_kind_oversize_and_tampering() {
     let encoded = envelope(EnvelopeKind::Program, b"x").expect("encode");
@@ -1330,10 +1246,10 @@ async fn recovery_projection_pages_a_maximal_execution_state() {
         SharedStateBytes::try_new(vec![0; MAX_SHARED_STATE_BYTES]).expect("maximal shared state");
     let fixture = activation_fixture_with_initial_state(initial_shared.clone());
     let directory = tempfile::tempdir().expect("tempdir");
-    let store = Store::open(
-        StoreConfig::new(directory.path().join("store.sqlite"), fixture.producer)
-            .with_queue_bytes(16 * 1024 * 1024),
-    )
+    let store = Store::open(StoreConfig::new(
+        directory.path().join("store.sqlite"),
+        fixture.producer,
+    ))
     .expect("open");
     let program_hash = ProgramHash::of(&fixture.program);
     store
@@ -1492,14 +1408,15 @@ async fn activation_prepare_commit_is_idempotent_and_recoverable() {
             .expect("execution"),
         CreateExecutionOutcome::Created(_)
     ));
-    assert!(matches!(
-        writer
-            .activate(ExecutionVersion::ZERO, 7)
+    let active = activate_record(&mut writer, ExecutionVersion::ZERO, 7)
+        .await
+        .expect("activate");
+    assert!(matches!(active.status(), ExecutionStatus::Active));
+    assert!(
+        activate_record(&mut writer, ExecutionVersion::new(1), 8)
             .await
-            .expect("activate"),
-        ApplyOutcome::Committed { .. }
-    ));
-    assert!(writer.activate(ExecutionVersion::new(1), 8).await.is_err());
+            .is_err()
+    );
     let state = store
         .handle()
         .load_execution(id)
@@ -1511,8 +1428,7 @@ async fn activation_prepare_commit_is_idempotent_and_recoverable() {
         context: vec![0xaa],
     };
     assert!(matches!(
-        writer
-            .commit_dispatch(
+        dispatch_record(&mut writer,
                 state.version(),
                 session_started_event(&fixture),
                 SharedStateBytes::try_new(vec![0]).expect("shared state"),
@@ -1530,10 +1446,7 @@ async fn activation_prepare_commit_is_idempotent_and_recoverable() {
             )
             .await
             .expect("arm timer"),
-        ApplyOutcome::Committed {
-            proposal_staged: true,
-            ..
-        }
+        state if state.pending_shared().is_some()
     ));
     drop(writer);
     let mut writer = store
@@ -1620,8 +1533,7 @@ async fn deferred_broadcast_commits_two_steps_at_one_event_position() {
         .expect("load active")
         .expect("active state");
     assert!(matches!(
-        writer
-            .commit_dispatch(
+        dispatch_record(&mut writer,
                 state.version(),
                 session_started_event(&fixture),
                 SharedStateBytes::try_new(vec![0]).expect("shared state"),
@@ -1639,10 +1551,7 @@ async fn deferred_broadcast_commits_two_steps_at_one_event_position() {
             )
             .await
             .expect("stage dispatch"),
-        ApplyOutcome::Committed {
-            proposal_staged: true,
-            ..
-        }
+        state if state.pending_shared().is_some()
     ));
     let proposed = store
         .handle()
@@ -1800,22 +1709,22 @@ async fn pending_proposal_leases_frames_but_withholds_local_effects() {
         .await
         .expect("load active")
         .expect("active state");
-    writer
-        .commit_dispatch(
-            state.version(),
-            session_started_event(&fixture),
-            SharedStateBytes::try_new(vec![0]).expect("shared state"),
-            LocalStateBytes::try_new(Vec::new()).expect("local state"),
-            Vec::new(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            7,
-        )
-        .await
-        .expect("stage initial event");
+    dispatch_record(
+        &mut writer,
+        state.version(),
+        session_started_event(&fixture),
+        SharedStateBytes::try_new(vec![0]).expect("shared state"),
+        LocalStateBytes::try_new(Vec::new()).expect("local state"),
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        7,
+    )
+    .await
+    .expect("stage initial event");
     let after_start = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
     let initial_signature = writer
         .lease_next_outbox(10)
@@ -1836,24 +1745,24 @@ async fn pending_proposal_leases_frames_but_withholds_local_effects() {
         context: vec![0x51],
     };
     let broadcast = vec![0x61, 0x62];
-    writer
-        .commit_dispatch(
-            after_start.version(),
-            Event::React,
-            SharedStateBytes::try_new(vec![0]).expect("shared state"),
-            LocalStateBytes::try_new(Vec::new()).expect("local state"),
-            vec![Effect::Broadcast {
-                data: broadcast.clone(),
-            }],
-            None,
-            None,
-            None,
-            None,
-            Some(callout),
-            10,
-        )
-        .await
-        .expect("stage broadcast proposal");
+    dispatch_record(
+        &mut writer,
+        after_start.version(),
+        Event::React,
+        SharedStateBytes::try_new(vec![0]).expect("shared state"),
+        LocalStateBytes::try_new(Vec::new()).expect("local state"),
+        vec![Effect::Broadcast {
+            data: broadcast.clone(),
+        }],
+        None,
+        None,
+        None,
+        None,
+        Some(callout),
+        10,
+    )
+    .await
+    .expect("stage broadcast proposal");
 
     let establishing = writer
         .lease_next_outbox(11)
@@ -1913,22 +1822,22 @@ async fn stopping_an_unsigned_proposal_cancels_exact_frames_and_recovers() {
         .await
         .expect("load active")
         .expect("active state");
-    writer
-        .commit_dispatch(
-            state.version(),
-            session_started_event(&fixture),
-            SharedStateBytes::try_new(vec![0]).expect("shared state"),
-            LocalStateBytes::try_new(Vec::new()).expect("local state"),
-            Vec::new(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            7,
-        )
-        .await
-        .expect("stage session start");
+    dispatch_record(
+        &mut writer,
+        state.version(),
+        session_started_event(&fixture),
+        SharedStateBytes::try_new(vec![0]).expect("shared state"),
+        LocalStateBytes::try_new(Vec::new()).expect("local state"),
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        7,
+    )
+    .await
+    .expect("stage session start");
     let after_start = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
     let start_frame = writer
         .lease_next_outbox(10)
@@ -1949,8 +1858,7 @@ async fn stopping_an_unsigned_proposal_cancels_exact_frames_and_recovers() {
 
     let data = vec![0xa1, 0xa2];
     assert!(matches!(
-        writer
-            .commit_dispatch(
+        dispatch_record(&mut writer,
                 after_start.version(),
                 Event::React,
                 SharedStateBytes::try_new(vec![0]).expect("shared state"),
@@ -1965,10 +1873,7 @@ async fn stopping_an_unsigned_proposal_cancels_exact_frames_and_recovers() {
             )
             .await
             .expect("stage broadcast proposal"),
-        ApplyOutcome::Committed {
-            proposal_staged: true,
-            ..
-        }
+        state if state.pending_shared().is_some()
     ));
     let proposed = store
         .handle()
@@ -2014,8 +1919,7 @@ async fn stopping_an_unsigned_proposal_cancels_exact_frames_and_recovers() {
         .clone()
         .with_signature(keys.sign(&unsigned.signing_bytes().expect("abort bytes")))
         .expect("signed abort");
-    writer
-        .stop_execution(proposed.version(), occurrence, None, 13)
+    stop_record(&mut writer, proposed.version(), occurrence, None, 13)
         .await
         .expect("stop unsigned proposal");
 
@@ -2123,8 +2027,7 @@ async fn portable_events_stage_agreement_without_shared_state_delta() {
         .expect("load active")
         .expect("active state");
     assert!(matches!(
-        writer
-            .commit_dispatch(
+        dispatch_record(&mut writer,
                 state.version(),
                 session_started_event(&fixture),
                 SharedStateBytes::try_new(vec![0]).expect("shared state"),
@@ -2139,10 +2042,7 @@ async fn portable_events_stage_agreement_without_shared_state_delta() {
             )
             .await
             .expect("stage session start"),
-        ApplyOutcome::Committed {
-            proposal_staged: true,
-            ..
-        }
+        state if state.pending_shared().is_some()
     ));
     let state = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
     assert_eq!(state.agreed_step(), 1);
@@ -2161,8 +2061,7 @@ async fn portable_events_stage_agreement_without_shared_state_delta() {
         &data,
     );
     assert!(matches!(
-        writer
-            .commit_dispatch(
+        dispatch_record(&mut writer,
                 state.version(),
                 Event::MessageReceived {
                     message_id,
@@ -2183,10 +2082,7 @@ async fn portable_events_stage_agreement_without_shared_state_delta() {
             )
             .await
             .expect("stage message"),
-        ApplyOutcome::Committed {
-            proposal_staged: true,
-            ..
-        }
+        state if state.pending_shared().is_some()
     ));
     let state = sign_step(&store, &fixture, execution_id, &mut writer, 11, 12).await;
     assert_eq!(state.agreed_step(), 2);
@@ -2232,22 +2128,22 @@ async fn terminal_agreement_clears_open_callout() {
         .await
         .expect("load active")
         .expect("active state");
-    writer
-        .commit_dispatch(
-            state.version(),
-            session_started_event(&fixture),
-            SharedStateBytes::try_new(vec![0]).expect("shared state"),
-            LocalStateBytes::try_new(Vec::new()).expect("local state"),
-            vec![],
-            None,
-            None,
-            None,
-            None,
-            Some(callout),
-            7,
-        )
-        .await
-        .expect("stage callout");
+    dispatch_record(
+        &mut writer,
+        state.version(),
+        session_started_event(&fixture),
+        SharedStateBytes::try_new(vec![0]).expect("shared state"),
+        LocalStateBytes::try_new(Vec::new()).expect("local state"),
+        vec![],
+        None,
+        None,
+        None,
+        None,
+        Some(callout),
+        7,
+    )
+    .await
+    .expect("stage callout");
     let waiting = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
 
     assert!(waiting.callout().is_some());
@@ -2265,30 +2161,30 @@ async fn terminal_agreement_clears_open_callout() {
         &data,
     );
     let outcome = vec![0x61, 0x62];
-    writer
-        .commit_dispatch(
-            after_waiting.version(),
-            Event::MessageReceived {
-                message_id,
-                from: fixture.producer,
-                position,
-                pre_state,
-                msg: data,
-            },
-            SharedStateBytes::try_new(vec![0]).expect("terminal shared state"),
-            LocalStateBytes::try_new(Vec::new()).expect("terminal local state"),
-            vec![Effect::SessionEnd {
-                outcome: outcome.clone(),
-            }],
-            Some(TerminalOutcome::new(outcome, br#"null"#.to_vec()).expect("terminal outcome")),
-            None,
-            None,
-            None,
-            None,
-            12,
-        )
-        .await
-        .expect("stage terminal agreement");
+    dispatch_record(
+        &mut writer,
+        after_waiting.version(),
+        Event::MessageReceived {
+            message_id,
+            from: fixture.producer,
+            position,
+            pre_state,
+            msg: data,
+        },
+        SharedStateBytes::try_new(vec![0]).expect("terminal shared state"),
+        LocalStateBytes::try_new(Vec::new()).expect("terminal local state"),
+        vec![Effect::SessionEnd {
+            outcome: outcome.clone(),
+        }],
+        Some(TerminalOutcome::new(outcome, br#"null"#.to_vec()).expect("terminal outcome")),
+        None,
+        None,
+        None,
+        None,
+        12,
+    )
+    .await
+    .expect("stage terminal agreement");
     let staged = store
         .handle()
         .load_execution(execution_id)
@@ -2326,25 +2222,25 @@ async fn authenticated_stop_clears_open_callout() {
         .await
         .expect("load active")
         .expect("active state");
-    writer
-        .commit_dispatch(
-            state.version(),
-            session_started_event(&fixture),
-            SharedStateBytes::try_new(vec![0]).expect("shared state"),
-            LocalStateBytes::try_new(Vec::new()).expect("local state"),
-            vec![],
-            None,
-            None,
-            None,
-            None,
-            Some(arena0_program::CalloutRequest {
-                callout_index: 0,
-                context: vec![0x71],
-            }),
-            7,
-        )
-        .await
-        .expect("stage callout");
+    dispatch_record(
+        &mut writer,
+        state.version(),
+        session_started_event(&fixture),
+        SharedStateBytes::try_new(vec![0]).expect("shared state"),
+        LocalStateBytes::try_new(Vec::new()).expect("local state"),
+        vec![],
+        None,
+        None,
+        None,
+        None,
+        Some(arena0_program::CalloutRequest {
+            callout_index: 0,
+            context: vec![0x71],
+        }),
+        7,
+    )
+    .await
+    .expect("stage callout");
     let waiting = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
     assert!(waiting.callout().is_some());
     let after_waiting = waiting;
@@ -2362,8 +2258,7 @@ async fn authenticated_stop_clears_open_callout() {
         .clone()
         .with_signature(keys.sign(&unsigned.signing_bytes().expect("abort bytes")))
         .expect("signed abort");
-    writer
-        .stop_execution(after_waiting.version(), occurrence, None, 12)
+    stop_record(&mut writer, after_waiting.version(), occurrence, None, 12)
         .await
         .expect("stop execution");
     let stopped = store
@@ -2407,44 +2302,44 @@ async fn answered_callout_stays_open_while_dispatch_proposal_is_staged() {
         .await
         .expect("load active")
         .expect("active state");
-    writer
-        .commit_dispatch(
-            state.version(),
-            session_started_event(&fixture),
-            SharedStateBytes::try_new(vec![0]).expect("shared state"),
-            LocalStateBytes::try_new(Vec::new()).expect("local state"),
-            vec![],
-            None,
-            None,
-            None,
-            None,
-            Some(callout),
-            7,
-        )
-        .await
-        .expect("stage callout");
+    dispatch_record(
+        &mut writer,
+        state.version(),
+        session_started_event(&fixture),
+        SharedStateBytes::try_new(vec![0]).expect("shared state"),
+        LocalStateBytes::try_new(Vec::new()).expect("local state"),
+        vec![],
+        None,
+        None,
+        None,
+        None,
+        Some(callout),
+        7,
+    )
+    .await
+    .expect("stage callout");
     let waiting = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
     let pending_id = waiting.callout().expect("pending callout").id;
 
-    writer
-        .commit_dispatch(
-            waiting.version(),
-            Event::InputReceived {
-                callout_index: 0,
-                data: vec![0x92],
-            },
-            SharedStateBytes::try_new(vec![1]).expect("updated shared state"),
-            LocalStateBytes::try_new(Vec::new()).expect("local state"),
-            vec![Effect::Broadcast { data: vec![0xa0] }],
-            None,
-            None,
-            None,
-            Some(pending_id),
-            None,
-            10,
-        )
-        .await
-        .expect("stage input proposal");
+    dispatch_record(
+        &mut writer,
+        waiting.version(),
+        Event::InputReceived {
+            callout_index: 0,
+            data: vec![0x92],
+        },
+        SharedStateBytes::try_new(vec![1]).expect("updated shared state"),
+        LocalStateBytes::try_new(Vec::new()).expect("local state"),
+        vec![Effect::Broadcast { data: vec![0xa0] }],
+        None,
+        None,
+        None,
+        Some(pending_id),
+        None,
+        10,
+    )
+    .await
+    .expect("stage input proposal");
     let proposed = store
         .handle()
         .load_execution(execution_id)
@@ -2487,22 +2382,22 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
         .await
         .expect("load active")
         .expect("active state");
-    writer
-        .commit_dispatch(
-            state.version(),
-            session_started_event(&fixture),
-            SharedStateBytes::try_new(vec![0]).expect("shared state"),
-            LocalStateBytes::try_new(Vec::new()).expect("local state"),
-            vec![],
-            None,
-            None,
-            None,
-            None,
-            Some(callout),
-            20,
-        )
-        .await
-        .expect("stage callout");
+    dispatch_record(
+        &mut writer,
+        state.version(),
+        session_started_event(&fixture),
+        SharedStateBytes::try_new(vec![0]).expect("shared state"),
+        LocalStateBytes::try_new(Vec::new()).expect("local state"),
+        vec![],
+        None,
+        None,
+        None,
+        None,
+        Some(callout),
+        20,
+    )
+    .await
+    .expect("stage callout");
     sign_step(&store, &fixture, execution_id, &mut writer, 21, 22).await;
     let pending_id = arena0_protocol::pending_id(execution_id, 0);
 
@@ -2523,25 +2418,25 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
         .await
         .expect("load waiting state")
         .expect("waiting state");
-    writer
-        .commit_dispatch(
-            state.version(),
-            Event::InputReceived {
-                callout_index: 0,
-                data: vec![0xfe],
-            },
-            SharedStateBytes::try_new(vec![0]).expect("shared state"),
-            LocalStateBytes::try_new(vec![2]).expect("local state"),
-            Vec::new(),
-            None,
-            None,
-            None,
-            Some(pending_id),
-            None,
-            24,
-        )
-        .await
-        .expect("consume callout");
+    dispatch_record(
+        &mut writer,
+        state.version(),
+        Event::InputReceived {
+            callout_index: 0,
+            data: vec![0xfe],
+        },
+        SharedStateBytes::try_new(vec![0]).expect("shared state"),
+        LocalStateBytes::try_new(vec![2]).expect("local state"),
+        Vec::new(),
+        None,
+        None,
+        None,
+        Some(pending_id),
+        None,
+        24,
+    )
+    .await
+    .expect("consume callout");
 
     let final_state = store
         .handle()
@@ -2594,22 +2489,22 @@ async fn accepted_inbound_signature_survives_restart_and_applies_once() {
         .claim_execution(execution_id)
         .expect("execution writer");
     let (event, shared, local, effects, terminal_outcome) = terminal_dispatch(&fixture);
-    writer
-        .commit_dispatch(
-            state.version(),
-            event,
-            shared,
-            local,
-            effects,
-            terminal_outcome,
-            None,
-            None,
-            None,
-            None,
-            7,
-        )
-        .await
-        .expect("stage shared proposal");
+    dispatch_record(
+        &mut writer,
+        state.version(),
+        event,
+        shared,
+        local,
+        effects,
+        terminal_outcome,
+        None,
+        None,
+        None,
+        None,
+        7,
+    )
+    .await
+    .expect("stage shared proposal");
     let proposed = store
         .handle()
         .load_execution(execution_id)
@@ -2662,16 +2557,16 @@ async fn accepted_inbound_signature_survives_restart_and_applies_once() {
         InboxAcceptOutcome::AlreadyAccepted
     );
     assert!(matches!(
-        writer
-            .commit_step_signature(
-                proposed.version(),
-                ParticipantStepSignature::new(source, commitment.step, signature),
-                Some(inbox_id),
-                10,
-            )
-            .await
-            .expect("apply accepted signature"),
-        ApplyOutcome::Committed { .. }
+        signature_record(
+            &mut writer,
+            proposed.version(),
+            ParticipantStepSignature::new(source, commitment.step, signature),
+            Some(inbox_id),
+            10,
+        )
+        .await
+        .expect("apply accepted signature"),
+        _
     ));
     assert!(
         writer
@@ -2959,12 +2854,12 @@ async fn receipt_is_published_from_durable_rows_after_restart() {
         .await
         .expect("load terminal state")
         .expect("terminal state");
+    let published = publication_record(&mut writer, state.version(), 12)
+        .await
+        .expect("publish");
     assert!(matches!(
-        writer
-            .publish_terminal(state.version(), 12)
-            .await
-            .expect("publish"),
-        ApplyOutcome::Committed { .. }
+        published.status(),
+        ExecutionStatus::Completed { .. }
     ));
     let state = store
         .handle()
@@ -2983,7 +2878,7 @@ async fn receipt_is_published_from_durable_rows_after_restart() {
     store.shutdown().await.expect("shutdown after assembly");
 
     let store = Store::open(StoreConfig::new(&path, fixture.producer)).expect("reopen published");
-    let receipt = publish_receipt(&store, &fixture, execution_id).await;
+    let receipt = load_published_receipt(&store, &fixture).await;
     let key = fixture.activation.session_hash();
     let by_id = store
         .handle()
@@ -3031,8 +2926,7 @@ async fn stopped_receipt_is_published_after_restart_and_verifies() {
         .handle()
         .claim_execution(execution_id)
         .expect("execution writer");
-    writer
-        .stop_execution(state.version(), occurrence, None, 7)
+    stop_record(&mut writer, state.version(), occurrence, None, 7)
         .await
         .expect("abort");
     drop(writer);
@@ -3052,13 +2946,9 @@ async fn stopped_receipt_is_published_after_restart_and_verifies() {
         .await
         .expect("load stopped state")
         .expect("stopped state");
-    assert!(matches!(
-        writer
-            .publish_terminal(state.version(), 8)
-            .await
-            .expect("publish stopped"),
-        ApplyOutcome::Committed { .. }
-    ));
+    publication_record(&mut writer, state.version(), 8)
+        .await
+        .expect("publish stopped");
     drop(writer);
     store
         .shutdown()
@@ -3066,7 +2956,7 @@ async fn stopped_receipt_is_published_after_restart_and_verifies() {
         .expect("shutdown after stopped publication");
 
     let store = Store::open(StoreConfig::new(&path, fixture.producer)).expect("reopen published");
-    let receipt = publish_receipt(&store, &fixture, execution_id).await;
+    let receipt = load_published_receipt(&store, &fixture).await;
     let encoded = receipt.encode().expect("encode receipt");
     let verified = ReceiptArtifact::decode(&encoded).expect("verify stopped receipt");
     assert!(matches!(
@@ -3109,8 +2999,7 @@ async fn persisted_receipt_tampering_fails_closed_on_restart() {
         .handle()
         .claim_execution(execution_id)
         .expect("execution writer");
-    writer
-        .stop_execution(state.version(), occurrence, None, 7)
+    stop_record(&mut writer, state.version(), occurrence, None, 7)
         .await
         .expect("abort");
     let state = store
@@ -3119,12 +3008,11 @@ async fn persisted_receipt_tampering_fails_closed_on_restart() {
         .await
         .expect("load stopped state")
         .expect("stopped state");
-    writer
-        .publish_terminal(state.version(), 8)
+    publication_record(&mut writer, state.version(), 8)
         .await
         .expect("publish stopped");
     drop(writer);
-    let published = publish_receipt(&store, &fixture, execution_id).await;
+    let published = load_published_receipt(&store, &fixture).await;
     store.shutdown().await.expect("shutdown");
 
     let connection = Connection::open(&path).expect("inspect");
@@ -3203,7 +3091,7 @@ async fn published_receipts_require_terminal_proof_and_production_rows_on_restar
             .await
             .expect("publish");
         drop(writer);
-        publish_receipt(&store, &fixture, execution_id).await;
+        load_published_receipt(&store, &fixture).await;
         store.shutdown().await.expect("shutdown");
 
         let connection = Connection::open(&path).expect("inspect");
@@ -3234,7 +3122,7 @@ async fn imported_receipt_is_durable_and_reimport_is_idempotent() {
         .await
         .expect("publish");
     drop(writer);
-    let receipt = publish_receipt(&produced, &fixture, ExecId([0x41; 32])).await;
+    let receipt = load_published_receipt(&produced, &fixture).await;
     produced.shutdown().await.expect("shutdown produced");
 
     let imported_host = other_peer(&fixture);
@@ -3358,7 +3246,7 @@ async fn imported_receipt_rejects_canonical_conflict_without_overwrite() {
         .await
         .expect("publish");
     drop(writer);
-    let receipt = publish_receipt(&produced, &fixture, ExecId([0x42; 32])).await;
+    let receipt = load_published_receipt(&produced, &fixture).await;
     produced.shutdown().await.expect("shutdown produced");
 
     let store = Store::open(StoreConfig::new(&path, other_peer(&fixture))).expect("open");
@@ -3404,7 +3292,7 @@ async fn exact_imported_receipt_is_promoted_by_local_publication() {
         .await
         .expect("publish");
     drop(writer);
-    let receipt = publish_receipt(&source, &fixture, ExecId([0x43; 32])).await;
+    let receipt = load_published_receipt(&source, &fixture).await;
     source.shutdown().await.expect("shutdown source");
 
     let imported = Store::open(StoreConfig::new(&target_path, fixture.producer)).expect("open");
@@ -3428,7 +3316,7 @@ async fn exact_imported_receipt_is_promoted_by_local_publication() {
         .await
         .expect("publish");
     drop(writer);
-    let published = publish_receipt(&target, &fixture, ExecId([0x44; 32])).await;
+    let published = load_published_receipt(&target, &fixture).await;
     assert_eq!(published, receipt);
     let stored = target
         .handle()
@@ -3474,7 +3362,7 @@ async fn locally_produced_receipt_import_retains_both_provenance() {
         .await
         .expect("publish");
     drop(writer);
-    let receipt = publish_receipt(&store, &fixture, execution_id).await;
+    let receipt = load_published_receipt(&store, &fixture).await;
 
     assert_eq!(
         store
@@ -3622,4 +3510,171 @@ fn previous_store_schema_is_rejected_without_rewriting_evidence() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(version, 1);
+}
+
+async fn activate_record(
+    writer: &mut ExecutionStore,
+    expected: ExecutionVersion,
+    now_ms: u64,
+) -> Result<ExecutionState, StoreError> {
+    let mut next = writer.load_execution().await?.expect("execution");
+    next.activate()?;
+    writer
+        .persist(TransitionRecord {
+            expected,
+            next: next.clone(),
+            change: Change::Activate,
+            now_ms,
+        })
+        .await?;
+    Ok(next)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_record(
+    writer: &mut ExecutionStore,
+    expected: ExecutionVersion,
+    event: Event<Vec<u8>>,
+    shared: SharedStateBytes,
+    local: LocalStateBytes,
+    effects: Vec<Effect>,
+    outcome: Option<TerminalOutcome>,
+    inbox_id: Option<InboxId>,
+    timer_id: Option<TimerId>,
+    pending_id: Option<arena0_protocol::PendingId>,
+    callout: Option<arena0_program::CalloutRequest>,
+    now_ms: u64,
+) -> Result<ExecutionState, StoreError> {
+    let mut next = writer.load_execution().await?.expect("execution");
+    next.apply_dispatch(
+        &event, shared, local, &effects, outcome, pending_id, callout,
+    )?;
+    writer
+        .persist(TransitionRecord {
+            expected,
+            next: next.clone(),
+            change: Change::Dispatch {
+                event,
+                effects,
+                inbox_id,
+                timer_id,
+            },
+            now_ms,
+        })
+        .await?;
+    Ok(next)
+}
+
+async fn signature_record(
+    writer: &mut ExecutionStore,
+    expected: ExecutionVersion,
+    signature: ParticipantStepSignature,
+    inbox_id: Option<InboxId>,
+    now_ms: u64,
+) -> Result<ExecutionState, StoreError> {
+    let mut next = writer.load_execution().await?.expect("execution");
+    let certified = next.add_step_signature(signature)?;
+    writer
+        .persist(TransitionRecord {
+            expected,
+            next: next.clone(),
+            change: Change::StepSignature {
+                certified,
+                inbox_id,
+            },
+            now_ms,
+        })
+        .await?;
+    Ok(next)
+}
+
+async fn stop_record(
+    writer: &mut ExecutionStore,
+    expected: ExecutionVersion,
+    occurrence: AbortOccurrence,
+    inbox_id: Option<InboxId>,
+    now_ms: u64,
+) -> Result<ExecutionState, StoreError> {
+    let mut next = writer.load_execution().await?.expect("execution");
+    next.stop(occurrence)?;
+    writer
+        .persist(TransitionRecord {
+            expected,
+            next: next.clone(),
+            change: Change::Stop { inbox_id },
+            now_ms,
+        })
+        .await?;
+    Ok(next)
+}
+
+async fn publication_record(
+    writer: &mut ExecutionStore,
+    expected: ExecutionVersion,
+    now_ms: u64,
+) -> Result<ExecutionState, StoreError> {
+    let mut next = writer.load_execution().await?.expect("execution");
+    let artifact = writer.assemble_receipt().await?;
+    next.publish_receipt(artifact.clone())?;
+    writer
+        .persist(TransitionRecord {
+            expected,
+            next: next.clone(),
+            change: Change::Publish { artifact },
+            now_ms,
+        })
+        .await?;
+    Ok(next)
+}
+
+#[tokio::test]
+async fn stale_transition_writes_neither_state_nor_side_rows() {
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("stale.sqlite");
+    let execution_id = ExecId([0x91; 32]);
+    let store = create_execution(&path, &fixture, execution_id).await;
+    let mut writer = store.handle().claim_execution(execution_id).unwrap();
+    let before = writer.load_execution().await.unwrap().unwrap();
+    let event = session_started_event(&fixture);
+    let mut next = before.clone();
+    next.apply_dispatch(
+        &event,
+        before.shared_state().clone(),
+        before.local_state().clone(),
+        &[],
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let result = writer
+        .persist(TransitionRecord {
+            expected: ExecutionVersion::ZERO,
+            next,
+            change: Change::Dispatch {
+                event,
+                effects: Vec::new(),
+                timer_id: None,
+                inbox_id: None,
+            },
+            now_ms: 10,
+        })
+        .await;
+    assert!(
+        matches!(result, Err(StoreError::Corruption(reason)) if reason == "execution version moved")
+    );
+    assert_eq!(writer.load_execution().await.unwrap().unwrap(), before);
+    let connection = Connection::open(&path).unwrap();
+    for table in ["event_records", "agreed_steps", "active_timers", "outbox"] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "stale transition wrote {table}");
+    }
+    drop(connection);
+    drop(writer);
+    store.shutdown().await.unwrap();
 }

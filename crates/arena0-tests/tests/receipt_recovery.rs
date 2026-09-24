@@ -90,8 +90,17 @@ async fn recover_after(cut: CrashAfter) {
             )
             .await
             .unwrap();
-        writer.activate(ExecutionVersion::ZERO, 6).await.unwrap();
-        let state = writer.load_execution().await.unwrap().unwrap();
+        let mut state = writer.load_execution().await.unwrap().unwrap();
+        state.activate().unwrap();
+        writer
+            .persist(arena0_store::TransitionRecord {
+                expected: ExecutionVersion::ZERO,
+                next: state.clone(),
+                change: arena0_store::Change::Activate,
+                now_ms: 6,
+            })
+            .await
+            .unwrap();
         let unsigned = AbortOccurrence::unsigned(
             activation.session_hash(),
             peers[0],
@@ -102,18 +111,32 @@ async fn recover_after(cut: CrashAfter) {
         )
         .unwrap();
         let signature = keys[0].sign(&unsigned.signing_bytes().unwrap());
+        let expected = state.version();
+        state
+            .stop(unsigned.with_signature(signature).unwrap())
+            .unwrap();
         writer
-            .stop_execution(
-                state.version(),
-                unsigned.with_signature(signature).unwrap(),
-                None,
-                7,
-            )
+            .persist(arena0_store::TransitionRecord {
+                expected,
+                next: state.clone(),
+                change: arena0_store::Change::Stop { inbox_id: None },
+                now_ms: 7,
+            })
             .await
             .unwrap();
         if matches!(cut, CrashAfter::Publication) {
-            let state = writer.load_execution().await.unwrap().unwrap();
-            writer.publish_terminal(state.version(), 8).await.unwrap();
+            let artifact = writer.assemble_receipt().await.unwrap();
+            let expected = state.version();
+            state.publish_receipt(artifact.clone()).unwrap();
+            writer
+                .persist(arena0_store::TransitionRecord {
+                    expected,
+                    next: state,
+                    change: arena0_store::Change::Publish { artifact },
+                    now_ms: 8,
+                })
+                .await
+                .unwrap();
         }
         // No actor runs between these durable mutations and the store close.
         // The reopened Host sees exactly the selected crash boundary.

@@ -4,7 +4,7 @@ use std::time::Instant;
 const PERFORMANCE_TARGET: &str = "arena0::performance";
 
 impl Database {
-    pub(super) fn is_poisoned(&self) -> bool {
+    pub(crate) fn is_poisoned(&self) -> bool {
         self.transaction_poison.is_some()
     }
 
@@ -14,19 +14,13 @@ impl Database {
                 "store transaction state is poisoned: {reason}"
             )));
         }
-        if self.pending_execution.is_some() {
-            return Err(StoreError::Corruption(
-                "execution update remained pending outside its transaction".into(),
-            ));
-        }
         self.connection.execute_batch("BEGIN IMMEDIATE")?;
         Ok(())
     }
 
-    /// Run one database operation inside the store's cache-aware transaction
-    /// boundary. Successful SQLite commit publishes the pending execution
-    /// snapshot; any operation or commit failure clears it, and a failed
-    /// rollback poisons the sole database owner.
+    /// Run one database operation in a SQLite transaction. An operation or
+    /// commit failure rolls it back; a failed rollback poisons the connection
+    /// so subsequent store calls fail closed.
     pub(super) fn transaction<T>(
         &mut self,
         operation: impl FnOnce(&mut Self) -> Result<T, StoreError>,
@@ -41,22 +35,12 @@ impl Database {
     pub(super) fn commit_result<T>(&mut self, value: T) -> Result<T, StoreError> {
         let started =
             tracing::enabled!(target: PERFORMANCE_TARGET, tracing::Level::DEBUG).then(Instant::now);
-        let correlation = self.pending_execution.as_ref().map(|pending| {
-            (
-                pending.state.execution_id(),
-                pending.state.version().get(),
-                pending.state.agreed_step(),
-                pending.encoded_bytes,
-            )
-        });
         if let Err(error) = self.connection.execute_batch("COMMIT") {
-            self.pending_execution = None;
             return match self.connection.execute_batch("ROLLBACK") {
                 Ok(()) => {
                     record_transaction(
                         started,
                         "sqlite_transaction_commit",
-                        correlation,
                         false,
                         "commit_failed_rolled_back",
                     );
@@ -68,7 +52,6 @@ impl Database {
                     record_transaction(
                         started,
                         "sqlite_transaction_commit",
-                        correlation,
                         false,
                         "commit_failed_poisoned",
                     );
@@ -76,40 +59,16 @@ impl Database {
                 }
             };
         }
-        if let Some(pending) = self.pending_execution.take() {
-            self.executions.insert(pending.state, pending.encoded_bytes);
-        }
-        record_transaction(
-            started,
-            "sqlite_transaction_commit",
-            correlation,
-            true,
-            "committed",
-        );
+        record_transaction(started, "sqlite_transaction_commit", true, "committed");
         Ok(value)
     }
 
     pub(super) fn rollback_result<T>(&mut self, error: StoreError) -> Result<T, StoreError> {
         let started =
             tracing::enabled!(target: PERFORMANCE_TARGET, tracing::Level::DEBUG).then(Instant::now);
-        let correlation = self.pending_execution.as_ref().map(|pending| {
-            (
-                pending.state.execution_id(),
-                pending.state.version().get(),
-                pending.state.agreed_step(),
-                pending.encoded_bytes,
-            )
-        });
-        self.pending_execution = None;
         match self.connection.execute_batch("ROLLBACK") {
             Ok(()) => {
-                record_transaction(
-                    started,
-                    "sqlite_transaction_rollback",
-                    correlation,
-                    true,
-                    "rolled_back",
-                );
+                record_transaction(started, "sqlite_transaction_rollback", true, "rolled_back");
                 Err(error)
             }
             Err(rollback) => {
@@ -118,7 +77,6 @@ impl Database {
                 record_transaction(
                     started,
                     "sqlite_transaction_rollback",
-                    correlation,
                     false,
                     "rollback_failed_poisoned",
                 );
@@ -131,31 +89,16 @@ impl Database {
 fn record_transaction(
     started: Option<Instant>,
     operation: &'static str,
-    correlation: Option<(ExecId, u64, u64, usize)>,
     success: bool,
     result_class: &'static str,
 ) {
     let Some(started) = started else {
         return;
     };
-    let (exec_id, version, agreed_step, encoded_size) = correlation
-        .map(|(exec_id, version, agreed_step, encoded_size)| {
-            (
-                Some(exec_id),
-                Some(version),
-                Some(agreed_step),
-                Some(encoded_size),
-            )
-        })
-        .unwrap_or((None, None, None, None));
     let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
     tracing::debug!(
         target: PERFORMANCE_TARGET,
         operation,
-        ?exec_id,
-        ?version,
-        ?agreed_step,
-        ?encoded_size,
         success,
         result_class,
         elapsed_us,
@@ -182,7 +125,6 @@ mod tests {
             record_transaction(
                 Some(Instant::now()),
                 "sqlite_transaction_commit",
-                Some((ExecId([1; 32]), 7, 3, 4096)),
                 true,
                 "committed",
             );
@@ -192,16 +134,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&text).expect("JSON trace line");
         assert_eq!(json["target"], PERFORMANCE_TARGET);
         let fields = json["fields"].as_object().expect("structured fields");
-        let allowed = [
-            "operation",
-            "exec_id",
-            "version",
-            "agreed_step",
-            "encoded_size",
-            "success",
-            "result_class",
-            "elapsed_us",
-        ];
+        let allowed = ["operation", "success", "result_class", "elapsed_us"];
         assert!(fields.keys().all(|field| allowed.contains(&field.as_str())));
         assert_eq!(fields["operation"], "sqlite_transaction_commit");
         assert_eq!(fields["success"], true);

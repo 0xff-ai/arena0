@@ -3,7 +3,7 @@
 //! One actor owns one resident [`ProgramInstance`]. Every mutating program
 //! event enters that instance through `arena0_dispatch`; this module validates
 //! the resulting state/effect boundary and hands the complete result to the
-//! store's one transactional `commit_dispatch` operation. The resident is
+//! store's transactional `persist` operation. The resident is
 //! never used as durable state: a proposal or an uncertain store reply always
 //! restores it from the committed images.
 
@@ -16,17 +16,13 @@ use arena0_protocol::{
     MessageId, ParticipantStepSignature, PeerIdSource, PendingId, SessionHash, StateHash,
     TerminalOutcome,
 };
-use arena0_sandbox::{
-    DispatchCall, GuestSigner, OutcomeCall, QueryCall, RandomReplay, ViewCall, WriterCall,
-};
-use arena0_store::{ApplyOutcome, InboxId};
+use arena0_sandbox::{DispatchCall, GuestSigner, OutcomeCall, QueryCall, ViewCall, WriterCall};
+use arena0_store::{Change, InboxId};
 use std::sync::Arc;
 
-use super::{ExecutionActor, MAX_CAS_RETRIES, MAX_TIMER_BATCH, now_ms};
+use super::{ExecutionActor, MAX_TIMER_BATCH, now_ms};
 
-/// Durable identities owned by the source of an event. The store validates
-/// that only the applicable identity is present and that it matches its
-/// authoritative inbox, timer, or committed open callout.
+/// Durable identities supplied by the actor's validated event source.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct DispatchSource {
     pub(super) inbox_id: Option<InboxId>,
@@ -118,7 +114,7 @@ impl ExecutionActor {
         pending_id: PendingId,
         data: JsonBytes,
     ) -> Result<(), SubmitInputError> {
-        let state = self.load_state().await?;
+        let state = &self.state;
         let Some(open) = state.callout() else {
             return Err(SubmitInputError::Expected(ExecError::CalloutNotPending));
         };
@@ -160,12 +156,8 @@ impl ExecutionActor {
         Ok(())
     }
 
-    pub(super) async fn query(
-        &self,
-        query_index: u32,
-        query: JsonBytes,
-    ) -> Result<JsonBytes, ExecError> {
-        let state = self.load_state().await?;
+    pub(super) fn query(&self, query_index: u32, query: JsonBytes) -> Result<JsonBytes, ExecError> {
+        let state = &self.state;
         let projection = self.context.program.query(QueryCall::new(
             state.shared_state().clone(),
             self.ensemble(),
@@ -175,11 +167,11 @@ impl ExecutionActor {
         Ok(projection.output)
     }
 
-    pub(super) async fn view(
+    pub(super) fn view(
         &self,
         viewport: JsonBytes,
     ) -> Result<(u64, arena0_protocol::View), ExecError> {
-        let state = self.load_state().await?;
+        let state = &self.state;
         let projection = self.context.program.view(ViewCall::new(
             state.shared_state().clone(),
             self.ensemble(),
@@ -192,12 +184,12 @@ impl ExecutionActor {
     }
 
     pub(super) async fn ensure_session_started(&mut self) -> Result<(), ExecError> {
-        let state = self.load_state().await?;
+        let state = &self.state;
         if state.status().lifecycle() != ExecLifecycle::Active
             || state.agreed_step() != 0
             || state.pending_shared().is_some()
         {
-            if self.session_start_is_durable(&state) {
+            if self.session_start_is_durable(state) {
                 self.emit_session_started().await?;
             }
             return Ok(());
@@ -263,7 +255,7 @@ impl ExecutionActor {
                 "execution frame is not a message".into(),
             ));
         };
-        let state = self.load_state().await?;
+        let state = &self.state;
         if state.status().is_terminal() {
             return Ok(false);
         }
@@ -296,7 +288,7 @@ impl ExecutionActor {
             }
             return Ok(false);
         }
-        if !self.writer_is(source, &state, &self.ensemble())? {
+        if !self.writer_is(source, state, &self.ensemble())? {
             if let Some(inbox_id) = inbox_id {
                 self.reject_inbound(inbox_id).await?;
             }
@@ -358,19 +350,17 @@ impl ExecutionActor {
         Ok(writer.and_then(|participant| ensemble.peer_at(participant)))
     }
 
-    /// Dispatch one flat event and persist the complete result. A frozen
-    /// boundary leaves the event unconsumed, while a guest rejection discards
-    /// the candidate and preserves the durable continuation. A compare-and-
-    /// set mismatch reloads the resident and retries with the recorded random
-    /// draws from the first invocation.
+    /// Apply an accepted dispatch to actor-owned state and persist it atomically.
+    /// Rejection restores the guest candidate; persistence failure reloads the
+    /// last durable state before any further transition.
     pub(super) async fn dispatch_event(
         &mut self,
         event: Event<Vec<u8>>,
         source: DispatchSource,
     ) -> Result<DispatchOutcome, ExecError> {
-        let mut replay = None;
-        for _ in 0..MAX_CAS_RETRIES {
-            let state = self.load_state().await?;
+        let mut next = self.state.clone();
+        {
+            let state = &next;
             if let Event::InputReceived { callout_index, .. } = &event
                 && !state.callout().is_some_and(|open| {
                     source.pending_id == Some(open.id) && *callout_index == open.callout_index
@@ -390,7 +380,7 @@ impl ExecutionActor {
                 self.discard_candidate()?;
                 return Ok(DispatchOutcome::Frozen);
             }
-            self.reconcile_resident(&state)?;
+            self.reconcile_resident()?;
 
             let call = {
                 let mut call = DispatchCall::new(
@@ -398,9 +388,6 @@ impl ExecutionActor {
                     self.ensemble(),
                     event.clone(),
                 );
-                if let Some(replay) = replay.clone() {
-                    call = call.with_random_replay(replay);
-                }
                 // Only local handlers may sign. `SessionStarted` is a
                 // pre-session dispatch and `MessageReceived` reproduces a
                 // peer's agreed result, so neither is offered a signer.
@@ -426,7 +413,7 @@ impl ExecutionActor {
                     // the durable image also covers a future sandbox error
                     // path that cannot prove its own rollback.
                     self.instance = None;
-                    self.restore_resident(&state)?;
+                    self.restore_resident()?;
                     let handler = match &event {
                         Event::InputReceived { .. } => Some("input"),
                         Event::MessageReceived { .. } => Some("message"),
@@ -547,84 +534,50 @@ impl ExecutionActor {
                     return Err(error);
                 }
             };
-            let random_draws = result.observations.random_draws;
             let candidate_local = result.local.clone();
-            let outcome = self
-                .context
-                .store
-                .commit_dispatch(
-                    state.version(),
-                    event.clone(),
-                    result.shared,
-                    result.local,
+            if let Err(error) = next.apply_dispatch(
+                &event,
+                result.shared,
+                result.local,
+                &effects,
+                terminal_outcome,
+                source.pending_id,
+                result.callout,
+            ) {
+                self.discard_candidate()?;
+                return Err(error.into());
+            }
+            let proposal_staged = next.pending_shared().is_some();
+            self.persist(
+                next,
+                Change::Dispatch {
+                    event,
                     effects,
-                    terminal_outcome,
-                    source.inbox_id,
-                    source.timer_id,
-                    source.pending_id,
-                    result.callout,
-                    now_ms(),
-                )
-                .await;
-            let outcome = match outcome {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    // Store reply loss is an unknown outcome. Never continue
-                    // with candidate Wasm memories after that boundary.
-                    self.restore_after_store_error().await;
-                    return Err(error.into());
-                }
-            };
-            match outcome {
-                ApplyOutcome::Committed {
-                    agreed_step,
-                    proposal_staged,
-                } => {
-                    if proposal_staged {
-                        self.discard_candidate()?;
-                    } else {
-                        let (shared, local) = match self.resident_mut()?.commit_payloads() {
-                            Ok(payloads) => payloads,
-                            Err(error) => {
-                                self.instance = None;
-                                self.reload_resident().await?;
-                                return Err(error.into());
-                            }
-                        };
-                        if shared != candidate_shared || local != candidate_local {
-                            self.reload_resident().await?;
-                            return Err(ExecError::InvalidState(
-                                "store committed payloads differ from the resident dispatch result"
-                                    .into(),
-                            ));
-                        }
+                    timer_id: source.timer_id,
+                    inbox_id: source.inbox_id,
+                },
+            )
+            .await?;
+            if proposal_staged {
+                self.discard_candidate()?;
+            } else {
+                let (shared, local) = match self.resident_mut()?.commit_payloads() {
+                    Ok(payloads) => payloads,
+                    Err(error) => {
+                        self.instance = None;
+                        self.reconcile_resident()?;
+                        return Err(error.into());
                     }
-                    self.emit_trace_appended(agreed_step).await;
-                    return Ok(DispatchOutcome::Committed);
-                }
-                ApplyOutcome::AlreadyApplied
-                | ApplyOutcome::InboxAlreadyApplied { .. }
-                | ApplyOutcome::InboxAlreadyConsumed { .. } => {
-                    self.discard_candidate()?;
-                    self.reload_resident().await?;
-                    return Ok(DispatchOutcome::Committed);
-                }
-                ApplyOutcome::VersionMismatch { .. } => {
-                    replay = Some(match RandomReplay::new(random_draws) {
-                        Ok(replay) => replay,
-                        Err(error) => {
-                            self.discard_candidate()?;
-                            return Err(ExecError::InvalidState(error.to_string()));
-                        }
-                    });
-                    self.discard_candidate()?;
-                    self.reload_resident().await?;
+                };
+                if shared != candidate_shared || local != candidate_local {
+                    self.reconcile_resident()?;
+                    return Err(ExecError::InvalidState(
+                        "committed payloads differ from the resident dispatch result".into(),
+                    ));
                 }
             }
+            Ok(DispatchOutcome::Committed)
         }
-        Err(ExecError::Unavailable(
-            "dispatch CAS retry limit exceeded".into(),
-        ))
     }
 
     /// Discard an uncommitted candidate. If the resident cannot restore its
@@ -641,12 +594,8 @@ impl ExecutionActor {
         restored
     }
 
-    pub(super) async fn reload_resident(&mut self) -> Result<(), ExecError> {
-        let state = self.load_state().await?;
-        self.reconcile_resident(&state)
-    }
-
-    fn reconcile_resident(&mut self, state: &ExecutionState) -> Result<(), ExecError> {
+    pub(super) fn reconcile_resident(&mut self) -> Result<(), ExecError> {
+        let state = &self.state;
         if self.instance.as_ref().is_some_and(|instance| {
             instance.committed_payloads().0 == state.shared_state()
                 && instance.committed_payloads().1 == state.local_state()
@@ -662,21 +611,7 @@ impl ExecutionActor {
             }
             restored
         } else {
-            self.restore_resident(state)
-        }
-    }
-
-    pub(super) async fn restore_after_store_error(&mut self) {
-        self.instance = None;
-        if let Ok(Some(state)) = self.context.store.load_execution().await
-            && let Err(error) = self.reconcile_resident(&state)
-        {
-            tracing::error!(
-                exec_id = %self.context.exec_id,
-                %error,
-                "unable to rebuild resident after unknown store outcome"
-            );
-            self.instance = None;
+            self.restore_resident()
         }
     }
 
@@ -733,50 +668,37 @@ impl ExecutionActor {
     }
 
     pub(super) async fn ensure_step_signature(&mut self) -> Result<(), ExecError> {
-        for _ in 0..MAX_CAS_RETRIES {
-            let state = self.load_state().await?;
-            let Some(proposal) = state.pending_shared() else {
-                return Ok(());
-            };
-            let signature = ParticipantStepSignature::new(
-                self.context.identity.peer_id(),
-                proposal.commitment().step,
-                self.context
-                    .execution_key
-                    .sign(&proposal.commitment().signing_bytes()),
-            );
-            let outcome = self
-                .context
-                .store
-                .commit_step_signature(state.version(), signature, None, now_ms())
-                .await;
-            let outcome = match outcome {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    self.restore_after_store_error().await;
-                    return Err(error.into());
-                }
-            };
-            match outcome {
-                ApplyOutcome::Committed { agreed_step, .. } => {
-                    self.reload_resident().await?;
-                    self.emit_trace_appended(agreed_step).await;
-                    return Ok(());
-                }
-                ApplyOutcome::AlreadyApplied
-                | ApplyOutcome::InboxAlreadyApplied { .. }
-                | ApplyOutcome::InboxAlreadyConsumed { .. } => {
-                    self.reload_resident().await?;
-                    return Ok(());
-                }
-                ApplyOutcome::VersionMismatch { .. } => {
-                    self.reload_resident().await?;
-                }
-            }
+        let Some(proposal) = self.state.pending_shared() else {
+            return Ok(());
+        };
+        if proposal
+            .signatures()
+            .iter()
+            .any(|signature| signature.participant() == self.context.identity.peer_id())
+        {
+            return Ok(());
         }
-        Err(ExecError::Unavailable(
-            "step signature CAS retry limit exceeded".into(),
-        ))
+        let signature = ParticipantStepSignature::new(
+            self.context.identity.peer_id(),
+            proposal.commitment().step,
+            self.context
+                .execution_key
+                .sign(&proposal.commitment().signing_bytes()),
+        );
+        let mut next = self.state.clone();
+        let certified = next.add_step_signature(signature)?;
+        let agreed_step = certified.as_ref().map(|proposal| proposal.entry().step);
+        self.persist(
+            next,
+            Change::StepSignature {
+                certified,
+                inbox_id: None,
+            },
+        )
+        .await?;
+        self.reconcile_resident()?;
+        self.emit_trace_appended(agreed_step).await;
+        Ok(())
     }
 
     pub(super) async fn emit_trace_appended(&mut self, step: Option<u64>) {
