@@ -533,8 +533,9 @@ Its `PendingId` is derived from the execution and event position and is encoded
 as a little-endian `u64` in Borsh and a decimal JSON string. The runtime
 announces the current open callout from execution state. A callout answer names
 that exact ID; the actor keeps the callout open while its answered result awaits
-agreement and replaces it only when the resulting state derives a different
-index or context.
+agreement. An accepted answer consumes the ID, so a question asked again after
+an answer gets a fresh one. Any other handler keeps the ID while the state
+derives the same index and context, and replaces it when they differ.
 
 Direct messages are a future delivery extension. It would use per-recipient
 sequence numbers, a small queue of unacknowledged sends whose payload remains in
