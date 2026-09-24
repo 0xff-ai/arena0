@@ -38,6 +38,7 @@ fn event_host(id: &str) -> HostInfo {
 
 fn active_status() -> ExecStatus {
     ExecStatus {
+        end: Default::default(),
         exec_id: arena0_client::protocol::ExecId([0x11; 32]),
         negotiation_id: Some(arena0_client::protocol::NegotiationId([0x22; 32])),
         program_id: arena0_client::protocol::ProgramHash([0x33; 32]),

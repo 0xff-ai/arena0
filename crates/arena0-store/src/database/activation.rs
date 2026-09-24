@@ -186,7 +186,7 @@ impl Database {
             let payload = open_envelope(
                 EnvelopeKind::PreparedActivation,
                 &prepared_bytes,
-                MAX_FRAME_BYTES,
+                MAX_ACTIVATION_BYTES,
             )?;
             let prepared: PreparedActivation = decode_borsh(&payload, "prepared activation")?;
             prepared
@@ -206,7 +206,8 @@ impl Database {
             }
             let committed = committed_bytes
                 .map(|bytes| {
-                    let payload = open_envelope(EnvelopeKind::Activation, &bytes, MAX_FRAME_BYTES)?;
+                    let payload =
+                        open_envelope(EnvelopeKind::Activation, &bytes, MAX_ACTIVATION_BYTES)?;
                     let activation: Activation = decode_borsh(&payload, "activation")?;
                     activation
                         .validate()
@@ -332,8 +333,8 @@ impl Database {
                 .ok_or_else(|| {
                     StoreError::Corruption("activation conflict has no owning activation".into())
                 })?;
-            let existing = open_envelope(kind, &existing, MAX_FRAME_BYTES)?;
-            let incoming = open_envelope(kind, &incoming, MAX_FRAME_BYTES)?;
+            let existing = open_envelope(kind, &existing, MAX_ACTIVATION_BYTES)?;
+            let incoming = open_envelope(kind, &incoming, MAX_ACTIVATION_BYTES)?;
             match kind {
                 EnvelopeKind::PreparedActivation => {
                     let existing: PreparedActivation =

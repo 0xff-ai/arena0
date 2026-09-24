@@ -98,6 +98,8 @@ impl AcceptedExecStream {
 /// A receiver-side decision that does not grant durable responsibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecDeliveryRejection {
+    /// The receiver has not reached the frame's prerequisite state.
+    NotYet,
     /// The receiver declined the frame without a conflicting durable record.
     Rejected,
     /// The frame conflicts with an existing durable record.
@@ -106,6 +108,7 @@ pub enum ExecDeliveryRejection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecDeliveryFailure {
+    NotYet,
     Rejected,
     Conflict,
     ReceiverDropped,
@@ -138,6 +141,7 @@ impl ExecDeliveryReceipt {
             return Err(TransportError::ConnectionClosed);
         };
         let failure = match rejection {
+            ExecDeliveryRejection::NotYet => ExecDeliveryFailure::NotYet,
             ExecDeliveryRejection::Rejected => ExecDeliveryFailure::Rejected,
             ExecDeliveryRejection::Conflict => ExecDeliveryFailure::Conflict,
         };
@@ -315,26 +319,32 @@ impl SendHandle {
             )));
         }
         let frame = Codec::new(StreamProtocol::Exec.max_frame_body()).encode(&wire)?;
-        let (responsibility, receipt) = oneshot::channel();
+        let (responsibility, mut receipt) = oneshot::channel();
         self.send_packet(StreamPacket {
             bytes: frame,
             responsibility: Some(responsibility),
         })
         .await?;
-        if self.state.is_closed() {
-            return Err(TransportError::ConnectionClosed);
-        }
         let mut closed = self.state.subscribe();
+        // A receiver may complete the receipt and immediately close its stream.
+        // That completed decision remains authoritative after closure.
         match tokio::select! {
-            result = receipt => result,
-            result = closed.changed() => {
-                let _ = result;
-                return Err(TransportError::ConnectionClosed);
+            biased;
+            result = &mut receipt => result,
+            () = async {
+                if !self.state.is_closed() {
+                    let _ = closed.changed().await;
+                }
+            } => {
+                match receipt.try_recv() {
+                    Ok(outcome) => Ok(outcome),
+                    Err(_) => return Err(TransportError::ConnectionClosed),
+                }
             }
         } {
-            Ok(Ok(_)) if self.state.is_closed() => Err(TransportError::ConnectionClosed),
             Ok(Ok(outcome)) => Ok(outcome),
             Ok(Err(ExecDeliveryFailure::Rejected)) => Err(TransportError::ExecRejected),
+            Ok(Err(ExecDeliveryFailure::NotYet)) => Err(TransportError::ExecNotYet),
             Ok(Err(ExecDeliveryFailure::Conflict)) => Err(TransportError::ExecConflict),
             Ok(Err(ExecDeliveryFailure::ReceiverDropped)) => {
                 Err(TransportError::ExecReceiverDropped)
@@ -393,7 +403,7 @@ impl SendHandle {
                 "execution handle has no session binding".into(),
             ));
         };
-        validate_exec_route(frame, session_hash, self.local)
+        validate_exec_route(frame, session_hash)
     }
 }
 
@@ -535,17 +545,23 @@ impl RecvHandle {
                 "execution handle has no session binding".into(),
             ));
         };
-        validate_exec_route(frame, session_hash, self.remote)
+        validate_exec_route(frame, session_hash)
     }
 }
 
 fn validate_exec_route(
     frame: &DomainExecFrame,
     session_hash: SessionHash,
-    authenticated_sender: PeerId,
 ) -> Result<(), TransportError> {
     match frame {
         DomainExecFrame::Message { .. } => {}
+        DomainExecFrame::StepCertificate { certificate } => {
+            if certificate.commitment().session_id != session_hash {
+                return Err(TransportError::ProtocolMismatch(
+                    "step certificate does not match the execution stream session".into(),
+                ));
+            }
+        }
         DomainExecFrame::StepSignature { commitment, .. } => {
             if commitment.session_id != session_hash {
                 return Err(TransportError::ProtocolMismatch(
@@ -559,11 +575,8 @@ fn validate_exec_route(
                     "abort does not match the execution stream session".into(),
                 ));
             }
-            if occurrence.sender() != authenticated_sender {
-                return Err(TransportError::ProtocolMismatch(
-                    "abort sender does not match the authenticated stream peer".into(),
-                ));
-            }
+            // Adopted occurrences may be forwarded. The actor authenticates
+            // their original signer against the committed session binding.
         }
     }
     Ok(())

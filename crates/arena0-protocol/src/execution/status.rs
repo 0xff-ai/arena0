@@ -28,7 +28,7 @@ pub enum ExecutionStatus {
     /// the resulting state image, not inside this status.
     Active,
     /// The final SessionEnd step is certified and awaits receipt publication.
-    Ended { outcome: TerminalOutcome },
+    Certified { outcome: TerminalOutcome },
     /// Completion evidence has been published.
     Completed {
         outcome: TerminalOutcome,
@@ -161,7 +161,7 @@ impl ExecutionStatus {
     pub const fn receipt_work(&self) -> ReceiptWork {
         match self {
             Self::Activating | Self::Active => ReceiptWork::NotTerminal,
-            Self::Ended { .. } | Self::Stopped { .. } => ReceiptWork::Assemble,
+            Self::Certified { .. } | Self::Stopped { .. } => ReceiptWork::Assemble,
             Self::Completed { .. } | Self::StoppedPublished { .. } => ReceiptWork::Published,
         }
     }
@@ -171,7 +171,7 @@ impl ExecutionStatus {
     pub const fn lifecycle(&self) -> ExecLifecycle {
         match self {
             Self::Activating => ExecLifecycle::Activating,
-            Self::Active | Self::Ended { .. } => ExecLifecycle::Active,
+            Self::Active | Self::Certified { .. } => ExecLifecycle::Active,
             Self::Completed { .. } => ExecLifecycle::Completed,
             Self::Stopped { cause } | Self::StoppedPublished { cause, .. } => match cause.kind() {
                 AbortKind::Fail => ExecLifecycle::Failed,
@@ -255,7 +255,7 @@ impl ExecutionStatus {
     ) -> Result<(), ProtocolError> {
         match self {
             Self::Activating | Self::Active => Ok(()),
-            Self::Ended { outcome } | Self::Completed { outcome, .. } => {
+            Self::Certified { outcome } | Self::Completed { outcome, .. } => {
                 outcome.validate()?;
                 if agreed.next_step() == 0 {
                     return Err(ProtocolError::InvalidTerminalStatus);

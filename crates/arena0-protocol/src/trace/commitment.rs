@@ -229,8 +229,8 @@ impl SignerSet {
 }
 
 /// The recorded agreement at one step: the BLS aggregate over the signing participants
-/// plus a bitmap of who signed. Computed and stored locally; never re-emitted to
-/// the network. Replaces the per-co-participant `Vec<Agreement>`.
+/// plus a bitmap of who signed. Certificate frames carry this same evidence
+/// so a peer can commit a staged step without collecting each signature again.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AggregateAttestation {
     /// Aggregate of the signers' `StepCommitment` signatures. The separate

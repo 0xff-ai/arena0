@@ -17,7 +17,7 @@ use arena0_protocol::{
     TerminalOutcome,
 };
 use arena0_sandbox::{DispatchCall, GuestSigner, OutcomeCall, QueryCall, ViewCall, WriterCall};
-use arena0_store::{Change, InboxId};
+use arena0_store::Change;
 use std::sync::Arc;
 
 use super::{ExecutionActor, MAX_TIMER_BATCH, now_ms};
@@ -25,7 +25,6 @@ use super::{ExecutionActor, MAX_TIMER_BATCH, now_ms};
 /// Durable identities supplied by the actor's validated event source.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct DispatchSource {
-    pub(super) inbox_id: Option<InboxId>,
     pub(super) timer_id: Option<arena0_protocol::TimerId>,
     pub(super) pending_id: Option<PendingId>,
     pub(super) advertised_post_state: Option<StateHash>,
@@ -235,13 +234,12 @@ impl ExecutionActor {
 
     /// Apply one authenticated or locally generated message envelope. The
     /// receiver checks both advertised frame hashes before it can sign the
-    /// resulting proposal; the producer never calls this method for its own
-    /// broadcast outbox row.
+    /// resulting proposal. The producer retains its own broadcast as staged
+    /// state and sends it only to remote participants.
     pub(super) async fn apply_message(
         &mut self,
         source: arena0_protocol::PeerId,
         frame: ExecFrame,
-        inbox_id: Option<InboxId>,
     ) -> Result<bool, ExecError> {
         let ExecFrame::Message {
             message_id,
@@ -260,11 +258,6 @@ impl ExecutionActor {
             return Ok(false);
         }
         if state.pending_shared().is_some() {
-            if inbox_id.is_some() {
-                // Keep the accepted inbox row pending while the current
-                // proposal gathers N-of-N signatures.
-                return Ok(false);
-            }
             return Err(ExecError::InvalidState(
                 "cannot apply a local message while a shared proposal is pending".into(),
             ));
@@ -283,15 +276,9 @@ impl ExecutionActor {
                 &data,
             ) != message_id
         {
-            if let Some(inbox_id) = inbox_id {
-                self.reject_inbound(inbox_id).await?;
-            }
             return Ok(false);
         }
         if !self.writer_is(source, state, &self.ensemble())? {
-            if let Some(inbox_id) = inbox_id {
-                self.reject_inbound(inbox_id).await?;
-            }
             return Ok(false);
         }
         let outcome = self
@@ -304,7 +291,6 @@ impl ExecutionActor {
                     msg: data,
                 },
                 DispatchSource {
-                    inbox_id,
                     advertised_post_state: Some(poststate),
                     ..DispatchSource::default()
                 },
@@ -554,7 +540,6 @@ impl ExecutionActor {
                     event,
                     effects,
                     timer_id: source.timer_id,
-                    inbox_id: source.inbox_id,
                 },
             )
             .await?;
@@ -688,14 +673,8 @@ impl ExecutionActor {
         let mut next = self.state.clone();
         let certified = next.add_step_signature(signature)?;
         let agreed_step = certified.as_ref().map(|proposal| proposal.entry().step);
-        self.persist(
-            next,
-            Change::StepSignature {
-                certified,
-                inbox_id: None,
-            },
-        )
-        .await?;
+        self.persist(next, Change::StepSignature { certified })
+            .await?;
         self.reconcile_resident()?;
         self.emit_trace_appended(agreed_step).await;
         Ok(())

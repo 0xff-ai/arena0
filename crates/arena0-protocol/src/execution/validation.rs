@@ -166,7 +166,7 @@ fn validate_proposal_status(
         ) if actual_commitment == commitment && actual_reason == reason => Ok(()),
         (
             Some(Effect::SessionEnd { outcome }),
-            super::ExecutionStatus::Ended { outcome: actual },
+            super::ExecutionStatus::Certified { outcome: actual },
         ) => {
             actual.validate()?;
             if actual.borsh() == outcome.as_slice() {

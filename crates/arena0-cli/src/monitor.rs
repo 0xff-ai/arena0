@@ -1032,6 +1032,7 @@ mod tests {
 
     fn status(exec_id: ExecId, program_id: ProgramHash) -> arena0_client::api::ExecStatus {
         arena0_client::api::ExecStatus {
+            end: Default::default(),
             exec_id,
             negotiation_id: None,
             program_id,

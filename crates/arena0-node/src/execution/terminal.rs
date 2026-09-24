@@ -55,7 +55,7 @@ impl ExecutionActor {
             return Ok(false);
         }
         let next = stopped_state(&self.state, &self.context.identity, kind, code, reason)?;
-        self.persist(next, Change::Stop { inbox_id: None }).await?;
+        self.persist(next, Change::Stop).await?;
         Ok(true)
     }
 
@@ -63,15 +63,15 @@ impl ExecutionActor {
         if !matches!(self.state.status().receipt_work(), ReceiptWork::Assemble) {
             return Ok(());
         }
-        let artifact = self.context.store.assemble_receipt().await?;
+        let artifact = self.context.store.assemble_receipt(&self.state).await?;
         let mut next = self.state.clone();
         next.publish_receipt(artifact.clone())?;
         self.persist(next, Change::Publish { artifact }).await
     }
 
     /// Deliver the observer-facing terminal boundary from its durable receipt.
-    /// The caller first settles final protocol frames; publication alone does
-    /// not release the actor's delivery obligations.
+    /// Publication is a local fact; the actor remains alive until every peer
+    /// acknowledges the final protocol frames.
     pub(super) async fn emit_published_terminal(&mut self) -> Result<(), ExecError> {
         if self.terminal_emitted {
             return Ok(());
@@ -188,7 +188,7 @@ pub(crate) async fn fail_execution(
             .persist(TransitionRecord {
                 expected: state.version(),
                 next: next.clone(),
-                change: Change::Stop { inbox_id: None },
+                change: Change::Stop,
                 now_ms: now_ms(),
             })
             .await?;
@@ -198,7 +198,7 @@ pub(crate) async fn fail_execution(
         FailureOutcome::TerminalPreserved
     };
     if matches!(state.status().receipt_work(), ReceiptWork::Assemble) {
-        let artifact = store.assemble_receipt().await?;
+        let artifact = store.assemble_receipt(&state).await?;
         let expected = state.version();
         state.publish_receipt(artifact.clone())?;
         store

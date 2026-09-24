@@ -169,6 +169,7 @@ mod tests {
             let response = |exec_id, from| -> Response {
                 Ok(ResponseOk::Inspection(ExecutionInspection {
                     status: ExecStatus {
+                        end: Default::default(),
                         exec_id,
                         negotiation_id: None,
                         program_id: ProgramHash([3; 32]),
@@ -340,6 +341,7 @@ mod tests {
                 .map_err(|_| anyhow!("inspection timestamp receiver closed"))?;
             let response: Response = Ok(ResponseOk::Inspection(ExecutionInspection {
                 status: ExecStatus {
+                    end: Default::default(),
                     exec_id,
                     negotiation_id: None,
                     program_id: ProgramHash([7; 32]),

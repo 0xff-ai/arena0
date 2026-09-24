@@ -8,6 +8,7 @@ mod abort;
 mod binding;
 mod certificate;
 mod cursor;
+mod end;
 mod error;
 mod outcome;
 mod pending;
@@ -51,6 +52,7 @@ pub use certificate::{
     StopReport,
 };
 pub use cursor::{ExecutionVersion, StepCursor};
+pub use end::{EndMatch, EndPhase};
 pub use error::ProtocolError;
 pub use outcome::TerminalOutcome;
 pub use pending::{OpenCallout, PendingId, PendingIdParseError, pending_id};

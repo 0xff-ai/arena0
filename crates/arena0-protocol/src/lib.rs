@@ -54,10 +54,10 @@ pub use event::Event;
 pub use exec::ExecLifecycle;
 pub use exec_frame::{ExecFrame, ExecFrameError};
 pub use execution::{
-    ABORT_OCCURRENCE_DOMAIN, ABORT_OCCURRENCE_VERSION, AbortKind, AbortOccurrence,
-    ExecutionBinding, ExecutionState, ExecutionStatus, ExecutionVersion, MAX_ACTIVE_TIMERS,
-    MAX_EFFECT_PAYLOAD_BYTES, MAX_EFFECTS, MAX_EXECUTION_STATE_BYTES, MAX_PROOF_SIGNATURES,
-    MAX_RECEIPT_BYTES, MAX_TERMINAL_OUTCOME_BYTES, MAX_TERMINAL_REASON_BYTES,
+    ABORT_OCCURRENCE_DOMAIN, ABORT_OCCURRENCE_VERSION, AbortKind, AbortOccurrence, EndMatch,
+    EndPhase, ExecutionBinding, ExecutionState, ExecutionStatus, ExecutionVersion,
+    MAX_ACTIVE_TIMERS, MAX_EFFECT_PAYLOAD_BYTES, MAX_EFFECTS, MAX_EXECUTION_STATE_BYTES,
+    MAX_PROOF_SIGNATURES, MAX_RECEIPT_BYTES, MAX_TERMINAL_OUTCOME_BYTES, MAX_TERMINAL_REASON_BYTES,
     MAX_TIMER_PAYLOAD_BYTES, MAX_TRACE_ENTRY_BYTES, OpenCallout, ParticipantStepSignature,
     PendingId, PendingIdParseError, ProtocolError, Receipt, ReceiptArtifact, ReceiptBody,
     ReceiptId, ReceiptKind, ReceiptWork, SharedProposal, StepCertificate, StepCursor, StopCause,

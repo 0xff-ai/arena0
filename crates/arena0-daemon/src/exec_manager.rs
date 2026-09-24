@@ -631,16 +631,14 @@ impl Supervisor {
         let initial_session = self.entry.session_id().await.ok().flatten();
         let exec_id = self.entry.exec_id;
         let mut resume = tokio::time::Instant::now() + stall;
-        let mut terminal = false;
         loop {
             tokio::select! {
                 _ = &mut stop => break,
                 event = self.spawned.message_rx.recv() => {
                     let Some(event) = event else { break };
                     resume = tokio::time::Instant::now() + stall;
-                    terminal = self.handle_message(event).await || terminal;
+                    self.handle_message(event).await;
                     self.entry.notify();
-                    if terminal { break; }
                 }
                 _ = tokio::time::sleep_until(resume) => {
                     if self.entry.lifecycle().await.is_ok_and(|state| state == ExecLifecycle::Active) {

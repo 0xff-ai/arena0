@@ -11,13 +11,16 @@ use std::io;
 use thiserror::Error;
 
 use crate::trace::StepCommitment;
-use crate::{AbortKind, AbortOccurrence, MessageId, SessionHash, StateHash};
+use crate::{
+    AbortKind, AbortOccurrence, AggregateAttestation, MessageId, SessionHash, SignerSet, StateHash,
+    StepCertificate,
+};
 
 /// A validated execution fact used by protocol machinery.
 ///
 /// Session routing is part of the transport stream metadata. Every value in
-/// this enum is therefore one durable fact: a message, one signature over one
-/// complete commitment, or one authenticated abort occurrence.
+/// this enum represents a message, a signature or certificate over a complete
+/// commitment, or an authenticated abort occurrence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecFrame {
     /// Broadcast one program payload at an agreed trace position.
@@ -39,6 +42,11 @@ pub enum ExecFrame {
         commitment: StepCommitment,
         /// BLS signature over the canonical commitment bytes.
         signature: BlsSignature,
+    },
+    /// N-of-N evidence for one shared-state commitment.
+    StepCertificate {
+        /// The certified commitment and its aggregate agreement.
+        certificate: StepCertificate,
     },
     /// Unilateral termination.
     Abort {
@@ -93,6 +101,29 @@ impl TryFrom<WireExecFrame> for ExecFrame {
                 let occurrence = abort_from_wire(occurrence)?;
                 Self::Abort { occurrence }
             }
+            WireExecFrame::StepCertificate {
+                commitment,
+                signers,
+                aggregate,
+            } => {
+                if signers.len() > arena0_wire::MAX_EXEC_SIGNER_BYTES {
+                    return Err(WireError::ValueTooLarge {
+                        field: "exec.signers",
+                        size: signers.len(),
+                        max: arena0_wire::MAX_EXEC_SIGNER_BYTES,
+                    }
+                    .into());
+                }
+                Self::StepCertificate {
+                    certificate: StepCertificate {
+                        commitment: step_commitment_from_wire(commitment)?,
+                        agreement: AggregateAttestation {
+                            aggregate,
+                            signers: SignerSet(signers),
+                        },
+                    },
+                }
+            }
         })
     }
 }
@@ -127,6 +158,11 @@ impl TryFrom<&ExecFrame> for WireExecFrame {
             },
             ExecFrame::Abort { occurrence } => Self::Abort {
                 occurrence: abort_to_wire(occurrence)?,
+            },
+            ExecFrame::StepCertificate { certificate } => Self::StepCertificate {
+                commitment: step_commitment_to_wire(certificate.commitment())?,
+                signers: certificate.agreement().signers.0.clone(),
+                aggregate: certificate.agreement().aggregate,
             },
         })
     }
@@ -330,6 +366,40 @@ mod tests {
         for frame in [message_frame(), step_signature_frame(), abort_frame()] {
             assert_roundtrip(frame);
         }
+        let ExecFrame::StepSignature {
+            commitment,
+            signature,
+        } = step_signature_frame()
+        else {
+            unreachable!()
+        };
+        assert_roundtrip(ExecFrame::StepCertificate {
+            certificate: StepCertificate {
+                commitment,
+                agreement: AggregateAttestation {
+                    aggregate: signature,
+                    signers: SignerSet(vec![3]),
+                },
+            },
+        });
+    }
+
+    #[test]
+    fn certificate_signer_bitmap_is_bounded_before_allocation() {
+        assert_eq!(
+            arena0_wire::MAX_EXEC_SIGNER_BYTES,
+            crate::negotiation::MAX_PARTICIPANTS.div_ceil(8)
+        );
+        let ExecFrame::StepSignature { commitment, .. } = step_signature_frame() else {
+            unreachable!()
+        };
+        let mut bytes = vec![arena0_wire::EXEC_KIND_STEP_CERTIFICATE];
+        bytes.extend(borsh::to_vec(&step_commitment_to_wire(&commitment).unwrap()).unwrap());
+        bytes.extend_from_slice(&(arena0_wire::MAX_EXEC_SIGNER_BYTES as u32 + 1).to_le_bytes());
+        assert_eq!(
+            borsh::from_slice::<ExecFrame>(&bytes).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]

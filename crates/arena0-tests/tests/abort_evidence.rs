@@ -1,7 +1,7 @@
 //! Authenticated stop evidence through a real Wasm-backed Host execution.
 //!
-//! A peer abort is accepted only after transport attribution, durable inbox
-//! acceptance, and occurrence validation. The light verifier then checks the
+//! A peer abort is acknowledged only after transport attribution, occurrence
+//! validation, and persistence of the resulting stop. The light verifier then checks the
 //! resulting stopped receipt.
 
 use arena0_crypto::NodeKeys;

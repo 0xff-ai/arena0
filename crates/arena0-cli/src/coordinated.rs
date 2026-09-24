@@ -2928,6 +2928,7 @@ mod tests {
         peer: PeerId,
     ) -> Response {
         Ok(ResponseOk::Status(ExecStatus {
+            end: Default::default(),
             exec_id: ExecId([0; 32]),
             negotiation_id: Some(arena0_client::protocol::NegotiationId([0x42; 32])),
             program_id,

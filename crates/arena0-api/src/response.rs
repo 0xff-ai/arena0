@@ -196,10 +196,47 @@ pub struct ProgramDetail {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecStatus {
+    /// Local end handshake; independent of receipt publication.
+    pub end: ExecEndStatus,
     pub exec_id: ExecId,
     pub negotiation_id: Option<NegotiationId>,
     pub program_id: ProgramHash,
     pub state: ExecStatusState,
+}
+
+/// Public local end-confirmation progress.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecEndStatus {
+    pub phase: ExecEndPhase,
+    pub unconfirmed: Vec<PeerId>,
+}
+
+/// Phase of the local end handshake.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecEndPhase {
+    #[default]
+    Open,
+    Ending,
+    Ended,
+}
+
+impl From<&arena0_protocol::EndPhase> for ExecEndStatus {
+    fn from(end: &arena0_protocol::EndPhase) -> Self {
+        use arena0_protocol::EndPhase;
+        Self {
+            phase: match end {
+                EndPhase::Open => ExecEndPhase::Open,
+                EndPhase::Ending { .. } => ExecEndPhase::Ending,
+                EndPhase::Ended { .. } => ExecEndPhase::Ended,
+            },
+            unconfirmed: end
+                .unconfirmed()
+                .map(|peers| peers.iter().copied().collect())
+                .unwrap_or_default(),
+        }
+    }
 }
 
 /// The facts valid at each public execution lifecycle.

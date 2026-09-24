@@ -32,10 +32,11 @@ pub use request::{
 };
 pub use response::{
     ActivationInspection, ActivationInspectionState, ActivationParticipant, ApiError, ApiErrorCode,
-    DaemonInfo, EffectKind, EffectSummary, EventKind, EventRecordSummary, ExecStatus,
-    ExecStatusState, ExecutionInspection, HostInfo, HostStatus, IdInfo, LightVerifiedTerminal,
-    NextEvent, PendingCalloutStatus, ProgramDetail, ProgramSummary, ReceiptListEntry,
-    ReceiptProvenance, Response, ResponseOk, SessionProgress, SessionStatus, VerifiedResult,
+    DaemonInfo, EffectKind, EffectSummary, EventKind, EventRecordSummary, ExecEndPhase,
+    ExecEndStatus, ExecStatus, ExecStatusState, ExecutionInspection, HostInfo, HostStatus, IdInfo,
+    LightVerifiedTerminal, NextEvent, PendingCalloutStatus, ProgramDetail, ProgramSummary,
+    ReceiptListEntry, ReceiptProvenance, Response, ResponseOk, SessionProgress, SessionStatus,
+    VerifiedResult,
 };
 
 #[cfg(test)]
@@ -301,6 +302,7 @@ mod tests {
     #[test]
     fn exec_status_serializes_only_state_valid_fields() {
         let status = ExecStatus {
+            end: Default::default(),
             exec_id: ExecId([5; 32]),
             negotiation_id: None,
             program_id: ProgramHash([7; 32]),
@@ -323,6 +325,10 @@ mod tests {
         assert!(json.get("host").is_none());
         assert!(json.get("step").is_none());
         assert_eq!(json["state"]["exec_state"], "Active");
+        assert_eq!(
+            json["end"],
+            serde_json::json!({"phase": "open", "unconfirmed": []})
+        );
         assert_eq!(json["state"]["session"]["step"], 3);
         let mut with_unknown_field = json.clone();
         with_unknown_field["queue_position"] = serde_json::json!(2);
@@ -331,6 +337,29 @@ mod tests {
         with_wrong_state_field["state"]["queue_position"] = serde_json::json!(2);
         assert!(serde_json::from_value::<ExecStatus>(with_wrong_state_field).is_err());
         assert_eq!(serde_json::from_value::<ExecStatus>(json).unwrap(), status);
+        for (phase, expected) in [
+            (ExecEndPhase::Ending, "ending"),
+            (ExecEndPhase::Ended, "ended"),
+        ] {
+            let mut terminal = status.clone();
+            terminal.state = ExecStatusState::Completed {
+                session: status.session().unwrap().clone(),
+            };
+            terminal.end = ExecEndStatus {
+                phase,
+                unconfirmed: vec![PeerId([8; 32])],
+            };
+            let json = serde_json::to_value(&terminal).unwrap();
+            assert_eq!(json["end"]["phase"], expected);
+            assert_eq!(
+                json["end"]["unconfirmed"],
+                serde_json::json!([PeerId([8; 32])])
+            );
+            assert_eq!(
+                serde_json::from_value::<ExecStatus>(json).unwrap(),
+                terminal
+            );
+        }
     }
 
     #[test]

@@ -2,8 +2,7 @@
 //!
 //! The node deliberately exposes commands and observations, not a mutable
 //! execution object. The private execution actor owns the only live guest and
-//! transport capabilities for one execution identity; protocol state is loaded
-//! from the store for each command.
+//! transport capabilities for one execution identity; protocol state remains in memory until restart or a failed persist.
 
 use arena0_protocol::PendingId;
 use std::sync::Arc;
@@ -51,6 +50,9 @@ pub enum ExecError {
     /// Durable or guest state violates an execution invariant.
     #[error("invalid execution state: {0}")]
     InvalidState(String),
+    /// Verified certificate evidence contradicts the actor's local state.
+    #[error("execution delivery invariant failed: {0}")]
+    DeliveryInvariant(&'static str),
     /// An execution dependency or owned task is unavailable.
     #[error("execution resource unavailable: {0}")]
     Unavailable(String),
@@ -128,10 +130,6 @@ pub enum ExecCommand {
     /// Deliver one transport-authenticated frame after the stream reader has
     /// placed it on the actor's serialized command queue.
     Inbound { delivery: ExecDelivery },
-    /// A previously authenticated execution stream closed. The actor treats
-    /// this as a terminal transport failure rather than silently losing a
-    /// peer's durable delivery path.
-    InboundStreamClosed { peer: arena0_protocol::PeerId },
 }
 
 /// A stream handed from the Host accept router to one execution actor.
@@ -192,6 +190,8 @@ pub struct ExecContext {
     /// This key is consumed by the one actor for this execution. Keeping it
     /// non-cloneable makes the actor the sole live signing authority.
     pub(crate) execution_key: ExecutionKey,
+    /// Local confirmation window, measured from actor start or wake.
+    pub end_confirmation_window: std::time::Duration,
 }
 
 impl ExecContext {
@@ -211,6 +211,7 @@ impl ExecContext {
             params,
             activation,
             execution_key,
+            end_confirmation_window: std::time::Duration::from_secs(600),
         }
     }
 }
@@ -345,6 +346,7 @@ impl std::fmt::Debug for ExecContext {
 /// That keeps an execution from being constructed with a store or transport
 /// unrelated to its Host.
 pub(crate) struct ActorContext {
+    pub(crate) end_confirmation_window: std::time::Duration,
     pub(crate) exec_id: ExecId,
     pub(crate) program: Arc<LoadedProgram>,
     pub(crate) params: JsonBytes,
@@ -367,6 +369,7 @@ impl ExecContext {
     ) -> ActorContext {
         let producer = identity.peer_id();
         ActorContext {
+            end_confirmation_window: self.end_confirmation_window,
             exec_id: self.exec_id,
             program: self.program,
             params: self.params,

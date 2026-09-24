@@ -3,20 +3,17 @@ use crate::lock::restrict_database_companions;
 
 mod activation;
 mod execution;
-mod inbox;
 mod integrity;
-mod outbox;
 mod receipt;
 mod recovery;
 mod registry;
 mod request;
+mod timers;
 
 pub(super) struct Database {
     connection: Connection,
     _lock: OwnerLock,
     host_id: PeerId,
-    lease_duration_ms: u64,
-    retry_delay_ms: u64,
     transaction_poison: Option<String>,
 }
 
@@ -50,8 +47,6 @@ impl Database {
             connection,
             _lock: lock,
             host_id: config.host_id,
-            lease_duration_ms: config.lease_duration_ms,
-            retry_delay_ms: config.retry_delay_ms,
             transaction_poison: None,
         };
         database.bind_metadata()?;
@@ -157,8 +152,6 @@ impl Database {
         self.validate_execution_salts()?;
         self.validate_programs()?;
         self.validate_receipts()?;
-        self.validate_outbox_rows()?;
-        self.validate_inbox_rows()?;
         Ok(())
     }
 }

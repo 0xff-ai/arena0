@@ -27,7 +27,7 @@ enum Milestone {
     CrashBoundaryPersisted,
     RecoveryStarted,
     TerminalObserved,
-    OutboxDrained,
+    FramesDelivered,
     ReceiptVerified,
     SecondRestartVerified,
 }
@@ -119,13 +119,13 @@ async fn recover_after(cut: CrashAfter) {
             .persist(arena0_store::TransitionRecord {
                 expected,
                 next: state.clone(),
-                change: arena0_store::Change::Stop { inbox_id: None },
+                change: arena0_store::Change::Stop,
                 now_ms: 7,
             })
             .await
             .unwrap();
         if matches!(cut, CrashAfter::Publication) {
-            let artifact = writer.assemble_receipt().await.unwrap();
+            let artifact = writer.assemble_receipt(&state).await.unwrap();
             let expected = state.version();
             state.publish_receipt(artifact.clone()).unwrap();
             writer
@@ -160,7 +160,7 @@ async fn recover_after(cut: CrashAfter) {
             .expect("attach local transports");
         // The recovery actor owns the producer side of the persisted abort
         // frame. Keep the remote endpoint alive with a transport-only reader
-        // so this test exercises the real outbox acknowledgement boundary
+        // so this test exercises the real final-frame acknowledgement boundary
         // without starting a second execution actor or fabricating state.
         let remote_transport = Arc::new(transports.remove(1));
         let remote_ack_task = tokio::spawn(acknowledge_exec_streams(remote_transport));
@@ -205,7 +205,7 @@ async fn recover_after(cut: CrashAfter) {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
-        progress.push((Milestone::OutboxDrained, started.elapsed()));
+        progress.push((Milestone::FramesDelivered, started.elapsed()));
         assert_eq!(receipts.len(), 1);
         assert_eq!(
             receipts[0].provenance,
@@ -248,7 +248,7 @@ async fn recover_after(cut: CrashAfter) {
 /// A transport-only remote seat that acknowledges the producer's stream
 /// responsibility. It deliberately does not apply the frame: receipt
 /// recovery owns the producer's durable terminal artifact, while this helper
-/// only prevents an absent remote actor from masking that outbox boundary.
+/// only prevents an absent remote actor from masking that delivery boundary.
 async fn acknowledge_exec_streams(transport: Arc<LocalTransport>) {
     let Ok(accepted) = transport.accept_exec().await else {
         return;

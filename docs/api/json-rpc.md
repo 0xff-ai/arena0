@@ -110,6 +110,12 @@ Once session progress exists, its `session` object also reports the public step,
 committed participants, pending callout summary, and whether this Host's
 receipt or stop report is durably available.
 
+The top-level `end` object reports local confirmation of the terminal result:
+`{"phase":"open","unconfirmed":[]}`, `{"phase":"ending","unconfirmed":["<peer-id>"]}`,
+or `{"phase":"ended","unconfirmed":[]}`. `ended` can retain unconfirmed
+peers when the confirmation window expires; receipt availability is independent
+of this phase.
+
 `exec.inspect` is a bounded, Host-local diagnostic projection for operator
 interfaces. It returns `exec.status`, durable activation facts, participant
 peer IDs and ticket commitments, and summaries of event dispatch records.
@@ -195,18 +201,36 @@ JSON clients whose number type cannot represent every `u64` value.
 Guest signing never reaches the client; the Host signs synchronously with its
 custodied identity or execution key inside the local handler dispatch.
 
-The Host persists an authenticated inbound execution frame before it
-acknowledges transport responsibility. The execution actor resolves the frame
-through the same flat event dispatch as local inputs. A direct store method
-commits the accepted event, shared and local state images, effects, timers,
-inbox status, and outbox rows in one SQLite transaction. Protocol frame outbox
-rows are per destination; a producer does not process its own broadcast.
-Outbox delivery uses leases and retries, and expired leases are recovered when
-the store opens. A pending callout retains its `pending_id` and guest context
-across a restart, so `exec.next` can return the same callout again. A certified
-final `SessionEnd` step authenticates completion and its outcome bytes. Receipt
-assembly and publication use that durable evidence; the socket exposes the
-terminal result and the authenticated portable artifact.
+The execution actor authenticates inbound frames against the state it holds in
+memory. It acknowledges a frame after persisting its transition, or after
+recognizing a duplicate or stale frame. A frame whose prerequisite state has
+not arrived receives a retryable `NotYet` response; the sender retains
+responsibility and retries. Accepted events, state images, effects, and timer
+changes commit together in one SQLite transaction.
+
+Each actor derives current messages, signatures, certificates, and its adopted
+abort occurrence from execution state. It sends those frames independently to
+each participant, with one bounded send per peer. A restart resends the current
+evidence. A pending callout retains its `pending_id` and guest context across
+restart, so `exec.next` can return the same callout again.
+
+A certified final `SessionEnd` step authenticates completion and its outcome
+bytes. Receipt publication exposes the terminal result and portable artifact
+to clients immediately. The terminal transition enters `ending` with every
+remote participant unconfirmed. Acknowledging terminal evidence, or returning
+matching terminal evidence, confirms a peer. Confirming the last peer moves
+the phase to `ended`. The node's confirmation window defaults to ten minutes
+from actor start or wake; expiry also moves the phase to `ended`, retaining
+unconfirmed peers. A rejection or conflicting conclusion leaves that peer
+unconfirmed and suppresses its sends for this actor run, while other lanes
+continue.
+
+Startup resumes `ending` executions. An authenticated frame from an unconfirmed
+peer wakes a dormant `ended` execution and receives `NotYet` until the actor
+can compare conclusions again. Traffic from confirmed peers is acknowledged
+as stale. Completion and certified shared stops match the same final step
+certificate; unilateral stops match an authenticated occurrence at the same
+agreed cursor, even when another participant forwards it.
 
 ## Receipts
 

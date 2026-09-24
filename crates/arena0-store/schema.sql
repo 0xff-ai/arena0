@@ -67,6 +67,8 @@ CREATE TABLE executions (
     session_id BLOB NOT NULL CHECK (length(session_id) = 32),
     state BLOB NOT NULL,
     local_state_checksum BLOB NOT NULL CHECK (length(local_state_checksum) = 32),
+    end_phase INTEGER NOT NULL CHECK (end_phase IN (0, 1, 2)),
+    end_unconfirmed BLOB NOT NULL,
     version INTEGER NOT NULL CHECK (version >= 0),
     lifecycle INTEGER NOT NULL CHECK (lifecycle >= 0),
     agreed_step INTEGER NOT NULL CHECK (agreed_step >= 0),
@@ -145,63 +147,6 @@ CREATE TABLE receipt_productions (
 CREATE INDEX receipt_productions_execution
     ON receipt_productions (execution_id, receipt_id);
 
-CREATE TABLE inbox (
-    execution_id BLOB NOT NULL CHECK (length(execution_id) = 32),
-    inbox_id BLOB NOT NULL CHECK (length(inbox_id) = 32),
-    source BLOB NOT NULL CHECK (length(source) = 32),
-    digest BLOB NOT NULL CHECK (length(digest) = 32),
-    frame BLOB NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('accepted', 'applied', 'consumed')),
-    accepted_at_ms INTEGER NOT NULL CHECK (accepted_at_ms >= 0),
-    applied_version INTEGER CHECK (applied_version IS NULL OR applied_version >= 0),
-    consumed_at_ms INTEGER CHECK (consumed_at_ms IS NULL OR consumed_at_ms >= 0),
-    PRIMARY KEY (execution_id, inbox_id),
-    FOREIGN KEY (execution_id) REFERENCES executions(execution_id),
-    CHECK ((status = 'accepted' AND applied_version IS NULL AND consumed_at_ms IS NULL)
-        OR (status = 'applied' AND applied_version IS NOT NULL AND consumed_at_ms IS NULL)
-        OR (status = 'consumed' AND applied_version IS NULL AND consumed_at_ms IS NOT NULL))
-) STRICT;
-
-CREATE TABLE inbox_conflicts (
-    conflict_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    execution_id BLOB NOT NULL CHECK (length(execution_id) = 32),
-    inbox_id BLOB NOT NULL CHECK (length(inbox_id) = 32),
-    existing_source BLOB NOT NULL CHECK (length(existing_source) = 32),
-    incoming_source BLOB NOT NULL CHECK (length(incoming_source) = 32),
-    existing_digest BLOB NOT NULL CHECK (length(existing_digest) = 32),
-    incoming_digest BLOB NOT NULL CHECK (length(incoming_digest) = 32),
-    incoming_frame BLOB NOT NULL,
-    observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),
-    FOREIGN KEY (execution_id) REFERENCES executions(execution_id)
-) STRICT;
-
-CREATE TABLE outbox (
-    execution_id BLOB NOT NULL CHECK (length(execution_id) = 32),
-    outbox_id BLOB NOT NULL CHECK (length(outbox_id) = 32),
-    version INTEGER NOT NULL CHECK (version >= 0),
-    event_position INTEGER NOT NULL CHECK (event_position >= 0),
-    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-    destination BLOB CHECK (destination IS NULL OR length(destination) = 32),
-    payload_kind TEXT NOT NULL CHECK (payload_kind = 'frame'),
-    payload BLOB NOT NULL,
-    attempts INTEGER NOT NULL CHECK (attempts >= 0),
-    status TEXT NOT NULL CHECK (status IN ('pending', 'leased', 'acknowledged', 'cancelled')),
-    available_at_ms INTEGER NOT NULL CHECK (available_at_ms >= 0),
-    lease_id BLOB CHECK (lease_id IS NULL OR length(lease_id) = 32),
-    lease_until_ms INTEGER CHECK (lease_until_ms IS NULL OR lease_until_ms >= 0),
-    last_error TEXT,
-    -- The content-addressed outbox id is the identity.  The causal columns
-    -- are indexed for deterministic leasing but are intentionally not a
-    -- UNIQUE constraint: SQLite treats NULL destinations as distinct and a
-    -- deferred successor may legitimately reuse an event coordinate.
-    PRIMARY KEY (execution_id, outbox_id),
-    FOREIGN KEY (execution_id) REFERENCES executions(execution_id),
-    CHECK ((status = 'pending' AND lease_id IS NULL AND lease_until_ms IS NULL)
-        OR (status = 'leased' AND lease_id IS NOT NULL AND lease_until_ms IS NOT NULL)
-        OR (status IN ('acknowledged', 'cancelled')
-            AND lease_id IS NULL AND lease_until_ms IS NULL))
-) STRICT;
-
 CREATE TABLE active_timers (
     execution_id BLOB NOT NULL CHECK (length(execution_id) = 32),
     timer_id BLOB NOT NULL CHECK (length(timer_id) = 32),
@@ -212,12 +157,6 @@ CREATE TABLE active_timers (
     FOREIGN KEY (execution_id) REFERENCES executions(execution_id)
 ) STRICT;
 
-CREATE INDEX outbox_ready
-    ON outbox (execution_id, status, available_at_ms, outbox_id);
-CREATE INDEX outbox_causal
-    ON outbox (execution_id, status, event_position, version, ordinal, destination);
-CREATE INDEX outbox_leases
-    ON outbox (execution_id, status, lease_until_ms);
 CREATE INDEX event_records_position
     ON event_records (execution_id, event_position);
 CREATE INDEX agreed_steps_position

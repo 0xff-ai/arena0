@@ -1,6 +1,22 @@
 use super::*;
 
 impl Database {
+    pub(crate) fn execution_end(
+        &mut self,
+        session_id: SessionHash,
+    ) -> Result<Option<(ExecId, arena0_protocol::EndPhase)>, StoreError> {
+        let row: Option<(Vec<u8>, i64, Vec<u8>)> = self.connection.query_row(
+ "SELECT execution_id, end_phase, end_unconfirmed FROM executions WHERE session_id = ?1",
+ params![session_id.0.to_vec()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional()?;
+        row.map(|(id, phase, peers)| {
+            Ok((
+                ExecId(array32(&id, "execution id")?),
+                decode_end(phase, &peers)?,
+            ))
+        })
+        .transpose()
+    }
+
     pub(crate) fn create_execution(
         &mut self,
         execution_id: ExecId,
@@ -70,8 +86,8 @@ impl Database {
             "INSERT INTO executions
              (execution_id, host_id, producer, session_id, state,
               local_state_checksum, version, lifecycle, agreed_step, event_position,
-              created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+              created_at_ms, updated_at_ms, end_phase, end_unconfirmed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12, ?13)",
             params![
                 state.execution_id().0.to_vec(),
                 self.host_id.0.to_vec(),
@@ -84,12 +100,14 @@ impl Database {
                 sqlite_u64(state.agreed_step())?,
                 sqlite_u64(state.event_position())?,
                 sqlite_u64(now_ms)?,
+                end_columns(state.end_phase())?.0,
+                end_columns(state.end_phase())?.1,
             ],
         )?;
         Ok(())
     }
 
-    /// Delivery scans need an execution identity, not its guest memory images.
+    /// Timer scans need an execution identity, not its guest memory images.
     pub(super) fn require_execution(&self, execution_id: ExecId) -> Result<(), StoreError> {
         let exists: bool = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM executions WHERE execution_id = ?1)",
@@ -309,6 +327,16 @@ impl Database {
         agreed_step: i64,
         event_position: i64,
     ) -> Result<(), StoreError> {
+        let (phase, peers): (i64, Vec<u8>) = self.connection.query_row(
+            "SELECT end_phase, end_unconfirmed FROM executions WHERE execution_id = ?1",
+            params![state.execution_id().0.to_vec()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if &decode_end(phase, &peers)? != state.end_phase() {
+            return Err(StoreError::Corruption(
+                "end phase index does not match state".into(),
+            ));
+        }
         if sqlite_i64(version)? != state.version().get()
             || lifecycle != lifecycle_tag(state.lifecycle())
             || sqlite_i64(agreed_step)? != state.agreed_step()
@@ -375,7 +403,6 @@ impl Database {
                 event,
                 effects,
                 timer_id,
-                inbox_id,
             } => {
                 let event_position = next.event_position().checked_sub(1).ok_or_else(|| {
                     StoreError::Corruption("dispatch event position is zero".into())
@@ -386,26 +413,7 @@ impl Database {
                     &event_bytes(&event)?,
                     &effects_bytes(&effects)?,
                 )?;
-                if let Some(proposal) = next.pending_shared() {
-                    if matches!(
-                        event,
-                        Event::InputReceived { .. } | Event::TimerFired { .. } | Event::React
-                    ) && let Some(index) = effects
-                        .iter()
-                        .position(|effect| matches!(effect, Effect::Broadcast { .. }))
-                    {
-                        let frame = successor_broadcast_frame(proposal)?;
-                        self.persist_frame_for_remotes(
-                            execution_id,
-                            event_position,
-                            next.version(),
-                            message_frame_ordinal(index as u32)?,
-                            &frame,
-                            &next,
-                            now_ms,
-                        )?;
-                    }
-                } else {
+                if next.pending_shared().is_none() {
                     self.persist_effects(
                         execution_id,
                         event_position,
@@ -415,87 +423,22 @@ impl Database {
                         &next,
                     )?;
                 }
-                if let Some(inbox_id) = inbox_id {
-                    if next.pending_shared().is_some() {
-                        self.mark_inbox_consumed(execution_id, inbox_id, now_ms)?;
-                    } else {
-                        self.mark_inbox_applied(execution_id, inbox_id, next.version())?;
-                    }
-                }
                 if let Some(timer_id) = timer_id {
                     self.consume_timer(execution_id, timer_id)?;
                 }
             }
-            Change::StepSignature {
-                certified,
-                inbox_id,
-            } => {
+            Change::StepSignature { certified } => {
                 if let Some(proposal) = certified.as_ref() {
                     self.commit_staged_event(
                         execution_id,
                         proposal,
-                        next.pending_shared(),
                         next.version(),
                         now_ms,
                         &next,
                     )?;
-                }
-                if inbox_id.is_none() {
-                    let proposal = certified
-                        .as_ref()
-                        .or_else(|| next.pending_shared())
-                        .ok_or_else(|| {
-                            StoreError::Corruption("signature has no proposal".into())
-                        })?;
-                    let signature = proposal
-                        .signatures()
-                        .iter()
-                        .find(|sig| sig.participant() == next.producer())
-                        .ok_or_else(|| StoreError::Corruption("local signature missing".into()))?;
-                    let frame = ExecFrame::StepSignature {
-                        commitment: proposal.commitment().clone(),
-                        signature: signature.signature().sig,
-                    };
-                    self.persist_frame_for_remotes(
-                        execution_id,
-                        proposal.event_position(),
-                        next.version(),
-                        0,
-                        &frame,
-                        &next,
-                        now_ms,
-                    )?;
-                }
-                if let Some(inbox_id) = inbox_id {
-                    self.mark_inbox_consumed(execution_id, inbox_id, now_ms)?;
                 }
             }
-            Change::Stop { inbox_id } => {
-                self.cancel_proposal_frames(execution_id, next.step_cursor())?;
-                if inbox_id.is_none() {
-                    let Some(arena0_protocol::StopCause::Authenticated(occurrence)) =
-                        next.status().terminal_cause()
-                    else {
-                        return Err(StoreError::Corruption(
-                            "stopped state lost its authenticated occurrence".into(),
-                        ));
-                    };
-                    self.persist_frame_for_remotes(
-                        execution_id,
-                        next.event_position(),
-                        next.version(),
-                        0,
-                        &ExecFrame::Abort {
-                            occurrence: occurrence.clone(),
-                        },
-                        &next,
-                        now_ms,
-                    )?;
-                }
-                if let Some(inbox_id) = inbox_id {
-                    self.mark_inbox_consumed(execution_id, inbox_id, now_ms)?;
-                }
-            }
+            Change::Stop | Change::End => {}
             Change::Publish { artifact } => {
                 self.persist_terminal_publication(execution_id, next.version(), &artifact, now_ms)?;
             }
@@ -506,11 +449,23 @@ impl Database {
     pub(crate) fn assemble_receipt(
         &mut self,
         execution_id: ExecId,
+        state: &ExecutionState,
     ) -> Result<ReceiptArtifact, StoreError> {
-        let state = self
-            .load_execution(execution_id)?
+        let version: i64 = self
+            .connection
+            .query_row(
+                "SELECT version FROM executions WHERE execution_id = ?1",
+                params![execution_id.0.to_vec()],
+                |row| row.get(0),
+            )
+            .optional()?
             .ok_or(StoreError::ExecutionNotFound(execution_id))?;
-        self.assemble_terminal_artifact(&state)
+        if state.execution_id() != execution_id || sqlite_i64(version)? != state.version().get() {
+            return Err(StoreError::Corruption(
+                "receipt assembly requires the committed execution version".into(),
+            ));
+        }
+        self.assemble_terminal_artifact(state)
     }
 
     fn assemble_terminal_artifact(
@@ -531,7 +486,7 @@ impl Database {
         } else {
             if !matches!(
                 state.status(),
-                ExecutionStatus::Ended { .. } | ExecutionStatus::Completed { .. }
+                ExecutionStatus::Certified { .. } | ExecutionStatus::Completed { .. }
             ) {
                 return Err(StoreError::Protocol(ProtocolError::InvalidTerminalStatus));
             }
@@ -791,7 +746,6 @@ impl Database {
         &mut self,
         execution_id: ExecId,
         proposal: &arena0_protocol::SharedProposal,
-        successor: Option<&arena0_protocol::SharedProposal>,
         version: ExecutionVersion,
         now_ms: u64,
         state: &ExecutionState,
@@ -802,19 +756,6 @@ impl Database {
             .filter(|(_, effect)| !matches!(effect, Effect::Broadcast { .. }))
             .cloned()
             .collect::<Vec<_>>();
-        let deferred_broadcast =
-            proposal
-                .effects()
-                .iter()
-                .find_map(|(ordinal, effect)| match effect {
-                    Effect::Broadcast { data } => Some((*ordinal, data.clone())),
-                    _ => None,
-                });
-        if successor.is_some() != deferred_broadcast.is_some() {
-            return Err(StoreError::Corruption(
-                "deferred broadcast and successor proposal disagree".into(),
-            ));
-        }
         let event_exists = self
             .connection
             .query_row(
@@ -846,19 +787,6 @@ impl Database {
             now_ms,
             state,
         )?;
-        if let (Some(successor), Some((ordinal, _))) = (successor, deferred_broadcast) {
-            let frame = successor_broadcast_frame(successor)?;
-            let frame_ordinal = message_frame_ordinal(ordinal)?;
-            self.persist_frame_for_remotes(
-                execution_id,
-                proposal.event_position(),
-                version,
-                frame_ordinal,
-                &frame,
-                state,
-                now_ms,
-            )?;
-        }
         Ok(())
     }
 
@@ -919,7 +847,7 @@ impl Database {
         let changed = self.connection.execute(
             "UPDATE executions SET state = ?1, local_state_checksum = ?2,
                     version = ?3, lifecycle = ?4, agreed_step = ?5,
-                    event_position = ?6, updated_at_ms = ?7
+                    event_position = ?6, updated_at_ms = ?7, end_phase = ?10, end_unconfirmed = ?11
              WHERE execution_id = ?8 AND version = ?9",
             params![
                 envelope(EnvelopeKind::ExecutionState, &bytes)?,
@@ -931,6 +859,8 @@ impl Database {
                 sqlite_u64(now_ms)?,
                 next.execution_id().0.to_vec(),
                 sqlite_u64(expected.get())?,
+                end_columns(next.end_phase())?.0,
+                end_columns(next.end_phase())?.1,
             ],
         )?;
         if changed != 1 {
@@ -1080,36 +1010,6 @@ fn indexed_effects(effects: &[Effect]) -> Result<Vec<(u32, Effect)>, StoreError>
             ))
         })
         .collect()
-}
-
-fn message_frame_ordinal(effect_ordinal: u32) -> Result<u32, StoreError> {
-    effect_ordinal
-        .checked_add(1)
-        .ok_or_else(|| StoreError::Corruption("broadcast frame ordinal exhausted".into()))
-}
-
-fn successor_broadcast_frame(
-    proposal: &arena0_protocol::SharedProposal,
-) -> Result<ExecFrame, StoreError> {
-    let Event::MessageReceived {
-        message_id,
-        position,
-        pre_state,
-        msg,
-        ..
-    } = &proposal.entry().event
-    else {
-        return Err(StoreError::Corruption(
-            "deferred broadcast successor is not a message event".into(),
-        ));
-    };
-    Ok(ExecFrame::Message {
-        message_id: *message_id,
-        seq: *position,
-        prestate: *pre_state,
-        poststate: proposal.entry().post_state,
-        data: msg.clone(),
-    })
 }
 
 fn dispatch_digest(event: &[u8], effects: &[u8]) -> [u8; 32] {

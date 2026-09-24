@@ -14,12 +14,12 @@ use arena0_program::{
 use arena0_protocol::execution::GuestSignData;
 use arena0_protocol::{
     AbortKind, AbortOccurrence, Activation, ActivationData, Ensemble, Event, ExecFrame, ExecId,
-    ExecutionAdmission, ExecutionStatus, MessageId, NegotiationId, Offer, OfferData,
-    ParticipantStepSignature, PeerId, PeerIdSource, PendingId, PreparedActivation, StateHash,
-    Ticket, TicketAction, TicketData, TicketHash,
+    ExecutionAdmission, ExecutionStatus, MessageId, NegotiationId, Offer, OfferData, PeerId,
+    PeerIdSource, PendingId, PreparedActivation, StateHash, Ticket, TicketAction, TicketData,
+    TicketHash,
 };
 use arena0_sandbox::{InitializeCall, LoadedProgram, Program, WasmtimeEngine};
-use arena0_store::{Change, OutboxPayloadKind, Store, StoreConfig};
+use arena0_store::{Change, Store, StoreConfig};
 use arena0_transport::Transport;
 use arena0_transport::local::{LocalNetwork, LocalTransport};
 use tempfile::TempDir;
@@ -225,6 +225,7 @@ impl Fixture {
 
     fn context(&self) -> ExecContext {
         ExecContext {
+            end_confirmation_window: Duration::from_secs(600),
             exec_id: EXEC_ID,
             program: self.loaded_program(),
             params: self.params.clone(),
@@ -261,8 +262,9 @@ impl Fixture {
             state,
             instance: None,
             messages,
-            send_streams: HashMap::new(),
-            inflight_send: None,
+            send_lanes: HashMap::new(),
+            send_tasks: tokio::task::JoinSet::new(),
+            end_deadline: tokio::time::Instant::now() + Duration::from_secs(600),
             session_started_emitted: false,
             terminal_emitted: false,
             announced_callout: None,
@@ -315,48 +317,518 @@ impl Fixture {
             commitment: proposal.clone(),
             signature: self.remote_execution_key().sign(&proposal.signing_bytes()),
         };
-        actor
-            .context
-            .store
-            .accept_inbound(self.remote_keys.peer_id(), frame, 11)
-            .await
-            .expect("accept remote session signature");
-        let inbox = actor
-            .context
-            .store
-            .list_pending_inbox(16)
-            .await
-            .expect("list remote session signature")
-            .into_iter()
-            .next()
-            .expect("remote session signature inbox");
-        actor
-            .resolve_inbox_item(inbox)
-            .await
-            .expect("remote session signature");
-        self.clear_outbox(actor).await;
-    }
-
-    async fn clear_outbox(&self, actor: &mut ExecutionActor) {
-        while let Some(leased) = actor
-            .context
-            .store
-            .lease_next_outbox(super::now_ms())
-            .await
-            .expect("lease outbox")
-        {
+        assert_eq!(
             actor
-                .context
-                .store
-                .acknowledge_outbox(leased.item.outbox_id, leased.lease_id)
+                .accept_frame(self.remote_keys.peer_id(), frame)
                 .await
-                .expect("ack outbox");
-        }
+                .expect("remote session signature"),
+            None
+        );
     }
 }
 
 fn message_state() -> arena0_program::SharedStateBytes {
     arena0_program::SharedStateBytes::try_new(vec![1]).expect("message state")
+}
+
+async fn ended_actor() -> (
+    Fixture,
+    ExecutionActor,
+    mpsc::Receiver<crate::SessionMessage>,
+) {
+    let fixture = Fixture::with_mode(true, GuestMode::EndOnMessage).await;
+    let (messages, mut observations) = mpsc::channel(16);
+    let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
+    fixture.commit_session_started(&mut actor).await;
+    let frame = message_frame(
+        &actor.state,
+        fixture.remote_keys.peer_id(),
+        actor.state.agreed_step(),
+        b"end".to_vec(),
+    );
+    assert_eq!(
+        actor
+            .accept_frame(fixture.remote_keys.peer_id(), frame)
+            .await
+            .unwrap(),
+        None
+    );
+    actor.ensure_step_signature().await.unwrap();
+    let commitment = actor.state.pending_shared().unwrap().commitment().clone();
+    let frame = ExecFrame::StepSignature {
+        signature: fixture
+            .remote_execution_key()
+            .sign(&commitment.signing_bytes()),
+        commitment,
+    };
+    assert_eq!(
+        actor
+            .accept_frame(fixture.remote_keys.peer_id(), frame)
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(matches!(
+        actor.state.status(),
+        ExecutionStatus::Certified { .. }
+    ));
+    while observations.try_recv().is_ok() {}
+    (fixture, actor, observations)
+}
+
+#[tokio::test]
+async fn rejected_terminal_frame_keeps_peer_unconfirmed_and_actor_alive() {
+    let (fixture, mut actor, _observations) = ended_actor().await;
+    actor.progress().await.unwrap();
+    let recv = fixture
+        .remote_transport
+        .accept_exec()
+        .await
+        .unwrap()
+        .into_parts()
+        .1;
+    let delivery = recv.recv_exec().await.unwrap();
+    delivery
+        .reject(arena0_transport::ExecDeliveryRejection::Rejected)
+        .unwrap();
+    let result = actor.send_tasks.join_next().await.unwrap().unwrap();
+    actor.settle_send(result).await.unwrap();
+    actor.progress().await.unwrap();
+    assert!(
+        actor
+            .state
+            .end_phase()
+            .unconfirmed()
+            .unwrap()
+            .contains(&fixture.remote_keys.peer_id())
+    );
+    assert!(
+        actor.send_tasks.is_empty(),
+        "rejected peer is suppressed for this run"
+    );
+    assert!(!actor.end_run_finished());
+    assert_eq!(
+        fixture
+            .store
+            .handle()
+            .list_recovery_candidates(arena0_store::RecoveryCursor::start(), 8)
+            .await
+            .unwrap()
+            .candidates()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn verified_final_certificate_waits_for_proposal_then_commits_without_rejection() {
+    let (_source_fixture, source, _source_observations) = ended_actor().await;
+    let certificate = source
+        .state
+        .current_frames(source.context.producer)
+        .into_iter()
+        .next()
+        .unwrap();
+    let fixture = Fixture::with_mode(true, GuestMode::EndOnMessage).await;
+    let (messages, _observations) = mpsc::channel(16);
+    let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
+    fixture.commit_session_started(&mut actor).await;
+    assert_eq!(actor.state.binding(), source.state.binding());
+    let before = actor.state.clone();
+    assert_eq!(
+        actor
+            .accept_frame(fixture.remote_keys.peer_id(), certificate.clone())
+            .await
+            .unwrap(),
+        Some(arena0_transport::ExecDeliveryRejection::NotYet)
+    );
+    assert_eq!(actor.state, before);
+    let message = message_frame(
+        &actor.state,
+        fixture.remote_keys.peer_id(),
+        actor.state.agreed_step(),
+        b"end".to_vec(),
+    );
+    assert_eq!(
+        actor
+            .accept_frame(fixture.remote_keys.peer_id(), message)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        actor
+            .accept_frame(fixture.remote_keys.peer_id(), certificate.clone())
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(matches!(
+        actor.state.status(),
+        ExecutionStatus::Certified { .. }
+    ));
+    assert_eq!(
+        actor
+            .accept_frame(fixture.remote_keys.peer_id(), certificate)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn retired_session_router_acknowledges_final_frames() {
+    let (fixture, mut actor, _observations) = ended_actor().await;
+    actor.finalize_receipt().await.unwrap();
+    let frame = actor
+        .state
+        .current_frames(actor.context.producer)
+        .into_iter()
+        .next()
+        .unwrap();
+    drop(actor);
+    let host = crate::Host::start(
+        fixture.local_keys.clone(),
+        fixture.local_transport.clone(),
+        fixture.store.handle().clone(),
+    );
+    let mut spawned = host
+        .spawn(fixture.context(), host.claim_execution(EXEC_ID).unwrap())
+        .unwrap();
+    let outbound = fixture
+        .remote_transport
+        .accept_exec()
+        .await
+        .unwrap()
+        .into_parts()
+        .1;
+    outbound.recv_exec().await.unwrap().acknowledge().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while spawned.message_rx.recv().await.is_some() {}
+    })
+    .await
+    .expect("actor retires after final acknowledgement");
+
+    // Keep the public execution handle alive after its actor has retired.
+    // Forwarders must still release the live route for stale acknowledgements.
+    let stream = fixture
+        .remote_transport
+        .open_exec(
+            &fixture.local_keys.peer_id(),
+            fixture.activation.session_hash(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), stream.send_exec(&frame))
+        .await
+        .unwrap()
+        .expect("retired execution acknowledges stale evidence");
+    spawned.shutdown().await;
+    host.stop().await;
+}
+
+#[tokio::test]
+async fn signature_and_message_classification_uses_actor_state() {
+    use arena0_transport::ExecDeliveryRejection::{Conflict, NotYet, Rejected};
+    let fixture = Fixture::new(true).await;
+    let (messages, _observations) = mpsc::channel(16);
+    let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
+    fixture.commit_session_started(&mut actor).await;
+    let source = fixture.remote_keys.peer_id();
+    let before = actor.state.clone();
+    let message = message_frame(&before, source, before.agreed_step(), vec![7]);
+    assert_eq!(
+        actor.accept_frame(source, message.clone()).await.unwrap(),
+        None
+    );
+    let staged = actor.state.clone();
+    assert_eq!(actor.accept_frame(source, message).await.unwrap(), None);
+    let conflicting = message_frame(&before, source, before.agreed_step(), vec![8]);
+    assert_eq!(
+        actor.accept_frame(source, conflicting).await.unwrap(),
+        Some(Conflict)
+    );
+    let commitment = staged.pending_shared().unwrap().commitment().clone();
+    let signature = ExecFrame::StepSignature {
+        signature: fixture
+            .remote_execution_key()
+            .sign(&commitment.signing_bytes()),
+        commitment: commitment.clone(),
+    };
+    assert_eq!(
+        actor.accept_frame(source, signature.clone()).await.unwrap(),
+        None
+    );
+    let signed = actor.state.clone();
+    // Shutdown proves the remaining classification paths do not load state.
+    let remote_key = fixture.remote_execution_key();
+    fixture.store.shutdown().await.unwrap();
+    assert_eq!(actor.accept_frame(source, signature).await.unwrap(), None);
+    let mut mismatch = commitment.clone();
+    mismatch.entry_hash[0] ^= 1;
+    assert_eq!(
+        actor
+            .accept_frame(
+                source,
+                ExecFrame::StepSignature {
+                    signature: remote_key.sign(&mismatch.signing_bytes()),
+                    commitment: mismatch
+                }
+            )
+            .await
+            .unwrap(),
+        Some(Rejected)
+    );
+    let mut future = commitment;
+    future.step += 1;
+    assert_eq!(
+        actor
+            .accept_frame(
+                source,
+                ExecFrame::StepSignature {
+                    signature: remote_key.sign(&future.signing_bytes()),
+                    commitment: future
+                }
+            )
+            .await
+            .unwrap(),
+        Some(NotYet)
+    );
+    assert_eq!(actor.state, signed);
+    actor
+        .deliver_frames()
+        .expect("outbound computation uses actor state");
+}
+
+#[tokio::test]
+async fn expired_end_wakes_on_unconfirmed_peer_and_simultaneous_evidence_confirms_it() {
+    let (fixture, mut actor, _observations) = ended_actor().await;
+    actor.finalize_receipt().await.unwrap();
+    let frame = actor.state.terminal_evidence().unwrap();
+    drop(actor);
+    let host = crate::Host::start(
+        fixture.local_keys.clone(),
+        fixture.local_transport.clone(),
+        fixture.store.handle().clone(),
+    );
+    let mut wakes = host.take_end_wakes().unwrap();
+    let mut context = fixture.context();
+    context.end_confirmation_window = Duration::ZERO;
+    let mut spawned = host
+        .spawn(context, host.claim_execution(EXEC_ID).unwrap())
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while spawned.message_rx.recv().await.is_some() {}
+    })
+    .await
+    .expect("window expires without waiting for the silent peer");
+    spawned.shutdown().await;
+    let (_, end) = fixture
+        .store
+        .handle()
+        .execution_end(fixture.activation.session_hash())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(end, arena0_protocol::EndPhase::Ended { unconfirmed } if unconfirmed.contains(&fixture.remote_keys.peer_id()))
+    );
+    assert!(
+        fixture
+            .store
+            .handle()
+            .list_recovery_candidates(arena0_store::RecoveryCursor::start(), 8)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let open = || async {
+        fixture
+            .remote_transport
+            .open_exec(
+                &fixture.local_keys.peer_id(),
+                fixture.activation.session_hash(),
+            )
+            .await
+    };
+    let stream = open().await.unwrap();
+    assert!(matches!(
+        stream.send_exec(&frame).await,
+        Err(arena0_transport::TransportError::ExecNotYet)
+    ));
+    let wake = tokio::time::timeout(Duration::from_secs(2), wakes.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(wake, EXEC_ID);
+    // The embedding supervisor reconstructs through the same public spawn
+    // boundary used at startup, after the router has returned NotYet.
+    let mut resumed = host
+        .spawn(fixture.context(), host.claim_execution(wake).unwrap())
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        open().await.unwrap().send_exec(&frame).await.unwrap();
+    })
+    .await
+    .expect("matching evidence is acknowledged across retirement");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while resumed.message_rx.recv().await.is_some() {}
+    })
+    .await
+    .expect("matching peer evidence confirms without an outbound ack");
+    resumed.shutdown().await;
+    let (_, end) = fixture
+        .store
+        .handle()
+        .execution_end(fixture.activation.session_hash())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(end, arena0_protocol::EndPhase::Ended { unconfirmed } if unconfirmed.is_empty())
+    );
+    open()
+        .await
+        .unwrap()
+        .send_exec(&frame)
+        .await
+        .expect("confirmed peer is stale");
+    host.stop().await;
+}
+
+#[tokio::test]
+async fn authenticated_abort_is_deferred_adopted_or_stale() {
+    use arena0_transport::ExecDeliveryRejection::NotYet;
+    let fixture = Fixture::new(true).await;
+    let (messages, _observations) = mpsc::channel(16);
+    let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
+    fixture.commit_session_started(&mut actor).await;
+    let source = fixture.remote_keys.peer_id();
+    let frame = |cursor| {
+        let unsigned = AbortOccurrence::unsigned(
+            fixture.activation.session_hash(),
+            source,
+            AbortKind::Abort,
+            1,
+            "peer stop",
+            cursor,
+        )
+        .unwrap();
+        let signature = fixture.remote_keys.sign(&unsigned.signing_bytes().unwrap());
+        ExecFrame::Abort {
+            occurrence: unsigned.with_signature(signature).unwrap(),
+        }
+    };
+    let before = actor.state.clone();
+    let ahead = arena0_protocol::StepCursor::new(
+        before.agreed_step() + 1,
+        before.agreed_state(),
+        before.agreed_link(),
+    );
+    assert_eq!(
+        actor.accept_frame(source, frame(ahead)).await.unwrap(),
+        Some(NotYet)
+    );
+    assert_eq!(actor.state, before);
+    let valid = frame(before.step_cursor());
+    assert_eq!(
+        actor
+            .accept_frame(fixture.local_keys.peer_id(), valid.clone())
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        actor.accept_frame(source, frame(ahead)).await.unwrap(),
+        Some(arena0_transport::ExecDeliveryRejection::Conflict)
+    );
+    assert!(
+        actor
+            .state
+            .end_phase()
+            .unconfirmed()
+            .unwrap()
+            .contains(&source)
+    );
+    let alternative = AbortOccurrence::unsigned(
+        fixture.activation.session_hash(),
+        source,
+        AbortKind::Fail,
+        2,
+        "independent stop report",
+        before.step_cursor(),
+    )
+    .unwrap();
+    let signature = fixture
+        .remote_keys
+        .sign(&alternative.signing_bytes().unwrap());
+    assert_eq!(
+        actor
+            .accept_frame(
+                source,
+                ExecFrame::Abort {
+                    occurrence: alternative.with_signature(signature).unwrap(),
+                }
+            )
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(actor.state.end_phase().unconfirmed().unwrap().is_empty());
+    assert_eq!(
+        actor.accept_frame(source, valid.clone()).await.unwrap(),
+        None
+    );
+    assert!(actor.state.status().is_terminal());
+    let stopped = actor.state.clone();
+    assert_eq!(actor.accept_frame(source, valid).await.unwrap(), None);
+    assert_eq!(actor.state, stopped);
+}
+
+#[tokio::test]
+async fn certificate_authentication_rejects_bad_evidence_but_local_contradiction_errors() {
+    let (_source_fixture, source, _observations) = ended_actor().await;
+    let certificate = source
+        .state
+        .current_frames(source.context.producer)
+        .into_iter()
+        .next()
+        .unwrap();
+    let fixture = Fixture::with_mode(true, GuestMode::EndOnMessage).await;
+    let (messages, _observations) = mpsc::channel(16);
+    let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
+    fixture.commit_session_started(&mut actor).await;
+    let mut raw = arena0_wire::ExecFrame::try_from(&certificate).unwrap();
+    if let arena0_wire::ExecFrame::StepCertificate { aggregate, .. } = &mut raw {
+        aggregate.0[0] ^= 1;
+    }
+    assert_eq!(
+        actor
+            .accept_frame(
+                fixture.remote_keys.peer_id(),
+                ExecFrame::try_from(raw).unwrap()
+            )
+            .await
+            .unwrap(),
+        Some(arena0_transport::ExecDeliveryRejection::Rejected)
+    );
+    let different = message_frame(
+        &actor.state,
+        fixture.remote_keys.peer_id(),
+        actor.state.agreed_step(),
+        b"different".to_vec(),
+    );
+    actor
+        .accept_frame(fixture.remote_keys.peer_id(), different)
+        .await
+        .unwrap();
+    assert!(matches!(
+        actor
+            .accept_frame(fixture.remote_keys.peer_id(), certificate)
+            .await,
+        Err(crate::ExecError::DeliveryInvariant(_))
+    ));
 }
 
 fn message_frame(
@@ -402,7 +874,7 @@ async fn rejected_writer_leaves_durable_state_unchanged() {
     );
 
     let applied = actor
-        .apply_message(fixture.remote_keys.peer_id(), frame, None)
+        .apply_message(fixture.remote_keys.peer_id(), frame)
         .await
         .expect("drop wrong writer");
     assert!(!applied);
@@ -451,7 +923,7 @@ async fn host_rejects_a_duplicate_actor_for_one_execution() {
 }
 
 #[tokio::test]
-async fn valid_writer_message_divergence_preserves_the_unconsumed_inbox() {
+async fn valid_writer_message_divergence_preserves_state_until_failure_is_persisted() {
     for (mode, cause) in [
         (
             GuestMode::RejectMessage,
@@ -483,13 +955,10 @@ async fn valid_writer_message_divergence_preserves_the_unconsumed_inbox() {
             data,
             poststate,
         };
-        actor
-            .context
-            .store
-            .accept_inbound(source, frame, 20)
+        let error = actor
+            .accept_frame(source, frame)
             .await
-            .expect("accept frame");
-        let error = actor.resolve_pending_inbox().await.expect_err("divergence");
+            .expect_err("divergence");
         let crate::ExecError::Diverged(reason) = &error else {
             panic!("expected divergence, got {error:?}");
         };
@@ -497,16 +966,6 @@ async fn valid_writer_message_divergence_preserves_the_unconsumed_inbox() {
         assert!(reason.contains(cause), "{reason}");
         assert!(reason.len() <= arena0_protocol::MAX_TERMINAL_REASON_BYTES);
         assert_eq!(actor.state.clone(), before);
-        assert_eq!(
-            actor
-                .context
-                .store
-                .list_pending_inbox(8)
-                .await
-                .expect("pending inbox")
-                .len(),
-            1
-        );
         assert!(
             actor.fail_terminal(error).await,
             "failure must permit final delivery"
@@ -557,40 +1016,19 @@ async fn invalid_messages_are_dropped_before_the_guest_can_diverge() {
             },
             poststate,
         };
-        let accepted = actor
-            .context
-            .store
-            .accept_inbound(source, frame.clone(), 20)
-            .await;
-        if invalid == "message_id" {
-            assert!(matches!(
-                accepted,
-                Err(arena0_store::StoreError::UnauthenticatedSource(_))
-            ));
-            assert!(
-                !actor
-                    .apply_message(source, frame, None)
-                    .await
-                    .expect("drop mismatched id")
-            );
-        } else {
-            accepted.expect("accept frame");
-            actor
-                .resolve_pending_inbox()
-                .await
-                .expect("drop invalid frame");
-        }
-        assert_eq!(actor.state.clone(), before, "{invalid}");
-        assert!(
-            actor
-                .context
-                .store
-                .list_pending_inbox(8)
-                .await
-                .expect("inbox")
-                .is_empty(),
-            "{invalid}"
+        let decision = actor
+            .accept_frame(source, frame)
+            .await
+            .expect("classification");
+        assert_eq!(
+            decision,
+            if invalid == "stale" {
+                None
+            } else {
+                Some(arena0_transport::ExecDeliveryRejection::Rejected)
+            }
         );
+        assert_eq!(actor.state.clone(), before, "{invalid}");
     }
 }
 
@@ -756,9 +1194,13 @@ async fn spawned_execution_keeps_host_router_alive_after_host_arc_drop() {
         .await
         .expect("load execution")
         .expect("execution state");
-    let source = fixture.remote_keys.peer_id();
-    let sequence = state.agreed_step();
-    let frame = message_frame(&state, source, sequence, Vec::new());
+    let commitment = state.pending_shared().unwrap().commitment().clone();
+    let frame = ExecFrame::StepSignature {
+        signature: fixture
+            .remote_execution_key()
+            .sign(&commitment.signing_bytes()),
+        commitment,
+    };
     let send = fixture
         .remote_transport
         .open_exec(
@@ -772,14 +1214,14 @@ async fn spawned_execution_keeps_host_router_alive_after_host_arc_drop() {
         .expect("transport acknowledgement timeout")
         .expect("durable inbound acknowledgement");
 
-    let pending = fixture
+    let committed = fixture
         .store
         .handle()
-        .list_pending_inbox(EXEC_ID, 16)
+        .load_execution(EXEC_ID)
         .await
-        .expect("list pending inbox");
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].source(), source);
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.agreed_step(), 1);
     spawned.shutdown().await;
 }
 
@@ -801,7 +1243,7 @@ async fn flat_dispatch_commits_local_state_in_the_resident() {
 }
 
 #[tokio::test]
-async fn restart_resumes_a_durable_timer_and_accepted_inbox() {
+async fn restart_resumes_a_durable_timer_and_accepts_a_message() {
     let fixture = Fixture::with_mode(true, GuestMode::Timer).await;
     let mut actor = fixture.prepare_active_actor().await;
     fixture.commit_session_started(&mut actor).await;
@@ -835,24 +1277,10 @@ async fn restart_resumes_a_durable_timer_and_accepted_inbox() {
     let source = fixture.remote_keys.peer_id();
     let frame = message_frame(&state, source, state.agreed_step(), vec![1, 2, 3]);
     restarted
-        .context
-        .store
-        .accept_inbound(source, frame, 14)
+        .accept_frame(source, frame)
         .await
         .expect("accept inbound");
-    restarted
-        .resolve_pending_inbox()
-        .await
-        .expect("resolve recovered inbox");
-    assert!(
-        fixture
-            .store
-            .handle()
-            .list_pending_inbox(EXEC_ID, 16)
-            .await
-            .expect("load pending inbox")
-            .is_empty()
-    );
+
     let resolved = fixture
         .store
         .handle()
@@ -963,15 +1391,6 @@ async fn restart_reannounces_committed_callout_once() {
         } if id == pending_id
             && context == b"null"
     ));
-    assert!(
-        restarted
-            .context
-            .store
-            .lease_next_outbox(super::now_ms())
-            .await
-            .expect("load outbox")
-            .is_none()
-    );
 }
 
 #[tokio::test]
@@ -1031,13 +1450,8 @@ async fn staged_result_preserves_callout_and_reports_agreement_pending() {
     let open = before.callout().unwrap().clone();
     let source = fixture.remote_keys.peer_id();
     let frame = message_frame(&before, source, before.agreed_step(), vec![1, 2, 3]);
-    actor
-        .context
-        .store
-        .accept_inbound(source, frame, 14)
-        .await
-        .unwrap();
-    actor.resolve_pending_inbox().await.unwrap();
+    actor.accept_frame(source, frame).await.unwrap();
+
     let staged = actor.state.clone();
     assert!(staged.pending_shared().is_some());
     assert_eq!(staged.callout(), Some(&open));
@@ -1182,27 +1596,8 @@ async fn receipt_budget_failure_publishes_a_stop_report_that_survives_restart() 
             before.agreed_step(),
             vec![1; arena0_protocol::MAX_EFFECT_PAYLOAD_BYTES],
         );
-        actor
-            .context
-            .store
-            .accept_inbound(
-                fixture.remote_keys.peer_id(),
-                frame.clone(),
-                super::now_ms(),
-            )
-            .await
-            .expect("accept writer message");
-        let inbox = actor
-            .context
-            .store
-            .list_pending_inbox(8)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|item| item.frame() == &frame)
-            .unwrap();
         let result = actor
-            .apply_message(fixture.remote_keys.peer_id(), frame, Some(inbox.inbox_id()))
+            .apply_message(fixture.remote_keys.peer_id(), frame)
             .await;
         if let Err(error @ crate::ExecError::ReceiptBudgetExhausted { .. }) = result {
             assert_eq!(actor.state.clone(), before);
@@ -1218,9 +1613,7 @@ async fn receipt_budget_failure_publishes_a_stop_report_that_survives_restart() 
         let staged = actor.state.clone();
         let commitment = staged.pending_shared().unwrap().commitment().clone();
         actor
-            .context
-            .store
-            .accept_inbound(
+            .accept_frame(
                 fixture.remote_keys.peer_id(),
                 ExecFrame::StepSignature {
                     signature: fixture
@@ -1228,13 +1621,11 @@ async fn receipt_budget_failure_publishes_a_stop_report_that_survives_restart() 
                         .sign(&commitment.signing_bytes()),
                     commitment,
                 },
-                super::now_ms(),
             )
             .await
             .expect("accept peer signature");
-        actor.resolve_pending_inbox().await.expect("certify step");
+
         assert!(actor.state.clone().pending_shared().is_none());
-        fixture.clear_outbox(&mut actor).await;
     }
     let stopped = actor.state.clone();
     let receipt_id = stopped
@@ -1298,150 +1689,12 @@ async fn receipt_budget_failure_publishes_a_stop_report_that_survives_restart() 
 }
 
 #[tokio::test]
-async fn terminal_observation_waits_for_final_step_delivery() {
-    let fixture = Fixture::with_mode(true, GuestMode::EndOnMessage).await;
-    let (messages, mut observations) = mpsc::channel(8);
-    let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
-    fixture.commit_session_started(&mut actor).await;
-    assert!(matches!(
-        observations.try_recv(),
-        Ok(crate::SessionMessage::TraceAppended { step: 0 })
-    ));
-
-    let state = actor.state.clone();
-    let frame = message_frame(
-        &state,
-        fixture.remote_keys.peer_id(),
-        state.agreed_step(),
-        b"end".to_vec(),
-    );
-    assert!(
-        actor
-            .apply_message(fixture.remote_keys.peer_id(), frame, None)
-            .await
-            .expect("apply terminal message")
-    );
-    actor
-        .ensure_step_signature()
-        .await
-        .expect("commit local terminal-step signature");
-    let state = actor.state.clone();
-    let proposal = state
-        .pending_shared()
-        .expect("terminal proposal")
-        .commitment()
-        .clone();
-    let proposal_step = proposal.step;
-    let remote_step = ParticipantStepSignature::new(
-        fixture.remote_keys.peer_id(),
-        proposal.step,
-        fixture
-            .remote_execution_key()
-            .sign(&proposal.signing_bytes()),
-    );
-    actor
-        .context
-        .store
-        .accept_inbound(
-            fixture.remote_keys.peer_id(),
-            ExecFrame::StepSignature {
-                commitment: proposal,
-                signature: remote_step.signature().sig,
-            },
-            19,
-        )
-        .await
-        .expect("accept remote terminal-step signature");
-    let inbox = actor
-        .context
-        .store
-        .list_pending_inbox(8)
-        .await
-        .expect("list terminal-step inbox")
-        .into_iter()
-        .next()
-        .expect("remote terminal-step signature inbox");
-    actor
-        .resolve_inbox_item(inbox)
-        .await
-        .expect("commit remote terminal-step signature");
-    assert!(
-        matches!(observations.try_recv(), Ok(crate::SessionMessage::TraceAppended { step }) if step == proposal_step)
-    );
-    actor
-        .reconcile_resident()
-        .expect("promote terminal-step memories");
-
-    let ended = actor.state.clone();
-    assert!(matches!(ended.status(), ExecutionStatus::Ended { .. }));
-    assert!(
-        actor
-            .fail_terminal(crate::ExecError::Unavailable("peer disconnected".into()))
-            .await
-    );
-    let published = actor.state.clone();
-    assert!(matches!(
-        published.status(),
-        ExecutionStatus::Completed { .. }
-    ));
-    assert_eq!(published.terminal_outcome(), ended.terminal_outcome());
-
-    // Receipt publication may finish locally, but progress must retain the
-    // actor's final step-signature send and withhold terminal observations until the
-    // remote transport grants durable responsibility.
-    actor.progress().await.expect("start final step delivery");
-    assert!(actor.inflight_send.is_some());
-    assert!(
-        actor
-            .context
-            .store
-            .has_unsettled_frames()
-            .await
-            .expect("inspect final frame")
-    );
-    assert!(observations.try_recv().is_err());
-
-    let accepted = fixture
-        .remote_transport
-        .accept_exec()
-        .await
-        .expect("accept final step stream");
-    let recv = accepted.into_parts().1;
-    let step_delivery = recv
-        .recv_exec()
-        .await
-        .expect("receive terminal-step signature");
-    assert!(matches!(
-        step_delivery.frame(),
-        ExecFrame::StepSignature { .. }
-    ));
-    assert!(observations.try_recv().is_err());
-    step_delivery
-        .acknowledge()
-        .expect("acknowledge terminal-step responsibility");
-
-    let joined = actor
-        .inflight_send
-        .as_mut()
-        .expect("in-flight send")
-        .wait()
-        .await;
-    actor
-        .settle_inflight_send(joined)
-        .await
-        .expect("settle terminal-step delivery");
+async fn terminal_publication_precedes_delivery_and_restart_resends_final_frames() {
+    let (fixture, mut actor, mut observations) = ended_actor().await;
     actor
         .progress()
         .await
-        .expect("publish terminal observation");
-    assert!(
-        !actor
-            .context
-            .store
-            .has_unsettled_frames()
-            .await
-            .expect("final frame settled")
-    );
+        .expect("publish and start final delivery");
     assert!(matches!(
         observations.recv().await,
         Some(crate::SessionMessage::ReceiptPublished { .. })
@@ -1450,10 +1703,60 @@ async fn terminal_observation_waits_for_final_step_delivery() {
         observations.recv().await,
         Some(crate::SessionMessage::Completed { .. })
     ));
+    assert!(!actor.end_run_finished());
+    let recv = fixture
+        .remote_transport
+        .accept_exec()
+        .await
+        .unwrap()
+        .into_parts()
+        .1;
+    let delivery = recv.recv_exec().await.unwrap();
+    let frame = delivery.frame().clone();
+    assert!(matches!(frame, ExecFrame::StepCertificate { .. }));
+    drop(delivery);
+    drop(recv);
+    drop(actor);
+
+    let (messages, mut observations) = mpsc::channel(16);
+    let mut restarted = fixture.actor_with_messages(messages).await;
+    restarted.recover().await.expect("resume final delivery");
+    assert!(matches!(
+        observations.recv().await,
+        Some(crate::SessionMessage::ReceiptPublished { .. })
+    ));
+    assert!(matches!(
+        observations.recv().await,
+        Some(crate::SessionMessage::Completed { .. })
+    ));
+    let recv = fixture
+        .remote_transport
+        .accept_exec()
+        .await
+        .unwrap()
+        .into_parts()
+        .1;
+    let delivery = recv.recv_exec().await.unwrap();
+    assert_eq!(delivery.frame(), &frame);
+    delivery.acknowledge().unwrap();
+    let result = restarted.send_tasks.join_next().await.unwrap().unwrap();
+    restarted.settle_send(result).await.unwrap();
+    restarted.progress().await.unwrap();
+    assert!(restarted.end_run_finished());
+    assert!(
+        fixture
+            .store
+            .handle()
+            .list_recovery_candidates(arena0_store::RecoveryCursor::start(), 8)
+            .await
+            .unwrap()
+            .candidates()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
-async fn stale_abort_is_rejected_across_restart_and_signed_proposal_still_commits() {
+async fn stale_abort_is_acked_across_restart_and_signed_proposal_still_commits() {
     let fixture = Fixture::with_mode(false, GuestMode::Broadcast).await;
     let mut actor = fixture.prepare_active_actor().await;
     let stale_cursor = actor.state.clone().step_cursor();
@@ -1494,12 +1797,9 @@ async fn stale_abort_is_rejected_across_restart_and_signed_proposal_still_commit
         )
         .expect("signed abort");
     actor
-        .context
-        .store
-        .accept_inbound(
+        .accept_frame(
             fixture.remote_keys.peer_id(),
             ExecFrame::Abort { occurrence },
-            20,
         )
         .await
         .expect("accept stale abort");
@@ -1508,15 +1808,7 @@ async fn stale_abort_is_rejected_across_restart_and_signed_proposal_still_commit
     let (messages, _observations) = mpsc::channel(32);
     let mut restarted = fixture.actor_with_messages(messages).await;
     restarted.recover().await.expect("recover signed proposal");
-    assert!(
-        restarted
-            .context
-            .store
-            .list_pending_inbox(8)
-            .await
-            .expect("list inbox after recovery")
-            .is_empty()
-    );
+
     let recovered = restarted.state.clone();
     assert_eq!(
         recovered
@@ -1527,9 +1819,7 @@ async fn stale_abort_is_rejected_across_restart_and_signed_proposal_still_commit
     );
 
     restarted
-        .context
-        .store
-        .accept_inbound(
+        .accept_frame(
             fixture.remote_keys.peer_id(),
             ExecFrame::StepSignature {
                 commitment: commitment.clone(),
@@ -1537,14 +1827,10 @@ async fn stale_abort_is_rejected_across_restart_and_signed_proposal_still_commit
                     .remote_execution_key()
                     .sign(&commitment.signing_bytes()),
             },
-            21,
         )
         .await
         .expect("accept final step signature");
-    restarted
-        .resolve_pending_inbox()
-        .await
-        .expect("commit final signature");
+
     let committed = restarted.state.clone();
     assert!(committed.pending_shared().is_none());
     assert_eq!(committed.agreed_step(), 2);
@@ -1604,7 +1890,7 @@ async fn message_handler_cannot_sign() {
     let sequence = state.agreed_step();
     let frame = message_frame(&state, source, sequence, vec![4, 5, 6]);
     let error = actor
-        .apply_message(source, frame, None)
+        .apply_message(source, frame)
         .await
         .expect_err("a message handler must not reach the signer");
     assert!(
@@ -1615,7 +1901,7 @@ async fn message_handler_cannot_sign() {
 }
 
 #[tokio::test]
-async fn inbound_transport_ack_follows_durable_acceptance() {
+async fn future_message_gets_not_yet_without_persistence() {
     let fixture = Fixture::new(true).await;
     let (messages, _observations) = mpsc::channel(32);
     let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
@@ -1642,21 +1928,19 @@ async fn inbound_transport_ack_follows_durable_acceptance() {
     let delivery = recv.recv_exec().await.expect("receive delivery");
     let resolver = tokio::spawn(async move { actor.inbound(delivery).await });
 
-    sender
-        .await
-        .expect("sender task")
-        .expect("durable receiver acknowledgement");
-    let pending = fixture
+    assert!(matches!(
+        sender.await.expect("sender task"),
+        Err(arena0_transport::TransportError::ExecNotYet)
+    ));
+    let persisted = fixture
         .store
         .handle()
-        .list_pending_inbox(EXEC_ID, 16)
+        .load_execution(EXEC_ID)
         .await
-        .expect("list accepted inbox");
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].source(), source);
-    assert!(
-        matches!(pending[0].frame(), ExecFrame::Message { seq, poststate, .. } if *seq == sequence && *poststate == StateHash::of_shared(&message_state()))
-    );
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.agreed_step(), state.agreed_step());
+    assert!(persisted.pending_shared().is_none());
 
     resolver
         .await
@@ -1678,7 +1962,6 @@ async fn future_step_signature_waits_behind_the_current_proposal() {
             .apply_message(
                 source,
                 message_frame(&state, source, sequence, vec![1, 2, 3]),
-                None,
             )
             .await
             .expect("stage current proposal")
@@ -1697,24 +1980,11 @@ async fn future_step_signature_waits_behind_the_current_proposal() {
             .sign(&future_commitment.signing_bytes()),
         commitment: future_commitment,
     };
-    actor
-        .context
-        .store
-        .accept_inbound(source, frame, 20)
-        .await
-        .expect("accept future signature");
-    actor
-        .resolve_pending_inbox()
-        .await
-        .expect("defer future signature");
-
-    let pending = fixture
-        .store
-        .handle()
-        .list_pending_inbox(EXEC_ID, 16)
-        .await
-        .expect("load deferred signature");
-    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        actor.accept_frame(source, frame).await.unwrap(),
+        Some(arena0_transport::ExecDeliveryRejection::NotYet)
+    );
+    assert_eq!(actor.state, state);
 }
 
 #[tokio::test]
@@ -1736,7 +2006,6 @@ async fn trace_observation_waits_for_the_certified_step() {
             .apply_message(
                 source,
                 message_frame(&state, source, sequence, vec![1, 2, 3]),
-                None,
             )
             .await
             .expect("stage shared proposal")
@@ -1763,9 +2032,7 @@ async fn trace_observation_waits_for_the_certified_step() {
         .commitment()
         .clone();
     actor
-        .context
-        .store
-        .accept_inbound(
+        .accept_frame(
             source,
             ExecFrame::StepSignature {
                 commitment: proposal.clone(),
@@ -1773,14 +2040,9 @@ async fn trace_observation_waits_for_the_certified_step() {
                     .remote_execution_key()
                     .sign(&proposal.signing_bytes()),
             },
-            20,
         )
         .await
         .expect("accept remote signature");
-    actor
-        .resolve_pending_inbox()
-        .await
-        .expect("resolve remote signature");
 
     assert!(matches!(
         observations.try_recv(),
@@ -1795,7 +2057,7 @@ async fn trace_observation_waits_for_the_certified_step() {
 }
 
 #[tokio::test]
-async fn broadcast_outbox_has_only_remote_destinations_and_no_self_apply() {
+async fn broadcast_delivery_has_only_remote_destinations_and_no_self_apply() {
     let fixture = Fixture::with_mode(false, GuestMode::Broadcast).await;
     let mut actor = fixture.prepare_active_actor().await;
     fixture.commit_session_started(&mut actor).await;
@@ -1811,16 +2073,11 @@ async fn broadcast_outbox_has_only_remote_destinations_and_no_self_apply() {
     let state = actor.state.clone();
     assert!(state.pending_shared().is_some());
     assert_eq!(state.agreed_step(), before.agreed_step());
-    let leased = actor
-        .context
-        .store
-        .lease_next_outbox(super::now_ms())
-        .await
-        .expect("lease broadcast")
-        .expect("remote broadcast row");
-    assert_eq!(leased.item.payload_kind, OutboxPayloadKind::Frame);
-    assert_eq!(leased.item.destination, Some(fixture.remote_keys.peer_id()));
-    let frame: ExecFrame = borsh::from_slice(&leased.item.payload).expect("decode broadcast frame");
+    let frame = state
+        .current_frames(fixture.local_keys.peer_id())
+        .into_iter()
+        .find(|frame| matches!(frame, ExecFrame::Message { .. }))
+        .expect("broadcast frame");
     assert!(matches!(
         frame,
         ExecFrame::Message {
@@ -1833,21 +2090,14 @@ async fn broadcast_outbox_has_only_remote_destinations_and_no_self_apply() {
         state.event_position(),
         before.event_position().saturating_add(1)
     );
-    actor
-        .context
-        .store
-        .acknowledge_outbox(leased.item.outbox_id, leased.lease_id)
-        .await
-        .expect("ack remote broadcast");
+    actor.deliver_frames().unwrap();
+    assert_eq!(actor.send_lanes.len(), 1);
     assert!(
         actor
-            .context
-            .store
-            .lease_next_outbox(super::now_ms())
-            .await
-            .expect("check no self broadcast")
-            .is_none()
+            .send_lanes
+            .contains_key(&fixture.remote_keys.peer_id())
     );
+    assert_eq!(actor.state, state);
 }
 
 fn activation(
@@ -2379,7 +2629,6 @@ async fn failed_persist_reloads_state_and_restores_resident_before_next_dispatch
                 },
                 effects: vec![],
                 timer_id: None,
-                inbox_id: None,
             },
             now_ms: super::now_ms(),
         })

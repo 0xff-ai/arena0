@@ -166,10 +166,23 @@ pub struct LiveExecution {
 /// capability is moved through request, activation, and execution unchanged.
 pub async fn spawn_live_execution(
     wasm: Vec<u8>,
+    cryptos: Vec<NodeKeys>,
+    negotiation_id: NegotiationId,
+    exec_id: ExecId,
+    params: Vec<u8>,
+) -> LiveExecution {
+    spawn_live_execution_with_delivery(wasm, cryptos, negotiation_id, exec_id, params, true).await
+}
+
+/// Build the same real execution while allowing tests to receive and decide
+/// outbound frames themselves when automatic acknowledgements are disabled.
+pub async fn spawn_live_execution_with_delivery(
+    wasm: Vec<u8>,
     mut cryptos: Vec<NodeKeys>,
     negotiation_id: NegotiationId,
     exec_id: ExecId,
     params: Vec<u8>,
+    automatic_acknowledgements: bool,
 ) -> LiveExecution {
     cryptos.sort_by_key(NodeKeys::peer_id);
     let peer_ids = cryptos.iter().map(NodeKeys::peer_id).collect::<Vec<_>>();
@@ -207,10 +220,11 @@ pub async fn spawn_live_execution(
     // from raw participant transports.  The actor still publishes its
     // durable signatures to every selected peer, so each remaining endpoint
     // needs a real transport reader to acknowledge those frames.  This keeps
-    // the producer's outbox on the production path without introducing a
+    // the producer's delivery lanes on the production path without introducing a
     // second runtime/store implementation into the fixture.
     let remote_ack_tasks = transports[1..peer_ids.len()]
         .iter()
+        .filter(|_| automatic_acknowledgements)
         .map(|transport| tokio::spawn(acknowledge_exec_streams(Arc::clone(transport))))
         .collect::<Vec<_>>();
     let directory = tempfile::tempdir().expect("temporary store directory");
@@ -260,10 +274,8 @@ pub async fn spawn_live_execution(
         execution_key(identity.as_ref()),
     );
     let spawned = host.spawn(context, execution_store).expect("spawn actor");
-    // Keep one authenticated stream open per remote participant. The Host
-    // treats a participant stream closure as terminal evidence, so tests that
-    // inject several frames must reuse these streams instead of dropping a
-    // one-frame handle after every send.
+    // Reuse an authenticated stream per remote participant for injections;
+    // opening a replacement stream is also safe after a transport failure.
     let mut participant_streams = Vec::with_capacity(peer_ids.len().saturating_sub(1));
     for transport in transports.iter().skip(1) {
         participant_streams.push(
@@ -329,7 +341,7 @@ pub async fn establish_live_session(execution: &LiveExecution, cryptos: &[NodeKe
 
 /// Supply every remote signature for the actor's current shared proposal.
 /// The caller chooses when to release this quorum, which lets receive-side
-/// tests observe accepted-but-not-yet-applicable inbox rows first.
+/// tests observe retryable NotYet decisions before releasing agreement.
 pub async fn complete_pending_shared(execution: &LiveExecution, cryptos: &[NodeKeys]) {
     let deadline = tokio::time::Instant::now() + LIVE_EXECUTION_TIMEOUT;
     let commitment = loop {
@@ -378,7 +390,7 @@ pub async fn complete_pending_shared(execution: &LiveExecution, cryptos: &[NodeK
     if let Some((first_index, first_crypto)) = pending.next() {
         let first = send_signature(execution, first_index, commitment.clone(), first_crypto);
         if let Some((second_index, second_crypto)) = pending.next() {
-            // The producer's outbox drives every selected peer. Keep the
+            // The producer's delivery lanes drive every selected peer. Keep the
             // inbound quorum drives live at the same time so one completed
             // transport receipt cannot starve the other participant's frame.
             let second = send_signature(execution, second_index, commitment.clone(), second_crypto);

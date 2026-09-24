@@ -89,13 +89,21 @@ impl Database {
         let imported = self.receipt_import_exists(receipt_id)?;
         let produced_execution = self.receipt_production(receipt_id)?;
         if let Some(execution_id) = produced_execution {
-            let state = self
-                .load_execution(execution_id)?
-                .ok_or(StoreError::ExecutionNotFound(execution_id))?;
-            if state.binding().session_id() != session_id
-                || state.producer() != self.host_id
-                || state.published_receipt_id() != Some(receipt_id)
-            {
+            // The production row is committed atomically with publication.
+            // Validate its routing indexes without decoding guest memories;
+            // actors also compare the artifact with their in-memory receipt id.
+            let bound: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM executions
+                 WHERE execution_id = ?1 AND session_id = ?2 AND producer = ?3
+                   AND end_phase <> 0)",
+                params![
+                    execution_id.0.to_vec(),
+                    session_id.0.to_vec(),
+                    self.host_id.0.to_vec()
+                ],
+                |row| row.get(0),
+            )?;
+            if !bound {
                 return Err(StoreError::Corruption(
                     "produced receipt is not bound to its Host execution".into(),
                 ));
@@ -352,7 +360,9 @@ impl Database {
         )?;
         let receipt: ReceiptArtifact = ReceiptArtifact::decode(&payload)
             .map_err(|error| StoreError::Corruption(format!("terminal publication: {error}")))?;
-        if sqlite_i64(version)? != state.version().get()
+        // End confirmations advance local state after publication without
+        // changing any portable evidence or the publication's original version.
+        if sqlite_i64(version)? > state.version().get()
             || row_id != receipt_id.as_bytes().to_vec()
             || receipt.receipt_id() != receipt_id
             || receipt.body().header().activation != *state.binding().activation()

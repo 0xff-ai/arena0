@@ -1,7 +1,7 @@
 //! Actor lifecycle, recovery, and serialized command dispatch.
 //!
 //! This module owns task startup and the actor loop. Guest transitions,
-//! inbox resolution, outbox delivery, and terminal boundaries live in their
+//! frame classification and delivery, and terminal boundaries live in their
 //! respective modules and extend the same private actor state owner.
 
 use std::collections::HashMap;
@@ -64,13 +64,15 @@ pub(crate) fn spawn_execution(context: ActorContext, host: Arc<Host>) -> Spawned
                 }
             }
         };
+        let end_deadline = tokio::time::Instant::now() + context.end_confirmation_window;
         let actor = ExecutionActor {
             context,
             state,
             instance: None,
             messages: message_tx,
-            send_streams: HashMap::new(),
-            inflight_send: None,
+            send_lanes: HashMap::new(),
+            send_tasks: JoinSet::new(),
+            end_deadline,
             session_started_emitted: false,
             terminal_emitted: false,
             announced_callout: None,
@@ -98,9 +100,10 @@ async fn forward_streams(
     let mut readers = JoinSet::new();
     loop {
         tokio::select! {
-            Some((peer, recv)) = streams.recv() => {
+            _ = commands.closed() => return,
+            Some((_peer, recv)) = streams.recv() => {
                 let commands = commands.clone();
-                readers.spawn(read_stream(peer, recv, commands));
+                readers.spawn(read_stream(recv, commands));
             }
             joined = readers.join_next(), if !readers.is_empty() => {
                 let _ = joined;
@@ -110,11 +113,7 @@ async fn forward_streams(
     }
 }
 
-async fn read_stream(
-    peer: arena0_protocol::PeerId,
-    recv: RecvHandle,
-    commands: mpsc::Sender<ExecCommand>,
-) {
+async fn read_stream(recv: RecvHandle, commands: mpsc::Sender<ExecCommand>) {
     loop {
         match recv.recv_exec().await {
             Ok(delivery) => {
@@ -126,12 +125,7 @@ async fn read_stream(
                     return;
                 }
             }
-            Err(_) => {
-                let _ = commands
-                    .send(ExecCommand::InboundStreamClosed { peer })
-                    .await;
-                return;
-            }
+            Err(_) => return,
         }
     }
 }
@@ -163,23 +157,18 @@ impl ExecutionActor {
 
         let mut ticker = progress_ticker();
         loop {
-            let has_inflight_send = self.inflight_send.is_some();
+            if self.end_run_finished() {
+                return;
+            }
             tokio::select! {
-                result = async {
-                    self.inflight_send
-                        .as_mut()
-                        .expect("in-flight send exists while selected")
-                        .wait()
-                        .await
-                }, if has_inflight_send => {
-                    let settled = self.settle_inflight_send(result).await;
-                    if !self.continue_after(settled).await {
-                        return;
-                    }
+                Some(joined) = self.send_tasks.join_next(), if !self.send_tasks.is_empty() => {
+                    let result = match joined {
+                        Ok(result) => self.settle_send(result).await,
+                        Err(_) => Err(ExecError::DeliveryInvariant("send task failed")),
+                    };
+                    if !self.continue_after(result).await { return; }
                     let progressed = self.progress().await;
-                    if !self.continue_after(progressed).await {
-                        return;
-                    }
+                    if !self.continue_after(progressed).await { return; }
                 }
                 command = commands.recv() => {
                     match command {
@@ -209,10 +198,14 @@ impl ExecutionActor {
 
     /// Keep one error boundary for recovery, commands, progress, and transport
     /// settlement. A durably recorded terminal continues on the same actor
-    /// loop so inbound acknowledgements and outbox retries cannot deadlock.
+    /// loop so inbound acknowledgements and delivery retries cannot deadlock.
     async fn continue_after(&mut self, result: Result<(), ExecError>) -> bool {
         match result {
             Ok(()) => true,
+            Err(error @ ExecError::DeliveryInvariant(_)) => {
+                tracing::error!(exec_id = %self.context.exec_id, %error, "execution delivery stopped");
+                false
+            }
             Err(error) => self.fail_terminal(error).await,
         }
     }
@@ -264,24 +257,10 @@ impl ExecutionActor {
                 Ok(())
             }
             ExecCommand::Inbound { delivery } => self.inbound(delivery).await,
-            ExecCommand::InboundStreamClosed { peer } => {
-                if self.ensemble().peers().contains(&peer) {
-                    Err(ExecError::Unavailable(format!(
-                        "execution stream from {peer} closed"
-                    )))
-                } else {
-                    // A route keyed only by session identity may receive an
-                    // outsider stream. Its closure is not evidence about the
-                    // activated participants and cannot terminate this actor.
-                    Ok(())
-                }
-            }
         }
     }
 
     pub(super) async fn recover(&mut self) -> Result<(), ExecError> {
-        self.context.store.recover_expired_leases(now_ms()).await?;
-
         // Construct the resident only after the execution aggregate exists.
         // Recovery always starts from the committed state images; a pending
         // proposal remains durable evidence and is deliberately not installed
@@ -406,7 +385,6 @@ impl ExecutionActor {
                 }
                 ReceiptWork::NotTerminal => {
                     self.ensure_session_started().await?;
-                    self.resolve_pending_inbox().await?;
                     self.fire_due_timers().await?;
                     drove_events = true;
                 }
@@ -428,7 +406,7 @@ impl ExecutionActor {
             .await?;
         }
         self.announce_callout().await?;
-        self.drain_outbox_report().await?;
+        self.deliver_frames()?;
         Ok(())
     }
 
@@ -456,17 +434,30 @@ impl ExecutionActor {
         Ok(())
     }
 
-    /// Finish local terminal work before exposing the observer-facing
-    /// publication. Protocol frames remain durable obligations after a receipt
-    /// is published: an in-flight send is leased and a delayed retry is still
-    /// pending, so either must settle before this actor reports completion.
+    /// Publish the local result before waiting for remote acknowledgements.
+    /// End confirmation remains local protocol state, independent of the
+    /// receipt. A deadline ends this run while retaining any unconfirmed peers.
     pub(super) async fn progress_terminal_boundary(&mut self) -> Result<(), ExecError> {
         self.finalize_receipt().await?;
-        self.drain_outbox_report().await?;
-        if self.context.store.has_unsettled_frames().await? {
-            return Ok(());
+        self.emit_published_terminal().await?;
+        if matches!(
+            self.state.end_phase(),
+            arena0_protocol::EndPhase::Ending { .. }
+        ) && tokio::time::Instant::now() >= self.end_deadline
+        {
+            let mut next = self.state.clone();
+            next.expire_end()?;
+            self.persist(next, Change::End).await?;
         }
-        self.emit_published_terminal().await
+        if !self.end_run_finished() {
+            self.deliver_frames()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn end_run_finished(&self) -> bool {
+        matches!(self.state.status().receipt_work(), ReceiptWork::Published)
+            && matches!(self.state.end_phase(), arena0_protocol::EndPhase::Ended { unconfirmed } if unconfirmed.is_empty() || tokio::time::Instant::now() >= self.end_deadline)
     }
 
     pub(super) async fn persist(

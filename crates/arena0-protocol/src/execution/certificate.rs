@@ -14,6 +14,32 @@ use super::{
 };
 
 impl StepCertificate {
+    /// Verify N-of-N evidence against its session binding, independently of
+    /// whether the receiving participant has restored the staged proposal yet.
+    pub fn verify(&self, binding: &ExecutionBinding) -> Result<(), ProtocolError> {
+        if self.commitment.domain != crate::STEP_COMMIT_DOMAIN
+            || self.commitment.session_id != binding.session_id()
+        {
+            return Err(ProtocolError::InvalidCertificate(
+                "step certificate binding mismatch".into(),
+            ));
+        }
+        let participants = binding.participant_keys()?;
+        if !self.agreement.signers.is_full(participants.len()) {
+            return Err(ProtocolError::IncompleteProof {
+                actual: self.agreement.signers.count(),
+                expected: participants.len(),
+            });
+        }
+        self.agreement
+            .verify_signatures(
+                self.commitment.step,
+                &self.commitment.signing_bytes(),
+                &participants.iter().map(|(_, key)| *key).collect::<Vec<_>>(),
+            )
+            .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))
+    }
+
     /// Build an activation-bound N-of-N certificate for a shared proposal.
     pub fn from_signatures(
         binding: &ExecutionBinding,

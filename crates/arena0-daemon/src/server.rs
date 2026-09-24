@@ -1381,6 +1381,28 @@ impl HostService {
             .write()
             .unwrap_or_else(|error| error.into_inner())
             .user_agent = user_agent;
+        if let Some(mut wakes) = self.runtime.take_end_wakes() {
+            let service = Arc::downgrade(self);
+            self.tasks.lock().await.spawn(async move {
+                while let Some(execution_id) = wakes.recv().await {
+                    let Some(service) = service.upgrade() else {
+                        return;
+                    };
+                    let result = async {
+                        if let Some(candidate) =
+                            service.store.end_wake_candidate(execution_id).await?
+                        {
+                            service.resume_candidate(candidate).await?;
+                        }
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        tracing::error!(%execution_id, %error, "unable to resume end handshake");
+                    }
+                }
+            });
+        }
         if let Err(error) = self.resume_durable().await {
             self.startup.host_progress(StartupStage::Failed, &self.name);
             return Err(error);
@@ -3601,14 +3623,20 @@ fn project_exec_status_facts(
         }
     };
 
+    let end = state
+        .as_ref()
+        .map(|state| arena0_api::ExecEndStatus::from(state.end_phase()))
+        .unwrap_or_default();
     let state = match state {
         Some(state) => match state.status() {
             ExecutionStatus::Activating => ExecStatusState::Activating {
                 session_id: Some(state.binding().session_id()),
             },
-            ExecutionStatus::Active | ExecutionStatus::Ended { .. } => ExecStatusState::Active {
-                session: session_status(&state),
-            },
+            ExecutionStatus::Active | ExecutionStatus::Certified { .. } => {
+                ExecStatusState::Active {
+                    session: session_status(&state),
+                }
+            }
             ExecutionStatus::Completed { .. } => ExecStatusState::Completed {
                 session: session_status(&state),
             },
@@ -3645,6 +3673,7 @@ fn project_exec_status_facts(
         },
     };
     Ok(ExecStatus {
+        end,
         exec_id,
         negotiation_id,
         program_id,

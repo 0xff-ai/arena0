@@ -2,7 +2,7 @@
 //!
 //! Execution streams carry one durable fact per frame. Session routing is
 //! established by the transport when the stream is opened, so the frame
-//! itself contains only a message, one complete signed commitment, or one
+//! itself contains a message, a commitment signature or certificate, or an
 //! authenticated abort occurrence.
 
 use arena0_crypto::{BlsSignature, Ed25519Signature};
@@ -32,6 +32,10 @@ pub const EXEC_KIND_MESSAGE: u8 = 0x00;
 pub const EXEC_KIND_STEP_SIGNATURE: u8 = 0x01;
 /// Typed execution message kind for [`ExecFrame::Abort`].
 pub const EXEC_KIND_ABORT: u8 = 0x02;
+/// Typed execution message kind for [`ExecFrame::StepCertificate`].
+pub const EXEC_KIND_STEP_CERTIFICATE: u8 = 0x03;
+/// Maximum bitmap size for the protocol's 64 participants.
+pub const MAX_EXEC_SIGNER_BYTES: usize = 8;
 
 /// Stable version-1 terminal kind tag carried by an abort occurrence.
 pub const ABORT_KIND_ABORT: u8 = 0x00;
@@ -227,6 +231,15 @@ pub enum ExecFrame {
         /// BLS signature over the canonical commitment bytes.
         signature: BlsSignature,
     },
+    /// Aggregate evidence for an agreed step.
+    StepCertificate {
+        /// The certified commitment.
+        commitment: WireStepCommitment,
+        /// Bitmap in committed participant order.
+        signers: Vec<u8>,
+        /// Aggregate signature over the commitment.
+        aggregate: BlsSignature,
+    },
     /// Unilateral termination.
     Abort {
         /// Signed, session-bound occurrence.
@@ -264,6 +277,16 @@ impl BorshSerialize for ExecFrame {
                 BorshSerialize::serialize(&EXEC_KIND_ABORT, writer)?;
                 BorshSerialize::serialize(occurrence, writer)
             }
+            Self::StepCertificate {
+                commitment,
+                signers,
+                aggregate,
+            } => {
+                BorshSerialize::serialize(&EXEC_KIND_STEP_CERTIFICATE, writer)?;
+                BorshSerialize::serialize(commitment, writer)?;
+                serialize_bounded_bytes(writer, signers, MAX_EXEC_SIGNER_BYTES, "exec.signers")?;
+                BorshSerialize::serialize(aggregate, writer)
+            }
         }
     }
 }
@@ -284,6 +307,11 @@ impl BorshDeserialize for ExecFrame {
             }),
             EXEC_KIND_ABORT => Ok(Self::Abort {
                 occurrence: WireAbortOccurrence::deserialize_reader(reader)?,
+            }),
+            EXEC_KIND_STEP_CERTIFICATE => Ok(Self::StepCertificate {
+                commitment: WireStepCommitment::deserialize_reader(reader)?,
+                signers: read_bounded_bytes(reader, MAX_EXEC_SIGNER_BYTES, "exec.signers")?,
+                aggregate: BlsSignature::deserialize_reader(reader)?,
             }),
             tag => Err(io::Error::new(
                 io::ErrorKind::InvalidData,

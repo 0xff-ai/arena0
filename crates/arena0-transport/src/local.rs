@@ -1460,6 +1460,21 @@ mod tests {
             Err(TransportError::ExecRejected)
         ));
 
+        let deferred = tokio::spawn({
+            let send = send.clone();
+            let frame = frame.clone();
+            async move { send.send_exec(&frame).await }
+        });
+        recv.recv_exec()
+            .await
+            .unwrap()
+            .reject(crate::ExecDeliveryRejection::NotYet)
+            .unwrap();
+        assert!(matches!(
+            deferred.await.unwrap(),
+            Err(TransportError::ExecNotYet)
+        ));
+
         let conflict = tokio::spawn({
             let send = send.clone();
             let frame = frame.clone();
@@ -1483,6 +1498,42 @@ mod tests {
             dropped.await.unwrap(),
             Err(TransportError::ExecReceiverDropped)
         ));
+    }
+
+    #[tokio::test]
+    async fn rejection_receipt_survives_immediate_stream_close() {
+        let (_network, peers) = transports();
+        let send = peers[0]
+            .open_exec(peers[1].peer_id(), SessionHash([13; 32]))
+            .await
+            .unwrap();
+        let recv = peers[1].accept_exec().await.unwrap().into_parts().1;
+        let task = tokio::spawn(async move { send.send_exec(&message_frame(13)).await });
+        recv.recv_exec()
+            .await
+            .unwrap()
+            .reject(crate::ExecDeliveryRejection::NotYet)
+            .unwrap();
+        // No yield between the decision and closure: both are ready when send resumes.
+        drop(recv);
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(TransportError::ExecNotYet)
+        ));
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_receipt_survives_immediate_stream_close() {
+        let (_network, peers) = transports();
+        let send = peers[0]
+            .open_exec(peers[1].peer_id(), SessionHash([13; 32]))
+            .await
+            .unwrap();
+        let recv = peers[1].accept_exec().await.unwrap().into_parts().1;
+        let task = tokio::spawn(async move { send.send_exec(&message_frame(13)).await });
+        recv.recv_exec().await.unwrap().acknowledge().unwrap();
+        drop(recv);
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -1568,7 +1619,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn abort_sender_is_authenticated_in_both_stream_directions() {
+    async fn forwarded_abort_preserves_origin_and_authenticated_stream_source() {
         let (_network, peers) = transports();
         let session_hash = SessionHash([26; 32]);
         let send = peers[0]
@@ -1589,11 +1640,16 @@ mod tests {
         delivery.acknowledge().unwrap();
         task.await.unwrap().unwrap();
 
-        let forged = abort_frame(session_hash, *peers[2].peer_id());
-        assert!(matches!(
-            send.send_exec(&forged).await,
-            Err(TransportError::ProtocolMismatch(_))
-        ));
+        let forwarded = abort_frame(session_hash, *peers[2].peer_id());
+        let task = tokio::spawn({
+            let forwarded = forwarded.clone();
+            async move { send.send_exec(&forwarded).await }
+        });
+        let delivery = recv.recv_exec().await.unwrap();
+        assert_eq!(delivery.source(), *peers[0].peer_id());
+        assert_eq!(delivery.frame(), &forwarded);
+        delivery.acknowledge().unwrap();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

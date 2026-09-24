@@ -27,7 +27,7 @@ use super::{
 /// post-agreement effect list because agreement commits the dispatch
 /// atomically: a failed or incomplete agreement must not expose either memory
 /// or any deferred effect. An establishing broadcast from a non-agreed event
-/// is consumed into its normalized trace entry and precommit outbox instead
+/// is consumed into its normalized trace entry instead
 /// of being retained here; a broadcast emitted by an already-agreed event is
 /// retained as deferred next-step work. `event_position` identifies the event
 /// that produced the result; it is independent of the agreed trace step.
@@ -39,7 +39,7 @@ pub struct SharedProposal {
     pub(crate) local_state: LocalStateBytes,
     /// Effects paired with their original dispatch ordinals. Establishing
     /// broadcasts may be omitted before staging; every retained effect keeps
-    /// its original ordinal for durable outbox identity.
+    /// its original ordinal for durable timer identity.
     pub(crate) effects: Vec<(u32, Effect)>,
     pub(crate) event_position: u64,
     pub(crate) status: ExecutionStatus,
@@ -241,6 +241,8 @@ pub struct ExecutionState {
     receipt_overhead: u64,
     pub(crate) agreed_state: StateHash,
     pub(crate) agreed_link: [u8; 32],
+    pub(crate) last_certificate: Option<StepCertificate>,
+    pub(crate) end_phase: super::EndPhase,
     pub(crate) last_reacted_step: Option<u64>,
     pub(crate) shared_state: SharedStateBytes,
     pub(crate) local_state: LocalStateBytes,
@@ -260,6 +262,8 @@ struct ExecutionStateBody {
     trace_bytes: u64,
     agreed_state: StateHash,
     agreed_link: [u8; 32],
+    last_certificate: Option<StepCertificate>,
+    end_phase: super::EndPhase,
     last_reacted_step: Option<u64>,
     shared_state: SharedStateBytes,
     local_state: LocalStateBytes,
@@ -302,6 +306,8 @@ impl ExecutionState {
             trace_bytes: self.trace_bytes,
             agreed_state: self.agreed_state,
             agreed_link: self.agreed_link,
+            last_certificate: self.last_certificate.clone(),
+            end_phase: self.end_phase.clone(),
             last_reacted_step: self.last_reacted_step,
             shared_state: self.shared_state.clone(),
             local_state: self.local_state.clone(),
@@ -324,6 +330,8 @@ impl ExecutionState {
             receipt_overhead,
             agreed_state: body.agreed_state,
             agreed_link: body.agreed_link,
+            last_certificate: body.last_certificate,
+            end_phase: body.end_phase,
             last_reacted_step: body.last_reacted_step,
             shared_state: body.shared_state,
             local_state: body.local_state,
@@ -338,7 +346,7 @@ impl ExecutionState {
         self.version.next().ok_or(ProtocolError::VersionExhausted)
     }
 
-    fn bump_version(&mut self) -> Result<(), ProtocolError> {
+    pub(super) fn bump_version(&mut self) -> Result<(), ProtocolError> {
         self.version = self.next_version()?;
         Ok(())
     }
@@ -382,6 +390,8 @@ impl ExecutionState {
             receipt_overhead,
             agreed_state: cursor.state_hash(),
             agreed_link: cursor.chain_hash(),
+            last_certificate: None,
+            end_phase: super::EndPhase::Open,
             last_reacted_step: None,
             shared_state,
             local_state,
@@ -440,7 +450,7 @@ impl ExecutionState {
             ExecutionStatus::StoppedPublished { receipt_id, .. } => Some(*receipt_id),
             ExecutionStatus::Activating
             | ExecutionStatus::Active
-            | ExecutionStatus::Ended { .. }
+            | ExecutionStatus::Certified { .. }
             | ExecutionStatus::Stopped { .. } => None,
         }
     }
@@ -566,7 +576,7 @@ impl ExecutionState {
     #[must_use]
     pub fn terminal_outcome(&self) -> Option<&TerminalOutcome> {
         match &self.status {
-            ExecutionStatus::Ended { outcome } | ExecutionStatus::Completed { outcome, .. } => {
+            ExecutionStatus::Certified { outcome } | ExecutionStatus::Completed { outcome, .. } => {
                 Some(outcome)
             }
             _ => None,
@@ -875,6 +885,67 @@ impl ExecutionState {
         }
     }
 
+    /// Frames that another participant may still need. Restart resends this
+    /// durable evidence without creating new signatures.
+    #[must_use]
+    pub fn current_frames(&self, me: PeerId) -> Vec<ExecFrame> {
+        let mut frames = Vec::new();
+        if let Some(certificate) = &self.last_certificate {
+            frames.push(ExecFrame::StepCertificate {
+                certificate: certificate.clone(),
+            });
+        }
+        if let Some(proposal) = &self.proposal {
+            if let Event::MessageReceived {
+                message_id,
+                from,
+                position,
+                pre_state,
+                msg,
+            } = &proposal.entry.event
+                && *from == me
+            {
+                frames.push(ExecFrame::Message {
+                    message_id: *message_id,
+                    seq: *position,
+                    prestate: *pre_state,
+                    data: msg.clone(),
+                    poststate: proposal.commitment.post_state,
+                });
+            }
+            if let Some(signature) = proposal
+                .signatures
+                .iter()
+                .find(|signature| signature.participant() == me)
+            {
+                frames.push(ExecFrame::StepSignature {
+                    commitment: proposal.commitment.clone(),
+                    signature: signature.signature().sig,
+                });
+            }
+        }
+        if let Some(super::StopCause::Authenticated(occurrence)) = self.status.terminal_cause() {
+            frames.push(ExecFrame::Abort {
+                occurrence: occurrence.clone(),
+            });
+        }
+        frames
+    }
+
+    /// Commit a staged proposal using complete N-of-N evidence. The returned
+    /// proposal carries the agreed entry and effects for atomic persistence.
+    pub fn certify_step(
+        &mut self,
+        certificate: StepCertificate,
+    ) -> Result<SharedProposal, ProtocolError> {
+        let mut next = self.clone();
+        let committed = next.commit_shared_inner(certificate)?;
+        next.bump_version()?;
+        next.validate_recovered()?;
+        *self = next;
+        Ok(committed)
+    }
+
     fn commit_shared_inner(
         &mut self,
         certificate: StepCertificate,
@@ -894,21 +965,7 @@ impl ExecutionState {
                 "step certificate does not match the staged proposal".into(),
             ));
         }
-        let participants = self.binding.participant_keys()?;
-        if !certificate.agreement.signers.is_full(participants.len()) {
-            return Err(ProtocolError::IncompleteProof {
-                actual: certificate.agreement.signers.count(),
-                expected: participants.len(),
-            });
-        }
-        certificate
-            .agreement
-            .verify_signatures(
-                certificate.commitment.step,
-                &certificate.commitment.signing_bytes(),
-                &participants.iter().map(|(_, key)| *key).collect::<Vec<_>>(),
-            )
-            .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
+        certificate.verify(&self.binding)?;
         let next = self.step_cursor().advance(&certificate.commitment)?;
         let trace_bytes = self.check_receipt_budget(&proposal.entry)?;
         let expected_successor = self.deferred_broadcast_successor(proposal)?;
@@ -923,9 +980,11 @@ impl ExecutionState {
         self.trace_bytes = trace_bytes;
         self.agreed_state = next.state_hash();
         self.agreed_link = next.chain_hash();
+        self.last_certificate = Some(certificate);
         self.shared_state = committed.shared_state.clone();
         self.local_state = committed.local_state.clone();
         self.status = committed.status.clone();
+        self.begin_end();
         self.callout = committed.callout.clone();
         self.proposal = expected_successor;
         Ok(committed)
@@ -1033,6 +1092,7 @@ impl ExecutionState {
         next.proposal = None;
         next.callout = None;
         next.status = ExecutionStatus::stopped(occurrence)?;
+        next.begin_end();
         next.bump_version()?;
         next.validate_recovered()?;
         *self = next;
@@ -1044,7 +1104,7 @@ impl ExecutionState {
         validate_receipt_body(&self.binding, artifact.body())?;
         let body = artifact.body();
         let status = match (&self.status, body.termination()) {
-            (ExecutionStatus::Ended { outcome }, crate::ReceiptTermination::Completed) => {
+            (ExecutionStatus::Certified { outcome }, crate::ReceiptTermination::Completed) => {
                 let last = body
                     .trace()
                     .last()
@@ -1182,6 +1242,22 @@ impl ExecutionState {
             .is_some_and(|step| step >= self.agreed_step)
         {
             return Err(ProtocolError::InvalidTerminalStatus);
+        }
+        self.validate_end()?;
+        match &self.last_certificate {
+            Some(certificate)
+                if certificate.commitment.step.checked_add(1) == Some(self.agreed_step)
+                    && certificate.commitment.post_state == self.agreed_state
+                    && certificate.commitment.link_hash() == self.agreed_link =>
+            {
+                certificate.verify(&self.binding)?;
+            }
+            None if self.agreed_step == 0 => {}
+            _ => {
+                return Err(ProtocolError::InvalidCertificate(
+                    "last certificate does not match the agreed cursor".into(),
+                ));
+            }
         }
         self.status
             .validate_binding(&self.binding, self.step_cursor())?;
@@ -1407,7 +1483,7 @@ fn proposal_status(
                 if outcome.borsh() != effect_outcome.as_slice() {
                     return Err(ProtocolError::OutcomeProjectionMismatch);
                 }
-                return Ok(ExecutionStatus::Ended { outcome });
+                return Ok(ExecutionStatus::Certified { outcome });
             }
             Effect::SessionAbort { .. } | Effect::Fail { .. } => {
                 if terminal_outcome.is_some() {
@@ -1539,6 +1615,127 @@ mod tests {
             initial,
             participants,
         }
+    }
+
+    #[test]
+    fn end_confirmation_is_local_idempotent_and_retains_silent_peers() {
+        use crate::{EndMatch, EndPhase};
+        let fixture = fixture();
+        let mut state = terminal_state(&fixture, Effect::SessionEnd { outcome: vec![7] });
+        let remote = fixture
+            .participants
+            .iter()
+            .map(|(p, _)| *p)
+            .find(|p| *p != fixture.producer())
+            .unwrap();
+        let evidence = state.terminal_evidence().unwrap();
+        assert_eq!(state.end_conclusion_matches(&evidence), EndMatch::Same);
+        assert!(matches!(state.end_phase(), EndPhase::Ending { .. }));
+        let version = state.version();
+        state.expire_end().unwrap();
+        assert!(state.version() > version);
+        assert!(
+            matches!(state.end_phase(), EndPhase::Ended { unconfirmed } if unconfirmed.contains(&remote))
+        );
+        assert!(state.expire_end().is_err());
+        assert!(state.confirm_end(state.producer()).is_err());
+        assert!(state.confirm_end(PeerId([0xff; 32])).is_err());
+        assert!(state.confirm_end(remote).unwrap());
+        let confirmed = state.clone();
+        assert!(!state.confirm_end(remote).unwrap());
+        assert_eq!(state, confirmed);
+        assert!(
+            matches!(state.end_phase(), EndPhase::Ended { unconfirmed } if unconfirmed.is_empty())
+        );
+        assert_eq!(state.terminal_evidence(), Some(evidence));
+        assert_eq!(
+            ExecutionState::decode(&state.encode().unwrap()).unwrap(),
+            state
+        );
+        let mut open = active_state(&fixture);
+        assert!(open.confirm_end(remote).is_err());
+        assert!(open.expire_end().is_err());
+    }
+
+    #[test]
+    fn completion_and_shared_stops_match_their_final_certificate() {
+        for effect in [
+            Effect::SessionEnd { outcome: vec![7] },
+            Effect::SessionAbort {
+                reason: "stop".into(),
+            },
+            Effect::Fail {
+                reason: "failure".into(),
+            },
+        ] {
+            let fixture = fixture();
+            let mut state = terminal_state(&fixture, effect);
+            let evidence = state.terminal_evidence().unwrap();
+            assert!(matches!(evidence, ExecFrame::StepCertificate { .. }));
+            assert_eq!(
+                state.end_conclusion_matches(&evidence),
+                crate::EndMatch::Same
+            );
+            let remote = fixture
+                .participants
+                .iter()
+                .map(|(p, _)| *p)
+                .find(|p| *p != fixture.producer())
+                .unwrap();
+            state.confirm_end(remote).unwrap();
+            assert!(
+                matches!(state.end_phase(), crate::EndPhase::Ended { unconfirmed } if unconfirmed.is_empty())
+            );
+        }
+    }
+
+    #[test]
+    fn confirming_last_remote_peer_completes_ending() {
+        let fixture = fixture();
+        let mut state = terminal_state(&fixture, Effect::SessionEnd { outcome: vec![7] });
+        let remote = fixture
+            .participants
+            .iter()
+            .map(|(peer, _)| *peer)
+            .find(|peer| *peer != fixture.producer())
+            .unwrap();
+        assert!(
+            matches!(state.end_phase(), crate::EndPhase::Ending { unconfirmed } if unconfirmed.len() == 1)
+        );
+        assert!(state.confirm_end(remote).unwrap());
+        assert!(
+            matches!(state.end_phase(), crate::EndPhase::Ended { unconfirmed } if unconfirmed.is_empty())
+        );
+    }
+
+    fn terminal_state(fixture: &Fixture, terminal: Effect) -> ExecutionState {
+        let mut state = active_state(fixture);
+        let ensemble =
+            Ensemble::from_peers(fixture.participants.iter().map(|(p, _)| *p).collect()).unwrap();
+        let outcome = matches!(terminal, Effect::SessionEnd { .. })
+            .then(|| TerminalOutcome::new(vec![7], b"7".to_vec()).unwrap());
+        state
+            .apply_dispatch(
+                &Event::SessionStarted { ensemble },
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[terminal],
+                outcome,
+                None,
+                None,
+            )
+            .unwrap();
+        let commitment = state.pending_shared().unwrap().commitment().clone();
+        for (peer, key) in &fixture.participants {
+            state
+                .add_step_signature(ParticipantStepSignature::new(
+                    *peer,
+                    commitment.step,
+                    key.sign(&commitment.signing_bytes()),
+                ))
+                .unwrap();
+        }
+        state
     }
 
     fn active_state(fixture: &Fixture) -> ExecutionState {
@@ -2047,7 +2244,7 @@ mod tests {
         }
         assert_eq!(
             state.status(),
-            &ExecutionStatus::Ended {
+            &ExecutionStatus::Certified {
                 outcome: outcome.clone()
             }
         );
@@ -2739,7 +2936,7 @@ mod tests {
             agreement: AggregateAttestation::empty(),
         };
         assert!(matches!(
-            state.commit_shared_inner(malformed),
+            state.certify_step(malformed),
             Err(ProtocolError::IncompleteProof { .. })
         ));
         assert_eq!(state, before);

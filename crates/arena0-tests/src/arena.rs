@@ -639,46 +639,6 @@ impl Run {
                         .load_execution(participant.exec_id)
                         .await
                         .expect("execution state query");
-                    let inbox = match loaded_state.as_ref() {
-                        Some(_) => participant
-                            .store_handle
-                            .list_pending_inbox(participant.exec_id, 64)
-                            .await
-                            .map(|items| {
-                                items
-                                    .iter()
-                                    .map(|item| {
-                                        let source = self
-                                            .participants
-                                            .iter()
-                                            .position(|candidate| {
-                                                candidate.peer_id == item.source()
-                                            })
-                                            .map_or_else(
-                                                || item.source().to_string(),
-                                                |index| format!("p{index}"),
-                                            );
-                                        let frame = match item.frame() {
-                                            arena0_protocol::ExecFrame::Message { seq, .. } => {
-                                                format!("message@{seq}")
-                                            }
-                                            arena0_protocol::ExecFrame::StepSignature {
-                                                commitment,
-                                                ..
-                                            } => {
-                                                format!("step-signature@{}", commitment.step)
-                                            }
-                                            arena0_protocol::ExecFrame::Abort { .. } => {
-                                                "abort".into()
-                                            }
-                                        };
-                                        format!("{source}:{frame}")
-                                    })
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_else(|error| vec![format!("error:{error}")]),
-                        None => vec!["execution-missing".into()],
-                    };
                     let state = loaded_state.as_ref().map(|state| {
                         let signatures = state
                             .pending_shared()
@@ -726,7 +686,7 @@ impl Run {
                         None => "execution-missing".into(),
                     };
                     diagnostics.push(format!(
-                        "node {i} state={state:?} trace={trace:?} inbox={inbox:?} events={}",
+                        "node {i} state={state:?} trace={trace:?} events={}",
                         participant.events.len(),
                     ));
                 }
@@ -982,7 +942,6 @@ impl Expect<'_> {
             if tokio::time::Instant::now() >= deadline {
                 let participant_events = participant.events.clone();
                 let mut states = Vec::with_capacity(self.run.participants.len());
-                let mut inboxes = Vec::with_capacity(self.run.participants.len());
                 for participant in &self.run.participants {
                     states.push(
                         participant
@@ -991,17 +950,10 @@ impl Expect<'_> {
                             .await
                             .expect("execution state"),
                     );
-                    inboxes.push(
-                        participant
-                            .store_handle
-                            .list_pending_inbox(participant.exec_id, 64)
-                            .await
-                            .expect("pending inbox"),
-                    );
                 }
                 let progress = self.run.progress_summary();
                 panic!(
-                    "participant {}: timeout waiting for CalloutRequested; progress: {progress}; events: {:?}; states: {states:?}; pending inboxes: {inboxes:?}",
+                    "participant {}: timeout waiting for CalloutRequested; progress: {progress}; events: {:?}; states: {states:?}",
                     self.participant, participant_events,
                 );
             }

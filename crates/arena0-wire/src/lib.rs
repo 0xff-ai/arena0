@@ -33,8 +33,9 @@ pub use codec::{
 pub use error::WireError;
 pub use exec::{
     ABORT_KIND_ABORT, ABORT_KIND_FAIL, EXEC_KIND_ABORT, EXEC_KIND_MESSAGE,
-    EXEC_KIND_STEP_SIGNATURE, ExecFrame, MAX_EXEC_ABORT_OCCURRENCE_BYTES, MAX_EXEC_MESSAGE_BYTES,
-    MAX_EXEC_REASON_BYTES, MessageIdBytes, PROTO_EXEC, PROTO_FETCH, PeerIdBytes, SessionHashBytes,
+    EXEC_KIND_STEP_CERTIFICATE, EXEC_KIND_STEP_SIGNATURE, ExecFrame,
+    MAX_EXEC_ABORT_OCCURRENCE_BYTES, MAX_EXEC_MESSAGE_BYTES, MAX_EXEC_REASON_BYTES,
+    MAX_EXEC_SIGNER_BYTES, MessageIdBytes, PROTO_EXEC, PROTO_FETCH, PeerIdBytes, SessionHashBytes,
     StateHashBytes, WireAbortCoordinate, WireAbortOccurrence, WireStepCommitment,
 };
 pub use fetch::{

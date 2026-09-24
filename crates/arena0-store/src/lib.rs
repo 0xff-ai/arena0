@@ -16,17 +16,17 @@ use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use arena0_crypto::{BlsSignature, ExecutionSalt};
+use arena0_crypto::ExecutionSalt;
 use arena0_program::{JsonBytes, ProgramHash};
 use arena0_protocol::execution::{
     ExecutionState, ExecutionStatus, ExecutionVersion, ReceiptArtifact, ReceiptId, TimerId,
 };
 use arena0_protocol::{
-    Activation, ExecFrame, ExecId, ExecLifecycle, ExecutionAdmission, LocalStateBytes, MessageId,
-    NegotiationTarget, PeerId, PreparedActivation, ProtocolError, SessionHash, SharedStateBytes,
-    StateHash, StepCommitment, TimerPayload,
+    Activation, ExecId, ExecLifecycle, ExecutionAdmission, LocalStateBytes, NegotiationTarget,
+    PeerId, PreparedActivation, ProtocolError, SessionHash, SharedStateBytes, StepCommitment,
+    TimerPayload,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -46,11 +46,9 @@ const ENVELOPE_VERSION: u16 = 2;
 const ENVELOPE_MAGIC: [u8; 8] = *b"AR0STOR1";
 const ENVELOPE_DOMAIN: &[u8] = b"arena0/store-envelope/v2";
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const DEFAULT_LEASE_DURATION_MS: u64 = 30_000;
-const DEFAULT_RETRY_DELAY_MS: u64 = 1_000;
 const MAX_ERROR_BYTES: usize = 4 * 1024;
 const MAX_ADMISSION_BYTES: usize = 4 * 1024;
-const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ACTIVATION_BYTES: usize = 16 * 1024 * 1024;
 // Timer rows store the complete `TimerPayload` (including the type name), not
 // just its value bytes. Keep the envelope bound large enough for both protocol
 // components plus their Borsh length prefixes.
@@ -65,64 +63,12 @@ const MAX_USER_AGENT_BYTES: usize = 256;
 /// to request another bounded page.
 pub const MAX_EVENT_INSPECTION_RECORDS: usize = 256;
 
-/// Stable identity of one store-local outbox row.
-///
-/// This is deliberately owned by the persistence boundary. Protocol frames
-/// and guest effects have different semantics, so neither is wrapped in a
-/// protocol-level durable-effect enum. The identity is nevertheless stable
-/// across retries and process restarts.
-#[derive(
-    BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
-)]
-pub struct OutboxId([u8; 32]);
-
-impl OutboxId {
-    fn derive(
-        execution_id: ExecId,
-        event_position: u64,
-        ordinal: u32,
-        destination: Option<PeerId>,
-        payload: &[u8],
-    ) -> Self {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"arena0/store-outbox/v2");
-        hasher.update(&execution_id.0);
-        hasher.update(&event_position.to_le_bytes());
-        hasher.update(&ordinal.to_le_bytes());
-        match destination {
-            Some(destination) => {
-                hasher.update(&[1]);
-                hasher.update(&destination.0);
-            }
-            None => {
-                hasher.update(&[0]);
-            }
-        }
-        hasher.update(payload);
-        Self(*hasher.finalize().as_bytes())
-    }
-
-    /// Construct an outbox identity from persisted bytes.
-    #[must_use]
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    /// Borrow the identity bytes.
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
 /// Configuration for one Host-owned SQLite database.
 #[derive(Debug, Clone)]
 pub struct StoreConfig {
     path: PathBuf,
     host_id: PeerId,
     busy_timeout: Duration,
-    lease_duration_ms: u64,
-    retry_delay_ms: u64,
 }
 
 impl StoreConfig {
@@ -133,8 +79,6 @@ impl StoreConfig {
             path: path.into(),
             host_id,
             busy_timeout: DEFAULT_BUSY_TIMEOUT,
-            lease_duration_ms: DEFAULT_LEASE_DURATION_MS,
-            retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
         }
     }
 
@@ -144,35 +88,6 @@ impl StoreConfig {
         self.busy_timeout = timeout;
         self
     }
-
-    /// Set the lease duration used by outbox reservations.
-    pub fn with_lease_duration(self, duration: Duration) -> Result<Self, StoreError> {
-        let millis = u64::try_from(duration.as_millis()).map_err(|_| {
-            StoreError::InvalidConfiguration("lease duration milliseconds must fit u64")
-        })?;
-        Ok(self.with_lease_duration_ms(millis))
-    }
-
-    /// Set the lease duration in milliseconds.
-    #[must_use]
-    pub const fn with_lease_duration_ms(mut self, duration_ms: u64) -> Self {
-        self.lease_duration_ms = duration_ms;
-        self
-    }
-
-    /// Set the fixed delay before a retried outbox item is ready.
-    #[must_use]
-    pub const fn with_retry_delay_ms(mut self, delay_ms: u64) -> Self {
-        self.retry_delay_ms = delay_ms;
-        self
-    }
-}
-
-/// Summary of lease recovery performed while opening or reconciling a store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct RecoveryReport {
-    /// Number of expired outbox leases returned to `pending`.
-    pub expired_outbox_leases: u64,
 }
 
 /// Result of inserting one content-addressed Wasm program.
@@ -244,7 +159,7 @@ impl RecoveryCursor {
     }
 }
 
-/// One execution with unfinished protocol, proof, or outbox work and the
+/// One execution with unfinished protocol, proof, or final-frame delivery work and the
 /// bounded row metadata needed to resume it.
 ///
 /// The store builds this projection from the request, activation, execution,
@@ -488,9 +403,6 @@ pub enum StoreError {
     /// A receipt was not found.
     #[error("receipt {0:?} was not found")]
     ReceiptNotFound(ReceiptId),
-    /// The requested outbox occurrence does not exist.
-    #[error("outbox occurrence {0:?} was not found")]
-    OutboxNotFound(OutboxId),
     /// The database contains malformed, tampered, or internally inconsistent data.
     #[error("store corruption: {0}")]
     Corruption(String),
@@ -506,12 +418,6 @@ pub enum StoreError {
     /// A local admission request does not authorize the proposed activation.
     #[error("invalid execution admission: {0}")]
     InvalidAdmission(String),
-    /// A frame could not be authenticated against its transport source.
-    #[error("inbound frame source is not authenticated: {0}")]
-    UnauthenticatedSource(String),
-    /// A frame was not durably accepted before an input tried to apply it.
-    #[error("inbound frame {0:?} was not durably accepted")]
-    InboxNotAccepted(InboxId),
 }
 
 /// Derived provenance of a receipt artifact retained by this Host.
@@ -828,8 +734,7 @@ pub enum CommitActivationOutcome {
 /// One actor-computed transition and its atomic durable consequences.
 ///
 /// The execution's sole writer computes `next` with a protocol transition.
-/// `change` must describe that same transition, including its authenticated
-/// inbox source or consumed timer. The store persists the result and side rows;
+/// `change` must describe that same transition, including its consumed timer. The store persists the result and side rows;
 /// it does not execute the protocol transition again.
 #[derive(Debug)]
 pub struct TransitionRecord {
@@ -846,6 +751,8 @@ pub struct TransitionRecord {
 /// Durable consequences of a protocol transition computed by the actor.
 #[derive(Debug)]
 pub enum Change {
+    /// Update the local end confirmation phase without changing evidence.
+    End,
     /// Enter active execution.
     Activate,
     /// Record an accepted guest dispatch and consume its durable source.
@@ -853,214 +760,15 @@ pub enum Change {
         event: Event<Vec<u8>>,
         effects: Vec<Effect>,
         timer_id: Option<TimerId>,
-        inbox_id: Option<InboxId>,
     },
     /// Record a signature, releasing a certified proposal when present.
     StepSignature {
         certified: Option<arena0_protocol::SharedProposal>,
-        inbox_id: Option<InboxId>,
     },
-    /// Record a stop and consume its optional peer source.
-    Stop { inbox_id: Option<InboxId> },
+    /// Record an authenticated stop.
+    Stop,
     /// Publish evidence assembled from durable rows.
     Publish { artifact: ReceiptArtifact },
-}
-
-/// A typed result for accepting one authenticated inbound frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InboxAcceptOutcome {
-    /// The frame and source attribution were durably accepted.
-    Accepted,
-    /// The exact frame was already accepted or applied.
-    AlreadyAccepted,
-    /// The exact frame was already applied by the execution transaction.
-    AlreadyApplied,
-    /// The exact frame was already consumed without dispatch/application.
-    AlreadyConsumed,
-    /// The frame id was reused with different durable evidence.
-    Conflict,
-}
-
-/// Result of explicitly rejecting any accepted inbound frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InboxRejectOutcome {
-    /// The frame was newly marked consumed.
-    Rejected,
-    /// The frame was already marked consumed.
-    AlreadyRejected,
-    /// The frame was already applied by a reducer transaction.
-    AlreadyApplied,
-}
-
-/// A source-labelled frame whose source is supplied by the authenticated
-/// transport.  Store validation additionally checks claimed message/abort
-/// identities before it records the frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AuthenticatedFrame {
-    source: PeerId,
-    frame: ExecFrame,
-}
-
-/// Store-domain identity of one authenticated inbound frame.
-///
-/// This is deliberately distinct from protocol execution positions used by
-/// durable effects.  The authenticated source is part of the identity, so
-/// identical frame bytes arriving over two authenticated routes cannot occupy
-/// one another's inbox slot.
-#[derive(
-    BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
-)]
-pub struct InboxId([u8; 32]);
-
-impl InboxId {
-    /// Construct an inbox identity from persisted bytes.
-    #[must_use]
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    /// Borrow the identity bytes.
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
-/// One accepted inbound frame awaiting its operation-specific resolution.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingInboxItem {
-    execution_id: ExecId,
-    inbox_id: InboxId,
-    source: PeerId,
-    frame: ExecFrame,
-}
-
-impl PendingInboxItem {
-    /// Return the owning execution.
-    #[must_use]
-    pub const fn execution_id(&self) -> ExecId {
-        self.execution_id
-    }
-
-    /// Return the authenticated inbox identity.
-    #[must_use]
-    pub const fn inbox_id(&self) -> InboxId {
-        self.inbox_id
-    }
-
-    /// Return the authenticated source peer.
-    #[must_use]
-    pub const fn source(&self) -> PeerId {
-        self.source
-    }
-
-    /// Borrow the canonical stored execution frame.
-    #[must_use]
-    pub const fn frame(&self) -> &ExecFrame {
-        &self.frame
-    }
-}
-
-/// Stable lease identity returned with one leased outbox item.
-#[derive(
-    BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
-)]
-pub struct LeaseId([u8; 32]);
-
-impl LeaseId {
-    /// Construct a lease identity from persisted bytes.
-    #[must_use]
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    /// Borrow the identity bytes.
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
-/// Current outbox delivery state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutboxStatus {
-    /// Available for delivery.
-    Pending,
-    /// Reserved by one delivery worker.
-    Leased,
-    /// Delivery was durably acknowledged.
-    Acknowledged,
-    /// Delivery was cancelled because its durable obligation was superseded.
-    ///
-    /// This is distinct from `Acknowledged`: cancellation is a local durable
-    /// disposition, not evidence that a receiver accepted the payload. For a
-    /// protocol frame this is permitted only before this Host's signature
-    /// exists.
-    Cancelled,
-}
-
-/// Storage classification for one outbox payload.
-///
-/// The payload bytes encode a canonical protocol [`ExecFrame`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutboxPayloadKind {
-    Frame,
-}
-
-/// One decoded outbox occurrence.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutboxItem {
-    /// Stable effect occurrence identity.
-    pub outbox_id: OutboxId,
-    /// Owning execution.
-    pub execution_id: ExecId,
-    /// Version that emitted the effect.
-    pub version: ExecutionVersion,
-    /// Event coordinate that produced the payload. This is distinct from the
-    /// aggregate version because one event can cross multiple store writes.
-    pub event_position: u64,
-    /// Position within the originating event's effect/frame list.
-    pub ordinal: u32,
-    /// Destination for a protocol frame.
-    pub destination: Option<PeerId>,
-    /// Encoding of the protocol frame in `payload`.
-    pub payload_kind: OutboxPayloadKind,
-    /// Canonical Borsh payload. Decode according to `payload_kind`.
-    pub payload: Vec<u8>,
-    /// Number of lease attempts so far; informational, never a dead-letter policy.
-    pub attempts: u32,
-    /// Current state.
-    pub status: OutboxStatus,
-    /// Earliest time at which delivery may begin.
-    pub available_at_ms: u64,
-}
-
-/// One outbox occurrence reserved by a lease.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeasedOutbox {
-    /// Leased occurrence data.
-    pub item: OutboxItem,
-    /// Lease identity required for completion or retry.
-    pub lease_id: LeaseId,
-    /// Lease expiry.
-    pub lease_until_ms: u64,
-}
-
-/// Typed result of an outbox delivery operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutboxDeliveryOutcome {
-    /// A lease was acknowledged.
-    Acknowledged,
-    /// The occurrence was already acknowledged.
-    AlreadyAcknowledged,
-    /// The occurrence was cancelled before delivery completed.
-    AlreadyCancelled,
-    /// The lease did not own the occurrence.
-    LeaseMismatch,
-    /// The occurrence was not leased.
-    NotLeased,
-    /// A retry was durably scheduled.
-    Retried { available_at_ms: u64, attempts: u32 },
 }
 
 /// One active timer scheduling projection.
@@ -1172,7 +880,6 @@ pub struct ExecutionStore {
 /// The owner of one SQLite connection and its process lock.
 pub struct Store {
     handle: StoreHandle,
-    recovery: RecoveryReport,
 }
 
 /// A process reservation for one store database path.
@@ -1189,10 +896,7 @@ pub struct StoreReservation {
 
 impl std::fmt::Debug for Store {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("Store")
-            .field("recovery", &self.recovery)
-            .finish_non_exhaustive()
+        formatter.debug_struct("Store").finish_non_exhaustive()
     }
 }
 
@@ -1207,14 +911,13 @@ impl Store {
         Ok(StoreReservation { path, lock })
     }
 
-    /// Open a database, acquire its process lock, validate it, and recover leases.
+    /// Open a database, acquire its process lock, and validate it.
     pub fn open(config: StoreConfig) -> Result<Self, StoreError> {
         Self::reserve(&config.path)?.open(config)
     }
 
     fn open_reserved(config: StoreConfig, lock: OwnerLock) -> Result<Self, StoreError> {
-        let mut db = Database::open(&config, lock)?;
-        let recovery = db.recover_all_expired_leases(unix_time_ms()?)?;
+        let db = Database::open(&config, lock)?;
         let handle = StoreHandle {
             inner: Arc::new(Inner {
                 db: StdMutex::new(Some(db)),
@@ -1222,19 +925,13 @@ impl Store {
                 host_id: config.host_id,
             }),
         };
-        Ok(Self { handle, recovery })
+        Ok(Self { handle })
     }
 
     /// Borrow the cloneable store handle.
     #[must_use]
     pub const fn handle(&self) -> &StoreHandle {
         &self.handle
-    }
-
-    /// Return recovery performed during open.
-    #[must_use]
-    pub const fn recovery_report(&self) -> RecoveryReport {
-        self.recovery
     }
 
     /// Close the connection and release the process lock.
@@ -1285,6 +982,23 @@ impl Drop for Store {
 }
 
 impl StoreHandle {
+    /// Read bounded reconstruction metadata for a dormant end handshake.
+    pub async fn end_wake_candidate(
+        &self,
+        execution_id: ExecId,
+    ) -> Result<Option<RecoveryCandidate>, StoreError> {
+        self.run(move |db| db.end_wake_candidate(execution_id))
+            .await
+    }
+    /// Read terminal routing metadata without decoding execution state or
+    /// memory images. The phase is independent of receipt publication.
+    pub async fn execution_end(
+        &self,
+        session_id: SessionHash,
+    ) -> Result<Option<(ExecId, arena0_protocol::EndPhase)>, StoreError> {
+        self.run(move |db| db.execution_end(session_id)).await
+    }
+
     /// Return the Host identity bound to this store.
     #[must_use]
     pub fn host_id(&self) -> PeerId {
@@ -1436,17 +1150,6 @@ impl StoreHandle {
     /// List bounded execution aggregates for restart recovery.
     pub async fn list_executions(&self, limit: usize) -> Result<Vec<ExecutionState>, StoreError> {
         self.run(move |db| db.list_executions(limit)).await
-    }
-
-    /// List accepted frames that still need resolution after a restart. The
-    /// returned frame is the canonical durable copy.
-    pub async fn list_pending_inbox(
-        &self,
-        execution_id: ExecId,
-        limit: usize,
-    ) -> Result<Vec<PendingInboxItem>, StoreError> {
-        self.run(move |db| db.list_pending_inbox(execution_id, limit))
-            .await
     }
 
     /// Read a bounded public trace range from the durable execution.
@@ -1695,16 +1398,6 @@ impl ExecutionStore {
         self.handle.load_receipt_by_id(receipt_id).await
     }
 
-    /// List this execution's accepted frames that still need resolution.
-    pub async fn list_pending_inbox(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<PendingInboxItem>, StoreError> {
-        self.handle
-            .list_pending_inbox(self.execution_id, limit)
-            .await
-    }
-
     /// Insert the initial execution aggregate from typed genesis inputs.
     ///
     /// The execution id comes from this capability, and the protocol
@@ -1745,100 +1438,16 @@ impl ExecutionStore {
             .await
     }
 
-    /// Assemble portable evidence from the committed execution and trace rows.
-    pub async fn assemble_receipt(&self) -> Result<ReceiptArtifact, StoreError> {
+    /// Assemble portable evidence using the actor's committed state and durable
+    /// trace rows. The state must belong to this execution at its stored version.
+    pub async fn assemble_receipt(
+        &self,
+        state: &ExecutionState,
+    ) -> Result<ReceiptArtifact, StoreError> {
         let execution_id = self.execution_id;
+        let state = state.clone();
         self.handle
-            .run(move |db| db.assemble_receipt(execution_id))
-            .await
-    }
-
-    /// Accept one frame whose source is the identity authenticated by the
-    /// transport. The returned outcome is the durable acknowledgement point.
-    pub async fn accept_inbound(
-        &mut self,
-        authenticated_source: PeerId,
-        frame: ExecFrame,
-        now_ms: u64,
-    ) -> Result<InboxAcceptOutcome, StoreError> {
-        let frame = AuthenticatedFrame {
-            source: authenticated_source,
-            frame,
-        };
-        let execution_id = self.execution_id;
-        self.handle
-            .run(move |db| db.accept_inbound(execution_id, frame, now_ms))
-            .await
-    }
-
-    /// Explicitly reject an accepted inbound frame that cannot become valid.
-    pub async fn reject_inbound(
-        &mut self,
-        inbox_id: InboxId,
-        now_ms: u64,
-    ) -> Result<InboxRejectOutcome, StoreError> {
-        let execution_id = self.execution_id;
-        self.handle
-            .run(move |db| db.reject_inbound(execution_id, inbox_id, now_ms))
-            .await
-    }
-
-    /// Lease the earliest ready outbox occurrence for this execution.
-    pub async fn lease_next_outbox(
-        &mut self,
-        now_ms: u64,
-    ) -> Result<Option<LeasedOutbox>, StoreError> {
-        let execution_id = self.execution_id;
-        self.handle
-            .run(move |db| db.lease_next_outbox(execution_id, now_ms))
-            .await
-    }
-
-    /// Return whether this execution still has a protocol frame waiting for
-    /// delivery. Pending and leased rows are both unsettled; acknowledged and
-    /// cancelled rows remain as immutable delivery history and do not count.
-    pub async fn has_unsettled_frames(&mut self) -> Result<bool, StoreError> {
-        let execution_id = self.execution_id;
-        self.handle
-            .run(move |db| db.has_unsettled_frames(execution_id))
-            .await
-    }
-
-    /// Acknowledge a leased outbox occurrence for this execution.
-    pub async fn acknowledge_outbox(
-        &mut self,
-        outbox_id: OutboxId,
-        lease_id: LeaseId,
-    ) -> Result<OutboxDeliveryOutcome, StoreError> {
-        let execution_id = self.execution_id;
-        self.handle
-            .run(move |db| db.acknowledge_outbox(execution_id, outbox_id, lease_id))
-            .await
-    }
-
-    /// Return a leased occurrence to pending with the configured delay.
-    pub async fn retry_outbox(
-        &mut self,
-        outbox_id: OutboxId,
-        lease_id: LeaseId,
-        now_ms: u64,
-        reason: impl Into<String>,
-    ) -> Result<OutboxDeliveryOutcome, StoreError> {
-        let reason = bounded_reason(reason.into())?;
-        let execution_id = self.execution_id;
-        self.handle
-            .run(move |db| db.retry_outbox(execution_id, outbox_id, lease_id, now_ms, reason))
-            .await
-    }
-
-    /// Recover this execution's expired outbox leases.
-    pub async fn recover_expired_leases(
-        &mut self,
-        now_ms: u64,
-    ) -> Result<RecoveryReport, StoreError> {
-        let execution_id = self.execution_id;
-        self.handle
-            .run(move |db| db.recover_expired_leases(execution_id, now_ms))
+            .run(move |db| db.assemble_receipt(execution_id, &state))
             .await
     }
 

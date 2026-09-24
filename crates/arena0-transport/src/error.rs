@@ -18,6 +18,9 @@ pub enum TransportError {
     /// The receiver declined durable responsibility for an execution frame.
     #[error("execution frame was rejected by the receiver")]
     ExecRejected,
+    /// The receiver must advance before it can apply this frame.
+    #[error("execution frame cannot be applied yet")]
+    ExecNotYet,
     /// The receiver found conflicting durable evidence for an execution frame.
     #[error("execution frame conflicts with receiver evidence")]
     ExecConflict,
