@@ -579,8 +579,9 @@ While `Ending`, the actor sends its terminal evidence, the final step
 certificate or the stop occurrence it adopted, to each unconfirmed peer. One
 persisted transition confirms a peer when it acknowledges that frame, because a
 receiver acknowledges only after durably applying it, or when the peer's own
-terminal evidence arrives and reaches the same conclusion: the same completed
-outcome, or a stop at the same agreed cursor. Every participant must reach the
+terminal evidence arrives and reaches the same conclusion: the same certified
+final step, whether it completes or stops the session, or a unilateral stop at
+the same agreed cursor. Every participant must reach the
 same conclusion, so a rejection or a conflicting conclusion never confirms a
 peer. The actor records an invariant error without payload, stops sending to
 that peer, and keeps serving the others. A receiver never rejects authentic
