@@ -1018,7 +1018,7 @@ impl ExecutionState {
             proposal
                 .signatures()
                 .iter()
-                .any(|signature| signature.participant() == self.producer)
+                .any(|signature| signature.participant() == occurrence.sender())
         }) {
             return Err(ProtocolError::SharedProposalSigned);
         }
@@ -2004,6 +2004,24 @@ mod tests {
 
     #[test]
     fn stop_rejects_a_pending_proposal_after_the_producer_signed_it() {
+        assert_stop_with_signed_proposal(true, true, false);
+    }
+
+    #[test]
+    fn peer_stop_is_accepted_after_only_the_producer_signed() {
+        assert_stop_with_signed_proposal(false, true, true);
+    }
+
+    #[test]
+    fn peer_stop_is_refused_after_that_peer_signed() {
+        assert_stop_with_signed_proposal(false, false, false);
+    }
+
+    fn assert_stop_with_signed_proposal(
+        sender_is_producer: bool,
+        signer_is_producer: bool,
+        accepted: bool,
+    ) {
         let fixture = fixture();
         let mut state = active_state(&fixture);
         let proposal = proposal_for(
@@ -2016,31 +2034,34 @@ mod tests {
             .stage_proposal(proposal, None)
             .expect("stage proposal");
         let staged = state.pending_shared().expect("pending proposal").clone();
-        let (producer, producer_key) = fixture
+        let (signer, signer_key) = fixture
             .participants
             .iter()
-            .find(|(peer, _)| *peer == fixture.producer())
-            .expect("producer key");
+            .find(|(peer, _)| (*peer == fixture.producer()) == signer_is_producer)
+            .expect("signer key");
         let signature = ParticipantStepSignature::new(
-            *producer,
+            *signer,
             staged.commitment().step,
-            producer_key.sign(&staged.commitment().signing_bytes()),
+            signer_key.sign(&staged.commitment().signing_bytes()),
         );
         assert!(
             state
                 .add_step_signature(signature)
-                .expect("local signature")
+                .expect("staged signature")
                 .is_none()
         );
 
         let identity = [1u8, 2]
             .into_iter()
             .map(|seed| NodeKeys::from_secret(SecretKey::from_bytes([seed; 32])))
-            .find(|keys| PeerId::from_ed25519(&keys.ed25519_public_key()) == fixture.producer())
-            .expect("producer identity");
+            .find(|keys| {
+                (PeerId::from_ed25519(&keys.ed25519_public_key()) == fixture.producer())
+                    == sender_is_producer
+            })
+            .expect("sender identity");
         let unsigned = AbortOccurrence::unsigned(
             fixture.activation.session_hash(),
-            fixture.producer(),
+            PeerId::from_ed25519(&identity.ed25519_public_key()),
             AbortKind::Abort,
             1,
             "operator stop",
@@ -2052,6 +2073,14 @@ mod tests {
             .with_signature(identity.sign(&unsigned.signing_bytes().expect("abort bytes")))
             .expect("signed abort");
         let before = state.clone();
+        if accepted {
+            state.stop(occurrence).expect("accept unsigned peer's stop");
+            assert!(state.status().is_terminal());
+            assert!(state.pending_shared().is_none());
+            assert!(state.callout().is_none());
+            assert_eq!(state.step_cursor(), before.step_cursor());
+            return;
+        }
         assert_eq!(
             state.stop(occurrence).unwrap_err(),
             ProtocolError::SharedProposalSigned

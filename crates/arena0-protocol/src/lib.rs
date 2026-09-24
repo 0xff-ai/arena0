@@ -80,7 +80,7 @@ pub use negotiation::{
     Activation, ActivationError, MAX_CLOCK_SKEW_MS, MAX_PARTICIPANTS, MAX_TICKET_LIFETIME_MS,
     PREPARE_WINDOW_MS, PreparedActivation,
 };
-pub use outcome::{SessionTermination, TrapKind};
+pub use outcome::SessionTermination;
 pub use session::{Committed, Ensemble, EnsembleError, Lifecycle, Nonce, Open, Participant};
 pub use system_event::{
     EventSource, ExecCreationOrigin, ExecutionEvent, ExecutionFailureCode, NegotiationEvent,

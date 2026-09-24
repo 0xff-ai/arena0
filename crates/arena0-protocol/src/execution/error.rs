@@ -52,8 +52,8 @@ pub enum ProtocolError {
     /// A shared proposal already exists.
     #[error("a shared proposal is already pending")]
     SharedProposalExists,
-    /// A local signature makes a pending shared proposal irrevocable.
-    #[error("a shared proposal with a local signature cannot be stopped")]
+    /// The stop sender has already signed the pending shared proposal.
+    #[error("the stop sender has already signed the pending shared proposal")]
     SharedProposalSigned,
     /// A shared signature arrived without a proposal.
     #[error("no shared proposal is pending")]

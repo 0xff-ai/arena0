@@ -64,6 +64,7 @@ enum GuestMode {
     LocalSign,
     SignOnMessage,
     Broadcast,
+    RejectMessage,
     EndOnMessage,
 }
 
@@ -108,12 +109,27 @@ impl Fixture {
     }
 
     async fn from_wasm(wasm: Vec<u8>) -> Self {
-        let local_keys = Arc::new(NodeKeys::from_secret(SecretKey::from_bytes([1; 32])));
-        let remote_keys = Arc::new(NodeKeys::from_secret(SecretKey::from_bytes([2; 32])));
+        Self::from_wasm_with_peer(wasm, None).await
+    }
+
+    async fn from_wasm_with_peer(wasm: Vec<u8>, peer: Option<&Self>) -> Self {
+        let (local_seed, remote_seed, local_salt, remote_salt) = if peer.is_some() {
+            (2, 1, 10, 9)
+        } else {
+            (1, 2, 9, 10)
+        };
+        let local_keys = Arc::new(NodeKeys::from_secret(SecretKey::from_bytes(
+            [local_seed; 32],
+        )));
+        let remote_keys = Arc::new(NodeKeys::from_secret(SecretKey::from_bytes(
+            [remote_seed; 32],
+        )));
         let local_peer = local_keys.peer_id();
         let remote_peer = remote_keys.peer_id();
-        let local_salt = ExecutionSalt::try_from_bytes([9; 32]).expect("non-zero test salt");
-        let remote_salt = ExecutionSalt::try_from_bytes([10; 32]).expect("non-zero test salt");
+        let local_salt =
+            ExecutionSalt::try_from_bytes([local_salt; 32]).expect("non-zero test salt");
+        let remote_salt =
+            ExecutionSalt::try_from_bytes([remote_salt; 32]).expect("non-zero test salt");
         let program = Program::parse(wasm.clone()).expect("program");
         let params = JsonBytes::try_new(b"null".to_vec()).expect("params");
         let initialized = WasmtimeEngine::new()
@@ -122,13 +138,18 @@ impl Fixture {
             .expect("loaded program")
             .initialize(InitializeCall::new(params.clone()))
             .expect("initialize program");
-        let activation = activation(
-            program.hash(),
-            local_keys.as_ref(),
-            remote_keys.as_ref(),
-            &local_salt,
-            &remote_salt,
-            StateHash::of_shared(&initialized.shared),
+        let activation = peer.map_or_else(
+            || {
+                activation(
+                    program.hash(),
+                    local_keys.as_ref(),
+                    remote_keys.as_ref(),
+                    &local_salt,
+                    &remote_salt,
+                    StateHash::of_shared(&initialized.shared),
+                )
+            },
+            |peer| peer.activation.clone(),
         );
         let directory = tempfile::tempdir().expect("temporary store directory");
         let path = directory.path().join("execution.sqlite");
@@ -144,8 +165,13 @@ impl Fixture {
             .create_execution_request(
                 program.hash(),
                 Some(params.clone()),
-                ExecutionAdmission::explicit(NEGOTIATION_ID, vec![local_peer, remote_peer])
-                    .expect("admission"),
+                peer.map_or_else(
+                    || {
+                        ExecutionAdmission::explicit(NEGOTIATION_ID, vec![local_peer, remote_peer])
+                            .expect("admission")
+                    },
+                    |peer| ExecutionAdmission::join(peer.local_keys.peer_id(), NEGOTIATION_ID),
+                ),
                 2,
             )
             .await
@@ -167,6 +193,13 @@ impl Fixture {
                 .expect("attach local transports");
         let local_transport = Arc::new(transports.remove(0));
         let remote_transport = Arc::new(transports.remove(0));
+        let (local_transport, remote_transport) =
+            peer.map_or((local_transport, remote_transport), |peer| {
+                (
+                    Arc::clone(&peer.remote_transport),
+                    Arc::clone(&peer.local_transport),
+                )
+            });
         Self {
             _directory: directory,
             store,
@@ -378,11 +411,11 @@ async fn rejected_writer_leaves_durable_state_unchanged() {
         Vec::new(),
     );
 
-    let error = actor
+    let applied = actor
         .apply_message(fixture.remote_keys.peer_id(), frame, None)
         .await
-        .expect_err("writer rejection");
-    assert!(matches!(error, crate::ExecError::InvalidState(_)));
+        .expect("drop wrong writer");
+    assert!(!applied);
 
     let after = fixture
         .store
@@ -425,6 +458,254 @@ async fn host_rejects_a_duplicate_actor_for_one_execution() {
         .expect("actor drop releases lifecycle claim");
     drop(reclaimed);
     host.stop().await;
+}
+
+#[tokio::test]
+async fn valid_writer_message_divergence_preserves_the_unconsumed_inbox() {
+    for (mode, cause) in [
+        (
+            GuestMode::RejectMessage,
+            "program rejected the writer message",
+        ),
+        (GuestMode::SignOnMessage, "message handler trapped"),
+        (GuestMode::Plain, "post-state mismatch"),
+    ] {
+        let fixture = Fixture::with_mode(true, mode).await;
+        let (messages, _observations) = mpsc::channel(8);
+        let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
+        fixture.commit_session_started(&mut actor).await;
+        let before = actor.load_state().await.expect("active state");
+        let source = fixture.remote_keys.peer_id();
+        // The identity is valid even when the advertised result is wrong.
+        let poststate = before.agreed_state();
+        let data = b"writer message".to_vec();
+        let frame = ExecFrame::Message {
+            message_id: MessageId::derive(
+                before.binding().session_id(),
+                source,
+                before.agreed_step(),
+                before.agreed_state(),
+                poststate,
+                &data,
+            ),
+            seq: before.agreed_step(),
+            prestate: before.agreed_state(),
+            data,
+            poststate,
+        };
+        actor
+            .context
+            .store
+            .accept_inbound(source, frame, 20)
+            .await
+            .expect("accept frame");
+        let error = actor.resolve_pending_inbox().await.expect_err("divergence");
+        let crate::ExecError::Diverged(reason) = &error else {
+            panic!("expected divergence, got {error:?}");
+        };
+        assert!(reason.starts_with("diverged at step 1:"), "{reason}");
+        assert!(reason.contains(cause), "{reason}");
+        assert!(reason.len() <= arena0_protocol::MAX_TERMINAL_REASON_BYTES);
+        assert_eq!(actor.load_state().await.expect("unchanged state"), before);
+        assert_eq!(
+            actor
+                .context
+                .store
+                .list_pending_inbox(8)
+                .await
+                .expect("pending inbox")
+                .len(),
+            1
+        );
+        assert!(
+            actor.fail_terminal(error).await,
+            "failure must permit final delivery"
+        );
+        let stopped = actor.load_state().await.expect("failed state");
+        assert!(stopped.status().is_terminal());
+        assert_eq!(stopped.step_cursor(), before.step_cursor());
+    }
+}
+
+#[tokio::test]
+async fn invalid_messages_are_dropped_before_the_guest_can_diverge() {
+    for invalid in ["stale", "prestate", "message_id", "writer"] {
+        let fixture = Fixture::with_mode(invalid != "writer", GuestMode::RejectMessage).await;
+        let (messages, _observations) = mpsc::channel(8);
+        let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
+        fixture.commit_session_started(&mut actor).await;
+        let before = actor.load_state().await.expect("active state");
+        let source = fixture.remote_keys.peer_id();
+        let seq = if invalid == "stale" {
+            before.agreed_step() - 1
+        } else {
+            before.agreed_step()
+        };
+        let prestate = if invalid == "prestate" {
+            StateHash([0xff; 32])
+        } else {
+            before.agreed_state()
+        };
+        let poststate = StateHash::of_shared(&message_state());
+        let data = b"invalid frame".to_vec();
+        let message_id = MessageId::derive(
+            before.binding().session_id(),
+            source,
+            seq,
+            prestate,
+            poststate,
+            &data,
+        );
+        let frame = ExecFrame::Message {
+            message_id,
+            seq,
+            prestate,
+            data: if invalid == "message_id" {
+                b"different payload".to_vec()
+            } else {
+                data
+            },
+            poststate,
+        };
+        let accepted = actor
+            .context
+            .store
+            .accept_inbound(source, frame.clone(), 20)
+            .await;
+        if invalid == "message_id" {
+            assert!(matches!(
+                accepted,
+                Err(arena0_store::StoreError::UnauthenticatedSource(_))
+            ));
+            assert!(
+                !actor
+                    .apply_message(source, frame, None)
+                    .await
+                    .expect("drop mismatched id")
+            );
+        } else {
+            accepted.expect("accept frame");
+            actor
+                .resolve_pending_inbox()
+                .await
+                .expect("drop invalid frame");
+        }
+        assert_eq!(
+            actor.load_state().await.expect("unchanged state"),
+            before,
+            "{invalid}"
+        );
+        assert!(
+            actor
+                .context
+                .store
+                .list_pending_inbox(8)
+                .await
+                .expect("inbox")
+                .is_empty(),
+            "{invalid}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn peer_divergence_ends_the_writer_after_it_signed_its_proposal() {
+    let writer = Fixture::with_mode(false, GuestMode::RejectMessage).await;
+    let receiver = Fixture::from_wasm_with_peer(writer.wasm.clone(), Some(&writer)).await;
+    for fixture in [&writer, &receiver] {
+        let (messages, _observations) = mpsc::channel(16);
+        let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
+        fixture.commit_session_started(&mut actor).await;
+        if fixture.local_keys.peer_id() == writer.local_keys.peer_id() {
+            assert_eq!(
+                actor
+                    .dispatch_event(Event::React, DispatchSource::default())
+                    .await
+                    .expect("writer proposal"),
+                DispatchOutcome::Committed
+            );
+            actor
+                .ensure_step_signature()
+                .await
+                .expect("sign writer proposal");
+            let state = actor.load_state().await.expect("signed proposal");
+            let signatures = state
+                .pending_shared()
+                .expect("staged proposal")
+                .signatures();
+            assert_eq!(signatures.len(), 1);
+            assert_eq!(signatures[0].participant(), writer.local_keys.peer_id());
+        }
+    }
+    let writer_host = crate::Host::start(
+        Arc::clone(&writer.local_keys),
+        writer.local_transport.clone() as Arc<dyn Transport + Sync>,
+        writer.store.handle().clone(),
+    );
+    let receiver_host = crate::Host::start(
+        Arc::clone(&receiver.local_keys),
+        receiver.local_transport.clone() as Arc<dyn Transport + Sync>,
+        receiver.store.handle().clone(),
+    );
+    let mut writer_exec = writer_host
+        .spawn(
+            writer.context(),
+            writer_host.claim_execution(EXEC_ID).expect("writer claim"),
+        )
+        .expect("writer actor");
+    let mut receiver_exec = receiver_host
+        .spawn(
+            receiver.context(),
+            receiver_host
+                .claim_execution(EXEC_ID)
+                .expect("receiver claim"),
+        )
+        .expect("receiver actor");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for execution in [&mut receiver_exec, &mut writer_exec] {
+            loop {
+                match execution
+                    .message_rx
+                    .recv()
+                    .await
+                    .expect("terminal observation")
+                {
+                    crate::SessionMessage::Failed { reason } => {
+                        assert!(
+                            reason.contains(
+                                "diverged at step 1: program rejected the writer message"
+                            ),
+                            "{reason}"
+                        );
+                        break;
+                    }
+                    crate::SessionMessage::Completed { .. }
+                    | crate::SessionMessage::Aborted { .. } => {
+                        panic!("expected authenticated failure")
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })
+    .await
+    .expect("both peers must finish without wedging");
+    for fixture in [&writer, &receiver] {
+        let state = fixture
+            .store
+            .handle()
+            .load_execution(EXEC_ID)
+            .await
+            .expect("load terminal")
+            .expect("execution");
+        assert!(state.status().is_terminal());
+        assert!(state.pending_shared().is_none());
+        assert_eq!(state.agreed_step(), 1);
+    }
+    writer_exec.shutdown().await;
+    receiver_exec.shutdown().await;
+    writer_host.stop().await;
+    receiver_host.stop().await;
 }
 
 #[tokio::test]
@@ -1281,7 +1562,8 @@ async fn message_handler_cannot_sign() {
         .await
         .expect_err("a message handler must not reach the signer");
     assert!(
-        matches!(error, crate::context::ExecError::Unavailable(_)),
+        matches!(&error, crate::context::ExecError::Diverged(reason)
+            if reason.contains("diverged at step 1") && reason.contains("message handler trapped")),
         "{error:?}"
     );
 }
@@ -1605,6 +1887,12 @@ fn execution_secret(salt: &ExecutionSalt) -> BlsSecretKey {
 }
 
 fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
+    let peers = Ensemble::from_peers(vec![
+        NodeKeys::from_secret(SecretKey::from_bytes([1; 32])).peer_id(),
+        NodeKeys::from_secret(SecretKey::from_bytes([2; 32])).peer_id(),
+    ])
+    .expect("ensemble");
+    let writer_peer = writer.map(|index| peers.peers()[usize::from(index)]);
     let unit = unit_schema();
     let capabilities = match mode {
         GuestMode::Plain | GuestMode::EndOnMessage => Vec::new(),
@@ -1613,7 +1901,7 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
         GuestMode::LocalSign | GuestMode::SignOnMessage => vec![Capability::Sign {
             schemes: vec![SignScheme::Ed25519],
         }],
-        GuestMode::Broadcast => vec![Capability::Messaging],
+        GuestMode::Broadcast | GuestMode::RejectMessage => vec![Capability::Messaging],
     };
     let callouts = match mode {
         GuestMode::Callout | GuestMode::CalloutFault | GuestMode::CalloutReject => {
@@ -1659,7 +1947,7 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
             r#"(import "arena0" "sign"
             (func $sign (param i32 i32 i32 i32 i32) (result i32)))"#
         }
-        GuestMode::Broadcast => {
+        GuestMode::Broadcast | GuestMode::RejectMessage => {
             r#"(import "arena0" "broadcast" (func $broadcast (param i32 i32)))"#
         }
         GuestMode::EndOnMessage => {
@@ -1719,7 +2007,7 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
               call $state_write
             "#
         }
-        GuestMode::Broadcast => {
+        GuestMode::Broadcast | GuestMode::RejectMessage => {
             r#"
               i32.const 1
               i32.const 1040
@@ -1733,6 +2021,27 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
         GuestMode::EndOnMessage | GuestMode::SignOnMessage => "",
     };
     let session_started_body = "";
+    let react_body = if matches!(mode, GuestMode::RejectMessage) {
+        // Both participants run React; only the designated writer broadcasts.
+        format!(
+            r#"
+          local.get $input
+          i64.load
+          i64.const {}
+          i64.ne
+          if
+            i32.const 32768
+            i32.const 3
+            call $pack
+            return
+          end
+          {react_body}
+        "#,
+            i64::from_le_bytes(writer_peer.expect("writer").0[..8].try_into().unwrap())
+        )
+    } else {
+        react_body.to_owned()
+    };
     let input_fault_body = match mode {
         GuestMode::CalloutFault => {
             r#"
@@ -1767,6 +2076,13 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
         _ => "",
     };
     let message_body = match mode {
+        GuestMode::RejectMessage => {
+            r#"
+              i32.const 32768
+              i32.const 1
+              i32.store8
+            "#
+        }
         GuestMode::EndOnMessage => {
             r#"
               i32.const 0

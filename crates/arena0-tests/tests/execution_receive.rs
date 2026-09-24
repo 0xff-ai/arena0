@@ -156,8 +156,8 @@ async fn future_message_stays_durable_until_public_head_catches_up() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rejected_shared_message_leaves_no_public_trace() {
-    let execution = harness(true).await;
+async fn rejected_shared_message_fails_without_advancing_the_public_trace() {
+    let mut execution = harness(true).await;
     establish_session(&execution).await;
     let source = execution.peer_ids[1];
     send_message(
@@ -172,7 +172,11 @@ async fn rejected_shared_message_leaves_no_public_trace() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let reason = terminal_reason(&mut execution.spawned).await;
+    assert!(
+        reason.starts_with("diverged at step 1: program rejected the writer message"),
+        "{reason}"
+    );
     let trace = execution
         .store_handle
         .read_trace(execution.exec_id, 0, u64::MAX)
@@ -183,14 +187,15 @@ async fn rejected_shared_message_leaves_no_public_trace() {
         1,
         "rejected call does not append a trace entry"
     );
-    assert!(
-        execution
-            .store_handle
-            .list_pending_inbox(execution.exec_id, 16)
-            .await
-            .expect("pending inbox")
-            .is_empty()
-    );
+    let state = execution
+        .store_handle
+        .load_execution(execution.exec_id)
+        .await
+        .expect("load failed execution")
+        .expect("execution");
+    assert!(state.status().is_terminal());
+    assert_eq!(state.agreed_step(), 1);
+    assert!(state.pending_shared().is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -76,8 +76,8 @@ impl ExecutionActor {
         match item.frame().clone() {
             frame @ ExecFrame::Message { .. } => {
                 // A future message or a proposal-frozen message remains in
-                // the inbox. apply_message rejects only an invalid message or
-                // a guest rejection, and leaves these causal waits pending.
+                // the inbox. apply_message rejects only invalid frames;
+                // divergence reaches the actor's authenticated failure path.
                 let _ = self
                     .apply_message(item.source(), frame, Some(item.inbox_id()))
                     .await?;

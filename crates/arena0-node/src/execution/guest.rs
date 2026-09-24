@@ -53,9 +53,9 @@ pub(super) enum SubmitInputError {
 /// Result of attempting to dispatch one event.
 ///
 /// `Frozen` means that the durable execution boundary did not allow the
-/// event to run. `Rejected` is a guest-level rejection: its candidate state
-/// and observations are discarded, while the actor and the durable pending
-/// continuation remain live.
+/// event to run. `Rejected` discards candidate state and observations. The
+/// caller reports an input rejection or ends the session for a writer-message
+/// divergence, according to the event being dispatched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum DispatchOutcome {
     Committed,
@@ -299,13 +299,10 @@ impl ExecutionActor {
         if !self.writer_is(source, &state, &self.ensemble())? {
             if let Some(inbox_id) = inbox_id {
                 self.reject_inbound(inbox_id).await?;
-                return Ok(false);
             }
-            return Err(ExecError::InvalidState(
-                "message source is not the guest-selected writer".into(),
-            ));
+            return Ok(false);
         }
-        let accepted = match self
+        let outcome = self
             .dispatch_event(
                 Event::MessageReceived {
                     message_id,
@@ -320,26 +317,23 @@ impl ExecutionActor {
                     ..DispatchSource::default()
                 },
             )
-            .await
-        {
-            Ok(accepted) => accepted,
-            Err(ExecError::InvalidState(message))
-                if message == "message dispatch did not reproduce the advertised post-state" =>
-            {
-                if let Some(inbox_id) = inbox_id {
-                    self.reject_inbound(inbox_id).await?;
-                    return Ok(false);
+            .await?;
+        match outcome {
+            DispatchOutcome::Committed => Ok(true),
+            DispatchOutcome::Frozen => Ok(false),
+            DispatchOutcome::Rejected { reason } => {
+                let mut message =
+                    format!("diverged at step {seq}: program rejected the writer message");
+                if let Some(reason) = reason {
+                    message.push_str(": ");
+                    message.push_str(&reason);
                 }
-                return Err(ExecError::InvalidState(message));
+                Err(ExecError::Diverged(super::truncate_reason(
+                    message,
+                    arena0_protocol::MAX_TERMINAL_REASON_BYTES,
+                )))
             }
-            Err(error) => return Err(error),
-        };
-        if matches!(accepted, DispatchOutcome::Rejected { .. })
-            && let Some(inbox_id) = inbox_id
-        {
-            self.reject_inbound(inbox_id).await?;
         }
-        Ok(matches!(accepted, DispatchOutcome::Committed))
     }
 
     pub(super) fn writer_is(
@@ -433,10 +427,15 @@ impl ExecutionActor {
                     // path that cannot prove its own rollback.
                     self.instance = None;
                     self.restore_resident(&state)?;
-                    if matches!(&event, Event::InputReceived { .. }) {
+                    let handler = match &event {
+                        Event::InputReceived { .. } => Some("input"),
+                        Event::MessageReceived { .. } => Some("message"),
+                        _ => None,
+                    };
+                    if let Some(handler) = handler {
                         return Ok(DispatchOutcome::Rejected {
                             reason: Some(super::truncate_reason(
-                                format!("input handler trapped: {error}"),
+                                format!("{handler} handler trapped: {error}"),
                                 arena0_program::MAX_REJECTION_REASON_BYTES,
                             )),
                         });
@@ -463,9 +462,13 @@ impl ExecutionActor {
                 .is_some_and(|post_state| post_state != candidate_hash)
             {
                 self.discard_candidate()?;
-                return Err(ExecError::InvalidState(
-                    "message dispatch did not reproduce the advertised post-state".into(),
-                ));
+                return Err(ExecError::Diverged(super::truncate_reason(
+                    format!(
+                        "diverged at step {}: post-state mismatch",
+                        state.agreed_step()
+                    ),
+                    arena0_protocol::MAX_TERMINAL_REASON_BYTES,
+                )));
             }
 
             let agreed_event = matches!(

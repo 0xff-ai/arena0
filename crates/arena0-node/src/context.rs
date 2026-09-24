@@ -39,6 +39,9 @@ pub enum ExecError {
     /// continuation. The contained message is safe to expose to the caller.
     #[error("callout answer rejected: {0}")]
     InputRejected(String),
+    /// A valid writer message was rejected or did not reproduce its post-state.
+    #[error("{0}")]
+    Diverged(String),
     /// A shared proposal is pending, so an input event was not consumed.
     #[error("execution is waiting for shared agreement; input was not consumed")]
     AgreementPending,
