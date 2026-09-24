@@ -172,6 +172,7 @@ pub(crate) struct HostState {
     pub ledger: ResourceLedger,
     pub profile: ExecutionProfile,
     pub callout_inputs: Vec<arena0_program::JsonSchemaDocument>,
+    pub signer: crate::signing::SignerSlot,
 }
 
 impl HostState {
@@ -202,6 +203,7 @@ impl HostState {
             ledger: ResourceLedger::new(),
             profile,
             callout_inputs,
+            signer: crate::signing::SignerSlot::default(),
         }
     }
 
@@ -233,6 +235,7 @@ impl HostState {
         self.effect_queue.clear();
         self.ledger = ResourceLedger::new();
         self.entropy.reset();
+        self.signer.clear();
         if let Some(draws) = random_replay {
             self.entropy.set_replay(draws.to_vec());
         }
@@ -252,6 +255,7 @@ impl HostState {
         self.effect_queue.clear();
         self.ledger = ResourceLedger::new();
         self.entropy.reset();
+        self.signer.clear();
         if let Some(draws) = random_replay {
             self.entropy.set_replay(draws.to_vec());
         }

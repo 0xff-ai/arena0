@@ -22,7 +22,10 @@ impl ExecutionActor {
     /// alive is essential: it can accept a peer's terminal frame while our own
     /// `Abort` send is waiting for that peer's durable acknowledgement.
     pub(super) async fn fail_terminal(&mut self, error: ExecError) -> bool {
-        let reason = truncate_reason(error.to_string());
+        let reason = truncate_reason(
+            error.to_string(),
+            arena0_protocol::MAX_TERMINAL_REASON_BYTES,
+        );
         match self.context.store.load_execution().await {
             Ok(Some(_)) => match fail_execution(
                 &mut self.context.store,
@@ -91,7 +94,7 @@ impl ExecutionActor {
         code: u32,
         reason: String,
     ) -> Result<bool, ExecError> {
-        let reason = truncate_reason(reason);
+        let reason = truncate_reason(reason, arena0_protocol::MAX_TERMINAL_REASON_BYTES);
         for _ in 0..MAX_CAS_RETRIES {
             let state = self.load_state().await?;
             if state.status().is_terminal() {
@@ -246,7 +249,7 @@ pub(crate) async fn fail_execution(
     identity: &NodeKeys,
     reason: String,
 ) -> Result<FailureOutcome, ExecError> {
-    let reason = truncate_reason(reason);
+    let reason = truncate_reason(reason, arena0_protocol::MAX_TERMINAL_REASON_BYTES);
     for _ in 0..MAX_CAS_RETRIES {
         let state = store
             .load_execution()

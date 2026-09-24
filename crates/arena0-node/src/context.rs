@@ -338,7 +338,9 @@ pub(crate) struct ActorContext {
     pub(crate) params: JsonBytes,
     pub(crate) activation: Activation,
     pub(crate) producer: arena0_protocol::PeerId,
-    pub(crate) execution_key: ExecutionKey,
+    /// Execution-scoped BLS signer shared by handle with per-dispatch guest
+    /// signers.
+    pub(crate) execution_key: Arc<ExecutionKey>,
     pub(crate) identity: Arc<NodeKeys>,
     pub(crate) store: ExecutionStore,
     pub(crate) transport: Arc<dyn Transport + Sync>,
@@ -358,7 +360,7 @@ impl ExecContext {
             params: self.params,
             activation: self.activation,
             producer,
-            execution_key: self.execution_key,
+            execution_key: Arc::new(self.execution_key),
             identity,
             store,
             transport,

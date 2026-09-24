@@ -80,10 +80,7 @@ impl TraceEntry {
     pub(crate) fn validate_shape(&self) -> io::Result<()> {
         match &self.event {
             Event::SessionStarted { .. } | Event::MessageReceived { .. } => {}
-            Event::InputReceived { .. }
-            | Event::TimerFired { .. }
-            | Event::Signed { .. }
-            | Event::React => {
+            Event::InputReceived { .. } | Event::TimerFired { .. } | Event::React => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "portable trace entry contains a non-agreed event",
@@ -140,7 +137,7 @@ impl TraceEntry {
     }
 }
 
-/// Runtime metadata for a suspended callout or signing continuation.
+/// Runtime metadata for a suspended callout continuation.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PendingRecord {
     pub id: PendingId,
@@ -195,7 +192,6 @@ fn serialize_pending_string<W: borsh::io::Write>(
 )]
 pub enum PendingOperation {
     Callout { callout_index: u32 },
-    Sign,
 }
 
 impl PendingOperation {
@@ -203,7 +199,6 @@ impl PendingOperation {
     pub const fn kind(self) -> PendingKind {
         match self {
             Self::Callout { .. } => PendingKind::Callout,
-            Self::Sign => PendingKind::Sign,
         }
     }
 }
@@ -224,11 +219,6 @@ impl PendingRecord {
                 },
                 expected_type: expected_type.clone(),
             }),
-            Effect::Sign { expected_type, .. } => Some(Self {
-                id,
-                operation: PendingOperation::Sign,
-                expected_type: expected_type.clone().or_else(|| Some("Vec<u8>".into())),
-            }),
             _ => None,
         }
     }
@@ -246,7 +236,6 @@ impl PendingRecord {
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PendingKind {
     Callout,
-    Sign,
 }
 
 impl BorshSerialize for PendingKind {
@@ -254,7 +243,6 @@ impl BorshSerialize for PendingKind {
         BorshSerialize::serialize(
             &match self {
                 Self::Callout => 0u8,
-                Self::Sign => 1u8,
             },
             writer,
         )
@@ -265,7 +253,6 @@ impl BorshDeserialize for PendingKind {
     fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> io::Result<Self> {
         match u8::deserialize_reader(reader)? {
             0 => Ok(Self::Callout),
-            1 => Ok(Self::Sign),
             tag => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown pending kind tag {tag}"),

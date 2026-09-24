@@ -107,8 +107,9 @@ impl Drop for InflightSend {
     }
 }
 
-pub(crate) fn truncate_reason(mut reason: String) -> String {
-    while reason.len() > arena0_protocol::MAX_TERMINAL_REASON_BYTES {
+/// Bound a human-readable reason to `limit` UTF-8 bytes at a scalar boundary.
+pub(crate) fn truncate_reason(mut reason: String, limit: usize) -> String {
+    while reason.len() > limit {
         // Popping whole scalar values keeps the cut at a UTF-8 boundary.
         // Calling `String::truncate` at the byte limit directly would panic
         // when the limit falls in the middle of a multibyte character.

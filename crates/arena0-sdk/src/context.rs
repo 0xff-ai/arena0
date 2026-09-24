@@ -397,6 +397,22 @@ impl<Shared, Local> Context<Shared, Local> {
             _marker: PhantomData,
         }
     }
+
+    /// Sign `payload` synchronously with the participant's host key.
+    ///
+    /// The host builds a versioned, execution-bound preimage from the dispatch
+    /// coordinates and returns both that exact preimage and its signature; both
+    /// schemes are deterministic, so re-running the handler after a crash
+    /// produces the same signature. Available only in local handlers
+    /// (`InputReceived`, `TimerFired`, `React`) whose program declared a `Sign`
+    /// capability for the requested scheme.
+    pub fn sign(&self, scheme: SignScheme, payload: &[u8]) -> Signed {
+        let (signed_bytes, signature) = effects::host_guest_sign(scheme, payload);
+        Signed {
+            signed_bytes,
+            signature,
+        }
+    }
 }
 
 /// Host side-effect handle passed to [`Context::effects`].
@@ -421,13 +437,16 @@ pub struct CalloutBuilder<T = ()> {
     _output: PhantomData<fn() -> T>,
 }
 
-/// Owned external signing effect builder.
-#[derive(Debug, Clone)]
-#[must_use = "sign builders must be dispatched"]
-pub struct SignBuilder {
-    scheme: SignScheme,
-    data: Vec<u8>,
-    expected_type: Option<String>,
+/// Exact bytes and signature returned by one synchronous guest signing call.
+///
+/// The guest receives both so it can persist or forward the exact preimage the
+/// host signed; the host never lets the guest guess what was signed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signed {
+    /// The exact versioned, execution-bound preimage the host signed.
+    pub signed_bytes: Vec<u8>,
+    /// The signature over `signed_bytes`.
+    pub signature: Vec<u8>,
 }
 
 /// Primitive message routing metadata.
@@ -541,19 +560,6 @@ impl<T> CalloutBuilder<T> {
             &self.context,
             self.expected_type.as_deref(),
         );
-    }
-}
-
-impl SignBuilder {
-    /// Override the expected output type name recorded for diagnostics.
-    pub fn expected_type(mut self, expected_type: impl Into<String>) -> Self {
-        self.expected_type = Some(expected_type.into());
-        self
-    }
-
-    /// Emit the sign effect.
-    pub fn dispatch(self) {
-        effects::host_sign(self.scheme, &self.data, self.expected_type.as_deref());
     }
 }
 
@@ -743,15 +749,6 @@ impl<Shared> Effects<'_, Shared> {
         let spec = (timer, schedule).into_timer_spec();
         effects::host_set_timer_spec(&spec);
     }
-
-    /// Build an external signing effect.
-    pub fn sign(&mut self, scheme: SignScheme, data: &[u8]) -> SignBuilder {
-        SignBuilder {
-            scheme,
-            data: data.to_vec(),
-            expected_type: Some("Vec<u8>".into()),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -818,29 +815,13 @@ mod tests {
     }
 
     #[test]
-    fn sign_builder_records_expected_type() {
-        let mut ctx = make_ctx();
-        crate::testing::drain_effects();
+    fn synchronous_sign_returns_the_payload_and_a_deterministic_signature() {
+        let ctx = make_ctx();
 
-        ctx.effects()
-            .sign(SignScheme::Ed25519, b"payload")
-            .dispatch();
-
-        let effects = crate::testing::drain_effects();
-        assert_eq!(effects.len(), 1);
-        match &effects[0] {
-            arena0_protocol::Effect::Sign {
-                scheme,
-                data,
-                expected_type,
-                ..
-            } => {
-                assert_eq!(*scheme, SignScheme::Ed25519);
-                assert_eq!(data, b"payload");
-                assert_eq!(expected_type.as_deref(), Some("Vec<u8>"));
-            }
-            other => panic!("expected sign effect, got {other:?}"),
-        }
+        let signed = ctx.sign(SignScheme::Ed25519, b"payload");
+        assert_eq!(signed.signed_bytes, b"payload");
+        assert_eq!(signed.signature.len(), 64);
+        assert_eq!(signed, ctx.sign(SignScheme::Ed25519, b"payload"));
     }
 
     #[test]

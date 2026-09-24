@@ -164,7 +164,6 @@ fn effect_name(effect: &Effect) -> &'static str {
         Effect::Broadcast { .. } => "Broadcast",
         Effect::Callout { .. } => "Callout",
         Effect::SetTimer { .. } => "SetTimer",
-        Effect::Sign { .. } => "Sign",
         Effect::SessionEnd { .. } => "SessionEnd",
         Effect::SessionAbort { .. } => "SessionAbort",
         Effect::Fail { .. } => "Fail",
@@ -179,7 +178,6 @@ pub(super) fn event_name(event: &Event) -> &'static str {
         Event::MessageReceived { .. } => "MessageReceived",
         Event::InputReceived { .. } => "InputReceived",
         Event::TimerFired { .. } => "TimerFired",
-        Event::Signed { .. } => "Signed",
         Event::React => "React",
     }
 }

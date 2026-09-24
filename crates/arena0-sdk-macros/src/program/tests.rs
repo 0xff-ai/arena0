@@ -256,3 +256,202 @@ fn detects_auto_capability_argument() {
 
     assert!(args.capabilities_auto);
 }
+
+fn auto_args() -> Arena0ProgramArgs {
+    syn::parse_str(
+        r#"name = "test", version = "1.0.0", description = "test", participants = 2, capabilities(auto)"#,
+    )
+    .unwrap()
+}
+
+fn expand_sign_module(item: Item) -> String {
+    expand_arena0_program_item(auto_args(), item)
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn infers_the_sign_scheme_of_a_literal_context_call() {
+    for (scheme, expected, absent) in [
+        ("Ed25519", "SignScheme :: Ed25519", "SignScheme :: Bls"),
+        ("Bls", "SignScheme :: Bls", "SignScheme :: Ed25519"),
+    ] {
+        let item: Item = syn::parse_str(&format!(
+            r#"
+            pub mod ping {{
+                use arena0::prelude::*;
+
+                #[arena0::state(max = 256)]
+                pub struct Shared {{ round: u64 }}
+
+                fn on_react(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {{
+                    let _ = ctx.sign(SignScheme::{scheme}, b"payload");
+                    Ok(Transition::Stay)
+                }}
+            }}
+            "#
+        ))
+        .unwrap();
+
+        let expanded = expand_sign_module(item);
+        assert!(expanded.contains("Capability :: Sign"), "{expanded}");
+        assert!(expanded.contains(expected), "{expanded}");
+        assert!(!expanded.contains(absent), "{expanded}");
+    }
+}
+
+#[test]
+fn infers_both_sign_schemes_for_a_dynamic_scheme() {
+    let item: Item = syn::parse_quote! {
+        pub mod ping {
+            use arena0::prelude::*;
+
+            #[arena0::state(max = 256)]
+            pub struct Shared { round: u64 }
+
+            fn on_react(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
+                let scheme = SignScheme::Bls;
+                let _ = ctx.sign(scheme, b"payload");
+                Ok(Transition::Stay)
+            }
+        }
+    };
+
+    let expanded = expand_sign_module(item);
+    assert!(expanded.contains("SignScheme :: Ed25519"), "{expanded}");
+    assert!(expanded.contains("SignScheme :: Bls"), "{expanded}");
+}
+
+#[test]
+fn ignores_sign_calls_on_non_context_receivers() {
+    let item: Item = syn::parse_quote! {
+        pub mod ping {
+            use arena0::prelude::*;
+
+            #[arena0::state(max = 256)]
+            pub struct Shared { round: u64 }
+
+            struct Helper;
+
+            impl Helper {
+                fn sign(&self, _payload: &[u8]) {}
+            }
+
+            fn on_react(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
+                let helper = Helper;
+                helper.sign(b"payload");
+                let _ = ctx;
+                Ok(Transition::Stay)
+            }
+        }
+    };
+
+    let expanded = expand_sign_module(item);
+    assert!(!expanded.contains("Capability :: Sign"), "{expanded}");
+}
+
+#[test]
+fn infers_sign_through_a_context_alias() {
+    let item: Item = syn::parse_quote! {
+        pub mod ping {
+            use arena0::prelude::*;
+
+            #[arena0::state(max = 256)]
+            pub struct Shared { round: u64 }
+
+            fn on_react(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
+                let signer = &*ctx;
+                let _ = signer.sign(SignScheme::Bls, b"payload");
+                Ok(Transition::Stay)
+            }
+        }
+    };
+
+    let expanded = expand_sign_module(item);
+    assert!(expanded.contains("Capability :: Sign"), "{expanded}");
+    assert!(!expanded.contains("SignScheme :: Ed25519"), "{expanded}");
+}
+
+#[test]
+fn scopes_context_bindings_to_the_declaring_function() {
+    let item: Item = syn::parse_quote! {
+        pub mod ping {
+            use arena0::prelude::*;
+
+            #[arena0::state(max = 256)]
+            pub struct Shared { round: u64 }
+
+            struct Helper;
+
+            impl Helper {
+                fn sign(&self, _scheme: SignScheme, _payload: &[u8]) {}
+            }
+
+            fn on_react(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
+                let _ = ctx;
+                Ok(Transition::Stay)
+            }
+
+            fn helper(ctx: &Helper) {
+                ctx.sign(SignScheme::Ed25519, b"payload");
+            }
+        }
+    };
+
+    let expanded = expand_sign_module(item);
+    assert!(!expanded.contains("Capability :: Sign"), "{expanded}");
+}
+
+#[test]
+fn ignores_sign_calls_through_a_shadowing_local() {
+    let item: Item = syn::parse_quote! {
+        pub mod ping {
+            use arena0::prelude::*;
+
+            #[arena0::state(max = 256)]
+            pub struct Shared { round: u64 }
+
+            struct Helper;
+
+            impl Helper {
+                fn sign(&self, _scheme: SignScheme, _payload: &[u8]) {}
+            }
+
+            fn on_react(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
+                let ctx = Helper;
+                ctx.sign(SignScheme::Ed25519, b"payload");
+                Ok(Transition::Stay)
+            }
+        }
+    };
+
+    let expanded = expand_sign_module(item);
+    assert!(!expanded.contains("Capability :: Sign"), "{expanded}");
+}
+
+#[test]
+fn scopes_effect_bindings_to_the_declaring_function() {
+    let item: Item = syn::parse_quote! {
+        pub mod ping {
+            use arena0::prelude::*;
+
+            #[arena0::state(max = 256)]
+            pub struct Shared { round: u64 }
+
+            pub enum Message { Pong }
+
+            fn on_react(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
+                let effects = ctx.effects();
+                let _ = effects;
+                Ok(Transition::Stay)
+            }
+
+            fn helper(effects: &mut Effects) {
+                effects.send(Participant::new(1), &Message::Pong);
+            }
+        }
+    };
+
+    let expanded = expand_sign_module(item);
+    assert!(!expanded.contains("Capability :: Messaging"), "{expanded}");
+}

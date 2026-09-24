@@ -8,16 +8,19 @@
 //! restores it from the committed images.
 
 use crate::context::{ExecError, SessionMessage};
-use arena0_crypto::SignScheme;
-use arena0_program::{CallStatus, JsonBytes};
+use arena0_crypto::{ExecutionKey, NodeKeys, SignScheme};
+use arena0_program::{CallStatus, JsonBytes, ProgramHash};
 use arena0_protocol::execution::GuestSignData;
 use arena0_protocol::{
     Committed, Effect, Ensemble, Event, ExecFrame, ExecLifecycle, ExecutionState, ExecutionStatus,
     MessageId, ParticipantStepSignature, ParticipantTerminalSignature, PeerIdSource, PendingId,
-    PendingOperation, StateHash, TerminalOutcome,
+    PendingOperation, SessionHash, StateHash, TerminalOutcome,
 };
-use arena0_sandbox::{DispatchCall, OutcomeCall, QueryCall, RandomReplay, ViewCall, WriterCall};
+use arena0_sandbox::{
+    DispatchCall, GuestSigner, OutcomeCall, QueryCall, RandomReplay, ViewCall, WriterCall,
+};
 use arena0_store::{ApplyOutcome, InboxId};
+use std::sync::Arc;
 
 use super::{ExecutionActor, MAX_CAS_RETRIES, MAX_TIMER_BATCH, now_ms};
 
@@ -63,6 +66,46 @@ pub(super) enum DispatchOutcome {
 impl From<ExecError> for SubmitInputError {
     fn from(error: ExecError) -> Self {
         Self::Fatal(error)
+    }
+}
+
+/// Per-dispatch signer handed to the guest's synchronous `sign` import.
+///
+/// It owns the execution-bound preimage construction so the guest receives the
+/// exact bytes that were signed, and it can only be reached through the import
+/// a local handler dispatch installed it for.
+struct DispatchSigner {
+    session_id: SessionHash,
+    program_hash: ProgramHash,
+    execution_id: arena0_protocol::ExecId,
+    event_position: u64,
+    identity: Arc<NodeKeys>,
+    execution_key: Arc<ExecutionKey>,
+}
+
+impl GuestSigner for DispatchSigner {
+    fn sign(
+        &self,
+        call_index: u32,
+        scheme: SignScheme,
+        payload: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let data = GuestSignData::new(
+            self.session_id,
+            self.program_hash,
+            self.execution_id,
+            self.event_position,
+            call_index,
+            scheme,
+            payload.to_vec(),
+        )
+        .map_err(|error| error.to_string())?;
+        let signing_bytes = data.signing_bytes().map_err(|error| error.to_string())?;
+        let signature = match scheme {
+            SignScheme::Ed25519 => self.identity.sign(&signing_bytes).0.to_vec(),
+            SignScheme::Bls => self.execution_key.sign(&signing_bytes).0.to_vec(),
+        };
+        Ok((signing_bytes, signature))
     }
 }
 
@@ -113,83 +156,6 @@ impl ExecutionActor {
             }
         }
         Ok(())
-    }
-
-    /// Sign and resume one guest signing continuation. The signer signs only
-    /// the exact versioned `GuestSignData` preimage supplied by the guest; it
-    /// cannot be used to sign a step or terminal commitment by relabelling it.
-    pub(super) async fn sign_and_resume(
-        &mut self,
-        pending_id: PendingId,
-        data: &GuestSignData,
-    ) -> Result<bool, ExecError> {
-        self.validate_guest_sign_data(pending_id, data)?;
-
-        let signing_bytes = data.signing_bytes()?;
-        let signature = match data.scheme() {
-            SignScheme::Ed25519 => self.context.identity.sign(&signing_bytes).0.to_vec(),
-            SignScheme::Bls => self.context.execution_key.sign(&signing_bytes).0.to_vec(),
-        };
-        self.resume_signature(pending_id, signature).await
-    }
-
-    fn validate_guest_sign_data(
-        &self,
-        pending_id: PendingId,
-        data: &GuestSignData,
-    ) -> Result<(), ExecError> {
-        if data.execution_id() != self.context.exec_id {
-            return Err(ExecError::InvalidState(
-                "guest signing request execution id does not match actor execution".into(),
-            ));
-        }
-        if data.session_id() != self.context.activation.session_hash() {
-            return Err(ExecError::InvalidState(
-                "guest signing request session does not match actor session".into(),
-            ));
-        }
-        if data.program_hash() != self.context.program.program().hash() {
-            return Err(ExecError::InvalidState(
-                "guest signing request program does not match actor program".into(),
-            ));
-        }
-        let expected = arena0_protocol::pending_id(
-            self.context.exec_id,
-            data.event_position(),
-            data.effect_index(),
-        );
-        if pending_id != expected {
-            return Err(ExecError::InvalidState(
-                "guest signing request coordinate does not match its continuation".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    async fn resume_signature(
-        &mut self,
-        pending_id: PendingId,
-        signature: Vec<u8>,
-    ) -> Result<bool, ExecError> {
-        if signature.len() > arena0_protocol::MAX_EFFECT_PAYLOAD_BYTES {
-            return Err(ExecError::InvalidState(
-                "submitted signature exceeds the protocol payload bound".into(),
-            ));
-        }
-        let accepted = self
-            .dispatch_event(
-                Event::Signed { signature },
-                DispatchSource {
-                    pending_id: Some(pending_id),
-                    ..DispatchSource::default()
-                },
-            )
-            .await?;
-        // The caller is the outbox delivery loop. It acknowledges this exact
-        // sign row after the continuation is durably consumed, then the outer
-        // actor progress cycle drives any newly exposed proof or effect work.
-        // Calling `progress` here would recurse through Sign delivery.
-        Ok(matches!(accepted, DispatchOutcome::Committed))
     }
 
     pub(super) async fn query(
@@ -416,7 +382,7 @@ impl ExecutionActor {
                 self.discard_candidate()?;
                 return Ok(DispatchOutcome::Frozen);
             }
-            if matches!(&event, Event::InputReceived { .. } | Event::Signed { .. }) {
+            if matches!(&event, Event::InputReceived { .. }) {
                 let Some(pending) = state.status().pending() else {
                     self.discard_candidate()?;
                     return Ok(DispatchOutcome::Frozen);
@@ -444,6 +410,22 @@ impl ExecutionActor {
                 if let Some(replay) = replay.clone() {
                     call = call.with_random_replay(replay);
                 }
+                // Only local handlers may sign. `SessionStarted` is a
+                // pre-session dispatch and `MessageReceived` reproduces a
+                // peer's agreed result, so neither is offered a signer.
+                if matches!(
+                    &event,
+                    Event::InputReceived { .. } | Event::TimerFired { .. } | Event::React
+                ) {
+                    call = call.with_signer(Arc::new(DispatchSigner {
+                        session_id: self.context.activation.session_hash(),
+                        program_hash: self.context.program.program().hash(),
+                        execution_id: self.context.exec_id,
+                        event_position: state.event_position(),
+                        identity: Arc::clone(&self.context.identity),
+                        execution_key: Arc::clone(&self.context.execution_key),
+                    }));
+                }
                 call
             };
             let result = match self.resident_mut()?.dispatch(call) {
@@ -456,7 +438,10 @@ impl ExecutionActor {
                     self.restore_resident(&state)?;
                     if matches!(&event, Event::InputReceived { .. }) {
                         return Ok(DispatchOutcome::Rejected {
-                            reason: Some(format!("input handler trapped: {error}")),
+                            reason: Some(super::truncate_reason(
+                                format!("input handler trapped: {error}"),
+                                arena0_program::MAX_REJECTION_REASON_BYTES,
+                            )),
                         });
                     }
                     return Err(error.into());

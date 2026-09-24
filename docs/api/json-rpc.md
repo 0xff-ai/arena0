@@ -183,8 +183,8 @@ Only generated guest code performs concrete DTO conversion to and from Borsh.
 the string unchanged when submitting an answer. This avoids precision loss in
 JSON clients whose number type cannot represent every `u64` value.
 
-Signing requests never reach the client; the Host answers them with its
-custodied execution key.
+Guest signing never reaches the client; the Host signs synchronously with its
+custodied identity or execution key inside the local handler dispatch.
 
 The Host persists an authenticated inbound execution frame before it
 acknowledges transport responsibility. The execution actor resolves the frame

@@ -137,7 +137,6 @@ fn register_sign(
     linker: &mut Linker<HostState>,
     allowed_schemes: Vec<SignScheme>,
 ) -> Result<(), SandboxError> {
-    let allowed_schemes_for_sign = allowed_schemes.clone();
     linker
         .func_wrap(
             abi::HOST_MODULE,
@@ -146,25 +145,43 @@ fn register_sign(
                   scheme: u32,
                   data_ptr: u32,
                   data_len: u32,
-                  expected_ptr: u32,
-                  expected_len: u32| {
+                  out_ptr: u32,
+                  out_cap: u32|
+                  -> Result<u32, wasmtime::Error> {
                 caller.begin_import("sign")?;
                 caller.reject_if_lifecycle_disallowed("sign", &[Lifecycle::Active])?;
                 caller.reject_read_only("sign")?;
                 let scheme = u32_to_sign_scheme(scheme)?;
-                reject_if_sign_scheme_disallowed("sign", scheme, &allowed_schemes_for_sign)?;
-                let data = caller.read_guest_bytes(data_ptr, data_len, "sign")?;
-                let expected_type = read_optional_guest_string(
-                    &mut caller,
-                    expected_ptr,
-                    expected_len,
-                    "sign:expected_type",
-                )?;
-                caller.record_effect(Effect::Sign {
-                    scheme,
-                    data,
-                    expected_type,
-                })
+                reject_if_sign_scheme_disallowed("sign", scheme, &allowed_schemes)?;
+                let payload = caller.read_guest_bytes(data_ptr, data_len, "sign")?;
+                let Some(signer) = caller.data().signer.signer() else {
+                    return Err(wasmtime::Error::msg(
+                        "sign is only available in local handlers",
+                    ));
+                };
+                let call_index = caller.data_mut().signer.next_call();
+                let (signed_bytes, signature) = signer
+                    .sign(call_index, scheme, &payload)
+                    .map_err(|error| wasmtime::Error::msg(format!("sign: {error}")))?;
+                let encoded = borsh::to_vec(&(signed_bytes, signature))
+                    .map_err(|error| wasmtime::Error::msg(format!("sign: encode: {error}")))?;
+                if encoded.len() > out_cap as usize {
+                    return Err(wasmtime::Error::msg(format!(
+                        "sign: result is {} bytes; guest capacity is {out_cap}",
+                        encoded.len()
+                    )));
+                }
+                let max_host_bytes = caller.data().profile.limits.max_host_bytes;
+                caller
+                    .data_mut()
+                    .ledger
+                    .copy_bytes(encoded.len(), max_host_bytes)
+                    .map_err(wasmtime::Error::new)?;
+                let work = caller.work_memory()?;
+                work.write(&mut caller, out_ptr as usize, &encoded)
+                    .map_err(|error| wasmtime::Error::msg(format!("sign: {error}")))?;
+                u32::try_from(encoded.len())
+                    .map_err(|_| wasmtime::Error::msg("sign: result length exceeds u32"))
             },
         )
         .map_err(map_err)?;
@@ -255,20 +272,25 @@ mod tests {
         stage: Lifecycle,
         scheme: u32,
         declared_schemes: Vec<SignScheme>,
-    ) -> (Store<HostState>, wasmtime::TypedFunc<(), ()>) {
+        with_signer: bool,
+    ) -> (
+        Store<HostState>,
+        wasmtime::TypedFunc<(), i32>,
+        wasmtime::Memory,
+    ) {
         let engine = Engine::default();
         let wat = format!(
             r#"
                 (module
-                  (import "arena0" "sign" (func $sign (param i32 i32 i32 i32 i32)))
+                  (import "arena0" "sign" (func $sign (param i32 i32 i32 i32 i32) (result i32)))
                   (memory (export "memory") 1)
-                  (data (i32.const 16) "Signature")
-                  (func (export "call_sign")
+                  (data (i32.const 64) "payload")
+                  (func (export "call_sign") (result i32)
                     i32.const {scheme}
+                    i32.const 64
+                    i32.const 7
                     i32.const 0
-                    i32.const 0
-                    i32.const 16
-                    i32.const 9
+                    i32.const 512
                     call $sign))
             "#
         );
@@ -292,13 +314,35 @@ mod tests {
                 Vec::new(),
             );
             hs.lifecycle = stage;
+            if with_signer {
+                hs.signer.install(Some(std::sync::Arc::new(TestSigner)));
+            }
             hs
         });
         let instance = linker.instantiate(&mut store, &module).unwrap();
         let sign = instance
-            .get_typed_func::<(), ()>(&mut store, "call_sign")
+            .get_typed_func::<(), i32>(&mut store, "call_sign")
             .unwrap();
-        (store, sign)
+        let memory = instance.get_memory(&mut store, "memory").unwrap();
+        (store, sign, memory)
+    }
+
+    /// Deterministic stand-in for the host signer: the "signed bytes" are the
+    /// call ordinal followed by the payload, and the signature repeats the
+    /// ordinal so the round trip is visible without a real key.
+    struct TestSigner;
+
+    impl crate::GuestSigner for TestSigner {
+        fn sign(
+            &self,
+            call_index: u32,
+            _scheme: SignScheme,
+            payload: &[u8],
+        ) -> Result<(Vec<u8>, Vec<u8>), String> {
+            let mut signed = call_index.to_le_bytes().to_vec();
+            signed.extend_from_slice(payload);
+            Ok((signed, vec![u8::try_from(call_index).unwrap_or(0); 64]))
+        }
     }
 
     fn instantiate_input_test_module(
@@ -390,9 +434,18 @@ mod tests {
     }
 
     #[test]
+    fn sign_without_a_signer_traps_in_a_local_handler() {
+        let (mut store, sign, _) =
+            instantiate_sign_test_module(Lifecycle::Active, 0, vec![SignScheme::Ed25519], false);
+        let error = sign.call(&mut store, ()).unwrap_err();
+        assert!(format!("{error:?}").contains("local handlers"), "{error:?}");
+        assert!(store.data().effect_queue.is_empty());
+    }
+
+    #[test]
     fn sign_rejected_during_pre_session() {
-        let (mut store, sign) =
-            instantiate_sign_test_module(Lifecycle::PreSession, 0, vec![SignScheme::Ed25519]);
+        let (mut store, sign, _) =
+            instantiate_sign_test_module(Lifecycle::PreSession, 0, vec![SignScheme::Ed25519], true);
         assert!(sign.call(&mut store, ()).is_err());
         assert!(store.data().effect_queue.is_empty());
     }
@@ -403,24 +456,31 @@ mod tests {
             vec![SignScheme::Ed25519],
             vec![SignScheme::Ed25519, SignScheme::Ed25519],
         ] {
-            let (mut store, sign) = instantiate_sign_test_module(Lifecycle::Active, 0, declared);
-            sign.call(&mut store, ()).unwrap();
-            assert_eq!(
-                store.data().effect_queue,
-                vec![Effect::Sign {
-                    scheme: SignScheme::Ed25519,
-                    data: Vec::new(),
-                    expected_type: Some("Signature".into()),
-                }]
-            );
+            let (mut store, sign, memory) =
+                instantiate_sign_test_module(Lifecycle::Active, 0, declared, true);
+            let written = sign.call(&mut store, ()).unwrap();
+            let mut encoded = vec![0u8; written as usize];
+            memory.read(&store, 0, &mut encoded).unwrap();
+            let (signed_bytes, signature): (Vec<u8>, Vec<u8>) =
+                borsh::from_slice(&encoded).unwrap();
+            assert_eq!(&signed_bytes[..4], 0u32.to_le_bytes());
+            assert_eq!(&signed_bytes[4..], b"payload");
+            assert_eq!(signature, vec![0u8; 64]);
         }
     }
 
     #[test]
     fn sign_rejects_undeclared_scheme() {
-        // ABI discriminant 1 no longer decodes to any scheme.
-        let (mut store, sign) =
-            instantiate_sign_test_module(Lifecycle::Active, 1, vec![SignScheme::Ed25519]);
+        let (mut store, sign, _) =
+            instantiate_sign_test_module(Lifecycle::Active, 1, vec![SignScheme::Ed25519], true);
+        assert!(sign.call(&mut store, ()).is_err());
+        assert!(store.data().effect_queue.is_empty());
+    }
+
+    #[test]
+    fn sign_rejects_unknown_scheme_discriminant() {
+        let (mut store, sign, _) =
+            instantiate_sign_test_module(Lifecycle::Active, 7, vec![SignScheme::Ed25519], true);
         assert!(sign.call(&mut store, ()).is_err());
         assert!(store.data().effect_queue.is_empty());
     }

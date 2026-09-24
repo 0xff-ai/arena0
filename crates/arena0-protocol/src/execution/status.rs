@@ -27,7 +27,7 @@ pub enum ExecutionStatus {
     Activating,
     /// The execution is runnable and has no stored continuation.
     Active,
-    /// A continuation is awaiting a callout answer or signature.
+    /// A continuation is awaiting a callout answer.
     Waiting { pending: PendingRecord },
     /// Successful terminal proof collection is in progress.
     TerminalProof { proof: Box<TerminalProof> },

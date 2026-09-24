@@ -392,8 +392,8 @@ impl std::fmt::Debug for ProgramInstance {
 impl ProgramInstance {
     /// Dispatch one event through the sole mutating guest export.
     pub fn dispatch(&mut self, call: DispatchCall) -> Result<DispatchCallResult, SandboxError> {
-        let (input, random_replay, lifecycle) = call.into_input()?;
-        self.dispatch_input(input, random_replay.as_ref(), lifecycle)
+        let (input, random_replay, lifecycle, signer) = call.into_input()?;
+        self.dispatch_input(input, random_replay.as_ref(), lifecycle, signer)
     }
 
     /// Replace the resident state with durable committed payloads during actor
@@ -478,6 +478,7 @@ impl ProgramInstance {
         input: DispatchInput,
         random_replay: Option<&crate::call::RandomReplay>,
         lifecycle: Lifecycle,
+        signer: Option<std::sync::Arc<dyn crate::GuestSigner>>,
     ) -> Result<DispatchCallResult, SandboxError> {
         let bytes = borsh::to_vec(&input)
             .map_err(|error| SandboxError::SerializationFailed(error.to_string()))?;
@@ -494,6 +495,9 @@ impl ProgramInstance {
         if let Err(error) = self.reset_for_dispatch(lifecycle, random_replay) {
             return self.rollback_error(error);
         }
+        // A signer is installed only for this dispatch; any rollback path
+        // clears it together with the rest of the per-call host state.
+        self.store.data_mut().signer.install(signer);
         let input_ptr_result = {
             let mut guest = Guest::new(&mut self.store, &self.instance);
             guest.alloc(bytes_len).and_then(|ptr| {

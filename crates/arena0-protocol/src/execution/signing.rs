@@ -1,4 +1,4 @@
-//! Kernel-owned signing contracts for guest `Sign` effects.
+//! Kernel-owned signing contracts for synchronous guest signing requests.
 
 use arena0_crypto::SignScheme;
 use arena0_program::ProgramHash;
@@ -11,10 +11,10 @@ use crate::{ExecId, SessionHash};
 
 use super::{MAX_EFFECT_PAYLOAD_BYTES, ProtocolError, ensure_payload};
 
-/// Versioned, execution-bound preimage presented to a local signer for a guest
-/// `Effect::Sign`. The guest payload is data inside this contract, never the
-/// protocol message itself, so it cannot be used as a signing oracle for step,
-/// terminal, activation, or receipt commitments.
+/// Versioned, execution-bound preimage presented to a local signer for one
+/// guest signing call. The guest payload is data inside this contract, never
+/// the protocol message itself, so it cannot be used as a signing oracle for
+/// step, terminal, activation, or receipt commitments.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct GuestSignData {
     domain: [u8; 24],
@@ -23,7 +23,7 @@ pub struct GuestSignData {
     program_hash: ProgramHash,
     execution_id: ExecId,
     event_position: u64,
-    effect_index: u32,
+    call_index: u32,
     scheme: SignScheme,
     payload: Vec<u8>,
 }
@@ -36,7 +36,7 @@ impl BorshSerialize for GuestSignData {
         BorshSerialize::serialize(&self.program_hash, writer)?;
         BorshSerialize::serialize(&self.execution_id, writer)?;
         BorshSerialize::serialize(&self.event_position, writer)?;
-        BorshSerialize::serialize(&self.effect_index, writer)?;
+        BorshSerialize::serialize(&self.call_index, writer)?;
         BorshSerialize::serialize(&self.scheme, writer)?;
         let length = u32::try_from(self.payload.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "signing payload too long"))?;
@@ -54,7 +54,7 @@ impl BorshDeserialize for GuestSignData {
             program_hash: ProgramHash::deserialize_reader(reader)?,
             execution_id: crate::ExecId::deserialize_reader(reader)?,
             event_position: u64::deserialize_reader(reader)?,
-            effect_index: u32::deserialize_reader(reader)?,
+            call_index: u32::deserialize_reader(reader)?,
             scheme: SignScheme::deserialize_reader(reader)?,
             payload: read_bytes(reader, MAX_EFFECT_PAYLOAD_BYTES, "signing payload")?,
         };
@@ -66,16 +66,16 @@ impl BorshDeserialize for GuestSignData {
 
 impl GuestSignData {
     /// Domain separation tag for guest-owned signing requests.
-    pub const DOMAIN: [u8; 24] = *b"arena0/guest-sign/v2\0\0\0\0";
+    pub const DOMAIN: [u8; 24] = *b"arena0/guest-sign/v3\0\0\0\0";
     /// Version of the guest signing request contract.
-    pub const VERSION: u16 = 2;
+    pub const VERSION: u16 = 3;
 
     pub fn new(
         session_id: SessionHash,
         program_hash: ProgramHash,
         execution_id: ExecId,
         event_position: u64,
-        effect_index: u32,
+        call_index: u32,
         scheme: SignScheme,
         payload: Vec<u8>,
     ) -> Result<Self, ProtocolError> {
@@ -86,7 +86,7 @@ impl GuestSignData {
             program_hash,
             execution_id,
             event_position,
-            effect_index,
+            call_index,
             scheme,
             payload,
         };
@@ -118,10 +118,10 @@ impl GuestSignData {
         self.event_position
     }
 
-    /// Return the guest effect ordinal bound into the signing request.
+    /// Return the sign call ordinal within its dispatch.
     #[must_use]
-    pub const fn effect_index(&self) -> u32 {
-        self.effect_index
+    pub const fn call_index(&self) -> u32 {
+        self.call_index
     }
 
     /// Return the requested signing scheme.

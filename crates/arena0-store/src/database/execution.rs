@@ -1606,7 +1606,6 @@ impl Database {
                     ..
                 },
             ) => callout_index == effect_index,
-            (Event::Signed { .. }, Effect::Sign { .. }) => true,
             _ => false,
         };
         if !operation_matches {
@@ -1697,7 +1696,7 @@ fn validate_dispatch_sources(
 ) -> Result<(), StoreError> {
     let inbox_applicable = matches!(event, Event::MessageReceived { .. });
     let timer_applicable = matches!(event, Event::TimerFired { .. });
-    let pending_applicable = matches!(event, Event::InputReceived { .. } | Event::Signed { .. });
+    let pending_applicable = matches!(event, Event::InputReceived { .. });
     if let Some(inbox_id) = inbox_id
         && !inbox_applicable
     {
@@ -1716,7 +1715,7 @@ fn validate_dispatch_sources(
             "pending id supplied for a non-continuation event".into(),
         ));
     }
-    let answer = matches!(event, Event::InputReceived { .. } | Event::Signed { .. });
+    let answer = matches!(event, Event::InputReceived { .. });
     if (answer || pending_id.is_some())
         && pending_id != state.status().pending().map(|pending| pending.id)
     {

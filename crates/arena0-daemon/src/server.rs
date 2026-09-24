@@ -3611,18 +3611,18 @@ fn project_exec_status_facts(
     let exec_id = request.execution_id();
     let program_id = request.program_hash();
     let negotiation_id = request.negotiation_id();
-    let pending_callout = pending.and_then(|request| match request {
-        arena0_store::PendingRequest::Callout {
+    let pending_callout = pending.map(|request| {
+        let arena0_store::PendingRequest::Callout {
             pending_id,
             callout_index,
             expected_type,
             ..
-        } => Some(PendingCalloutStatus {
+        } = request;
+        PendingCalloutStatus {
             pending_id,
             callout_index,
             expected_type,
-        }),
-        arena0_store::PendingRequest::Signature { .. } => None,
+        }
     });
     let session_status = |state: &arena0_protocol::execution::ExecutionState| {
         let activation = state.binding().activation();
@@ -3766,7 +3766,6 @@ fn project_event_record_summary(
                     arena0_store::EffectKind::Broadcast => ApiEffectKind::Broadcast,
                     arena0_store::EffectKind::Callout => ApiEffectKind::Callout,
                     arena0_store::EffectKind::SetTimer => ApiEffectKind::SetTimer,
-                    arena0_store::EffectKind::Sign => ApiEffectKind::Sign,
                     arena0_store::EffectKind::Fail => ApiEffectKind::Fail,
                 },
                 payload_bytes,
@@ -3781,7 +3780,6 @@ fn project_event_record_summary(
             arena0_store::EventKind::MessageReceived => ApiEventKind::MessageReceived,
             arena0_store::EventKind::InputReceived => ApiEventKind::InputReceived,
             arena0_store::EventKind::TimerFired => ApiEventKind::TimerFired,
-            arena0_store::EventKind::Signed => ApiEventKind::Signed,
             arena0_store::EventKind::React => ApiEventKind::React,
         },
         input_payload_bytes,

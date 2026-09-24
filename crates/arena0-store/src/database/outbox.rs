@@ -3,8 +3,6 @@ use super::*;
 pub(super) struct PendingEffectRow {
     pub(super) outbox_id: OutboxId,
     pub(super) status: OutboxStatus,
-    pub(super) event_position: u64,
-    pub(super) ordinal: u32,
     pub(super) effect: Effect,
 }
 
@@ -69,38 +67,6 @@ impl Database {
                     expected_type,
                 }
             }
-            Effect::Sign { scheme, data, .. } => {
-                let data = GuestSignData::new(
-                    state.binding().session_id(),
-                    state.binding().program_hash(),
-                    execution_id,
-                    row.event_position,
-                    row.ordinal,
-                    scheme,
-                    data,
-                )?;
-                account_response(
-                    &mut response_bytes,
-                    borsh::to_vec(&data)
-                        .map_err(|error| {
-                            StoreError::Corruption(format!(
-                                "pending signature response encode: {error}"
-                            ))
-                        })?
-                        .len()
-                        .checked_add(128)
-                        .ok_or(StoreError::CommandTooLarge {
-                            required: usize::MAX,
-                            capacity: MAX_RESPONSE_BYTES,
-                        })?,
-                )?;
-                PendingRequest::Signature {
-                    outbox_id: row.outbox_id,
-                    status: row.status,
-                    pending_id: pending.id,
-                    data,
-                }
-            }
             _ => {
                 return Err(StoreError::Corruption(
                     "pending identity names the wrong effect kind".into(),
@@ -142,8 +108,6 @@ impl Database {
                     "pending effect outbox id",
                 )?),
                 status: parse_outbox_status(&row.get::<_, String>(3)?)?,
-                event_position,
-                ordinal,
                 effect: decode_borsh(&row.get::<_, Vec<u8>>(4)?, "pending effect")?,
             });
         }
@@ -571,7 +535,7 @@ impl Database {
     ) -> Result<(), StoreError> {
         for (ordinal, effect) in effects {
             match effect {
-                Effect::Callout { .. } | Effect::Sign { .. } => {
+                Effect::Callout { .. } => {
                     let payload = borsh::to_vec(effect).map_err(|error| {
                         StoreError::Corruption(format!("outbox effect encode: {error}"))
                     })?;
@@ -668,7 +632,7 @@ impl Database {
                 "continuation effect outbox id",
             )?);
             let effect: Effect = decode_borsh(&row.get::<_, Vec<u8>>(1)?, "continuation effect")?;
-            if matches!(effect, Effect::Callout { .. } | Effect::Sign { .. }) {
+            if matches!(effect, Effect::Callout { .. }) {
                 effects.push((outbox_id, effect));
             }
         }
@@ -725,7 +689,7 @@ impl Database {
         Ok(())
     }
 
-    /// Retire every pending/leased Callout and Sign row when the
+    /// Retire every pending/leased Callout row when the
     /// execution crosses a terminal boundary. These rows are local delivery
     /// attempts; retaining them after terminal completion could resurrect a
     /// continuation on restart. Protocol-frame rows remain untouched.
@@ -1039,7 +1003,7 @@ fn validate_outbox_payload(kind: OutboxPayloadKind, payload: &[u8]) -> Result<()
                 });
             }
             let effect: Effect = decode_borsh(payload, "outbox effect")?;
-            if !matches!(effect, Effect::Callout { .. } | Effect::Sign { .. }) {
+            if !matches!(effect, Effect::Callout { .. }) {
                 return Err(StoreError::Corruption(
                     "outbox effect does not require external delivery".into(),
                 ));

@@ -17,8 +17,8 @@ pub use abi::{
     ABI_VERSION, AbiEnvelopeError, CallStatus, DispatchInput, DispatchOutput, HOST_MODULE,
     InitInput, InitializedState, JsonBytes, JsonBytesError, MAX_CALL_PAYLOAD_BYTES,
     MAX_REJECTION_REASON_BYTES, MAX_SESSION_CONTEXT_BYTES, OutcomeBytes, OutcomeBytesError,
-    OutcomeInput, OutcomeOutput, QueryInput, QueryOutput, StateMemoryKind, ViewInput, ViewOutput,
-    WriterInput, WriterOutput,
+    OutcomeInput, OutcomeOutput, QueryInput, QueryOutput, SIGN_RESULT_OVERHEAD_BYTES,
+    StateMemoryKind, ViewInput, ViewOutput, WriterInput, WriterOutput,
 };
 pub use id::IdParseError;
 pub use profile::{

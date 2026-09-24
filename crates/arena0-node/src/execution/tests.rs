@@ -13,10 +13,10 @@ use arena0_program::{
 };
 use arena0_protocol::execution::GuestSignData;
 use arena0_protocol::{
-    AbortKind, AbortOccurrence, Activation, ActivationData, Effect, Ensemble, Event, ExecFrame,
-    ExecId, ExecutionAdmission, MessageId, NegotiationId, Offer, OfferData,
-    ParticipantStepSignature, ParticipantTerminalSignature, PeerId, PeerIdSource, PendingOperation,
-    PreparedActivation, StateHash, Ticket, TicketAction, TicketData, TicketHash,
+    AbortKind, AbortOccurrence, Activation, ActivationData, Ensemble, Event, ExecFrame, ExecId,
+    ExecutionAdmission, MessageId, NegotiationId, Offer, OfferData, ParticipantStepSignature,
+    ParticipantTerminalSignature, PeerId, PeerIdSource, PreparedActivation, StateHash, Ticket,
+    TicketAction, TicketData, TicketHash,
 };
 use arena0_sandbox::{InitializeCall, LoadedProgram, Program, WasmtimeEngine};
 use arena0_store::{ApplyOutcome, OutboxPayloadKind, Store, StoreConfig};
@@ -46,7 +46,10 @@ fn guest_wasm(stem: &str) -> Vec<u8> {
 
 #[test]
 fn terminal_reason_truncation_preserves_utf8_boundaries() {
-    let reason = super::truncate_reason("é".repeat(arena0_protocol::MAX_TERMINAL_REASON_BYTES));
+    let reason = super::truncate_reason(
+        "é".repeat(arena0_protocol::MAX_TERMINAL_REASON_BYTES),
+        arena0_protocol::MAX_TERMINAL_REASON_BYTES,
+    );
     assert!(reason.len() <= arena0_protocol::MAX_TERMINAL_REASON_BYTES);
     assert!(std::str::from_utf8(reason.as_bytes()).is_ok());
 }
@@ -58,8 +61,8 @@ enum GuestMode {
     Callout,
     CalloutFault,
     CalloutReject,
-    Sign,
-    SignThenBroadcast,
+    LocalSign,
+    SignOnMessage,
     Broadcast,
     EndOnMessage,
 }
@@ -326,18 +329,6 @@ impl Fixture {
                 .expect("ack outbox");
         }
     }
-}
-
-async fn stage_signature_request(actor: &mut ExecutionActor) -> arena0_protocol::PendingId {
-    let accepted = actor
-        .dispatch_event(Event::React, DispatchSource::default())
-        .await
-        .expect("dispatch sign request");
-    assert_eq!(accepted, DispatchOutcome::Committed);
-    let state = actor.load_state().await.expect("load signing state");
-    let pending = state.status().pending().expect("pending sign");
-    assert_eq!(pending.operation, PendingOperation::Sign);
-    pending.id
 }
 
 fn message_state() -> arena0_program::SharedStateBytes {
@@ -818,6 +809,7 @@ async fn input_handler_trap_rejects_without_ending_session() {
         result,
         Err(SubmitInputError::Expected(crate::ExecError::InputRejected(reason)))
             if reason.starts_with("input handler trapped:")
+                && reason.len() <= arena0_program::MAX_REJECTION_REASON_BYTES
     ));
 
     let after = fixture
@@ -1150,182 +1142,69 @@ async fn stale_abort_is_rejected_across_restart_and_signed_proposal_still_commit
 }
 
 #[tokio::test]
-async fn crash_before_signature_application_is_recovered_inside_actor() {
-    let fixture = Fixture::with_mode(false, GuestMode::Sign).await;
-    let mut actor = fixture.prepare_active_actor().await;
-    fixture.commit_session_started(&mut actor).await;
-    let pending_id = stage_signature_request(&mut actor).await;
-    let leased = actor
-        .context
-        .store
-        .lease_next_outbox(super::now_ms())
-        .await
-        .expect("lease signature request")
-        .expect("signature request outbox");
-    assert_eq!(leased.item.payload_kind, OutboxPayloadKind::Effect);
-    let effect: Effect = borsh::from_slice(&leased.item.payload).expect("decode sign effect");
-    assert!(matches!(
-        effect,
-        Effect::Sign { ref data, .. } if data == b"sig"
-    ));
-    assert_eq!(
-        arena0_protocol::pending_id(EXEC_ID, leased.item.event_position, leased.item.ordinal),
-        pending_id
-    );
-    let lease_until = leased.lease_until_ms;
-    drop(actor);
-
-    let mut recovery_store = fixture
-        .store
-        .handle()
-        .claim_execution(EXEC_ID)
-        .expect("reclaim execution after crash");
-    recovery_store
-        .recover_expired_leases(lease_until)
-        .await
-        .expect("recover signature lease");
-    drop(recovery_store);
-
+async fn react_handler_signs_with_the_participant_identity_key() {
+    let fixture = Fixture::with_mode(false, GuestMode::LocalSign).await;
     let (messages, _observations) = mpsc::channel(8);
-    let mut restarted = fixture.actor_with_messages(messages);
-    restarted.recover().await.expect("recover signature outbox");
-    let state = restarted.load_state().await.expect("load resumed state");
-    assert!(state.status().pending().is_none());
-    assert_eq!(state.local_state().as_bytes(), &[9]);
-    assert!(
-        restarted
-            .context
-            .store
-            .lease_next_outbox(super::now_ms())
-            .await
-            .expect("check acknowledged signature request")
-            .is_none()
-    );
-}
-
-#[tokio::test]
-async fn crash_after_signature_application_is_idempotently_acknowledged() {
-    let fixture = Fixture::with_mode(false, GuestMode::Sign).await;
-    let mut actor = fixture.prepare_active_actor().await;
+    let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
     fixture.commit_session_started(&mut actor).await;
-    let pending_id = stage_signature_request(&mut actor).await;
-    let leased = actor
-        .context
-        .store
-        .lease_next_outbox(super::now_ms())
+    let position = actor
+        .load_state()
         .await
-        .expect("lease signature request")
-        .expect("signature request outbox");
-    let effect: Effect = borsh::from_slice(&leased.item.payload).expect("decode sign effect");
-    let Effect::Sign {
-        scheme,
-        data: payload,
-        ..
-    } = effect
-    else {
-        panic!("expected sign effect");
-    };
-    let guest_data = GuestSignData::new(
+        .expect("load pre-sign state")
+        .event_position();
+    assert_eq!(
+        actor
+            .dispatch_event(Event::React, DispatchSource::default())
+            .await
+            .expect("dispatch local sign"),
+        DispatchOutcome::Committed
+    );
+    let state = actor.load_state().await.expect("load signed state");
+    let (signed_bytes, signature): (Vec<u8>, Vec<u8>) =
+        borsh::from_slice(state.local_state().as_bytes()).expect("decode sign result");
+    let expected = GuestSignData::new(
         fixture.activation.session_hash(),
         Program::parse(fixture.wasm.clone())
             .expect("program")
             .hash(),
         EXEC_ID,
-        leased.item.event_position,
-        leased.item.ordinal,
-        scheme,
-        payload,
+        position,
+        0,
+        SignScheme::Ed25519,
+        b"sig".to_vec(),
     )
-    .expect("guest sign data");
-    assert_eq!(
-        arena0_protocol::pending_id(EXEC_ID, leased.item.event_position, leased.item.ordinal),
-        pending_id
-    );
+    .expect("guest sign data")
+    .signing_bytes()
+    .expect("signing bytes");
+    assert_eq!(signed_bytes, expected);
     assert!(
-        actor
-            .sign_and_resume(pending_id, &guest_data)
-            .await
-            .expect("apply signature before crash")
-    );
-    assert!(
-        actor
-            .load_state()
-            .await
-            .expect("load applied state")
-            .status()
-            .pending()
-            .is_none()
-    );
-    let lease_until = leased.lease_until_ms;
-    drop(actor);
-
-    let mut recovery_store = fixture
-        .store
-        .handle()
-        .claim_execution(EXEC_ID)
-        .expect("reclaim execution after crash");
-    recovery_store
-        .recover_expired_leases(lease_until)
-        .await
-        .expect("recover signature lease");
-    drop(recovery_store);
-
-    let (messages, _observations) = mpsc::channel(8);
-    let mut restarted = fixture.actor_with_messages(messages);
-    restarted
-        .recover()
-        .await
-        .expect("recover applied signature");
-    let state = restarted.load_state().await.expect("load resumed state");
-    assert!(state.status().pending().is_none());
-    assert!(
-        restarted
-            .context
-            .store
-            .lease_next_outbox(super::now_ms())
-            .await
-            .expect("check acknowledged signature request")
-            .is_none()
+        arena0_crypto::verify(
+            SignScheme::Ed25519,
+            &fixture.local_keys.ed25519_public_key().0,
+            &signed_bytes,
+            &signature,
+        )
+        .expect("verify")
     );
 }
 
 #[tokio::test]
-async fn progress_consumes_sign_and_signs_followup_proposal_without_another_tick() {
-    let fixture = Fixture::with_mode(false, GuestMode::SignThenBroadcast).await;
+async fn message_handler_cannot_sign() {
+    let fixture = Fixture::with_mode(false, GuestMode::SignOnMessage).await;
     let (messages, _observations) = mpsc::channel(8);
     let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
     fixture.commit_session_started(&mut actor).await;
-    let _pending_id = stage_signature_request(&mut actor).await;
-
-    // One progress pass must drain the durable Sign effect, dispatch Signed,
-    // stage the shared result emitted by that continuation, and add this
-    // participant's step signature. A second ticker iteration would hide a
-    // missing Sign trampoline.
-    actor
-        .progress()
+    let state = actor.load_state().await.expect("load active state");
+    let source = fixture.local_keys.peer_id();
+    let sequence = state.agreed_step();
+    let frame = message_frame(&state, source, sequence, vec![4, 5, 6]);
+    let error = actor
+        .apply_message(source, frame, None)
         .await
-        .expect("progress signed continuation");
-
-    let state = actor.load_state().await.expect("load follow-up proposal");
-    let proposal = state
-        .pending_shared()
-        .expect("signed continuation stages a proposal");
-    assert!(matches!(
-        proposal.entry().event,
-        Event::MessageReceived { ref msg, .. } if msg == b"broadcast"
-    ));
-    assert_eq!(proposal.signature_count(), 1);
-    assert!(proposal.status().pending().is_none());
-    let requests = actor
-        .context
-        .store
-        .pending_requests()
-        .await
-        .expect("inspect consumed sign request");
+        .expect_err("a message handler must not reach the signer");
     assert!(
-        requests.is_empty(),
-        "consumed sign request remained observable: {requests:?}; status={:?}",
-        state.status()
+        matches!(error, crate::context::ExecError::Unavailable(_)),
+        "{error:?}"
     );
 }
 
@@ -1655,15 +1534,9 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
         GuestMode::Callout | GuestMode::CalloutFault | GuestMode::CalloutReject => {
             vec![Capability::Input]
         }
-        GuestMode::Sign => vec![Capability::Sign {
+        GuestMode::LocalSign | GuestMode::SignOnMessage => vec![Capability::Sign {
             schemes: vec![SignScheme::Ed25519],
         }],
-        GuestMode::SignThenBroadcast => vec![
-            Capability::Sign {
-                schemes: vec![SignScheme::Ed25519],
-            },
-            Capability::Messaging,
-        ],
         GuestMode::Broadcast => vec![Capability::Messaging],
     };
     let callouts = match mode {
@@ -1709,14 +1582,9 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
             r#"(import "arena0" "request_input"
             (func $request_input (param i32 i32 i32 i32 i32)))"#
         }
-        GuestMode::Sign => {
+        GuestMode::LocalSign | GuestMode::SignOnMessage => {
             r#"(import "arena0" "sign"
-            (func $sign (param i32 i32 i32 i32 i32)))"#
-        }
-        GuestMode::SignThenBroadcast => {
-            r#"(import "arena0" "sign"
-            (func $sign (param i32 i32 i32 i32 i32)))
-            (import "arena0" "broadcast" (func $broadcast (param i32 i32)))"#
+            (func $sign (param i32 i32 i32 i32 i32) (result i32)))"#
         }
         GuestMode::Broadcast => {
             r#"(import "arena0" "broadcast" (func $broadcast (param i32 i32)))"#
@@ -1763,18 +1631,21 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
               call $request_input
             "#
         }
-        GuestMode::Sign | GuestMode::SignThenBroadcast => {
+        GuestMode::LocalSign => {
             r#"
               i32.const 1
               i32.const 1040
               i32.const 1
               call $state_write
+              i32.const 1
+              i32.const 2000
               i32.const 0
               i32.const 1050
               i32.const 3
-              i32.const 1070
-              i32.const 5
+              i32.const 2000
+              i32.const 512
               call $sign
+              call $state_write
             "#
         }
         GuestMode::Broadcast => {
@@ -1788,7 +1659,7 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
               call $broadcast
             "#
         }
-        GuestMode::EndOnMessage => "",
+        GuestMode::EndOnMessage | GuestMode::SignOnMessage => "",
     };
     let session_started_body = "";
     let input_fault_body = match mode {
@@ -1840,6 +1711,21 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
               call $end_session
             "#
         }
+        GuestMode::SignOnMessage => {
+            r#"
+              i32.const 0
+              i32.const 1024
+              i32.const 1
+              call $state_write
+              i32.const 0
+              i32.const 1050
+              i32.const 3
+              i32.const 2000
+              i32.const 512
+              call $sign
+              drop
+            "#
+        }
         _ => {
             r#"
               i32.const 0
@@ -1852,20 +1738,6 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
               call $state_write
             "#
         }
-    };
-    let signed_body = match mode {
-        GuestMode::SignThenBroadcast => {
-            r#"
-              i32.const 0
-              i32.const 1040
-              i32.const 1
-              call $state_write
-              i32.const 1110
-              i32.const 9
-              call $broadcast
-            "#
-        }
-        _ => "",
     };
     let timer_body = match mode {
         GuestMode::Timer => {
@@ -1958,27 +1830,19 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
               if
                 {message_body}
               else
-               local.get $event_ptr
-               i32.load8_u
-               i32.const 4
-               i32.eq
-               if
-                 {signed_body}
+                local.get $event_ptr
+                i32.load8_u
+                i32.const 2
+                i32.eq
+                if
+                  {input_fault_body}
                 else
                   local.get $event_ptr
                   i32.load8_u
-                  i32.const 2
+                  i32.const 4
                   i32.eq
                   if
-                    {input_fault_body}
-                  else
-                     local.get $event_ptr
-                     i32.load8_u
-                     i32.const 5
-                     i32.eq
-                     if
-                       {react_body}
-                    end
+                    {react_body}
                   end
                 end
               end
@@ -2009,7 +1873,6 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
         metadata_len = metadata.len(),
         react_body = react_body,
         session_started_body = session_started_body,
-        signed_body = signed_body,
         input_fault_body = input_fault_body,
         message_body = message_body,
         timer_body = timer_body,

@@ -297,7 +297,6 @@ pub enum EventKind {
     MessageReceived,
     InputReceived,
     TimerFired,
-    Signed,
     React,
 }
 
@@ -319,7 +318,6 @@ pub enum EffectKind {
     Broadcast,
     Callout,
     SetTimer,
-    Sign,
     Fail,
 }
 
@@ -443,7 +441,7 @@ impl ExecStatusState {
     }
 }
 
-/// The blocking return of `exec.next`. Signing continuations stay inside the
+/// The blocking return of `exec.next`. Guest signing stays inside the
 /// execution actor, which owns the custodied key.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum NextEvent {

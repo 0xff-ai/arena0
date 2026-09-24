@@ -709,7 +709,7 @@ pub(crate) fn validate_pending_record(pending: &PendingRecord) -> Result<(), Pro
         return Err(ProtocolError::InvalidPendingContinuation);
     }
     match pending.operation {
-        PendingOperation::Callout { .. } | PendingOperation::Sign => {}
+        PendingOperation::Callout { .. } => {}
     }
     Ok(())
 }
@@ -752,7 +752,7 @@ pub(crate) fn validate_effects(effects: &[(u32, Effect)]) -> Result<(), Protocol
     )?;
     let pending_count = effects
         .iter()
-        .filter(|(_, effect)| matches!(effect, Effect::Callout { .. } | Effect::Sign { .. }))
+        .filter(|(_, effect)| matches!(effect, Effect::Callout { .. }))
         .count();
     if pending_count > 1 {
         return Err(ProtocolError::InvalidPendingContinuation);
@@ -797,21 +797,6 @@ fn validate_effect(effect: &Effect) -> Result<(), ProtocolError> {
                 MAX_TERMINAL_REASON_BYTES,
             )?;
             ensure_payload("timer data", timer.data.len(), MAX_TIMER_PAYLOAD_BYTES)
-        }
-        Effect::Sign {
-            data,
-            expected_type,
-            ..
-        } => {
-            ensure_payload(
-                "signature payload",
-                data.len(),
-                super::MAX_EFFECT_PAYLOAD_BYTES,
-            )?;
-            if let Some(expected) = expected_type {
-                ensure_payload("expected type", expected.len(), MAX_TERMINAL_REASON_BYTES)?;
-            }
-            Ok(())
         }
     }
 }

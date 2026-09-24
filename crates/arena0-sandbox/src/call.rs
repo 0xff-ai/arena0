@@ -10,6 +10,9 @@ use arena0_program::{
 };
 use arena0_protocol::{Committed, Ensemble, Event, PeerId};
 use borsh::BorshSerialize;
+use std::sync::Arc;
+
+use crate::GuestSigner;
 
 /// Replay evidence supplied to a dispatch call.
 #[derive(Debug, Clone, Default)]
@@ -86,13 +89,36 @@ impl InitializeCall {
     }
 }
 
+/// Decoded inputs for one resident dispatch: the ABI envelope, optional replay
+/// evidence, the lifecycle the guest sees, and the per-dispatch signer.
+type DispatchParts = (
+    DispatchInput,
+    Option<RandomReplay>,
+    arena0_protocol::Lifecycle,
+    Option<Arc<dyn GuestSigner>>,
+);
+
 /// One event dispatched through the resident Wasm instance.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DispatchCall {
     pub(crate) peer_id: PeerId,
     pub(crate) session: Ensemble<Committed>,
     pub(crate) event: Event<Vec<u8>>,
     pub(crate) random_replay: Option<RandomReplay>,
+    pub(crate) signer: Option<Arc<dyn GuestSigner>>,
+}
+
+impl std::fmt::Debug for DispatchCall {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DispatchCall")
+            .field("peer_id", &self.peer_id)
+            .field("session", &self.session)
+            .field("event", &self.event)
+            .field("random_replay", &self.random_replay)
+            .field("signer", &self.signer.is_some())
+            .finish()
+    }
 }
 
 impl DispatchCall {
@@ -105,7 +131,18 @@ impl DispatchCall {
             session,
             event,
             random_replay: None,
+            signer: None,
         }
+    }
+
+    /// Install the signer exposed to this dispatch's synchronous `sign` calls.
+    ///
+    /// Only local handler events may carry a signer; a dispatch without one
+    /// traps when the guest calls `sign`.
+    #[must_use]
+    pub fn with_signer(mut self, signer: Arc<dyn GuestSigner>) -> Self {
+        self.signer = Some(signer);
+        self
     }
 
     /// Replay the recorded random draws for this dispatch.
@@ -115,21 +152,13 @@ impl DispatchCall {
         self
     }
 
-    pub(crate) fn into_input(
-        self,
-    ) -> Result<
-        (
-            DispatchInput,
-            Option<RandomReplay>,
-            arena0_protocol::Lifecycle,
-        ),
-        crate::SandboxError,
-    > {
+    pub(crate) fn into_input(self) -> Result<DispatchParts, crate::SandboxError> {
         let Self {
             peer_id,
             session,
             event,
             random_replay,
+            signer,
         } = self;
         let session_bytes = serialize(&session)?;
         let event_bytes = serialize(&event)?;
@@ -140,7 +169,7 @@ impl DispatchCall {
         } else {
             arena0_protocol::Lifecycle::Active
         };
-        Ok((input, random_replay, lifecycle))
+        Ok((input, random_replay, lifecycle, signer))
     }
 }
 

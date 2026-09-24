@@ -2837,72 +2837,6 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
         .await
         .expect("consume callout");
 
-    let state = store
-        .handle()
-        .load_execution(execution_id)
-        .await
-        .expect("load active after callout")
-        .expect("active state after callout");
-    writer
-        .commit_dispatch(
-            state.version(),
-            Event::React,
-            SharedStateBytes::try_new(vec![0]).expect("shared state"),
-            LocalStateBytes::try_new(vec![3]).expect("local state"),
-            vec![Effect::Sign {
-                scheme: arena0_crypto::SignScheme::Ed25519,
-                data: vec![5, 6],
-                expected_type: Some("bytes".into()),
-            }],
-            None,
-            None,
-            None,
-            None,
-            25,
-        )
-        .await
-        .expect("stage signing request");
-    let sign_effect_id = arena0_protocol::pending_id(execution_id, 2, 0);
-    let requests = store
-        .handle()
-        .list_pending_requests(execution_id)
-        .await
-        .expect("pending signing request");
-    assert!(matches!(
-        &requests[..],
-        [PendingRequest::Signature {
-            pending_id,
-            data,
-            ..
-        }] if *pending_id == sign_effect_id
-            && data.execution_id() == execution_id
-            && data.event_position() == 2
-            && data.effect_index() == 0
-            && data.payload() == [5, 6]
-    ));
-    let state = store
-        .handle()
-        .load_execution(execution_id)
-        .await
-        .expect("load signing state")
-        .expect("signing state");
-    writer
-        .commit_dispatch(
-            state.version(),
-            Event::Signed {
-                signature: vec![0xaa],
-            },
-            SharedStateBytes::try_new(vec![0]).expect("shared state"),
-            LocalStateBytes::try_new(vec![4]).expect("local state"),
-            Vec::new(),
-            None,
-            None,
-            None,
-            Some(sign_effect_id),
-            26,
-        )
-        .await
-        .expect("consume signing request");
     let final_state = store
         .handle()
         .load_execution(execution_id)
@@ -2910,7 +2844,7 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
         .expect("load final state")
         .expect("final state");
     assert_eq!(final_state.shared_state().as_bytes(), &[0]);
-    assert_eq!(final_state.local_state().as_bytes(), &[4]);
+    assert_eq!(final_state.local_state().as_bytes(), &[2]);
     drop(writer);
 
     let page = store
@@ -2918,9 +2852,9 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
         .read_event_summaries(execution_id, Some(0), 8)
         .await
         .expect("event inspection page");
-    assert_eq!(page.total(), 4);
+    assert_eq!(page.total(), 2);
     assert_eq!(page.next(), None);
-    assert_eq!(page.summaries().len(), 4);
+    assert_eq!(page.summaries().len(), 2);
     assert_eq!(page.summaries()[0].event_position, 0);
     assert_eq!(page.summaries()[0].agreed_steps, vec![0]);
     assert_eq!(page.summaries()[0].event, EventKind::SessionStarted);
@@ -2937,18 +2871,6 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
     assert_eq!(page.summaries()[1].event, EventKind::InputReceived);
     assert_eq!(page.summaries()[1].input_payload_bytes, Some(1));
     assert!(page.summaries()[1].effects.is_empty());
-    assert_eq!(page.summaries()[2].event_position, 2);
-    assert_eq!(page.summaries()[2].event, EventKind::React);
-    assert_eq!(
-        page.summaries()[2].effects[0],
-        EffectSummary {
-            kind: EffectKind::Sign,
-            payload_bytes: Some(2),
-        }
-    );
-    assert_eq!(page.summaries()[3].event_position, 3);
-    assert_eq!(page.summaries()[3].event, EventKind::Signed);
-    assert!(page.summaries()[3].effects.is_empty());
     assert!(
         store
             .handle()

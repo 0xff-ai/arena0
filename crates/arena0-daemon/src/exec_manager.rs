@@ -475,10 +475,7 @@ fn project_callout(
         callout_index,
         context,
         ..
-    } = request
-    else {
-        anyhow::bail!("signing request is daemon-internal")
-    };
+    } = request;
     let callout = schema
         .callouts
         .get(usize::try_from(callout_index).context("callout index overflow")?)

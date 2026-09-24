@@ -120,7 +120,7 @@ impl std::fmt::Display for PendingHarnessError {
 
 impl std::error::Error for PendingHarnessError {}
 
-/// Shared exact-once ledger for pending callout and signing continuations.
+/// Shared exact-once ledger for pending callout continuations.
 ///
 /// Native and Wasm harnesses differ in how they dispatch a result, but they
 /// must agree on stale ids, kind/index checks, rejected-input preservation,
@@ -221,16 +221,15 @@ impl PendingLedger {
             });
         }
 
-        if let (
+        let (
             PendingOperation::Callout {
                 callout_index: submitted,
             },
             PendingOperation::Callout {
                 callout_index: pending,
             },
-        ) = (operation, active.operation)
-            && submitted != pending
-        {
+        ) = (operation, active.operation);
+        if submitted != pending {
             return Err(PendingHarnessError::CalloutIndexMismatch {
                 submitted: Some(submitted),
                 pending: Some(pending),
@@ -468,14 +467,6 @@ impl HandlerResult {
             .any(|e| matches!(e, Effect::Callout { .. }))
     }
 
-    /// True if any effect is a `Sign`.
-    #[must_use]
-    pub fn has_sign(&self) -> bool {
-        self.effects
-            .iter()
-            .any(|e| matches!(e, Effect::Sign { .. }))
-    }
-
     /// True if any effect is a `SessionEnd`.
     #[must_use]
     pub fn has_session_end(&self) -> bool {
@@ -640,15 +631,6 @@ where
     where
         A: CalloutSpec<P>;
 
-    /// Resolve a generated signing continuation with an explicit pending id.
-    ///
-    /// Backend-specific for the same reason as [`resolve_callout_with_pending_id`](Self::resolve_callout_with_pending_id).
-    fn resolve_sign_with_pending_id(
-        &mut self,
-        pending_id: Option<PendingId>,
-        signature: Vec<u8>,
-    ) -> Result<HandlerResult, PendingHarnessError>;
-
     /// Resolve a generated typed callout by delivering its exact output type.
     fn resolve_callout<A>(&mut self, output: A::Output) -> HandlerResult
     where
@@ -668,20 +650,5 @@ where
     {
         let pending_id = self.active_pending().map(|pending| pending.id);
         self.resolve_callout_with_pending_id::<A>(pending_id, output)
-    }
-
-    /// Resolve a generated signing continuation by delivering raw signature bytes.
-    fn resolve_sign(&mut self, signature: Vec<u8>) -> HandlerResult {
-        self.try_resolve_sign(signature)
-            .expect("pending sign validation failed")
-    }
-
-    /// Resolve a generated signing continuation after validating the active pending id.
-    fn try_resolve_sign(
-        &mut self,
-        signature: Vec<u8>,
-    ) -> Result<HandlerResult, PendingHarnessError> {
-        let pending_id = self.active_pending().map(|pending| pending.id);
-        self.resolve_sign_with_pending_id(pending_id, signature)
     }
 }

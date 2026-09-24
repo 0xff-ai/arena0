@@ -44,7 +44,7 @@ pub use arena0_sdk_macros::{
 };
 pub use context::{
     CalloutBuilder, Context, Crypto, Effects, PrimitiveField, PrimitiveOutput, PrimitiveOutputs,
-    PrimitiveRoute, RawPrimitiveRoute, SignBuilder,
+    PrimitiveRoute, RawPrimitiveRoute, Signed,
 };
 #[doc(hidden)]
 pub use effects::{

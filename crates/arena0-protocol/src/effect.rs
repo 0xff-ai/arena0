@@ -8,8 +8,6 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::io;
 
-use arena0_crypto::SignScheme;
-
 use crate::TimerPayload;
 use crate::bounded::{
     read_bytes as read_bounded_bytes, read_option_string as read_bounded_option_string,
@@ -35,12 +33,6 @@ pub enum Effect {
     },
     /// Arm a one-shot timer with its payload.
     SetTimer { delay_ms: u64, timer: TimerPayload },
-    /// Request a host signature.
-    Sign {
-        scheme: SignScheme,
-        data: Vec<u8>,
-        expected_type: Option<String>,
-    },
     /// Terminate program execution immediately with an error.
     Fail { reason: String },
 }
@@ -50,8 +42,7 @@ const EFFECT_SESSION_ABORT: u8 = 1;
 const EFFECT_BROADCAST: u8 = 2;
 const EFFECT_CALLOUT: u8 = 3;
 const EFFECT_SET_TIMER: u8 = 4;
-const EFFECT_SIGN: u8 = 5;
-const EFFECT_FAIL: u8 = 6;
+const EFFECT_FAIL: u8 = 5;
 
 impl BorshSerialize for Effect {
     fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
@@ -108,26 +99,6 @@ impl BorshSerialize for Effect {
                 BorshSerialize::serialize(delay_ms, writer)?;
                 timer.serialize_bounded(writer)
             }
-            Self::Sign {
-                scheme,
-                data,
-                expected_type,
-            } => {
-                BorshSerialize::serialize(&EFFECT_SIGN, writer)?;
-                BorshSerialize::serialize(scheme, writer)?;
-                serialize_bounded_bytes(
-                    writer,
-                    data,
-                    crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
-                    "signature payload",
-                )?;
-                serialize_bounded_option_string(
-                    writer,
-                    expected_type.as_deref(),
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "expected type",
-                )
-            }
             Self::Fail { reason } => {
                 BorshSerialize::serialize(&EFFECT_FAIL, writer)?;
                 serialize_bounded_string(
@@ -181,19 +152,6 @@ impl BorshDeserialize for Effect {
             EFFECT_SET_TIMER => Ok(Self::SetTimer {
                 delay_ms: u64::deserialize_reader(reader)?,
                 timer: TimerPayload::deserialize_bounded(reader)?,
-            }),
-            EFFECT_SIGN => Ok(Self::Sign {
-                scheme: SignScheme::deserialize_reader(reader)?,
-                data: read_bounded_bytes(
-                    reader,
-                    crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
-                    "signature payload",
-                )?,
-                expected_type: read_bounded_option_string(
-                    reader,
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "expected type",
-                )?,
             }),
             EFFECT_FAIL => Ok(Self::Fail {
                 reason: read_bounded_string(
@@ -275,11 +233,6 @@ mod tests {
             Effect::SetTimer {
                 delay_ms: 1000,
                 timer: TimerPayload::unit(),
-            },
-            Effect::Sign {
-                scheme: SignScheme::Ed25519,
-                data: vec![30, 40],
-                expected_type: Some("Signature".into()),
             },
             Effect::Fail {
                 reason: "failed".into(),

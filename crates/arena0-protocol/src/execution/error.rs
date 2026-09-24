@@ -143,7 +143,7 @@ pub enum ProtocolError {
     /// The Borsh outcome differs from SessionEnd's bytes.
     #[error("terminal outcome Borsh bytes do not match the SessionEnd effect")]
     OutcomeProjectionMismatch,
-    /// A local answer or signature did not identify the stored continuation.
+    /// A local answer did not identify the stored continuation.
     #[error("continuation does not match the pending continuation")]
     PendingContinuationMismatch,
     /// A continuation effect is malformed.

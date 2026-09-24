@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arena0_crypto::{BlsSignature, ExecutionSalt};
 use arena0_program::{JsonBytes, ProgramHash};
 use arena0_protocol::execution::{
-    ExecutionState, ExecutionStatus, ExecutionVersion, GuestSignData, ParticipantStepSignature,
+    ExecutionState, ExecutionStatus, ExecutionVersion, ParticipantStepSignature,
     ParticipantTerminalSignature, ReceiptArtifact, ReceiptId, TimerId,
 };
 use arena0_protocol::trace::PendingRecord;
@@ -668,7 +668,6 @@ pub enum EventKind {
     MessageReceived,
     InputReceived,
     TimerFired,
-    Signed,
     React,
 }
 
@@ -688,7 +687,6 @@ pub enum EffectKind {
     Broadcast,
     Callout,
     SetTimer,
-    Sign,
     Fail,
 }
 
@@ -773,7 +771,6 @@ impl EventRecordSummary {
             Event::MessageReceived { msg, .. } => (EventKind::MessageReceived, Some(msg.len())),
             Event::InputReceived { data, .. } => (EventKind::InputReceived, Some(data.len())),
             Event::TimerFired { timer } => (EventKind::TimerFired, Some(timer.data.len())),
-            Event::Signed { signature, .. } => (EventKind::Signed, Some(signature.len())),
             Event::React => (EventKind::React, None),
         };
         let effects = effects
@@ -798,10 +795,6 @@ impl EventRecordSummary {
                 Effect::SetTimer { timer, .. } => EffectSummary {
                     kind: EffectKind::SetTimer,
                     payload_bytes: Some(timer.data.len()),
-                },
-                Effect::Sign { data, .. } => EffectSummary {
-                    kind: EffectKind::Sign,
-                    payload_bytes: Some(data.len()),
                 },
                 Effect::Fail { reason } => EffectSummary {
                     kind: EffectKind::Fail,
@@ -1180,8 +1173,8 @@ impl StoredReceipt {
 ///
 /// Outbox rows are retained after acknowledgement, so the store can recover
 /// a request whose message was delivered immediately before a process crash.
-/// The projection includes the original callout context or the exact guest
-/// signing preimage; no daemon-side copy is needed.
+/// The projection includes the original callout context; no daemon-side copy is
+/// needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingRequest {
     /// A typed JSON callout waiting for its agent answer.
@@ -1199,17 +1192,6 @@ pub enum PendingRequest {
         /// Generated expected result type, when available.
         expected_type: Option<String>,
     },
-    /// A guest-produced signing request waiting for its signature.
-    Signature {
-        /// Durable outbox identity carrying the original request.
-        outbox_id: OutboxId,
-        /// Current delivery state of that outbox row.
-        status: OutboxStatus,
-        /// Pending continuation identity.
-        pending_id: PendingId,
-        /// Exact guest-selected signing preimage.
-        data: GuestSignData,
-    },
 }
 
 impl PendingRequest {
@@ -1217,7 +1199,7 @@ impl PendingRequest {
     #[must_use]
     pub const fn outbox_id(&self) -> OutboxId {
         match self {
-            Self::Callout { outbox_id, .. } | Self::Signature { outbox_id, .. } => *outbox_id,
+            Self::Callout { outbox_id, .. } => *outbox_id,
         }
     }
 
@@ -1225,7 +1207,7 @@ impl PendingRequest {
     #[must_use]
     pub const fn status(&self) -> OutboxStatus {
         match self {
-            Self::Callout { status, .. } | Self::Signature { status, .. } => *status,
+            Self::Callout { status, .. } => *status,
         }
     }
 
@@ -1233,7 +1215,7 @@ impl PendingRequest {
     #[must_use]
     pub const fn pending_id(&self) -> PendingId {
         match self {
-            Self::Callout { pending_id, .. } | Self::Signature { pending_id, .. } => *pending_id,
+            Self::Callout { pending_id, .. } => *pending_id,
         }
     }
 }

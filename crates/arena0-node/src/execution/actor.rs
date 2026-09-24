@@ -25,8 +25,6 @@ use super::{
     COMMAND_CAPACITY, ExecutionActor, PROGRESS_INTERVAL, STREAM_CAPACITY, callout_requested, now_ms,
 };
 
-const MAX_PROGRESS_PASSES: usize = 64;
-
 /// Spawn one actor and one concurrent reader supervisor.
 #[must_use]
 pub(crate) fn spawn_execution(context: ActorContext, host: Arc<Host>) -> SpawnedExec {
@@ -255,9 +253,7 @@ impl ExecutionActor {
         // before the actor crashed, leaving the durable continuation waiting
         // for an answer while its outbox row is no longer pending. Capture
         // that projection before the normal outbox drain; rows that are still
-        // pending/leased will be delivered by the drain itself. Signature
-        // requests never cross this boundary: the actor signs and resumes
-        // them as one leased outbox operation.
+        // pending/leased will be delivered by the drain itself.
         let replay_requests = self
             .context
             .store
@@ -288,24 +284,22 @@ impl ExecutionActor {
         requests: &[PendingRequest],
     ) -> Result<(), ExecError> {
         for request in requests {
-            if let PendingRequest::Callout {
+            let PendingRequest::Callout {
                 pending_id,
                 callout_index,
                 context,
                 expected_type,
                 ..
-            } = request
-            {
-                self.messages
-                    .send(callout_requested(
-                        *pending_id,
-                        *callout_index,
-                        context.clone(),
-                        expected_type.clone(),
-                    ))
-                    .await
-                    .map_err(|_| ExecError::Unavailable("message receiver closed".into()))?;
-            }
+            } = request;
+            self.messages
+                .send(callout_requested(
+                    *pending_id,
+                    *callout_index,
+                    context.clone(),
+                    expected_type.clone(),
+                ))
+                .await
+                .map_err(|_| ExecError::Unavailable("message receiver closed".into()))?;
         }
         Ok(())
     }
@@ -405,54 +399,41 @@ impl ExecutionActor {
     }
 
     pub(super) async fn progress(&mut self) -> Result<(), ExecError> {
-        'progress: for _ in 0..MAX_PROGRESS_PASSES {
-            let mut drove_events = false;
-            let state = loop {
-                let state = self.load_state().await?;
-                match state.status().receipt_work() {
-                    ReceiptWork::NotTerminal | ReceiptWork::CollectSignatures if drove_events => {
-                        break state;
-                    }
-                    ReceiptWork::NotTerminal | ReceiptWork::CollectSignatures => {
-                        self.ensure_session_started().await?;
-                        self.resolve_pending_inbox().await?;
-                        self.fire_due_timers().await?;
-                        drove_events = true;
-                    }
-                    ReceiptWork::Incomplete => return Ok(()),
-                    ReceiptWork::Assemble | ReceiptWork::Published => {
-                        if !self.progress_terminal_boundary().await? {
-                            return Ok(());
-                        }
-                        continue 'progress;
-                    }
+        let mut drove_events = false;
+        let state = loop {
+            let state = self.load_state().await?;
+            match state.status().receipt_work() {
+                ReceiptWork::NotTerminal | ReceiptWork::CollectSignatures if drove_events => {
+                    break state;
                 }
-            };
-            if state.pending_shared().is_some() {
-                self.ensure_step_signature().await?;
-            } else if state.terminal_pending() {
-                self.ensure_terminal_signature().await?;
-            } else if state.status().lifecycle() == ExecLifecycle::Active
-                && state.status().pending().is_none()
-                && state.agreed_step() > 0
-                && state.last_reacted_step() != Some(state.agreed_step() - 1)
-            {
-                self.dispatch_event(
-                    arena0_protocol::Event::React,
-                    super::guest::DispatchSource::default(),
-                )
-                .await?;
+                ReceiptWork::NotTerminal | ReceiptWork::CollectSignatures => {
+                    self.ensure_session_started().await?;
+                    self.resolve_pending_inbox().await?;
+                    self.fire_due_timers().await?;
+                    drove_events = true;
+                }
+                ReceiptWork::Incomplete => return Ok(()),
+                ReceiptWork::Assemble | ReceiptWork::Published => {
+                    return self.progress_terminal_boundary().await;
+                }
             }
-            let summary = self.drain_outbox_report().await?;
-            if !summary.sign_consumed {
-                return Ok(());
-            }
+        };
+        if state.pending_shared().is_some() {
+            self.ensure_step_signature().await?;
+        } else if state.terminal_pending() {
+            self.ensure_terminal_signature().await?;
+        } else if state.status().lifecycle() == ExecLifecycle::Active
+            && state.status().pending().is_none()
+            && state.agreed_step() > 0
+            && state.last_reacted_step() != Some(state.agreed_step() - 1)
+        {
+            self.dispatch_event(
+                arena0_protocol::Event::React,
+                super::guest::DispatchSource::default(),
+            )
+            .await?;
         }
-        tracing::debug!(
-            exec_id = %self.context.exec_id,
-            passes = MAX_PROGRESS_PASSES,
-            "progress trampoline yielded after bounded Sign continuations"
-        );
+        self.drain_outbox_report().await?;
         Ok(())
     }
 
@@ -460,14 +441,13 @@ impl ExecutionActor {
     /// publication. Protocol frames remain durable obligations after a receipt
     /// is published: an in-flight send is leased and a delayed retry is still
     /// pending, so either must settle before this actor reports completion.
-    pub(super) async fn progress_terminal_boundary(&mut self) -> Result<bool, ExecError> {
+    pub(super) async fn progress_terminal_boundary(&mut self) -> Result<(), ExecError> {
         super::terminal::finalize_receipt(&mut self.context.store).await?;
-        let summary = self.drain_outbox_report().await?;
+        self.drain_outbox_report().await?;
         if self.context.store.has_unsettled_frames().await? {
-            return Ok(false);
+            return Ok(());
         }
-        self.emit_published_terminal().await?;
-        Ok(summary.sign_consumed)
+        self.emit_published_terminal().await
     }
 
     pub(super) async fn load_state(&self) -> Result<ExecutionState, ExecError> {

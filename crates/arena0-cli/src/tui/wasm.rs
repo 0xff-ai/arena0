@@ -422,7 +422,6 @@ pub(super) fn event_name(kind: EventKind) -> &'static str {
         EventKind::MessageReceived => "message received",
         EventKind::InputReceived => "input received",
         EventKind::TimerFired => "timer fired",
-        EventKind::Signed => "signed",
         EventKind::React => "react",
     }
 }
@@ -434,7 +433,6 @@ fn effect_label(effect: &arena0_client::api::EffectSummary) -> String {
         EffectKind::Broadcast => "broadcast",
         EffectKind::Callout => "callout",
         EffectKind::SetTimer => "set timer",
-        EffectKind::Sign => "sign",
         EffectKind::Fail => "fail",
     };
     effect

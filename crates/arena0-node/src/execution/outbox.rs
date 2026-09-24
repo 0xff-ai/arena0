@@ -10,9 +10,8 @@
 use std::time::Instant;
 
 use crate::context::ExecError;
-use arena0_protocol::execution::GuestSignData;
 use arena0_protocol::{Effect, ExecFrame, PendingOperation, ReceiptWork};
-use arena0_store::{OutboxItem, OutboxPayloadKind};
+use arena0_store::OutboxPayloadKind;
 use arena0_transport::TransportError;
 
 use super::{ExecutionActor, InflightSend, callout_requested, now_ms};
@@ -23,7 +22,6 @@ const PERFORMANCE_TARGET: &str = "arena0::performance";
 pub(super) struct OutboxDrainSummary {
     count: usize,
     result_class: &'static str,
-    pub(super) sign_consumed: bool,
 }
 
 /// A leased delivery can fail without invalidating the execution. Transport
@@ -88,17 +86,12 @@ fn classify_transport_error(error: TransportError) -> OutboxDeliveryError {
 }
 
 impl ExecutionActor {
-    /// Drain durable work and report whether a guest Sign continuation was
-    /// consumed. The actor progress loop uses that bit to immediately revisit
-    /// the state machine: a Signed dispatch can expose a proposal or another
-    /// effect, but re-entering `progress` from Sign delivery would make an
-    /// infinitely-sized async future.
+    /// Drain durable work for this actor.
     pub(super) async fn drain_outbox_report(&mut self) -> Result<OutboxDrainSummary, ExecError> {
         if self.inflight_send.is_some() {
             return Ok(OutboxDrainSummary {
                 count: 0,
                 result_class: "send_inflight",
-                sign_consumed: false,
             });
         }
         let started =
@@ -121,13 +114,11 @@ impl ExecutionActor {
 
     async fn drain_outbox_inner(&mut self) -> Result<OutboxDrainSummary, ExecError> {
         let mut count = 0;
-        let mut sign_consumed = false;
         loop {
             let Some(leased) = self.context.store.lease_next_outbox(now_ms()).await? else {
                 return Ok(OutboxDrainSummary {
                     count,
                     result_class: if count == 0 { "empty" } else { "drained" },
-                    sign_consumed,
                 });
             };
             count = count.saturating_add(1);
@@ -151,7 +142,6 @@ impl ExecutionActor {
                             return Ok(OutboxDrainSummary {
                                 count,
                                 result_class: "send_started",
-                                sign_consumed,
                             });
                         }
                         Err(error) => Err(error),
@@ -159,13 +149,12 @@ impl ExecutionActor {
                 }
                 OutboxPayloadKind::Effect => {
                     let effect = decode_effect(&item.payload)?;
-                    self.deliver_effect(&effect, &item).await
+                    self.deliver_effect(&effect).await
                 }
             };
 
             match result {
-                Ok(effect_consumed_sign) => {
-                    sign_consumed |= effect_consumed_sign;
+                Ok(()) => {
                     self.context
                         .store
                         .acknowledge_outbox(item.outbox_id, leased.lease_id)
@@ -181,7 +170,6 @@ impl ExecutionActor {
                         return Ok(OutboxDrainSummary {
                             count,
                             result_class: "retry_scheduled",
-                            sign_consumed,
                         });
                     }
                     return Err(error.into_runtime());
@@ -255,18 +243,14 @@ impl ExecutionActor {
         }
     }
 
-    async fn deliver_effect(
-        &mut self,
-        effect: &Effect,
-        item: &OutboxItem,
-    ) -> Result<bool, OutboxDeliveryError> {
-        if matches!(effect, Effect::Callout { .. } | Effect::Sign { .. }) {
+    async fn deliver_effect(&mut self, effect: &Effect) -> Result<(), OutboxDeliveryError> {
+        if matches!(effect, Effect::Callout { .. }) {
             let state = self.load_state().await?;
             if !matches!(state.status().receipt_work(), ReceiptWork::NotTerminal) {
                 // Every terminal boundary supersedes an older guest
                 // continuation. This includes successful terminal-proof
                 // collection, not only an authenticated stop.
-                return Ok(false);
+                return Ok(());
             }
         }
         match effect {
@@ -304,33 +288,7 @@ impl ExecutionActor {
                     ))
                     .await
                     .map_err(|_| ExecError::Unavailable("message receiver closed".into()))?;
-                Ok(false)
-            }
-            Effect::Sign { scheme, data, .. } => {
-                let pending_id = arena0_protocol::pending_id(
-                    self.context.exec_id,
-                    item.event_position,
-                    item.ordinal,
-                );
-                let data = GuestSignData::new(
-                    self.context.activation.session_hash(),
-                    self.context.program.program().hash(),
-                    self.context.exec_id,
-                    item.event_position,
-                    item.ordinal,
-                    *scheme,
-                    data.clone(),
-                )?;
-                if !self.sign_and_resume(pending_id, &data).await? {
-                    // A signing request is acknowledged only after its
-                    // exact continuation was consumed. A frozen proposal or
-                    // a guest rejection leaves the same outbox row pending for
-                    // another delivery attempt.
-                    return Err(OutboxDeliveryError::Retryable(ExecError::Unavailable(
-                        "signature continuation was not consumed".into(),
-                    )));
-                }
-                Ok(true)
+                Ok(())
             }
             _ => Err(ExecError::InvalidState(
                 "non-deliverable effect reached the durable effect outbox".into(),

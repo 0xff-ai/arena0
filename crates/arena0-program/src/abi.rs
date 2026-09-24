@@ -21,6 +21,11 @@ pub const MAX_CALL_PAYLOAD_BYTES: usize = crate::profile::MAX_INPUT_BYTES as usi
 pub const MAX_SESSION_CONTEXT_BYTES: usize = 1024 * 1024;
 /// Maximum UTF-8 bytes returned as the reason for a rejected input dispatch.
 pub const MAX_REJECTION_REASON_BYTES: usize = 1024;
+/// Host bytes a synchronous `sign` call adds around the guest payload: the
+/// `GuestSignData` header, the two `Vec<u8>` length prefixes of the returned
+/// `(signed_bytes, signature)` pair, and a 64-byte Ed25519 signature. A guest
+/// allocates `payload.len() + SIGN_RESULT_OVERHEAD_BYTES` for the result.
+pub const SIGN_RESULT_OVERHEAD_BYTES: usize = 256;
 
 /// Bounded, complete JSON bytes at an agent-facing request or projection boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -898,7 +903,7 @@ pub mod imports {
     pub const REQUEST_INPUT: &str = "request_input";
     /// Start a one-shot timer with a typed payload.
     pub const SET_TIMER: &str = "set_timer";
-    /// Sign data with the node's key.
+    /// Sign one guest payload with the node's key.
     pub const SIGN: &str = "sign";
     /// End the current session successfully.
     pub const END_SESSION: &str = "end_session";
@@ -993,6 +998,17 @@ mod tests {
                 assert!(all_effects.contains(import));
             }
         }
+    }
+
+    #[test]
+    fn sign_result_overhead_covers_the_preimage_header_and_signature() {
+        // GuestSignData header: domain, version, session, program, execution,
+        // event position, call index, scheme, and payload length prefix.
+        let header = 24 + 2 + 32 + 32 + 32 + 8 + 4 + 1 + 4;
+        // Returned `(signed_bytes, signature)`: two length prefixes and a
+        // 64-byte Ed25519 signature.
+        let envelope = 4 + 4 + 64;
+        assert!(SIGN_RESULT_OVERHEAD_BYTES >= header + envelope);
     }
 
     #[test]

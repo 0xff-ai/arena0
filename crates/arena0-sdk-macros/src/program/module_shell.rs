@@ -325,17 +325,6 @@ fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
             }
         });
     }
-    if module_has_fn(items, "__arena0_on_signed") {
-        methods.push(quote! {
-            #[doc(hidden)]
-            fn __arena0_on_signed(
-                ctx: &mut ::arena0::Context<Self::Shared, Self::Local>,
-                signature: ::std::vec::Vec<u8>,
-            ) -> Result<::arena0::ProgramTransition<Self>, ::arena0::ProgramFault> {
-                self::__arena0_on_signed(ctx, signature)
-            }
-        });
-    }
     if let Some(timer_ty) = module_typed_timer_arg(items) {
         methods.push(quote! {
             fn on_timer(

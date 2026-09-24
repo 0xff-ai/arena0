@@ -29,7 +29,7 @@ unsafe extern "C" {
         expected_len: u32,
     );
     fn set_timer(delay_ms: u64, type_ptr: u32, type_len: u32, data_ptr: u32, data_len: u32);
-    fn sign(scheme: u32, data_ptr: u32, data_len: u32, expected_ptr: u32, expected_len: u32);
+    fn sign(scheme: u32, data_ptr: u32, data_len: u32, out_ptr: u32, out_cap: u32) -> u32;
     fn end_session(result_ptr: u32, result_len: u32);
     fn abort_session(reason_ptr: u32, reason_len: u32);
     fn state_len(kind: u32) -> u32;
@@ -166,23 +166,49 @@ pub(crate) fn host_set_timer_spec(spec: &TimerSpec) {
     });
 }
 
-pub(crate) fn host_sign(scheme: SignScheme, data: &[u8], expected_type: Option<&str>) {
+pub(crate) fn host_guest_sign(scheme: SignScheme, payload: &[u8]) -> (Vec<u8>, Vec<u8>) {
     #[cfg(target_arch = "wasm32")]
     unsafe {
-        sign(
+        let capacity = payload
+            .len()
+            .saturating_add(arena0_program::SIGN_RESULT_OVERHEAD_BYTES);
+        let out = crate::io_alloc::io_alloc(capacity);
+        assert!(!out.is_null(), "guest sign buffer allocation failed");
+        // The host writes a Borsh `(signed_bytes, signature)` pair and returns
+        // its length; a missing signer traps before any bytes are written.
+        let written = sign(
             sign_scheme_tag(scheme),
-            data.as_ptr() as u32,
-            data.len() as u32,
-            expected_type.map_or(0, |value| value.as_ptr() as u32),
-            expected_type.map_or(0, str::len) as u32,
-        );
+            payload.as_ptr() as u32,
+            payload.len() as u32,
+            out as u32,
+            capacity as u32,
+        ) as usize;
+        debug_assert!(written <= capacity);
+        let bytes = core::slice::from_raw_parts(out, written).to_vec();
+        crate::io_alloc::io_dealloc(out, capacity);
+        borsh::from_slice(&bytes).expect("host sign result decode failed")
     }
     #[cfg(not(target_arch = "wasm32"))]
-    crate::testing::push_effect(arena0_protocol::Effect::Sign {
-        scheme,
-        data: data.to_vec(),
-        expected_type: expected_type.map(str::to_string),
-    });
+    {
+        fake_sign(scheme, payload)
+    }
+}
+
+/// Deterministic stand-in for the host signer in native builds. The harness
+/// cannot reach a real key, so it returns the payload unchanged with a
+/// deterministic 64-byte signature over it.
+#[cfg(not(target_arch = "wasm32"))]
+fn fake_sign(scheme: SignScheme, payload: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let _ = scheme;
+    let first = blake3::hash(payload);
+    let mut second_input = Vec::with_capacity(1 + payload.len());
+    second_input.push(0);
+    second_input.extend_from_slice(payload);
+    let second = blake3::hash(&second_input);
+    let mut signature = Vec::with_capacity(64);
+    signature.extend_from_slice(first.as_bytes());
+    signature.extend_from_slice(second.as_bytes());
+    (payload.to_vec(), signature)
 }
 
 pub(crate) fn host_end_session(outcome: &[u8]) {

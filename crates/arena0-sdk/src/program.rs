@@ -139,13 +139,6 @@ pub trait Program: Sized {
     ) -> anyhow::Result<ProgramTransition<Self>> {
         Ok(Transition::Stay)
     }
-    #[doc(hidden)]
-    fn __arena0_on_signed(
-        _ctx: &mut Context<Self::Shared, Self::Local>,
-        _signature: Vec<u8>,
-    ) -> Result<ProgramTransition<Self>, ProgramFault> {
-        Ok(Transition::Stay)
-    }
 
     fn on_timer(
         _ctx: &mut Context<Self::Shared, Self::Local>,

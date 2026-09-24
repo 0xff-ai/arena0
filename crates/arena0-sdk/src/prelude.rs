@@ -10,7 +10,7 @@ pub mod prelude {
         PrimitiveOutput, PrimitiveOutputs, PrimitiveRoute, PrimitiveRouteSchema, Program,
         ProgramDefinition, ProgramFault, ProgramMetadata, ProgramQuery, ProgramSchema,
         ProgramValue, ProgramView, ProtocolFault, QuerySchema, RawPrimitiveRoute, SharedState,
-        SignBuilder, SignScheme, StateHash, StateSchema, TimerPayload, TimerSchedule, TimerSpec,
+        SignScheme, Signed, StateHash, StateSchema, TimerPayload, TimerSchedule, TimerSpec,
         TraceEntry, Transition, View, Viewport, timer_payload,
     };
     pub use anyhow::{anyhow, bail, ensure};

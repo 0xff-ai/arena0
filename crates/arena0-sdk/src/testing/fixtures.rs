@@ -94,11 +94,6 @@ fn pending_from_effects(id: PendingId, effects: &[Effect]) -> Option<PendingReco
             },
             expected_type: expected_type.clone(),
         }),
-        Effect::Sign { expected_type, .. } => Some(PendingRecord {
-            id,
-            operation: arena0_protocol::PendingOperation::Sign,
-            expected_type: expected_type.clone().or_else(|| Some("Vec<u8>".into())),
-        }),
         _ => None,
     })
 }
@@ -341,9 +336,7 @@ impl<P: Program> TestHarness<P> {
     {
         let previous_pending = self.pending.active().cloned();
         let pending_close = match &event {
-            Event::InputReceived { .. } | Event::Signed { .. } => {
-                Some(ClosedPendingReason::Resolved)
-            }
+            Event::InputReceived { .. } => Some(ClosedPendingReason::Resolved),
             _ => None,
         };
         let pre_snapshot = shared_snapshot(&self.shared);
@@ -686,15 +679,6 @@ impl<P: Program> TestHarness<P> {
                 ),
                 None,
             ),
-            Event::Signed { signature } => {
-                let result = self.run_program(
-                    Event::Signed {
-                        signature: signature.clone(),
-                    },
-                    |ctx| P::__arena0_on_signed(ctx, signature),
-                );
-                (result, None)
-            }
             Event::React => (self.react(), None),
         })
     }
@@ -839,24 +823,6 @@ where
                 data,
             },
             |ctx| P::on_input(ctx, input),
-        ))
-    }
-
-    /// Resolve a generated signing continuation with an explicit pending id.
-    ///
-    /// Re-dispatches through the program's native signed-continuation handler.
-    fn resolve_sign_with_pending_id(
-        &mut self,
-        pending_id: Option<PendingId>,
-        signature: Vec<u8>,
-    ) -> Result<HandlerResult, PendingHarnessError> {
-        self.pending
-            .validate(pending_id, arena0_protocol::PendingOperation::Sign)?;
-        Ok(self.run_program(
-            Event::Signed {
-                signature: signature.clone(),
-            },
-            |ctx| P::__arena0_on_signed(ctx, signature),
         ))
     }
 }

@@ -311,22 +311,6 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                         }
                     }
                 }
-                ::arena0::Event::Signed {
-                    signature,
-                } => {
-                    match <#program_ty as ::arena0::Program>::__arena0_on_signed(
-                        &mut ctx,
-                        signature,
-                    ) {
-                        Ok(transition) => {
-                            ctx.__apply_transition::<#program_ty>(transition);
-                            (::arena0::CallStatus::Accepted, None)
-                        }
-                        Err(::arena0::ProgramFault(error)) => {
-                            panic!("signed handler failed: {error:#}");
-                        }
-                    }
-                }
                 ::arena0::Event::React => {
                     match <#program_ty as ::arena0::Program>::on_react(&mut ctx) {
                         Ok(transition) => {

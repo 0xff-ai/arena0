@@ -1,8 +1,8 @@
 //! Inbound events dispatched to programs by the runtime.
 //!
 //! Each [`Event`] variant represents something that happened outside the
-//! program: a session boundary, a message arrival, or a local input, timer,
-//! signature, or reaction. Every event uses the same dispatch path and may
+//! program: a session boundary, a message arrival, or a local input, timer, or
+//! reaction. Every event uses the same dispatch path and may
 //! affect either state and emit any [`Effect`](crate::Effect).
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -37,8 +37,6 @@ pub enum Event<M = Vec<u8>> {
     InputReceived { callout_index: u32, data: Vec<u8> },
     /// A previously set timer fired with its scheduled payload.
     TimerFired { timer: TimerPayload },
-    /// Completed [`Sign`](crate::Effect::Sign) effect.
-    Signed { signature: Vec<u8> },
     /// Run the program's reaction code after an agreed entry applied.
     React,
 }
@@ -72,7 +70,6 @@ impl Event<Vec<u8>> {
                 data,
             },
             Self::TimerFired { timer } => Event::TimerFired { timer },
-            Self::Signed { signature } => Event::Signed { signature },
             Self::React => Event::React,
         })
     }
@@ -82,8 +79,7 @@ const EVENT_SESSION_STARTED: u8 = 0;
 const EVENT_MESSAGE_RECEIVED: u8 = 1;
 const EVENT_INPUT_RECEIVED: u8 = 2;
 const EVENT_TIMER_FIRED: u8 = 3;
-const EVENT_SIGNED: u8 = 4;
-const EVENT_REACT: u8 = 5;
+const EVENT_REACT: u8 = 4;
 
 impl<M: BorshSerialize> BorshSerialize for Event<M> {
     fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
@@ -124,16 +120,6 @@ impl<M: BorshSerialize> BorshSerialize for Event<M> {
                 BorshSerialize::serialize(&EVENT_TIMER_FIRED, writer)?;
                 timer.serialize_bounded(writer)
             }
-            Self::Signed { signature } => {
-                BorshSerialize::serialize(&EVENT_SIGNED, writer)?;
-                serialize_bounded_bytes(
-                    writer,
-                    signature,
-                    crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
-                    "event signature payload",
-                )?;
-                Ok(())
-            }
             Self::React => BorshSerialize::serialize(&EVENT_REACT, writer),
         }
     }
@@ -162,13 +148,6 @@ impl<M: BorshDeserialize> BorshDeserialize for Event<M> {
             }),
             EVENT_TIMER_FIRED => Ok(Self::TimerFired {
                 timer: TimerPayload::deserialize_bounded(reader)?,
-            }),
-            EVENT_SIGNED => Ok(Self::Signed {
-                signature: read_bounded_bytes(
-                    reader,
-                    crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
-                    "event signature payload",
-                )?,
             }),
             EVENT_REACT => Ok(Self::React),
             tag => Err(io::Error::new(
@@ -208,9 +187,6 @@ mod tests {
                     data: vec![7],
                 },
             },
-            Event::Signed {
-                signature: vec![0xDD, 0xEE],
-            },
             Event::React,
         ];
 
@@ -240,7 +216,7 @@ mod tests {
         assert_eq!(borsh::to_vec(&start).unwrap()[0], 0);
         assert_eq!(borsh::to_vec(&message).unwrap()[0], 1);
         assert_eq!(borsh::to_vec(&timer).unwrap()[0], 3);
-        assert_eq!(borsh::to_vec(&raw_react).unwrap()[0], 5);
+        assert_eq!(borsh::to_vec(&raw_react).unwrap()[0], 4);
         assert!(borsh::from_slice::<Event<Vec<u8>>>(&[0xff]).is_err());
     }
 

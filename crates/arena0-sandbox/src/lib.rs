@@ -18,6 +18,7 @@ mod call;
 mod engine;
 mod error;
 mod finalize;
+mod signing;
 mod validation;
 
 pub use call::{
@@ -26,6 +27,7 @@ pub use call::{
 };
 pub use engine::{LoadedProgram, ProgramInstance, WasmtimeEngine};
 pub use error::SandboxError;
+pub use signing::GuestSigner;
 
 mod program;
 pub use program::Program;

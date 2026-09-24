@@ -1232,16 +1232,13 @@ fn validate_pending_dispatch(
             Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. }
         )
     });
-    let continuation = effects.iter().any(|effect| {
-        matches!(
-            effect,
-            Effect::Callout { .. } | Effect::Sign { .. } | Effect::SetTimer { .. }
-        )
-    });
+    let continuation = effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Callout { .. } | Effect::SetTimer { .. }));
     if lifecycle && continuation {
         return Err(ProtocolError::InvalidTerminalStatus);
     }
-    let answer = matches!(event, Event::InputReceived { .. } | Event::Signed { .. });
+    let answer = matches!(event, Event::InputReceived { .. });
     if !answer {
         if pending_id.is_some() {
             return Err(ProtocolError::PendingContinuationMismatch);
@@ -1264,7 +1261,6 @@ fn validate_pending_dispatch(
                 callout_index: expected_index,
             },
         ) => *callout_index == expected_index,
-        (Event::Signed { .. }, PendingOperation::Sign) => true,
         _ => false,
     };
     if !matches {
@@ -1283,7 +1279,7 @@ fn next_dispatch_status(
     let continuation = effects
         .iter()
         .enumerate()
-        .filter(|(_, effect)| matches!(effect, Effect::Callout { .. } | Effect::Sign { .. }))
+        .filter(|(_, effect)| matches!(effect, Effect::Callout { .. }))
         .map(|(index, effect)| {
             let ordinal =
                 u32::try_from(index).map_err(|_| ProtocolError::InvalidPendingContinuation)?;
@@ -1294,7 +1290,7 @@ fn next_dispatch_status(
     if continuation.len() > 1 {
         return Err(ProtocolError::InvalidPendingContinuation);
     }
-    let consumes_pending = matches!(event, Event::InputReceived { .. } | Event::Signed { .. });
+    let consumes_pending = matches!(event, Event::InputReceived { .. });
     if let Some(next) = continuation.into_iter().next() {
         if existing.is_some() && !consumes_pending {
             return Err(ProtocolError::InvalidPendingContinuation);
@@ -1333,10 +1329,7 @@ fn normalize_proposal_event(
     if let Some(index) = broadcast_index
         && matches!(
             event,
-            Event::InputReceived { .. }
-                | Event::TimerFired { .. }
-                | Event::Signed { .. }
-                | Event::React
+            Event::InputReceived { .. } | Event::TimerFired { .. } | Event::React
         )
     {
         let Effect::Broadcast { data } = &proposal_effects[index].1 else {
