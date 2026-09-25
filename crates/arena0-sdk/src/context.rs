@@ -311,6 +311,20 @@ impl<Shared, Local, M: Mode> Ctx<Shared, Local, M> {
 }
 
 impl<Shared, Local, M: EffectMode> Ctx<Shared, Local, M> {
+    /// A context holding only this dispatch's state and local identity; the
+    /// mode-specific `__new` constructors carry the safety contract.
+    fn with_state(shared: Shared, local: Local, peer_id: PeerId) -> Self {
+        Self {
+            shared,
+            local,
+            peer_id,
+            remote_peer: None,
+            participant: None,
+            committed_ensemble: None,
+            _mode: PhantomData,
+        }
+    }
+
     /// Mutable reference to local, participant-private state.
     pub fn local_mut(&mut self) -> &mut Local {
         &mut self.local
@@ -432,15 +446,7 @@ impl<Shared, Local> Ctx<Shared, Local, AgreedMode> {
     /// mode. Generated dispatch glue meets this precondition.
     #[doc(hidden)]
     pub unsafe fn __new(shared: Shared, local: Local, peer_id: PeerId) -> Self {
-        Self {
-            shared,
-            local,
-            peer_id,
-            remote_peer: None,
-            participant: None,
-            committed_ensemble: None,
-            _mode: PhantomData,
-        }
+        Self::with_state(shared, local, peer_id)
     }
 
     /// Mutably borrow replicated shared state for this event.
@@ -491,15 +497,7 @@ impl<Shared, Local> Ctx<Shared, Local, LocalMode> {
     /// the byte guard that rejects the resulting dispatch.
     #[doc(hidden)]
     pub unsafe fn __new(shared: Shared, local: Local, peer_id: PeerId) -> Self {
-        Self {
-            shared,
-            local,
-            peer_id,
-            remote_peer: None,
-            participant: None,
-            committed_ensemble: None,
-            _mode: PhantomData,
-        }
+        Self::with_state(shared, local, peer_id)
     }
 
     /// Sign `payload` synchronously with the participant's host key.

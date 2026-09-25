@@ -40,70 +40,57 @@ fn native_host_unavailable(import: &'static str) -> ! {
     panic!("arena0 host import `{import}` is only available inside the Wasm guest")
 }
 
+/// Run `body` against the `arena0` imports inside the Wasm guest. Native
+/// builds never reach a host import, so there the call consumes its
+/// arguments and panics naming `IMPORT`.
+macro_rules! host_import {
+    ($import:ident($($arg:expr),*) { $($body:tt)* }) => {{
+        #[cfg(target_arch = "wasm32")]
+        // SAFETY: every import reads or writes only the guest ranges passed
+        // to it, which the caller's borrowed arguments keep alive.
+        unsafe { $($body)* }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = ($($arg,)*);
+            native_host_unavailable(imports::$import)
+        }
+    }};
+}
+
 /// Return the encoded byte length of one host-owned state value.
 #[doc(hidden)]
 pub fn host_state_len(kind: u32) -> usize {
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
+    host_import!(STATE_LEN(kind) {
         state_len(kind) as usize
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = kind;
-        native_host_unavailable(imports::STATE_LEN)
-    }
+    })
 }
 
 /// Read one host-owned state value into a guest buffer.
 #[doc(hidden)]
 pub fn host_state_read(kind: u32, buffer: &mut [u8]) {
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
+    host_import!(STATE_READ(kind, buffer) {
         state_read(kind, buffer.as_mut_ptr() as u32, buffer.len() as u32);
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = (kind, buffer);
-        native_host_unavailable(imports::STATE_READ)
-    }
+    })
 }
 
 /// Replace one host-owned state value from a guest buffer.
 #[doc(hidden)]
 pub fn host_state_write(kind: u32, buffer: &[u8]) {
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
+    host_import!(STATE_WRITE(kind, buffer) {
         state_write(kind, buffer.as_ptr() as u32, buffer.len() as u32);
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = (kind, buffer);
-        native_host_unavailable(imports::STATE_WRITE)
-    }
+    })
 }
 
 pub fn host_log(level: LogLevel, msg: &str) {
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
+    host_import!(LOG(level, msg) {
         log(level.abi_tag(), msg.as_ptr() as u32, msg.len() as u32);
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = (level, msg);
-        native_host_unavailable(imports::LOG)
-    }
+    })
 }
 
 pub(crate) fn host_random(buf: &mut [u8]) {
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
+    host_import!(RANDOM(buf) {
         random(buf.as_mut_ptr() as u32, buf.len() as u32);
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = buf;
-        native_host_unavailable(imports::RANDOM)
-    }
+    })
 }
 
 /// Broadcast a message to every participant.
@@ -111,23 +98,16 @@ pub(crate) fn host_random(buf: &mut [u8]) {
 /// Returns [`BroadcastError::QueueFull`] when the durable outgoing queue is
 /// full; the host then queues nothing.
 pub(crate) fn host_broadcast(msg_bytes: &[u8]) -> Result<(), crate::context::BroadcastError> {
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
+    host_import!(BROADCAST(msg_bytes) {
         if broadcast(msg_bytes.as_ptr() as u32, msg_bytes.len() as u32) != 0 {
             return Err(crate::context::BroadcastError::QueueFull);
         }
         Ok(())
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = msg_bytes;
-        native_host_unavailable(imports::BROADCAST)
-    }
+    })
 }
 
 pub(crate) fn host_set_timer(delay_ms: u64, payload: &TimerPayload) {
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
+    host_import!(SET_TIMER(delay_ms, payload) {
         let TimerPayload { type_name, data } = payload;
         set_timer(
             delay_ms,
@@ -136,17 +116,11 @@ pub(crate) fn host_set_timer(delay_ms: u64, payload: &TimerPayload) {
             data.as_ptr() as u32,
             data.len() as u32,
         );
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = (delay_ms, payload);
-        native_host_unavailable(imports::SET_TIMER)
-    }
+    })
 }
 
 pub(crate) fn host_guest_sign(scheme: SignScheme, payload: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
+    host_import!(SIGN(scheme, payload) {
         let capacity = payload
             .len()
             .saturating_add(arena0_program::SIGN_RESULT_OVERHEAD_BYTES);
@@ -165,46 +139,23 @@ pub(crate) fn host_guest_sign(scheme: SignScheme, payload: &[u8]) -> (Vec<u8>, V
         let bytes = core::slice::from_raw_parts(out, written).to_vec();
         crate::io_alloc::io_dealloc(out, capacity);
         borsh::from_slice(&bytes).expect("host sign result decode failed")
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = (scheme, payload);
-        native_host_unavailable(imports::SIGN)
-    }
+    })
 }
 
 pub(crate) fn host_end_session(outcome: &[u8]) {
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
+    host_import!(END_SESSION(outcome) {
         end_session(outcome.as_ptr() as u32, outcome.len() as u32);
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = outcome;
-        native_host_unavailable(imports::END_SESSION)
-    }
+    })
 }
 
 pub(crate) fn host_abort_session(reason: &str) {
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
+    host_import!(ABORT_SESSION(reason) {
         abort_session(reason.as_ptr() as u32, reason.len() as u32);
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = reason;
-        native_host_unavailable(imports::ABORT_SESSION)
-    }
+    })
 }
 
 pub fn host_fail(reason: &str) {
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
+    host_import!(FAIL(reason) {
         fail(reason.as_ptr() as u32, reason.len() as u32);
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = reason;
-        native_host_unavailable(imports::FAIL)
-    }
+    })
 }

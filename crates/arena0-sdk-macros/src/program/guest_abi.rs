@@ -61,6 +61,24 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
             ((ptr as i64) << 32) | ((len as i64) & 0xFFFF_FFFF)
         }
 
+        /// Copy `bytes` into a fresh guest allocation and pack its pointer
+        /// and length for the host.
+        fn __arena0_write_bytes(bytes: &[u8], what: &str) -> i64 {
+            if bytes.is_empty() {
+                return __arena0_pack(0, 0);
+            }
+            let len = ::core::convert::TryFrom::try_from(bytes.len())
+                .unwrap_or_else(|_| panic!("{what} length overflows i32"));
+            // SAFETY: the guest allocator owns the returned linear-memory
+            // range until the host reads and deallocates it.
+            let ptr = unsafe { arena0_alloc(len) };
+            assert!(ptr > 0, "{what} allocation failed");
+            unsafe {
+                ::core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+            }
+            __arena0_pack(ptr, len)
+        }
+
         fn __arena0_write_result<T: ::arena0::borsh::BorshSerialize>(result: &T) -> i64 {
             let bytes = ::arena0::borsh::to_vec(result)
                 .expect("guest call result serialization failed");
@@ -68,19 +86,7 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                 bytes.len() <= ::arena0::MAX_CALL_ENVELOPE_BYTES as usize,
                 "guest call result exceeds ABI envelope bound"
             );
-            let len = ::core::convert::TryFrom::try_from(bytes.len())
-                .expect("guest call result length overflows i32");
-            if bytes.is_empty() {
-                return __arena0_pack(0, 0);
-            }
-            // SAFETY: the guest allocator owns the returned linear-memory
-            // range until the host reads and deallocates it.
-            let ptr = unsafe { arena0_alloc(len) };
-            assert!(ptr > 0, "guest result allocation failed");
-            unsafe {
-                ::core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-            }
-            __arena0_pack(ptr, len)
+            __arena0_write_bytes(&bytes, "guest result")
         }
 
         fn __arena0_read_input<T: ::arena0::borsh::BorshDeserialize>(ptr: i32, len: i32) -> T {
@@ -117,12 +123,21 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
             bytes
         }
 
-        fn __arena0_load_shared_bytes() -> ::std::vec::Vec<u8> {
-            let len = ::arena0::__host_state_len(::arena0::__STATE_KIND_SHARED);
-            assert!(len <= __ARENA0_STATE_MAX, "shared state exceeds STATE_MAX");
+        /// Read one host state memory after checking its length against `max`.
+        fn __arena0_read_state(kind: u32, max: usize, too_large: &str) -> ::std::vec::Vec<u8> {
+            let len = ::arena0::__host_state_len(kind);
+            assert!(len <= max, "{too_large}");
             let mut bytes = ::std::vec![0u8; len];
-            ::arena0::__host_state_read(::arena0::__STATE_KIND_SHARED, &mut bytes);
+            ::arena0::__host_state_read(kind, &mut bytes);
             bytes
+        }
+
+        fn __arena0_load_shared_bytes() -> ::std::vec::Vec<u8> {
+            __arena0_read_state(
+                ::arena0::__STATE_KIND_SHARED,
+                __ARENA0_STATE_MAX,
+                "shared state exceeds STATE_MAX",
+            )
         }
 
         fn __arena0_decode_shared(bytes: &[u8]) -> #shared_ty {
@@ -134,13 +149,11 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
         }
 
         fn __arena0_load_local() -> #local_ty {
-            let len = ::arena0::__host_state_len(::arena0::__STATE_KIND_LOCAL);
-            assert!(
-                len <= ::arena0::MAX_LOCAL_STATE_BYTES as usize,
-                "local state exceeds the ABI state bound"
+            let bytes = __arena0_read_state(
+                ::arena0::__STATE_KIND_LOCAL,
+                ::arena0::MAX_LOCAL_STATE_BYTES as usize,
+                "local state exceeds the ABI state bound",
             );
-            let mut bytes = ::std::vec![0u8; len];
-            ::arena0::__host_state_read(::arena0::__STATE_KIND_LOCAL, &mut bytes);
             ::arena0::borsh::from_slice(&bytes).expect("local state deserialization failed")
         }
 
@@ -528,17 +541,7 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
             let bytes = ::arena0::ProgramDefinition { metadata, schema }
                 .encode()
                 .expect("metadata serialization failed");
-            if bytes.is_empty() {
-                return __arena0_pack(0, 0);
-            }
-            let len = ::core::convert::TryFrom::try_from(bytes.len())
-                .expect("metadata length overflows i32");
-            let ptr = unsafe { arena0_alloc(len) };
-            assert!(ptr > 0, "metadata allocation failed");
-            unsafe {
-                ::core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-            }
-            __arena0_pack(ptr, len)
+            __arena0_write_bytes(&bytes, "metadata")
         }
         };
     }
