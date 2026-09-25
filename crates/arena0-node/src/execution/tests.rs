@@ -13,9 +13,9 @@ use arena0_program::{
 };
 use arena0_protocol::execution::GuestSignData;
 use arena0_protocol::{
-    AbortKind, AbortOccurrence, Activation, ActivationData, Ensemble, Event, ExecFrame, ExecId,
-    ExecutionAdmission, ExecutionStatus, NegotiationId, Offer, OfferData, PeerId, PeerIdSource,
-    PendingId, PreparedActivation, StateHash, Ticket, TicketAction, TicketData, TicketHash,
+    AbortKind, AbortOccurrence, Activation, ActivationData, CalloutId, Ensemble, Event, ExecFrame,
+    ExecId, ExecutionAdmission, ExecutionStatus, NegotiationId, Offer, OfferData, PeerId,
+    PeerIdSource, PreparedActivation, StateHash, Ticket, TicketAction, TicketData, TicketHash,
 };
 use arena0_sandbox::{LoadedProgram, Program};
 use arena0_store::{Change, Store, StoreConfig};
@@ -1426,7 +1426,7 @@ async fn staged_result_preserves_callout_and_reports_agreement_pending() {
     fixture.commit_session_started(&mut actor).await;
     let answer = JsonBytes::try_new(b"null".to_vec()).unwrap();
     assert!(matches!(
-        actor.submit_input(PendingId::new(0), answer.clone()).await,
+        actor.submit_input(CalloutId::new(0), answer.clone()).await,
         Err(SubmitInputError::Expected(
             crate::ExecError::CalloutNotPending
         ))
@@ -1457,7 +1457,7 @@ async fn staged_result_preserves_callout_and_reports_agreement_pending() {
     ));
     assert!(matches!(
         actor
-            .submit_input(PendingId::new(open.id.get().wrapping_add(1)), answer)
+            .submit_input(CalloutId::new(open.id.get().wrapping_add(1)), answer)
             .await,
         Err(SubmitInputError::Expected(
             crate::ExecError::CalloutNotPending

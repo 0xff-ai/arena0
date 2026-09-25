@@ -12,8 +12,8 @@ use arena0_crypto::{ExecutionKey, NodeKeys, SignScheme};
 use arena0_program::{CallStatus, JsonBytes, ProgramHash};
 use arena0_protocol::execution::GuestSignData;
 use arena0_protocol::{
-    Committed, Effect, Ensemble, Event, ExecLifecycle, ExecutionState, ExecutionStatus,
-    ParticipantStepSignature, PeerIdSource, PendingId, SessionHash, SharedProposal, StepEvent,
+    CalloutId, Committed, Effect, Ensemble, Event, ExecLifecycle, ExecutionState, ExecutionStatus,
+    ParticipantStepSignature, PeerIdSource, SessionHash, SharedProposal, StepEvent,
     TerminalOutcome,
 };
 use arena0_sandbox::{DispatchCall, GuestSigner};
@@ -28,7 +28,7 @@ pub(super) enum DispatchSource {
     /// A local event with no durable identity beyond its event record.
     Local,
     /// A callout answer that must name the exact open callout.
-    Answer(PendingId),
+    Answer(CalloutId),
     /// A timer firing that consumes its durable timer identity.
     Timer(arena0_protocol::TimerId),
     /// An authenticated peer message with the author's complete commitment.
@@ -119,7 +119,7 @@ impl ExecutionActor {
     /// the command reports that rejection without taking the actor down.
     pub(super) async fn submit_input(
         &mut self,
-        pending_id: PendingId,
+        pending_id: CalloutId,
         data: JsonBytes,
     ) -> Result<(), SubmitInputError> {
         let state = &self.state;

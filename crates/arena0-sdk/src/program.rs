@@ -146,7 +146,7 @@ pub trait Program: Sized {
     ///
     /// The Host calls this after every accepted dispatch, before the resulting
     /// state image is recorded. Returning the same request (index and context)
-    /// keeps the current open callout and its `PendingId` after a non-answer
+    /// keeps the current open callout and its `CalloutId` after a non-answer
     /// event. An accepted answer consumes its ID, so even an identical next
     /// question receives a new ID. Returning a
     /// different request replaces it with a new one; returning `None`

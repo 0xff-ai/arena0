@@ -32,7 +32,7 @@ use std::process::ExitCode;
 use anyhow::{Context, anyhow, bail};
 use arena0_client::answer;
 use arena0_client::api::{
-    ApiErrorCode, AwaitState, EnsembleSpec, ExecStatus, HostRequest, NextEvent, PendingId,
+    ApiErrorCode, AwaitState, CalloutId, EnsembleSpec, ExecStatus, HostRequest, NextEvent,
     ReceiptSummary, ResponseOk,
 };
 use arena0_client::proto::DaemonClient;
@@ -271,7 +271,7 @@ enum ExecCommand {
     Submit {
         exec_id: String,
         #[arg(long)]
-        pending_id: PendingId,
+        pending_id: CalloutId,
         #[arg(long)]
         answer: Option<String>,
     },

@@ -257,7 +257,7 @@ fn input_keys_submit_json_and_escape_clears() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "Choose".to_owned(),
         prompt: "Choose".to_owned(),
@@ -285,7 +285,7 @@ fn invalid_tui_answer_keeps_the_callout_until_valid_input() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "Choose".to_owned(),
         prompt: "Cooperate or defect".to_owned(),
@@ -330,7 +330,7 @@ fn duplicate_callout_key_does_not_replace_pending_reply() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "first".to_owned(),
         prompt: "first".to_owned(),
@@ -342,7 +342,7 @@ fn duplicate_callout_key_does_not_replace_pending_reply() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "second".to_owned(),
         prompt: "second".to_owned(),
@@ -367,7 +367,7 @@ fn host_callouts_keep_independent_textarea_drafts_and_reply_routes() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "first".to_owned(),
         prompt: "first".to_owned(),
@@ -380,7 +380,7 @@ fn host_callouts_keep_independent_textarea_drafts_and_reply_routes() {
     state.apply(RunUpdate::Callout {
         host: second_host.clone(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(2),
+        pending_id: CalloutId::new(2),
         callout_index: 1,
         name: "second".to_owned(),
         prompt: "second".to_owned(),
@@ -475,7 +475,7 @@ fn pending_answer_can_be_left_and_reentered() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "Choose".to_owned(),
         prompt: "Choose".to_owned(),
@@ -500,7 +500,7 @@ fn tab_moves_focus_inside_the_current_view_only() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "Choose".to_owned(),
         prompt: "Choose".to_owned(),
@@ -536,7 +536,7 @@ fn composer_shortcut_then_backtab_returns_to_visible_records() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "Choose".to_owned(),
         prompt: "Choose".to_owned(),
@@ -571,7 +571,7 @@ fn arrivals_preserve_callout_order_and_submission_selects_the_oldest() {
         state.apply(RunUpdate::Callout {
             host: HostName::for_local_index(index),
             exec_id: active_status().exec_id,
-            pending_id: PendingId::new(1),
+            pending_id: CalloutId::new(1),
             callout_index: 1,
             name: "Choose".to_owned(),
             prompt: "Choose".to_owned(),
@@ -965,7 +965,7 @@ fn composer_height_tracks_wrapped_semantic_rows_and_editor_lines() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "Choose".to_owned(),
         prompt: "x".repeat(300),
@@ -1037,7 +1037,7 @@ fn insert_mode_keeps_printable_controls_and_supports_editing() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "Choose".to_owned(),
         prompt: "value".to_owned(),
@@ -1337,7 +1337,7 @@ fn monitor_a_opens_only_the_selected_execution_callout() {
         state.apply(RunUpdate::Monitor(MonitorUpdate::Callout {
             host: host.clone(),
             exec_id,
-            pending_id: PendingId::new(exec_id.0[0] as u64),
+            pending_id: CalloutId::new(exec_id.0[0] as u64),
             callout_index: 1,
             name: "Choose".to_owned(),
             prompt: "choose".to_owned(),
@@ -1608,7 +1608,7 @@ fn monitor_submission_routes_to_exact_callout_and_closes_selected_composer() {
         state.apply(RunUpdate::Monitor(MonitorUpdate::Callout {
             host: host.clone(),
             exec_id: ExecId([byte; 32]),
-            pending_id: PendingId::new(u64::from(byte)),
+            pending_id: CalloutId::new(u64::from(byte)),
             callout_index: 1,
             name: format!("Choice-{byte}"),
             prompt: "choose".to_owned(),
@@ -1620,14 +1620,14 @@ fn monitor_submission_routes_to_exact_callout_and_closes_selected_composer() {
     state.apply(RunUpdate::Monitor(MonitorUpdate::Submission {
         host: host.clone(),
         exec_id: ExecId([2; 32]),
-        pending_id: PendingId::new(2),
+        pending_id: CalloutId::new(2),
         result: MonitorSubmission::Rejected("\u{1b}[31mtransport\u{1b}[0m".to_owned()),
     }));
     assert_eq!(state.focus, Focus::Composer);
     assert_eq!(
         state
             .callouts
-            .get_mut(&host, ExecId([2; 32]), PendingId::new(2))
+            .get_mut(&host, ExecId([2; 32]), CalloutId::new(2))
             .expect("retained callout")
             .submission_error
             .as_deref(),
@@ -1636,7 +1636,7 @@ fn monitor_submission_routes_to_exact_callout_and_closes_selected_composer() {
     state.apply(RunUpdate::Monitor(MonitorUpdate::Submission {
         host,
         exec_id: ExecId([1; 32]),
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         result: MonitorSubmission::Accepted,
     }));
     assert_eq!(state.focus, Focus::Hosts);
@@ -1687,7 +1687,7 @@ fn arrows_edit_the_answer_and_numbers_remain_text_while_typing() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "Choose".into(),
         prompt: "Choose".into(),
@@ -1769,7 +1769,7 @@ fn monitor_tab_reaches_the_answer_pane_and_returns_in_order() {
     state.apply(RunUpdate::Monitor(MonitorUpdate::Callout {
         host: first_host(),
         exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "Choose".into(),
         prompt: "Choose".into(),

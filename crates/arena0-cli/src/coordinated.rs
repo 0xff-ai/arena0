@@ -22,7 +22,7 @@ use arena0_client::api::{
 };
 use arena0_client::proto::{DaemonClient, Subscription};
 use arena0_client::protocol::{
-    AbortKind, ColorDepth, ExecId, ExecLifecycle, PeerId, PendingId, ProgramHash, SessionHash,
+    AbortKind, CalloutId, ColorDepth, ExecId, ExecLifecycle, PeerId, ProgramHash, SessionHash,
     StopCause, View,
 };
 use arena0_home::HostName;
@@ -1844,7 +1844,7 @@ impl ActiveDriver {
     async fn answer(
         &mut self,
         scope: DriverAnswerContext<'_>,
-        pending_id: PendingId,
+        pending_id: CalloutId,
         callout_index: u32,
         callout: Callout<'_>,
         progress: &RunProgress,
@@ -2633,7 +2633,7 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         let exec_id = ExecId([0x81; 32]);
         let session_id = SessionHash([0x82; 32]);
-        let pending_id = PendingId::new(17);
+        let pending_id = CalloutId::new(17);
         let server = tokio::spawn(serve_script(
             listener,
             host("host-01"),
@@ -2695,7 +2695,7 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         let exec_id = ExecId([0x83; 32]);
         let session_id = SessionHash([0x84; 32]);
-        let pending_id = PendingId::new(18);
+        let pending_id = CalloutId::new(18);
         let callout = ResponseOk::Next(NextEvent::Callout {
             pending_id,
             callout_index: 0,
@@ -2707,7 +2707,7 @@ mod tests {
             .unwrap(),
             context: Value::Null,
         });
-        let next_id = PendingId::new(19);
+        let next_id = CalloutId::new(19);
         let mut reasked = callout.clone();
         if let ResponseOk::Next(NextEvent::Callout { pending_id, .. }) = &mut reasked {
             *pending_id = next_id;

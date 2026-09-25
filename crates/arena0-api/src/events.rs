@@ -7,7 +7,7 @@
 use arena0_crypto::AgentPubKey;
 use arena0_program::{JsonSchemaDocument, ProgramHash};
 use arena0_protocol::{
-    ExecId, ExecLifecycle, NegotiationId, PeerId, PendingId, SessionHash, StateHash,
+    CalloutId, ExecId, ExecLifecycle, NegotiationId, PeerId, SessionHash, StateHash,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -172,7 +172,7 @@ pub enum EventData {
     SessionStarted { ensemble: Vec<PeerId> },
     #[serde(rename = "exec.session.callout")]
     SessionCallout {
-        pending_id: PendingId,
+        pending_id: CalloutId,
         callout_index: u32,
         name: String,
         prompt: String,
@@ -180,7 +180,7 @@ pub enum EventData {
         context: Value,
     },
     #[serde(rename = "exec.session.callout_answered")]
-    SessionCalloutAnswered { pending_id: PendingId },
+    SessionCalloutAnswered { pending_id: CalloutId },
     #[serde(rename = "exec.session.step")]
     SessionStep {
         step: u64,
@@ -693,7 +693,7 @@ mod tests {
             ),
             frame(
                 EventData::SessionCallout {
-                    pending_id: PendingId::new(1),
+                    pending_id: CalloutId::new(1),
                     callout_index: 0,
                     name: "Ask".into(),
                     prompt: "?".into(),
@@ -705,7 +705,7 @@ mod tests {
             ),
             frame(
                 EventData::SessionCalloutAnswered {
-                    pending_id: PendingId::new(1),
+                    pending_id: CalloutId::new(1),
                 },
                 Some(exec),
                 Some(sid),
@@ -761,7 +761,7 @@ mod tests {
 
     #[test]
     fn event_pending_ids_are_decimal_strings() {
-        let pending_id = PendingId::new(u64::MAX);
+        let pending_id = CalloutId::new(u64::MAX);
         let frame = frame(
             EventData::SessionCalloutAnswered { pending_id },
             Some(id(1)),

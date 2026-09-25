@@ -1644,7 +1644,7 @@ async fn pending_proposal_exposes_frames_but_withholds_callout() {
     assert!(committed.pending_shared().is_none());
     assert_eq!(
         committed.callout().expect("callout pending").id,
-        arena0_protocol::pending_id(execution_id, proposed.event_position() - 1)
+        arena0_protocol::callout_id(execution_id, proposed.event_position() - 1)
     );
 
     assert_eq!(committed.callout().unwrap().context, vec![0x51]);
@@ -2026,7 +2026,7 @@ async fn flat_dispatch_persists_pending_request_and_event_summaries() {
     .await
     .expect("stage callout");
     sign_step(&store, &fixture, execution_id, &mut writer, 21, 22).await;
-    let pending_id = arena0_protocol::pending_id(execution_id, 0);
+    let pending_id = arena0_protocol::callout_id(execution_id, 0);
 
     let committed = store
         .handle()
@@ -2904,7 +2904,7 @@ async fn dispatch_record(
     effects: Vec<Effect>,
     outcome: Option<TerminalOutcome>,
     timer_id: Option<TimerId>,
-    pending_id: Option<arena0_protocol::PendingId>,
+    pending_id: Option<arena0_protocol::CalloutId>,
     callout: Option<arena0_program::CalloutRequest>,
     now_ms: u64,
 ) -> Result<ExecutionState, StoreError> {

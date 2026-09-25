@@ -18,8 +18,8 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use arena0_api::{
-    ActivityData, ActivityResult, ApiError, ApiErrorCode, ColorDepth, EnsembleSpec,
-    ExecStatusState, HostRequest, NextEvent, PendingId, ProgramSummary, ReceiptRef, ResponseOk,
+    ActivityData, ActivityResult, ApiError, ApiErrorCode, CalloutId, ColorDepth, EnsembleSpec,
+    ExecStatusState, HostRequest, NextEvent, ProgramSummary, ReceiptRef, ResponseOk,
 };
 use arena0_program::ParticipantCount;
 use arena0_protocol::{ExecId, NegotiationTarget, PeerId, SessionHash};
@@ -327,7 +327,7 @@ struct AnswerCalloutArg {
     _token: McpToken,
     execution: ExecRef,
     /// Pending id returned by `await_execution_event`.
-    pending_id: PendingId,
+    pending_id: CalloutId,
     /// JSON answer in the shape of the callout's inline schema.
     answer: Option<Value>,
 }
@@ -403,7 +403,7 @@ struct AckOutput {
 enum ExecutionEvent {
     Waiting,
     Callout {
-        pending_id: PendingId,
+        pending_id: CalloutId,
         callout_index: u32,
         name: String,
         prompt: String,

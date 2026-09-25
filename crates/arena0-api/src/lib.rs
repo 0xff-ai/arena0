@@ -21,7 +21,7 @@ mod response;
 
 pub use activity::{ActivityData, ActivityFrame, ActivityResult};
 pub use arena0_protocol::{
-    ColorDepth, EffectKind, EffectSummary, EventKind, ExecLifecycle, NegotiationTarget, PendingId,
+    CalloutId, ColorDepth, EffectKind, EffectSummary, EventKind, ExecLifecycle, NegotiationTarget,
     ReceiptArtifact, ReceiptSummary, ReceiptTermination, View,
 };
 pub use events::{
@@ -110,7 +110,7 @@ mod tests {
             (
                 HostRequest::ExecSubmit {
                     exec_id: ExecId([1u8; 32]),
-                    pending_id: PendingId::new(3),
+                    pending_id: CalloutId::new(3),
                     answer: Some(serde_json::json!("Rock")),
                 },
                 "exec.submit",
@@ -202,7 +202,7 @@ mod tests {
             join_request
         );
 
-        let pending_id = PendingId::new(u64::MAX);
+        let pending_id = CalloutId::new(u64::MAX);
         let submit = HostRequest::ExecSubmit {
             exec_id,
             pending_id,
@@ -240,7 +240,7 @@ mod tests {
             (
                 HostRequest::ExecSubmit {
                     exec_id,
-                    pending_id: PendingId::new(3),
+                    pending_id: CalloutId::new(3),
                     answer: Some(serde_json::json!({})),
                 },
                 "answer_raw",
@@ -311,7 +311,7 @@ mod tests {
                     peers: vec![PeerId([8; 32])],
                     participants: 2,
                     pending_callout: Some(PendingCalloutStatus {
-                        pending_id: PendingId::new(11),
+                        pending_id: CalloutId::new(11),
                         callout_index: 1,
                     }),
                     receipt_available: false,
@@ -362,7 +362,7 @@ mod tests {
 
     #[test]
     fn response_pending_ids_are_decimal_strings() {
-        let pending_id = PendingId::new(u64::MAX);
+        let pending_id = CalloutId::new(u64::MAX);
         let response = ResponseOk::Next(NextEvent::Callout {
             pending_id,
             callout_index: 0,

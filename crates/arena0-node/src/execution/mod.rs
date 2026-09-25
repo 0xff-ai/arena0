@@ -58,11 +58,11 @@ struct ExecutionActor {
     terminal_emitted: bool,
     /// Last open-callout identity announced to the observer. A restart starts
     /// empty so the committed callout is announced once again.
-    announced_callout: Option<arena0_protocol::PendingId>,
+    announced_callout: Option<arena0_protocol::CalloutId>,
 }
 
 fn callout_requested(
-    pending_id: arena0_protocol::PendingId,
+    pending_id: arena0_protocol::CalloutId,
     callout_index: u32,
     context: Vec<u8>,
 ) -> SessionMessage {

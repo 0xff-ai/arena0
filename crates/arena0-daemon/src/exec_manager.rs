@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use arena0_api::{ApiError, ApiErrorCode, AwaitState, ExecLifecycle, NextEvent, PendingId};
+use arena0_api::{ApiError, ApiErrorCode, AwaitState, CalloutId, ExecLifecycle, NextEvent};
 use arena0_node::{ExecCommand, LocalTicketWithdrawal, SessionMessage, SpawnedExec};
 use arena0_program::{ProgramHash, ProgramSchema};
 use arena0_protocol::execution::ExecutionState;
@@ -234,7 +234,7 @@ impl ExecutionHandle {
     /// that the callout is still open when the answer is dispatched.
     pub(crate) async fn submit(
         &self,
-        pending_id: PendingId,
+        pending_id: CalloutId,
         data: arena0_program::JsonBytes,
     ) -> Result<(), ApiError> {
         loop {
@@ -442,7 +442,7 @@ pub(crate) fn satisfies(lifecycle: ExecLifecycle, until: AwaitState) -> bool {
 /// the supervisor from matching a public API enum just to emit a host event.
 #[derive(Debug)]
 struct CalloutProjection {
-    pending_id: PendingId,
+    pending_id: CalloutId,
     callout_index: u32,
     name: String,
     prompt: String,
@@ -451,7 +451,7 @@ struct CalloutProjection {
 }
 
 fn project_callout(
-    pending_id: PendingId,
+    pending_id: CalloutId,
     callout_index: u32,
     context: &[u8],
     schema: &ProgramSchema,
@@ -808,7 +808,7 @@ impl Supervisor {
 
     async fn project_callout(
         &mut self,
-        pending_id: PendingId,
+        pending_id: CalloutId,
     ) -> anyhow::Result<Option<(EventSource, CalloutProjection)>> {
         let Some(state) = self.entry.execution().await? else {
             return Ok(None);

@@ -10,7 +10,7 @@ use crate::trace::{
     AggregateAttestation, StepCommitment, StepEvent, StepTerminal, TRACE_FORMAT_VERSION, TraceEntry,
 };
 use crate::{
-    Effect, Event, ExecFrame, ExecId, OpenCallout, PeerId, PendingId, StateHash, pending_id,
+    CalloutId, Effect, Event, ExecFrame, ExecId, OpenCallout, PeerId, StateHash, callout_id,
 };
 
 use super::{
@@ -544,7 +544,7 @@ impl ExecutionState {
         local_state: LocalStateBytes,
         effects: &[Effect],
         terminal_outcome: Option<TerminalOutcome>,
-        pending_id: Option<PendingId>,
+        pending_id: Option<CalloutId>,
         callout: Option<CalloutRequest>,
     ) -> Result<Option<ExecFrame>, ProtocolError> {
         if self.proposal.is_some() {
@@ -1190,7 +1190,7 @@ fn indexed_dispatch_effects(effects: &[Effect]) -> Result<Vec<(u32, Effect)>, Pr
 fn validate_callout_dispatch(
     state: &ExecutionState,
     event: &Event<Vec<u8>>,
-    pending_id: Option<PendingId>,
+    pending_id: Option<CalloutId>,
 ) -> Result<(), ProtocolError> {
     let answer = matches!(event, Event::InputReceived { .. });
     if !answer {
@@ -1242,7 +1242,7 @@ fn next_open_callout(
         return Some(current.clone());
     }
     Some(OpenCallout {
-        id: pending_id(state.execution_id, event_position),
+        id: callout_id(state.execution_id, event_position),
         callout_index: request.callout_index,
         context: request.context,
     })
@@ -1330,7 +1330,7 @@ mod tests {
     use crate::{
         AbortKind, AbortOccurrence, Ensemble, Event, LocalStateBytes, NegotiationId, OpenCallout,
         SharedStateBytes, StateHash, StepEvent, StepTerminal, StopCause, TicketAction, TraceEntry,
-        pending_id,
+        callout_id,
     };
 
     struct Fixture {
@@ -1549,7 +1549,7 @@ mod tests {
             local: LocalStateBytes,
             effects: &[Effect],
             outcome: Option<TerminalOutcome>,
-            pending_id: Option<PendingId>,
+            pending_id: Option<CalloutId>,
             callout: Option<CalloutRequest>,
         ) -> Result<Option<ExecFrame>, ProtocolError> {
             let result =
@@ -1702,7 +1702,7 @@ mod tests {
             )
             .unwrap();
         let first = state.callout().unwrap().clone();
-        assert_eq!(first.id, pending_id(state.execution_id(), first_position));
+        assert_eq!(first.id, callout_id(state.execution_id(), first_position));
         assert_eq!(state.lifecycle(), ExecLifecycle::Waiting);
         state
             .sandbox_apply(
@@ -1738,7 +1738,7 @@ mod tests {
         assert_ne!(reasked.id, first.id);
         assert_eq!(
             reasked.id,
-            pending_id(state.execution_id(), answer_position)
+            callout_id(state.execution_id(), answer_position)
         );
         let before_replay = state.clone();
         assert_eq!(
@@ -1780,7 +1780,7 @@ mod tests {
             assert_ne!(state.callout().unwrap().id, previous);
             assert_eq!(
                 state.callout().unwrap().id,
-                pending_id(state.execution_id(), position)
+                callout_id(state.execution_id(), position)
             );
         }
         state
@@ -1833,7 +1833,7 @@ mod tests {
                     callout_index: 2,
                     data: vec![],
                 },
-                Some(PendingId::new(id.get().wrapping_add(1))),
+                Some(CalloutId::new(id.get().wrapping_add(1))),
             ),
             (
                 Event::InputReceived {
@@ -2624,7 +2624,7 @@ mod tests {
         assert_eq!(state.version(), ExecutionVersion::new(1));
 
         let pending = OpenCallout {
-            id: pending_id(state.execution_id(), state.event_position()),
+            id: callout_id(state.execution_id(), state.event_position()),
             callout_index: 0,
             context: b"null".to_vec(),
         };

@@ -5,7 +5,7 @@
 use arena0_crypto::AgentPubKey;
 use arena0_program::{JsonSchemaDocument, ParticipantCount, ProgramHash, ProgramSchema};
 use arena0_protocol::{
-    EffectSummary, EventKind, ExecId, ExecLifecycle, NegotiationId, OfferHash, PeerId, PendingId,
+    CalloutId, EffectSummary, EventKind, ExecId, ExecLifecycle, NegotiationId, OfferHash, PeerId,
     ReceiptArtifact, ReceiptSummary, SessionHash, StateHash, TicketHash, TraceEntry, View,
 };
 use serde::{Deserialize, Serialize};
@@ -342,7 +342,7 @@ pub enum SessionProgress {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PendingCalloutStatus {
-    pub pending_id: PendingId,
+    pub pending_id: CalloutId,
     pub callout_index: u32,
 }
 
@@ -442,7 +442,7 @@ pub enum NextEvent {
     /// program schema, `schema` is the answer type inline (so a cold agent needs no
     /// `get_program`), and `context` is guest-produced JSON.
     Callout {
-        pending_id: PendingId,
+        pending_id: CalloutId,
         callout_index: u32,
         name: String,
         prompt: String,

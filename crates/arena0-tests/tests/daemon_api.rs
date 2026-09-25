@@ -861,7 +861,7 @@ async fn read_event(reader: &mut BufReader<OwnedReadHalf>) -> EventFrame {
 
 async fn read_until_answered(
     reader: &mut BufReader<OwnedReadHalf>,
-    pending_id: arena0_protocol::PendingId,
+    pending_id: arena0_protocol::CalloutId,
 ) -> bool {
     loop {
         if matches!(

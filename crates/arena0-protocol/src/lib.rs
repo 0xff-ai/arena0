@@ -52,14 +52,14 @@ pub use event::{Event, EventKind};
 pub use exec::ExecLifecycle;
 pub use exec_frame::{ExecFrame, MAX_EXEC_FRAME_BYTES};
 pub use execution::{
-    ABORT_OCCURRENCE_DOMAIN, ABORT_OCCURRENCE_VERSION, AbortKind, AbortOccurrence, EndMatch,
-    EndPhase, ExecutionBinding, ExecutionState, ExecutionStatus, ExecutionVersion,
-    MAX_ACTIVE_TIMERS, MAX_EFFECT_PAYLOAD_BYTES, MAX_EFFECTS, MAX_EXECUTION_STATE_BYTES,
-    MAX_PROOF_SIGNATURES, MAX_RECEIPT_BYTES, MAX_TERMINAL_OUTCOME_BYTES, MAX_TERMINAL_REASON_BYTES,
-    MAX_TIMER_PAYLOAD_BYTES, MAX_TRACE_ENTRY_BYTES, OpenCallout, ParticipantStepSignature,
-    PendingId, PendingIdParseError, ProtocolError, Receipt, ReceiptArtifact, ReceiptBody,
-    ReceiptId, ReceiptKind, ReceiptSummary, ReceiptWork, SharedProposal, StepCertificate,
-    StepCursor, StopCause, StopReport, TerminalOutcome, TimerId, pending_id, validate_agreed_trace,
+    ABORT_OCCURRENCE_DOMAIN, ABORT_OCCURRENCE_VERSION, AbortKind, AbortOccurrence, CalloutId,
+    CalloutIdParseError, EndMatch, EndPhase, ExecutionBinding, ExecutionState, ExecutionStatus,
+    ExecutionVersion, MAX_ACTIVE_TIMERS, MAX_EFFECT_PAYLOAD_BYTES, MAX_EFFECTS,
+    MAX_EXECUTION_STATE_BYTES, MAX_PROOF_SIGNATURES, MAX_RECEIPT_BYTES, MAX_TERMINAL_OUTCOME_BYTES,
+    MAX_TERMINAL_REASON_BYTES, MAX_TIMER_PAYLOAD_BYTES, MAX_TRACE_ENTRY_BYTES, OpenCallout,
+    ParticipantStepSignature, ProtocolError, Receipt, ReceiptArtifact, ReceiptBody, ReceiptId,
+    ReceiptKind, ReceiptSummary, ReceiptWork, SharedProposal, StepCertificate, StepCursor,
+    StopCause, StopReport, TerminalOutcome, TimerId, callout_id, validate_agreed_trace,
 };
 pub use fetch_frame::{FetchFrame, FetchFrameError};
 pub use id::IdParseError;

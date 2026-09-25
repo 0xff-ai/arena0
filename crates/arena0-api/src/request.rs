@@ -10,7 +10,7 @@
 
 use arena0_program::ProgramHash;
 use arena0_protocol::{
-    ColorDepth, ExecId, NegotiationTarget, PeerId, PendingId, ReceiptArtifact, SessionHash,
+    CalloutId, ColorDepth, ExecId, NegotiationTarget, PeerId, ReceiptArtifact, SessionHash,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -105,7 +105,7 @@ pub enum HostRequest {
     #[serde(rename = "exec.submit")]
     ExecSubmit {
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
         /// The answer as JSON, validated against the pending callout's `output`
         /// schema.
         answer: Option<Value>,

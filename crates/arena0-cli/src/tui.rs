@@ -171,7 +171,7 @@ use arena0_client::program::{BorshSchemaDocument, ProgramHash};
 #[cfg(test)]
 use arena0_client::protocol::TicketHash;
 use arena0_client::protocol::{
-    ExecId, ExecLifecycle, PeerId, PendingId, SessionHash, Slot, StepEvent as TraceEvent,
+    CalloutId, ExecId, ExecLifecycle, PeerId, SessionHash, Slot, StepEvent as TraceEvent,
     StepTerminal as TraceEffect, TraceEntry, View,
 };
 use arena0_client::sanitize;
@@ -375,7 +375,7 @@ pub(crate) enum RunUpdate {
     Callout {
         host: HostName,
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
         callout_index: u32,
         name: String,
         prompt: String,
@@ -481,7 +481,7 @@ pub(crate) enum MonitorUpdate {
     Callout {
         host: HostName,
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
         callout_index: u32,
         name: String,
         prompt: String,
@@ -491,7 +491,7 @@ pub(crate) enum MonitorUpdate {
     Submission {
         host: HostName,
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
         result: MonitorSubmission,
     },
     Connection {
@@ -514,7 +514,7 @@ pub(crate) enum MonitorAction {
     Submit {
         host: HostName,
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
         answer: Value,
     },
 }
@@ -536,7 +536,7 @@ pub(crate) struct EventPageRequest {
 pub(crate) struct TuiCalloutRequest {
     pub(crate) host: HostName,
     pub(crate) exec_id: ExecId,
-    pub(crate) pending_id: PendingId,
+    pub(crate) pending_id: CalloutId,
     pub(crate) callout_index: u32,
     pub(crate) name: String,
     pub(crate) prompt: String,

@@ -3,7 +3,7 @@
 //! These types describe host and protocol facts. They are not guest ABI,
 //! guest wire, receipt, or durable trace types.
 
-use crate::PendingId;
+use crate::CalloutId;
 use valuable::Valuable;
 
 use crate::{ExecId, ExecLifecycle, NegotiationId, PeerId, SessionHash, TicketHash};
@@ -126,11 +126,11 @@ pub enum ExecutionEvent {
         ensemble: Vec<PeerId>,
     },
     CalloutRequested {
-        pending_id: PendingId,
+        pending_id: CalloutId,
         callout_index: u32,
     },
     CalloutAnswered {
-        pending_id: PendingId,
+        pending_id: CalloutId,
     },
     Terminal {
         kind: TerminalKind,

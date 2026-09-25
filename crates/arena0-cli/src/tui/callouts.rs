@@ -1,11 +1,11 @@
-use super::{ExecId, HostName, PendingId, TextArea, Value, oneshot};
+use super::{CalloutId, ExecId, HostName, TextArea, Value, oneshot};
 use std::collections::VecDeque;
 
 #[derive(Debug)]
 pub(super) struct PendingCallout {
     pub(super) host: HostName,
     pub(super) exec_id: ExecId,
-    pub(super) pending_id: PendingId,
+    pub(super) pending_id: CalloutId,
     pub(super) callout_index: u32,
     pub(super) name: String,
     pub(super) prompt: String,
@@ -28,7 +28,7 @@ impl PendingCallout {
         &self,
         host: &HostName,
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
         callout_index: u32,
     ) -> bool {
         self.host == *host
@@ -88,7 +88,7 @@ impl CalloutQueue {
         &self,
         host: &HostName,
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
     ) -> Option<&str> {
         self.requests
             .iter()
@@ -123,7 +123,7 @@ impl CalloutQueue {
         &mut self,
         host: &HostName,
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
     ) -> bool {
         let Some(index) = self.requests.iter().position(|request| {
             request.host == *host
@@ -141,7 +141,7 @@ impl CalloutQueue {
         &mut self,
         host: &HostName,
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
     ) -> Option<&mut PendingCallout> {
         self.requests.iter_mut().find(|request| {
             request.host == *host && request.exec_id == exec_id && request.pending_id == pending_id
@@ -172,7 +172,7 @@ impl CalloutQueue {
         &mut self,
         host: &HostName,
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
     ) -> Option<PendingCallout> {
         let index = self.requests.iter().position(|request| {
             request.host == *host && request.exec_id == exec_id && request.pending_id == pending_id

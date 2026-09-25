@@ -465,8 +465,8 @@ After an accepted dispatch, the program's read-only `callout` function derives
 at most one open callout from the resulting state image. The runtime stores that
 callout with the image in the committed execution record, or in the staged
 shared proposal until the proposal is certified. If the callout index and
-context are unchanged, the existing `PendingId` remains open; a different
-callout receives a new `PendingId`, and no callout withdraws the old one. A
+context are unchanged, the existing `CalloutId` remains open; a different
+callout receives a new `CalloutId`, and no callout withdraws the old one. A
 terminal status has no open callout. Local events do not dispatch while a
 proposal is staged.
 
@@ -481,7 +481,7 @@ the participant identity; BLS uses its execution key. A declared
 signed bytes together with the signature. The supported schemes are
 deterministic, so a crash rerun produces the same signature.
 
-An answer must name the exact open `PendingId`. A mismatch returns
+An answer must name the exact open `CalloutId`. A mismatch returns
 `CalloutNotPending`. While a proposal is staged, an answer returns
 `AgreementPending` and the callout stays open. The Host
 checks the answer against the callout's output schema before dispatch. If the
@@ -568,7 +568,7 @@ due timers from the execution record and applies each firing as one
 the timer's authority.
 
 The open callout is stored with the committed state image or staged proposal.
-Its `PendingId` is derived from the execution and event position and is encoded
+Its `CalloutId` is derived from the execution and event position and is encoded
 as a little-endian `u64` in Borsh and a decimal JSON string. The runtime
 announces the current open callout from execution state. A callout answer names
 that exact ID; the actor keeps the callout open while its answered result awaits
@@ -782,7 +782,7 @@ stops the daemon or its executions. Executions are keyed by Host and local
 execution ID; negotiation and session identities group multiparty views.
 
 A monitor may submit one answer for the open callout through the ordinary
-`exec.submit` operation. The answer must name the exact open `PendingId`;
+`exec.submit` operation. The answer must name the exact open `CalloutId`;
 reading a callout grants no ownership or reservation. The execution actor
 serializes competing answers. A stale or losing submission reports
 `CalloutNotPending`; a resubmission while the answered result is staged waits

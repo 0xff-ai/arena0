@@ -33,11 +33,11 @@ use arena0_program::{
     ABI_VERSION, JsonBytes, JsonSchemaDocument, ParticipantCount, ProgramHash, ProgramSchema,
 };
 use arena0_protocol::{
-    ActivationAnnouncement, EventSource, ExecCreationOrigin, ExecId, ExecutionAdmission,
+    ActivationAnnouncement, CalloutId, EventSource, ExecCreationOrigin, ExecId, ExecutionAdmission,
     ExecutionEvent, ExecutionFailureCode, FetchFrame, MAX_CLOCK_SKEW_MS, MAX_TICKET_LIFETIME_MS,
     NegotiationEvent, NegotiationFact, NegotiationGossip, NegotiationId, NegotiationTarget, Offer,
-    OfferData, OfferHash, PREPARE_WINDOW_MS, PeerId, PendingId, ReceiptArtifact, SessionHash,
-    StateHash, TerminalKind, Ticket, TicketAction, TicketData, TicketHash, Viewport,
+    OfferData, OfferHash, PREPARE_WINDOW_MS, PeerId, ReceiptArtifact, SessionHash, StateHash,
+    TerminalKind, Ticket, TicketAction, TicketData, TicketHash, Viewport,
     system_event::SystemEvent,
 };
 use arena0_sandbox::{LoadedProgram, Program, WasmtimeEngine};
@@ -409,7 +409,7 @@ pub(crate) enum HostEvent {
     },
     SessionCallout {
         source: EventSource,
-        pending_id: PendingId,
+        pending_id: CalloutId,
         callout_index: u32,
         name: String,
         prompt: String,
@@ -418,7 +418,7 @@ pub(crate) enum HostEvent {
     },
     SessionCalloutAnswered {
         source: EventSource,
-        pending_id: PendingId,
+        pending_id: CalloutId,
     },
     SessionCompleted {
         source: EventSource,
@@ -3276,7 +3276,7 @@ impl HostService {
     async fn submit(
         &self,
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
         answer: Option<serde_json::Value>,
     ) -> Response {
         let request = self
@@ -3338,7 +3338,7 @@ impl HostService {
     async fn pending_callout_index(
         &self,
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
     ) -> Result<Option<u32>, ApiError> {
         Ok(self
             .store
@@ -3356,7 +3356,7 @@ impl HostService {
     async fn reclassify_submit_failure(
         &self,
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
         error: ApiError,
     ) -> ApiError {
         match self.pending_callout_index(exec_id, pending_id).await {

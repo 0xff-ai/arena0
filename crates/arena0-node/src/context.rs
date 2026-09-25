@@ -4,7 +4,7 @@
 //! execution object. The private execution actor owns the only live guest and
 //! transport capabilities for one execution identity; protocol state remains in memory until restart or a failed persist.
 
-use arena0_protocol::PendingId;
+use arena0_protocol::CalloutId;
 use std::sync::Arc;
 
 use arena0_crypto::{ExecutionKey, ExecutionSalt, NodeKeys};
@@ -102,7 +102,7 @@ pub enum ExecCommand {
     /// Submit a validated JSON answer to the open program callout.
     SubmitInput {
         /// The open callout identity being answered.
-        pending_id: PendingId,
+        pending_id: CalloutId,
         /// Complete agent-facing JSON input.
         data: JsonBytes,
         /// Command result.
@@ -157,7 +157,7 @@ pub enum SessionMessage {
     },
     /// The committed open callout is ready for an agent answer.
     CalloutRequested {
-        pending_id: PendingId,
+        pending_id: CalloutId,
         callout_index: u32,
         context: Vec<u8>,
     },

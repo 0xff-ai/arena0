@@ -6,12 +6,12 @@
 
 mod abort;
 mod binding;
+mod callout;
 mod certificate;
 mod cursor;
 mod end;
 mod error;
 mod outcome;
-mod pending;
 mod signing;
 mod state;
 mod status;
@@ -47,6 +47,7 @@ pub const MAX_RECEIPT_TRACE_ENTRIES: usize = 65_536;
 
 pub use abort::{ABORT_OCCURRENCE_DOMAIN, ABORT_OCCURRENCE_VERSION, AbortKind, AbortOccurrence};
 pub use binding::ExecutionBinding;
+pub use callout::{CalloutId, CalloutIdParseError, OpenCallout, callout_id};
 pub use certificate::{
     ParticipantStepSignature, Receipt, ReceiptArtifact, ReceiptBody, ReceiptId, ReceiptKind,
     ReceiptSummary, StopReport,
@@ -55,7 +56,6 @@ pub use cursor::{ExecutionVersion, StepCursor};
 pub use end::{EndMatch, EndPhase};
 pub use error::ProtocolError;
 pub use outcome::TerminalOutcome;
-pub use pending::{OpenCallout, PendingId, PendingIdParseError, pending_id};
 pub use signing::GuestSignData;
 pub use state::{ExecutionState, SharedProposal, StepCertificate};
 pub use status::{ExecutionStatus, ReceiptWork, StopCause};
