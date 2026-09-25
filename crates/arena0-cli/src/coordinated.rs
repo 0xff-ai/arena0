@@ -246,11 +246,11 @@ pub(crate) struct HostEvidence {
 /// no driver-local data.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AggregateResult {
-    pub(crate) receipt_id: arena0_client::protocol::ReceiptId,
-    pub(crate) program_id: ProgramHash,
-    pub(crate) session_id: SessionHash,
-    pub(crate) participants: Vec<PeerId>,
-    pub(crate) steps: u64,
+    /// The receipt summary every Host's evidence agrees on; its program and
+    /// session match the selected program and activated session.
+    pub(crate) summary: ReceiptSummary,
+    /// The terminal bound to the verified summary, with the completion's
+    /// JSON outcome.
     pub(crate) terminal: AggregateTerminal,
     pub(crate) verification: VerificationSummary,
     pub(crate) receipts: Vec<HostEvidence>,
@@ -723,11 +723,7 @@ impl Coordinator {
         let terminal = bind_verified_terminal(terminal, &agreement.terminal)?;
 
         Ok(AggregateResult {
-            receipt_id: agreement.receipt_id,
-            program_id,
-            session_id,
-            participants: agreement.ensemble,
-            steps: agreement.steps,
+            summary: agreement,
             terminal,
             verification: VerificationSummary {
                 all_verified: true,

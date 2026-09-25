@@ -1073,11 +1073,11 @@ fn render_coordinated_result(
         let mut document = json!({
             "exec": result.terminal.tag(),
             "program": program,
-            "program_id": result.program_id.to_string(),
-            "session_id": result.session_id.to_string(),
-            "receipt_id": result.receipt_id.to_string(),
-            "participants": result.participants.len(),
-            "steps": result.steps,
+            "program_id": result.summary.program_id.to_string(),
+            "session_id": result.summary.session_id.to_string(),
+            "receipt_id": result.summary.receipt_id.to_string(),
+            "participants": result.summary.ensemble.len(),
+            "steps": result.summary.steps,
             "verified": {
                 "receipts": receipts,
                 "all_verified": result.verification.all_verified,
@@ -1097,10 +1097,10 @@ fn render_coordinated_result(
             coordinated::AggregateTerminal::Failed => palette.red(result.terminal.tag()),
         };
         println!("{terminal} {program}");
-        println!("  session      {}", result.session_id);
-        println!("  receipt      {}", result.receipt_id);
-        println!("  participants {}", result.participants.len());
-        println!("  steps        {}", result.steps);
+        println!("  session      {}", result.summary.session_id);
+        println!("  receipt      {}", result.summary.receipt_id);
+        println!("  participants {}", result.summary.ensemble.len());
+        println!("  steps        {}", result.summary.steps);
         if let coordinated::AggregateTerminal::Completed {
             outcome: Some(outcome),
         } = &result.terminal
@@ -1110,7 +1110,7 @@ fn render_coordinated_result(
         println!(
             "  verified     {}/{} receipts",
             result.receipts.len(),
-            result.participants.len()
+            result.summary.ensemble.len()
         );
     }
 }
