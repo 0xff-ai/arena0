@@ -21,6 +21,7 @@ mod guest;
 mod terminal;
 
 pub(crate) use actor::spawn_execution;
+pub(crate) use delivery::authenticates;
 pub(crate) use terminal::fail_execution;
 
 const COMMAND_CAPACITY: usize = 64;

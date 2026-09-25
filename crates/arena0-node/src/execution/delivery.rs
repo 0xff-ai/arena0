@@ -5,7 +5,9 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use arena0_protocol::{ExecFrame, ParticipantStepSignature, PeerId, PeerIdSource, ProtocolError};
+use arena0_protocol::{
+    ExecFrame, ExecutionState, ParticipantStepSignature, PeerId, PeerIdSource, ProtocolError,
+};
 use arena0_store::Change;
 use arena0_transport::{ExecDelivery, ExecDeliveryRejection, SendHandle, TransportError};
 use tokio::time::Instant;
@@ -66,43 +68,8 @@ impl ExecutionActor {
         frame: ExecFrame,
     ) -> Result<Option<ExecDeliveryRejection>, ExecError> {
         use ExecDeliveryRejection::{Conflict, NotYet, Rejected};
-        if !self
-            .state
-            .binding()
-            .activation()
-            .tickets()
-            .iter()
-            .any(|ticket| ticket.data.signer == source)
-        {
+        if !authenticates(&self.state, source, &frame) {
             return Ok(Some(Rejected));
-        }
-        // Authenticate terminal evidence before comparing conclusions. Adopted
-        // aborts retain their original signer, independently of the forwarding peer.
-        match &frame {
-            ExecFrame::StepCertificate { certificate }
-                if certificate.verify(self.state.binding()).is_err() =>
-            {
-                return Ok(Some(Rejected));
-            }
-            ExecFrame::Abort { occurrence }
-                if occurrence.session_id() != self.state.binding().session_id()
-                    || !self
-                        .state
-                        .binding()
-                        .activation()
-                        .tickets()
-                        .iter()
-                        .any(|t| t.data.signer == occurrence.sender())
-                    || !occurrence.verify_signature().unwrap_or(false) =>
-            {
-                return Ok(Some(Rejected));
-            }
-            ExecFrame::StepSignature { commitment, .. }
-                if commitment.session_id != self.state.binding().session_id() =>
-            {
-                return Ok(Some(Rejected));
-            }
-            _ => {}
         }
         if self.state.status().is_terminal() {
             match self.state.end_conclusion_matches(&frame) {
@@ -354,6 +321,36 @@ impl ExecutionActor {
             }
         }
         Ok(())
+    }
+}
+
+/// Authenticate a frame against the session binding before any comparison
+/// with local state. Live actors and the retired-session router share this
+/// one policy. Adopted aborts retain their original signer, independently of
+/// the forwarding peer.
+pub(crate) fn authenticates(state: &ExecutionState, source: PeerId, frame: &ExecFrame) -> bool {
+    let binding = state.binding();
+    let participant = |peer: PeerId| {
+        binding
+            .activation()
+            .tickets()
+            .iter()
+            .any(|ticket| ticket.data.signer == peer)
+    };
+    if !participant(source) {
+        return false;
+    }
+    match frame {
+        ExecFrame::StepCertificate { certificate } => certificate.verify(binding).is_ok(),
+        ExecFrame::Abort { occurrence } => {
+            occurrence.session_id() == binding.session_id()
+                && participant(occurrence.sender())
+                && occurrence.verify_signature().unwrap_or(false)
+        }
+        ExecFrame::StepSignature { commitment, .. } => {
+            commitment.session_id == binding.session_id()
+        }
+        ExecFrame::Message { .. } => true,
     }
 }
 

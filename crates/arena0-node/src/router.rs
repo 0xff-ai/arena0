@@ -2,14 +2,15 @@
 //!
 //! Stream metadata selects an execution actor before any frame is delivered.
 //! The actor interprets live execution frames. A terminal session without a
-//! live actor acknowledges stale traffic using the store's routing projection.
+//! live actor authenticates frames with the actor's policy and acknowledges
+//! stale traffic using the store's routing projection.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use arena0_protocol::{FetchFrame, SessionHash};
 use arena0_store::StoreHandle;
-use arena0_transport::{ExecStreamMetadata, RecvHandle, Transport};
+use arena0_transport::{ExecDeliveryRejection, ExecStreamMetadata, RecvHandle, Transport};
 use arena0_wire::StreamProtocol;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -83,30 +84,43 @@ async fn route_exec(
     store: StoreHandle,
     end_wakes: mpsc::Sender<arena0_protocol::ExecId>,
 ) {
-    if !matches!(
-        store.execution_end(metadata.session_hash()).await,
-        Ok(Some((
-            _,
-            arena0_protocol::EndPhase::Ending { .. } | arena0_protocol::EndPhase::Ended { .. }
-        )))
-    ) {
+    let session = metadata.session_hash();
+    let source = metadata.remote_peer();
+    let Ok(Some((
+        execution_id,
+        arena0_protocol::EndPhase::Ending { .. } | arena0_protocol::EndPhase::Ended { .. },
+    ))) = store.execution_end(session).await
+    else {
         return;
-    }
+    };
+    // A terminal conclusion and its binding are immutable, so one load
+    // authenticates every frame on this stream with the actor's policy.
+    let Ok(Some(state)) = store.load_execution(execution_id).await else {
+        return;
+    };
     while let Ok(Ok(delivery)) = timeout(EXEC_FALLBACK_IDLE_TIMEOUT, recv.recv_exec()).await {
-        // Only narrow projections are read here. Reconstruction belongs to
-        // the supervisor's actor-start path, not inbound classification.
-        match store.execution_end(metadata.session_hash()).await {
+        if !crate::execution::authenticates(&state, source, delivery.frame()) {
+            let _ = delivery.reject(ExecDeliveryRejection::Rejected);
+            continue;
+        }
+        if state.end_conclusion_matches(delivery.frame()) == arena0_protocol::EndMatch::Different {
+            let _ = delivery.reject(ExecDeliveryRejection::Conflict);
+            continue;
+        }
+        // Confirmation progress may change while this stream is open; read
+        // only its narrow projection per frame.
+        match store.execution_end(session).await {
             Ok(Some((execution_id, arena0_protocol::EndPhase::Ended { unconfirmed })))
-                if unconfirmed.contains(&metadata.remote_peer()) =>
+                if unconfirmed.contains(&source) =>
             {
-                let _ = delivery.reject(arena0_transport::ExecDeliveryRejection::NotYet);
+                let _ = delivery.reject(ExecDeliveryRejection::NotYet);
                 let _ = end_wakes.try_send(execution_id);
                 return;
             }
             Ok(Some((_, phase)))
                 if phase
                     .unconfirmed()
-                    .is_some_and(|peers| !peers.contains(&metadata.remote_peer())) =>
+                    .is_some_and(|peers| !peers.contains(&source)) =>
             {
                 let _ = delivery.acknowledge();
             }

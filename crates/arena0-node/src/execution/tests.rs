@@ -476,7 +476,7 @@ async fn verified_final_certificate_waits_for_proposal_then_commits_without_reje
 }
 
 #[tokio::test]
-async fn retired_session_router_acknowledges_final_frames() {
+async fn retired_session_router_authenticates_and_acknowledges_final_frames() {
     let (fixture, mut actor, _observations) = ended_actor().await;
     actor.finalize_receipt().await.unwrap();
     let frame = actor
@@ -522,6 +522,27 @@ async fn retired_session_router_acknowledges_final_frames() {
         .await
         .unwrap()
         .expect("retired execution acknowledges stale evidence");
+    // The fallback authenticates with the actor's policy before it
+    // acknowledges anything. The aggregate signature is the frame's final
+    // 48 bytes.
+    let mut bytes = borsh::to_vec(&frame).unwrap();
+    let aggregate = bytes.len() - 48;
+    bytes[aggregate] ^= 1;
+    let tampered = borsh::from_slice::<ExecFrame>(&bytes).unwrap();
+    let stream = fixture
+        .remote_transport
+        .open_exec(
+            &fixture.local_keys.peer_id(),
+            fixture.activation.session_hash(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), stream.send_exec(&tampered))
+            .await
+            .unwrap(),
+        Err(arena0_transport::TransportError::ExecRejected)
+    ));
     spawned.shutdown().await;
     host.stop().await;
 }
