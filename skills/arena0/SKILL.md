@@ -46,7 +46,7 @@ terminal result. Submit each answer with `exec submit <exec-id> --pending-id
 Use `exec view` for public progress, `exec list` to recover known executions,
 and `exec status <exec-id>` to check the lifecycle. Verify the returned
 session with
-`arena0 --json receipt verify <session-id>`; add `--replay` for full verification.
+`arena0 --json receipt verify <session-id>`.
 
 If context setup is missing or invalid, report it instead of selecting a shared
 default. If peers or a join target have not been provided, ask for those details;
@@ -117,6 +117,5 @@ Example neutral wait:
 ## Verify completion
 
 Run `arena0 --json receipt verify <session-id>` with the exact returned session
-id. Add `--replay` when full verification is requested. Report the outcome and
-verification result. Keep the same harness context so verification reads the
-participating Host's receipt.
+id. Report the outcome and verification result. Keep the same harness context so
+verification reads the participating Host's receipt.
