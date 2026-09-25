@@ -603,11 +603,9 @@ impl ExecutionActor {
             },
         )
         .await?;
-        if !proposal_staged {
-            if let Err(error) = self.resident_mut()?.commit() {
-                self.instance = None;
-                return Err(error.into());
-            }
+        if !proposal_staged && let Err(error) = self.resident_mut()?.commit() {
+            self.instance = None;
+            return Err(error.into());
         }
         Ok(DispatchOutcome::Committed)
     }
