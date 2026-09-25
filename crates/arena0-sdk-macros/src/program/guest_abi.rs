@@ -117,14 +117,6 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
             bytes
         }
 
-        fn __arena0_load_shared() -> #shared_ty {
-            let len = ::arena0::__host_state_len(::arena0::__STATE_KIND_SHARED);
-            assert!(len <= __ARENA0_STATE_MAX, "shared state exceeds STATE_MAX");
-            let mut bytes = ::std::vec![0u8; len];
-            ::arena0::__host_state_read(::arena0::__STATE_KIND_SHARED, &mut bytes);
-            ::arena0::borsh::from_slice(&bytes).expect("shared state deserialization failed")
-        }
-
         fn __arena0_load_shared_bytes() -> ::std::vec::Vec<u8> {
             let len = ::arena0::__host_state_len(::arena0::__STATE_KIND_SHARED);
             assert!(len <= __ARENA0_STATE_MAX, "shared state exceeds STATE_MAX");
@@ -133,9 +125,12 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
             bytes
         }
 
+        fn __arena0_decode_shared(bytes: &[u8]) -> #shared_ty {
+            ::arena0::borsh::from_slice(bytes).expect("shared state deserialization failed")
+        }
+
         fn __arena0_restore_shared(bytes: &::arena0::SharedStateBytes) -> #shared_ty {
-            ::arena0::borsh::from_slice(bytes.as_bytes())
-                .expect("shared state deserialization failed")
+            __arena0_decode_shared(bytes.as_bytes())
         }
 
         fn __arena0_load_local() -> #local_ty {
@@ -205,35 +200,19 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
             Local(::arena0::LocalContext<#shared_ty, #local_ty>, ::std::vec::Vec<u8>),
         }
 
-        fn __arena0_make_ctx(
+        /// Build the handler context of mode `M` for one dispatch from the
+        /// decoded shared image, the durable local image, and the committed
+        /// session. `new` is the mode's unsafe constructor; this is the
+        /// generated dispatch glue that meets its precondition.
+        fn __arena0_make_ctx<M: ::arena0::Mode>(
             input: &::arena0::DispatchInput,
-        ) -> ::arena0::Context<#shared_ty, #local_ty> {
-            let peer_id = ::arena0::types::PeerId(input.peer_id);
-            let session: ::arena0::Ensemble<::arena0::Committed> =
-                ::arena0::borsh::from_slice(&input.session)
-                    .expect("session context deserialization failed");
-            let participant = session
-                .participant_of(&peer_id)
-                .expect("local peer is not in the committed ensemble");
-            // SAFETY: this is the generated dispatch glue for an agreed event.
-            let mut ctx = unsafe {
-                ::arena0::Context::__new(
-                    __arena0_load_shared(),
-                    __arena0_load_local(),
-                    peer_id,
-                )
-            };
-            ctx.__set_participant(participant);
-            if let Some(remote) = session.others(&peer_id).next() {
-                ctx.__set_remote_peer(remote);
-            }
-            ctx.__set_committed_ensemble(session);
-            ctx
-        }
-
-        fn __arena0_make_local_ctx(
-            input: &::arena0::DispatchInput,
-        ) -> ::arena0::LocalContext<#shared_ty, #local_ty> {
+            shared: #shared_ty,
+            new: unsafe fn(
+                #shared_ty,
+                #local_ty,
+                ::arena0::types::PeerId,
+            ) -> ::arena0::Ctx<#shared_ty, #local_ty, M>,
+        ) -> ::arena0::Ctx<#shared_ty, #local_ty, M> {
             let peer_id = ::arena0::types::PeerId(input.peer_id);
             let session: ::arena0::Ensemble<::arena0::Committed> =
                 ::arena0::borsh::from_slice(&input.session)
@@ -243,19 +222,33 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                 .expect("local peer is not in the committed ensemble");
             // SAFETY: this is the generated dispatch glue; the images are the
             // Host's committed shared image and the durable local image.
-            let mut ctx = unsafe {
-                ::arena0::LocalContext::__new(
-                    __arena0_load_shared(),
-                    __arena0_load_local(),
-                    peer_id,
-                )
-            };
+            let mut ctx = unsafe { new(shared, __arena0_load_local(), peer_id) };
             ctx.__set_participant(participant);
             if let Some(remote) = session.others(&peer_id).next() {
                 ctx.__set_remote_peer(remote);
             }
             ctx.__set_committed_ensemble(session);
             ctx
+        }
+
+        fn __arena0_make_agreed_ctx(
+            input: &::arena0::DispatchInput,
+        ) -> ::arena0::Context<#shared_ty, #local_ty> {
+            let shared = __arena0_decode_shared(&__arena0_load_shared_bytes());
+            __arena0_make_ctx(input, shared, ::arena0::Context::<#shared_ty, #local_ty>::__new)
+        }
+
+        /// A local context and the shared bytes it was decoded from, read
+        /// from the Host once; the bytes are written back unchanged.
+        fn __arena0_make_local_ctx(
+            input: &::arena0::DispatchInput,
+        ) -> (::arena0::LocalContext<#shared_ty, #local_ty>, ::std::vec::Vec<u8>) {
+            let shared_bytes = __arena0_load_shared_bytes();
+            let shared = __arena0_decode_shared(&shared_bytes);
+            (
+                __arena0_make_ctx(input, shared, ::arena0::LocalContext::<#shared_ty, #local_ty>::__new),
+                shared_bytes,
+            )
         }
 
         #[unsafe(no_mangle)]
@@ -318,8 +311,9 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                 .expect("dispatch event deserialization failed");
             let (ctx, status, reason) = match raw_event {
                 ::arena0::Event::SessionStarted { ensemble } => {
-                    let mut ctx = __arena0_make_ctx(&input);
-                    ctx.__set_committed_ensemble(ensemble.clone());
+                    // The dispatch session is the committed ensemble the
+                    // event carries; the context already holds it.
+                    let mut ctx = __arena0_make_agreed_ctx(&input);
                     let outcome = match <#program_ty as ::arena0::Program>::on_session_started(
                         &mut ctx,
                         &ensemble,
@@ -335,7 +329,7 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                     (__Arena0Dispatch::Agreed(ctx), outcome.0, outcome.1)
                 }
                 ::arena0::Event::MessageReceived { from, msg } => {
-                    let mut ctx = __arena0_make_ctx(&input);
+                    let mut ctx = __arena0_make_agreed_ctx(&input);
                     let typed_msg: #message_ty = ::arena0::borsh::from_slice(&msg)
                         .expect("message deserialization failed");
                     let from = ctx.participant_for_peer(from);
@@ -359,8 +353,7 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                     callout_index,
                     data,
                 } => {
-                    let mut local_ctx = __arena0_make_local_ctx(&input);
-                    let shared_bytes = __arena0_load_shared_bytes();
+                    let (mut local_ctx, shared_bytes) = __arena0_make_local_ctx(&input);
                     let outcome = match <#callout_ty as ::arena0::Arena0Callout>::from_raw(
                         callout_index,
                         data,
@@ -389,8 +382,7 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                     )
                 }
                 ::arena0::Event::TimerFired { timer } => {
-                    let mut local_ctx = __arena0_make_local_ctx(&input);
-                    let shared_bytes = __arena0_load_shared_bytes();
+                    let (mut local_ctx, shared_bytes) = __arena0_make_local_ctx(&input);
                     let outcome = match <#program_ty as ::arena0::Program>::on_timer(
                         &mut local_ctx,
                         timer,
