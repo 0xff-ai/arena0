@@ -11,7 +11,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use wasmtime::{Global, Instance, Memory, Store, StoreLimitsBuilder, Val};
 
 use super::memory::Guest;
-use super::{CallInstance, CallKind, InstanceConfig, instantiate_module, max_output};
+use super::{CallKind, InstanceConfig, instantiate_module, max_output};
 use crate::call::{DispatchCall, serialize};
 use crate::finalize::MUTABLE_GLOBAL_EXPORT_PREFIX;
 use crate::{
@@ -269,9 +269,6 @@ impl super::LoadedProgram {
         O: BorshDeserialize,
     {
         let bytes = encode_envelope(&input, self.profile.limits.max_call_envelope_bytes)?;
-        let bytes_len = u32::try_from(bytes.len()).map_err(|_| {
-            SandboxError::InputLimitExceeded("call input length overflows u32".into())
-        })?;
         let mut instance = instantiate_module(
             &self.engine,
             &self.module,
@@ -283,46 +280,15 @@ impl super::LoadedProgram {
                 dispatch,
             },
         )?;
-        let input_ptr = {
-            let mut guest = Guest::new(&mut instance.store, &instance.instance);
-            let ptr = guest.alloc(bytes_len)?;
-            guest.write_mem_charged(ptr, &bytes, self.profile.limits.max_host_bytes)?;
-            ptr
-        };
-        let returned = {
-            let mut guest = Guest::new(&mut instance.store, &instance.instance);
-            guest.call_pair_return(export, input_ptr, bytes_len)?
-        };
-        let output = self.decode_result::<O>(&mut instance, returned.0, returned.1)?;
-        {
-            let mut guest = Guest::new(&mut instance.store, &instance.instance);
-            guest.zero_mem(input_ptr, bytes_len)?;
-            guest.dealloc(input_ptr, bytes_len)?;
-        }
-        let fuel_used = self.profile.fuel.per_call.saturating_sub(
-            instance
-                .store
-                .get_fuel()
-                .unwrap_or(self.profile.fuel.per_call),
-        );
-        let observations = instance.store.data_mut().finish_observations(fuel_used)?;
-        Ok((output, observations))
-    }
-
-    fn decode_result<O: BorshDeserialize>(
-        &self,
-        instance: &mut CallInstance,
-        ptr: u32,
-        len: u32,
-    ) -> Result<O, SandboxError> {
-        decode_output(
+        let (output, fuel_used) = call_export(
             &mut instance.store,
             &instance.instance,
-            ptr,
-            len,
-            self.profile.limits.max_call_envelope_bytes,
-            self.profile.limits.max_host_bytes,
-        )
+            &self.profile,
+            export,
+            &bytes,
+        )?;
+        let observations = instance.store.data_mut().finish_observations(fuel_used)?;
+        Ok((output, observations))
     }
 }
 
@@ -347,6 +313,44 @@ fn encode_envelope<T: BorshSerialize>(value: &T, max_bytes: u64) -> Result<Vec<u
 ///
 /// This is the single output-direction bound check shared by the fresh
 /// (`decode_result`) and resident (`decode_resident_result`) paths.
+/// Run one guest export on an encoded call envelope: copy it into a guest
+/// allocation, call `export`, decode the returned envelope, then zero and
+/// release the input. Returns the output and the fuel the call used.
+fn call_export<O: BorshDeserialize>(
+    store: &mut Store<super::HostState>,
+    instance: &Instance,
+    profile: &arena0_program::ExecutionProfile,
+    export: &str,
+    bytes: &[u8],
+) -> Result<(O, u64), SandboxError> {
+    let bytes_len = u32::try_from(bytes.len())
+        .map_err(|_| SandboxError::InputLimitExceeded("call input length overflows u32".into()))?;
+    let max_host = profile.limits.max_host_bytes;
+    let (input_ptr, (output_ptr, output_len)) = {
+        let mut guest = Guest::new(store, instance);
+        let input_ptr = guest.alloc(bytes_len)?;
+        guest.write_mem_charged(input_ptr, bytes, max_host)?;
+        (
+            input_ptr,
+            guest.call_pair_return(export, input_ptr, bytes_len)?,
+        )
+    };
+    let output = decode_output(
+        store,
+        instance,
+        output_ptr,
+        output_len,
+        profile.limits.max_call_envelope_bytes,
+        max_host,
+    )?;
+    let mut guest = Guest::new(store, instance);
+    guest.zero_mem(input_ptr, bytes_len)?;
+    guest.dealloc(input_ptr, bytes_len)?;
+    let per_call = profile.fuel.per_call;
+    let fuel_used = per_call.saturating_sub(store.get_fuel().unwrap_or(per_call));
+    Ok((output, fuel_used))
+}
+
 fn decode_output<O: BorshDeserialize>(
     store: &mut Store<super::HostState>,
     instance: &Instance,
@@ -544,32 +548,20 @@ impl ProgramInstance {
         signer: Option<std::sync::Arc<dyn crate::GuestSigner>>,
     ) -> Result<DispatchCallResult, SandboxError> {
         let bytes = encode_envelope(&input, self.profile.limits.max_call_envelope_bytes)?;
-        let bytes_len = u32::try_from(bytes.len()).map_err(|_| {
-            SandboxError::InputLimitExceeded("dispatch input length overflows u32".into())
-        })?;
         if let Err(error) = self.reset_for_dispatch(dispatch, outgoing_len) {
             return self.rollback_error(error);
         }
         // A signer is installed only for this dispatch; any rollback path
         // clears it together with the rest of the per-call host state.
         self.store.data_mut().signer.install(signer);
-        let input_ptr_result = {
-            let mut guest = Guest::new(&mut self.store, &self.instance);
-            guest.alloc(bytes_len).and_then(|ptr| {
-                guest
-                    .write_mem_charged(ptr, &bytes, self.profile.limits.max_host_bytes)
-                    .map(|()| ptr)
-            })
-        };
-        let input_ptr = input_ptr_result.or_else(|error| self.rollback_error(error))?;
-        let returned = {
-            let mut guest = Guest::new(&mut self.store, &self.instance);
-            guest.call_pair_return(abi::exports::DISPATCH, input_ptr, bytes_len)
-        };
-        let returned = returned.or_else(|error| self.rollback_error(error))?;
-        let output = self
-            .decode_resident_result(returned.0, returned.1)
-            .or_else(|error| self.rollback_error(error))?;
+        let (output, fuel_used) = call_export::<DispatchOutput>(
+            &mut self.store,
+            &self.instance,
+            &self.profile,
+            abi::exports::DISPATCH,
+            &bytes,
+        )
+        .or_else(|error| self.rollback_error(error))?;
         if output.status == CallStatus::Accepted
             && let Some(callout) = &output.callout
             && let Err(error) =
@@ -577,20 +569,6 @@ impl ProgramInstance {
         {
             return self.rollback_error(error);
         }
-        {
-            let mut guest = Guest::new(&mut self.store, &self.instance);
-            if let Err(error) = guest
-                .zero_mem(input_ptr, bytes_len)
-                .and_then(|()| guest.dealloc(input_ptr, bytes_len))
-            {
-                return self.rollback_error(error);
-            }
-        }
-        let fuel_used = self
-            .profile
-            .fuel
-            .per_call
-            .saturating_sub(self.store.get_fuel().unwrap_or(self.profile.fuel.per_call));
         // A rejected handler has no state or observation commit semantics.
         // Restore before inspecting its candidate frames so malformed or
         // oversized guest writes cannot turn a normal rejection into a
@@ -638,21 +616,6 @@ impl ProgramInstance {
             local: Some(local),
             observations,
         })
-    }
-
-    fn decode_resident_result(
-        &mut self,
-        ptr: u32,
-        len: u32,
-    ) -> Result<DispatchOutput, SandboxError> {
-        decode_output(
-            &mut self.store,
-            &self.instance,
-            ptr,
-            len,
-            self.profile.limits.max_call_envelope_bytes,
-            self.profile.limits.max_host_bytes,
-        )
     }
 
     fn validate_payloads(
