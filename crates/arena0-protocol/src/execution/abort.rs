@@ -85,45 +85,25 @@ pub struct AbortOccurrence {
     sender: PeerId,
     kind: AbortKind,
     code: u32,
-    #[borsh(
-        serialize_with = "bounded::write_string::<MAX_TERMINAL_REASON_BYTES>",
-        deserialize_with = "bounded::read_string::<MAX_TERMINAL_REASON_BYTES>"
-    )]
+    #[borsh(serialize_with = "bounded::write_string::<MAX_TERMINAL_REASON_BYTES>")]
     reason: String,
     coordinate: StepCursor,
     signature: Ed25519Signature,
 }
 
-#[derive(BorshDeserialize)]
-struct AbortOccurrenceRaw {
-    domain: [u8; 24],
-    version: u16,
-    session_id: SessionHash,
-    sender: PeerId,
-    kind: AbortKind,
-    code: u32,
-    #[borsh(
-        serialize_with = "bounded::write_string::<MAX_TERMINAL_REASON_BYTES>",
-        deserialize_with = "bounded::read_string::<MAX_TERMINAL_REASON_BYTES>"
-    )]
-    reason: String,
-    coordinate: StepCursor,
-    signature: Ed25519Signature,
-}
-
+// Reads the derived field layout, then rejects an invalid shape.
 impl BorshDeserialize for AbortOccurrence {
     fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
-        let raw = AbortOccurrenceRaw::deserialize_reader(reader)?;
         let occurrence = Self {
-            domain: raw.domain,
-            version: raw.version,
-            session_id: raw.session_id,
-            sender: raw.sender,
-            kind: raw.kind,
-            code: raw.code,
-            reason: raw.reason,
-            coordinate: raw.coordinate,
-            signature: raw.signature,
+            domain: BorshDeserialize::deserialize_reader(reader)?,
+            version: BorshDeserialize::deserialize_reader(reader)?,
+            session_id: BorshDeserialize::deserialize_reader(reader)?,
+            sender: BorshDeserialize::deserialize_reader(reader)?,
+            kind: BorshDeserialize::deserialize_reader(reader)?,
+            code: BorshDeserialize::deserialize_reader(reader)?,
+            reason: bounded::read_string::<MAX_TERMINAL_REASON_BYTES>(reader)?,
+            coordinate: BorshDeserialize::deserialize_reader(reader)?,
+            signature: BorshDeserialize::deserialize_reader(reader)?,
         };
         occurrence.validate_shape().map_err(|error| {
             borsh::io::Error::new(borsh::io::ErrorKind::InvalidData, error.to_string())
