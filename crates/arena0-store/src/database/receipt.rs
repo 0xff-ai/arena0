@@ -310,9 +310,13 @@ impl Database {
         Ok(())
     }
 
+    /// Validate one execution's publication rows against its already
+    /// validated agreed `trace`. This is the only open-time decode of a
+    /// produced artifact; [`Self::validate_receipts`] skips produced rows.
     pub(super) fn validate_terminal_rows(
         &mut self,
         state: &ExecutionState,
+        trace: &[arena0_protocol::TraceEntry],
     ) -> Result<(), StoreError> {
         let execution_id = state.execution_id();
         let count: i64 = self.connection.query_row(
@@ -342,12 +346,7 @@ impl Database {
         let row = self
             .receipt_row_by_id(receipt_id)?
             .ok_or_else(|| StoreError::Corruption("published receipt row is missing".into()))?;
-        let bytes = open_envelope(
-            EnvelopeKind::Receipt,
-            &row.artifact,
-            arena0_protocol::MAX_RECEIPT_BYTES,
-        )?;
-        let receipt = ReceiptArtifact::decode(&bytes)?;
+        let receipt = self.decode_stored_receipt(row)?.receipt;
         // End confirmations advance local state after publication without
         // changing any portable evidence or the publication's original version.
         if sqlite_i64(version)? > state.version().get()
@@ -361,7 +360,7 @@ impl Database {
                 "terminal record does not match published execution state".into(),
             ));
         }
-        if receipt.body().trace() != self.load_agreed_trace_in_transaction(state)? {
+        if receipt.body().trace() != trace {
             return Err(StoreError::Corruption(
                 "receipt trace does not match durable public commits".into(),
             ));
@@ -385,9 +384,7 @@ impl Database {
                 }
             }
         }
-        if row.session_id != state.binding().session_id().0.to_vec()
-            || row.kind != artifact_kind(&receipt)
-        {
+        if receipt.body().header().session_hash() != state.binding().session_id() {
             return Err(StoreError::Corruption(
                 "receipt artifact does not match terminal publication".into(),
             ));
@@ -432,6 +429,11 @@ impl Database {
             };
             let full_page = ids.len() == DATABASE_VALIDATION_PAGE_SIZE as usize;
             for receipt_id in ids {
+                // Produced artifacts were decoded with their execution by
+                // `validate_terminal_rows`, which requires this relation.
+                if self.receipt_production(receipt_id)?.is_some() {
+                    continue;
+                }
                 let row = self.receipt_row_by_id(receipt_id)?.ok_or_else(|| {
                     StoreError::Corruption("receipt disappeared while validating".into())
                 })?;

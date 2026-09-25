@@ -288,9 +288,9 @@ impl Database {
         state: &ExecutionState,
     ) -> Result<(), StoreError> {
         self.validate_event_rows(state)?;
-        self.validate_agreed_rows(state)?;
+        let trace = self.validate_agreed_rows(state)?;
         self.validate_timer_rows(state)?;
-        self.validate_terminal_rows(state)?;
+        self.validate_terminal_rows(state, &trace)?;
         Ok(())
     }
 
@@ -562,28 +562,7 @@ impl Database {
         }
         drop(rows);
         drop(statement);
-        let mut participants = state
-            .binding()
-            .activation()
-            .tickets()
-            .iter()
-            .filter_map(|ticket| match &ticket.data.action {
-                arena0_protocol::TicketAction::Active { execution_bls, .. } => {
-                    Some((ticket.data.signer, *execution_bls))
-                }
-                arena0_protocol::TicketAction::Withdrawn => None,
-            })
-            .collect::<Vec<_>>();
-        participants.sort_by_key(|(peer, _)| *peer);
-        if participants.len() != state.binding().activation().tickets().len() {
-            return Err(StoreError::Corruption(
-                "activation contains a non-active participant ticket".into(),
-            ));
-        }
-        let keys = participants.iter().map(|(_, key)| *key).collect::<Vec<_>>();
         let mut trace = Vec::with_capacity(raw.len());
-        let mut cursor_state = state.binding().activation().offer().data().initial_state;
-        let mut cursor_link = arena0_protocol::CHAIN_START;
         let mut trace_bytes = 0u64;
         for (index, (step, origin_event_position, version, artifact, entry_hash)) in
             raw.into_iter().enumerate()
@@ -632,36 +611,12 @@ impl Database {
                     "agreed step index does not match entry".into(),
                 ));
             }
-            if entry.pre_state != cursor_state {
-                return Err(StoreError::Corruption(
-                    "agreed trace pre-state does not match cursor".into(),
-                ));
-            }
-            let commitment =
-                StepCommitment::for_entry(state.binding().session_id(), &entry, cursor_link);
-            if commitment.post_state != entry.post_state
-                || !entry.agreement.signers.is_full(keys.len())
-            {
-                return Err(StoreError::Corruption(
-                    "agreed trace commitment is inconsistent".into(),
-                ));
-            }
-            entry
-                .agreement
-                .verify_signatures(step, &commitment.signing_bytes(), &keys)
-                .map_err(|error| StoreError::Corruption(format!("agreed signature: {error}")))?;
-            cursor_state = entry.post_state;
-            cursor_link = commitment.link_hash();
             trace_bytes += borsh::object_length(&entry)
                 .map_err(|error| StoreError::Corruption(format!("trace size: {error}")))?
                 as u64;
             trace.push(entry);
         }
-        if trace.len() as u64 != state.agreed_step()
-            || trace_bytes != state.trace_bytes()
-            || cursor_state != state.agreed_state()
-            || cursor_link != state.agreed_link()
-        {
+        if trace.len() as u64 != state.agreed_step() || trace_bytes != state.trace_bytes() {
             return Err(StoreError::Corruption(
                 "agreed trace does not match execution cursor".into(),
             ));
@@ -844,12 +799,22 @@ impl Database {
         Ok(())
     }
 
+    /// Load the agreed trace and authenticate it once, through the protocol's
+    /// own certified-trace validation, against the execution cursor.
     pub(super) fn validate_agreed_rows(
         &mut self,
         state: &ExecutionState,
-    ) -> Result<(), StoreError> {
-        let _ = self.load_agreed_trace_in_transaction(state)?;
-        Ok(())
+    ) -> Result<Vec<arena0_protocol::TraceEntry>, StoreError> {
+        let trace = self.load_agreed_trace_in_transaction(state)?;
+        let cursor = arena0_protocol::validate_agreed_trace(state.binding(), &trace)
+            .map_err(|error| StoreError::Corruption(format!("agreed trace: {error}")))?;
+        if cursor.state_hash() != state.agreed_state() || cursor.chain_hash() != state.agreed_link()
+        {
+            return Err(StoreError::Corruption(
+                "agreed trace does not match execution cursor".into(),
+            ));
+        }
+        Ok(trace)
     }
 
     pub(super) fn validate_timer_rows(&mut self, state: &ExecutionState) -> Result<(), StoreError> {

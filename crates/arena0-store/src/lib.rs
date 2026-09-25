@@ -25,8 +25,7 @@ use arena0_protocol::execution::{
 };
 use arena0_protocol::{
     Activation, ExecId, ExecLifecycle, ExecutionAdmission, LocalStateBytes, NegotiationTarget,
-    PeerId, PreparedActivation, ProtocolError, SessionHash, SharedStateBytes, StepCommitment,
-    TimerPayload,
+    PeerId, PreparedActivation, ProtocolError, SessionHash, SharedStateBytes, TimerPayload,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 use rusqlite::{Connection, OptionalExtension, params};
