@@ -54,6 +54,41 @@ pub enum EventSource {
     },
 }
 
+impl EventSource {
+    /// The most specific source for an execution: its session once the
+    /// execution aggregate exists, else its negotiation, else the bare
+    /// execution (an open Join can fail before it accepts an offer, so no
+    /// negotiation identity exists yet).
+    #[must_use]
+    pub const fn most_specific(
+        peer_id: PeerId,
+        exec_id: ExecId,
+        program_id: ProgramHash,
+        negotiation_id: Option<NegotiationId>,
+        session_hash: Option<SessionHash>,
+    ) -> Self {
+        match (session_hash, negotiation_id) {
+            (Some(session_hash), _) => Self::Session {
+                peer_id,
+                exec_id,
+                program_id,
+                session_hash,
+            },
+            (None, Some(negotiation_id)) => Self::Negotiation {
+                peer_id,
+                exec_id,
+                program_id,
+                negotiation_id,
+            },
+            (None, None) => Self::Execution {
+                peer_id,
+                exec_id,
+                program_id,
+            },
+        }
+    }
+}
+
 /// Safe negotiation progress and decisions.
 #[derive(Debug, Clone, PartialEq, Eq, Valuable, serde::Serialize, serde::Deserialize)]
 pub enum NegotiationEvent {

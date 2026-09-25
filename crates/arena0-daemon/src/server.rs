@@ -3890,29 +3890,13 @@ impl HostService {
 
 fn recovery_event_source(peer_id: PeerId, candidate: &RecoveryCandidate) -> EventSource {
     let request = candidate.request();
-    match (candidate.has_execution(), candidate.session_id()) {
-        (true, Some(session_hash)) => EventSource::Session {
-            peer_id,
-            exec_id: request.execution_id(),
-            program_id: request.program_hash(),
-            session_hash,
-        },
-        _ => match request.negotiation_id() {
-            Some(negotiation_id) => EventSource::Negotiation {
-                peer_id,
-                exec_id: request.execution_id(),
-                program_id: request.program_hash(),
-                negotiation_id,
-            },
-            // An open Join may fail before any offer is accepted, so no
-            // negotiation identity exists for its recovery event.
-            None => EventSource::Execution {
-                peer_id,
-                exec_id: request.execution_id(),
-                program_id: request.program_hash(),
-            },
-        },
-    }
+    EventSource::most_specific(
+        peer_id,
+        request.execution_id(),
+        request.program_hash(),
+        request.negotiation_id(),
+        candidate.session_id().filter(|_| candidate.has_execution()),
+    )
 }
 
 fn recovery_reason(reason: String) -> String {

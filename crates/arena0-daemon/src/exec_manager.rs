@@ -121,31 +121,17 @@ impl ExecutionHandle {
     /// Build the source for a safe daemon event from durable request and
     /// activation facts.
     pub(crate) async fn event_source(&self) -> anyhow::Result<EventSource> {
-        let peer_id = self.store.host_id();
-        let program_id = self.program_id().await?;
-        if let Some(state) = self.execution().await? {
-            return Ok(EventSource::Session {
-                peer_id,
-                exec_id: self.exec_id,
-                program_id,
-                session_hash: state.binding().session_id(),
-            });
-        }
-        match self.negotiation_id().await? {
-            Some(negotiation_id) => Ok(EventSource::Negotiation {
-                peer_id,
-                exec_id: self.exec_id,
-                program_id,
-                negotiation_id,
-            }),
-            // An open Join can fail before it accepts an offer, so there is
-            // no negotiation identity to attach to its terminal event.
-            None => Ok(EventSource::Execution {
-                peer_id,
-                exec_id: self.exec_id,
-                program_id,
-            }),
-        }
+        let session_hash = self
+            .execution()
+            .await?
+            .map(|state| state.binding().session_id());
+        Ok(EventSource::most_specific(
+            self.store.host_id(),
+            self.exec_id,
+            self.program_id().await?,
+            self.negotiation_id().await?,
+            session_hash,
+        ))
     }
 
     pub(crate) async fn await_state(
@@ -675,12 +661,13 @@ impl Supervisor {
             let state = self.entry.execution().await.ok().flatten()?;
             let binding = state.binding();
             self.session = Some(SessionFacts {
-                source: EventSource::Session {
-                    peer_id: self.entry.store.host_id(),
-                    exec_id: self.entry.exec_id,
-                    program_id: binding.program_hash(),
-                    session_hash: binding.session_id(),
-                },
+                source: EventSource::most_specific(
+                    self.entry.store.host_id(),
+                    self.entry.exec_id,
+                    binding.program_hash(),
+                    None,
+                    Some(binding.session_id()),
+                ),
                 ensemble: binding.participants().collect(),
             });
         }
