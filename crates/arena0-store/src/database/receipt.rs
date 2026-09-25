@@ -59,7 +59,7 @@ impl Database {
         let Some(row) = self.receipt_row_by_id(receipt_id)? else {
             return Ok(None);
         };
-        let stored = self.decode_stored_receipt(row)?;
+        let (stored, _) = self.decode_stored_receipt(row)?;
         if stored.receipt_id != receipt_id {
             return Err(StoreError::Corruption(
                 "receipt id lookup returned a different artifact".into(),
@@ -68,7 +68,14 @@ impl Database {
         Ok(Some(stored))
     }
 
-    fn decode_stored_receipt(&mut self, row: RawReceiptRow) -> Result<StoredReceipt, StoreError> {
+    /// Decode one receipt row, checking its id, session and kind indexes
+    /// against the artifact and, for a produced artifact, that the producing
+    /// execution is this Host's ended execution of the same session. Returns
+    /// the producing execution alongside the artifact.
+    fn decode_stored_receipt(
+        &mut self,
+        row: RawReceiptRow,
+    ) -> Result<(StoredReceipt, Option<ExecId>), StoreError> {
         let payload = open_envelope(
             EnvelopeKind::Receipt,
             &row.artifact,
@@ -109,14 +116,15 @@ impl Database {
                 ));
             }
         }
-        Ok(StoredReceipt {
+        let stored = StoredReceipt {
             receipt_id,
             provenance: ReceiptProvenance::from_facts(imported, produced_execution.is_some())
                 .ok_or_else(|| {
                     StoreError::Corruption("receipt artifact has no provenance fact".into())
                 })?,
             receipt,
-        })
+        };
+        Ok((stored, produced_execution))
     }
 
     fn receipt_import_exists(&self, receipt_id: ReceiptId) -> Result<bool, StoreError> {
@@ -316,11 +324,14 @@ impl Database {
         let row = self
             .receipt_row_by_id(receipt_id)?
             .ok_or_else(|| StoreError::Corruption("published receipt row is missing".into()))?;
-        let receipt = self.decode_stored_receipt(row)?.receipt;
-        if receipt.receipt_id() != receipt_id
+        // The row decode checks the id and session indexes and binds the
+        // production to this Host's execution of that session. The session
+        // itself derives from the activation compared here.
+        let (stored, production) = self.decode_stored_receipt(row)?;
+        let receipt = stored.receipt;
+        if production != Some(execution_id)
             || receipt.body().header().activation != *state.binding().activation()
             || state.producer() != self.host_id
-            || self.receipt_production(receipt_id)? != Some(execution_id)
         {
             return Err(StoreError::Corruption(
                 "terminal record does not match published execution state".into(),
@@ -349,11 +360,6 @@ impl Database {
                     ));
                 }
             }
-        }
-        if receipt.body().header().session_hash() != state.binding().session_id() {
-            return Err(StoreError::Corruption(
-                "receipt artifact does not match terminal publication".into(),
-            ));
         }
         Ok(())
     }
