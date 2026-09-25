@@ -19,8 +19,8 @@ static SHARED_TEST_ENGINE: OnceLock<Arc<WasmtimeEngine>> = OnceLock::new();
 /// One persistent engine per test process.
 ///
 /// The engine is built once (first caller wins) with
-/// [`WasmtimeEngine::new_persistent`] on [`resolve_test_cache_dir`] applied to
-/// the process environment, which is created if missing. Tests that
+/// [`WasmtimeEngine::new_persistent`] on a cache directory resolved from
+/// the process environment and created if missing. Tests that
 /// specifically exercise engine configuration or cache behaviour keep their
 /// own engines; every other test loads programs through this one so each
 /// guest module is compiled once.
@@ -54,7 +54,7 @@ pub fn shared_test_engine() -> Arc<WasmtimeEngine> {
 /// resolves the same directory. `Path::join` with an absolute argument yields
 /// that argument, so absolute inputs pass through unchanged.
 #[must_use]
-pub fn resolve_test_cache_dir(
+pub(crate) fn resolve_test_cache_dir(
     override_dir: Option<PathBuf>,
     cargo_target_dir: Option<PathBuf>,
     workspace_root: &Path,
