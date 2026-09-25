@@ -46,12 +46,12 @@ impl BorshSerialize for FetchFrame {
                 response
                     .validate()
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+                // `validate` bounds the frame body size.
                 let tickets = response
                     .tickets
                     .iter()
                     .map(borsh::to_vec)
                     .collect::<io::Result<Vec<_>>>()?;
-                check_response_len(&tickets, io::ErrorKind::InvalidInput)?;
                 BorshSerialize::serialize(&FETCH_KIND_RESPONSE, writer)?;
                 BorshSerialize::serialize(&response.session_hash, writer)?;
                 write_collection_len(writer, tickets.len(), MAX_FETCH_TICKETS, "fetch.tickets")?;
@@ -110,16 +110,23 @@ impl BorshDeserialize for FetchFrame {
 // Every variable-length field is bounded before allocation.
 impl WireDecode for FetchFrame {}
 
-/// Reject a response whose encoded body (kind, routing key, collection
-/// length, and each length-prefixed ticket) exceeds
-/// [`MAX_FETCH_RESPONSE_BYTES`].
-fn check_response_len(tickets: &[Vec<u8>], kind: io::ErrorKind) -> io::Result<()> {
-    let size = tickets
-        .iter()
-        .try_fold(1 + 32 + 4, |total: usize, ticket| {
-            total.checked_add(4)?.checked_add(ticket.len())
+/// The encoded body size of a response frame whose tickets encode to
+/// `ticket_lens` bytes: kind, routing key, collection length, and each
+/// length-prefixed ticket. This is the one size [`MAX_FETCH_RESPONSE_BYTES`]
+/// bounds; saturates on overflow.
+pub(crate) fn response_body_len(ticket_lens: impl IntoIterator<Item = usize>) -> usize {
+    ticket_lens
+        .into_iter()
+        .try_fold(1 + 32 + 4, |total: usize, len| {
+            total.checked_add(4)?.checked_add(len)
         })
-        .unwrap_or(usize::MAX);
+        .unwrap_or(usize::MAX)
+}
+
+/// Reject encoded tickets whose response body exceeds
+/// [`MAX_FETCH_RESPONSE_BYTES`], before any ticket is decoded.
+fn check_response_len(tickets: &[Vec<u8>], kind: io::ErrorKind) -> io::Result<()> {
+    let size = response_body_len(tickets.iter().map(Vec::len));
     if size > MAX_FETCH_RESPONSE_BYTES {
         return Err(io::Error::new(
             kind,
@@ -204,6 +211,11 @@ mod tests {
             assert_eq!(
                 borsh::to_vec(&frame).unwrap(),
                 borsh::to_vec(&derived).unwrap()
+            );
+            // `ActivationTickets::validate` bounds exactly this body size.
+            assert_eq!(
+                response_body_len(tickets.iter().map(|t| borsh::object_length(t).unwrap())),
+                borsh::to_vec(&frame).unwrap().len()
             );
             let encoded = codec().encode(&frame).unwrap();
             assert_eq!(codec().decode::<FetchFrame>(&encoded).unwrap(), frame);

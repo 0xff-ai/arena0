@@ -340,7 +340,10 @@ mod tests {
         for (field, invalid) in [
             ("version", serde_json::json!(0)),
             ("sender", serde_json::to_value(PeerId([0; 32])).unwrap()),
-            ("reason", serde_json::json!("x".repeat(MAX_TERMINAL_REASON_BYTES + 1))),
+            (
+                "reason",
+                serde_json::json!("x".repeat(MAX_TERMINAL_REASON_BYTES + 1)),
+            ),
         ] {
             let mut tampered = json.clone();
             tampered[field] = invalid;

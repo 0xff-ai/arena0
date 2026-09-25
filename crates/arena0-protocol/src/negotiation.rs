@@ -1467,7 +1467,8 @@ pub struct ActivationTickets {
 }
 
 impl ActivationTickets {
-    /// Validate the ticket count and the bounded encoded response size.
+    /// Validate the ticket count and the encoded size of the fetch frame that
+    /// carries this response.
     pub fn validate(&self) -> Result<(), NegotiationError> {
         if self.tickets.len() > MAX_FETCH_TICKETS {
             return Err(NegotiationError::FetchTooManyTickets {
@@ -1478,9 +1479,11 @@ impl ActivationTickets {
         for ticket in &self.tickets {
             ticket.validate()?;
         }
-        let len = borsh::to_vec(self)
-            .expect("ActivationTickets is serializable")
-            .len();
+        let len = crate::fetch_frame::response_body_len(
+            self.tickets
+                .iter()
+                .map(|ticket| borsh::object_length(ticket).expect("a ticket is serializable")),
+        );
         if len > MAX_FETCH_RESPONSE_BYTES {
             return Err(NegotiationError::FetchResponseTooLarge {
                 max: MAX_FETCH_RESPONSE_BYTES,
