@@ -352,7 +352,8 @@ struct SpawnPlan {
     actor_execution_key: ExecutionKey,
     execution_store: HostExecutionStore,
     /// Whether the actor's observations replay a session this Host already
-    /// reported, so the supervisor must not project them again.
+    /// reported (an end wake), so the supervisor must not project them again
+    /// and the ended session gets no relay.
     replay: bool,
 }
 
@@ -3239,8 +3240,9 @@ impl HostService {
         // The post-commit relay: session-lived, re-emits the final offer and
         // the exact tickets on the program topic and serves the convergence
         // fetch from the committed ActivationRecord. The creator is the
-        // convergence authority: only it relays.
-        if self.peer_id == committed.activation().offer().data().creator {
+        // convergence authority: only it relays. An end wake resumes a
+        // session that already ended, so it has nothing to relay.
+        if !replay && self.peer_id == committed.activation().offer().data().creator {
             let relay = Arc::clone(self);
             self.tasks
                 .lock()
@@ -3740,13 +3742,20 @@ impl HostService {
                 return;
             }
         };
+        if entry
+            .lifecycle()
+            .await
+            .is_ok_and(ExecLifecycle::is_terminal)
+        {
+            return;
+        }
         let mut fetch_rx = self.runtime.register_fetch_handler(session_hash);
         let bootstrap = committed
             .activation()
             .prepared()
             .signers()
             .collect::<Vec<_>>();
-        let topic = match self
+        let mut topic = match self
             .subscribe_negotiation(program_id, bootstrap.clone())
             .await
         {
@@ -3756,15 +3765,6 @@ impl HostService {
                 None
             }
         };
-        if entry
-            .lifecycle()
-            .await
-            .is_ok_and(ExecLifecycle::is_terminal)
-        {
-            self.runtime.unregister_fetch_handler(session_hash);
-            return;
-        }
-        let mut topic = topic;
         let mut cadence = tokio::time::interval(Duration::from_millis(RELAY_CADENCE_MS));
         loop {
             tokio::select! {
@@ -5073,10 +5073,12 @@ mod tests {
                     .expect("load wake candidate")
                     .expect("ended execution is a wake candidate");
                 let mut events = daemon.events.subscribe();
+                let tasks_before = daemon.tasks.lock().await.len();
                 daemon
                     .resume_candidate(candidate, cause)
                     .await
                     .expect("resume");
+                let spawned_tasks = daemon.tasks.lock().await.len() - tasks_before;
                 assert!(daemon.execs.get(&execution_id).is_some(), "actor resumed");
                 let mut observed = Vec::new();
                 let _ = tokio::time::timeout(Duration::from_secs(2), async {
@@ -5088,14 +5090,19 @@ mod tests {
                 })
                 .await;
                 daemon.execs.stop().await;
-                observed
+                (observed, spawned_tasks)
             }
         };
 
-        // A peer's wake only finishes end confirmation.
-        assert_eq!(wake(ResumeCause::EndWake).await, Vec::new());
+        // A peer's wake only finishes end confirmation: no replayed
+        // observations and no session relay for the creator.
+        assert_eq!(wake(ResumeCause::EndWake).await, (Vec::new(), 0));
         // Startup recovery reports the same execution to a new observer.
-        let observed = wake(ResumeCause::Startup).await;
+        let (observed, spawned_tasks) = wake(ResumeCause::Startup).await;
+        assert_eq!(
+            spawned_tasks, 1,
+            "startup recovery starts the creator's relay"
+        );
         assert!(
             observed
                 .iter()
