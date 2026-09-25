@@ -319,7 +319,7 @@ fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
     if module_has_fn(items, "callout") {
         methods.push(quote! {
             fn callout(
-                ctx: &::arena0::CalloutContext<'_, Self::Shared, Self::Local>,
+                ctx: &::arena0::CalloutContext<Self::Shared, Self::Local>,
             ) -> ::core::option::Option<Self::Callout> {
                 self::callout(ctx)
             }

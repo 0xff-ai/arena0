@@ -212,7 +212,7 @@ pub mod contract_net {
         Ok(Transition::Stay)
     }
 
-    fn callout(ctx: &CalloutContext<'_, Shared, Local>) -> Option<Callout> {
+    fn callout(ctx: &CalloutContext<Shared, Local>) -> Option<Callout> {
         (ctx.shared().phase() == Phase::CollectingOffers
             && ctx.me() != COORDINATOR
             && ctx.shared().expected_writer() == Some(ctx.me())

@@ -351,7 +351,8 @@ impl<P: Program> TestHarness<P> {
         let pre_state = shared_hash_snapshot(&pre_snapshot);
         let shared = std::mem::take(&mut self.shared);
         let local = std::mem::take(&mut self.local);
-        let mut ctx = Context::__new(shared, local, self.peer_id);
+        // SAFETY: the native harness dispatches an agreed event here.
+        let mut ctx = unsafe { Context::__new(shared, local, self.peer_id) };
         if let Some(ref ensemble) = self.committed_ensemble {
             let participant = ensemble
                 .participant_of(&self.peer_id)
@@ -376,12 +377,9 @@ impl<P: Program> TestHarness<P> {
             }
         };
 
-        let callout_request = if failed {
-            None
-        } else {
-            P::callout(&ctx.__callout_context())
-        };
-        let (mut shared, mut local, _) = ctx.__into_parts();
+        let ctx = ctx.__read();
+        let callout_request = if failed { None } else { P::callout(&ctx) };
+        let (mut shared, mut local) = ctx.__into_parts();
         let mut effects = drain_effects();
         let logs = if failed {
             // Faults roll back the complete dispatch observation. In
@@ -505,12 +503,13 @@ impl<P: Program> TestHarness<P> {
                 .unwrap_or(true);
         // A changed shared image rejects the dispatch before any callout is
         // derived.
+        let ctx = ctx.__read();
         let callout_request = if failed || shared_changed {
             None
         } else {
-            P::callout(&ctx.__callout_context())
+            P::callout(&ctx)
         };
-        let mut local = ctx.__into_local();
+        let mut local = ctx.__into_parts().1;
         let mut shared: P::Shared =
             borsh::from_slice(&pre_snapshot).expect("shared state deserialization");
         let mut effects = drain_effects();
@@ -621,7 +620,8 @@ impl<P: Program> TestHarness<P> {
         let pre_state = shared_hash_snapshot(&pre_snapshot);
         let shared = std::mem::take(&mut self.shared);
         let local = std::mem::take(&mut self.local);
-        let mut ctx = Context::__new(shared, local, self.peer_id);
+        // SAFETY: the native harness dispatches an agreed event here.
+        let mut ctx = unsafe { Context::__new(shared, local, self.peer_id) };
         if let Some(ref ensemble) = self.committed_ensemble {
             let participant = ensemble
                 .participant_of(&self.peer_id)
@@ -652,12 +652,13 @@ impl<P: Program> TestHarness<P> {
             }
         };
 
+        let ctx = ctx.__read();
         let callout_request = if failed || rejected {
             None
         } else {
-            P::callout(&ctx.__callout_context())
+            P::callout(&ctx)
         };
-        let (mut shared, mut local, _) = ctx.__into_parts();
+        let (mut shared, mut local) = ctx.__into_parts();
         let mut effects = drain_effects();
 
         if rejected {

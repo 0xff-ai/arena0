@@ -285,7 +285,7 @@ pub mod rock_paper_scissors {
         Ok(Transition::To(Phase::Playing))
     }
 
-    fn callout(ctx: &CalloutContext<'_, Shared, Local>) -> Option<Callout> {
+    fn callout(ctx: &CalloutContext<Shared, Local>) -> Option<Callout> {
         (ctx.shared().commit_reveal.expected_writer() == Some(ctx.me())
             && ctx
                 .shared()

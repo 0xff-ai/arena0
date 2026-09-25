@@ -140,7 +140,7 @@ pub mod minimal_choice {
         Ok(Transition::To(Phase::Choosing))
     }
 
-    fn callout(ctx: &CalloutContext<'_, Shared, Local>) -> Option<Callout> {
+    fn callout(ctx: &CalloutContext<Shared, Local>) -> Option<Callout> {
         (!ctx.local().choice_pending && writer(ctx.shared()) == Some(ctx.me())).then(|| {
             let previous = ctx.shared().choices.iter().flatten().next().copied();
             callouts::Choose { previous }.into()

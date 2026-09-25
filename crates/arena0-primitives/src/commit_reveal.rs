@@ -194,6 +194,7 @@ where
     Shared: Primitive,
     Local: CommitRevealLocalState<T>,
     T: BorshSerialize + Clone,
+    Mode: arena0::EffectMode,
 {
     fn needs_commit(mut self) -> bool {
         self.with_shared_local(|cr, local| cr.needs_commit(local.commit_reveal_local()))
@@ -228,7 +229,7 @@ where
 }
 
 impl<Shared, Local, T, Route> CommitRevealFieldExt<T, Route>
-    for PrimitiveField<'_, Shared, Local, CommitReveal<T>, Route, arena0::MutablePrimitive>
+    for PrimitiveField<'_, Shared, Local, CommitReveal<T>, Route, arena0::AgreedMode>
 where
     Shared: Primitive,
     Local: CommitRevealLocalState<T>,

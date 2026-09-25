@@ -22,14 +22,121 @@ use crate::effects;
 use crate::timer::IntoTimerEffect;
 use crate::{Program, Transition};
 
-/// Dispatch context passed to every mutating handler.
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Which handler a [`Ctx`] serves. Sealed: the SDK defines every mode.
+pub trait Mode: sealed::Sealed {}
+
+/// A mode whose handler may change local state and emit effects.
 ///
-/// One context owns both replicated shared state and participant-local state.
-/// Handlers may update either state and emit effects during the same semantic
-/// dispatch. The Host treats both values as one dispatch result, restoring both
-/// on rejection or fault and persisting/promoting them atomically at the
-/// applicable agreement boundary.
-pub struct Context<Shared, Local = ()> {
+/// Emission takes the handle, so only an effect-bearing context of the same mode can emit.
+/// A callout has no effect handle:
+///
+/// ```compile_fail
+/// fn emit(mut ctx: arena0::CalloutContext<(), ()>) {
+///     let _ = ctx.effects();
+/// }
+/// ```
+///
+/// A local handler cannot select agreed broadcast semantics:
+///
+/// ```compile_fail
+/// use arena0::{AgreedMode, EffectMode, LocalContext};
+/// fn emit(ctx: &mut LocalContext<(), ()>) {
+///     <AgreedMode as EffectMode>::__broadcast(&mut ctx.effects(), Vec::new());
+/// }
+/// ```
+///
+/// Nor can safe code build an agreed context to borrow its handle:
+///
+/// ```compile_fail
+/// fn emit(ctx: &arena0::CalloutContext<(), ()>) {
+///     let mut forged = arena0::Context::<(), ()>::__new((), (), ctx.identity());
+///     forged.effects().broadcast(&0u8);
+/// }
+/// ```
+pub trait EffectMode: Mode + Sized {
+    /// The result of one broadcast: `()` for agreed handlers,
+    /// `Result<(), BroadcastError>` for local handlers.
+    type Broadcast;
+
+    #[doc(hidden)]
+    fn __broadcast<Shared>(
+        effects: &mut Effects<'_, Shared, Self>,
+        bytes: Vec<u8>,
+    ) -> Self::Broadcast;
+
+    /// Emit every message in order.
+    #[doc(hidden)]
+    fn __broadcast_all<Shared>(
+        effects: &mut Effects<'_, Shared, Self>,
+        bytes: impl IntoIterator<Item = Vec<u8>>,
+    ) -> Self::Broadcast;
+}
+
+/// An agreed handler (`on_session_started`, `on_message`): it may change
+/// shared state, and its broadcast cannot fail.
+#[derive(Debug, Clone, Copy)]
+pub struct AgreedMode;
+
+/// A local handler (`on_input`, `on_timer`): shared state is read-only, a
+/// broadcast can fail with [`BroadcastError::QueueFull`], and it may `sign`.
+#[derive(Debug, Clone, Copy)]
+pub struct LocalMode;
+
+/// The read-only view `callout` receives.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadMode;
+
+impl sealed::Sealed for AgreedMode {}
+impl sealed::Sealed for LocalMode {}
+impl sealed::Sealed for ReadMode {}
+impl Mode for AgreedMode {}
+impl Mode for LocalMode {}
+impl Mode for ReadMode {}
+
+impl EffectMode for AgreedMode {
+    type Broadcast = ();
+
+    fn __broadcast<Shared>(_: &mut Effects<'_, Shared, Self>, bytes: Vec<u8>) -> Self::Broadcast {
+        let queued = effects::host_broadcast(&bytes);
+        debug_assert!(queued.is_ok(), "an agreed broadcast always queues");
+    }
+
+    fn __broadcast_all<Shared>(
+        effects: &mut Effects<'_, Shared, Self>,
+        bytes: impl IntoIterator<Item = Vec<u8>>,
+    ) -> Self::Broadcast {
+        for b in bytes {
+            Self::__broadcast(effects, b);
+        }
+    }
+}
+
+impl EffectMode for LocalMode {
+    type Broadcast = Result<(), BroadcastError>;
+
+    fn __broadcast<Shared>(_: &mut Effects<'_, Shared, Self>, bytes: Vec<u8>) -> Self::Broadcast {
+        effects::host_broadcast(&bytes)
+    }
+
+    fn __broadcast_all<Shared>(
+        _: &mut Effects<'_, Shared, Self>,
+        bytes: impl IntoIterator<Item = Vec<u8>>,
+    ) -> Self::Broadcast {
+        let mut result = Ok(());
+        for b in bytes {
+            result = result.and(effects::host_broadcast(&b));
+        }
+        result
+    }
+}
+
+/// Dispatch context for one program handler. `M` selects what the handler may
+/// do: see [`AgreedMode`], [`LocalMode`] and [`ReadMode`].
+pub struct Ctx<Shared, Local = (), M = AgreedMode> {
     shared: Shared,
     local: Local,
     peer_id: PeerId,
@@ -40,11 +147,33 @@ pub struct Context<Shared, Local = ()> {
     /// full participant set), so it is authoritative for participant resolution without
     /// being re-hashed into program shared state.
     committed_ensemble: Option<Ensemble<Committed>>,
+    _mode: PhantomData<M>,
 }
 
-impl<Shared: std::fmt::Debug, Local: std::fmt::Debug> std::fmt::Debug for Context<Shared, Local> {
+/// Dispatch context passed to every mutating handler.
+///
+/// One context owns both replicated shared state and participant-local state.
+/// Handlers may update either state and emit effects during the same semantic
+/// dispatch. The Host treats both values as one dispatch result, restoring both
+/// on rejection or fault and persisting/promoting them atomically at the
+/// applicable agreement boundary.
+pub type Context<Shared, Local = ()> = Ctx<Shared, Local, AgreedMode>;
+
+/// Dispatch context for local handlers.
+///
+/// A local event may not change agreed shared state, so this context owns the
+/// shared value privately and exposes it read-only. It provides the participant,
+/// local-state, effect, random, log, and primitive author helpers, plus the
+/// synchronous [`sign`](Self::sign) host call. It has no way to extract or
+/// reconstruct a mutable shared image.
+pub type LocalContext<Shared, Local = ()> = Ctx<Shared, Local, LocalMode>;
+
+/// Read-only context for `callout`.
+pub type CalloutContext<Shared, Local = ()> = Ctx<Shared, Local, ReadMode>;
+
+impl<Shared: std::fmt::Debug, Local: std::fmt::Debug, M> std::fmt::Debug for Ctx<Shared, Local, M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Context")
+        f.debug_struct("Ctx")
             .field("shared", &self.shared)
             .field("local", &self.local)
             .field("peer_id", &self.peer_id)
@@ -53,44 +182,7 @@ impl<Shared: std::fmt::Debug, Local: std::fmt::Debug> std::fmt::Debug for Contex
     }
 }
 
-impl<Shared, Local> Context<Shared, Local> {
-    #[doc(hidden)]
-    pub fn __new(shared: Shared, local: Local, peer_id: PeerId) -> Self {
-        Self {
-            shared,
-            local,
-            peer_id,
-            remote_peer: None,
-            participant: None,
-            committed_ensemble: None,
-        }
-    }
-
-    #[doc(hidden)]
-    pub fn __into_parts(self) -> (Shared, Local, PeerId) {
-        (self.shared, self.local, self.peer_id)
-    }
-
-    /// Shared state visible to every participant.
-    pub fn shared(&self) -> &Shared {
-        &self.shared
-    }
-
-    /// Mutably borrow replicated shared state for this event.
-    pub fn shared_mut(&mut self) -> &mut Shared {
-        &mut self.shared
-    }
-
-    /// Mutably borrow both state values for a coordinated update.
-    pub fn state_mut(&mut self) -> (&mut Shared, &mut Local) {
-        (&mut self.shared, &mut self.local)
-    }
-
-    /// Apply a shared-state mutation through a closure.
-    pub fn mutate_shared<R>(&mut self, f: impl FnOnce(&mut Shared) -> R) -> R {
-        f(&mut self.shared)
-    }
-
+impl<Shared, Local, M: Mode> Ctx<Shared, Local, M> {
     #[doc(hidden)]
     pub fn __set_participant(&mut self, participant: Participant) {
         self.participant = Some(participant);
@@ -114,14 +206,33 @@ impl<Shared, Local> Context<Shared, Local> {
         self.committed_ensemble.as_ref()
     }
 
+    #[doc(hidden)]
+    pub fn __into_parts(self) -> (Shared, Local) {
+        (self.shared, self.local)
+    }
+
+    /// Convert into the read-only view `callout` receives. Moves the fields; nothing is copied.
+    #[doc(hidden)]
+    pub fn __read(self) -> CalloutContext<Shared, Local> {
+        Ctx {
+            shared: self.shared,
+            local: self.local,
+            peer_id: self.peer_id,
+            remote_peer: self.remote_peer,
+            participant: self.participant,
+            committed_ensemble: self.committed_ensemble,
+            _mode: PhantomData,
+        }
+    }
+
+    /// Shared state visible to every participant.
+    pub fn shared(&self) -> &Shared {
+        &self.shared
+    }
+
     /// Shared reference to local, participant-private state.
     pub fn local(&self) -> &Local {
         &self.local
-    }
-
-    /// Mutable reference to local, participant-private state.
-    pub fn local_mut(&mut self) -> &mut Local {
-        &mut self.local
     }
 
     /// The identity of the local node running this program instance.
@@ -259,6 +370,13 @@ impl<Shared, Local> Context<Shared, Local> {
     pub fn my_index(&self) -> usize {
         self.me().index()
     }
+}
+
+impl<Shared, Local, M: EffectMode> Ctx<Shared, Local, M> {
+    /// Mutable reference to local, participant-private state.
+    pub fn local_mut(&mut self) -> &mut Local {
+        &mut self.local
+    }
 
     /// Atomic local mutation without access to effects.
     pub fn mutate_local<R>(&mut self, f: impl FnOnce(&mut Local) -> R) -> R {
@@ -345,9 +463,9 @@ impl<Shared, Local> Context<Shared, Local> {
         &mut self,
         field: for<'b> fn(&'b mut Shared) -> &'b mut P,
         shared_field: for<'b> fn(&'b Shared) -> &'b P,
-    ) -> PrimitiveField<'_, Shared, Local, P> {
+    ) -> PrimitiveField<'_, Shared, Local, P, RawPrimitiveRoute, M> {
         PrimitiveField {
-            ctx: PrimitiveCtx::Mutable(self),
+            ctx: self,
             field,
             shared_field,
             _marker: PhantomData,
@@ -361,13 +479,62 @@ impl<Shared, Local> Context<Shared, Local> {
         &mut self,
         field: for<'b> fn(&'b mut Shared) -> &'b mut P,
         shared_field: for<'b> fn(&'b Shared) -> &'b P,
-    ) -> PrimitiveField<'_, Shared, Local, P, Route> {
+    ) -> PrimitiveField<'_, Shared, Local, P, Route, M> {
         PrimitiveField {
-            ctx: PrimitiveCtx::Mutable(self),
+            ctx: self,
             field,
             shared_field,
             _marker: PhantomData,
         }
+    }
+
+    /// Borrow the side-effect handle without access to state.
+    ///
+    /// The returned [`Effects`] handle can emit dispatch effects, but cannot
+    /// read or mutate program state.
+    pub fn effects(&mut self) -> Effects<'_, Shared, M> {
+        Effects {
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<Shared, Local> Ctx<Shared, Local, AgreedMode> {
+    /// Build the context for one agreed dispatch.
+    ///
+    /// # Safety
+    ///
+    /// Only the dispatch of an agreed event may build this context. Its
+    /// effect handle emits with agreed semantics, so a context built inside a
+    /// callout or local handler would let that handler broadcast outside its
+    /// mode. Generated dispatch glue and the native dispatch harness meet
+    /// this precondition.
+    #[doc(hidden)]
+    pub unsafe fn __new(shared: Shared, local: Local, peer_id: PeerId) -> Self {
+        Self {
+            shared,
+            local,
+            peer_id,
+            remote_peer: None,
+            participant: None,
+            committed_ensemble: None,
+            _mode: PhantomData,
+        }
+    }
+
+    /// Mutably borrow replicated shared state for this event.
+    pub fn shared_mut(&mut self) -> &mut Shared {
+        &mut self.shared
+    }
+
+    /// Mutably borrow both state values for a coordinated update.
+    pub fn state_mut(&mut self) -> (&mut Shared, &mut Local) {
+        (&mut self.shared, &mut self.local)
+    }
+
+    /// Apply a shared-state mutation through a closure.
+    pub fn mutate_shared<R>(&mut self, f: impl FnOnce(&mut Shared) -> R) -> R {
+        f(&mut self.shared)
     }
 
     /// Apply one lifecycle transition after the handler has mutated state.
@@ -387,28 +554,47 @@ impl<Shared, Local> Context<Shared, Local> {
             Transition::Abort(reason) => effects::host_abort_session(reason.as_str()),
         }
     }
+}
 
-    /// Borrow the side-effect handle without access to state.
+impl<Shared, Local> Ctx<Shared, Local, LocalMode> {
+    /// Build the context for one local dispatch.
     ///
-    /// The returned [`Effects`] handle can emit dispatch effects, but cannot
-    /// read or mutate program state.
-    pub fn effects(&mut self) -> Effects<'_, Shared, AgreedEffects> {
-        Effects {
-            _marker: PhantomData,
+    /// # Safety
+    ///
+    /// The caller must pass this dispatch's committed shared image and its
+    /// durable local image, and the shared value must be exactly the one the
+    /// Host will compare against. `callout` derives from the shared image, so
+    /// passing any other value would let a local handler expose a replacement
+    /// view to `callout`, influencing a callout from state the Host never
+    /// commits. Generated dispatch glue and the native dispatch harness meet
+    /// this precondition; a test may deliberately violate it only to exercise
+    /// the byte guard that rejects the resulting dispatch.
+    #[doc(hidden)]
+    pub unsafe fn __new(shared: Shared, local: Local, peer_id: PeerId) -> Self {
+        Self {
+            shared,
+            local,
+            peer_id,
+            remote_peer: None,
+            participant: None,
+            committed_ensemble: None,
+            _mode: PhantomData,
         }
     }
 
-    /// The read-only view a program's `callout` function receives.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn __callout_context(&self) -> CalloutContext<'_, Shared, Local> {
-        CalloutContext {
-            shared: &self.shared,
-            local: &self.local,
-            peer_id: self.peer_id,
-            remote_peer: self.remote_peer,
-            participant: self.participant,
-            committed_ensemble: self.committed_ensemble.as_ref(),
+    /// Sign `payload` synchronously with the participant's host key.
+    ///
+    /// The host builds a versioned, execution-bound preimage from the dispatch
+    /// coordinates and returns both that exact preimage and its signature; both
+    /// schemes are deterministic, so re-running the handler after a crash
+    /// produces the same signature. Available only in local handlers
+    /// (`InputReceived`, `TimerFired`) whose program declared a `Sign`
+    /// capability for the requested scheme.
+    pub fn sign(&mut self, scheme: SignScheme, payload: &[u8]) -> Signed {
+        let (signed_bytes, signature) = effects::host_guest_sign(scheme, payload);
+        Signed {
+            signed_bytes,
+            signature,
         }
     }
 }
@@ -433,530 +619,14 @@ impl std::fmt::Display for BroadcastError {
 
 impl std::error::Error for BroadcastError {}
 
-/// Dispatch context for local handlers.
-///
-/// A local event may not change agreed shared state, so this context owns the
-/// shared value privately and exposes it read-only. It provides the participant,
-/// local-state, effect, random, log, and primitive author helpers, plus the
-/// synchronous [`sign`](Self::sign) host call. It has no way to extract or
-/// reconstruct a mutable shared image.
-pub struct LocalContext<Shared, Local = ()> {
-    shared: Shared,
-    local: Local,
-    peer_id: PeerId,
-    remote_peer: Option<PeerId>,
-    participant: Option<Participant>,
-    committed_ensemble: Option<Ensemble<Committed>>,
-}
-
-impl<Shared: std::fmt::Debug, Local: std::fmt::Debug> std::fmt::Debug
-    for LocalContext<Shared, Local>
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LocalContext")
-            .field("shared", &self.shared)
-            .field("local", &self.local)
-            .field("peer_id", &self.peer_id)
-            .field("participant", &self.participant)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<Shared, Local> LocalContext<Shared, Local> {
-    /// Build the context for one local dispatch.
-    ///
-    /// # Safety
-    ///
-    /// The caller must pass this dispatch's committed shared image and its
-    /// durable local image, and the shared value must be exactly the one the
-    /// Host will compare against. `callout` derives from the shared image, so
-    /// passing any other value would let a local handler expose a replacement
-    /// view to `callout`, influencing a callout from state the Host never
-    /// commits. Generated dispatch glue and the native dispatch harness meet
-    /// this precondition; a test may deliberately violate it only to exercise
-    /// the byte guard that rejects the resulting dispatch.
-    #[doc(hidden)]
-    pub unsafe fn __new(shared: Shared, local: Local, peer_id: PeerId) -> Self {
-        Self {
-            shared,
-            local,
-            peer_id,
-            remote_peer: None,
-            participant: None,
-            committed_ensemble: None,
-        }
-    }
-
-    /// Consume the context and return the local state.
-    ///
-    /// Generated dispatch glue uses this to store the accepted local image; the
-    /// shared image is written back from the original Host bytes, never from
-    /// this context.
-    #[doc(hidden)]
-    pub fn __into_local(self) -> Local {
-        self.local
-    }
-
-    /// Shared state visible to every participant, read-only.
-    pub fn shared(&self) -> &Shared {
-        &self.shared
-    }
-
-    #[doc(hidden)]
-    pub fn __set_participant(&mut self, participant: Participant) {
-        self.participant = Some(participant);
-    }
-
-    #[doc(hidden)]
-    pub fn __set_remote_peer(&mut self, peer: PeerId) {
-        self.remote_peer = Some(peer);
-    }
-
-    #[doc(hidden)]
-    pub fn __set_committed_ensemble(&mut self, ensemble: Ensemble<Committed>) {
-        self.committed_ensemble = Some(ensemble);
-    }
-
-    /// The confirmed session ensemble, or `None` before a session starts.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn __committed_ensemble(&self) -> Option<&Ensemble<Committed>> {
-        self.committed_ensemble.as_ref()
-    }
-
-    /// Shared reference to local, participant-private state.
-    pub fn local(&self) -> &Local {
-        &self.local
-    }
-
-    /// Mutable reference to local, participant-private state.
-    pub fn local_mut(&mut self) -> &mut Local {
-        &mut self.local
-    }
-
-    /// The identity of the local node running this program instance.
-    pub fn identity(&self) -> PeerId {
-        self.peer_id
-    }
-
-    /// The confirmed session ensemble in canonical order.
-    ///
-    /// # Panics
-    /// Panics if called before a session is established.
-    pub fn ensemble(&self) -> &Ensemble<Committed> {
-        self.committed_ensemble
-            .as_ref()
-            .expect("no session ensemble (called before the session started)")
-    }
-
-    /// The remote transport peer in this bilateral session.
-    ///
-    /// # Panics
-    /// Panics if called before a session is established.
-    pub fn peer(&self) -> PeerId {
-        self.remote_peer.expect("no bilateral session established")
-    }
-
-    /// This node's participant identity in the active session.
-    ///
-    /// # Panics
-    /// Panics if called before a session is established.
-    pub fn me(&self) -> Participant {
-        self.participant
-            .expect("participant not assigned (no active session)")
-    }
-
-    /// The other participant in a bilateral session.
-    ///
-    /// # Panics
-    /// Panics if called before a session is established.
-    pub fn other(&self) -> Participant {
-        self.me().other()
-    }
-
-    /// The local session role for role enums derived from participant identity.
-    pub fn role<Role>(&self) -> Role
-    where
-        Role: From<Participant>,
-    {
-        Role::from(self.me())
-    }
-
-    /// Convert a domain role back to its canonical session participant.
-    pub fn participant<Role>(&self, role: Role) -> Participant
-    where
-        Role: Into<Participant>,
-    {
-        let participant = role.into();
-        if let Some(ensemble) = self.committed_ensemble.as_ref() {
-            assert!(
-                ensemble.peer_at(participant).is_some(),
-                "participant {} is not in the committed ensemble",
-                participant.index()
-            );
-        } else {
-            assert!(
-                participant.index() < 2,
-                "role maps to participant {} outside this bilateral session",
-                participant.index()
-            );
-        }
-        participant
-    }
-
-    /// Resolve a session participant to its transport identity.
-    pub fn peer_for(&self, participant: Participant) -> PeerId {
-        if let Some(ensemble) = self.committed_ensemble.as_ref() {
-            return ensemble
-                .peer_at(participant)
-                .expect("participant is not in the committed ensemble");
-        }
-        if participant == self.me() {
-            self.peer_id
-        } else if participant == self.other() {
-            self.peer()
-        } else {
-            panic!(
-                "participant {} is not in this bilateral session",
-                participant.index()
-            );
-        }
-    }
-
-    /// Resolve a transport peer in the active session to a participant.
-    ///
-    /// # Panics
-    /// Panics if `peer` is outside the active bilateral ensemble.
-    pub fn participant_for_peer(&self, peer: PeerId) -> Participant {
-        if let Some(ensemble) = self.committed_ensemble.as_ref() {
-            return ensemble
-                .participant_of(&peer)
-                .expect("peer is not in the committed ensemble");
-        }
-        if peer == self.peer_id {
-            self.me()
-        } else if Some(peer) == self.remote_peer {
-            self.other()
-        } else {
-            panic!("peer {peer} is not in this session");
-        }
-    }
-
-    /// Local participant index in the active session's canonical ensemble.
-    pub fn my_index(&self) -> usize {
-        self.me().index()
-    }
-
-    /// Atomic local mutation without access to effects.
-    pub fn mutate_local<R>(&mut self, f: impl FnOnce(&mut Local) -> R) -> R {
-        f(&mut self.local)
-    }
-
-    /// Run a primitive helper with an immutable view of its shared field and
-    /// mutable access to the program's local state.
-    pub(crate) fn __with_shared_local<P, R>(
-        &mut self,
-        field: for<'b> fn(&'b Shared) -> &'b P,
-        f: impl FnOnce(&P, &mut Local) -> R,
-    ) -> R {
-        let primitive = field(&self.shared);
-        f(primitive, &mut self.local)
-    }
-
-    /// Emit an informational local diagnostic log.
-    pub fn log(&mut self, msg: &str) {
-        self.log_level(LogLevel::Info, msg);
-    }
-
-    /// Emit a local diagnostic log at the given level.
-    pub fn log_level(&mut self, level: LogLevel, msg: &str) {
-        effects::host_log(level, msg);
-    }
-
-    /// Fill `buf` with host-provided random bytes.
-    pub fn random(&mut self, buf: &mut [u8]) {
-        effects::host_random(buf);
-    }
-
-    /// Fill a fixed-size array with host-provided random bytes.
-    pub fn random_bytes<const N: usize>(&mut self) -> [u8; N] {
-        let mut buf = [0u8; N];
-        effects::host_random(&mut buf);
-        buf
-    }
-
-    /// Pure synchronous cryptographic helpers.
-    pub fn crypto(&self) -> Crypto {
-        Crypto
-    }
-
-    /// Convert a primitive-produced peer message into a detached broadcast output.
-    pub fn primitive_output<T>(&mut self, msg: T) -> PrimitiveOutput<T> {
-        PrimitiveOutput {
-            message: msg,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Convert multiple primitive peer messages into a detached broadcast batch.
-    pub fn primitive_outputs<T>(
-        &mut self,
-        messages: impl IntoIterator<Item = T>,
-    ) -> PrimitiveOutputs<T> {
-        PrimitiveOutputs {
-            outputs: messages
-                .into_iter()
-                .map(|msg| PrimitiveOutput {
-                    message: msg,
-                    _marker: PhantomData,
-                })
-                .collect(),
-        }
-    }
-
-    /// Build a read-only primitive handle for a generated `#[arena0::state]`
-    /// field.
-    ///
-    /// The returned handle has no shared-mutation method, so a local handler
-    /// cannot change agreed shared state through a primitive.
-    #[doc(hidden)]
-    pub fn __primitive_field<P>(
-        &mut self,
-        field: for<'b> fn(&'b mut Shared) -> &'b mut P,
-        shared_field: for<'b> fn(&'b Shared) -> &'b P,
-    ) -> PrimitiveField<'_, Shared, Local, P, RawPrimitiveRoute, LocalPrimitive> {
-        PrimitiveField {
-            ctx: PrimitiveCtx::Local(self),
-            field,
-            shared_field,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Build a route-aware read-only primitive handle for a generated field.
-    #[doc(hidden)]
-    pub fn __primitive_field_routed<P, Route>(
-        &mut self,
-        field: for<'b> fn(&'b mut Shared) -> &'b mut P,
-        shared_field: for<'b> fn(&'b Shared) -> &'b P,
-    ) -> PrimitiveField<'_, Shared, Local, P, Route, LocalPrimitive> {
-        PrimitiveField {
-            ctx: PrimitiveCtx::Local(self),
-            field,
-            shared_field,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Borrow the side-effect handle without access to state.
-    pub fn effects(&mut self) -> Effects<'_, Shared, LocalEffects> {
-        Effects {
-            _marker: PhantomData,
-        }
-    }
-
-    /// Sign `payload` synchronously with the participant's host key.
-    ///
-    /// The host builds a versioned, execution-bound preimage from the dispatch
-    /// coordinates and returns both that exact preimage and its signature; both
-    /// schemes are deterministic, so re-running the handler after a crash
-    /// produces the same signature. Available only in local handlers
-    /// (`InputReceived`, `TimerFired`) whose program declared a `Sign`
-    /// capability for the requested scheme.
-    pub fn sign(&mut self, scheme: SignScheme, payload: &[u8]) -> Signed {
-        let (signed_bytes, signature) = effects::host_guest_sign(scheme, payload);
-        Signed {
-            signed_bytes,
-            signature,
-        }
-    }
-
-    /// The read-only view a program's `callout` function receives.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn __callout_context(&self) -> CalloutContext<'_, Shared, Local> {
-        CalloutContext {
-            shared: &self.shared,
-            local: &self.local,
-            peer_id: self.peer_id,
-            remote_peer: self.remote_peer,
-            participant: self.participant,
-            committed_ensemble: self.committed_ensemble.as_ref(),
-        }
-    }
-}
-
-/// The read-only context a program's `callout` function receives.
-///
-/// It borrows the shared and local state, so a callout can inspect state but
-/// never change it. Both [`Context`] and [`LocalContext`] produce one.
-pub struct CalloutContext<'a, Shared, Local = ()> {
-    shared: &'a Shared,
-    local: &'a Local,
-    peer_id: PeerId,
-    remote_peer: Option<PeerId>,
-    participant: Option<Participant>,
-    committed_ensemble: Option<&'a Ensemble<Committed>>,
-}
-
-impl<Shared: std::fmt::Debug, Local: std::fmt::Debug> std::fmt::Debug
-    for CalloutContext<'_, Shared, Local>
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CalloutContext")
-            .field("shared", &self.shared)
-            .field("local", &self.local)
-            .field("participant", &self.participant)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<Shared, Local> CalloutContext<'_, Shared, Local> {
-    /// Shared state visible to every participant.
-    pub fn shared(&self) -> &Shared {
-        self.shared
-    }
-
-    /// Local, participant-private state.
-    pub fn local(&self) -> &Local {
-        self.local
-    }
-
-    /// The identity of the local node running this program instance.
-    pub fn identity(&self) -> PeerId {
-        self.peer_id
-    }
-
-    /// The confirmed session ensemble in canonical order.
-    ///
-    /// # Panics
-    /// Panics if called before a session is established.
-    pub fn ensemble(&self) -> &Ensemble<Committed> {
-        self.committed_ensemble
-            .expect("no session ensemble (called before the session started)")
-    }
-
-    /// The remote transport peer in this bilateral session.
-    ///
-    /// # Panics
-    /// Panics if called before a session is established.
-    pub fn peer(&self) -> PeerId {
-        self.remote_peer.expect("no bilateral session established")
-    }
-
-    /// This node's participant identity in the active session.
-    ///
-    /// # Panics
-    /// Panics if called before a session is established.
-    pub fn me(&self) -> Participant {
-        self.participant
-            .expect("participant not assigned (no active session)")
-    }
-
-    /// The other participant in a bilateral session.
-    ///
-    /// # Panics
-    /// Panics if called before a session is established.
-    pub fn other(&self) -> Participant {
-        self.me().other()
-    }
-
-    /// The local session role for role enums derived from participant identity.
-    pub fn role<Role>(&self) -> Role
-    where
-        Role: From<Participant>,
-    {
-        Role::from(self.me())
-    }
-
-    /// Convert a domain role back to its canonical session participant.
-    pub fn participant<Role>(&self, role: Role) -> Participant
-    where
-        Role: Into<Participant>,
-    {
-        let participant = role.into();
-        if let Some(ensemble) = self.committed_ensemble {
-            assert!(
-                ensemble.peer_at(participant).is_some(),
-                "participant {} is not in the committed ensemble",
-                participant.index()
-            );
-        } else {
-            assert!(
-                participant.index() < 2,
-                "role maps to participant {} outside this bilateral session",
-                participant.index()
-            );
-        }
-        participant
-    }
-
-    /// Resolve a session participant to its transport identity.
-    pub fn peer_for(&self, participant: Participant) -> PeerId {
-        if let Some(ensemble) = self.committed_ensemble {
-            return ensemble
-                .peer_at(participant)
-                .expect("participant is not in the committed ensemble");
-        }
-        if participant == self.me() {
-            self.peer_id
-        } else if participant == self.other() {
-            self.peer()
-        } else {
-            panic!(
-                "participant {} is not in this bilateral session",
-                participant.index()
-            );
-        }
-    }
-
-    /// Resolve a transport peer in the active session to a participant.
-    ///
-    /// # Panics
-    /// Panics if `peer` is outside the active bilateral ensemble.
-    pub fn participant_for_peer(&self, peer: PeerId) -> Participant {
-        if let Some(ensemble) = self.committed_ensemble {
-            return ensemble
-                .participant_of(&peer)
-                .expect("peer is not in the committed ensemble");
-        }
-        if peer == self.peer_id {
-            self.me()
-        } else if Some(peer) == self.remote_peer {
-            self.other()
-        } else {
-            panic!("peer {peer} is not in this session");
-        }
-    }
-
-    /// Local participant index in the active session's canonical ensemble.
-    pub fn my_index(&self) -> usize {
-        self.me().index()
-    }
-}
-
 /// Host side-effect handle passed to [`Context::effects`].
 ///
 /// Provides methods to broadcast messages and set timers. Lifecycle
 /// transitions belong to the enclosing [`Context`], not this effect handle.
 /// The handle does not expose program state to the caller.
-pub struct Effects<'a, Shared, Mode = AgreedEffects> {
-    _marker: PhantomData<(&'a Shared, Mode)>,
+pub struct Effects<'a, Shared, M = AgreedMode> {
+    _marker: PhantomData<(&'a Shared, M)>,
 }
-
-/// Marker for an agreed handler's effect handle.
-///
-/// An agreed handler never observes the local outgoing queue, so its
-/// [`Effects::broadcast`] is infallible. See [`LocalEffects`].
-#[derive(Debug, Clone, Copy)]
-pub struct AgreedEffects;
-
-/// Marker for a local handler's effect handle.
-///
-/// A local handler observes the bounded outgoing queue, so its
-/// [`Effects::broadcast`] returns [`BroadcastError`].
-#[derive(Debug, Clone, Copy)]
-pub struct LocalEffects;
 
 /// Exact bytes and signature returned by one synchronous guest signing call.
 ///
@@ -1019,66 +689,15 @@ pub struct PrimitiveOutputs<T, Route = RawPrimitiveRoute> {
     outputs: Vec<PrimitiveOutput<T, Route>>,
 }
 
-/// Marker for a primitive field obtained from an agreed handler's [`Context`].
-#[derive(Debug, Clone, Copy)]
-pub struct MutablePrimitive;
-
-/// Marker for a primitive field obtained from a local handler's
-/// [`LocalContext`].
-#[derive(Debug, Clone, Copy)]
-pub struct LocalPrimitive;
-
-/// The context reference behind a primitive field.
-enum PrimitiveCtx<'a, Shared, Local> {
-    Mutable(&'a mut Context<Shared, Local>),
-    Local(&'a mut LocalContext<Shared, Local>),
-}
-
-impl<Shared, Local> PrimitiveCtx<'_, Shared, Local> {
-    fn me(&self) -> Participant {
-        match self {
-            Self::Mutable(ctx) => ctx.me(),
-            Self::Local(ctx) => ctx.me(),
-        }
-    }
-
-    fn __with_shared_local<P, R>(
-        &mut self,
-        field: for<'b> fn(&'b Shared) -> &'b P,
-        f: impl FnOnce(&P, &mut Local) -> R,
-    ) -> R {
-        match self {
-            Self::Mutable(ctx) => ctx.__with_shared_local(field, f),
-            Self::Local(ctx) => ctx.__with_shared_local(field, f),
-        }
-    }
-
-    fn mutate_local<R>(&mut self, f: impl FnOnce(&mut Local) -> R) -> R {
-        match self {
-            Self::Mutable(ctx) => ctx.mutate_local(f),
-            Self::Local(ctx) => ctx.mutate_local(f),
-        }
-    }
-
-    fn random_bytes<const N: usize>(&mut self) -> [u8; N] {
-        match self {
-            Self::Mutable(ctx) => ctx.random_bytes(),
-            Self::Local(ctx) => ctx.random_bytes(),
-        }
-    }
-}
-
 /// Generated handle for a primitive field.
 ///
-/// An agreed handler's field is mutable ([`MutablePrimitive`]); a local
-/// handler's field is read-only ([`LocalPrimitive`]) and has no
-/// [`PrimitiveField::mutate`] method.
-pub struct PrimitiveField<'a, Shared, Local, P, Route = RawPrimitiveRoute, Mode = MutablePrimitive>
-{
-    ctx: PrimitiveCtx<'a, Shared, Local>,
+/// An agreed handler's field is mutable; a local handler's field is
+/// read-only and has no [`PrimitiveField::mutate`] method.
+pub struct PrimitiveField<'a, Shared, Local, P, Route = RawPrimitiveRoute, M = AgreedMode> {
+    ctx: &'a mut Ctx<Shared, Local, M>,
     field: for<'b> fn(&'b mut Shared) -> &'b mut P,
     shared_field: for<'b> fn(&'b Shared) -> &'b P,
-    _marker: PhantomData<(Route, Mode)>,
+    _marker: PhantomData<Route>,
 }
 
 impl<Shared, Local, P, Route, Mode> std::fmt::Debug
@@ -1112,71 +731,56 @@ impl Crypto {
     }
 }
 
-impl<Shared: std::fmt::Debug, Mode> std::fmt::Debug for Effects<'_, Shared, Mode> {
+impl<Shared, M> std::fmt::Debug for Effects<'_, Shared, M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Effects").finish_non_exhaustive()
     }
 }
 
-/// A mode-specific broadcast sink used by detached primitive outputs.
-///
-/// An agreed handler's sink is infallible; a local handler's sink returns
-/// [`BroadcastError`]. Passing the enclosing context's `effects()` handle makes
-/// misuse a type error.
-#[doc(hidden)]
-pub trait BroadcastSink {
-    /// The mode-specific result of emitting one or more broadcasts.
-    type Output;
-
-    /// Emit one already-encoded message.
-    fn emit_broadcast(&mut self, bytes: Vec<u8>) -> Self::Output;
-
-    /// An empty batch result.
-    fn empty_output() -> Self::Output;
-
-    /// Combine two per-output results in order.
-    fn combine(first: Self::Output, second: Self::Output) -> Self::Output;
-}
-
-impl<Shared> BroadcastSink for Effects<'_, Shared, AgreedEffects> {
-    type Output = ();
-
-    fn emit_broadcast(&mut self, bytes: Vec<u8>) -> Self::Output {
-        let queued = effects::host_broadcast(&bytes);
-        debug_assert!(queued.is_ok(), "an agreed broadcast always queues");
+impl<Shared, M: EffectMode> Effects<'_, Shared, M> {
+    /// Broadcast a borsh-serialized message to every participant.
+    ///
+    /// The message is appended to this participant's durable outgoing queue. A
+    /// later dispatch authors the head when the `writer` projection selects
+    /// this participant; the author applies its own message through the same
+    /// `on_message` dispatch every receiver runs.
+    ///
+    /// In an agreed handler this cannot fail: an agreed handler never observes
+    /// the local queue, and if the agreed step would overflow the queue the
+    /// Host fails the session instead of signing it. In a local handler it
+    /// returns [`BroadcastError::QueueFull`] when the queue is full and queues
+    /// nothing.
+    pub fn broadcast<T: BorshSerialize>(&mut self, msg: &T) -> M::Broadcast {
+        M::__broadcast(self, borsh::to_vec(msg).expect("message serialization"))
     }
-
-    fn empty_output() -> Self::Output {}
-
-    fn combine(_first: Self::Output, _second: Self::Output) -> Self::Output {}
-}
-
-impl<Shared> BroadcastSink for Effects<'_, Shared, LocalEffects> {
-    type Output = Result<(), BroadcastError>;
-
-    fn emit_broadcast(&mut self, bytes: Vec<u8>) -> Self::Output {
-        effects::host_broadcast(&bytes)
-    }
-
-    fn empty_output() -> Self::Output {
-        Ok(())
-    }
-
-    fn combine(first: Self::Output, second: Self::Output) -> Self::Output {
-        first.and(second)
+    /// Schedule a timer.
+    ///
+    /// Untyped timers use a delay and the unit marker:
+    /// `ctx.effects().set_timer(1000, ())`.
+    ///
+    /// Typed timers use a program enum plus a duration:
+    /// `ctx.effects().set_timer(Timer::TurnDeadline, Duration::from_secs(60))`.
+    pub fn set_timer<A, B>(&mut self, timer: A, schedule: B)
+    where
+        (A, B): IntoTimerEffect,
+    {
+        let spec = (timer, schedule).into_timer_spec();
+        effects::host_set_timer_spec(&spec);
     }
 }
 
-impl<T, Route> PrimitiveOutput<T, Route>
-where
-    Route: PrimitiveRoute<T>,
-{
+impl<T, Route: PrimitiveRoute<T>> PrimitiveOutput<T, Route> {
     /// Broadcast this primitive output to every participant through the
     /// enclosing context's effect handle.
-    pub fn broadcast<S: BroadcastSink>(self, sink: &mut S) -> S::Output {
+    pub fn broadcast<Shared, M: EffectMode>(
+        self,
+        effects: &mut Effects<'_, Shared, M>,
+    ) -> M::Broadcast {
         let msg = Route::wrap(self.message);
-        let msg_bytes = borsh::to_vec(&msg).expect("primitive message serialization");
-        sink.emit_broadcast(msg_bytes)
+        M::__broadcast(
+            effects,
+            borsh::to_vec(&msg).expect("primitive message serialization"),
+        )
     }
 }
 
@@ -1184,14 +788,15 @@ impl<T, Route> PrimitiveOutput<T, Route> {
     /// Wrap this primitive output in a program-level peer-message envelope and
     /// broadcast it to every participant through the enclosing context's
     /// effect handle.
-    pub fn broadcast_via<W: BorshSerialize, S: BroadcastSink>(
+    pub fn broadcast_via<W: BorshSerialize, Shared, M: EffectMode>(
         self,
-        sink: &mut S,
+        effects: &mut Effects<'_, Shared, M>,
         wrap: impl FnOnce(T) -> W,
-    ) -> S::Output {
-        let msg_bytes =
-            borsh::to_vec(&wrap(self.message)).expect("primitive envelope serialization");
-        sink.emit_broadcast(msg_bytes)
+    ) -> M::Broadcast {
+        M::__broadcast(
+            effects,
+            borsh::to_vec(&wrap(self.message)).expect("primitive envelope serialization"),
+        )
     }
 }
 
@@ -1217,17 +822,20 @@ impl<T, Route> PrimitiveOutputs<T, Route> {
 
     /// Wrap and broadcast every output in this batch through the enclosing
     /// context's effect handle.
-    pub fn broadcast_via<W: BorshSerialize, S: BroadcastSink>(
+    pub fn broadcast_via<W: BorshSerialize, Shared, M: EffectMode>(
         self,
-        sink: &mut S,
+        effects: &mut Effects<'_, Shared, M>,
         mut wrap: impl FnMut(T) -> W,
-    ) -> S::Output {
-        let mut result = S::empty_output();
-        for output in self.outputs {
-            let next = output.broadcast_via(&mut *sink, &mut wrap);
-            result = S::combine(result, next);
-        }
-        result
+    ) -> M::Broadcast {
+        M::__broadcast_all(
+            effects,
+            self.outputs
+                .into_iter()
+                .map(|output| {
+                    borsh::to_vec(&wrap(output.message)).expect("primitive envelope serialization")
+                })
+                .collect::<Vec<_>>(),
+        )
     }
 
     /// Iterate over detached outputs for custom wrapping.
@@ -1236,23 +844,27 @@ impl<T, Route> PrimitiveOutputs<T, Route> {
     }
 }
 
-impl<T, Route> PrimitiveOutputs<T, Route>
-where
-    Route: PrimitiveRoute<T>,
-{
+impl<T, Route: PrimitiveRoute<T>> PrimitiveOutputs<T, Route> {
     /// Broadcast every output in this batch to every participant through the
     /// enclosing context's effect handle.
-    pub fn broadcast<S: BroadcastSink>(self, sink: &mut S) -> S::Output {
-        let mut result = S::empty_output();
-        for output in self.outputs {
-            let next = output.broadcast(&mut *sink);
-            result = S::combine(result, next);
-        }
-        result
+    pub fn broadcast<Shared, M: EffectMode>(
+        self,
+        effects: &mut Effects<'_, Shared, M>,
+    ) -> M::Broadcast {
+        M::__broadcast_all(
+            effects,
+            self.outputs
+                .into_iter()
+                .map(|output| {
+                    borsh::to_vec(&Route::wrap(output.message))
+                        .expect("primitive message serialization")
+                })
+                .collect::<Vec<_>>(),
+        )
     }
 }
 
-impl<Shared, Local, P, Route, Mode> PrimitiveField<'_, Shared, Local, P, Route, Mode> {
+impl<Shared, Local, P, Route, M: EffectMode> PrimitiveField<'_, Shared, Local, P, Route, M> {
     /// Return the participant identity associated with this dispatch.
     pub fn me(&self) -> Participant {
         self.ctx.me()
@@ -1299,63 +911,14 @@ impl<Shared, Local, P, Route, Mode> PrimitiveField<'_, Shared, Local, P, Route, 
     }
 }
 
-impl<Shared, Local, P, Route> PrimitiveField<'_, Shared, Local, P, Route, MutablePrimitive> {
+impl<Shared, Local, P, Route> PrimitiveField<'_, Shared, Local, P, Route, AgreedMode> {
     /// Mutate the primitive field as part of the current dispatch.
     ///
     /// Available only on an agreed handler's field; a local handler's field is
     /// read-only.
     pub fn mutate<R>(&mut self, f: impl FnOnce(&mut P) -> R) -> R {
         let field = self.field;
-        match &mut self.ctx {
-            PrimitiveCtx::Mutable(ctx) => ctx.mutate_shared(|shared| f(field(shared))),
-            PrimitiveCtx::Local(_) => unreachable!("a local primitive field is read-only"),
-        }
-    }
-}
-
-impl<Shared> Effects<'_, Shared, AgreedEffects> {
-    /// Broadcast a borsh-serialized message to every participant.
-    ///
-    /// The message is appended to this participant's durable outgoing queue. A
-    /// later dispatch authors the head when the `writer` projection selects
-    /// this participant; the author applies its own message through the same
-    /// `on_message` dispatch every receiver runs.
-    ///
-    /// An agreed handler never observes the local queue, so this cannot fail;
-    /// if the agreed step would overflow the queue the Host fails the session
-    /// instead of signing it.
-    pub fn broadcast<T: BorshSerialize>(&mut self, msg: &T) {
-        let msg_bytes = borsh::to_vec(msg).expect("message serialization");
-        let queued = effects::host_broadcast(&msg_bytes);
-        debug_assert!(queued.is_ok(), "an agreed broadcast always queues");
-    }
-}
-
-impl<Shared> Effects<'_, Shared, LocalEffects> {
-    /// Broadcast a borsh-serialized message to every participant.
-    ///
-    /// Returns [`BroadcastError::QueueFull`] when the queue is full; nothing is
-    /// queued in that case.
-    pub fn broadcast<T: BorshSerialize>(&mut self, msg: &T) -> Result<(), BroadcastError> {
-        let msg_bytes = borsh::to_vec(msg).expect("message serialization");
-        effects::host_broadcast(&msg_bytes)
-    }
-}
-
-impl<Shared, Mode> Effects<'_, Shared, Mode> {
-    /// Schedule a timer.
-    ///
-    /// Untyped timers use a delay and the unit marker:
-    /// `ctx.effects().set_timer(1000, ())`.
-    ///
-    /// Typed timers use a program enum plus a duration:
-    /// `ctx.effects().set_timer(Timer::TurnDeadline, Duration::from_secs(60))`.
-    pub fn set_timer<A, B>(&mut self, timer: A, schedule: B)
-    where
-        (A, B): IntoTimerEffect,
-    {
-        let spec = (timer, schedule).into_timer_spec();
-        effects::host_set_timer_spec(&spec);
+        self.ctx.mutate_shared(|shared| f(field(shared)))
     }
 }
 
@@ -1374,7 +937,8 @@ mod tests {
     impl Primitive for TestState {}
 
     fn make_ctx() -> Context<TestState> {
-        Context::__new(TestState::default(), (), PeerId([0; 32]))
+        // SAFETY: a unit test stands in for agreed dispatch glue.
+        unsafe { Context::__new(TestState::default(), (), PeerId([0; 32])) }
     }
 
     fn make_local_ctx() -> LocalContext<TestState> {

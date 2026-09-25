@@ -155,7 +155,7 @@ pub trait Program: Sized {
     /// withdraws it. A terminal transition has no callout regardless of this
     /// result. The callout is computed from state only; it must not depend on
     /// the dispatch that produced the state.
-    fn callout(_ctx: &CalloutContext<'_, Self::Shared, Self::Local>) -> Option<Self::Callout> {
+    fn callout(_ctx: &CalloutContext<Self::Shared, Self::Local>) -> Option<Self::Callout> {
         None
     }
 

@@ -238,7 +238,7 @@ impl Program for ReplacingLocalProgram {
         Ok(())
     }
 
-    fn callout(ctx: &CalloutContext<'_, Self::Shared, Self::Local>) -> Option<Self::Callout> {
+    fn callout(ctx: &CalloutContext<Self::Shared, Self::Local>) -> Option<Self::Callout> {
         ctx.shared().sender.is_none().then_some(())
     }
 }
@@ -353,7 +353,7 @@ impl Program for PoisoningLocalProgram {
         Ok(())
     }
 
-    fn callout(ctx: &CalloutContext<'_, Self::Shared, Self::Local>) -> Option<Self::Callout> {
+    fn callout(ctx: &CalloutContext<Self::Shared, Self::Local>) -> Option<Self::Callout> {
         (!ctx.shared().poison).then_some(())
     }
 }

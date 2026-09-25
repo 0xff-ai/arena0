@@ -66,7 +66,7 @@ pub mod local_context_forge {
         Ok(())
     }
 
-    fn callout(ctx: &CalloutContext<'_, Shared, Local>) -> Option<Callout> {
+    fn callout(ctx: &CalloutContext<Shared, Local>) -> Option<Callout> {
         (ctx.shared().marker != 0).then(|| Callout::Wait {
             marker: ctx.shared().marker,
         })

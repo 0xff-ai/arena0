@@ -447,7 +447,7 @@ pub mod chess {
     }
 
     /// Ask the participant whose turn it is for a legal move.
-    fn callout(ctx: &CalloutContext<'_, Shared, Local>) -> Option<Callout> {
+    fn callout(ctx: &CalloutContext<Shared, Local>) -> Option<Callout> {
         let state = ctx.shared();
         if state.phase() != Phase::Playing || state.status != Status::InProgress {
             return None;

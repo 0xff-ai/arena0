@@ -336,7 +336,7 @@ pub mod vickrey_auction {
         Ok(Transition::To(Phase::Bidding))
     }
 
-    fn callout(ctx: &CalloutContext<'_, Shared, Local>) -> Option<Callout> {
+    fn callout(ctx: &CalloutContext<Shared, Local>) -> Option<Callout> {
         (ctx.shared().phase() == Phase::Bidding
             && ctx.me().index() != 0
             && ctx.shared().bids.expected_writer() == Some(ctx.me())
