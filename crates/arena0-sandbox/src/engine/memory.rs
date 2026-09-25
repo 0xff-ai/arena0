@@ -1,5 +1,6 @@
 //! Bounded Wasm memory access for one guest invocation.
 
+use arena0_program::abi::exports;
 use wasmtime::{Instance, Store};
 
 use super::HostState;
@@ -152,7 +153,7 @@ impl<'a> Guest<'a> {
     pub(super) fn call_metadata(&mut self) -> Result<(u32, u32), SandboxError> {
         let func = self
             .instance
-            .get_typed_func::<(), i64>(&mut *self.store, "arena0_metadata")
+            .get_typed_func::<(), i64>(&mut *self.store, exports::METADATA)
             .map_err(|e| SandboxError::dispatch_failed(e.to_string()))?;
         unpack_i64(func.call(&mut *self.store, ()).map_err(trap_to_error)?)
     }
@@ -163,7 +164,7 @@ impl<'a> Guest<'a> {
     pub(super) fn prepare(&mut self) -> Result<(), SandboxError> {
         let func = self
             .instance
-            .get_typed_func::<(), i32>(&mut *self.store, "arena0_prepare")
+            .get_typed_func::<(), i32>(&mut *self.store, exports::PREPARE)
             .map_err(|error| SandboxError::instantiation_failed(error.to_string()))?;
         let prepared = func.call(&mut *self.store, ()).map_err(trap_to_error)?;
         if prepared == 0 {
@@ -179,7 +180,7 @@ impl<'a> Guest<'a> {
     pub(super) fn alloc(&mut self, len: u32) -> Result<u32, SandboxError> {
         let func = self
             .instance
-            .get_typed_func::<i32, i32>(&mut *self.store, "arena0_alloc")
+            .get_typed_func::<i32, i32>(&mut *self.store, exports::ALLOC)
             .map_err(|e| SandboxError::dispatch_failed(e.to_string()))?;
         let ptr = func
             .call(&mut *self.store, len as i32)
@@ -197,7 +198,7 @@ impl<'a> Guest<'a> {
     pub(super) fn dealloc(&mut self, ptr: u32, len: u32) -> Result<(), SandboxError> {
         let func = self
             .instance
-            .get_typed_func::<(i32, i32), ()>(&mut *self.store, "arena0_dealloc")
+            .get_typed_func::<(i32, i32), ()>(&mut *self.store, exports::DEALLOC)
             .map_err(|e| SandboxError::dispatch_failed(e.to_string()))?;
         func.call(&mut *self.store, (ptr as i32, len as i32))
             .map_err(trap_to_error)
@@ -205,7 +206,7 @@ impl<'a> Guest<'a> {
 
     fn memory(&mut self) -> Result<wasmtime::Memory, SandboxError> {
         self.instance
-            .get_memory(&mut *self.store, "memory")
+            .get_memory(&mut *self.store, exports::WORK_MEMORY)
             .ok_or_else(|| SandboxError::dispatch_failed("no 'memory' export"))
     }
 }

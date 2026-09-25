@@ -130,9 +130,9 @@ pub(crate) fn register_always_available(
             abi::HOST_MODULE,
             imports::LOG,
             |mut caller: Caller<'_, HostState>, level: u32, ptr: u32, len: u32| {
-                caller.begin_import("log")?;
-                caller.reject_read_only("log")?;
-                let message = caller.read_guest_bytes(ptr, len, "log")?;
+                caller.begin_import(imports::LOG)?;
+                caller.reject_read_only(imports::LOG)?;
+                let message = caller.read_guest_bytes(ptr, len, imports::LOG)?;
                 let profile = caller.data().profile.clone();
                 caller
                     .data_mut()
@@ -144,13 +144,8 @@ pub(crate) fn register_always_available(
                     )
                     .map_err(wasmtime::Error::new)?;
                 let message = String::from_utf8_lossy(&message).into_owned();
-                let log_level = match level {
-                    0 => LogLevel::Debug,
-                    1 => LogLevel::Info,
-                    2 => LogLevel::Warn,
-                    3 => LogLevel::Error,
-                    _ => return Err(wasmtime::Error::msg("invalid log level ABI tag")),
-                };
+                let log_level = LogLevel::from_abi_tag(level)
+                    .ok_or_else(|| wasmtime::Error::msg("invalid log level ABI tag"))?;
                 caller
                     .data_mut()
                     .logs
@@ -165,8 +160,8 @@ pub(crate) fn register_always_available(
             abi::HOST_MODULE,
             imports::RANDOM,
             |mut caller: Caller<'_, HostState>, ptr: u32, len: u32| {
-                caller.begin_import("random")?;
-                caller.reject_read_only("random")?;
+                caller.begin_import(imports::RANDOM)?;
+                caller.reject_read_only(imports::RANDOM)?;
                 let profile = caller.data().profile.clone();
                 if u64::from(len) > profile.randomness.max_draw_bytes {
                     return Err(wasmtime::Error::msg(format!(
@@ -207,9 +202,9 @@ pub(crate) fn register_always_available(
             abi::HOST_MODULE,
             imports::FAIL,
             |mut caller: Caller<'_, HostState>, reason_ptr: u32, reason_len: u32| {
-                caller.begin_import("fail")?;
-                caller.reject_read_only("fail")?;
-                let reason = caller.read_guest_bytes(reason_ptr, reason_len, "fail")?;
+                caller.begin_import(imports::FAIL)?;
+                caller.reject_read_only(imports::FAIL)?;
+                let reason = caller.read_guest_bytes(reason_ptr, reason_len, imports::FAIL)?;
                 caller.record_effect(Effect::Fail {
                     reason: String::from_utf8_lossy(&reason).into_owned(),
                 })
@@ -222,9 +217,10 @@ pub(crate) fn register_always_available(
             abi::HOST_MODULE,
             imports::END_SESSION,
             |mut caller: Caller<'_, HostState>, outcome_ptr: u32, outcome_len: u32| {
-                caller.begin_import("end_session")?;
-                caller.reject_read_only("end_session")?;
-                let outcome = caller.read_guest_bytes(outcome_ptr, outcome_len, "end_session")?;
+                caller.begin_import(imports::END_SESSION)?;
+                caller.reject_read_only(imports::END_SESSION)?;
+                let outcome =
+                    caller.read_guest_bytes(outcome_ptr, outcome_len, imports::END_SESSION)?;
                 caller.record_effect(Effect::SessionEnd { outcome })
             },
         )
@@ -235,9 +231,10 @@ pub(crate) fn register_always_available(
             abi::HOST_MODULE,
             imports::ABORT_SESSION,
             |mut caller: Caller<'_, HostState>, reason_ptr: u32, reason_len: u32| {
-                caller.begin_import("abort_session")?;
-                caller.reject_read_only("abort_session")?;
-                let reason = caller.read_guest_bytes(reason_ptr, reason_len, "abort_session")?;
+                caller.begin_import(imports::ABORT_SESSION)?;
+                caller.reject_read_only(imports::ABORT_SESSION)?;
+                let reason =
+                    caller.read_guest_bytes(reason_ptr, reason_len, imports::ABORT_SESSION)?;
                 caller.record_effect(Effect::SessionAbort {
                     reason: String::from_utf8_lossy(&reason).into_owned(),
                 })

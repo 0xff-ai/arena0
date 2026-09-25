@@ -150,6 +150,10 @@ pub enum OutcomeBytesError {
 
 /// Export names in the resident-instance guest ABI.
 pub mod exports {
+    /// The guest's work (linear) memory.
+    pub const WORK_MEMORY: &str = "memory";
+    /// The `i32` global holding the guest's ABI version.
+    pub const ABI_VERSION: &str = "arena0_abi_version";
     /// Guest allocation entry point.
     pub const ALLOC: &str = "arena0_alloc";
     /// Guest deallocation entry point.
@@ -575,6 +579,47 @@ fn ensure_field(field: &'static str, bytes: &[u8], max: usize) -> Result<(), Abi
     Ok(())
 }
 
+/// Level tags of the `log` import. These values are part of the ABI.
+pub mod log_level {
+    /// Debug.
+    pub const DEBUG: u32 = 0;
+    /// Info.
+    pub const INFO: u32 = 1;
+    /// Warn.
+    pub const WARN: u32 = 2;
+    /// Error.
+    pub const ERROR: u32 = 3;
+}
+
+/// Scheme tags of the `sign` import. These values are part of the ABI.
+pub mod sign_scheme {
+    use arena0_crypto::SignScheme;
+
+    /// Ed25519.
+    pub const ED25519: u32 = 0;
+    /// BLS.
+    pub const BLS: u32 = 1;
+
+    /// The ABI tag of `scheme`.
+    #[must_use]
+    pub const fn tag(scheme: SignScheme) -> u32 {
+        match scheme {
+            SignScheme::Ed25519 => ED25519,
+            SignScheme::Bls => BLS,
+        }
+    }
+
+    /// The scheme an ABI tag names, if any.
+    #[must_use]
+    pub const fn from_tag(tag: u32) -> Option<SignScheme> {
+        match tag {
+            ED25519 => Some(SignScheme::Ed25519),
+            BLS => Some(SignScheme::Bls),
+            _ => None,
+        }
+    }
+}
+
 /// Names of host-function imports. These values are part of the ABI.
 pub mod imports {
     /// Return the current payload length of one canonical state memory.
@@ -648,6 +693,17 @@ mod tests {
     use super::*;
     use arena0_crypto::SignScheme;
     use std::collections::HashSet;
+
+    #[test]
+    fn sign_scheme_tags_round_trip() {
+        for scheme in [SignScheme::Ed25519, SignScheme::Bls] {
+            assert_eq!(
+                sign_scheme::from_tag(sign_scheme::tag(scheme)),
+                Some(scheme)
+            );
+        }
+        assert_eq!(sign_scheme::from_tag(2), None);
+    }
 
     #[test]
     fn imports_for_each_capability() {

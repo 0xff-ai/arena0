@@ -351,7 +351,10 @@ pub(crate) fn instantiate_module(
     )?;
     instance
         .instance
-        .get_memory(&mut instance.store, "memory")
+        .get_memory(
+            &mut instance.store,
+            arena0_program::abi::exports::WORK_MEMORY,
+        )
         .map(|_| instance)
         .ok_or_else(|| SandboxError::instantiation_failed("no 'memory' export"))
 }

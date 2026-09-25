@@ -53,7 +53,7 @@ impl super::LoadedProgram {
         )?;
         let work = instance
             .instance
-            .get_memory(&mut instance.store, "memory")
+            .get_memory(&mut instance.store, abi::exports::WORK_MEMORY)
             .ok_or_else(|| SandboxError::instantiation_failed("no work memory export"))?;
         let shared_memory = instance
             .instance

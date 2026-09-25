@@ -540,7 +540,7 @@ pub(crate) fn validate_finalized_shape(
         ));
     }
     let expected_memories = [
-        ("memory", 0),
+        (abi::exports::WORK_MEMORY, 0),
         (abi::exports::SHARED_MEMORY, 1),
         (abi::exports::LOCAL_MEMORY, 2),
     ];

@@ -85,32 +85,12 @@ pub fn host_state_write(kind: u32, buffer: &[u8]) {
 pub fn host_log(level: LogLevel, msg: &str) {
     #[cfg(target_arch = "wasm32")]
     unsafe {
-        log(log_level_tag(level), msg.as_ptr() as u32, msg.len() as u32);
+        log(level.abi_tag(), msg.as_ptr() as u32, msg.len() as u32);
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = (level, msg);
         native_host_unavailable(imports::LOG)
-    }
-}
-
-#[inline]
-#[cfg(target_arch = "wasm32")]
-const fn log_level_tag(level: LogLevel) -> u32 {
-    match level {
-        LogLevel::Debug => 0,
-        LogLevel::Info => 1,
-        LogLevel::Warn => 2,
-        LogLevel::Error => 3,
-    }
-}
-
-#[inline]
-#[cfg(target_arch = "wasm32")]
-const fn sign_scheme_tag(scheme: SignScheme) -> u32 {
-    match scheme {
-        SignScheme::Ed25519 => 0,
-        SignScheme::Bls => 1,
     }
 }
 
@@ -175,7 +155,7 @@ pub(crate) fn host_guest_sign(scheme: SignScheme, payload: &[u8]) -> (Vec<u8>, V
         // The host writes a Borsh `(signed_bytes, signature)` pair and returns
         // its length; a missing signer traps before any bytes are written.
         let written = sign(
-            sign_scheme_tag(scheme),
+            arena0_program::abi::sign_scheme::tag(scheme),
             payload.as_ptr() as u32,
             payload.len() as u32,
             out as u32,

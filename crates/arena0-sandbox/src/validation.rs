@@ -57,7 +57,7 @@ const REQUIRED_FUNC_EXPORTS: &[(&str, &[AbiType], Returns)] = &[
     (abi::exports::METADATA, &[], Returns::Packed),
 ];
 
-const REQUIRED_GLOBAL_EXPORTS: &[&str] = &["arena0_abi_version"];
+const REQUIRED_GLOBAL_EXPORTS: &[&str] = &[abi::exports::ABI_VERSION];
 
 /// Globals at or above this value are assumed to be pointers into linear
 /// memory (the Rust wasm32 pattern for `#[no_mangle] static` items) and
@@ -165,11 +165,11 @@ pub(crate) fn validate_raw_exports(module: &Module) -> Result<(), SandboxError> 
     validate_required_exports(module)?;
     let memory = module
         .exports()
-        .find(|export| export.name() == "memory")
-        .ok_or_else(|| SandboxError::MissingExport("memory".into()))?;
+        .find(|export| export.name() == abi::exports::WORK_MEMORY)
+        .ok_or_else(|| SandboxError::MissingExport(abi::exports::WORK_MEMORY.into()))?;
     if memory.ty().memory().is_none() {
         return Err(SandboxError::InvalidExportSignature {
-            name: "memory".into(),
+            name: abi::exports::WORK_MEMORY.into(),
             expected: "memory export",
             actual: format!("{:?}", memory.ty()),
         });
@@ -284,7 +284,7 @@ fn read_global_i32(
 
     // Rust wasm32 pattern: the global holds a pointer into linear memory.
     let memory = instance
-        .get_memory(&mut *store, "memory")
+        .get_memory(&mut *store, abi::exports::WORK_MEMORY)
         .ok_or_else(|| SandboxError::dispatch_failed("no 'memory' export"))?;
     let data = memory.data(&*store);
     let addr = raw as usize;
@@ -304,7 +304,7 @@ pub(crate) fn check_abi_version(
     store: &mut wasmtime::Store<super::engine::HostState>,
     instance: &wasmtime::Instance,
 ) -> Result<(), SandboxError> {
-    let version = read_global_i32(store, instance, "arena0_abi_version")?;
+    let version = read_global_i32(store, instance, abi::exports::ABI_VERSION)?;
 
     if version != EXPECTED_ABI_VERSION {
         return Err(SandboxError::InvalidAbiVersion {

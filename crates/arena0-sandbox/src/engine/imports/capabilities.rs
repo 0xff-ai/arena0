@@ -51,8 +51,8 @@ fn register_messaging(linker: &mut Linker<HostState>) -> Result<(), SandboxError
              data_ptr: u32,
              data_len: u32|
              -> Result<u32, wasmtime::Error> {
-                caller.begin_import("broadcast")?;
-                caller.reject_read_only("broadcast")?;
+                caller.begin_import(imports::BROADCAST)?;
+                caller.reject_read_only(imports::BROADCAST)?;
                 // The queue is local, so an agreed handler never observes it:
                 // in an agreed dispatch the call always queues and reports
                 // success. Only a local handler sees the bound.
@@ -88,8 +88,8 @@ fn register_timers(linker: &mut Linker<HostState>) -> Result<(), SandboxError> {
              type_len: u32,
              data_ptr: u32,
              data_len: u32| {
-                caller.begin_import("set_timer")?;
-                caller.reject_read_only("set_timer")?;
+                caller.begin_import(imports::SET_TIMER)?;
+                caller.reject_read_only(imports::SET_TIMER)?;
                 let type_bytes = caller.read_guest_bytes(type_ptr, type_len, "set_timer:type")?;
                 let type_name = String::from_utf8(type_bytes).map_err(|e| {
                     wasmtime::Error::msg(format!("set_timer: invalid type name: {e}"))
@@ -120,11 +120,11 @@ fn register_sign(
                   out_ptr: u32,
                   out_cap: u32|
                   -> Result<u32, wasmtime::Error> {
-                caller.begin_import("sign")?;
-                caller.reject_read_only("sign")?;
+                caller.begin_import(imports::SIGN)?;
+                caller.reject_read_only(imports::SIGN)?;
                 let scheme = u32_to_sign_scheme(scheme)?;
-                reject_if_sign_scheme_disallowed("sign", scheme, &allowed_schemes)?;
-                let payload = caller.read_guest_bytes(data_ptr, data_len, "sign")?;
+                reject_if_sign_scheme_disallowed(imports::SIGN, scheme, &allowed_schemes)?;
+                let payload = caller.read_guest_bytes(data_ptr, data_len, imports::SIGN)?;
                 let Some(signer) = caller.data().signer.signer() else {
                     return Err(wasmtime::Error::msg(
                         "sign is only available in local handlers",

@@ -4,6 +4,7 @@
 //! One dispatch may mutate both state memories and emit any combination of
 //! these values; the actor decides which effects need durable delivery.
 
+use arena0_program::abi::log_level;
 use arena0_program::bounded;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
@@ -104,9 +105,47 @@ pub enum LogLevel {
     Error,
 }
 
+impl LogLevel {
+    /// The level's tag in the `log` host import.
+    #[must_use]
+    pub const fn abi_tag(self) -> u32 {
+        match self {
+            Self::Debug => log_level::DEBUG,
+            Self::Info => log_level::INFO,
+            Self::Warn => log_level::WARN,
+            Self::Error => log_level::ERROR,
+        }
+    }
+
+    /// The level a `log` host-import tag names, if any.
+    #[must_use]
+    pub const fn from_abi_tag(tag: u32) -> Option<Self> {
+        match tag {
+            log_level::DEBUG => Some(Self::Debug),
+            log_level::INFO => Some(Self::Info),
+            log_level::WARN => Some(Self::Warn),
+            log_level::ERROR => Some(Self::Error),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_level_tags_round_trip() {
+        for level in [
+            LogLevel::Debug,
+            LogLevel::Info,
+            LogLevel::Warn,
+            LogLevel::Error,
+        ] {
+            assert_eq!(LogLevel::from_abi_tag(level.abi_tag()), Some(level));
+        }
+        assert_eq!(LogLevel::from_abi_tag(4), None);
+    }
 
     #[test]
     fn borsh_round_trip_all_effect_variants() {

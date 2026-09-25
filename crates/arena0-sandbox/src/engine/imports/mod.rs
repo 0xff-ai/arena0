@@ -4,6 +4,7 @@ mod capabilities;
 mod core;
 
 use arena0_crypto::SignScheme;
+use arena0_program::abi::imports;
 use arena0_program::{Capability, StateMemoryKind};
 use arena0_protocol::Effect;
 use wasmtime::{Caller, Extern, Memory};
@@ -47,7 +48,7 @@ pub(super) trait CallerExt {
 
 impl CallerExt for Caller<'_, HostState> {
     fn work_memory(&mut self) -> Result<Memory, wasmtime::Error> {
-        match self.get_export("memory") {
+        match self.get_export(arena0_program::abi::exports::WORK_MEMORY) {
             Some(Extern::Memory(memory)) => Ok(memory),
             _ => Err(wasmtime::Error::msg("memory not found in caller")),
         }
@@ -185,21 +186,16 @@ impl CallerExt for Caller<'_, HostState> {
 
 fn effect_name(effect: &Effect) -> &'static str {
     match effect {
-        Effect::SessionEnd { .. } => "end_session",
-        Effect::SessionAbort { .. } => "abort_session",
-        Effect::Fail { .. } => "fail",
-        Effect::SetTimer { .. } => "set_timer",
-        Effect::Broadcast { .. } => "broadcast",
+        Effect::SessionEnd { .. } => imports::END_SESSION,
+        Effect::SessionAbort { .. } => imports::ABORT_SESSION,
+        Effect::Fail { .. } => imports::FAIL,
+        Effect::SetTimer { .. } => imports::SET_TIMER,
+        Effect::Broadcast { .. } => imports::BROADCAST,
     }
 }
 
 /// Decode a u32 ABI discriminant to a [`SignScheme`].
 fn u32_to_sign_scheme(value: u32) -> Result<SignScheme, wasmtime::Error> {
-    match value {
-        0 => Ok(SignScheme::Ed25519),
-        1 => Ok(SignScheme::Bls),
-        _ => Err(wasmtime::Error::msg(format!(
-            "unknown sign scheme: {value}"
-        ))),
-    }
+    arena0_program::abi::sign_scheme::from_tag(value)
+        .ok_or_else(|| wasmtime::Error::msg(format!("unknown sign scheme: {value}")))
 }
