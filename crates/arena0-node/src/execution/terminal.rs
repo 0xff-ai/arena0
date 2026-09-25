@@ -8,9 +8,10 @@ use arena0_crypto::NodeKeys;
 use arena0_protocol::{
     AbortKind, AbortOccurrence, ExecutionState, PeerIdSource, ReceiptTermination, ReceiptWork,
 };
-use arena0_store::{Change, ExecutionStore, TransitionRecord};
+use arena0_store::{Change, ExecutionStore};
 
-use super::{ExecutionActor, now_ms, truncate_reason};
+use super::actor::persist_transition;
+use super::{ExecutionActor, truncate_reason};
 
 impl ExecutionActor {
     pub(super) async fn terminate(&mut self, reason: String) -> Result<(), ExecError> {
@@ -23,19 +24,15 @@ impl ExecutionActor {
     /// alive is essential: it can accept a peer's terminal frame while our own
     /// `Abort` send is waiting for that peer's durable acknowledgement.
     pub(super) async fn fail_terminal(&mut self, error: ExecError) -> bool {
-        let reason = truncate_reason(
-            error.to_string(),
-            arena0_protocol::MAX_TERMINAL_REASON_BYTES,
-        );
         let preserved = matches!(self.state.status().receipt_work(), ReceiptWork::Assemble);
-        let result = async {
-            if matches!(self.state.status().receipt_work(), ReceiptWork::NotTerminal) {
-                self.persist_abort(AbortKind::Fail, 1, reason).await?;
-            }
-            self.finalize_receipt().await
-        }
+        let result = fail_and_publish(
+            &mut self.context.store,
+            &mut self.state,
+            &self.context.identity,
+            error.to_string(),
+        )
         .await;
-        match result {
+        match self.resync_on_error(result).await {
             Ok(()) => true,
             Err(error) => {
                 tracing::error!(exec_id = %self.context.exec_id, %error, "unable to durably record execution failure");
@@ -59,13 +56,8 @@ impl ExecutionActor {
     }
 
     pub(super) async fn finalize_receipt(&mut self) -> Result<(), ExecError> {
-        if !matches!(self.state.status().receipt_work(), ReceiptWork::Assemble) {
-            return Ok(());
-        }
-        let artifact = self.context.store.assemble_receipt(&self.state).await?;
-        let mut next = self.state.clone();
-        next.publish_receipt(artifact.clone())?;
-        self.persist(next, Change::Publish { artifact }).await
+        let result = publish_receipt(&mut self.context.store, &mut self.state).await;
+        self.resync_on_error(result).await
     }
 
     /// Deliver the observer-facing terminal boundary from its durable receipt.
@@ -136,12 +128,6 @@ impl ExecutionActor {
     }
 }
 
-/// Whether failure was recorded or an existing terminal result was preserved.
-pub(crate) enum FailureOutcome {
-    Recorded,
-    TerminalPreserved,
-}
-
 /// Compute the same authenticated stop for live actors and startup recovery.
 fn stopped_state(
     state: &ExecutionState,
@@ -170,44 +156,46 @@ fn stopped_state(
     Ok(next)
 }
 
+/// Stop a running execution with a local `Fail`, then publish its receipt.
+/// Live actors and startup recovery share this one sequence; `state` advances
+/// only after each durable write succeeds. A terminal execution keeps its
+/// conclusion and only finishes publication.
+async fn fail_and_publish(
+    store: &mut ExecutionStore,
+    state: &mut ExecutionState,
+    identity: &NodeKeys,
+    reason: String,
+) -> Result<(), ExecError> {
+    if matches!(state.status().receipt_work(), ReceiptWork::NotTerminal) {
+        let next = stopped_state(state, identity, AbortKind::Fail, 1, reason)?;
+        persist_transition(store, state, next, Change::State).await?;
+    }
+    publish_receipt(store, state).await
+}
+
+/// Assemble and persist the local receipt once terminal evidence is complete.
+async fn publish_receipt(
+    store: &mut ExecutionStore,
+    state: &mut ExecutionState,
+) -> Result<(), ExecError> {
+    if !matches!(state.status().receipt_work(), ReceiptWork::Assemble) {
+        return Ok(());
+    }
+    let artifact = store.assemble_receipt(state).await?;
+    let mut next = state.clone();
+    next.publish_receipt(artifact.clone())?;
+    persist_transition(store, state, next, Change::Publish { artifact }).await
+}
+
 /// Record an execution failure during startup, before a live actor owns state.
-/// The one loaded state advances only after each durable record succeeds.
 pub(crate) async fn fail_execution(
     store: &mut ExecutionStore,
     identity: &NodeKeys,
     reason: String,
-) -> Result<FailureOutcome, ExecError> {
+) -> Result<(), ExecError> {
     let mut state = store
         .load_execution()
         .await?
         .ok_or(ExecError::NotFound(store.execution_id()))?;
-    let outcome = if matches!(state.status().receipt_work(), ReceiptWork::NotTerminal) {
-        let next = stopped_state(&state, identity, AbortKind::Fail, 1, reason)?;
-        store
-            .persist(TransitionRecord {
-                expected: state.version(),
-                next: next.clone(),
-                change: Change::State,
-                now_ms: now_ms(),
-            })
-            .await?;
-        state = next;
-        FailureOutcome::Recorded
-    } else {
-        FailureOutcome::TerminalPreserved
-    };
-    if matches!(state.status().receipt_work(), ReceiptWork::Assemble) {
-        let artifact = store.assemble_receipt(&state).await?;
-        let expected = state.version();
-        state.publish_receipt(artifact.clone())?;
-        store
-            .persist(TransitionRecord {
-                expected,
-                next: state,
-                change: Change::Publish { artifact },
-                now_ms: now_ms(),
-            })
-            .await?;
-    }
-    Ok(outcome)
+    fail_and_publish(store, &mut state, identity, reason).await
 }

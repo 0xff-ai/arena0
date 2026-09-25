@@ -456,28 +456,29 @@ impl ExecutionActor {
         next: ExecutionState,
         change: Change,
     ) -> Result<(), ExecError> {
-        let record = TransitionRecord {
-            expected: self.state.version(),
-            next: next.clone(),
-            change,
-            now_ms: now_ms(),
+        let result =
+            persist_transition(&mut self.context.store, &mut self.state, next, change).await;
+        self.resync_on_error(result).await
+    }
+
+    /// After a failed durable write the store outcome is unknown: drop the
+    /// resident and reload the last durable state before any further
+    /// transition, then return the original error.
+    pub(super) async fn resync_on_error(
+        &mut self,
+        result: Result<(), ExecError>,
+    ) -> Result<(), ExecError> {
+        let Err(error) = result else {
+            return Ok(());
         };
-        match self.context.store.persist(record).await {
-            Ok(()) => {
-                self.state = next;
-                Ok(())
-            }
-            Err(error) => {
-                self.instance = None;
-                self.state = self
-                    .context
-                    .store
-                    .load_execution()
-                    .await?
-                    .ok_or(ExecError::NotFound(self.context.exec_id))?;
-                Err(error.into())
-            }
-        }
+        self.instance = None;
+        self.state = self
+            .context
+            .store
+            .load_execution()
+            .await?
+            .ok_or(ExecError::NotFound(self.context.exec_id))?;
+        Err(error)
     }
 
     /// Construct or replace the execution-local resident from committed
@@ -531,6 +532,26 @@ impl ExecutionActor {
         )
         .expect("validated activation has a committed ensemble")
     }
+}
+
+/// Persist `next` as the successor of `state`, advancing `state` only after
+/// the transition is durable.
+pub(super) async fn persist_transition(
+    store: &mut arena0_store::ExecutionStore,
+    state: &mut ExecutionState,
+    next: ExecutionState,
+    change: Change,
+) -> Result<(), ExecError> {
+    store
+        .persist(TransitionRecord {
+            expected: state.version(),
+            next: next.clone(),
+            change,
+            now_ms: now_ms(),
+        })
+        .await?;
+    *state = next;
+    Ok(())
 }
 
 fn progress_ticker() -> Interval {

@@ -204,9 +204,7 @@ impl Host {
                 "execution store belongs to another host".into(),
             ));
         }
-        crate::execution::fail_execution(execution_store.store_mut(), &self.identity, reason)
-            .await
-            .map(|_| ())
+        crate::execution::fail_execution(execution_store.store_mut(), &self.identity, reason).await
     }
 
     /// Register a convergence-fetch handler for one session.
