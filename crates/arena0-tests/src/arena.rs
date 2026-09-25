@@ -6,15 +6,13 @@
 //! transport endpoint. There is no mutable sandbox or in-memory store mock in
 //! this test layer.
 use std::fmt::Write as _;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arena0_crypto::{ExecutionKey, ExecutionSalt, NodeKeys, SecretKey};
 use arena0_node::{
-    DurableOutcome, ExecCommand, ExecError, Host, NegotiationAttempt, NegotiationEffects,
-    NegotiationStart, PrepareOutcome, SessionMessage, SpawnedExec,
+    ExecCommand, ExecError, Host, NegotiationAttempt, NegotiationEffects, NegotiationStart,
+    SessionMessage, SpawnedExec,
 };
 use arena0_node::{ExecContext, NegotiationBook};
 use arena0_program::JsonBytes;
@@ -359,53 +357,7 @@ impl Arena {
                     supervision: None,
                     deadline: Some(deadline),
                 };
-                let prepare: arena0_node::PrepareEffect = Box::new(
-                    |store: &mut arena0_store::ExecutionStore,
-                     prepared|
-                     -> Pin<
-                        Box<dyn Future<Output = Result<PrepareOutcome, String>> + Send + '_>,
-                    > {
-                        Box::pin(async move {
-                            match store
-                                .prepare_activation(prepared, unix_time_ms())
-                                .await
-                                .map_err(|error| error.to_string())?
-                            {
-                                arena0_store::PrepareActivationOutcome::Prepared(_)
-                                | arena0_store::PrepareActivationOutcome::AlreadyPrepared(_)
-                                | arena0_store::PrepareActivationOutcome::AlreadyCommitted(_) => {
-                                    Ok(PrepareOutcome::Accepted)
-                                }
-                                arena0_store::PrepareActivationOutcome::Conflict { .. } => {
-                                    Ok(PrepareOutcome::Conflict)
-                                }
-                            }
-                        })
-                    },
-                );
-                let persist_activation: arena0_node::PersistActivationEffect = Box::new(
-                    |store: &mut arena0_store::ExecutionStore,
-                     activation|
-                     -> Pin<
-                        Box<dyn Future<Output = Result<DurableOutcome, String>> + Send + '_>,
-                    > {
-                        Box::pin(async move {
-                            match store
-                                .commit_activation(activation, unix_time_ms())
-                                .await
-                                .map_err(|error| error.to_string())?
-                            {
-                                arena0_store::CommitActivationOutcome::Committed(_)
-                                | arena0_store::CommitActivationOutcome::AlreadyCommitted(_) => {
-                                    Ok(DurableOutcome::Accepted)
-                                }
-                                arena0_store::CommitActivationOutcome::Conflict { .. } => {
-                                    Ok(DurableOutcome::Conflict)
-                                }
-                            }
-                        })
-                    },
-                );
+                let (prepare, persist_activation) = arena0_node::store_activation_effects();
                 let recompute_initial_state = Box::new(move |params: &[u8]| {
                     let initialized = recompute_loaded
                         .initialize(

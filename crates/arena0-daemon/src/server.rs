@@ -26,8 +26,8 @@ use arena0_api::{HostRequest, HostStatus};
 use arena0_crypto::{AgentPubKey, ExecutionKey, NodeKeys};
 use arena0_node::{ActivatedSession, NegotiationBook};
 use arena0_node::{
-    DurableOutcome, HostExecutionStore, NegotiationAttempt, NegotiationEffects, NegotiationStart,
-    NegotiationSupervision, PrepareOutcome, unix_time_ms,
+    HostExecutionStore, NegotiationAttempt, NegotiationEffects, NegotiationStart,
+    NegotiationSupervision, store_activation_effects, unix_time_ms,
 };
 use arena0_program::{
     ABI_VERSION, JsonBytes, JsonSchemaDocument, ParticipantCount, ProgramHash, ProgramSchema,
@@ -3150,7 +3150,7 @@ impl HostService {
             .install_negotiation(offer.clone(), ticket_tx.clone(), withdrawals_tx)
             .await;
 
-        let (prepare, persist_commit) = activation_callbacks();
+        let (prepare, persist_commit) = store_activation_effects();
         let publish_event = |source, event| {
             self.events.emit(HostEvent::Negotiation { source, event });
         };
@@ -3987,44 +3987,6 @@ async fn offer_is_usable_for_join(
     initial_state == data.initial_state
         && data.deadline_unix_ms > unix_time_ms().saturating_add(PREPARE_WINDOW_MS)
         && deadline.is_none_or(|deadline| Instant::now() < deadline)
-}
-
-/// Wire negotiation's durable boundaries directly to the supplied execution
-/// writer. No daemon aggregate or callback-side state is retained.
-fn activation_callbacks() -> (
-    arena0_node::PrepareEffect,
-    arena0_node::PersistActivationEffect,
-) {
-    let prepare: arena0_node::PrepareEffect = Box::new(|store, prepared| {
-        Box::pin(async move {
-            match store.prepare_activation(prepared, unix_time_ms()).await {
-                Ok(
-                    arena0_store::PrepareActivationOutcome::Prepared(_)
-                    | arena0_store::PrepareActivationOutcome::AlreadyPrepared(_)
-                    | arena0_store::PrepareActivationOutcome::AlreadyCommitted(_),
-                ) => Ok(PrepareOutcome::Accepted),
-                Ok(arena0_store::PrepareActivationOutcome::Conflict { .. }) => {
-                    Ok(PrepareOutcome::Conflict)
-                }
-                Err(error) => Err(error.to_string()),
-            }
-        })
-    });
-    let persist_activation: arena0_node::PersistActivationEffect = Box::new(|store, activation| {
-        Box::pin(async move {
-            match store.commit_activation(activation, unix_time_ms()).await {
-                Ok(
-                    arena0_store::CommitActivationOutcome::Committed(_)
-                    | arena0_store::CommitActivationOutcome::AlreadyCommitted(_),
-                ) => Ok(DurableOutcome::Accepted),
-                Ok(arena0_store::CommitActivationOutcome::Conflict { .. }) => {
-                    Ok(DurableOutcome::Conflict)
-                }
-                Err(error) => Err(error.to_string()),
-            }
-        })
-    });
-    (prepare, persist_activation)
 }
 
 #[cfg(test)]

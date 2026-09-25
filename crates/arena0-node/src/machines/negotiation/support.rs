@@ -133,6 +133,44 @@ pub type PersistActivationEffect = Box<
         + Send,
 >;
 
+/// The standard durable boundaries: prepare and commit the activation
+/// directly on the supplied execution writer, mapping the store's
+/// compare-and-set outcomes to the negotiation's. No state is retained
+/// between calls.
+#[must_use]
+pub fn store_activation_effects() -> (PrepareEffect, PersistActivationEffect) {
+    let prepare: PrepareEffect = Box::new(|store, prepared| {
+        Box::pin(async move {
+            match store.prepare_activation(prepared, unix_time_ms()).await {
+                Ok(
+                    arena0_store::PrepareActivationOutcome::Prepared(_)
+                    | arena0_store::PrepareActivationOutcome::AlreadyPrepared(_)
+                    | arena0_store::PrepareActivationOutcome::AlreadyCommitted(_),
+                ) => Ok(PrepareOutcome::Accepted),
+                Ok(arena0_store::PrepareActivationOutcome::Conflict { .. }) => {
+                    Ok(PrepareOutcome::Conflict)
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        })
+    });
+    let persist_activation: PersistActivationEffect = Box::new(|store, activation| {
+        Box::pin(async move {
+            match store.commit_activation(activation, unix_time_ms()).await {
+                Ok(
+                    arena0_store::CommitActivationOutcome::Committed(_)
+                    | arena0_store::CommitActivationOutcome::AlreadyCommitted(_),
+                ) => Ok(DurableOutcome::Accepted),
+                Ok(arena0_store::CommitActivationOutcome::Conflict { .. }) => {
+                    Ok(DurableOutcome::Conflict)
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        })
+    });
+    (prepare, persist_activation)
+}
+
 /// Synchronous callback used to recompute the creator's initial state when it
 /// evaluates a counteroffer.
 pub type RecomputeInitialStateEffect = Box<dyn FnMut(&[u8]) -> Result<StateHash, String> + Send>;

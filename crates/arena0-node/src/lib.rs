@@ -23,5 +23,6 @@ pub use machines::negotiation::{
     ApplyError, ApplyOutcome, DurableOutcome, FETCH_TIMEOUT, LocalTicketWithdrawal,
     NegotiationAttempt, NegotiationBook, NegotiationDriveError, NegotiationEffects,
     NegotiationStart, NegotiationSupervision, PersistActivationEffect, PrepareEffect,
-    PrepareOutcome, RecomputeInitialStateEffect, serve_fetch_evidence, unix_time_ms,
+    PrepareOutcome, RecomputeInitialStateEffect, serve_fetch_evidence, store_activation_effects,
+    unix_time_ms,
 };
