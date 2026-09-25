@@ -95,7 +95,7 @@ async fn recover_after(cut: CrashAfter) {
             .persist(arena0_store::TransitionRecord {
                 expected: ExecutionVersion::ZERO,
                 next: state.clone(),
-                change: arena0_store::Change::Activate,
+                change: arena0_store::Change::State,
                 now_ms: 6,
             })
             .await
@@ -118,7 +118,7 @@ async fn recover_after(cut: CrashAfter) {
             .persist(arena0_store::TransitionRecord {
                 expected,
                 next: state.clone(),
-                change: arena0_store::Change::Stop,
+                change: arena0_store::Change::State,
                 now_ms: 7,
             })
             .await

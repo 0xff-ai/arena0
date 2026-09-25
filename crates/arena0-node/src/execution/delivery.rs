@@ -236,7 +236,7 @@ impl ExecutionActor {
                     }
                     Err(_) => return Ok(Some(Rejected)),
                 }
-                self.persist(next, Change::Stop).await?;
+                self.persist(next, Change::State).await?;
             }
         }
         Ok(None)
@@ -324,7 +324,7 @@ impl ExecutionActor {
     async fn confirm_peer(&mut self, peer: PeerId) -> Result<(), ExecError> {
         let mut next = self.state.clone();
         if next.confirm_end(peer)? {
-            self.persist(next, Change::End).await?;
+            self.persist(next, Change::State).await?;
         }
         Ok(())
     }

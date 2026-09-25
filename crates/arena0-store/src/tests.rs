@@ -249,7 +249,7 @@ async fn recovery_resumes_ending_and_skips_ended_with_unconfirmed_peers() {
         .persist(TransitionRecord {
             expected: state.version(),
             next: ended.clone(),
-            change: Change::End,
+            change: Change::State,
             now_ms: 21,
         })
         .await
@@ -2887,7 +2887,7 @@ async fn activate_record(
         .persist(TransitionRecord {
             expected,
             next: next.clone(),
-            change: Change::Activate,
+            change: Change::State,
             now_ms,
         })
         .await?;
@@ -2958,7 +2958,7 @@ async fn stop_record(
         .persist(TransitionRecord {
             expected,
             next: next.clone(),
-            change: Change::Stop,
+            change: Change::State,
             now_ms,
         })
         .await?;

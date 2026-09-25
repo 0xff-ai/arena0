@@ -332,7 +332,7 @@ impl Database {
         }
         self.persist_state(expected, &next, now_ms)?;
         match change {
-            Change::Activate => {}
+            Change::State => {}
             Change::Dispatch {
                 event,
                 effects,
@@ -365,7 +365,6 @@ impl Database {
                     self.commit_staged_event(execution_id, proposal, next.version(), now_ms)?;
                 }
             }
-            Change::Stop | Change::End | Change::DropOutgoing => {}
             Change::Publish { artifact } => {
                 self.persist_terminal_publication(execution_id, &artifact, now_ms)?;
             }

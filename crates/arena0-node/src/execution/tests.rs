@@ -288,7 +288,7 @@ impl Fixture {
         let mut next = state.clone();
         next.activate().expect("activate");
         actor
-            .persist(next, Change::Activate)
+            .persist(next, Change::State)
             .await
             .expect("persist activation");
         actor.restore_resident().expect("restore resident");

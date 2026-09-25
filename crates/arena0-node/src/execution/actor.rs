@@ -271,7 +271,7 @@ impl ExecutionActor {
         if state.status().lifecycle() == ExecLifecycle::Activating {
             let mut next = self.state.clone();
             next.activate()?;
-            self.persist(next, Change::Activate).await?;
+            self.persist(next, Change::State).await?;
         }
 
         self.progress().await
@@ -438,7 +438,7 @@ impl ExecutionActor {
         {
             let mut next = self.state.clone();
             next.expire_end()?;
-            self.persist(next, Change::End).await?;
+            self.persist(next, Change::State).await?;
         }
         if !self.end_run_finished() {
             self.deliver_frames()?;

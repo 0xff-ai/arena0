@@ -55,7 +55,7 @@ impl ExecutionActor {
             return Ok(());
         }
         let next = stopped_state(&self.state, &self.context.identity, kind, code, reason)?;
-        self.persist(next, Change::Stop).await
+        self.persist(next, Change::State).await
     }
 
     pub(super) async fn finalize_receipt(&mut self) -> Result<(), ExecError> {
@@ -187,7 +187,7 @@ pub(crate) async fn fail_execution(
             .persist(TransitionRecord {
                 expected: state.version(),
                 next: next.clone(),
-                change: Change::Stop,
+                change: Change::State,
                 now_ms: now_ms(),
             })
             .await?;

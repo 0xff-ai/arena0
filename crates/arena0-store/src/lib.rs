@@ -739,12 +739,10 @@ pub struct TransitionRecord {
 /// Durable consequences of a protocol transition computed by the actor.
 #[derive(Debug)]
 pub enum Change {
-    /// Update the local end confirmation phase without changing evidence.
-    End,
-    /// Drop the head of the outgoing queue after the program rejected it.
-    DropOutgoing,
-    /// Enter active execution.
-    Activate,
+    /// Persist only the execution state: activation, an authenticated stop,
+    /// an end-confirmation phase, or dropping a rejected outgoing message
+    /// write no rows beyond it.
+    State,
     /// Record an accepted guest dispatch and consume its durable source.
     Dispatch {
         event: Event<Vec<u8>>,
@@ -755,8 +753,6 @@ pub enum Change {
     StepSignature {
         certified: Option<arena0_protocol::SharedProposal>,
     },
-    /// Record an authenticated stop.
-    Stop,
     /// Publish evidence assembled from durable rows.
     Publish { artifact: ReceiptArtifact },
 }

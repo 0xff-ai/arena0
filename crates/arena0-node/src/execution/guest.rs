@@ -346,7 +346,7 @@ impl ExecutionActor {
                 DispatchOutcome::Rejected { .. } => {
                     let mut next = self.state.clone();
                     next.drop_outgoing_head()?;
-                    self.persist(next, Change::DropOutgoing).await?;
+                    self.persist(next, Change::State).await?;
                     tracing::error!(
                         exec_id = %self.context.exec_id,
                         "own queued message rejected by the program"
