@@ -3,8 +3,11 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use std::io;
 
-use super::exec::SessionHashBytes;
 use crate::{WireError, read_bounded_bytes_vec, serialize_bounded_vec};
+
+/// A fixed-width raw session hash in a wire frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
+pub struct SessionHashBytes(pub [u8; 32]);
 
 /// Maximum number of tickets carried by one fetch response.
 pub const MAX_FETCH_TICKETS: usize = 64;
@@ -168,4 +171,4 @@ impl BorshDeserialize for FetchFrame {
     }
 }
 
-impl crate::sealed::WireDecode for FetchFrame {}
+impl crate::WireDecode for FetchFrame {}

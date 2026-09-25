@@ -8,7 +8,6 @@ description = "Versioned, bounded wire values and canonical framing for arena0"
 publish = true
 
 [dependencies]
-arena0-crypto = { path = "../arena0-crypto", version = "0.1.0" }
 borsh.workspace = true
 thiserror.workspace = true
 

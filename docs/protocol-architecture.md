@@ -495,10 +495,11 @@ accepted event, shared and local state images, and effects to a focused store
 method. Rejected events, guest traps, and bounded execution
 failures restore both state memories and persist no effects.
 
-Shared-state steps exchange `arena0_protocol::ExecFrame` values;
-`arena0-transport` converts them to the bounded raw values owned by
-`arena0-wire` for canonical framing and delivery. A message frame carries the
-message data and the author's complete `StepCommitment` for it. The author applies
+Shared-state steps exchange `arena0_protocol::ExecFrame` values. The protocol
+crate owns their bounded Borsh encoding, and `arena0-transport` frames them with
+`arena0-wire::Codec` for delivery. A message frame carries the message data,
+bounded like the trace's message event, and the author's complete
+`StepCommitment` for it. The author applies
 its own message through the same dispatch as every receiver. A step is accepted
 only when all selected participants sign the same `StepCommitment`.
 

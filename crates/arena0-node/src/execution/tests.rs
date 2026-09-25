@@ -798,16 +798,14 @@ async fn certificate_authentication_rejects_bad_evidence_but_local_contradiction
     let (messages, _observations) = mpsc::channel(16);
     let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
     fixture.commit_session_started(&mut actor).await;
-    let mut raw = arena0_wire::ExecFrame::try_from(&certificate).unwrap();
-    if let arena0_wire::ExecFrame::StepCertificate { aggregate, .. } = &mut raw {
-        aggregate.0[0] ^= 1;
-    }
+    // The aggregate signature is the frame's final 48 bytes.
+    let mut bytes = borsh::to_vec(&certificate).unwrap();
+    let aggregate = bytes.len() - 48;
+    bytes[aggregate] ^= 1;
+    let tampered = borsh::from_slice::<ExecFrame>(&bytes).unwrap();
     assert_eq!(
         actor
-            .accept_frame(
-                fixture.remote_keys.peer_id(),
-                ExecFrame::try_from(raw).unwrap()
-            )
+            .accept_frame(fixture.remote_keys.peer_id(), tampered)
             .await
             .unwrap(),
         Some(arena0_transport::ExecDeliveryRejection::Rejected)

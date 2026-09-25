@@ -30,9 +30,7 @@ use arena0_protocol::{
     ExecFrame as DomainExecFrame, FetchFrame as DomainFetchFrame, NegotiationId, PeerId,
     SessionHash,
 };
-use arena0_wire::{
-    Codec, ExecFrame as WireExecFrame, FetchFrame as WireFetchFrame, StreamProtocol,
-};
+use arena0_wire::{Codec, FetchFrame as WireFetchFrame, StreamProtocol};
 use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
@@ -310,7 +308,6 @@ impl SendHandle {
     /// Send an [`arena0_protocol::ExecFrame`] on an `Exec` stream.
     pub async fn send_exec(&self, msg: &DomainExecFrame) -> Result<(), TransportError> {
         self.validate_exec_route(msg)?;
-        let wire = WireExecFrame::try_from(msg)?;
         if self.proto != StreamProtocol::Exec {
             return Err(TransportError::ProtocolMismatch(format!(
                 "sent {:?} frame on a {:?} stream",
@@ -318,7 +315,7 @@ impl SendHandle {
                 self.proto
             )));
         }
-        let frame = Codec::new(StreamProtocol::Exec.max_frame_body()).encode(&wire)?;
+        let frame = Codec::new(StreamProtocol::Exec.max_frame_body()).encode(msg)?;
         let (responsibility, mut receipt) = oneshot::channel();
         self.send_packet(StreamPacket {
             bytes: frame,
@@ -468,21 +465,15 @@ impl RecvHandle {
             ));
         };
         let frame = match Codec::new(StreamProtocol::Exec.max_frame_body())
-            .decode::<WireExecFrame>(&packet.bytes)
+            .decode::<DomainExecFrame>(&packet.bytes)
         {
-            Ok(frame) => match DomainExecFrame::try_from(frame) {
-                Ok(frame) => {
-                    if let Err(error) = self.validate_exec_route(&frame) {
-                        let _ = responsibility.send(Err(ExecDeliveryFailure::Rejected));
-                        return Err(error);
-                    }
-                    frame
-                }
-                Err(error) => {
+            Ok(frame) => {
+                if let Err(error) = self.validate_exec_route(&frame) {
                     let _ = responsibility.send(Err(ExecDeliveryFailure::Rejected));
-                    return Err(error.into());
+                    return Err(error);
                 }
-            },
+                frame
+            }
             Err(error) => {
                 let _ = responsibility.send(Err(ExecDeliveryFailure::Rejected));
                 return Err(error.into());

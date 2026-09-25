@@ -17,35 +17,46 @@ pub const ABORT_OCCURRENCE_VERSION: u16 = 1;
 
 /// The terminal meaning authenticated by an [`AbortOccurrence`].
 ///
-/// The explicit tags are part of the version-1 wire and proof contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
+/// The explicit tags are part of the version-1 wire and proof contract, and
+/// are the single definition used by both the Borsh and JSON encodings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum AbortKind {
     /// Explicitly stop the execution without classifying it as a failure.
-    Abort,
+    Abort = 0x00,
     /// Classify the execution as failed.
-    Fail,
+    Fail = 0x01,
 }
 
 impl AbortKind {
     /// Stable version-1 tag.
     #[must_use]
     pub const fn tag(self) -> u8 {
-        match self {
-            Self::Abort => 0x00,
-            Self::Fail => 0x01,
-        }
+        self as u8
     }
 
     /// Decode a stable version-1 tag.
     pub fn from_tag(tag: u8) -> Result<Self, borsh::io::Error> {
         match tag {
-            0x00 => Ok(Self::Abort),
-            0x01 => Ok(Self::Fail),
+            tag if tag == Self::Abort.tag() => Ok(Self::Abort),
+            tag if tag == Self::Fail.tag() => Ok(Self::Fail),
             tag => Err(borsh::io::Error::new(
                 borsh::io::ErrorKind::InvalidData,
                 format!("unknown abort kind tag {tag}"),
             )),
         }
+    }
+}
+
+impl BorshSerialize for AbortKind {
+    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> borsh::io::Result<()> {
+        BorshSerialize::serialize(&self.tag(), writer)
+    }
+}
+
+impl BorshDeserialize for AbortKind {
+    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
+        Self::from_tag(u8::deserialize_reader(reader)?)
     }
 }
 

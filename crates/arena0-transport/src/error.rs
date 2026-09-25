@@ -117,16 +117,6 @@ impl From<arena0_wire::WireError> for TransportError {
     }
 }
 
-impl From<arena0_protocol::ExecFrameError> for TransportError {
-    fn from(error: arena0_protocol::ExecFrameError) -> Self {
-        match error {
-            arena0_protocol::ExecFrameError::Wire(error) => Self::from(error),
-            arena0_protocol::ExecFrameError::Commitment(error) => Self::InvalidFrame(error),
-            arena0_protocol::ExecFrameError::Abort(error) => Self::InvalidFrame(error),
-        }
-    }
-}
-
 impl From<arena0_protocol::FetchFrameError> for TransportError {
     fn from(error: arena0_protocol::FetchFrameError) -> Self {
         match error {

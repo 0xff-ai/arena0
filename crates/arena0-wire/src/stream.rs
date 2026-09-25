@@ -1,6 +1,11 @@
 //! Stream-level wire discriminators.
 
-use crate::{PROTO_EXEC, PROTO_FETCH, WireError};
+use crate::WireError;
+
+/// The convergence-fetch stream discriminator.
+pub const PROTO_FETCH: u8 = 0x01;
+/// The committed-execution stream discriminator.
+pub const PROTO_EXEC: u8 = 0x02;
 
 /// Which multiplexed protocol a stream carries.
 ///

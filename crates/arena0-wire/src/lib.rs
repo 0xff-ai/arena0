@@ -4,47 +4,36 @@
 //! the canonical length-prefixed Borsh encoding for those values. It has no
 //! transport, runtime, storage, or asynchronous I/O dependencies. A transport
 //! supplies the bytes and owns delivery; this crate only validates and encodes
-//! the wire representation. Protocol-domain conversion belongs to
-//! `arena0-protocol`.
+//! the wire representation. Execution frames carry protocol-domain values, so
+//! `arena0-protocol` owns their encoding on top of this crate's bounded codec.
 
 mod codec;
 mod error;
-mod exec;
 mod fetch;
 mod stream;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use std::io;
 
-mod sealed {
-    pub trait WireDecode {}
-}
-
-/// A wire value with a decoder that enforces its field-level bounds before
-/// allocating variable-length fields. This trait is sealed and is implemented
-/// only for the raw frame values defined by this crate.
-pub trait WireDecode: sealed::WireDecode + BorshDeserialize {}
-
-impl<T> WireDecode for T where T: sealed::WireDecode + BorshDeserialize {}
+/// A frame value whose decoder enforces its field-level bounds before
+/// allocating variable-length fields. Implement it only for frame values
+/// whose every variable-length field is read through [`read_bounded_bytes`]
+/// or an equivalent bounded reader.
+pub trait WireDecode: BorshDeserialize {}
 
 pub use codec::{
     Codec, DEFAULT_MAX_MESSAGE_SIZE, FRAME_HEADER_SIZE, FRAME_VERSION, FRAME_VERSION_SIZE,
 };
 pub use error::WireError;
-pub use exec::{
-    ABORT_KIND_ABORT, ABORT_KIND_FAIL, EXEC_KIND_ABORT, EXEC_KIND_MESSAGE,
-    EXEC_KIND_STEP_CERTIFICATE, EXEC_KIND_STEP_SIGNATURE, ExecFrame,
-    MAX_EXEC_ABORT_OCCURRENCE_BYTES, MAX_EXEC_MESSAGE_BYTES, MAX_EXEC_REASON_BYTES,
-    MAX_EXEC_SIGNER_BYTES, PROTO_EXEC, PROTO_FETCH, PeerIdBytes, SessionHashBytes, StateHashBytes,
-    WireAbortCoordinate, WireAbortOccurrence, WireStepCommitment,
-};
 pub use fetch::{
     FETCH_KIND_REQUEST, FETCH_KIND_RESPONSE, FetchFrame, MAX_FETCH_RESPONSE_BYTES,
-    MAX_FETCH_TICKET_BYTES, MAX_FETCH_TICKETS,
+    MAX_FETCH_TICKET_BYTES, MAX_FETCH_TICKETS, SessionHashBytes,
 };
-pub use stream::StreamProtocol;
+pub use stream::{PROTO_EXEC, PROTO_FETCH, StreamProtocol};
 
-pub(crate) fn serialize_bounded_bytes<W: io::Write>(
+/// Write length-prefixed bytes, reporting an over-bound value as a typed
+/// [`WireError::ValueTooLarge`] naming `field`.
+pub fn serialize_bounded_bytes<W: io::Write>(
     writer: &mut W,
     bytes: &[u8],
     max: usize,
@@ -107,7 +96,9 @@ pub(crate) fn serialize_bounded_vec<W: io::Write, T: BorshSerialize>(
     Ok(())
 }
 
-pub(crate) fn read_bounded_bytes<R: io::Read>(
+/// Read length-prefixed bytes, rejecting an over-bound length with a typed
+/// [`WireError::ValueTooLarge`] before allocating.
+pub fn read_bounded_bytes<R: io::Read>(
     reader: &mut R,
     max: usize,
     field: &'static str,

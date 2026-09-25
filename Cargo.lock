@@ -433,7 +433,6 @@ dependencies = [
 name = "arena0-wire"
 version = "0.1.0"
 dependencies = [
- "arena0-crypto",
  "borsh",
  "thiserror 2.0.18",
 ]
