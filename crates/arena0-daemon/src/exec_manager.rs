@@ -15,10 +15,7 @@ use arena0_api::{ApiError, ApiErrorCode, AwaitState, ExecLifecycle, NextEvent, P
 use arena0_node::{ExecCommand, LocalTicketWithdrawal, SessionMessage, SpawnedExec};
 use arena0_program::{ProgramHash, ProgramSchema};
 use arena0_protocol::execution::ExecutionState;
-use arena0_protocol::{
-    AbortKind, EventSource, ExecId, ExecutionStatus, NegotiationId, SessionHash, StopCause, Ticket,
-    View,
-};
+use arena0_protocol::{AbortKind, EventSource, ExecId, NegotiationId, SessionHash, Ticket, View};
 use arena0_sandbox::Program;
 use arena0_store::StoreHandle;
 use arena0_transport::Transport;
@@ -529,13 +526,26 @@ pub(crate) struct ExecutionHandles {
 }
 
 /// Owns the live actor and its bounded supervisor loop. Durable execution
-/// state is always loaded through `entry.store`; no protocol state is copied.
+/// state is always loaded through `entry.store`; only the immutable session
+/// binding facts are cached.
 #[allow(missing_debug_implementations)]
 pub(crate) struct Supervisor {
     pub entry: Arc<ExecutionHandle>,
     pub spawned: SpawnedExec,
     pub events: Events,
     pub transport: Arc<dyn Transport + Sync>,
+    pub session: Option<SessionFacts>,
+    /// The actor was woken only to finish end confirmation. Its restart
+    /// replays observations this Host already reported, so none are projected.
+    pub replay: bool,
+}
+
+/// Session facts fixed by the committed activation.
+#[derive(Debug)]
+pub(crate) struct SessionFacts {
+    source: EventSource,
+    /// Participants in canonical activation order.
+    ensemble: Vec<arena0_protocol::PeerId>,
 }
 
 impl ExecutionHandles {
@@ -659,28 +669,41 @@ impl Supervisor {
         }
     }
 
-    async fn handle_message(&mut self, message: SessionMessage) {
-        match message {
-            SessionMessage::SessionStarted { .. } => {
-                let Ok(Some(state)) = self.entry.execution().await else {
-                    return;
-                };
-                let source = EventSource::Session {
+    /// Immutable session facts, loaded once the execution aggregate exists.
+    async fn session(&mut self) -> Option<&SessionFacts> {
+        if self.session.is_none() {
+            let state = self.entry.execution().await.ok().flatten()?;
+            let binding = state.binding();
+            self.session = Some(SessionFacts {
+                source: EventSource::Session {
                     peer_id: self.entry.store.host_id(),
                     exec_id: self.entry.exec_id,
-                    program_id: state.binding().program_hash(),
-                    session_hash: state.binding().session_id(),
+                    program_id: binding.program_hash(),
+                    session_hash: binding.session_id(),
+                },
+                ensemble: binding.participants().collect(),
+            });
+        }
+        self.session.as_ref()
+    }
+
+    /// Project one actor observation. Payloads carry the observed facts; the
+    /// store is read only for the trace entry, the callout's current state,
+    /// and a failure's lifecycle.
+    async fn handle_message(&mut self, message: SessionMessage) {
+        if self.replay {
+            return;
+        }
+        match message {
+            SessionMessage::SessionStarted { .. } => {
+                let Some(session) = self.session().await else {
+                    return;
                 };
-                self.events.emit(HostEvent::SessionStarted {
-                    source,
-                    ensemble: state
-                        .binding()
-                        .activation()
-                        .tickets()
-                        .iter()
-                        .map(|ticket| ticket.data.signer)
-                        .collect(),
-                });
+                let event = HostEvent::SessionStarted {
+                    source: session.source.clone(),
+                    ensemble: session.ensemble.clone(),
+                };
+                self.events.emit(event);
             }
             SessionMessage::TraceAppended { step } => {
                 let Ok(entries) = self
@@ -694,26 +717,20 @@ impl Supervisor {
                 let Some(entry) = entries.into_iter().next() else {
                     return;
                 };
-                let Ok(Some(state)) = self.entry.execution().await else {
+                let Some(session) = self.session().await else {
                     return;
                 };
-                let source = EventSource::Session {
-                    peer_id: self.entry.store.host_id(),
-                    exec_id: self.entry.exec_id,
-                    program_id: state.binding().program_hash(),
-                    session_hash: state.binding().session_id(),
-                };
                 let signers = u16::try_from(entry.agreement.signers.count()).unwrap_or(u16::MAX);
-                let participants =
-                    u16::try_from(state.binding().activation().tickets().len()).unwrap_or(u16::MAX);
-                self.events.emit(HostEvent::SessionStep {
-                    source,
+                let participants = u16::try_from(session.ensemble.len()).unwrap_or(u16::MAX);
+                let event = HostEvent::SessionStep {
+                    source: session.source.clone(),
                     step: entry.step,
                     pre_state: entry.pre_state,
                     post_state: entry.post_state,
                     signers,
                     participants,
-                });
+                };
+                self.events.emit(event);
             }
             SessionMessage::CalloutRequested { pending_id, .. } => {
                 if let Ok(Some((source, projection))) = self.project_callout(pending_id).await {
@@ -736,71 +753,54 @@ impl Supervisor {
                     });
                 }
             }
-            SessionMessage::Completed { .. } => {
-                if let Ok(Some(state)) = self.entry.execution().await
-                    && matches!(state.status(), ExecutionStatus::Completed { .. })
-                {
-                    let source = EventSource::Session {
-                        peer_id: self.entry.store.host_id(),
-                        exec_id: self.entry.exec_id,
-                        program_id: state.binding().program_hash(),
-                        session_hash: state.binding().session_id(),
-                    };
-                    let outcome = state
-                        .terminal_outcome_json()
-                        .and_then(|json| serde_json::from_slice(json).ok());
-                    self.events
-                        .emit(HostEvent::SessionCompleted { source, outcome });
-                }
+            SessionMessage::Completed { result_json, .. } => {
+                let Some(session) = self.session().await else {
+                    return;
+                };
+                let event = HostEvent::SessionCompleted {
+                    source: session.source.clone(),
+                    outcome: result_json.and_then(|json| serde_json::from_slice(&json).ok()),
+                };
+                self.events.emit(event);
             }
-            SessionMessage::Aborted { .. } => {
-                if let Ok(Some(state)) = self.entry.execution().await {
-                    let source = EventSource::Session {
-                        peer_id: self.entry.store.host_id(),
-                        exec_id: self.entry.exec_id,
-                        program_id: state.binding().program_hash(),
-                        session_hash: state.binding().session_id(),
-                    };
-                    if let Some(cause) = state.status().terminal_cause() {
-                        let step = match cause {
-                            StopCause::Authenticated(occurrence) => {
-                                occurrence.coordinate().next_step()
-                            }
-                            StopCause::Shared { commitment, .. } => commitment.step,
-                        };
-                        self.events.emit(HostEvent::SessionAborted {
-                            source,
-                            step,
-                            reason: cause.reason().to_owned(),
-                            failure: if cause.kind() == AbortKind::Abort {
-                                arena0_protocol::ExecutionFailureCode::ProgramAborted
-                            } else {
-                                arena0_protocol::ExecutionFailureCode::Runtime
-                            },
-                        });
-                    }
-                }
+            SessionMessage::Aborted { step, reason } => {
+                let Some(session) = self.session().await else {
+                    return;
+                };
+                let event = HostEvent::SessionAborted {
+                    source: session.source.clone(),
+                    step,
+                    reason,
+                    failure: arena0_protocol::ExecutionFailureCode::ProgramAborted,
+                };
+                self.events.emit(event);
             }
             SessionMessage::Failed { reason } => {
-                if let Ok(Some(state)) = self.entry.execution().await {
-                    let source = self.entry.event_source().await.ok();
-                    if state.lifecycle() == ExecLifecycle::Aborted {
-                        if let Some(source) = source {
-                            self.events.emit(HostEvent::SessionAborted {
-                                source,
-                                step: state.agreed_step().saturating_sub(1),
-                                reason,
-                                failure: arena0_protocol::ExecutionFailureCode::ProgramAborted,
-                            });
-                        }
-                    } else if let Some(source) = source {
-                        self.events.emit(HostEvent::Failed {
-                            source,
-                            reason,
-                            failure: arena0_protocol::ExecutionFailureCode::Runtime,
-                        });
-                    }
-                }
+                // A supervisor failure can report over an execution that
+                // already stopped with an abort; the durable cause wins.
+                let Ok(Some(state)) = self.entry.execution().await else {
+                    return;
+                };
+                let Ok(source) = self.entry.event_source().await else {
+                    return;
+                };
+                let aborted = state
+                    .status()
+                    .terminal_cause()
+                    .filter(|cause| cause.kind() == AbortKind::Abort);
+                self.events.emit(match aborted {
+                    Some(cause) => HostEvent::SessionAborted {
+                        source,
+                        step: cause.step(),
+                        reason,
+                        failure: arena0_protocol::ExecutionFailureCode::ProgramAborted,
+                    },
+                    None => HostEvent::Failed {
+                        source,
+                        reason,
+                        failure: arena0_protocol::ExecutionFailureCode::Runtime,
+                    },
+                });
             }
             SessionMessage::ReceiptPublished { .. } => {}
         }
@@ -828,7 +828,12 @@ impl Supervisor {
             &open.context,
             &program.definition().schema,
         )?;
-        let source = self.entry.event_source().await?;
+        let source = self
+            .session()
+            .await
+            .context("session facts are unavailable")?
+            .source
+            .clone();
         Ok(Some((source, event)))
     }
 }

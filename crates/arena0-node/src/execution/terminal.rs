@@ -101,23 +101,15 @@ impl ExecutionActor {
                 result: receipt.body().outcome().to_vec(),
                 result_json: state.terminal_outcome_json().map(ToOwned::to_owned),
             },
-            ReceiptTermination::Stopped { cause } => {
-                let step = match cause {
-                    arena0_protocol::StopCause::Authenticated(occurrence) => {
-                        occurrence.coordinate().next_step()
-                    }
-                    arena0_protocol::StopCause::Shared { commitment, .. } => commitment.step,
-                };
-                match cause.kind() {
-                    AbortKind::Abort => SessionMessage::Aborted {
-                        step,
-                        reason: cause.reason().to_owned(),
-                    },
-                    AbortKind::Fail => SessionMessage::Failed {
-                        reason: cause.reason().to_owned(),
-                    },
-                }
-            }
+            ReceiptTermination::Stopped { cause } => match cause.kind() {
+                AbortKind::Abort => SessionMessage::Aborted {
+                    step: cause.step(),
+                    reason: cause.reason().to_owned(),
+                },
+                AbortKind::Fail => SessionMessage::Failed {
+                    reason: cause.reason().to_owned(),
+                },
+            },
         };
         self.messages
             .send(message)

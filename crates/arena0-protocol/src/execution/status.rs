@@ -85,6 +85,16 @@ impl StopCause {
         }
     }
 
+    /// The step this stop concludes: the next step of an authenticated
+    /// occurrence's cursor, or the certified shared step that stopped.
+    #[must_use]
+    pub const fn step(&self) -> u64 {
+        match self {
+            Self::Authenticated(occurrence) => occurrence.coordinate().next_step(),
+            Self::Shared { commitment, .. } => commitment.step,
+        }
+    }
+
     /// Return the terminal kind when this cause is an abort/failure cause.
     #[must_use]
     pub const fn kind(&self) -> AbortKind {

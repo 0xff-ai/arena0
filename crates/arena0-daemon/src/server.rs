@@ -353,6 +353,19 @@ struct SpawnPlan {
     committed: ActivatedSession,
     actor_execution_key: ExecutionKey,
     execution_store: HostExecutionStore,
+    /// Whether the actor's observations replay a session this Host already
+    /// reported, so the supervisor must not project them again.
+    replay: bool,
+}
+
+/// Why a durable execution is being resumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeCause {
+    /// Startup recovery reports each resumed execution to a new observer.
+    Startup,
+    /// A peer poked an ended session. The actor only finishes end
+    /// confirmation; its creation and terminal were already reported.
+    EndWake,
 }
 
 /// One validated negotiation or execution occurrence. `Events` owns every
@@ -1386,7 +1399,9 @@ impl HostService {
                         if let Some(candidate) =
                             service.store.end_wake_candidate(execution_id).await?
                         {
-                            service.resume_candidate(candidate).await?;
+                            service
+                                .resume_candidate(candidate, ResumeCause::EndWake)
+                                .await?;
                         }
                         Ok::<(), anyhow::Error>(())
                     }
@@ -1418,7 +1433,8 @@ impl HostService {
                 .await?;
             let next = page.next_cursor();
             for candidate in page.into_candidates() {
-                self.resume_candidate(candidate).await?;
+                self.resume_candidate(candidate, ResumeCause::Startup)
+                    .await?;
             }
             let Some(next) = next else {
                 return Ok(());
@@ -1438,22 +1454,25 @@ impl HostService {
     async fn resume_candidate(
         self: &Arc<Self>,
         candidate: RecoveryCandidate,
+        cause: ResumeCause,
     ) -> anyhow::Result<()> {
         let request = candidate.request().clone();
         let exec_id = request.execution_id();
         if self.execs.get(&exec_id).is_some() {
             return Ok(());
         }
-        self.events.emit(HostEvent::Created {
-            source: EventSource::Execution {
-                peer_id: self.peer_id,
-                exec_id,
-                program_id: request.program_hash(),
-            },
-            negotiation_id: request.negotiation_id(),
-            queue_position: None,
-            origin: ExecCreationOrigin::Recovery,
-        });
+        if cause == ResumeCause::Startup {
+            self.events.emit(HostEvent::Created {
+                source: EventSource::Execution {
+                    peer_id: self.peer_id,
+                    exec_id,
+                    program_id: request.program_hash(),
+                },
+                negotiation_id: request.negotiation_id(),
+                queue_position: None,
+                origin: ExecCreationOrigin::Recovery,
+            });
+        }
 
         // The recovery page intentionally contains only bounded metadata.
         // Load each potentially large aggregate separately and complete all
@@ -1751,6 +1770,7 @@ impl HostService {
                             committed,
                             actor_execution_key: actor_key,
                             execution_store,
+                            replay: cause == ResumeCause::EndWake,
                         },
                     )
                     .await
@@ -3214,6 +3234,7 @@ impl HostService {
                 committed,
                 actor_execution_key,
                 execution_store,
+                replay: false,
             },
         )
         .await?;
@@ -3232,6 +3253,7 @@ impl HostService {
             committed,
             actor_execution_key,
             execution_store,
+            replay,
         } = plan;
         let exec_id = entry.exec_id();
         let params = JsonBytes::try_new(params)
@@ -3253,6 +3275,8 @@ impl HostService {
             spawned,
             events: self.events.clone(),
             transport: Arc::clone(&self.transport),
+            session: None,
+            replay,
         });
 
         // The post-commit relay: session-lived, re-emits the final offer and
@@ -5006,6 +5030,177 @@ mod tests {
                 .await
                 .expect("active execution count"),
             1
+        );
+        daemon.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_wake_resumes_without_replaying_observations() {
+        use arena0_protocol::AbortOccurrence;
+        use arena0_store::{Change, TransitionRecord};
+
+        let (_dir, store, daemon, peer) = test_daemon();
+        let wasm =
+            std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "../../programs/target/wasm32-unknown-unknown/release/rock_paper_scissors.wasm",
+            ))
+            .expect("built rock_paper_scissors guest; run `just build-programs`");
+        let program = Program::try_from(wasm.clone()).expect("program");
+        let (program_hash, _) = store
+            .handle()
+            .register_program(wasm, 1)
+            .await
+            .expect("program");
+        let params = JsonBytes::try_new(b"null".to_vec()).expect("params");
+        let initialized = daemon
+            .engine
+            .load(&program)
+            .expect("load program")
+            .initialize(params.clone())
+            .expect("initialize program");
+        let execution_id = ExecId([0xC4; 32]);
+        let negotiation_id = NegotiationId([0xC5; 32]);
+        let TwoPartyActivation {
+            other,
+            prepared,
+            activation,
+            ..
+        } = two_party_activation(
+            &daemon,
+            peer,
+            program_hash,
+            negotiation_id,
+            &initialized.shared,
+        );
+        let mut writer = daemon.runtime.claim_execution(execution_id).unwrap();
+        writer
+            .create_execution_request(
+                program_hash,
+                Some(params),
+                ExecutionAdmission::explicit(negotiation_id, vec![peer, other]).expect("admission"),
+                1,
+            )
+            .await
+            .expect("request");
+        writer
+            .prepare_activation(prepared, 2)
+            .await
+            .expect("prepare");
+        writer
+            .commit_activation(activation.clone(), 3)
+            .await
+            .expect("commit");
+        writer
+            .create_execution(activation, peer, initialized.shared, initialized.local, 4)
+            .await
+            .expect("execution");
+        drop(writer);
+
+        // Stop, publish, and close the confirmation window with the other
+        // participant still unconfirmed: the state an end wake resumes.
+        async fn persist(
+            writer: &mut arena0_store::ExecutionStore,
+            state: &mut ExecutionState,
+            next: ExecutionState,
+            change: Change,
+        ) {
+            writer
+                .persist(TransitionRecord {
+                    expected: state.version(),
+                    next: next.clone(),
+                    change,
+                    now_ms: 5,
+                })
+                .await
+                .expect("persist transition");
+            *state = next;
+        }
+        let mut writer = store.handle().claim_execution(execution_id).unwrap();
+        let mut state = writer.load_execution().await.unwrap().unwrap();
+        let mut next = state.clone();
+        next.activate().expect("activate");
+        let unsigned = AbortOccurrence::unsigned(
+            next.binding().session_id(),
+            peer,
+            AbortKind::Abort,
+            0,
+            "operator stop".to_owned(),
+            next.step_cursor(),
+        )
+        .expect("abort occurrence");
+        let signature = daemon
+            .identity
+            .sign(&unsigned.signing_bytes().expect("abort bytes"));
+        next.stop(unsigned.with_signature(signature).expect("signed abort"))
+            .expect("stop");
+        persist(&mut writer, &mut state, next, Change::State).await;
+        let artifact = writer.assemble_receipt(&state).await.expect("receipt");
+        let mut next = state.clone();
+        next.publish_receipt(artifact.clone()).expect("publish");
+        persist(&mut writer, &mut state, next, Change::Publish { artifact }).await;
+        let mut next = state.clone();
+        next.expire_end().expect("expire end");
+        persist(&mut writer, &mut state, next, Change::State).await;
+        assert!(matches!(
+            state.end_phase(),
+            arena0_protocol::EndPhase::Ended { unconfirmed } if unconfirmed.contains(&other)
+        ));
+        drop(writer);
+
+        let replayed = |frame: &EventFrame| {
+            frame.exec_id == Some(execution_id)
+                && matches!(
+                    frame.data,
+                    EventData::Created { .. }
+                        | EventData::SessionStarted { .. }
+                        | EventData::SessionEnded { .. }
+                        | EventData::Terminated { .. }
+                )
+        };
+        let wake = |cause| {
+            let daemon = &daemon;
+            async move {
+                let candidate = daemon
+                    .store
+                    .end_wake_candidate(execution_id)
+                    .await
+                    .expect("load wake candidate")
+                    .expect("ended execution is a wake candidate");
+                let mut events = daemon.events.subscribe();
+                daemon
+                    .resume_candidate(candidate, cause)
+                    .await
+                    .expect("resume");
+                assert!(daemon.execs.get(&execution_id).is_some(), "actor resumed");
+                let mut observed = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                    while let Ok(frame) = events.recv().await {
+                        if replayed(&frame) {
+                            observed.push(frame.data);
+                        }
+                    }
+                })
+                .await;
+                daemon.execs.stop().await;
+                observed
+            }
+        };
+
+        // A peer's wake only finishes end confirmation.
+        assert_eq!(wake(ResumeCause::EndWake).await, Vec::new());
+        // Startup recovery reports the same execution to a new observer.
+        let observed = wake(ResumeCause::Startup).await;
+        assert!(
+            observed
+                .iter()
+                .any(|data| matches!(data, EventData::Created { .. })),
+            "{observed:?}"
+        );
+        assert!(
+            observed
+                .iter()
+                .any(|data| matches!(data, EventData::SessionEnded { .. })),
+            "{observed:?}"
         );
         daemon.stop().await;
     }
