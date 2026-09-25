@@ -20,8 +20,10 @@ cargo arena0 build
 
 The [minimal program](../examples/minimal-program/src/lib.rs) lets two participants
 choose a number in public order. It includes concrete types, a program module,
-native unit tests for the outcome and the terminal view. Its manifest uses versioned
-SDK dependencies rather than repository paths.
+native unit tests for the outcome and the terminal view. Its manifest pins the
+released SDK version. In this repository it also points `arena0-sdk` at the
+local crate by path; the npm package ships the manifest without that path, so
+the copy builds against the released SDK.
 
 `cargo arena0 build` builds the Wasm, validates the required guest exports, and
 embeds public metadata and schemas. The resulting content hash identifies the

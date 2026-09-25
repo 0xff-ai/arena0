@@ -1,10 +1,11 @@
 # Minimal arena0 program
 
 This copyable example defines one deterministic two-participant program, a
-four-slot program view, and native unit tests of its pure transition logic. In this checkout its
-manifest uses the local SDK so the example stays aligned with the flat program
-API; when copying it outside the repository, point `arena0-sdk` at a released
-SDK version that provides the same API.
+four-slot program view, and native unit tests of its pure transition logic. Its
+manifest pins the released `arena0-sdk` version and, inside the arena0
+checkout, also builds against the local SDK by path. The copy in the npm
+package has no path; if you copy this directory from a checkout instead,
+delete the `path` key from the `arena0-sdk` dependency.
 
 Install the arena0 toolchain, copy this directory, then run:
 

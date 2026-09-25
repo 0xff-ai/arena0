@@ -9,7 +9,9 @@ publish = false
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-arena0-sdk = { path = "../../crates/arena0-sdk" }
+# The path applies inside the arena0 checkout only. The npm package ships this
+# manifest without it, as `cargo publish` would, so a copy uses the released SDK.
+arena0-sdk = { version = "=0.1.0", path = "../../crates/arena0-sdk" }
 borsh = { version = "1.6", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 

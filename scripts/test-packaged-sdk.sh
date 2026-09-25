@@ -28,10 +28,6 @@ if [[ ! -f "$example_source/Cargo.toml" || ! -f "$example_source/src/lib.rs" ]];
   echo "minimal-program example is incomplete at $example_source" >&2
   exit 1
 fi
-if grep -Eq 'arena0-[a-z-]+ = \{[^}]*path' "$example_source/Cargo.toml"; then
-  echo "minimal-program must use released dependencies, not repository paths" >&2
-  exit 1
-fi
 for package in "${packages[@]}"; do
   if ! cmp -s "$repo_root/LICENSE" "$repo_root/crates/$package/LICENSE"; then
     echo "$package packaged license differs from the repository license" >&2
@@ -103,6 +99,14 @@ done
 mkdir -p "$smoke_root/packages"
 cp -R "$example_source" "$smoke_root/minimal-program"
 rm -rf -- "$smoke_root/minimal-program/target" "$smoke_root/minimal-program/Cargo.lock"
+# Drop the checkout-only `path` keys, as the npm package does.
+manifest="$smoke_root/minimal-program/Cargo.toml"
+sed -E 's/, path = "[^"]*"//' "$manifest" >"$manifest.released"
+mv "$manifest.released" "$manifest"
+if grep -Eq 'arena0-[a-z-]+ = \{[^}]*path' "$manifest"; then
+  echo "minimal-program must use released dependencies, not repository paths" >&2
+  exit 1
+fi
 for package in "${packages[@]}"; do
   python3 -m tarfile -e \
     "$package_root/$package-$version.crate" "$smoke_root/packages"
