@@ -153,16 +153,11 @@ fn assert_context_host_operations(
         "a bootstrapped Host should expose its built-in programs"
     );
 
-    let identities = json_output(
-        invoke(home, &["--json", "identity", "list"], &environment),
-        "arena0 --json identity list",
+    let identity = json_output(
+        invoke(home, &["--json", "identity"], &environment),
+        "arena0 --json identity",
     );
-    let identities = identities["identities"]
-        .as_array()
-        .expect("identity list should contain identities");
-    assert_eq!(identities.len(), 1);
-    assert_eq!(identities[0]["peer_id"], peer_id.to_string());
-    assert_eq!(identities[0]["active"], true);
+    assert_eq!(identity["peer_id"], peer_id.to_string());
 
     let executions = json_output(
         invoke(home, &["--json", "exec", "list"], &environment),
@@ -412,46 +407,27 @@ fn codex_context_fallback_and_explicit_host_override_are_observable() {
 
     let explicit_context = "harness:other";
     let explicit = hello(home.path(), Some(explicit_context), USER_AGENT);
-    let (explicit_id, _explicit_peer) = host_info(explicit, None, USER_AGENT);
-
-    let new_identity = json_output(
-        invoke(
-            home.path(),
-            &[
-                "--json",
-                "--host",
-                explicit_id.as_str(),
-                "identity",
-                "new",
-                "override",
-            ],
-            &[("ARENA0_CONTEXT", fallback_context)],
-        ),
-        "arena0 --json --host <explicit> identity new",
-    );
-    assert_eq!(new_identity["label"], "override");
+    let (explicit_id, explicit_peer) = host_info(explicit, None, USER_AGENT);
 
     let selected = json_output(
         invoke(
             home.path(),
-            &["--json", "--host", explicit_id.as_str(), "identity", "list"],
+            &["--json", "--host", explicit_id.as_str(), "identity"],
             &[("ARENA0_CONTEXT", fallback_context)],
         ),
-        "arena0 --json --host <explicit> identity list",
+        "arena0 --json --host <explicit> identity",
     );
-    assert_eq!(selected["identities"].as_array().unwrap().len(), 2);
+    assert_eq!(selected["peer_id"], explicit_peer.to_string());
 
-    let fallback_identities = json_output(
+    let fallback_identity = json_output(
         invoke(
             home.path(),
-            &["--json", "identity", "list"],
+            &["--json", "identity"],
             &[("ARENA0_CONTEXT", fallback_context)],
         ),
-        "arena0 --json identity list from fallback context",
+        "arena0 --json identity from fallback context",
     );
-    let fallback_identities = fallback_identities["identities"].as_array().unwrap();
-    assert_eq!(fallback_identities.len(), 1);
-    assert_eq!(fallback_identities[0]["peer_id"], fallback_peer.to_string());
+    assert_eq!(fallback_identity["peer_id"], fallback_peer.to_string());
     assert_eq!(host_count(home.path()), 2);
 
     daemon.stop();

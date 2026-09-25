@@ -27,9 +27,7 @@ pub use events::{
     EventData, EventFilter, EventFrame, ExecOrigin, ExecutionFailureKind, NegotiationStage,
     SessionTerminal,
 };
-pub use request::{
-    AwaitState, EnsembleSpec, HostRequest, IdRef, ProgramRefError, ReceiptRef, Request,
-};
+pub use request::{AwaitState, EnsembleSpec, HostRequest, ProgramRefError, ReceiptRef, Request};
 pub use response::{
     ActivationInspection, ActivationInspectionState, ActivationParticipant, ApiError, ApiErrorCode,
     DaemonInfo, EffectKind, EffectSummary, EventKind, EventRecordSummary, ExecEndPhase,
@@ -83,7 +81,7 @@ mod tests {
     #[test]
     fn request_round_trips_with_path_tags() {
         let cases = [
-            (HostRequest::IdList, "id.list"),
+            (HostRequest::IdShow, "id.show"),
             (
                 HostRequest::ExecNext {
                     exec_id: ExecId([7u8; 32]),

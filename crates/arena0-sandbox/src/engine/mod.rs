@@ -183,13 +183,8 @@ impl HostState {
         profile: ExecutionProfile,
         call_kind: CallKind,
         dispatch: crate::call::DispatchKind,
-        random_replay: Option<&[Vec<u8>]>,
         callout_inputs: Vec<arena0_program::JsonSchemaDocument>,
     ) -> Self {
-        let mut entropy = Entropy::live();
-        if let Some(draws) = random_replay {
-            entropy.set_replay(draws.to_vec());
-        }
         Self {
             limits: StoreLimitsBuilder::new()
                 .memory_size(profile.limits.max_memory_bytes as usize)
@@ -203,7 +198,7 @@ impl HostState {
             outgoing_len: 0,
             logs: Vec::new(),
             effect_queue: Vec::new(),
-            entropy,
+            entropy: Entropy::live(),
             ledger: ResourceLedger::new(),
             profile,
             callout_inputs,
@@ -218,10 +213,7 @@ impl HostState {
         Ok(crate::CallObservations {
             effects: std::mem::take(&mut self.effect_queue),
             fuel_used,
-            random_draws: self
-                .entropy
-                .finish()
-                .map_err(|error| SandboxError::dispatch_failed(error.to_string()))?,
+            random_draws: self.entropy.finish(),
             logs: std::mem::take(&mut self.logs),
         })
     }
@@ -232,7 +224,6 @@ impl HostState {
         &mut self,
         dispatch: crate::call::DispatchKind,
         outgoing_len: usize,
-        random_replay: Option<&[Vec<u8>]>,
     ) {
         self.call_kind = CallKind::Dispatch;
         self.dispatch = dispatch;
@@ -242,29 +233,19 @@ impl HostState {
         self.ledger = ResourceLedger::new();
         self.entropy.reset();
         self.signer.clear();
-        if let Some(draws) = random_replay {
-            self.entropy.set_replay(draws.to_vec());
-        }
     }
 
     /// Clear setup observations while retaining the call kind selected for a
     /// fresh operation. Preparation is a bootstrap boundary, not a dispatch;
     /// it must neither consume operation fuel nor leave allocator accounting
     /// in the subsequent call.
-    pub(crate) fn reset_after_prepare(
-        &mut self,
-        call_kind: CallKind,
-        random_replay: Option<&[Vec<u8>]>,
-    ) {
+    pub(crate) fn reset_after_prepare(&mut self, call_kind: CallKind) {
         self.call_kind = call_kind;
         self.logs.clear();
         self.effect_queue.clear();
         self.ledger = ResourceLedger::new();
         self.entropy.reset();
         self.signer.clear();
-        if let Some(draws) = random_replay {
-            self.entropy.set_replay(draws.to_vec());
-        }
     }
 }
 
@@ -344,7 +325,6 @@ pub(crate) struct InstanceConfig<'a> {
     pub profile: &'a ExecutionProfile,
     pub call_kind: CallKind,
     pub dispatch: crate::call::DispatchKind,
-    pub random_replay: Option<&'a [Vec<u8>]>,
 }
 
 pub(crate) fn instantiate_module(
@@ -358,7 +338,6 @@ pub(crate) fn instantiate_module(
         profile,
         call_kind,
         dispatch,
-        random_replay,
     } = config;
     let mut store = Store::new(
         engine,
@@ -366,7 +345,6 @@ pub(crate) fn instantiate_module(
             profile.clone(),
             CallKind::Prepare,
             dispatch,
-            random_replay,
             schema.callouts.iter().map(|c| c.input.clone()).collect(),
         ),
     );
@@ -390,9 +368,7 @@ pub(crate) fn instantiate_module(
             .prepare()
             .map_err(|error| SandboxError::instantiation_failed(error.to_string()))?;
     }
-    store
-        .data_mut()
-        .reset_after_prepare(call_kind, random_replay);
+    store.data_mut().reset_after_prepare(call_kind);
     store
         .set_fuel(profile.fuel.per_call)
         .map_err(|error| SandboxError::instantiation_failed(error.to_string()))?;

@@ -114,7 +114,7 @@ impl std::fmt::Debug for McpConfig {
 /// topology and daemon endpoint are added by [`Daemon::start`].
 #[derive(Debug)]
 pub(crate) struct HostConfig {
-    /// Operator-visible Host name used in event frames and identity labels.
+    /// Operator-visible Host name used in event frames.
     name: HostName,
     /// The one signing identity shared by this Host's runtime and service.
     identity: Arc<NodeKeys>,
@@ -128,7 +128,7 @@ pub(crate) struct HostConfig {
 }
 
 impl HostConfig {
-    /// Open one Host home, provision its active identity, and import embedded
+    /// Open one Host home, provision its identity, and import embedded
     /// programs idempotently when `bootstrap` is enabled.
     pub(crate) fn open<N>(name: N, paths: Paths, bootstrap: bool) -> anyhow::Result<Self>
     where
@@ -141,30 +141,24 @@ impl HostConfig {
         paths.ensure_dirs().context("create state directories")?;
 
         let reservation = Store::reserve(&paths.db_path).context("reserve Host ownership")?;
-        let keystore = Arc::new(Keystore::open(paths.keys_dir.clone())?);
-        let peer_id = match keystore.active_peer_id() {
-            Some(peer_id) => peer_id,
-            None if !keystore.list()?.is_empty() => {
-                anyhow::bail!(
-                    "no active identity in {}; repair or recreate this Host",
-                    paths.keys_dir.display()
-                );
-            }
+        let keystore = match Keystore::open(paths.keys_dir.clone())? {
+            Some(keystore) => keystore,
             None if !bootstrap => {
                 anyhow::bail!(
-                    "no identity in {}; run `arena0 identity new` or start without --no-bootstrap",
+                    "no identity in {}; start without --no-bootstrap",
                     paths.keys_dir.display()
                 );
             }
             None => {
-                let info = keystore
-                    .new_identity(Some(name.to_string()))
-                    .context("mint the Host identity")?;
-                tracing::info!(peer = %info.peer_id, host = %name, "created ensemble identity");
-                info.peer_id
+                let keystore =
+                    Keystore::create(paths.keys_dir.clone()).context("mint the Host identity")?;
+                tracing::info!(peer = %keystore.peer_id(), host = %name, "created ensemble identity");
+                keystore
             }
         };
-        let identity = Arc::new(keystore.active_crypto()?);
+        let peer_id = keystore.peer_id();
+        let identity = keystore.node_keys();
+        let keystore = Arc::new(keystore);
         let store = reservation
             .open(StoreConfig::new(paths.db_path.clone(), peer_id))
             .with_context(|| format!("open SQLite store at {}", paths.db_path.display()))?;
@@ -206,19 +200,18 @@ impl HostConfig {
         // Custody is opened only after this process owns the durable store. A
         // mismatched or missing identity therefore cannot acquire identity
         // custody while another process owns the database.
-        let keystore = Arc::new(Keystore::open(paths.keys_dir.clone())?);
-        let actual_peer = keystore
-            .active_peer_id()
-            .ok_or_else(|| anyhow::anyhow!("existing Host has no active identity"))?;
+        let keystore = Keystore::open(paths.keys_dir.clone())?
+            .ok_or_else(|| anyhow::anyhow!("existing Host has no identity"))?;
         anyhow::ensure!(
-            actual_peer == expected_peer,
+            keystore.peer_id() == expected_peer,
             "existing Host identity does not match the authenticated peer"
         );
-        let identity = Arc::new(keystore.active_crypto()?);
+        let identity = keystore.node_keys();
         anyhow::ensure!(
             identity.peer_id() == expected_peer,
             "existing Host identity changed while opening"
         );
+        let keystore = Arc::new(keystore);
         let store = reservation
             .open(StoreConfig::new(paths.db_path.clone(), expected_peer))
             .with_context(|| format!("open SQLite store at {}", paths.db_path.display()))?;
@@ -1358,6 +1351,83 @@ async fn join_server_task(
 #[cfg(test)]
 mod construction_tests {
     use super::*;
+    use arena0_crypto::SecretKey;
+    use std::fs::{self, OpenOptions};
+    use std::io::Write as _;
+
+    fn replace_identity_seed(keys_dir: &std::path::Path, seed: &[u8; 32]) {
+        let temporary = keys_dir.join(".identity.seed.tmp.snapshot-test");
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut temporary_file = options.open(&temporary).unwrap();
+        temporary_file.write_all(seed).unwrap();
+        temporary_file.sync_all().unwrap();
+        drop(temporary_file);
+        fs::rename(&temporary, keys_dir.join("identity.seed")).unwrap();
+        #[cfg(unix)]
+        {
+            OpenOptions::new()
+                .read(true)
+                .open(keys_dir)
+                .unwrap()
+                .sync_all()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn seed_replacement_after_host_open_keeps_one_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::from_root(directory.path().to_owned()).unwrap();
+        let name: HostName = "snapshot".parse().unwrap();
+        let paths = Paths::from_location(&home.host(&name)).unwrap();
+        let config = HostConfig::open(name.clone(), paths.clone(), true).unwrap();
+        let expected = config.peer_id();
+        assert_eq!(config.store.handle().host_id(), expected);
+
+        let replacement_seed = [0xa5; 32];
+        let replacement_peer =
+            NodeKeys::from_secret(SecretKey::from_bytes(replacement_seed)).peer_id();
+        assert_ne!(replacement_peer, expected);
+        replace_identity_seed(&paths.keys_dir, &replacement_seed);
+        let reread = Keystore::open(paths.keys_dir.clone())
+            .unwrap()
+            .expect("replacement seed should open");
+        assert_eq!(reread.peer_id(), replacement_peer);
+
+        assert_eq!(config.keystore.node_keys().peer_id(), expected);
+        assert_eq!(config.keystore.info().peer_id, expected);
+
+        let engine = Arc::new(WasmtimeEngine::new().unwrap());
+        let startup = Arc::new(StartupTimeline::new(1, 0));
+        let runtime_ensemble = Ensemble::start(vec![(
+            Arc::clone(&config.identity),
+            config.store.handle().clone(),
+        )])
+        .unwrap();
+        let runtime = runtime_ensemble
+            .host(&expected)
+            .expect("runtime should start with the opened identity");
+        assert_eq!(runtime.peer_id, expected);
+        let transport = runtime_ensemble
+            .transport(&expected)
+            .expect("transport should start with the opened identity");
+        let service = compose_service(&config, transport, runtime, &engine, &startup).unwrap();
+        let info = match service.dispatch(HostRequest::IdShow).await {
+            Ok(ResponseOk::Id(info)) => info,
+            response => panic!("unexpected id.show response: {response:?}"),
+        };
+        assert_eq!(info.peer_id, expected);
+
+        service.stop().await;
+        runtime_ensemble.stop().await;
+        config.store.shutdown().await.unwrap();
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn over_capacity_initial_hosts_fail_before_provisioning() {

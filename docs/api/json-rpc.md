@@ -41,13 +41,10 @@ are `NotFound`, `BadRequest`, `Ambiguous`, `Schema`, `Negotiation`,
 
 | Method | Params | Success |
 |---|---|---|
-| `id.new` | `{label?}` | `Id` |
-| `id.list` | — | `IdList` |
-| `id.show` | `{id}` | `Id` |
-| `id.remove` | `{id}` | `Ack` |
+| `id.show` | — | `Id` |
 
-The active identity is the Host's durable protocol identity and cannot be
-removed through `id.remove`; rotation requires a lifecycle-aware operation.
+Each Host has exactly one identity, minted when the Host is created. A new
+identity means a new Host (`hosts.open`).
 
 Seeds never cross the socket. `IdInfo` contains public identity material only.
 

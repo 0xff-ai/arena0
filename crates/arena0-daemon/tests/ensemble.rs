@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arena0_api::{ApiErrorCode, EnsembleSpec, HostRequest, IdRef, Request, Response, ResponseOk};
+use arena0_api::{ApiErrorCode, EnsembleSpec, HostRequest, Request, Response, ResponseOk};
 use arena0_daemon::{Daemon, McpConfig};
 use arena0_program::ParticipantCount;
 use tempfile::TempDir;
@@ -114,7 +114,7 @@ async fn routes_two_hosts_through_one_socket() {
 }
 
 #[tokio::test]
-async fn active_identity_cannot_be_removed_over_shared_unix_api() {
+async fn id_show_returns_the_host_identity() {
     let (home, daemon, serving) = start(&["a", "b"]).await;
     let socket = home.path().join("arena0.sock");
     let info = call(&socket, &host("a", HostRequest::Info)).await;
@@ -122,52 +122,26 @@ async fn active_identity_cannot_be_removed_over_shared_unix_api() {
         Ok(ResponseOk::HostStatus(status)) => status,
         info => panic!("unexpected Host info response: {info:?}"),
     };
-    let response = call(
-        &socket,
-        &host(
-            "a",
-            HostRequest::IdRemove {
-                id: IdRef::Peer(status.host.peer_id),
-            },
-        ),
-    )
-    .await;
-    let error = response.expect_err("active identity removal must be rejected");
-    assert_eq!(error.code, ApiErrorCode::BadRequest);
-    assert!(error.message.contains("active Host identity"));
+    let id = match call(&socket, &host("a", HostRequest::IdShow)).await {
+        Ok(ResponseOk::Id(id)) => id,
+        response => panic!("unexpected id.show response: {response:?}"),
+    };
+    assert_eq!(id.peer_id, status.host.peer_id);
+    assert_eq!(id.transport_key, status.transport_key);
+    assert_ne!(
+        id.peer_id,
+        match call(&socket, &host("b", HostRequest::IdShow)).await {
+            Ok(ResponseOk::Id(id)) => id.peer_id,
+            response => panic!("unexpected id.show response: {response:?}"),
+        }
+    );
     stop(home, daemon, serving).await;
 }
 
 #[tokio::test]
-async fn shared_unix_api_classifies_identity_and_program_input_errors() {
+async fn shared_unix_api_classifies_program_input_errors() {
     let (home, daemon, serving) = start(&["host-01", "host-02"]).await;
     let socket = home.path().join("arena0.sock");
-    let missing = call(
-        &socket,
-        &host(
-            "host-01",
-            HostRequest::IdShow {
-                id: IdRef::Label("missing".into()),
-            },
-        ),
-    )
-    .await
-    .expect_err("missing identity should be typed");
-    assert_eq!(missing.code, ApiErrorCode::NotFound);
-
-    let invalid_label = call(
-        &socket,
-        &host(
-            "host-01",
-            HostRequest::IdNew {
-                label: Some("bad\u{1b}label".into()),
-            },
-        ),
-    )
-    .await
-    .expect_err("invalid identity label should be typed");
-    assert_eq!(invalid_label.code, ApiErrorCode::BadRequest);
-
     let invalid_program = call(
         &socket,
         &host(
@@ -190,12 +164,12 @@ async fn variable_size_program_accepts_supported_explicit_ensemble() {
     let socket = home.path().join("arena0.sock");
     let mut peers = Vec::new();
     for name in ["host-01", "host-02", "host-03"] {
-        let response = call(&socket, &host(name, HostRequest::IdList)).await;
-        let ids = match response {
-            Ok(ResponseOk::IdList(ids)) => ids,
+        let response = call(&socket, &host(name, HostRequest::IdShow)).await;
+        let id = match response {
+            Ok(ResponseOk::Id(id)) => id,
             response => panic!("unexpected identity response: {response:?}"),
         };
-        peers.push(ids[0].peer_id);
+        peers.push(id.peer_id);
     }
     let response = call(&socket, &host("host-01", HostRequest::ProgramList)).await;
     let programs = match response {

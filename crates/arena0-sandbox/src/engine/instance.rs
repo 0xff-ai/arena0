@@ -132,7 +132,6 @@ impl super::WasmtimeEngine {
                 profile: &self.profile,
                 call_kind: CallKind::Metadata,
                 dispatch: DispatchKind::Local,
-                random_replay: None,
             },
         )?;
         Ok(Arc::new(super::LoadedProgram {
@@ -183,7 +182,6 @@ impl super::WasmtimeEngine {
                 self.profile.clone(),
                 CallKind::Metadata,
                 DispatchKind::Local,
-                None,
                 Vec::new(),
             ),
         );
@@ -204,9 +202,7 @@ impl super::WasmtimeEngine {
                 .prepare()
                 .map_err(|error| SandboxError::instantiation_failed(error.to_string()))?;
         }
-        store
-            .data_mut()
-            .reset_after_prepare(CallKind::Metadata, None);
+        store.data_mut().reset_after_prepare(CallKind::Metadata);
         store
             .set_fuel(self.profile.fuel.per_call)
             .map_err(|error| SandboxError::instantiation_failed(error.to_string()))?;

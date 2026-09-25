@@ -3,7 +3,7 @@
 //!
 //! This is the symmetric multiparty program: the shared state (the final total)
 //! converges identically across every node, while the random draws exercise the
-//! entropy record/replay path and the broadcast exercises N-party routing.
+//! live entropy path and the broadcast exercises N-party routing.
 //! Membership is formed by admission, not in-program: the runtime hands the
 //! sealed committed ensemble to `on_session_started` and keeps it available
 //! through `ctx.ensemble()`. Every participant BLS-signs the activation commitment that

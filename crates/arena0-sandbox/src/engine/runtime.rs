@@ -25,7 +25,6 @@ impl super::LoadedProgram {
         let (output, observations) = self.invoke::<InitInput, arena0_program::InitializedState>(
             CallKind::Initialize,
             DispatchKind::Local,
-            None,
             abi::exports::INITIALIZE,
             input,
         )?;
@@ -48,7 +47,6 @@ impl super::LoadedProgram {
                 profile: &self.profile,
                 call_kind: CallKind::Dispatch,
                 dispatch: DispatchKind::Local,
-                random_replay: None,
             },
         )?;
         let work = instance
@@ -131,7 +129,6 @@ impl super::LoadedProgram {
         let (output, observations) = self.invoke::<WriterInput, WriterOutput>(
             CallKind::Writer,
             DispatchKind::Local,
-            None,
             abi::exports::WRITER,
             input,
         )?;
@@ -166,7 +163,6 @@ impl super::LoadedProgram {
         let (output, observations) = self.invoke::<QueryInput, QueryOutput>(
             CallKind::Query,
             DispatchKind::Local,
-            None,
             abi::exports::QUERY,
             input,
         )?;
@@ -192,7 +188,6 @@ impl super::LoadedProgram {
         let (output, observations) = self.invoke::<ViewInput, ViewOutput>(
             CallKind::View,
             DispatchKind::Local,
-            None,
             abi::exports::VIEW,
             input,
         )?;
@@ -208,7 +203,6 @@ impl super::LoadedProgram {
         let (output, observations) = self.invoke::<OutcomeInput, OutcomeOutput>(
             CallKind::Outcome,
             DispatchKind::Local,
-            None,
             abi::exports::OUTCOME,
             input,
         )?;
@@ -226,7 +220,6 @@ impl super::LoadedProgram {
         &self,
         kind: CallKind,
         dispatch: DispatchKind,
-        random_replay: Option<&[Vec<u8>]>,
         export: &str,
         input: I,
     ) -> Result<(O, CallObservations), SandboxError>
@@ -255,7 +248,6 @@ impl super::LoadedProgram {
                 profile: &self.profile,
                 call_kind: kind,
                 dispatch,
-                random_replay,
             },
         )?;
         let input_ptr = {
@@ -392,14 +384,8 @@ impl std::fmt::Debug for ProgramInstance {
 impl ProgramInstance {
     /// Dispatch one event through the sole mutating guest export.
     pub fn dispatch(&mut self, call: DispatchCall) -> Result<DispatchCallResult, SandboxError> {
-        let (input, random_replay, dispatch, outgoing_len, signer) = call.into_input()?;
-        self.dispatch_input(
-            input,
-            random_replay.as_ref(),
-            dispatch,
-            outgoing_len,
-            signer,
-        )
+        let (input, dispatch, outgoing_len, signer) = call.into_input()?;
+        self.dispatch_input(input, dispatch, outgoing_len, signer)
     }
 
     /// Replace the resident state with durable committed payloads during actor
@@ -482,7 +468,6 @@ impl ProgramInstance {
     fn dispatch_input(
         &mut self,
         input: DispatchInput,
-        random_replay: Option<&crate::call::RandomReplay>,
         dispatch: DispatchKind,
         outgoing_len: usize,
         signer: Option<std::sync::Arc<dyn crate::GuestSigner>>,
@@ -499,7 +484,7 @@ impl ProgramInstance {
         let bytes_len = u32::try_from(bytes.len()).map_err(|_| {
             SandboxError::InputLimitExceeded("dispatch input length overflows u32".into())
         })?;
-        if let Err(error) = self.reset_for_dispatch(dispatch, outgoing_len, random_replay) {
+        if let Err(error) = self.reset_for_dispatch(dispatch, outgoing_len) {
             return self.rollback_error(error);
         }
         // A signer is installed only for this dispatch; any rollback path
@@ -632,17 +617,14 @@ impl ProgramInstance {
         &mut self,
         dispatch: DispatchKind,
         outgoing_len: usize,
-        random_replay: Option<&crate::call::RandomReplay>,
     ) -> Result<(), SandboxError> {
         // Reset at entry so every guest call sees the same temporary-memory and
         // mutable-global baseline, including when a prior accepted result was
         // not yet committed by the owning store transaction.
         let reset_result = self.reset_work_and_globals();
-        self.store.data_mut().reset_for_dispatch(
-            dispatch,
-            outgoing_len,
-            random_replay.map(crate::call::RandomReplay::as_slice),
-        );
+        self.store
+            .data_mut()
+            .reset_for_dispatch(dispatch, outgoing_len);
         reset_result?;
         self.store
             .set_fuel(self.profile.fuel.per_call)
@@ -670,7 +652,7 @@ impl ProgramInstance {
         let restore_result = self.restore_committed();
         self.store
             .data_mut()
-            .reset_for_dispatch(DispatchKind::Local, 0, None);
+            .reset_for_dispatch(DispatchKind::Local, 0);
         restore_result
     }
 

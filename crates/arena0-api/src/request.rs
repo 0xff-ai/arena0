@@ -48,15 +48,9 @@ pub enum HostRequest {
     #[serde(rename = "host.info")]
     Info,
     // Identity / custody (CLI only; never sent by the MCP server). Seeds never
-    // cross the socket: `id.new` returns only public material.
-    #[serde(rename = "id.new")]
-    IdNew { label: Option<String> },
-    #[serde(rename = "id.list")]
-    IdList,
+    // cross the socket: `id.show` returns only public material.
     #[serde(rename = "id.show")]
-    IdShow { id: IdRef },
-    #[serde(rename = "id.remove")]
-    IdRemove { id: IdRef },
+    IdShow,
 
     // Program catalog. `program` is a human handle, unique short-hash prefix, or
     // full 64-hex id, resolved to a `ProgramHash` daemon-side.
@@ -176,13 +170,6 @@ pub enum EnsembleSpec {
     /// Join the first valid offer on the program topic, or one exact offer
     /// when `target` is supplied.
     Join { target: Option<NegotiationTarget> },
-}
-
-/// Reference an identity by `PeerId` or operator label.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum IdRef {
-    Peer(PeerId),
-    Label(String),
 }
 
 /// Select exact stored evidence, this Host's session publication, or an inline artifact.

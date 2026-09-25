@@ -21,7 +21,6 @@ pub enum ResponseOk {
     /// A method with no payload succeeded (e.g. `daemon.stop`, `program.remove`).
     Ack,
     Id(IdInfo),
-    IdList(Vec<IdInfo>),
     Program(Box<ProgramDetail>),
     ProgramList(Vec<ProgramSummary>),
     /// `exec.new` returns immediately; negotiation runs in the background. The state
@@ -161,17 +160,14 @@ pub enum ApiErrorCode {
     Internal,
 }
 
-/// Public material for one keystore identity. Seeds never appear here.
+/// Public material for the Host identity. Seeds never appear here.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IdInfo {
     pub peer_id: PeerId,
-    pub label: Option<String>,
     /// The persistent Ed25519 identity key used by the Host.
     /// `peer_id` is derived from this key. The execution BLS key is minted per exec,
     /// so it is not identity material and does not appear here.
     pub transport_key: AgentPubKey,
-    /// Whether this is the daemon's active identity.
-    pub active: bool,
 }
 
 /// A registry listing entry (no wasm bytes, no schema).

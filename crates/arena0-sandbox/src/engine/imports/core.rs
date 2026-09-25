@@ -267,11 +267,7 @@ pub(crate) fn register_always_available(
                     return Err(wasmtime::Error::msg("random: write out of bounds"));
                 }
                 let mut bytes = vec![0u8; len as usize];
-                caller
-                    .data_mut()
-                    .entropy
-                    .fill(&mut bytes)
-                    .map_err(|error| wasmtime::Error::msg(error.to_string()))?;
+                caller.data_mut().entropy.fill(&mut bytes);
                 let data = work_mem.data_mut(&mut caller);
                 data[start..end].copy_from_slice(&bytes);
                 Ok(())

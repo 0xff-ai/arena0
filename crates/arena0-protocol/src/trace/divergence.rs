@@ -1,14 +1,11 @@
-//! Divergence diagnosis: comparing traces for exact replay equivalence and
-//! pinpointing the first field where two entries came apart.
+//! Divergence diagnostics: the structured mismatch class and the human-readable
+//! record raised when two native dispatch histories came apart.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::Participant;
-
-use super::TRACE_FORMAT_VERSION;
-use super::entry::TraceEntry;
 
 /// Structured class of trace replay or comparison mismatch.
 #[derive(
@@ -137,139 +134,6 @@ fn short(v: &str) -> String {
 
 impl std::error::Error for DivergenceDiagnostic {}
 
-impl TraceEntry {
-    /// Verify that a trace entry uses the current schema version.
-    pub fn validate_format(&self) -> Result<(), DivergenceDiagnostic> {
-        if self.trace_version != TRACE_FORMAT_VERSION {
-            return Err(DivergenceDiagnostic::new_at(
-                self.step,
-                DivergenceKind::TraceVersionMismatch,
-                "trace_version",
-                TRACE_FORMAT_VERSION,
-                self.trace_version,
-            ));
-        }
-        Ok(())
-    }
-
-    /// Verify that a trace is internally replayable as a hash chain.
-    pub fn verify_chain(trace: &[Self]) -> Result<(), DivergenceDiagnostic> {
-        for (idx, entry) in trace.iter().enumerate() {
-            entry.validate_format()?;
-            if entry.step != idx as u64 {
-                return Err(DivergenceDiagnostic::new_at(
-                    entry.step,
-                    DivergenceKind::StepIndexMismatch,
-                    "step",
-                    idx,
-                    entry.step,
-                ));
-            }
-            if let Some(next) = trace.get(idx + 1)
-                && entry.post_state != next.pre_state
-            {
-                return Err(DivergenceDiagnostic::new_at(
-                    next.step,
-                    DivergenceKind::ChainMismatch,
-                    "pre_state",
-                    entry.post_state,
-                    next.pre_state,
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Compare two traces for exact replay equivalence.
-    pub fn compare_traces(left: &[Self], right: &[Self]) -> Result<(), DivergenceDiagnostic> {
-        if left.len() != right.len() {
-            return Err(DivergenceDiagnostic::new_at(
-                left.len().max(right.len()) as u64,
-                DivergenceKind::StepCountMismatch,
-                "len",
-                left.len(),
-                right.len(),
-            ));
-        }
-
-        Self::verify_chain(left)?;
-        Self::verify_chain(right)?;
-
-        for (left, right) in left.iter().zip(right) {
-            Self::compare_step(left, right)?;
-        }
-        Ok(())
-    }
-
-    /// Compare two records for exact replay equivalence.
-    pub fn compare_step(left: &Self, right: &Self) -> Result<(), DivergenceDiagnostic> {
-        left.validate_format()?;
-        right.validate_format()?;
-        compare_entry(left, right)
-    }
-}
-
-fn compare_entry(left: &TraceEntry, right: &TraceEntry) -> Result<(), DivergenceDiagnostic> {
-    if left.step != right.step {
-        return Err(DivergenceDiagnostic::new_at(
-            left.step,
-            DivergenceKind::StepIndexMismatch,
-            "step",
-            left.step,
-            right.step,
-        ));
-    }
-    if left.event != right.event {
-        return Err(DivergenceDiagnostic::new_at(
-            left.step,
-            DivergenceKind::EventMismatch,
-            format!("event{}", first_json_diff_path(&left.event, &right.event)),
-            &left.event,
-            &right.event,
-        ));
-    }
-    if left.pre_state != right.pre_state {
-        return Err(DivergenceDiagnostic::new_at(
-            left.step,
-            DivergenceKind::PreStateMismatch,
-            "pre_state",
-            left.pre_state,
-            right.pre_state,
-        ));
-    }
-    if left.terminal != right.terminal {
-        return Err(DivergenceDiagnostic::new_at(
-            left.step,
-            DivergenceKind::EffectMismatch,
-            format!(
-                "terminal{}",
-                first_json_diff_path(&left.terminal, &right.terminal)
-            ),
-            &left.terminal,
-            &right.terminal,
-        ));
-    }
-    if left.post_state != right.post_state {
-        return Err(DivergenceDiagnostic::new_at(
-            left.step,
-            DivergenceKind::PostStateMismatch,
-            "post_state",
-            left.post_state,
-            right.post_state,
-        ));
-    }
-    Ok(())
-}
-
-fn first_json_diff_path<T: Serialize>(left: &T, right: &T) -> String {
-    let left = serde_json::to_value(left).ok();
-    let right = serde_json::to_value(right).ok();
-    match (left, right) {
-        (Some(left), Some(right)) => left.first_difference_path(&right),
-        _ => String::new(),
-    }
-}
-
 /// Deterministic diagnostic paths shared by trace comparison and native replay.
 /// This is a presentation operation and does not affect proof semantics.
 pub trait JsonDiffExt {
@@ -316,66 +180,7 @@ impl JsonDiffExt for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trace::AggregateAttestation;
-    use crate::{StateHash, StepEvent, StepTerminal};
 
-    fn hash(byte: u8) -> StateHash {
-        StateHash([byte; 32])
-    }
-
-    fn entry(step: u64, pre: StateHash, post: StateHash) -> TraceEntry {
-        TraceEntry {
-            trace_version: TRACE_FORMAT_VERSION,
-            step,
-            event: StepEvent::Message {
-                from: crate::PeerId([1; 32]),
-                data: Vec::new(),
-            },
-            pre_state: pre,
-            post_state: post,
-            terminal: None,
-            agreement: AggregateAttestation::empty(),
-        }
-    }
-
-    #[test]
-    fn verify_chain_accepts_linked_steps() {
-        let trace = vec![entry(0, hash(0), hash(1)), entry(1, hash(1), hash(2))];
-        TraceEntry::verify_chain(&trace).unwrap();
-    }
-
-    #[test]
-    fn verify_chain_reports_broken_link() {
-        let trace = vec![entry(0, hash(0), hash(1)), entry(1, hash(9), hash(2))];
-        let err = TraceEntry::verify_chain(&trace).unwrap_err();
-        assert_eq!(err.kind, DivergenceKind::ChainMismatch);
-        assert_eq!(err.step, 1);
-        assert_eq!(err.field_path, "pre_state");
-    }
-
-    #[test]
-    fn compare_traces_reports_effect_mismatch() {
-        let left = vec![entry(0, hash(0), hash(1))];
-        let mut right = left.clone();
-        right[0].terminal = Some(StepTerminal::End { outcome: vec![] });
-        let err = TraceEntry::compare_traces(&left, &right).unwrap_err();
-        assert_eq!(err.kind, DivergenceKind::EffectMismatch);
-    }
-
-    #[test]
-    fn compare_step_reports_terminal_mismatch() {
-        let mut left = entry(0, hash(0), hash(1));
-        left.terminal = Some(StepTerminal::Fail {
-            reason: "boom".into(),
-        });
-        let mut right = left.clone();
-        right.terminal = Some(StepTerminal::Abort {
-            reason: "retry".into(),
-        });
-        let err = TraceEntry::compare_step(&left, &right).unwrap_err();
-        assert_eq!(err.kind, DivergenceKind::EffectMismatch);
-        assert_eq!(err.field_path, "terminal.Abort");
-    }
     #[test]
     fn json_difference_paths_are_deterministic() {
         for (left, right, path) in [

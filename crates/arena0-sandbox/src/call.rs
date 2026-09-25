@@ -4,71 +4,14 @@
 //! dispatches. Read-only projections continue to use fresh instances.
 
 use arena0_program::{
-    DispatchInput, InitInput, JsonBytes, MAX_CALL_ENVELOPE_BYTES, MAX_HOST_BYTES,
-    MAX_RANDOM_DRAW_BYTES, MAX_RANDOM_DRAWS, OutcomeInput, QueryInput, SharedStateBytes, ViewInput,
-    WriterInput,
+    DispatchInput, InitInput, JsonBytes, MAX_CALL_ENVELOPE_BYTES, OutcomeInput, QueryInput,
+    SharedStateBytes, ViewInput, WriterInput,
 };
 use arena0_protocol::{Committed, Ensemble, Event, PeerId};
 use borsh::BorshSerialize;
 use std::sync::Arc;
 
 use crate::GuestSigner;
-
-/// Replay evidence supplied to a dispatch call.
-#[derive(Debug, Clone, Default)]
-pub struct RandomReplay(Vec<Vec<u8>>);
-
-/// Failure to construct bounded replay evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum RandomReplayError {
-    /// The replay contained too many draws.
-    #[error("random replay contains {actual} draws; maximum is {max}")]
-    TooManyDraws { actual: usize, max: u32 },
-    /// One draw exceeded the per-draw bound.
-    #[error("random replay draw is {actual} bytes; maximum is {max}")]
-    DrawTooLarge { actual: usize, max: u64 },
-    /// All replay bytes exceeded the per-call host budget.
-    #[error("random replay contains {actual} bytes; maximum is {max}")]
-    TooManyBytes { actual: usize, max: u32 },
-}
-
-impl RandomReplay {
-    /// Use recorded draws as the guest's deterministic entropy source.
-    pub fn new(draws: Vec<Vec<u8>>) -> Result<Self, RandomReplayError> {
-        if draws.len() > MAX_RANDOM_DRAWS as usize {
-            return Err(RandomReplayError::TooManyDraws {
-                actual: draws.len(),
-                max: MAX_RANDOM_DRAWS,
-            });
-        }
-        let mut total = 0usize;
-        for draw in &draws {
-            if draw.len() as u64 > MAX_RANDOM_DRAW_BYTES {
-                return Err(RandomReplayError::DrawTooLarge {
-                    actual: draw.len(),
-                    max: MAX_RANDOM_DRAW_BYTES,
-                });
-            }
-            total = total
-                .checked_add(draw.len())
-                .ok_or(RandomReplayError::TooManyBytes {
-                    actual: usize::MAX,
-                    max: MAX_HOST_BYTES,
-                })?;
-        }
-        if total > MAX_HOST_BYTES as usize {
-            return Err(RandomReplayError::TooManyBytes {
-                actual: total,
-                max: MAX_HOST_BYTES,
-            });
-        }
-        Ok(Self(draws))
-    }
-
-    pub(crate) fn as_slice(&self) -> &[Vec<u8>] {
-        &self.0
-    }
-}
 
 /// Initialize a fresh program's shared and local state.
 #[derive(Debug, Clone)]
@@ -99,12 +42,11 @@ pub(crate) enum DispatchKind {
     Local,
 }
 
-/// Decoded inputs for one resident dispatch: the ABI envelope, optional replay
-/// evidence, the dispatch kind the guest sees, the committed outgoing length,
-/// and the per-dispatch signer.
+/// Decoded inputs for one resident dispatch: the ABI envelope, the dispatch
+/// kind the guest sees, the committed outgoing length, and the per-dispatch
+/// signer.
 type DispatchParts = (
     DispatchInput,
-    Option<RandomReplay>,
     DispatchKind,
     usize,
     Option<Arc<dyn GuestSigner>>,
@@ -116,7 +58,6 @@ pub struct DispatchCall {
     pub(crate) peer_id: PeerId,
     pub(crate) session: Ensemble<Committed>,
     pub(crate) event: Event<Vec<u8>>,
-    pub(crate) random_replay: Option<RandomReplay>,
     pub(crate) outgoing_len: usize,
     pub(crate) signer: Option<Arc<dyn GuestSigner>>,
 }
@@ -128,7 +69,6 @@ impl std::fmt::Debug for DispatchCall {
             .field("peer_id", &self.peer_id)
             .field("session", &self.session)
             .field("event", &self.event)
-            .field("random_replay", &self.random_replay)
             .field("signer", &self.signer.is_some())
             .finish()
     }
@@ -143,7 +83,6 @@ impl DispatchCall {
             peer_id,
             session,
             event,
-            random_replay: None,
             outgoing_len: 0,
             signer: None,
         }
@@ -169,19 +108,11 @@ impl DispatchCall {
         self
     }
 
-    /// Replay the recorded random draws for this dispatch.
-    #[must_use]
-    pub fn with_random_replay(mut self, replay: RandomReplay) -> Self {
-        self.random_replay = Some(replay);
-        self
-    }
-
     pub(crate) fn into_input(self) -> Result<DispatchParts, crate::SandboxError> {
         let Self {
             peer_id,
             session,
             event,
-            random_replay,
             outgoing_len,
             signer,
         } = self;
@@ -193,7 +124,7 @@ impl DispatchCall {
             Event::SessionStarted { .. } | Event::MessageReceived { .. } => DispatchKind::Agreed,
             Event::InputReceived { .. } | Event::TimerFired { .. } => DispatchKind::Local,
         };
-        Ok((input, random_replay, dispatch, outgoing_len, signer))
+        Ok((input, dispatch, outgoing_len, signer))
     }
 }
 
@@ -341,11 +272,5 @@ mod tests {
         .0;
         assert_eq!(input.peer_id, [1; 32]);
         assert!(borsh::from_slice::<Ensemble<Committed>>(&input.session).is_ok());
-    }
-
-    #[test]
-    fn random_replay_is_bounded_at_construction() {
-        let replay = RandomReplay::new(vec![vec![0; MAX_RANDOM_DRAW_BYTES as usize + 1]]);
-        assert!(replay.is_err());
     }
 }

@@ -272,6 +272,7 @@ fn native_local_handler_cannot_forge_a_shared_view_for_the_callout() {
 #[derive(
     Debug,
     Clone,
+    Default,
     PartialEq,
     Eq,
     arena0::serde::Serialize,
@@ -284,22 +285,13 @@ struct FallibleShared {
     poison: bool,
 }
 
-impl Default for FallibleShared {
-    fn default() -> Self {
-        Self { poison: false }
-    }
-}
-
 impl arena0::borsh::BorshSerialize for FallibleShared {
     fn serialize<W: arena0::borsh::io::Write>(
         &self,
         writer: &mut W,
     ) -> arena0::borsh::io::Result<()> {
         if self.poison {
-            return Err(arena0::borsh::io::Error::new(
-                arena0::borsh::io::ErrorKind::Other,
-                "poisoned shared image",
-            ));
+            return Err(arena0::borsh::io::Error::other("poisoned shared image"));
         }
         arena0::borsh::BorshSerialize::serialize(&self.poison, writer)
     }

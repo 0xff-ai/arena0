@@ -44,7 +44,15 @@ pub enum LightVerifiedTerminal {
 /// sandbox.
 pub fn verify_light(receipt_bytes: &[u8]) -> Result<LightVerified, VerifyError> {
     let receipt = decode_receipt(receipt_bytes)?;
-    project_verified(&receipt)
+    verify_light_artifact(&receipt)
+}
+
+/// Verify an already-authenticated [`ReceiptArtifact`] without re-encoding it.
+///
+/// A `ReceiptArtifact` is authenticated and bounded at construction, so this
+/// skips the artifact decode step and projects its evidence directly.
+pub fn verify_light_artifact(receipt: &ReceiptArtifact) -> Result<LightVerified, VerifyError> {
+    project_verified(receipt)
 }
 
 pub(crate) fn decode_receipt(receipt_bytes: &[u8]) -> Result<ReceiptArtifact, VerifyError> {
@@ -315,6 +323,16 @@ pub(crate) mod tests {
             LightVerifiedTerminal::Completed { outcome_borsh }
                 if outcome_borsh == vec![7, 8, 9]
         ));
+    }
+
+    #[test]
+    fn artifact_verification_matches_encoded_verification() {
+        let bytes = fixture();
+        let receipt = arena0_protocol::ReceiptArtifact::decode(&bytes).expect("fixture decodes");
+        assert_eq!(
+            verify_light(&bytes).expect("encoded fixture verifies"),
+            verify_light_artifact(&receipt).expect("artifact verifies"),
+        );
     }
 
     #[test]

@@ -28,10 +28,7 @@ mod finalize;
 mod signing;
 mod validation;
 
-pub use call::{
-    DispatchCall, InitializeCall, OutcomeCall, QueryCall, RandomReplay, RandomReplayError,
-    ViewCall, WriterCall,
-};
+pub use call::{DispatchCall, InitializeCall, OutcomeCall, QueryCall, ViewCall, WriterCall};
 pub use engine::{LoadedProgram, ProgramInstance, WasmtimeEngine};
 pub use error::SandboxError;
 pub use signing::GuestSigner;

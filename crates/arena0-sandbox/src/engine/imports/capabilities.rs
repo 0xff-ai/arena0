@@ -211,7 +211,6 @@ mod tests {
                 arena0_program::ExecutionProfile::current(),
                 CallKind::Dispatch,
                 crate::call::DispatchKind::Local,
-                None,
                 Vec::new(),
             );
             hs.dispatch = dispatch;
@@ -266,7 +265,6 @@ mod tests {
                 arena0_program::ExecutionProfile::current(),
                 CallKind::Dispatch,
                 crate::call::DispatchKind::Local,
-                None,
                 Vec::new(),
             );
             hs.dispatch = dispatch;
@@ -417,7 +415,6 @@ mod tests {
                 arena0_program::ExecutionProfile::current(),
                 CallKind::Dispatch,
                 crate::call::DispatchKind::Local,
-                None,
                 Vec::new(),
             );
             hs.dispatch = dispatch;

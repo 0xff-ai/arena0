@@ -15,7 +15,7 @@ use arena0_client::api::{
 use arena0_client::proto::DaemonClient;
 use arena0_client::protocol::{ABI_VERSION, PeerId, ProgramHash, SessionHash};
 use arena0_home::HostName;
-use arena0_verify::{LightVerifiedTerminal as LightVerifiedTerminalBytes, verify_light};
+use arena0_verify::{LightVerifiedTerminal as LightVerifiedTerminalBytes, verify_light_artifact};
 use serde_json::json;
 use tokio::task::JoinSet;
 
@@ -232,10 +232,7 @@ async fn verify_file_light(
     let receipt_id = receipt.receipt_id();
 
     // Light: entirely offline.
-    let encoded = receipt
-        .encode()
-        .map_err(|error| anyhow::anyhow!("encode receipt {}: {error}", path.display()))?;
-    let light = verify_light(&encoded).map_err(|e| anyhow::anyhow!("FAILED: {e}"))?;
+    let light = verify_light_artifact(&receipt).map_err(|e| anyhow::anyhow!("FAILED: {e}"))?;
     let result = VerifiedResult::Light {
         terminal: terminal_of(&light.terminal),
     };

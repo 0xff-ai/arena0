@@ -32,7 +32,7 @@ use std::process::ExitCode;
 use anyhow::{Context, anyhow, bail};
 use arena0_client::answer;
 use arena0_client::api::{
-    ApiErrorCode, AwaitState, EnsembleSpec, ExecStatus, HostRequest, IdRef, NextEvent, PendingId,
+    ApiErrorCode, AwaitState, EnsembleSpec, ExecStatus, HostRequest, NextEvent, PendingId,
     ResponseOk, VerifiedResult,
 };
 use arena0_client::proto::DaemonClient;
@@ -160,11 +160,8 @@ enum Command {
     Status,
     /// Stop the local daemon and its Hosts.
     Stop,
-    /// Identity custody operations handled by the Host.
-    Identity {
-        #[command(subcommand)]
-        command: IdentityCommand,
-    },
+    /// Show the selected Host identity.
+    Identity,
     /// Manage the selected Host's local program catalog.
     Program {
         #[command(subcommand)]
@@ -230,21 +227,6 @@ struct SkillOutput<'a> {
 
 fn default_user_agent() -> String {
     format!("arena0-cli/{}", env!("CARGO_PKG_VERSION"))
-}
-
-#[derive(Debug, Subcommand)]
-enum IdentityCommand {
-    /// Mint a new identity, optionally with a label.
-    New {
-        #[arg(value_name = "LABEL")]
-        label: Option<String>,
-    },
-    /// List identities in this Host's keystore.
-    List,
-    /// Show one identity by peer id or label.
-    Show { id: String },
-    /// Remove one identity by peer id or label.
-    Remove { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -853,7 +835,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Hook { .. } => unreachable!("hook returned before runtime setup"),
         Command::Status => status(&ctx, host_selected).await,
         Command::Stop => stop(&ctx).await,
-        Command::Identity { command } => identity(&ctx, command).await,
+        Command::Identity => identity(&ctx).await,
         Command::Program { command } => program(&ctx, command).await,
         Command::Exec { command } => execution(&ctx, command).await,
         Command::Watch { exec } => watch::watch(&ctx, exec).await,
@@ -1233,79 +1215,24 @@ async fn stop(ctx: &Ctx) -> anyhow::Result<()> {
     }
 }
 
-async fn identity(ctx: &Ctx, command: IdentityCommand) -> anyhow::Result<()> {
-    let request = match command {
-        IdentityCommand::New { label } => HostRequest::IdNew { label },
-        IdentityCommand::List => HostRequest::IdList,
-        IdentityCommand::Show { id } => HostRequest::IdShow {
-            id: identity_reference(&id),
-        },
-        IdentityCommand::Remove { id } => HostRequest::IdRemove {
-            id: identity_reference(&id),
-        },
-    };
-    match ctx.call(&request).await? {
+async fn identity(ctx: &Ctx) -> anyhow::Result<()> {
+    match ctx.call(&HostRequest::IdShow).await? {
         ResponseOk::Id(info) => {
             if ctx.mode.is_json() {
                 ui::print_json(&id_json(&info));
             } else {
-                println!(
-                    "{}  {}{}",
-                    info.peer_id,
-                    info.label.as_deref().unwrap_or("(no label)"),
-                    if info.active { "  active" } else { "" }
-                );
+                println!("{}", info.peer_id);
             }
         }
-        ResponseOk::IdList(list) => {
-            if ctx.mode.is_json() {
-                ui::print_json(&json!({
-                    "identities": list.iter().map(id_json).collect::<Vec<_>>()
-                }));
-            } else {
-                let rows = list
-                    .iter()
-                    .map(|info| {
-                        vec![
-                            info.peer_id.fmt_short().to_string(),
-                            info.label.clone().unwrap_or_else(|| "(no label)".into()),
-                            if info.active {
-                                "active".into()
-                            } else {
-                                String::new()
-                            },
-                        ]
-                    })
-                    .collect::<Vec<_>>();
-                print!(
-                    "{}",
-                    ui::render_table(
-                        &["PEER", "LABEL", "STATE"],
-                        &rows,
-                        ctx.palette,
-                        ctx.viewport().width,
-                    )
-                );
-            }
-        }
-        ResponseOk::Ack => print_ack(ctx),
         other => bail!("unexpected identity response: {other:?}"),
     }
     Ok(())
 }
 
-fn identity_reference(value: &str) -> IdRef {
-    value
-        .parse::<PeerId>()
-        .map_or_else(|_| IdRef::Label(value.to_owned()), IdRef::Peer)
-}
-
 fn id_json(info: &arena0_client::api::IdInfo) -> Value {
     json!({
         "peer_id": info.peer_id.to_string(),
-        "label": info.label,
         "transport_key": info.transport_key.to_string(),
-        "active": info.active,
     })
 }
 
@@ -1997,7 +1924,7 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(Cli::try_parse_from(["arena0", "identity", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["arena0", "identity"]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "arena0",

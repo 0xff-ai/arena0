@@ -60,7 +60,7 @@ use crate::exec_manager::{
 };
 use crate::schema;
 use crate::startup::{StartupStage, StartupTimeline};
-use crate::store::{Keystore, KeystoreError};
+use crate::store::Keystore;
 use arena0_store::{
     ActivationRecord, ActivationRecordStatus, AdmissionBindingOutcome,
     EventRecordSummary as StoreEventRecordSummary, ExecutionRequest,
@@ -1143,7 +1143,7 @@ impl HostService {
     /// Start the daemon's protocol runtime and host services.
     #[cfg(test)]
     fn start(init: HostServiceInit) -> anyhow::Result<Arc<Self>> {
-        let identity = Arc::new(init.keystore.active_crypto()?);
+        let identity = init.keystore.node_keys();
         let runtime =
             arena0_node::Host::start(identity, Arc::clone(&init.transport), init.store.clone());
         Self::start_with_runtime_owned(init, runtime, true)
@@ -1181,7 +1181,7 @@ impl HostService {
         let peer_id = identity.peer_id();
         anyhow::ensure!(
             runtime.peer_id == peer_id,
-            "runtime host identity {runtime_peer} does not match keystore identity {peer_id}",
+            "runtime host peer {runtime_peer} does not match the peer derived from the runtime identity keys {peer_id}",
             runtime_peer = runtime.peer_id,
         );
         let execs = Arc::new(ExecutionHandles::new(store.clone()));
@@ -1909,26 +1909,7 @@ impl HostService {
     pub(crate) async fn dispatch(self: &Arc<Self>, req: HostRequest) -> Response {
         match req {
             HostRequest::Info => self.host_status().await.map(ResponseOk::HostStatus),
-            HostRequest::IdNew { label } => {
-                let ks = Arc::clone(&self.keystore);
-                blocking(move || ks.new_identity(label))
-                    .await
-                    .map(ResponseOk::Id)
-            }
-            HostRequest::IdList => {
-                let ks = Arc::clone(&self.keystore);
-                blocking(move || ks.list()).await.map(ResponseOk::IdList)
-            }
-            HostRequest::IdShow { id } => {
-                let ks = Arc::clone(&self.keystore);
-                blocking(move || ks.show(&id)).await.map(ResponseOk::Id)
-            }
-            HostRequest::IdRemove { id } => {
-                let ks = Arc::clone(&self.keystore);
-                blocking(move || ks.remove(&id))
-                    .await
-                    .map(|()| ResponseOk::Ack)
-            }
+            HostRequest::IdShow => Ok(ResponseOk::Id(self.keystore.info())),
 
             HostRequest::ProgramList => self
                 .catalog
@@ -3786,42 +3767,6 @@ fn receipt_list_entry(stored: arena0_store::StoredReceipt) -> arena0_api::Receip
     }
 }
 
-/// Run a blocking store call off the async runtime, mapping errors to `ApiError`.
-async fn blocking<T, F, E>(f: F) -> Result<T, ApiError>
-where
-    F: FnOnce() -> Result<T, E> + Send + 'static,
-    E: Into<ApiError> + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| ApiError::new(ApiErrorCode::Internal, format!("join: {e}")))?
-        .map_err(Into::into)
-}
-
-impl From<KeystoreError> for ApiError {
-    fn from(error: KeystoreError) -> Self {
-        match error {
-            KeystoreError::NotFound { reference } => Self::new(
-                ApiErrorCode::NotFound,
-                format!("no identity matches {reference:?}"),
-            ),
-            KeystoreError::Ambiguous { reference, matches } => Self::new(
-                ApiErrorCode::Ambiguous,
-                format!(
-                    "identity reference '{reference}' is ambiguous: {matches} identities match"
-                ),
-            ),
-            KeystoreError::InvalidLabel(message) => Self::new(ApiErrorCode::BadRequest, message),
-            KeystoreError::ActiveIdentityRemoval => Self::new(
-                ApiErrorCode::BadRequest,
-                "cannot remove the active Host identity; rotate it through a lifecycle-aware operation",
-            ),
-            KeystoreError::Storage(error) => Self::new(ApiErrorCode::Storage, error.to_string()),
-        }
-    }
-}
-
 fn catalog_api_error(error: CatalogError) -> ApiError {
     match error {
         CatalogError::InvalidProgram(error) => {
@@ -4203,12 +4148,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let keys = dir.path().join("keys");
         std::fs::create_dir_all(&keys).unwrap();
-        let keystore = Arc::new(Keystore::open(keys).unwrap());
-        let identity = keystore.new_identity(Some("host-01".into())).unwrap();
+        let keystore = Arc::new(Keystore::create(keys).unwrap());
+        let peer_id = keystore.peer_id();
 
         let store = arena0_store::Store::open(arena0_store::StoreConfig::new(
             dir.path().join("arena0.sqlite"),
-            identity.peer_id,
+            peer_id,
         ))
         .unwrap();
         let store_handle = store.handle().clone();
@@ -4217,7 +4162,7 @@ mod tests {
 
         let network = LocalNetwork::new();
         let mut transports =
-            LocalTransport::create_network(&network, vec![identity.peer_id]).expect("test network");
+            LocalTransport::create_network(&network, vec![peer_id]).expect("test network");
         let daemon = HostService::start(HostServiceInit {
             name: "host-01".into(),
             transport: Arc::new(transports.remove(0)),
@@ -4228,7 +4173,7 @@ mod tests {
             startup: Arc::new(StartupTimeline::new(1, 0)),
         })
         .unwrap();
-        (dir, store, daemon, identity.peer_id)
+        (dir, store, daemon, peer_id)
     }
 
     #[tokio::test(flavor = "multi_thread")]

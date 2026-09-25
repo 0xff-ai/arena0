@@ -476,7 +476,6 @@ mod tests {
                 arena0_program::ExecutionProfile::current(),
                 crate::engine::CallKind::Metadata,
                 crate::call::DispatchKind::Local,
-                None,
                 Vec::new(),
             ),
         );

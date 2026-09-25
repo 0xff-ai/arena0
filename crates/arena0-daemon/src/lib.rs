@@ -31,4 +31,4 @@ mod open_host_tests;
 pub use ensemble::{Daemon, McpConfig};
 pub use paths::Paths;
 pub use run::run;
-pub use store::{Keystore, KeystoreError};
+pub use store::Keystore;

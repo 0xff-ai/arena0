@@ -8,4 +8,4 @@ mod error;
 mod light;
 
 pub use error::VerifyError;
-pub use light::{LightVerified, LightVerifiedTerminal, verify_light};
+pub use light::{LightVerified, LightVerifiedTerminal, verify_light, verify_light_artifact};

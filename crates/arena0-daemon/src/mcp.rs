@@ -2065,7 +2065,7 @@ mod tests {
         let mut token = String::new();
         let mut wrong_identity_token = String::new();
         let mut original_peer = Value::Null;
-        let mut identity_index = std::path::PathBuf::new();
+        let mut identity_seed = std::path::PathBuf::new();
 
         for phase in 0..3 {
             let daemon = Daemon::start(
@@ -2099,7 +2099,7 @@ mod tests {
                     original_peer = hello["peer_id"].clone();
                     let info = daemon.services()[0].1.host_info();
                     let name = info.id.parse().unwrap();
-                    identity_index = home.host(&name).state_dir().join("keys/index.json");
+                    identity_seed = home.host(&name).state_dir().join("keys/identity.seed");
                     wrong_identity_token = daemon
                         .issue_token(&name, PeerId([9; 32]))
                         .unwrap()
@@ -2147,7 +2147,7 @@ mod tests {
                             .await;
                     assert_eq!(rejected.is_error, Some(true));
                     assert!(daemon.services().is_empty());
-                    assert!(!identity_index.exists(), "missing identity was recreated");
+                    assert!(!identity_seed.exists(), "missing identity was recreated");
                 }
                 _ => unreachable!(),
             }
@@ -2156,7 +2156,7 @@ mod tests {
             supervisor.await.unwrap().unwrap();
             drop(daemon);
             if phase == 1 {
-                std::fs::remove_file(&identity_index).unwrap();
+                std::fs::remove_file(&identity_seed).unwrap();
             }
         }
     }
