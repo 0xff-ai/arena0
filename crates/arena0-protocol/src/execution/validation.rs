@@ -4,7 +4,7 @@ use crate::trace::{
     AggregateAttestation, ReceiptTermination, StepCommitment, StepEvent, StepTerminal,
     TRACE_FORMAT_VERSION, TraceEntry,
 };
-use crate::{Effect, Ensemble, StateHash};
+use crate::{Effect, StateHash};
 
 use super::{
     AbortKind, ExecutionBinding, MAX_EFFECTS, MAX_RECEIPT_BYTES, MAX_TERMINAL_OUTCOME_BYTES,
@@ -94,7 +94,12 @@ pub(crate) fn validate_proposal(
         });
     }
     for signature in &proposal.signatures {
-        let key = binding.participant_key(&signature.participant())?;
+        let key = participants
+            .binary_search_by_key(&signature.participant(), |(participant, _)| *participant)
+            .map(|index| participants[index].1)
+            .map_err(|_| ProtocolError::UnknownParticipant {
+                participant: signature.participant(),
+            })?;
         verify_step_signature(&key, &expected_commitment, signature)?;
     }
     validate_step_signature_order(&proposal.signatures)
@@ -281,12 +286,7 @@ fn validate_stopped_receipt(
     match cause {
         StopCause::Authenticated(occurrence) => {
             occurrence.validate_for_session(binding.session_id())?;
-            if !binding
-                .participant_keys()?
-                .into_iter()
-                .any(|(participant, _)| participant == occurrence.sender())
-                || !occurrence.verify_signature()?
-            {
+            if !binding.is_participant(occurrence.sender()) || !occurrence.verify_signature()? {
                 return Err(ProtocolError::UnauthenticatedAbort);
             }
             let cursor =
@@ -476,14 +476,9 @@ pub(crate) fn validate_shared_entry(
             if expected_step != 0 {
                 return Err(ProtocolError::SessionStartPosition);
             }
-            let expected = Ensemble::from_peers(
-                binding
-                    .participant_keys()?
-                    .into_iter()
-                    .map(|(peer, _)| peer)
-                    .collect(),
-            )
-            .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
+            let expected = binding
+                .ensemble()
+                .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
             if ensemble != &expected {
                 return Err(ProtocolError::SessionStartMismatch);
             }

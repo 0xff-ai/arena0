@@ -245,10 +245,7 @@ pub(crate) fn validate_cause_binding(
         StopCause::Authenticated(occurrence) => {
             if occurrence.session_id() != binding.session_id()
                 || *occurrence.coordinate() != agreed
-                || !binding
-                    .participant_keys()?
-                    .into_iter()
-                    .any(|(participant, _)| participant == occurrence.sender())
+                || !binding.is_participant(occurrence.sender())
                 || !occurrence
                     .verify_signature()
                     .map_err(|_| ProtocolError::InvalidTerminalStatus)?

@@ -330,21 +330,14 @@ impl ExecutionActor {
 /// the forwarding peer.
 pub(crate) fn authenticates(state: &ExecutionState, source: PeerId, frame: &ExecFrame) -> bool {
     let binding = state.binding();
-    let participant = |peer: PeerId| {
-        binding
-            .activation()
-            .tickets()
-            .iter()
-            .any(|ticket| ticket.data.signer == peer)
-    };
-    if !participant(source) {
+    if !binding.is_participant(source) {
         return false;
     }
     match frame {
         ExecFrame::StepCertificate { certificate } => certificate.verify(binding).is_ok(),
         ExecFrame::Abort { occurrence } => {
             occurrence.session_id() == binding.session_id()
-                && participant(occurrence.sender())
+                && binding.is_participant(occurrence.sender())
                 && occurrence.verify_signature().unwrap_or(false)
         }
         ExecFrame::StepSignature { commitment, .. } => {

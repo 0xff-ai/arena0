@@ -516,15 +516,10 @@ impl ExecutionActor {
     }
 
     pub(super) fn ensemble(&self) -> Ensemble<Committed> {
-        Ensemble::from_peers(
-            self.context
-                .activation
-                .tickets()
-                .iter()
-                .map(|ticket| ticket.data.signer)
-                .collect(),
-        )
-        .expect("validated activation has a committed ensemble")
+        self.state
+            .binding()
+            .ensemble()
+            .expect("validated activation has a committed ensemble")
     }
 }
 

@@ -270,12 +270,7 @@ impl ExecutionState {
         if receipt_overhead > super::MAX_RECEIPT_BYTES as u64 {
             return Err(ProtocolError::ReceiptBudgetExhausted { step: 0 });
         }
-        if !binding
-            .activation
-            .tickets()
-            .iter()
-            .any(|ticket| ticket.data.signer == producer)
-        {
+        if !binding.is_participant(producer) {
             return Err(ProtocolError::UnknownParticipant {
                 participant: producer,
             });
@@ -951,13 +946,7 @@ impl ExecutionState {
     /// Accept an authenticated stop at the current agreed cursor.
     pub fn stop(&mut self, occurrence: super::AbortOccurrence) -> Result<(), ProtocolError> {
         occurrence.validate_for_session(self.binding.session_id())?;
-        if !self
-            .binding
-            .activation()
-            .tickets()
-            .iter()
-            .any(|ticket| ticket.data.signer == occurrence.sender())
-        {
+        if !self.binding.is_participant(occurrence.sender()) {
             return Err(ProtocolError::UnauthenticatedAbort);
         }
         if !occurrence.verify_signature()? {
@@ -1104,13 +1093,7 @@ impl ExecutionState {
 
     /// Validate aggregate cross-field invariants after decoding persisted bytes.
     pub(super) fn validate_recovered(&self) -> Result<(), ProtocolError> {
-        if !self
-            .binding
-            .activation
-            .tickets()
-            .iter()
-            .any(|ticket| ticket.data.signer == self.producer)
-        {
+        if !self.binding.is_participant(self.producer) {
             return Err(ProtocolError::UnknownParticipant {
                 participant: self.producer,
             });

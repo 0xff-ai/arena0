@@ -3443,16 +3443,10 @@ impl HostService {
                 .load_program(state.binding().program_hash())
                 .await
                 .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
-            let ensemble = arena0_protocol::Ensemble::from_peers(
-                state
-                    .binding()
-                    .activation()
-                    .tickets()
-                    .iter()
-                    .map(|ticket| ticket.data.signer)
-                    .collect(),
-            )
-            .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
+            let ensemble = state
+                .binding()
+                .ensemble()
+                .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
             let engine = Arc::clone(&self.engine);
             let step = state.agreed_step();
             let shared = state.shared_state().clone();
@@ -3554,17 +3548,15 @@ fn project_exec_status_facts(
     let program_id = request.program_hash();
     let negotiation_id = request.negotiation_id();
     let session_status = |state: &arena0_protocol::execution::ExecutionState| {
-        let activation = state.binding().activation();
+        let binding = state.binding();
         SessionStatus {
-            session_id: state.binding().session_id(),
+            session_id: binding.session_id(),
             step: state.agreed_step(),
-            peers: activation
-                .tickets()
-                .iter()
-                .map(|ticket| ticket.data.signer)
+            peers: binding
+                .participants()
                 .filter(|peer| *peer != peer_id)
                 .collect(),
-            participants: activation.tickets().len(),
+            participants: binding.activation().tickets().len(),
             pending_callout: state.callout().map(|callout| PendingCalloutStatus {
                 pending_id: callout.id,
                 callout_index: callout.callout_index,

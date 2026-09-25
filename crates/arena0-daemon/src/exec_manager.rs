@@ -238,26 +238,14 @@ impl ExecutionHandle {
         })
     }
 
+    /// Submit an answer the caller has matched to the committed callout and
+    /// validated against its schema. The actor owns the authoritative check
+    /// that the callout is still open when the answer is dispatched.
     pub(crate) async fn submit(
         &self,
         pending_id: PendingId,
         data: arena0_program::JsonBytes,
     ) -> Result<(), ApiError> {
-        let callout_matches = self
-            .execution()
-            .await
-            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
-            .is_some_and(|state| {
-                state
-                    .callout()
-                    .is_some_and(|callout| callout.id == pending_id)
-            });
-        if !callout_matches {
-            return Err(ApiError::new(
-                ApiErrorCode::CalloutNotPending,
-                format!("no pending {pending_id}"),
-            ));
-        }
         loop {
             let (reply, rx) = oneshot::channel();
             self.running()?

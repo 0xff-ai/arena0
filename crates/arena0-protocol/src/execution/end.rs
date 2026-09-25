@@ -52,10 +52,7 @@ impl ExecutionState {
         }
         let unconfirmed: BTreeSet<_> = self
             .binding()
-            .activation()
-            .tickets()
-            .iter()
-            .map(|ticket| ticket.data.signer)
+            .participants()
             .filter(|peer| *peer != self.producer())
             .collect();
         self.end_phase = EndPhase::Ending { unconfirmed };
@@ -64,14 +61,7 @@ impl ExecutionState {
     /// Confirm a remote participant. Duplicate confirmations do not change
     /// the version and must not be persisted as a new transition.
     pub fn confirm_end(&mut self, peer: PeerId) -> Result<bool, ProtocolError> {
-        if peer == self.producer()
-            || !self
-                .binding()
-                .activation()
-                .tickets()
-                .iter()
-                .any(|t| t.data.signer == peer)
-        {
+        if peer == self.producer() || !self.binding().is_participant(peer) {
             return Err(ProtocolError::InvalidTerminalStatus);
         }
         let mut next = self.clone();
@@ -162,15 +152,10 @@ impl ExecutionState {
                 if matches!(self.end_phase, EndPhase::Ending { .. }) && unconfirmed.is_empty() {
                     return Err(ProtocolError::InvalidTerminalStatus);
                 }
-                if unconfirmed.iter().any(|peer| {
-                    *peer == self.producer()
-                        || !self
-                            .binding()
-                            .activation()
-                            .tickets()
-                            .iter()
-                            .any(|t| t.data.signer == *peer)
-                }) {
+                if unconfirmed
+                    .iter()
+                    .any(|peer| *peer == self.producer() || !self.binding().is_participant(*peer))
+                {
                     return Err(ProtocolError::InvalidTerminalStatus);
                 }
                 Ok(())
