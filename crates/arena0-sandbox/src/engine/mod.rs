@@ -332,36 +332,60 @@ pub(crate) fn instantiate_module(
     module: &Module,
     config: InstanceConfig<'_>,
 ) -> Result<CallInstance, SandboxError> {
-    let InstanceConfig {
-        metadata,
-        schema,
-        profile,
-        call_kind,
-        dispatch,
-    } = config;
+    let mut instance = prepare_instance(
+        engine,
+        module,
+        config.profile,
+        config.call_kind,
+        config.dispatch,
+        config
+            .schema
+            .callouts
+            .iter()
+            .map(|c| c.input.clone())
+            .collect(),
+        |linker| {
+            imports::register_always_available(linker)?;
+            imports::register_capability_imports(linker, &config.metadata.capabilities)
+        },
+    )?;
+    instance
+        .instance
+        .get_memory(&mut instance.store, "memory")
+        .map(|_| instance)
+        .ok_or_else(|| SandboxError::instantiation_failed("no 'memory' export"))
+}
+
+/// Shared fresh-instance bootstrap: host store, linker imports, ABI check,
+/// and the `arena0_prepare` boundary.
+///
+/// Both the capability-scoped `instantiate_module` and the metadata probe in
+/// `instance.rs` build disposable instances this way; only the import set
+/// differs (declared capabilities versus every capability), so the caller
+/// selects imports and continues with its own export call.
+fn prepare_instance(
+    engine: &Engine,
+    module: &Module,
+    profile: &ExecutionProfile,
+    call_kind: CallKind,
+    dispatch: crate::call::DispatchKind,
+    callout_inputs: Vec<arena0_program::JsonSchemaDocument>,
+    register_imports: impl FnOnce(&mut Linker<HostState>) -> Result<(), SandboxError>,
+) -> Result<CallInstance, SandboxError> {
     let mut store = Store::new(
         engine,
-        HostState::new(
-            profile.clone(),
-            CallKind::Prepare,
-            dispatch,
-            schema.callouts.iter().map(|c| c.input.clone()).collect(),
-        ),
+        HostState::new(profile.clone(), CallKind::Prepare, dispatch, callout_inputs),
     );
     store.limiter(|state| &mut state.limits);
     store
         .set_fuel(profile.fuel.per_call)
         .map_err(|e| SandboxError::instantiation_failed(e.to_string()))?;
     let mut linker = Linker::new(engine);
-    imports::register_always_available(&mut linker)?;
-    imports::register_capability_imports(&mut linker, &metadata.capabilities)?;
+    register_imports(&mut linker)?;
     let instance = linker
         .instantiate(&mut store, module)
         .map_err(|e| SandboxError::instantiation_failed(e.to_string()))?;
     validation::check_abi_version(&mut store, &instance)?;
-    instance
-        .get_memory(&mut store, "memory")
-        .ok_or_else(|| SandboxError::instantiation_failed("no 'memory' export"))?;
     {
         let mut guest = memory::Guest::new(&mut store, &instance);
         guest

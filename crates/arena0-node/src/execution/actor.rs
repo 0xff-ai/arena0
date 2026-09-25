@@ -477,7 +477,6 @@ impl ExecutionActor {
                     .load_execution()
                     .await?
                     .ok_or(ExecError::NotFound(self.context.exec_id))?;
-                self.restore_resident()?;
                 Err(error.into())
             }
         }
@@ -496,10 +495,31 @@ impl ExecutionActor {
         Ok(())
     }
 
+    /// Reload the resident in place from `state`'s committed images after a
+    /// transition replaced them without a resident commit (certification).
+    /// A missing resident stays missing and is rebuilt on next use. On failure
+    /// the resident is dropped so the next use rebuilds it.
+    pub(super) fn reload_resident(&mut self) -> Result<(), ExecError> {
+        let Some(instance) = self.instance.as_mut() else {
+            return Ok(());
+        };
+        let reloaded = instance
+            .restore_payloads(
+                self.state.shared_state().clone(),
+                self.state.local_state().clone(),
+            )
+            .map_err(ExecError::from);
+        if reloaded.is_err() {
+            self.instance = None;
+        }
+        reloaded
+    }
+
     pub(super) fn resident_mut(&mut self) -> Result<&mut ProgramInstance, ExecError> {
-        self.instance.as_mut().ok_or_else(|| {
-            ExecError::InvalidState("execution resident has not been initialized".into())
-        })
+        if self.instance.is_none() {
+            self.restore_resident()?;
+        }
+        Ok(self.instance.as_mut().expect("resident was just restored"))
     }
 
     pub(super) fn ensemble(&self) -> Ensemble<Committed> {

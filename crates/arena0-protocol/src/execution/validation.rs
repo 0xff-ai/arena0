@@ -54,16 +54,25 @@ pub(crate) fn validate_proposal(
             "pending proposal carries an agreement".into(),
         ));
     }
+    // The commitment derives from this same entry, so the staged pre-state
+    // is pinned to the agreed cursor explicitly here; without the former
+    // stored-commitment comparison this mutation would otherwise reach
+    // `advance` as a different error variant.
+    if proposal.entry.pre_state != agreed.state_hash() {
+        return Err(ProtocolError::InvalidCertificate(
+            "pending proposal pre-state is not the agreed state".into(),
+        ));
+    }
     let expected_commitment =
         StepCommitment::for_entry(binding.session_id(), &proposal.entry, agreed.chain_hash());
-    if proposal.commitment != expected_commitment
-        || proposal.commitment.post_state != StateHash::of_shared(&proposal.shared_state)
-    {
+    // The commitment is derived, never stored: the only consistency check
+    // is that the proposed bytes hash to the entry's post-state.
+    if expected_commitment.post_state != StateHash::of_shared(&proposal.shared_state) {
         return Err(ProtocolError::InvalidCertificate(
             "pending proposal commitment is inconsistent".into(),
         ));
     }
-    let advanced = agreed.advance(&proposal.commitment)?;
+    let advanced = agreed.advance(&expected_commitment)?;
 
     let lifecycle = proposal
         .effects
@@ -82,7 +91,7 @@ pub(crate) fn validate_proposal(
         ));
     }
     proposal.status.validate_binding(binding, advanced)?;
-    validate_proposal_status(&proposal.entry, &proposal.commitment, &proposal.status)?;
+    validate_proposal_status(&proposal.entry, &expected_commitment, &proposal.status)?;
 
     let participants = binding.participant_keys()?;
     if proposal.signatures.len() > participants.len() {
@@ -94,22 +103,22 @@ pub(crate) fn validate_proposal(
     }
     for signature in &proposal.signatures {
         let key = binding.participant_key(&signature.participant())?;
-        if signature.signature().step != proposal.commitment.step {
+        if signature.signature().step != expected_commitment.step {
             return Err(ProtocolError::InvalidStepSignature {
                 participant: signature.participant(),
-                step: proposal.commitment.step,
+                step: expected_commitment.step,
             });
         }
         let valid = key
             .verify(
-                &proposal.commitment.signing_bytes(),
+                &expected_commitment.signing_bytes(),
                 &signature.signature().sig,
             )
             .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
         if !valid {
             return Err(ProtocolError::InvalidStepSignature {
                 participant: signature.participant(),
-                step: proposal.commitment.step,
+                step: expected_commitment.step,
             });
         }
     }
@@ -501,8 +510,10 @@ pub(crate) fn validate_shared_entry(
 /// bound, each effect's payload bounds, and the exact canonical `Vec<Effect>`
 /// encoding bound, including the vector's length prefix.
 ///
-/// The sandbox calls this at emission and recovery validation calls it on
-/// stored proposals, so the two boundaries cannot drift.
+/// Three callers share this one owner: the sandbox at emission,
+/// `ExecutionState::apply_dispatch` before staging or installing, and the
+/// store when it reopens event records. Recovery reaches it through
+/// `validate_effects`.
 pub fn check_effect_budget<'a>(
     effects: impl IntoIterator<Item = &'a Effect>,
 ) -> Result<(), ProtocolError> {
@@ -518,17 +529,22 @@ pub fn check_effect_budget<'a>(
             });
         }
         validate_effect_payload(effect)?;
-        let len = borsh::object_length(effect)
-            .map_err(|error| ProtocolError::Serialization(error.to_string()))?;
-        total = total
-            .checked_add(len)
-            .ok_or(ProtocolError::EncodedTooLarge {
-                kind: "effects",
-                actual: usize::MAX,
-                max: arena0_program::MAX_EFFECT_BYTES as usize,
-            })?;
+        total = add_effect_len(total, effect)?;
     }
     ensure_encoded("effects", total, arena0_program::MAX_EFFECT_BYTES as usize)
+}
+
+/// Accumulate one effect's canonical encoding length into an aggregate total.
+fn add_effect_len(total: usize, effect: &Effect) -> Result<usize, ProtocolError> {
+    let len = borsh::object_length(effect)
+        .map_err(|error| ProtocolError::Serialization(error.to_string()))?;
+    total
+        .checked_add(len)
+        .ok_or(ProtocolError::EncodedTooLarge {
+            kind: "effects",
+            actual: usize::MAX,
+            max: arena0_program::MAX_EFFECT_BYTES as usize,
+        })
 }
 
 pub(crate) fn validate_effects(effects: &[(u32, Effect)]) -> Result<(), ProtocolError> {
@@ -548,7 +564,7 @@ pub(crate) fn validate_effects(effects: &[(u32, Effect)]) -> Result<(), Protocol
 }
 
 /// Check one effect's payload against its protocol bound.
-pub fn validate_effect_payload(effect: &Effect) -> Result<(), ProtocolError> {
+fn validate_effect_payload(effect: &Effect) -> Result<(), ProtocolError> {
     match effect {
         Effect::SessionEnd { outcome } => ensure_payload(
             "terminal outcome",

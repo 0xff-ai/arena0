@@ -45,6 +45,9 @@ use arena0_program::{
 use arena0_protocol::Effect;
 
 /// Complete result of one resident dispatch.
+///
+/// An accepted dispatch carries its state images. A rejected dispatch
+/// carries only the reason and no images, so rejection clones nothing.
 #[derive(Debug)]
 pub struct DispatchCallResult {
     /// Whether the event was accepted or rejected.
@@ -53,14 +56,10 @@ pub struct DispatchCallResult {
     pub reason: Option<String>,
     /// The single open callout derived from an accepted post-state, if any.
     pub callout: Option<CalloutRequest>,
-    /// Shared payload after an accepted dispatch, or the committed payload on
-    /// rejection/failure recovery.
-    pub shared: SharedStateBytes,
-    /// Local payload after an accepted dispatch, or the committed payload on
-    /// rejection/failure recovery.
-    pub local: LocalStateBytes,
-    /// BLAKE3 of the complete canonical shared-memory image.
-    pub shared_hash: [u8; 32],
+    /// Shared payload after an accepted dispatch, or `None` on rejection.
+    pub shared: Option<SharedStateBytes>,
+    /// Local payload after an accepted dispatch, or `None` on rejection.
+    pub local: Option<LocalStateBytes>,
     /// Host-owned effects and execution observations.
     pub observations: CallObservations,
 }

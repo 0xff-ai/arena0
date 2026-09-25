@@ -657,7 +657,7 @@ impl Run {
                             state.agreed_step(),
                             state.event_position(),
                             state.outgoing().len(),
-                            state.pending_shared().map(|proposal| proposal.commitment().step),
+                            state.pending_shared().map(|_| state.proposal_commitment().expect("staged commitment").step),
                         )
                     });
                     let trace = match loaded_state.as_ref() {

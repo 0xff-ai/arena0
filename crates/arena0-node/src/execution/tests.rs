@@ -291,7 +291,7 @@ impl Fixture {
             .persist(next, Change::Activate)
             .await
             .expect("persist activation");
-        actor.reconcile_resident().expect("restore resident");
+        actor.restore_resident().expect("restore resident");
         actor
     }
 
@@ -311,11 +311,7 @@ impl Fixture {
             .await
             .expect("local session signature");
         let state = actor.state.clone();
-        let proposal = state
-            .pending_shared()
-            .expect("pending session proposal")
-            .commitment()
-            .clone();
+        let proposal = state.proposal_commitment().expect("staged commitment");
         let frame = ExecFrame::StepSignature {
             commitment: proposal.clone(),
             signature: self.remote_execution_key().sign(&proposal.signing_bytes()),
@@ -357,7 +353,7 @@ async fn ended_actor() -> (
         None
     );
     actor.ensure_step_signature().await.unwrap();
-    let commitment = actor.state.pending_shared().unwrap().commitment().clone();
+    let commitment = actor.state.proposal_commitment().unwrap();
     let frame = ExecFrame::StepSignature {
         signature: fixture
             .remote_execution_key()
@@ -551,7 +547,7 @@ async fn signature_and_message_classification_uses_actor_state() {
         actor.accept_frame(source, conflicting).await.unwrap(),
         Some(Conflict)
     );
-    let commitment = staged.pending_shared().unwrap().commitment().clone();
+    let commitment = staged.proposal_commitment().unwrap();
     let signature = ExecFrame::StepSignature {
         signature: fixture
             .remote_execution_key()
@@ -1207,7 +1203,7 @@ async fn spawned_execution_keeps_host_router_alive_after_host_arc_drop() {
         .await
         .expect("load execution")
         .expect("execution state");
-    let commitment = state.pending_shared().unwrap().commitment().clone();
+    let commitment = state.proposal_commitment().unwrap();
     let frame = ExecFrame::StepSignature {
         signature: fixture
             .remote_execution_key()
@@ -1508,6 +1504,13 @@ async fn rejected_callout_answer_preserves_pending_continuation_until_valid_inpu
     let committed = actor.state.clone();
     assert!(committed.callout().is_none());
     assert!(!committed.status().is_terminal());
+    // Exactly the accepted result committed: one transition past the
+    // rejection snapshot, whose images the rejection left untouched.
+    assert_eq!(
+        committed.version(),
+        before.version().next().expect("version")
+    );
+    assert_eq!(committed.event_position(), before.event_position() + 1);
 }
 
 #[tokio::test]
@@ -1599,7 +1602,7 @@ async fn receipt_budget_failure_publishes_a_stop_report_that_survives_restart() 
             .await
             .expect("local signature");
         let staged = actor.state.clone();
-        let commitment = staged.pending_shared().unwrap().commitment().clone();
+        let commitment = staged.proposal_commitment().unwrap();
         actor
             .accept_frame(
                 fixture.remote_keys.peer_id(),
@@ -1774,7 +1777,7 @@ async fn stale_abort_is_acked_across_restart_and_signed_proposal_still_commits()
         .pending_shared()
         .expect("pending proposal after local signature");
     assert_eq!(proposal.signature_count(), 1);
-    let commitment = proposal.commitment().clone();
+    let commitment = proposed.proposal_commitment().expect("staged commitment");
 
     let unsigned = AbortOccurrence::unsigned(
         fixture.activation.session_hash(),
@@ -1807,13 +1810,7 @@ async fn stale_abort_is_acked_across_restart_and_signed_proposal_still_commits()
     restarted.recover().await.expect("recover signed proposal");
 
     let recovered = restarted.state.clone();
-    assert_eq!(
-        recovered
-            .pending_shared()
-            .expect("signed proposal survives stale abort")
-            .commitment(),
-        &commitment
-    );
+    assert_eq!(recovered.proposal_commitment().as_ref(), Some(&commitment));
 
     restarted
         .accept_frame(
@@ -1970,11 +1967,7 @@ async fn future_step_signature_waits_behind_the_current_proposal() {
     );
 
     let state = actor.state.clone();
-    let mut future_commitment = state
-        .pending_shared()
-        .expect("current proposal")
-        .commitment()
-        .clone();
+    let mut future_commitment = state.proposal_commitment().expect("staged commitment");
     future_commitment.step += 1;
     let frame = ExecFrame::StepSignature {
         signature: fixture
@@ -2029,10 +2022,8 @@ async fn trace_observation_waits_for_the_certified_step() {
     let proposal = actor
         .state
         .clone()
-        .pending_shared()
-        .expect("pending proposal")
-        .commitment()
-        .clone();
+        .proposal_commitment()
+        .expect("pending proposal");
     actor
         .accept_frame(
             source,
@@ -2099,7 +2090,7 @@ async fn local_broadcast_is_queued_then_authored() {
         frame,
         ExecFrame::Message { commitment, .. }
             if commitment.step == before.agreed_step()
-                && commitment == *state.pending_shared().unwrap().commitment()
+                && Some(&commitment) == state.proposal_commitment().as_ref()
     ));
     assert_eq!(
         state.event_position(),
@@ -2910,7 +2901,7 @@ fn wat_data(bytes: &[u8]) -> String {
 }
 
 #[tokio::test]
-async fn failed_persist_reloads_state_and_restores_resident_before_next_dispatch() {
+async fn failed_persist_reloads_state_and_rebuilds_resident_on_next_dispatch() {
     let fixture = Fixture::new(false).await;
     let mut actor = fixture.prepare_active_actor().await;
     fixture.commit_session_started(&mut actor).await;
@@ -2961,9 +2952,10 @@ async fn failed_persist_reloads_state_and_restores_resident_before_next_dispatch
         "stale actor must not overwrite durable state"
     );
     assert_eq!(actor.state, durable);
-    let resident = actor.instance.as_ref().unwrap().committed_payloads();
-    assert_eq!(resident.0, durable.shared_state());
-    assert_eq!(resident.1, durable.local_state());
+    assert!(
+        actor.instance.is_none(),
+        "a failed persist drops the resident; the next use rebuilds it"
+    );
     assert_eq!(
         actor
             .dispatch_event(
@@ -2976,6 +2968,13 @@ async fn failed_persist_reloads_state_and_restores_resident_before_next_dispatch
             .unwrap(),
         DispatchOutcome::Committed
     );
+    let resident = actor
+        .instance
+        .as_ref()
+        .expect("rebuilt resident")
+        .committed_payloads();
+    assert_eq!(resident.0, actor.state.shared_state());
+    assert_eq!(resident.1, actor.state.local_state());
     assert_eq!(actor.state.local_state().as_bytes(), &[9]);
     assert_eq!(
         actor.context.store.load_execution().await.unwrap().unwrap(),

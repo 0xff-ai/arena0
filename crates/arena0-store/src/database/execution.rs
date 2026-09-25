@@ -893,7 +893,7 @@ impl Database {
             )?;
             let _: Event<Vec<u8>> = decode_borsh(&event_payload, "event record event")?;
             let effects: Vec<Effect> = decode_borsh(&effects_payload, "event record effects")?;
-            validate_effect_payloads(&effects)?;
+            arena0_protocol::execution::check_effect_budget(&effects)?;
             if dispatch_digest(&event_payload, &effects_payload)
                 != array32(&row.get::<_, Vec<u8>>(3)?, "event digest")?
             {
@@ -972,23 +972,6 @@ impl Database {
         }
         Ok(())
     }
-}
-
-fn validate_effect_payloads(effects: &[Effect]) -> Result<(), StoreError> {
-    if effects.len() > arena0_protocol::MAX_EFFECTS {
-        return Err(StoreError::CommandTooLarge {
-            required: effects.len(),
-            capacity: arena0_protocol::MAX_EFFECTS,
-        });
-    }
-    let bytes = effects_bytes(effects)?;
-    if bytes.len() > arena0_protocol::MAX_RECEIPT_BYTES {
-        return Err(StoreError::CommandTooLarge {
-            required: bytes.len(),
-            capacity: arena0_protocol::MAX_RECEIPT_BYTES,
-        });
-    }
-    Ok(())
 }
 
 fn indexed_effects(effects: &[Effect]) -> Result<Vec<(u32, Effect)>, StoreError> {

@@ -35,10 +35,12 @@ const MAX_TIMER_BATCH: usize = 16;
 struct ExecutionActor {
     context: ActorContext,
     state: arena0_protocol::ExecutionState,
-    /// The sole live Wasm instance for this execution.  The compiled
-    /// `LoadedProgram` stays in `ActorContext` and may be shared by other
-    /// actors, but this instance is execution-local and is only entered by
-    /// the serialized actor loop.
+    /// The sole live Wasm instance for this execution, entered only by the
+    /// serialized actor loop. `Some` means its rollback checkpoint holds exactly
+    /// `state`'s committed shared and local images; `None` means the next
+    /// `resident_mut` rebuilds it from `state`. Every transition that replaces
+    /// `state`'s images without `ProgramInstance::commit` calls
+    /// `reload_resident` right after persisting.
     pub(super) instance: Option<ProgramInstance>,
     messages: mpsc::Sender<SessionMessage>,
     send_lanes: HashMap<arena0_protocol::PeerId, delivery::SendLane>,

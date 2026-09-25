@@ -3,9 +3,28 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use arena0_program::{CallStatus, JsonBytes};
+use arena0_program::{CallStatus, JsonBytes, LocalStateBytes, SharedStateBytes};
 use arena0_protocol::{Committed, Ensemble, Event, PeerId, StateHash};
-use arena0_sandbox::{DispatchCall, InitializeCall, Program, ProgramInstance, WasmtimeEngine};
+use arena0_sandbox::{
+    DispatchCall, DispatchCallResult, InitializeCall, Program, ProgramInstance, WasmtimeEngine,
+};
+
+/// Borrow one accepted dispatch's images. Accepted results always carry them;
+/// rejected results carry none, so rejection clones nothing.
+fn accepted_images(result: &DispatchCallResult) -> (&SharedStateBytes, &LocalStateBytes) {
+    assert_eq!(result.status, CallStatus::Accepted);
+    (
+        result.shared.as_ref().expect("accepted shared image"),
+        result.local.as_ref().expect("accepted local image"),
+    )
+}
+
+/// A rejected dispatch carries only its reason and no images.
+fn assert_no_images(result: &DispatchCallResult) {
+    assert_eq!(result.status, CallStatus::Rejected);
+    assert!(result.shared.is_none(), "rejection carries no shared image");
+    assert!(result.local.is_none(), "rejection carries no local image");
+}
 use arena0_test_engine::shared_test_engine;
 use wasmparser::{ExternalKind, Parser, Payload};
 
@@ -113,9 +132,7 @@ fn sdk_guest_dispatch_has_exact_memories_and_rolls_back_rejected_state() {
         ))
         .expect("SessionStarted dispatch");
     assert_eq!(started.status, CallStatus::Accepted);
-    resident
-        .commit_payloads()
-        .expect("commit SessionStarted state");
+    resident.commit().expect("commit SessionStarted state");
     let (before_shared, before_local) = resident.committed_payloads();
     let before_shared = before_shared.clone();
     let before_local = before_local.clone();
@@ -130,15 +147,18 @@ fn sdk_guest_dispatch_has_exact_memories_and_rolls_back_rejected_state() {
             contribution_event(peer0, 111),
         ))
         .expect("own contribution dispatch");
-    assert_eq!(accepted.status, CallStatus::Accepted);
-    assert_ne!(accepted.shared, before_shared);
-    assert_eq!(accepted.local, before_local);
-    assert_ne!(accepted.shared_hash, before_hash);
-    let (accepted_shared, accepted_local) = resident
-        .commit_payloads()
+    let (accepted_shared_image, accepted_local_image) = accepted_images(&accepted);
+    assert_ne!(accepted_shared_image, &before_shared);
+    assert_eq!(accepted_local_image, &before_local);
+    assert_ne!(StateHash::of_shared(accepted_shared_image).0, before_hash);
+    resident
+        .commit()
         .expect("commit accepted contribution state");
-    assert_eq!(accepted_shared, accepted.shared);
-    assert_eq!(accepted_local, accepted.local);
+    let (accepted_shared, accepted_local) = resident.committed_payloads();
+    let accepted_shared = accepted_shared.clone();
+    let accepted_local = accepted_local.clone();
+    assert_eq!(&accepted_shared, accepted_shared_image);
+    assert_eq!(&accepted_local, accepted_local_image);
 
     // Participant 0's slot is filled, so a message from that same participant
     // is a validly encoded but deterministic wrong-writer reject. Its payload
@@ -151,10 +171,7 @@ fn sdk_guest_dispatch_has_exact_memories_and_rolls_back_rejected_state() {
             contribution_event(peer0, 999),
         ))
         .expect("wrong-writer dispatch should return rejected status");
-    assert_eq!(rejected.status, CallStatus::Rejected);
-    assert_eq!(rejected.shared, accepted_shared);
-    assert_eq!(rejected.local, accepted_local);
-    assert_eq!(rejected.shared_hash, accepted.shared_hash);
+    assert_no_images(&rejected);
     assert_eq!(
         resident.committed_payloads(),
         (&accepted_shared, &accepted_local)
@@ -181,9 +198,7 @@ fn sdk_guest_repeated_allocations_preserve_commit_restore_and_rollback() {
             },
         ))
         .expect("SessionStarted dispatch");
-    resident
-        .commit_payloads()
-        .expect("commit SessionStarted state");
+    resident.commit().expect("commit SessionStarted state");
 
     for index in 0..8u8 {
         let peer = PeerId([index; 32]);
@@ -196,13 +211,12 @@ fn sdk_guest_repeated_allocations_preserve_commit_restore_and_rollback() {
             .expect("repeated contribution dispatch");
         assert_eq!(accepted.status, CallStatus::Accepted);
         resident
-            .commit_payloads()
+            .commit()
             .expect("commit repeated contribution state");
     }
     let (committed_shared, committed_local) = resident.committed_payloads();
     let committed_shared = committed_shared.clone();
     let committed_local = committed_local.clone();
-    let committed_hash = StateHash::of_shared(&committed_shared).0;
 
     // An accepted candidate is discarded by explicit recovery before the
     // subsequent failure, proving that the durable checkpoint remains the
@@ -231,10 +245,7 @@ fn sdk_guest_repeated_allocations_preserve_commit_restore_and_rollback() {
             contribution_event(peer0, 999),
         ))
         .expect("wrong-writer dispatch should reject");
-    assert_eq!(rejected.status, CallStatus::Rejected);
-    assert_eq!(rejected.shared, committed_shared);
-    assert_eq!(rejected.local, committed_local);
-    assert_eq!(rejected.shared_hash, committed_hash);
+    assert_no_images(&rejected);
 
     // Malformed generated-event bytes trap before the handler can commit; the
     // resident must still expose exactly the same checkpoint afterward.
@@ -261,10 +272,7 @@ fn sdk_guest_repeated_allocations_preserve_commit_restore_and_rollback() {
             },
         ))
         .expect("dispatch after trap should observe the restored checkpoint");
-    assert_eq!(after_fault.status, CallStatus::Rejected);
-    assert_eq!(after_fault.shared, committed_shared);
-    assert_eq!(after_fault.local, committed_local);
-    assert_eq!(after_fault.shared_hash, committed_hash);
+    assert_no_images(&after_fault);
 }
 
 fn local_context_forge_wasm() -> Vec<u8> {
@@ -310,9 +318,7 @@ fn sdk_guest_rejects_a_local_handler_that_forges_its_shared_view() {
     assert_eq!(started.status, CallStatus::Accepted);
     // The committed marker is zero, so the fixture opens no callout.
     assert!(started.callout.is_none());
-    resident
-        .commit_payloads()
-        .expect("commit SessionStarted state");
+    resident.commit().expect("commit SessionStarted state");
     let (before_shared, before_local) = resident.committed_payloads();
     let before_shared = before_shared.clone();
     let before_local = before_local.clone();
@@ -331,8 +337,7 @@ fn sdk_guest_rejects_a_local_handler_that_forges_its_shared_view() {
         CallStatus::Rejected,
         "the forged shared view must be rejected"
     );
-    assert_eq!(rejected.shared, before_shared);
-    assert_eq!(rejected.local, before_local);
+    assert_no_images(&rejected);
     // The forged marker would open a callout; the glue must derive none.
     assert!(
         rejected.callout.is_none(),

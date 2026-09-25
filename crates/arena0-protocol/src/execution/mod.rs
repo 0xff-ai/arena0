@@ -64,7 +64,7 @@ pub use status::{ExecutionStatus, ReceiptWork, StopCause};
 pub use timer::TimerId;
 pub use timer_firing::TimerFiring;
 
-pub use validation::{check_effect_budget, validate_effect_payload};
+pub use validation::check_effect_budget;
 pub(crate) use validation::{
     ensure_encoded, ensure_payload, validate_effects, validate_proposal, validate_receipt_body,
     validate_receipt_body_shape,

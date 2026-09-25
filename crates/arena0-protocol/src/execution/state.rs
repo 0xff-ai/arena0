@@ -1,6 +1,5 @@
 use arena0_program::{CalloutRequest, LocalStateBytes, SharedStateBytes};
 use borsh::{BorshDeserialize, BorshSerialize};
-use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "performance-tracing")]
 use std::time::Instant;
@@ -17,8 +16,8 @@ use crate::{
 use super::{
     ExecutionBinding, ExecutionStatus, ExecutionVersion, MAX_EFFECTS, MAX_EXECUTION_STATE_BYTES,
     MAX_PROOF_SIGNATURES, ParticipantStepSignature, ProtocolError, ReceiptArtifact, ReceiptId,
-    StepCursor, TerminalOutcome, ensure_encoded, ensure_payload, validate_effects,
-    validate_proposal, validate_receipt_body,
+    StepCursor, TerminalOutcome, check_effect_budget, ensure_encoded, ensure_payload,
+    validate_effects, validate_proposal, validate_receipt_body,
 };
 
 /// A shared step waiting for N-of-N signatures.
@@ -31,7 +30,6 @@ use super::{
 /// that produced the result; it is independent of the agreed trace step.
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct SharedProposal {
-    pub(crate) commitment: StepCommitment,
     pub(crate) entry: TraceEntry,
     pub(crate) shared_state: SharedStateBytes,
     pub(crate) local_state: LocalStateBytes,
@@ -50,9 +48,11 @@ pub struct SharedProposal {
 
 impl SharedProposal {
     /// Construct a staged dispatch result.
+    ///
+    /// A non-active status carries no open callout; the commitment is
+    /// derived from the entry where it is needed, never stored.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        commitment: StepCommitment,
         entry: TraceEntry,
         shared_state: SharedStateBytes,
         local_state: LocalStateBytes,
@@ -71,8 +71,10 @@ impl SharedProposal {
             });
         }
         validate_outgoing(&outgoing)?;
+        if !matches!(status, ExecutionStatus::Active) && callout.is_some() {
+            return Err(ProtocolError::InvalidCalloutState);
+        }
         let proposal = Self {
-            commitment,
             entry,
             shared_state,
             local_state,
@@ -146,12 +148,6 @@ impl SharedProposal {
         self.signatures.len()
     }
 
-    /// Borrow the trace-owned commitment being signed.
-    #[must_use]
-    pub const fn commitment(&self) -> &StepCommitment {
-        &self.commitment
-    }
-
     /// Add one participant's checked signature to this proposal.
     ///
     /// The proposal owns the signature list, but the activation binding owns
@@ -161,6 +157,7 @@ impl SharedProposal {
     pub fn add_signature(
         &mut self,
         binding: &ExecutionBinding,
+        commitment: &StepCommitment,
         signature: ParticipantStepSignature,
     ) -> Result<(), ProtocolError> {
         let participant = signature.participant();
@@ -176,19 +173,19 @@ impl SharedProposal {
         }
 
         let key = binding.participant_key(&participant)?;
-        if signature.signature().step != self.commitment.step {
+        if signature.signature().step != commitment.step {
             return Err(ProtocolError::InvalidStepSignature {
                 participant,
-                step: self.commitment.step,
+                step: commitment.step,
             });
         }
         let valid = key
-            .verify(&self.commitment.signing_bytes(), &signature.signature().sig)
+            .verify(&commitment.signing_bytes(), &signature.signature().sig)
             .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
         if !valid {
             return Err(ProtocolError::InvalidStepSignature {
                 participant,
-                step: self.commitment.step,
+                step: commitment.step,
             });
         }
         if self.signatures.len() >= MAX_PROOF_SIGNATURES {
@@ -233,7 +230,7 @@ impl StepCertificate {
 /// separately the next portable trace position. The shared hash and chain
 /// link always describe the last agreed step; local state and staged results
 /// are intentionally outside that commitment.
-#[derive(Serialize, Debug, Clone, PartialEq)]
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq)]
 pub struct ExecutionState {
     pub(crate) execution_id: ExecId,
     pub(crate) binding: ExecutionBinding,
@@ -244,8 +241,8 @@ pub struct ExecutionState {
     pub(crate) agreed_step: u64,
     /// Sum of canonical encodings of certified entries, including agreements.
     pub(crate) trace_bytes: u64,
-    /// Derived once from activation when constructing or decoding the aggregate.
-    #[serde(skip)]
+    /// Derived from the binding by construction and by [`Self::decode`]; never persisted.
+    #[borsh(skip)]
     receipt_overhead: u64,
     pub(crate) agreed_state: StateHash,
     pub(crate) agreed_link: [u8; 32],
@@ -260,98 +257,7 @@ pub struct ExecutionState {
     pub(crate) callout: Option<OpenCallout>,
 }
 
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
-struct ExecutionStateBody {
-    execution_id: ExecId,
-    binding: ExecutionBinding,
-    producer: PeerId,
-    status: ExecutionStatus,
-    version: ExecutionVersion,
-    event_position: u64,
-    agreed_step: u64,
-    trace_bytes: u64,
-    agreed_state: StateHash,
-    agreed_link: [u8; 32],
-    last_certificate: Option<StepCertificate>,
-    end_phase: super::EndPhase,
-    outgoing: Vec<Vec<u8>>,
-    shared_state: SharedStateBytes,
-    local_state: LocalStateBytes,
-    proposal: Option<SharedProposal>,
-    callout: Option<OpenCallout>,
-}
-
-impl BorshSerialize for ExecutionState {
-    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> borsh::io::Result<()> {
-        BorshSerialize::serialize(&self.body(), writer)
-    }
-}
-
-impl BorshDeserialize for ExecutionState {
-    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
-        let body = ExecutionStateBody::deserialize_reader(reader)?;
-        Self::from_body(body).map_err(|error| {
-            borsh::io::Error::new(borsh::io::ErrorKind::InvalidData, error.to_string())
-        })
-    }
-}
-
-impl<'de> Deserialize<'de> for ExecutionState {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let body = <ExecutionStateBody as Deserialize>::deserialize(deserializer)?;
-        Self::from_body(body).map_err(D::Error::custom)
-    }
-}
-
 impl ExecutionState {
-    fn body(&self) -> ExecutionStateBody {
-        ExecutionStateBody {
-            execution_id: self.execution_id,
-            binding: self.binding.clone(),
-            producer: self.producer,
-            status: self.status.clone(),
-            version: self.version,
-            event_position: self.event_position,
-            agreed_step: self.agreed_step,
-            trace_bytes: self.trace_bytes,
-            agreed_state: self.agreed_state,
-            agreed_link: self.agreed_link,
-            last_certificate: self.last_certificate.clone(),
-            end_phase: self.end_phase.clone(),
-            outgoing: self.outgoing.clone(),
-            shared_state: self.shared_state.clone(),
-            local_state: self.local_state.clone(),
-            proposal: self.proposal.clone(),
-            callout: self.callout.clone(),
-        }
-    }
-
-    fn from_body(body: ExecutionStateBody) -> Result<Self, ProtocolError> {
-        let receipt_overhead = ReceiptArtifact::reserved_overhead(&body.binding)?;
-        let state = Self {
-            execution_id: body.execution_id,
-            binding: body.binding,
-            producer: body.producer,
-            status: body.status,
-            version: body.version,
-            event_position: body.event_position,
-            agreed_step: body.agreed_step,
-            trace_bytes: body.trace_bytes,
-            receipt_overhead,
-            agreed_state: body.agreed_state,
-            agreed_link: body.agreed_link,
-            last_certificate: body.last_certificate,
-            end_phase: body.end_phase,
-            outgoing: body.outgoing,
-            shared_state: body.shared_state,
-            local_state: body.local_state,
-            proposal: body.proposal,
-            callout: body.callout,
-        };
-        state.validate_recovered()?;
-        Ok(state)
-    }
-
     fn next_version(&self) -> Result<ExecutionVersion, ProtocolError> {
         self.version.next().ok_or(ProtocolError::VersionExhausted)
     }
@@ -577,6 +483,20 @@ impl ExecutionState {
         self.proposal.as_ref()
     }
 
+    /// Derive the staged proposal's commitment, if one exists.
+    #[must_use]
+    pub fn proposal_commitment(&self) -> Option<StepCommitment> {
+        self.proposal
+            .as_ref()
+            .map(|proposal| self.commitment_for(proposal))
+    }
+
+    /// The commitment a staged proposal signs: the session, the entry and the
+    /// agreed chain link.
+    fn commitment_for(&self, proposal: &SharedProposal) -> StepCommitment {
+        StepCommitment::for_entry(self.binding.session_id(), &proposal.entry, self.agreed_link)
+    }
+
     /// Borrow the guest-produced terminal outcome projection, if any.
     #[must_use]
     pub fn terminal_outcome(&self) -> Option<&TerminalOutcome> {
@@ -615,7 +535,8 @@ impl ExecutionState {
         let mut next = self.clone();
         next.status = ExecutionStatus::active();
         next.bump_version()?;
-        next.validate_recovered()?;
+        // `activate` only flips the lifecycle; the aggregate was valid on
+        // entry and no hashed or signed field changed, so no re-check runs.
         *self = next;
         Ok(())
     }
@@ -627,7 +548,9 @@ impl ExecutionState {
     /// appended to the outgoing queue, never staged as effects. The returned
     /// frame is the establishing message an own-message dispatch delivers.
     /// `callout` is the one request the program derived from the accepted
-    /// post-state.
+    /// post-state. The protocol owns the post-state hash: it is computed
+    /// here exactly once and used for the local-event check, the entry, and
+    /// the installed or staged state.
     #[allow(clippy::too_many_arguments)]
     pub fn apply_dispatch(
         &mut self,
@@ -654,6 +577,8 @@ impl ExecutionState {
             return Err(ProtocolError::InvalidTerminalStatus);
         }
         validate_callout_dispatch(self, event, pending_id)?;
+        // The same budget the sandbox enforced at emission; checked again here so release builds never stage or install an over-budget result.
+        check_effect_budget(effects)?;
         let agreed_event = matches!(
             event,
             Event::SessionStarted { .. } | Event::MessageReceived { .. }
@@ -679,6 +604,7 @@ impl ExecutionState {
                 event_position,
                 shared_state,
                 local_state,
+                post_state,
                 outgoing,
                 status,
                 next_callout,
@@ -748,7 +674,6 @@ impl ExecutionState {
         let status = proposal_status(&entry, &commitment, terminal_outcome)?;
         let next_callout = next_open_callout(self, event, event_position, &status, callout);
         let proposal = SharedProposal::new(
-            commitment,
             entry,
             shared_state,
             local_state,
@@ -768,11 +693,14 @@ impl ExecutionState {
     /// Such a dispatch may replace local memory and may leave a callout open,
     /// but its shared payload must hash to the current agreed shared state. A
     /// dispatch that changes that hash is rejected by [`Self::apply_dispatch`].
+    /// `post_state` is the sandbox-computed hash of `shared_state`.
+    #[allow(clippy::too_many_arguments)]
     fn install_dispatch(
         &mut self,
         event_position: u64,
         shared_state: SharedStateBytes,
         local_state: LocalStateBytes,
+        post_state: StateHash,
         outgoing: Vec<Vec<u8>>,
         status: ExecutionStatus,
         callout: Option<OpenCallout>,
@@ -794,9 +722,13 @@ impl ExecutionState {
                 "dispatch event position is not the next event position".into(),
             ));
         }
-        if StateHash::of_shared(&shared_state) != self.agreed_state {
+        if post_state != self.agreed_state {
             return Err(ProtocolError::StateHashMismatch);
         }
+        // The outgoing queue carries guest-influenced bytes; re-check its
+        // length and per-message bounds here since the full re-check no
+        // longer runs on this path.
+        validate_outgoing(&outgoing)?;
         let next_event_position = event_position
             .checked_add(1)
             .ok_or(ProtocolError::VersionExhausted)?;
@@ -809,7 +741,6 @@ impl ExecutionState {
         next.status = status;
         next.callout = callout;
         next.bump_version()?;
-        next.validate_recovered()?;
         *self = next;
         Ok(())
     }
@@ -844,11 +775,13 @@ impl ExecutionState {
             &proposal,
         )?;
         self.check_proposal_receipt_budget(&proposal)?;
+        // Staging checks the proposal's own inputs (binding, cursor,
+        // receipt budget); the aggregate was valid on entry and no hashed
+        // or signed committed field changed, so no re-check runs.
         let mut next = self.clone();
         next.event_position = next_event_position;
         next.proposal = Some(proposal);
         next.bump_version()?;
-        next.validate_recovered()?;
         *self = next;
         Ok(())
     }
@@ -865,7 +798,7 @@ impl ExecutionState {
         let mut next = self.clone();
         next.outgoing.remove(0);
         next.bump_version()?;
-        next.validate_recovered()?;
+        // Only the queue shrank; every other invariant is unchanged.
         *self = next;
         Ok(())
     }
@@ -887,12 +820,17 @@ impl ExecutionState {
                 .ok_or(ProtocolError::SharedProposalMissing)?,
         )?;
         let mut next = self.clone();
+        // Derive the commitment once: signature verification and the
+        // completion branch below share it instead of re-hashing the entry.
+        let commitment = next
+            .proposal_commitment()
+            .ok_or(ProtocolError::SharedProposalMissing)?;
         {
             let binding = &next.binding;
             next.proposal
                 .as_mut()
                 .ok_or(ProtocolError::SharedProposalMissing)?
-                .add_signature(binding, signature)?;
+                .add_signature(binding, &commitment, signature)?;
         }
         let complete = next.proposal.as_ref().is_some_and(|proposal| {
             proposal.signatures.len() == next.binding.activation().tickets().len()
@@ -900,18 +838,21 @@ impl ExecutionState {
         if complete {
             let certificate = StepCertificate::from_signatures(
                 &next.binding,
+                &commitment,
                 next.proposal
                     .as_ref()
                     .ok_or(ProtocolError::SharedProposalMissing)?,
             )?;
-            let committed = next.commit_shared_inner(certificate)?;
+            let committed = next.install_certified(certificate)?;
             next.bump_version()?;
-            next.validate_recovered()?;
+            // The commit path verified the certificate and re-checked the
+            // proposal budget; no second BLS verification runs here.
             *self = next;
             Ok(Some(committed))
         } else {
             next.bump_version()?;
-            next.validate_recovered()?;
+            // Only the signature list grew; `add_signature` checked the new
+            // signature against the staged commitment.
             *self = next;
             Ok(None)
         }
@@ -928,11 +869,14 @@ impl ExecutionState {
             });
         }
         if let Some(proposal) = &self.proposal {
+            // Derive once per call; the commitment is a pure function of the
+            // staged entry and the agreed link.
+            let commitment = self.commitment_for(proposal);
             if let StepEvent::Message { from, data } = &proposal.entry.event
                 && *from == me
             {
                 frames.push(ExecFrame::Message {
-                    commitment: proposal.commitment.clone(),
+                    commitment: commitment.clone(),
                     data: data.clone(),
                 });
             }
@@ -942,7 +886,7 @@ impl ExecutionState {
                 .find(|signature| signature.participant() == me)
             {
                 frames.push(ExecFrame::StepSignature {
-                    commitment: proposal.commitment.clone(),
+                    commitment,
                     signature: signature.signature().sig,
                 });
             }
@@ -962,14 +906,15 @@ impl ExecutionState {
         certificate: StepCertificate,
     ) -> Result<SharedProposal, ProtocolError> {
         let mut next = self.clone();
-        let committed = next.commit_shared_inner(certificate)?;
+        let committed = next.install_certified(certificate)?;
         next.bump_version()?;
-        next.validate_recovered()?;
+        // Same single-verification rule as the `add_step_signature` commit
+        // branch above.
         *self = next;
         Ok(committed)
     }
 
-    fn commit_shared_inner(
+    fn install_certified(
         &mut self,
         certificate: StepCertificate,
     ) -> Result<SharedProposal, ProtocolError> {
@@ -983,7 +928,7 @@ impl ExecutionState {
             proposal.event_position,
             proposal,
         )?;
-        if certificate.commitment != proposal.commitment {
+        if certificate.commitment != self.commitment_for(proposal) {
             return Err(ProtocolError::InvalidCertificate(
                 "step certificate does not match the staged proposal".into(),
             ));
@@ -1049,7 +994,8 @@ impl ExecutionState {
         next.status = ExecutionStatus::stopped(occurrence)?;
         next.begin_end();
         next.bump_version()?;
-        next.validate_recovered()?;
+        // The occurrence was authenticated above and `stopped` builds the
+        // terminal status; no hashed or signed field changed.
         *self = next;
         Ok(())
     }
@@ -1100,12 +1046,15 @@ impl ExecutionState {
         next.status = status;
         next.callout = None;
         next.bump_version()?;
-        next.validate_recovered()?;
+        // The artifact body was validated against the terminal status above;
+        // publication only flips the status.
         *self = next;
         Ok(())
     }
 
-    /// Decode and validate one persisted aggregate.
+    /// Decode and validate one persisted aggregate. This is
+    /// the only way to recover an `ExecutionState` from bytes; raw Borsh
+    /// deserialization skips the derived receipt overhead and recovery validation.
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
         #[cfg(feature = "performance-tracing")]
         let performance_enabled = tracing::enabled!(
@@ -1118,8 +1067,11 @@ impl ExecutionState {
         let encoded_size = performance_enabled.then_some(bytes.len());
         let result = (|| {
             ensure_encoded("execution state", bytes.len(), MAX_EXECUTION_STATE_BYTES)?;
-            borsh::from_slice::<Self>(bytes)
-                .map_err(|error| ProtocolError::Deserialization(error.to_string()))
+            let mut state = borsh::from_slice::<Self>(bytes)
+                .map_err(|error| ProtocolError::Deserialization(error.to_string()))?;
+            state.receipt_overhead = ReceiptArtifact::reserved_overhead(&state.binding)?;
+            state.validate_recovered()?;
+            Ok(state)
         })();
 
         #[cfg(feature = "performance-tracing")]
@@ -1539,6 +1491,7 @@ mod tests {
         assert!(matches!(state.end_phase(), EndPhase::Ending { .. }));
         let version = state.version();
         state.expire_end().unwrap();
+        assert_valid(&state);
         assert!(state.version() > version);
         assert!(
             matches!(state.end_phase(), EndPhase::Ended { unconfirmed } if unconfirmed.contains(&remote))
@@ -1589,6 +1542,7 @@ mod tests {
                 .find(|p| *p != fixture.producer())
                 .unwrap();
             state.confirm_end(remote).unwrap();
+            assert_valid(&state);
             assert!(
                 matches!(state.end_phase(), crate::EndPhase::Ended { unconfirmed } if unconfirmed.is_empty())
             );
@@ -1609,15 +1563,51 @@ mod tests {
             matches!(state.end_phase(), crate::EndPhase::Ending { unconfirmed } if unconfirmed.len() == 1)
         );
         assert!(state.confirm_end(remote).unwrap());
+        assert_valid(&state);
         assert!(
             matches!(state.end_phase(), crate::EndPhase::Ended { unconfirmed } if unconfirmed.is_empty())
         );
     }
 
+    /// Decode-time invariant check for tests: every successful transition
+    /// must preserve the recovered-state invariants, without paying for the
+    /// full re-check (shared re-hash plus certificate BLS verification) at
+    /// runtime.
+    fn assert_valid(state: &ExecutionState) {
+        state
+            .validate_recovered()
+            .expect("transition preserves recovered-state invariants");
+    }
+
+    /// Test stand-in for the dispatch path: run the protocol transition and
+    /// prove the result still decodes as valid. A method (not a free
+    /// function) so callers can pass `state`-borrowed arguments alongside
+    /// the `&mut` receiver, exactly as production callers do.
+    impl ExecutionState {
+        #[allow(clippy::too_many_arguments)]
+        fn sandbox_apply(
+            &mut self,
+            event: &Event<Vec<u8>>,
+            shared: SharedStateBytes,
+            local: LocalStateBytes,
+            effects: &[Effect],
+            outcome: Option<TerminalOutcome>,
+            pending_id: Option<PendingId>,
+            callout: Option<CalloutRequest>,
+        ) -> Result<Option<ExecFrame>, ProtocolError> {
+            let result =
+                self.apply_dispatch(event, shared, local, effects, outcome, pending_id, callout);
+            if result.is_ok() {
+                assert_valid(self);
+            }
+            result
+        }
+    }
+
     /// Add every participant signature to the staged proposal and push the
     /// certified entry into `trace`.
     fn certify_pending(state: &mut ExecutionState, fixture: &Fixture, trace: &mut Vec<TraceEntry>) {
-        let commitment = state.pending_shared().unwrap().commitment().clone();
+        let commitment = state.proposal_commitment().expect("staged proposal");
         for (index, (peer, key)) in fixture.participants.iter().enumerate() {
             let committed = state
                 .add_step_signature(ParticipantStepSignature::new(
@@ -1626,6 +1616,7 @@ mod tests {
                     key.sign(&commitment.signing_bytes()),
                 ))
                 .unwrap();
+            assert_valid(state);
             if index + 1 < fixture.participants.len() {
                 assert!(committed.is_none());
                 assert_eq!(state.status(), &ExecutionStatus::Active);
@@ -1643,7 +1634,7 @@ mod tests {
         let outcome = matches!(terminal, Effect::SessionEnd { .. })
             .then(|| TerminalOutcome::new(vec![7], b"7".to_vec()).unwrap());
         state
-            .apply_dispatch(
+            .sandbox_apply(
                 &Event::SessionStarted { ensemble },
                 state.shared_state().clone(),
                 state.local_state().clone(),
@@ -1653,7 +1644,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let commitment = state.pending_shared().unwrap().commitment().clone();
+        assert_valid(&state);
+        let commitment = state.proposal_commitment().expect("staged proposal");
         for (peer, key) in &fixture.participants {
             state
                 .add_step_signature(ParticipantStepSignature::new(
@@ -1663,6 +1655,7 @@ mod tests {
                 ))
                 .unwrap();
         }
+        assert_valid(&state);
         state
     }
 
@@ -1676,6 +1669,7 @@ mod tests {
         )
         .expect("valid execution state");
         state.activate().expect("activation transition");
+        assert_valid(&state);
         state
     }
 
@@ -1713,13 +1707,7 @@ mod tests {
             terminal: None,
             agreement: AggregateAttestation::empty(),
         };
-        let commitment = StepCommitment::for_entry(
-            fixture.activation.session_hash(),
-            &entry,
-            state.agreed_link(),
-        );
         SharedProposal::new(
-            commitment,
             entry,
             shared_state,
             local_state,
@@ -1746,7 +1734,7 @@ mod tests {
         };
         let first_position = state.event_position();
         state
-            .apply_dispatch(
+            .sandbox_apply(
                 &event,
                 state.shared_state().clone(),
                 state.local_state().clone(),
@@ -1760,7 +1748,7 @@ mod tests {
         assert_eq!(first.id, pending_id(state.execution_id(), first_position));
         assert_eq!(state.lifecycle(), ExecLifecycle::Waiting);
         state
-            .apply_dispatch(
+            .sandbox_apply(
                 &event,
                 state.shared_state().clone(),
                 state.local_state().clone(),
@@ -1777,7 +1765,7 @@ mod tests {
             data: vec![],
         };
         state
-            .apply_dispatch(
+            .sandbox_apply(
                 &answer,
                 state.shared_state().clone(),
                 state.local_state().clone(),
@@ -1797,7 +1785,7 @@ mod tests {
         );
         let before_replay = state.clone();
         assert_eq!(
-            state.apply_dispatch(
+            state.sandbox_apply(
                 &answer,
                 state.shared_state().clone(),
                 state.local_state().clone(),
@@ -1822,7 +1810,7 @@ mod tests {
             let previous = state.callout().unwrap().id;
             let position = state.event_position();
             state
-                .apply_dispatch(
+                .sandbox_apply(
                     &event,
                     state.shared_state().clone(),
                     state.local_state().clone(),
@@ -1839,7 +1827,7 @@ mod tests {
             );
         }
         state
-            .apply_dispatch(
+            .sandbox_apply(
                 &event,
                 state.shared_state().clone(),
                 state.local_state().clone(),
@@ -1861,7 +1849,7 @@ mod tests {
             timer: crate::TimerPayload::unit(),
         };
         state
-            .apply_dispatch(
+            .sandbox_apply(
                 &timer,
                 state.shared_state().clone(),
                 state.local_state().clone(),
@@ -1901,7 +1889,7 @@ mod tests {
         ] {
             let before = state.clone();
             assert_eq!(
-                state.apply_dispatch(
+                state.sandbox_apply(
                     &event,
                     state.shared_state().clone(),
                     state.local_state().clone(),
@@ -1915,7 +1903,7 @@ mod tests {
             assert_eq!(state, before);
         }
         state
-            .apply_dispatch(
+            .sandbox_apply(
                 &Event::InputReceived {
                     callout_index: 2,
                     data: vec![],
@@ -1958,7 +1946,7 @@ mod tests {
             Ensemble::from_peers(fixture.participants.iter().map(|(peer, _)| *peer).collect())
                 .expect("complete ensemble");
         state
-            .apply_dispatch(
+            .sandbox_apply(
                 &Event::SessionStarted { ensemble },
                 state.shared_state().clone(),
                 state.local_state().clone(),
@@ -1968,7 +1956,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let commitment = state.pending_shared().unwrap().commitment().clone();
+        let commitment = state.proposal_commitment().unwrap().clone();
         for (peer, key) in &fixture.participants {
             state
                 .add_step_signature(ParticipantStepSignature::new(
@@ -1978,6 +1966,7 @@ mod tests {
                 ))
                 .unwrap();
         }
+        assert_valid(&state);
         state
     }
 
@@ -1988,7 +1977,7 @@ mod tests {
         let before = state.clone();
         let changed = SharedStateBytes::try_new(vec![0x7f]).expect("state");
         let error = state
-            .apply_dispatch(
+            .sandbox_apply(
                 &local_timer_event(),
                 changed,
                 state.local_state().clone(),
@@ -2009,7 +1998,7 @@ mod tests {
         let before_step = state.agreed_step();
         let before_position = state.event_position();
         state
-            .apply_dispatch(
+            .sandbox_apply(
                 &local_timer_event(),
                 state.shared_state().clone(),
                 state.local_state().clone(),
@@ -2030,7 +2019,7 @@ mod tests {
         let fixture = fixture();
         let mut state = started_state(&fixture);
         state
-            .apply_dispatch(
+            .sandbox_apply(
                 &local_timer_event(),
                 state.shared_state().clone(),
                 state.local_state().clone(),
@@ -2046,7 +2035,7 @@ mod tests {
             msg: vec![0xbb],
         };
         assert_eq!(
-            state.apply_dispatch(
+            state.sandbox_apply(
                 &mismatched,
                 state.shared_state().clone(),
                 state.local_state().clone(),
@@ -2064,7 +2053,7 @@ mod tests {
             msg: vec![0xaa],
         };
         let frame = state
-            .apply_dispatch(
+            .sandbox_apply(
                 &matching,
                 state.shared_state().clone(),
                 state.local_state().clone(),
@@ -2090,7 +2079,7 @@ mod tests {
         let fixture = fixture();
         let mut state = started_state(&fixture);
         state
-            .apply_dispatch(
+            .sandbox_apply(
                 &local_timer_event(),
                 state.shared_state().clone(),
                 state.local_state().clone(),
@@ -2105,7 +2094,7 @@ mod tests {
             msg: vec![0xaa],
         };
         state
-            .apply_dispatch(
+            .sandbox_apply(
                 &matching,
                 state.shared_state().clone(),
                 state.local_state().clone(),
@@ -2122,7 +2111,7 @@ mod tests {
             state.pending_shared().expect("proposal").outgoing(),
             &[vec![0xbb]]
         );
-        let commitment = state.pending_shared().unwrap().commitment().clone();
+        let commitment = state.proposal_commitment().unwrap().clone();
         for (peer, key) in &fixture.participants {
             state
                 .add_step_signature(ParticipantStepSignature::new(
@@ -2134,6 +2123,7 @@ mod tests {
         }
         assert!(state.pending_shared().is_none());
         assert_eq!(state.outgoing(), &[vec![0xbb]]);
+        assert_valid(&state);
     }
 
     #[test]
@@ -2150,7 +2140,7 @@ mod tests {
         // The author queues the message, then applies its own message.
         let mut author = started_state(&fixture);
         author
-            .apply_dispatch(
+            .sandbox_apply(
                 &local_timer_event(),
                 author.shared_state().clone(),
                 author.local_state().clone(),
@@ -2161,7 +2151,7 @@ mod tests {
             )
             .unwrap();
         author
-            .apply_dispatch(
+            .sandbox_apply(
                 &Event::MessageReceived {
                     from: author_peer,
                     msg: vec![0xaa],
@@ -2179,7 +2169,7 @@ mod tests {
         // local queue length. The entry must be byte-identical.
         let mut receiver = started_state_as(&fixture, receiver_peer);
         receiver
-            .apply_dispatch(
+            .sandbox_apply(
                 &local_timer_event(),
                 receiver.shared_state().clone(),
                 receiver.local_state().clone(),
@@ -2190,7 +2180,7 @@ mod tests {
             )
             .unwrap();
         receiver
-            .apply_dispatch(
+            .sandbox_apply(
                 &Event::MessageReceived {
                     from: author_peer,
                     msg: vec![0xaa],
@@ -2206,7 +2196,10 @@ mod tests {
 
         let authored = author.pending_shared().expect("author proposal");
         let received = receiver.pending_shared().expect("receiver proposal");
-        assert_eq!(authored.commitment(), received.commitment());
+        assert_eq!(
+            author.proposal_commitment().expect("author commitment"),
+            receiver.proposal_commitment().expect("receiver commitment")
+        );
         assert_eq!(
             borsh::to_vec(authored.entry()).expect("encode author entry"),
             borsh::to_vec(received.entry()).expect("encode receiver entry"),
@@ -2218,7 +2211,7 @@ mod tests {
         let fixture = fixture();
         let mut state = active_state(&fixture);
         state
-            .apply_dispatch(
+            .sandbox_apply(
                 &local_timer_event(),
                 state.shared_state().clone(),
                 state.local_state().clone(),
@@ -2233,6 +2226,7 @@ mod tests {
             .unwrap();
         assert_eq!(state.outgoing(), &[vec![1], vec![2]]);
         state.drop_outgoing_head().unwrap();
+        assert_valid(&state);
         assert_eq!(state.outgoing(), &[vec![2]]);
         state.drop_outgoing_head().unwrap();
         assert_eq!(
@@ -2263,6 +2257,58 @@ mod tests {
     }
 
     #[test]
+    fn local_dispatch_with_changed_shared_image_is_rejected_without_mutation() {
+        let fixture = fixture();
+        let mut state = active_state(&fixture);
+        let before = state.encode().expect("encode state");
+        let result = state.sandbox_apply(
+            &local_timer_event(),
+            SharedStateBytes::try_new(vec![0x99]).expect("changed shared state"),
+            state.local_state().clone(),
+            &[],
+            None,
+            None,
+            None,
+        );
+        assert_eq!(result, Err(ProtocolError::LocalSharedChange));
+        assert_eq!(state.encode().expect("re-encode state"), before);
+    }
+
+    #[test]
+    fn agreed_dispatch_over_the_effect_budget_is_rejected_without_mutation() {
+        let fixture = fixture();
+        let mut state = active_state(&fixture);
+        let ensemble =
+            Ensemble::from_peers(fixture.participants.iter().map(|(p, _)| *p).collect()).unwrap();
+        // Each timer fits its individual bound; only the aggregate exceeds
+        // the 4 MiB budget recovery enforces.
+        let timers: Vec<Effect> = (0..64u64)
+            .map(|delay_ms| Effect::SetTimer {
+                delay_ms,
+                timer: crate::TimerPayload {
+                    type_name: "t".into(),
+                    data: vec![0u8; 64 * 1024],
+                },
+            })
+            .collect();
+        let before = state.encode().expect("encode state");
+        let result = state.sandbox_apply(
+            &Event::SessionStarted { ensemble },
+            state.shared_state().clone(),
+            state.local_state().clone(),
+            &timers,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            matches!(result, Err(ProtocolError::EncodedTooLarge { .. })),
+            "over-budget effects must not stage: {result:?}"
+        );
+        assert_eq!(state.encode().expect("re-encode state"), before);
+    }
+
+    #[test]
     fn outgoing_queue_bound_is_enforced_on_decode() {
         let fixture = fixture();
         let mut state = active_state(&fixture);
@@ -2290,7 +2336,7 @@ mod tests {
                 *msg = vec![1; super::super::MAX_EFFECT_PAYLOAD_BYTES];
             }
             let before = state.clone();
-            let result = state.apply_dispatch(
+            let result = state.sandbox_apply(
                 &event,
                 state.shared_state().clone(),
                 state.local_state().clone(),
@@ -2306,7 +2352,7 @@ mod tests {
                 // A terminal step is subject to the same check; it cannot
                 // certify an outcome that leaves local assembly impossible.
                 assert!(matches!(
-                    state.apply_dispatch(
+                    state.sandbox_apply(
                         &event,
                         state.shared_state().clone(),
                         state.local_state().clone(),
@@ -2325,7 +2371,7 @@ mod tests {
                 break;
             }
             result.unwrap();
-            let commitment = state.pending_shared().unwrap().commitment().clone();
+            let commitment = state.proposal_commitment().unwrap().clone();
             for (peer, key) in &fixture.participants {
                 if let Some(committed) = state
                     .add_step_signature(ParticipantStepSignature::new(
@@ -2340,6 +2386,7 @@ mod tests {
             }
             assert_eq!(state.trace_bytes(), encoded_trace_bytes);
             assert!(state.pending_shared().is_none());
+            assert_valid(&state);
         }
     }
 
@@ -2355,7 +2402,7 @@ mod tests {
 
         // Step 0: the session boundary, with no effects.
         state
-            .apply_dispatch(
+            .sandbox_apply(
                 &Event::SessionStarted { ensemble },
                 state.shared_state().clone(),
                 state.local_state().clone(),
@@ -2378,7 +2425,7 @@ mod tests {
         let msg = vec![1u8];
         let event = Event::MessageReceived { from: remote, msg };
         state
-            .apply_dispatch(
+            .sandbox_apply(
                 &event,
                 state.shared_state().clone(),
                 state.local_state().clone(),
@@ -2455,6 +2502,7 @@ mod tests {
         assert!(ReceiptArtifact::new(body(stopped, vec![7])).is_err());
 
         state.publish_receipt(artifact.clone()).unwrap();
+        assert_valid(&state);
         assert_eq!(
             state.status(),
             &ExecutionStatus::Completed {
@@ -2477,7 +2525,7 @@ mod tests {
             context: b"null".to_vec(),
         };
         state
-            .apply_dispatch(
+            .sandbox_apply(
                 &Event::SessionStarted { ensemble },
                 state.shared_state().clone(),
                 state.local_state().clone(),
@@ -2490,12 +2538,13 @@ mod tests {
         assert!(state.callout().is_none());
         let proposal = state.pending_shared().unwrap().clone();
         assert!(proposal.callout().is_some());
+        let commitment = state.proposal_commitment().expect("staged commitment");
         for (peer, key) in &fixture.participants {
             state
                 .add_step_signature(ParticipantStepSignature::new(
                     *peer,
-                    proposal.commitment().step,
-                    key.sign(&proposal.commitment().signing_bytes()),
+                    commitment.step,
+                    key.sign(&commitment.signing_bytes()),
                 ))
                 .unwrap();
         }
@@ -2512,7 +2561,7 @@ mod tests {
         .event
         .dispatch_event();
         state
-            .apply_dispatch(
+            .sandbox_apply(
                 &event,
                 state.shared_state().clone(),
                 state.local_state().clone(),
@@ -2525,12 +2574,13 @@ mod tests {
         assert_eq!(state.callout(), open.as_ref());
         let proposal = state.pending_shared().unwrap().clone();
         assert!(proposal.callout().is_none());
+        let commitment = state.proposal_commitment().expect("staged commitment");
         for (peer, key) in &fixture.participants {
             state
                 .add_step_signature(ParticipantStepSignature::new(
                     *peer,
-                    proposal.commitment().step,
-                    key.sign(&proposal.commitment().signing_bytes()),
+                    commitment.step,
+                    key.sign(&commitment.signing_bytes()),
                 ))
                 .unwrap();
         }
@@ -2627,11 +2677,13 @@ mod tests {
                 state.event_position(),
                 fixture.initial.clone(),
                 local.clone(),
+                StateHash::of_shared(&fixture.initial),
                 Vec::new(),
                 ExecutionStatus::active(),
                 Some(pending),
             )
             .expect("dispatch installation");
+        assert_valid(&state);
         assert_eq!(state.event_position(), 1);
         assert_eq!(state.shared_state(), &fixture.initial);
         assert_eq!(state.local_state(), &local);
@@ -2644,6 +2696,7 @@ mod tests {
                 state.event_position() + 1,
                 fixture.initial.clone(),
                 local,
+                StateHash::of_shared(&fixture.initial),
                 Vec::new(),
                 ExecutionStatus::active(),
                 None,
@@ -2682,7 +2735,8 @@ mod tests {
             LocalStateBytes::try_new(vec![0x52]).expect("state"),
         );
         state.stage_proposal(proposal).expect("stage proposal");
-        let staged = state.pending_shared().expect("pending proposal").clone();
+        assert_valid(&state);
+        let commitment = state.proposal_commitment().expect("staged commitment");
         let (signer, signer_key) = fixture
             .participants
             .iter()
@@ -2690,8 +2744,8 @@ mod tests {
             .expect("signer key");
         let signature = ParticipantStepSignature::new(
             *signer,
-            staged.commitment().step,
-            signer_key.sign(&staged.commitment().signing_bytes()),
+            commitment.step,
+            signer_key.sign(&commitment.signing_bytes()),
         );
         assert!(
             state
@@ -2724,6 +2778,7 @@ mod tests {
         let before = state.clone();
         if accepted {
             state.stop(occurrence).expect("accept unsigned peer's stop");
+            assert_valid(&state);
             assert!(state.status().is_terminal());
             assert!(state.pending_shared().is_none());
             assert!(state.callout().is_none());
@@ -2756,7 +2811,7 @@ mod tests {
             proposed_shared.clone(),
             proposed_local.clone(),
         );
-        malformed.commitment.post_state = StateHash([0xee; 32]);
+        malformed.entry.post_state = StateHash([0xee; 32]);
         let before = state.clone();
         assert!(state.stage_proposal(malformed).is_err());
         assert_eq!(state, before);
@@ -2765,6 +2820,7 @@ mod tests {
         state
             .stage_proposal(proposal.clone())
             .expect("valid proposal");
+        assert_valid(&state);
         assert_eq!(state.event_position(), 1);
         assert_eq!(state.pending_shared(), Some(&proposal));
 
@@ -2791,12 +2847,15 @@ mod tests {
             ))
             .expect("valid proposal");
         let staged = state.pending_shared().expect("staged proposal").clone();
+        // The staged commitment derives from the pre-commit link; keep it
+        // for the assertions below since certification advances the link.
+        let staged_commitment = state.proposal_commitment().expect("staged commitment");
 
         let (first_peer, first_key) = &fixture.participants[0];
         let first_signature = ParticipantStepSignature::new(
             *first_peer,
-            staged.commitment().step,
-            first_key.sign(&staged.commitment().signing_bytes()),
+            staged_commitment.step,
+            first_key.sign(&staged_commitment.signing_bytes()),
         );
         assert!(
             state
@@ -2804,14 +2863,15 @@ mod tests {
                 .expect("first signature")
                 .is_none()
         );
+        assert_valid(&state);
         assert_eq!(state.shared_state(), &fixture.initial);
         assert_eq!(state.local_state().as_bytes(), &[0x90]);
 
         let (second_peer, second_key) = &fixture.participants[1];
         let second_signature = ParticipantStepSignature::new(
             *second_peer,
-            staged.commitment().step,
-            second_key.sign(&staged.commitment().signing_bytes()),
+            staged_commitment.step,
+            second_key.sign(&staged_commitment.signing_bytes()),
         );
         let committed = state
             .add_step_signature(second_signature)
@@ -2823,7 +2883,8 @@ mod tests {
         assert_eq!(state.status(), committed.status());
         assert_eq!(state.agreed_step(), 1);
         assert_eq!(state.agreed_state(), StateHash::of_shared(&proposed_shared));
-        assert_eq!(state.agreed_link(), committed.commitment().link_hash());
+        assert_eq!(state.agreed_link(), staged_commitment.link_hash());
+        assert_valid(&state);
         assert_eq!(committed.entry().agreement.signers.count(), 2);
         assert!(
             committed
@@ -2844,17 +2905,19 @@ mod tests {
                 second_local.clone(),
             ))
             .expect("second proposal");
-        let second_staged = state.pending_shared().expect("second proposal").clone();
+        assert_valid(&state);
+        let commitment = state.proposal_commitment().expect("staged commitment");
         for (peer, key) in &fixture.participants {
             let signature = ParticipantStepSignature::new(
                 *peer,
-                second_staged.commitment().step,
-                key.sign(&second_staged.commitment().signing_bytes()),
+                commitment.step,
+                key.sign(&commitment.signing_bytes()),
             );
             state
                 .add_step_signature(signature)
                 .expect("reaction signature");
         }
+        assert_valid(&state);
         assert_eq!(state.agreed_step(), 2);
         assert_eq!(state.shared_state(), &second_shared);
         assert_eq!(state.local_state(), &second_local);
@@ -2879,15 +2942,18 @@ mod tests {
         );
         proposal.effects = vec![(0, terminal)];
         proposal.outgoing = vec![vec![0xa3]];
-        proposal.commitment = StepCommitment::for_entry(
-            fixture.activation.session_hash(),
+        // The commitment derives from the mutated entry; no stored copy is
+        // rebuilt here.
+        proposal.status = ExecutionStatus::from_shared_entry(
             &proposal.entry,
-            state.agreed_link(),
-        );
-        proposal.status =
-            ExecutionStatus::from_shared_entry(&proposal.entry, proposal.commitment.clone())
-                .expect("terminal status construction")
-                .expect("abort status");
+            StepCommitment::for_entry(
+                fixture.activation.session_hash(),
+                &proposal.entry,
+                state.agreed_link(),
+            ),
+        )
+        .expect("terminal status construction")
+        .expect("abort status");
         validate_proposal(
             state.binding(),
             state.step_cursor(),
@@ -2910,12 +2976,13 @@ mod tests {
                 LocalStateBytes::try_new(vec![0x82]).expect("state"),
             ))
             .expect("valid proposal");
-        let staged = state.pending_shared().expect("proposal").clone();
+        assert_valid(&state);
+        let commitment = state.proposal_commitment().expect("staged commitment");
         let (peer, key) = &fixture.participants[0];
         let signature = ParticipantStepSignature::new(
             *peer,
-            staged.commitment().step,
-            key.sign(&staged.commitment().signing_bytes()),
+            commitment.step,
+            key.sign(&commitment.signing_bytes()),
         );
         assert!(
             state
@@ -2927,8 +2994,11 @@ mod tests {
             state.add_step_signature(signature.clone()).unwrap_err(),
             ProtocolError::DuplicateStepSignature { participant: *peer }
         );
-        let conflicting =
-            ParticipantStepSignature::new(*peer, staged.commitment().step, BlsSignature([0; 48]));
+        let conflicting = ParticipantStepSignature::new(
+            *peer,
+            state.proposal_commitment().expect("staged commitment").step,
+            BlsSignature([0; 48]),
+        );
         assert_eq!(
             state.add_step_signature(conflicting).unwrap_err(),
             ProtocolError::ConflictingStepSignature { participant: *peer }
@@ -2936,6 +3006,7 @@ mod tests {
 
         let incomplete = StepCertificate::from_signatures(
             state.binding(),
+            &state.proposal_commitment().expect("staged commitment"),
             state.pending_shared().expect("proposal"),
         )
         .unwrap_err();
@@ -2948,7 +3019,7 @@ mod tests {
         );
         let before = state.clone();
         let malformed = StepCertificate {
-            commitment: staged.commitment().clone(),
+            commitment: state.proposal_commitment().expect("staged commitment"),
             agreement: AggregateAttestation::empty(),
         };
         assert!(matches!(
@@ -2971,7 +3042,7 @@ mod tests {
         );
         assert_eq!(
             ExecutionState::decode(&encoded).unwrap_err(),
-            ProtocolError::Deserialization("shared state hash mismatch".into())
+            ProtocolError::StateHashMismatch
         );
 
         let mut bad_proposal = active_state(&fixture);
@@ -3018,11 +3089,8 @@ mod tests {
             .map(|terminal| (0, terminal.to_effect()))
             .into_iter()
             .collect();
-        terminal.commitment = StepCommitment::for_entry(
-            fixture.activation.session_hash(),
-            &terminal.entry,
-            terminal_status.agreed_link(),
-        );
+        // The commitment derives from the mutated entry; no stored copy is
+        // rebuilt here.
         terminal_status.event_position = 1;
         terminal_status.proposal = Some(terminal);
         assert_eq!(

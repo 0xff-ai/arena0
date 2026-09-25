@@ -135,13 +135,17 @@ impl ExecutionActor {
                 if commitment.session_id != self.state.binding().session_id()
                     || commitment.pre_state != self.state.agreed_state()
                     || commitment.link != self.state.agreed_link()
-                    || !self.writer_is(source, &self.state, &self.ensemble())?
+                    || self.writer_for_shared(self.state.shared_state(), &self.ensemble())?
+                        != Some(source)
                 {
                     return Ok(Some(Rejected));
                 }
                 if let Some(proposal) = self.state.pending_shared() {
+                    // Derive once per frame; the commitment is a pure
+                    // function of the staged entry and the agreed link.
+                    let staged = self.state.proposal_commitment();
                     return Ok(
-                        if proposal.commitment() == commitment
+                        if staged.as_ref() == Some(commitment)
                             && matches!(&proposal.entry().event,
                                 arena0_protocol::StepEvent::Message { from, data: staged }
                                     if *from == source && staged == data)
@@ -167,7 +171,7 @@ impl ExecutionActor {
                 let Some(proposal) = self.state.pending_shared() else {
                     return Ok(Some(NotYet));
                 };
-                if proposal.commitment() != &commitment {
+                if self.state.proposal_commitment().as_ref() != Some(&commitment) {
                     return Ok(Some(Rejected));
                 }
                 let signature = ParticipantStepSignature::new(source, commitment.step, signature);
@@ -181,17 +185,20 @@ impl ExecutionActor {
                 let agreed = certified.as_ref().map(|proposal| proposal.entry().step);
                 self.persist(next, Change::StepSignature { certified })
                     .await?;
-                self.reconcile_resident()?;
+                if agreed.is_some() {
+                    // Certification replaced the committed images.
+                    self.reload_resident()?;
+                }
                 self.emit_trace_appended(agreed).await;
             }
             ExecFrame::StepCertificate { certificate } => {
                 if certificate.commitment().step < step {
                     return Ok(None);
                 }
-                let Some(proposal) = self.state.pending_shared() else {
+                if self.state.pending_shared().is_none() {
                     return Ok(Some(NotYet));
                 };
-                if proposal.commitment() != certificate.commitment() {
+                if self.state.proposal_commitment().as_ref() != Some(certificate.commitment()) {
                     return Err(ExecError::DeliveryInvariant(
                         "verified certificate contradicts the staged proposal",
                     ));
@@ -208,7 +215,8 @@ impl ExecutionActor {
                     },
                 )
                 .await?;
-                self.reconcile_resident()?;
+                // Certification replaced the committed images.
+                self.reload_resident()?;
                 self.emit_trace_appended(Some(agreed)).await;
             }
             ExecFrame::Abort { occurrence } => {

@@ -117,10 +117,8 @@ async fn sign_step(
         .expect("load pending proposal")
         .expect("pending proposal state");
     let commitment = state
-        .pending_shared()
-        .expect("pending shared proposal")
-        .commitment()
-        .clone();
+        .proposal_commitment()
+        .expect("pending shared proposal");
     let producer_bls = BlsSecretKey::from_seed(&[11; 32]).expect("producer bls");
     let other_bls = BlsSecretKey::from_seed(&[12; 32]).expect("other bls");
     signature_record(

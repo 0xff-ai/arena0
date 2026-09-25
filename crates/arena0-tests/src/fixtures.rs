@@ -346,9 +346,9 @@ pub async fn complete_pending_shared(execution: &LiveExecution, cryptos: &[NodeK
             .load_execution(execution.exec_id)
             .await
             .expect("load execution")
-            && let Some(proposal) = state.pending_shared()
+            && state.pending_shared().is_some()
         {
-            break proposal.commitment().clone();
+            break state.proposal_commitment().expect("staged commitment");
         }
         assert!(
             tokio::time::Instant::now() < deadline,

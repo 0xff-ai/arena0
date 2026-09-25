@@ -125,15 +125,13 @@ impl super::LoadedProgram {
     pub fn writer(&self, call: WriterCall) -> Result<GuestWriterResult, SandboxError> {
         let participant_count = call.session.len();
         let input = call.into_input();
-        self.validate_shared_state(&input.shared)?;
-        let (output, observations) = self.invoke::<WriterInput, WriterOutput>(
+        let (output, fuel_used) = self.project::<WriterInput, WriterOutput>(
             CallKind::Writer,
-            DispatchKind::Local,
             abi::exports::WRITER,
+            "writer",
             input,
+            |input: &WriterInput| &input.shared,
         )?;
-        let fuel_used = observations.fuel_used;
-        ensure_read_only(&observations, "writer")?;
         let writer = output.participant.map(arena0_protocol::Participant::new);
         if writer.is_some_and(|participant| participant.index() >= participant_count) {
             return Err(SandboxError::DispatchFailed(
@@ -160,14 +158,13 @@ impl super::LoadedProgram {
         let input = call.into_input()?;
         self.validate_shared_state(&input.shared)?;
         let query_index = input.query_index;
-        let (output, observations) = self.invoke::<QueryInput, QueryOutput>(
+        let (output, fuel_used) = self.project::<QueryInput, QueryOutput>(
             CallKind::Query,
-            DispatchKind::Local,
             abi::exports::QUERY,
+            "query",
             input,
+            |input: &QueryInput| &input.shared,
         )?;
-        let fuel_used = observations.fuel_used;
-        ensure_read_only(&observations, "query")?;
         if output.query_index != query_index {
             return Err(SandboxError::DispatchFailed(
                 "query output index does not match input".into(),
@@ -184,36 +181,55 @@ impl super::LoadedProgram {
     /// Execute one read-only viewport projection in a fresh guest instance.
     pub fn view(&self, call: ViewCall) -> Result<GuestProjectionResult, SandboxError> {
         let input = call.into_input()?;
-        self.validate_shared_state(&input.shared)?;
-        let (output, observations) = self.invoke::<ViewInput, ViewOutput>(
+        let (output, fuel_used) = self.project::<ViewInput, ViewOutput>(
             CallKind::View,
-            DispatchKind::Local,
             abi::exports::VIEW,
+            "view",
             input,
+            |input: &ViewInput| &input.shared,
         )?;
-        let fuel_used = observations.fuel_used;
-        ensure_read_only(&observations, "view")?;
         projection_result(output.json, fuel_used, max_output(&self.profile), None)
     }
 
     /// Execute the pure terminal-outcome projection in a fresh guest instance.
     pub fn outcome(&self, call: OutcomeCall) -> Result<GuestOutcomeResult, SandboxError> {
         let input = call.into_input()?;
-        self.validate_shared_state(&input.shared)?;
-        let (output, observations) = self.invoke::<OutcomeInput, OutcomeOutput>(
+        let (output, fuel_used) = self.project::<OutcomeInput, OutcomeOutput>(
             CallKind::Outcome,
-            DispatchKind::Local,
             abi::exports::OUTCOME,
+            "outcome",
             input,
+            |input: &OutcomeInput| &input.shared,
         )?;
-        let fuel_used = observations.fuel_used;
-        ensure_read_only(&observations, "outcome")?;
         outcome_result(
             output,
             fuel_used,
             max_output(&self.profile),
             &self.program.definition().schema.outcome,
         )
+    }
+
+    /// Run one read-only projection: validate the shared state bound,
+    /// invoke the export in a fresh instance, and reject any guest effect.
+    /// This folds the validate/invoke/read-only triple the four fresh
+    /// projections share; each caller keeps only its result check.
+    fn project<I, O>(
+        &self,
+        kind: CallKind,
+        export: &str,
+        operation: &str,
+        input: I,
+        shared: impl FnOnce(&I) -> &SharedStateBytes,
+    ) -> Result<(O, u64), SandboxError>
+    where
+        I: BorshSerialize,
+        O: BorshDeserialize,
+    {
+        self.validate_shared_state(shared(&input))?;
+        let (output, observations) = self.invoke(kind, DispatchKind::Local, export, input)?;
+        let fuel_used = observations.fuel_used;
+        ensure_read_only(&observations, operation)?;
+        Ok((output, fuel_used))
     }
 
     fn invoke<I, O>(
@@ -227,15 +243,7 @@ impl super::LoadedProgram {
         I: BorshSerialize,
         O: BorshDeserialize,
     {
-        let bytes = borsh::to_vec(&input)
-            .map_err(|error| SandboxError::SerializationFailed(error.to_string()))?;
-        if bytes.len() > self.profile.limits.max_call_envelope_bytes as usize {
-            return Err(SandboxError::InputLimitExceeded(format!(
-                "encoded call input is {} bytes; maximum is {}",
-                bytes.len(),
-                self.profile.limits.max_call_envelope_bytes
-            )));
-        }
+        let bytes = encode_envelope(&input, self.profile.limits.max_call_envelope_bytes)?;
         let bytes_len = u32::try_from(bytes.len()).map_err(|_| {
             SandboxError::InputLimitExceeded("call input length overflows u32".into())
         })?;
@@ -282,22 +290,61 @@ impl super::LoadedProgram {
         ptr: u32,
         len: u32,
     ) -> Result<O, SandboxError> {
-        if len as usize > self.profile.limits.max_call_envelope_bytes as usize {
-            return Err(SandboxError::OutputLimitExceeded {
-                size: len as u64,
-                max: self.profile.limits.max_call_envelope_bytes,
-            });
-        }
-        let bytes = {
-            let mut guest = Guest::new(&mut instance.store, &instance.instance);
-            let bytes = guest.read_mem_charged(ptr, len, self.profile.limits.max_host_bytes)?;
-            guest.zero_mem(ptr, len)?;
-            guest.dealloc(ptr, len)?;
-            bytes
-        };
-        borsh::from_slice(&bytes)
-            .map_err(|error| SandboxError::DeserializationFailed(error.to_string()))
+        decode_output(
+            &mut instance.store,
+            &instance.instance,
+            ptr,
+            len,
+            self.profile.limits.max_call_envelope_bytes,
+            self.profile.limits.max_host_bytes,
+        )
     }
+}
+
+/// Encode one call envelope against the profile limit.
+///
+/// This is the single input-direction bound check shared by the fresh
+/// (`invoke`) and resident (`dispatch_input`) paths; the profile owns the
+/// limit.
+fn encode_envelope<T: BorshSerialize>(value: &T, max_bytes: u64) -> Result<Vec<u8>, SandboxError> {
+    let bytes = borsh::to_vec(value)
+        .map_err(|error| SandboxError::SerializationFailed(error.to_string()))?;
+    if bytes.len() > max_bytes as usize {
+        return Err(SandboxError::InputLimitExceeded(format!(
+            "encoded call input is {} bytes; maximum is {max_bytes}",
+            bytes.len(),
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Decode one call output against the profile limit.
+///
+/// This is the single output-direction bound check shared by the fresh
+/// (`decode_result`) and resident (`decode_resident_result`) paths.
+fn decode_output<O: BorshDeserialize>(
+    store: &mut Store<super::HostState>,
+    instance: &Instance,
+    ptr: u32,
+    len: u32,
+    max_envelope: u64,
+    max_host: u64,
+) -> Result<O, SandboxError> {
+    if len as usize > max_envelope as usize {
+        return Err(SandboxError::OutputLimitExceeded {
+            size: len as u64,
+            max: max_envelope,
+        });
+    }
+    let bytes = {
+        let mut guest = Guest::new(store, instance);
+        let bytes = guest.read_mem_charged(ptr, len, max_host)?;
+        guest.zero_mem(ptr, len)?;
+        guest.dealloc(ptr, len)?;
+        bytes
+    };
+    borsh::from_slice(&bytes)
+        .map_err(|error| SandboxError::DeserializationFailed(error.to_string()))
 }
 
 fn projection_result(
@@ -422,13 +469,15 @@ impl ProgramInstance {
         self.reset_work_and_globals()
     }
 
-    /// Promote the currently resident state images to the rollback checkpoint
-    /// after the owning store transaction confirms commitment.
-    pub fn commit_payloads(&mut self) -> Result<(SharedStateBytes, LocalStateBytes), SandboxError> {
-        let (shared, local, _) = self.resident_payloads()?;
-        self.committed_shared = shared.clone();
-        self.committed_local = local.clone();
-        Ok((shared, local))
+    /// Promote the currently resident state images to the rollback
+    /// checkpoint after the owning store transaction confirms commitment.
+    /// The caller already holds the accepted images; nothing is returned,
+    /// so commitment copies nothing back out.
+    pub fn commit(&mut self) -> Result<(), SandboxError> {
+        let (shared, local) = self.resident_payloads()?;
+        self.committed_shared = shared;
+        self.committed_local = local;
+        Ok(())
     }
 
     /// Return the last state images known to be committed by the owner.
@@ -437,27 +486,24 @@ impl ProgramInstance {
         (&self.committed_shared, &self.committed_local)
     }
 
-    fn resident_payloads(
-        &self,
-    ) -> Result<(SharedStateBytes, LocalStateBytes, [u8; 32]), SandboxError> {
-        let shared_view = canonical_state_view(
+    fn resident_payloads(&self) -> Result<(SharedStateBytes, LocalStateBytes), SandboxError> {
+        let shared_payload = canonical_state_payload(
             &self.store,
             self.shared_memory,
             self.shared_max_bytes,
             "shared",
         )?;
-        let local_view = canonical_state_view(
+        let local_payload = canonical_state_payload(
             &self.store,
             self.local_memory,
             self.profile.limits.max_local_state_bytes as usize,
             "local",
         )?;
-        let shared_hash = arena0_protocol::StateHash::of(shared_view.image).0;
-        let shared = SharedStateBytes::try_from_slice(shared_view.payload)
+        let shared = SharedStateBytes::try_from_slice(shared_payload)
             .map_err(|error| SandboxError::dispatch_failed(error.to_string()))?;
-        let local = LocalStateBytes::try_from_slice(local_view.payload)
+        let local = LocalStateBytes::try_from_slice(local_payload)
             .map_err(|error| SandboxError::dispatch_failed(error.to_string()))?;
-        Ok((shared, local, shared_hash))
+        Ok((shared, local))
     }
 
     fn rollback_error<T>(&mut self, error: SandboxError) -> Result<T, SandboxError> {
@@ -472,15 +518,7 @@ impl ProgramInstance {
         outgoing_len: usize,
         signer: Option<std::sync::Arc<dyn crate::GuestSigner>>,
     ) -> Result<DispatchCallResult, SandboxError> {
-        let bytes = borsh::to_vec(&input)
-            .map_err(|error| SandboxError::SerializationFailed(error.to_string()))?;
-        if bytes.len() > self.profile.limits.max_call_envelope_bytes as usize {
-            return Err(SandboxError::InputLimitExceeded(format!(
-                "encoded dispatch input is {} bytes; maximum is {}",
-                bytes.len(),
-                self.profile.limits.max_call_envelope_bytes
-            )));
-        }
+        let bytes = encode_envelope(&input, self.profile.limits.max_call_envelope_bytes)?;
         let bytes_len = u32::try_from(bytes.len()).map_err(|_| {
             SandboxError::InputLimitExceeded("dispatch input length overflows u32".into())
         })?;
@@ -535,13 +573,14 @@ impl ProgramInstance {
         // including replayable random bytes.
         if output.status == CallStatus::Rejected {
             self.rollback_after_failure()?;
+            // A rejection carries no images: the caller keeps its committed
+            // state and nothing is cloned here.
             return Ok(DispatchCallResult {
                 status: output.status,
                 reason: output.reason,
                 callout: None,
-                shared: self.committed_shared.clone(),
-                local: self.committed_local.clone(),
-                shared_hash: self.committed_shared_hash()?,
+                shared: None,
+                local: None,
                 observations: CallObservations {
                     effects: Vec::new(),
                     fuel_used,
@@ -558,21 +597,20 @@ impl ProgramInstance {
             .or_else(|error| self.rollback_error(error))?;
 
         // The state-validation boundary borrows the fixed memories directly:
-        // one shared view supplies both the payload copy and its hash, and the
-        // local view supplies only its payload copy. The entry reset above is
+        // one shared view supplies the payload copy and the local view
+        // supplies only its payload copy. The entry reset above is
         // the sole successful work-memory/global reset boundary; failed calls
         // use rollback below, while the next dispatch deterministically resets
         // any successful call's temporary work state before re-entry.
-        let (shared, local, shared_hash) = self
+        let (shared, local) = self
             .resident_payloads()
             .or_else(|error| self.rollback_error(error))?;
         Ok(DispatchCallResult {
             status: output.status,
             reason: output.reason,
             callout: output.callout,
-            shared,
-            local,
-            shared_hash,
+            shared: Some(shared),
+            local: Some(local),
             observations,
         })
     }
@@ -582,21 +620,14 @@ impl ProgramInstance {
         ptr: u32,
         len: u32,
     ) -> Result<DispatchOutput, SandboxError> {
-        if len as usize > self.profile.limits.max_call_envelope_bytes as usize {
-            return Err(SandboxError::OutputLimitExceeded {
-                size: len as u64,
-                max: self.profile.limits.max_call_envelope_bytes,
-            });
-        }
-        let bytes = {
-            let mut guest = Guest::new(&mut self.store, &self.instance);
-            let bytes = guest.read_mem_charged(ptr, len, self.profile.limits.max_host_bytes)?;
-            guest.zero_mem(ptr, len)?;
-            guest.dealloc(ptr, len)?;
-            bytes
-        };
-        borsh::from_slice(&bytes)
-            .map_err(|error| SandboxError::DeserializationFailed(error.to_string()))
+        decode_output(
+            &mut self.store,
+            &self.instance,
+            ptr,
+            len,
+            self.profile.limits.max_call_envelope_bytes,
+            self.profile.limits.max_host_bytes,
+        )
     }
 
     fn validate_payloads(
@@ -655,35 +686,19 @@ impl ProgramInstance {
             .reset_for_dispatch(DispatchKind::Local, 0);
         restore_result
     }
-
-    fn committed_shared_hash(&self) -> Result<[u8; 32], SandboxError> {
-        let view = canonical_state_view(
-            &self.store,
-            self.shared_memory,
-            self.shared_max_bytes,
-            "shared",
-        )?;
-        Ok(arena0_protocol::StateHash::of(view.image).0)
-    }
 }
 
 /// Borrowed view of one validated fixed-width state memory.
 ///
-/// The view keeps the complete canonical image for hashing and the bounded
-/// payload range for the one unavoidable host-owned state copy. It never owns
-/// guest memory and must not outlive the immutable store borrow used to create
-/// it.
-struct CanonicalStateView<'a> {
-    image: &'a [u8],
-    payload: &'a [u8],
-}
-
-fn canonical_state_view<'a>(
+/// The returned slice is the bounded payload range of the complete canonical
+/// image. It never owns guest memory and must not outlive the immutable
+/// store borrow used to create it.
+fn canonical_state_payload<'a>(
     store: &'a Store<super::HostState>,
     memory: Memory,
     max_payload: usize,
     label: &str,
-) -> Result<CanonicalStateView<'a>, SandboxError> {
+) -> Result<&'a [u8], SandboxError> {
     let data = memory.data(store);
     let prefix = arena0_program::CANONICAL_STATE_PREFIX_BYTES;
     if data.len() < prefix {
@@ -716,10 +731,7 @@ fn canonical_state_view<'a>(
     if length > max_payload {
         return Err(SandboxError::MemoryLimitExceeded(length as u64));
     }
-    Ok(CanonicalStateView {
-        image: data,
-        payload: &data[prefix..end],
-    })
+    Ok(&data[prefix..end])
 }
 
 fn write_state_payload(
@@ -1191,14 +1203,14 @@ mod resident_runtime_tests {
         );
         assert_eq!(instance.committed_payloads().0.as_bytes(), b"shared");
         assert_eq!(instance.committed_payloads().1.as_bytes(), b"local");
-        let shared = canonical_state_view(
+        let shared = canonical_state_payload(
             &instance.store,
             instance.shared_memory,
             instance.shared_max_bytes,
             "shared",
         )
         .unwrap();
-        assert_eq!(shared.payload, b"shared");
+        assert_eq!(shared, b"shared");
     }
 
     #[test]
@@ -1210,25 +1222,41 @@ mod resident_runtime_tests {
         );
         let first = instance.dispatch(call()).unwrap();
         assert_eq!(first.status, arena0_program::CallStatus::Accepted);
-        assert_eq!(first.shared.as_bytes(), b"sh");
-        assert_eq!(first.local.as_bytes(), &[1]);
+        assert_eq!(
+            first.shared.as_ref().expect("accepted shared").as_bytes(),
+            b"sh"
+        );
+        assert_eq!(
+            first.local.as_ref().expect("accepted local").as_bytes(),
+            &[1]
+        );
         assert_eq!(
             first.observations.effects,
             vec![Effect::Broadcast {
                 data: b"effect".to_vec()
             }]
         );
-        let first_hash = first.shared_hash;
+        let first_hash =
+            arena0_protocol::StateHash::of_shared(first.shared.as_ref().expect("accepted shared"));
 
         let second = instance.dispatch(call()).unwrap();
-        assert_eq!(second.shared.as_bytes(), b"sh");
+        assert_eq!(
+            second.shared.as_ref().expect("accepted shared").as_bytes(),
+            b"sh"
+        );
         // The mutable guest global is restored before each dispatch.
-        assert_eq!(second.local.as_bytes(), &[1]);
-        assert_eq!(second.shared_hash, first_hash);
+        assert_eq!(
+            second.local.as_ref().expect("accepted local").as_bytes(),
+            &[1]
+        );
+        assert_eq!(
+            arena0_protocol::StateHash::of_shared(second.shared.as_ref().expect("accepted shared")),
+            first_hash
+        );
         let canonical_shared = arena0_program::canonical_state_image(b"sh").unwrap();
         assert_eq!(
             first_hash,
-            arena0_protocol::StateHash::of(&canonical_shared).0
+            arena0_protocol::StateHash::of(&canonical_shared)
         );
     }
 
@@ -1258,9 +1286,8 @@ mod resident_runtime_tests {
             instance.dispatch(call()),
             Err(SandboxError::MemoryLimitExceeded(65))
         ));
-        let (restored_shared, restored_local) = instance.commit_payloads().unwrap();
-        assert_eq!(restored_shared, shared);
-        assert_eq!(restored_local, local);
+        instance.commit().unwrap();
+        assert_eq!(instance.committed_payloads(), (&shared, &local));
     }
 
     #[test]
@@ -1274,8 +1301,8 @@ mod resident_runtime_tests {
             .unwrap();
         let result = rejected.dispatch(call()).unwrap();
         assert_eq!(result.status, arena0_program::CallStatus::Rejected);
-        assert_eq!(result.shared.as_bytes(), b"old");
-        assert_eq!(result.local.as_bytes(), b"keep");
+        assert!(result.shared.is_none(), "rejection carries no shared image");
+        assert!(result.local.is_none(), "rejection carries no local image");
 
         let mut trapped = resident("unreachable", Vec::new(), "");
         trapped
@@ -1306,8 +1333,8 @@ mod resident_runtime_tests {
         let result = instance.dispatch(call()).unwrap();
 
         assert_eq!(result.status, arena0_program::CallStatus::Rejected);
-        assert_eq!(result.shared, shared);
-        assert_eq!(result.local, local);
+        assert!(result.shared.is_none(), "rejection carries no shared image");
+        assert!(result.local.is_none(), "rejection carries no local image");
         assert!(result.observations.effects.is_empty());
         assert!(result.observations.logs.is_empty());
         assert!(result.observations.random_draws.is_empty());
@@ -1337,9 +1364,8 @@ mod resident_runtime_tests {
             instance.dispatch(call()),
             Err(SandboxError::DispatchFailed(_))
         ));
-        let (restored_shared, restored_local) = instance.commit_payloads().unwrap();
-        assert_eq!(restored_shared, shared);
-        assert_eq!(restored_local, local);
+        instance.commit().unwrap();
+        assert_eq!(instance.committed_payloads(), (&shared, &local));
     }
 
     #[test]
@@ -1365,9 +1391,8 @@ mod resident_runtime_tests {
             instance.dispatch(call()),
             Err(SandboxError::MemoryLimitExceeded(_))
         ));
-        let (restored_shared, restored_local) = instance.commit_payloads().unwrap();
-        assert_eq!(restored_shared, shared);
-        assert_eq!(restored_local, local);
+        instance.commit().unwrap();
+        assert_eq!(instance.committed_payloads(), (&shared, &local));
     }
 
     #[test]

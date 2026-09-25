@@ -6,7 +6,7 @@ use std::io;
 use crate::PeerId;
 use crate::bounded::{read_bytes as read_bounded_bytes, write_bytes};
 use crate::negotiation::MAX_PARAMS_LEN;
-use crate::trace::{AggregateAttestation, SessionHeader, StepSig, TraceEntry};
+use crate::trace::{AggregateAttestation, SessionHeader, StepCommitment, StepSig, TraceEntry};
 
 use super::{
     ExecutionBinding, MAX_RECEIPT_BYTES, ProtocolError, SharedProposal, StepCertificate,
@@ -41,8 +41,12 @@ impl StepCertificate {
     }
 
     /// Build an activation-bound N-of-N certificate for a shared proposal.
+    ///
+    /// The commitment is derived by the caller from the staged entry; this
+    /// method only checks signatures against it and bundles the aggregate.
     pub fn from_signatures(
         binding: &ExecutionBinding,
+        commitment: &StepCommitment,
         proposal: &SharedProposal,
     ) -> Result<Self, ProtocolError> {
         let participants = binding.participant_keys()?;
@@ -67,15 +71,12 @@ impl StepCertificate {
                 });
             };
             let valid = key
-                .verify(
-                    &proposal.commitment.signing_bytes(),
-                    &signature.signature.sig,
-                )
+                .verify(&commitment.signing_bytes(), &signature.signature.sig)
                 .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
             if !valid {
                 return Err(ProtocolError::InvalidStepSignature {
                     participant: *participant,
-                    step: proposal.commitment.step,
+                    step: commitment.step,
                 });
             }
             signer_set.set(index);
@@ -86,14 +87,14 @@ impl StepCertificate {
             .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
         agreement
             .verify_signatures(
-                proposal.commitment.step,
-                &proposal.commitment.signing_bytes(),
+                commitment.step,
+                &commitment.signing_bytes(),
                 &participants.iter().map(|(_, key)| *key).collect::<Vec<_>>(),
             )
             .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
 
         Ok(Self {
-            commitment: proposal.commitment.clone(),
+            commitment: commitment.clone(),
             agreement,
         })
     }

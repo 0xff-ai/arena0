@@ -13,8 +13,7 @@ use arena0_program::{CallStatus, JsonBytes, ProgramHash};
 use arena0_protocol::execution::GuestSignData;
 use arena0_protocol::{
     Committed, Effect, Ensemble, Event, ExecFrame, ExecLifecycle, ExecutionState, ExecutionStatus,
-    ParticipantStepSignature, PeerIdSource, PendingId, SessionHash, StateHash, StepEvent,
-    TerminalOutcome,
+    ParticipantStepSignature, PeerIdSource, PendingId, SessionHash, StepEvent, TerminalOutcome,
 };
 use arena0_sandbox::{DispatchCall, GuestSigner, OutcomeCall, QueryCall, ViewCall, WriterCall};
 use arena0_store::Change;
@@ -217,7 +216,9 @@ impl ExecutionActor {
     fn session_start_is_durable(&self, state: &ExecutionState) -> bool {
         state.agreed_step() > 0
             || state.pending_shared().is_some_and(|proposal| {
-                proposal.commitment().step == 0
+                state
+                    .proposal_commitment()
+                    .is_some_and(|commitment| commitment.step == 0)
                     && matches!(proposal.entry().event, StepEvent::SessionStarted { .. })
             })
     }
@@ -271,7 +272,7 @@ impl ExecutionActor {
         {
             return Ok(false);
         }
-        if !self.writer_is(source, state, &self.ensemble())? {
+        if self.writer_for_shared(state.shared_state(), &self.ensemble())? != Some(source) {
             return Ok(false);
         }
         let outcome = self
@@ -301,16 +302,7 @@ impl ExecutionActor {
         }
     }
 
-    pub(super) fn writer_is(
-        &self,
-        source: arena0_protocol::PeerId,
-        state: &ExecutionState,
-        ensemble: &Ensemble<Committed>,
-    ) -> Result<bool, ExecError> {
-        Ok(self.writer_for_shared(state.shared_state(), ensemble)? == Some(source))
-    }
-
-    fn writer_for_shared(
+    pub(super) fn writer_for_shared(
         &self,
         shared: &arena0_program::SharedStateBytes,
         ensemble: &Ensemble<Committed>,
@@ -371,238 +363,258 @@ impl ExecutionActor {
         Ok(())
     }
 
-    /// Apply an accepted dispatch to actor-owned state and persist it atomically.
-    /// Rejection restores the guest candidate; persistence failure reloads the
-    /// last durable state before any further transition.
+    /// Apply one event through the resident dispatch and persist its result.
+    ///
+    /// Pre-dispatch checks run before the resident is touched, so they
+    /// return without discarding any candidate. Everything after the
+    /// resident dispatch funnels through the single `discard_candidate`
+    /// site below: any error or rejection restores the committed
+    /// checkpoint, and a committed dispatch with a staged proposal does
+    /// the same. A committed local dispatch instead commits the resident,
+    /// so the checkpoint tracks the new state. Persistence failure reloads
+    /// the last durable state before any further transition.
     pub(super) async fn dispatch_event(
         &mut self,
         event: Event<Vec<u8>>,
         source: DispatchSource,
     ) -> Result<DispatchOutcome, ExecError> {
-        let mut next = self.state.clone();
-        {
-            let state = &next;
-            if let Event::InputReceived { callout_index, .. } = &event {
-                let DispatchSource::Answer(pending_id) = source else {
+        if let Event::InputReceived { callout_index, .. } = &event {
+            let DispatchSource::Answer(pending_id) = source else {
+                return Err(ExecError::CalloutNotPending);
+            };
+            if !self
+                .state
+                .callout()
+                .is_some_and(|open| pending_id == open.id && *callout_index == open.callout_index)
+            {
+                return Err(ExecError::CalloutNotPending);
+            }
+        }
+        if self.state.status().is_terminal() {
+            return Ok(DispatchOutcome::Frozen);
+        }
+        if self.state.pending_shared().is_some() {
+            return Ok(DispatchOutcome::Frozen);
+        }
+        if !matches!(self.state.status(), ExecutionStatus::Active) {
+            return Ok(DispatchOutcome::Frozen);
+        }
+
+        // The sandbox bounds broadcasts against the committed queue. An
+        // own message authors the head it is about to pop, so it is not
+        // counted as already committed.
+        let outgoing_len = match &source {
+            DispatchSource::OwnMessage => self.state.outgoing().len().saturating_sub(1),
+            DispatchSource::Local
+            | DispatchSource::Answer(_)
+            | DispatchSource::Timer(_)
+            | DispatchSource::PeerMessage { .. } => self.state.outgoing().len(),
+        };
+        let outcome = self.dispatch_inner(event, source, outgoing_len).await;
+        match outcome {
+            Ok(DispatchOutcome::Committed) => {
+                if self.state.pending_shared().is_some() {
                     self.discard_candidate()?;
-                    return Err(ExecError::CalloutNotPending);
+                }
+                Ok(DispatchOutcome::Committed)
+            }
+            Ok(DispatchOutcome::Rejected { reason }) => {
+                self.discard_candidate()?;
+                Ok(DispatchOutcome::Rejected { reason })
+            }
+            Ok(DispatchOutcome::Frozen) => Ok(DispatchOutcome::Frozen),
+            Err(error) => {
+                // Trap paths already restored or replaced the resident, so a
+                // missing instance means there is nothing to discard. Every
+                // other error leaves candidate state behind and must restore
+                // it. A discard failure drops the resident and masks the
+                // original error, exactly as the former per-site `?` did.
+                if self.instance.is_some() {
+                    self.discard_candidate()?;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Run one checked event through the resident and persist the result.
+    ///
+    /// The caller owns the single discard site; this function restores the
+    /// resident itself only on sandbox trap paths, where the sandbox has
+    /// already rolled back and the durable image is reloaded here.
+    async fn dispatch_inner(
+        &mut self,
+        event: Event<Vec<u8>>,
+        source: DispatchSource,
+        outgoing_len: usize,
+    ) -> Result<DispatchOutcome, ExecError> {
+        let event_position = self.state.event_position();
+        let call = {
+            let mut call = DispatchCall::new(
+                self.context.identity.peer_id(),
+                self.ensemble(),
+                event.clone(),
+            )
+            .with_outgoing_len(outgoing_len);
+            // Only local handlers may sign. `SessionStarted` is a
+            // pre-session dispatch and `MessageReceived` reproduces a
+            // peer's agreed result, so neither is offered a signer.
+            if matches!(
+                &event,
+                Event::InputReceived { .. } | Event::TimerFired { .. }
+            ) {
+                call = call.with_signer(Arc::new(DispatchSigner {
+                    session_id: self.context.activation.session_hash(),
+                    program_hash: self.context.program.program().hash(),
+                    execution_id: self.context.exec_id,
+                    event_position,
+                    identity: Arc::clone(&self.context.identity),
+                    execution_key: Arc::clone(&self.context.execution_key),
+                }));
+            }
+            call
+        };
+        let result = match self.resident_mut()?.dispatch(call) {
+            Ok(result) => result,
+            Err(error) => {
+                // ProgramInstance rolls back on guest traps, but dropping
+                // the resident also covers a future sandbox error
+                // path that cannot prove its own rollback; the next use
+                // rebuilds it from the durable images.
+                self.instance = None;
+                let handler = match &event {
+                    Event::InputReceived { .. } => Some("input"),
+                    Event::MessageReceived { .. } => Some("message"),
+                    _ => None,
                 };
-                if !state.callout().is_some_and(|open| {
-                    pending_id == open.id && *callout_index == open.callout_index
-                }) {
-                    self.discard_candidate()?;
-                    return Err(ExecError::CalloutNotPending);
+                if let Some(handler) = handler {
+                    return Ok(DispatchOutcome::Rejected {
+                        reason: Some(super::truncate_reason(
+                            format!("{handler} handler trapped: {error}"),
+                            arena0_program::MAX_REJECTION_REASON_BYTES,
+                        )),
+                    });
                 }
+                return Err(error.into());
             }
-            if state.status().is_terminal() {
-                return Ok(DispatchOutcome::Frozen);
-            }
-            if state.pending_shared().is_some() {
-                self.discard_candidate()?;
-                return Ok(DispatchOutcome::Frozen);
-            }
-            if !matches!(state.status(), ExecutionStatus::Active) {
-                self.discard_candidate()?;
-                return Ok(DispatchOutcome::Frozen);
-            }
-            self.reconcile_resident()?;
-
-            // The sandbox bounds broadcasts against the committed queue. An
-            // own message authors the head it is about to pop, so it is not
-            // counted as already committed.
-            let outgoing_len = match source {
-                DispatchSource::OwnMessage => state.outgoing().len().saturating_sub(1),
-                DispatchSource::Local
-                | DispatchSource::Answer(_)
-                | DispatchSource::Timer(_)
-                | DispatchSource::PeerMessage { .. } => state.outgoing().len(),
-            };
-            let call = {
-                let mut call = DispatchCall::new(
-                    self.context.identity.peer_id(),
-                    self.ensemble(),
-                    event.clone(),
-                )
-                .with_outgoing_len(outgoing_len);
-                // Only local handlers may sign. `SessionStarted` is a
-                // pre-session dispatch and `MessageReceived` reproduces a
-                // peer's agreed result, so neither is offered a signer.
-                if matches!(
-                    &event,
-                    Event::InputReceived { .. } | Event::TimerFired { .. }
-                ) {
-                    call = call.with_signer(Arc::new(DispatchSigner {
-                        session_id: self.context.activation.session_hash(),
-                        program_hash: self.context.program.program().hash(),
-                        execution_id: self.context.exec_id,
-                        event_position: state.event_position(),
-                        identity: Arc::clone(&self.context.identity),
-                        execution_key: Arc::clone(&self.context.execution_key),
-                    }));
-                }
-                call
-            };
-            let result = match self.resident_mut()?.dispatch(call) {
-                Ok(result) => result,
-                Err(error) => {
-                    // ProgramInstance rolls back on guest traps, but loading
-                    // the durable image also covers a future sandbox error
-                    // path that cannot prove its own rollback.
-                    self.instance = None;
-                    self.restore_resident()?;
-                    let handler = match &event {
-                        Event::InputReceived { .. } => Some("input"),
-                        Event::MessageReceived { .. } => Some("message"),
-                        _ => None,
-                    };
-                    if let Some(handler) = handler {
-                        return Ok(DispatchOutcome::Rejected {
-                            reason: Some(super::truncate_reason(
-                                format!("{handler} handler trapped: {error}"),
-                                arena0_program::MAX_REJECTION_REASON_BYTES,
-                            )),
-                        });
-                    }
-                    return Err(error.into());
-                }
-            };
-            if result.status == CallStatus::Rejected {
-                self.discard_candidate()?;
-                return Ok(DispatchOutcome::Rejected {
-                    reason: result.reason,
-                });
-            }
-
-            let candidate_hash = StateHash::of_shared(&result.shared);
-            if candidate_hash != StateHash(result.shared_hash) {
-                self.discard_candidate()?;
+        };
+        if result.status == CallStatus::Rejected {
+            return Ok(DispatchOutcome::Rejected {
+                reason: result.reason,
+            });
+        }
+        // An accepted dispatch always carries its images; the protocol owns
+        // their hash and computes it once in `apply_dispatch`.
+        let (shared, local) = match (result.shared, result.local) {
+            (Some(shared), Some(local)) => (shared, local),
+            _ => {
                 return Err(ExecError::InvalidState(
-                    "sandbox shared-state hash does not match its payload".into(),
+                    "accepted dispatch returned no state images".into(),
                 ));
             }
-            let candidate_shared = result.shared.clone();
-            let candidate_local = result.local.clone();
-            let effects = result.observations.effects;
-            let terminal_outcome = match self.terminal_outcome(&result.shared, &effects) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    self.discard_candidate()?;
-                    return Err(error);
+        };
+        let effects = result.observations.effects;
+        let terminal_outcome = self.terminal_outcome(&shared, &effects)?;
+        // Clone late: a rejected dispatch reaches no protocol transition
+        // and clones nothing.
+        let mut next = self.state.clone();
+        if let Err(error) = next.apply_dispatch(
+            &event,
+            shared,
+            local,
+            &effects,
+            terminal_outcome,
+            match source {
+                DispatchSource::Answer(pending_id) => Some(pending_id),
+                DispatchSource::Local
+                | DispatchSource::Timer(_)
+                | DispatchSource::PeerMessage { .. }
+                | DispatchSource::OwnMessage => None,
+            },
+            result.callout,
+        ) {
+            return match (&source, error) {
+                // An agreed step whose broadcasts would overflow the local
+                // outgoing queue fails the session; the Host does not sign
+                // it. The failure boundary records the Host-signed `Fail`.
+                (_, arena0_protocol::ProtocolError::OutgoingQueueFull { .. }) => {
+                    Err(ExecError::OutgoingQueueOverflow)
                 }
-            };
-            if let Err(error) = next.apply_dispatch(
-                &event,
-                result.shared,
-                result.local,
-                &effects,
-                terminal_outcome,
-                match source {
-                    DispatchSource::Answer(pending_id) => Some(pending_id),
+                // A local receipt-budget limit is a session-level stop, not
+                // a program divergence.
+                (_, arena0_protocol::ProtocolError::ReceiptBudgetExhausted { step }) => {
+                    Err(ExecError::ReceiptBudgetExhausted { step })
+                }
+                // A peer message the local program cannot apply is a
+                // divergence, not an agent rejection.
+                (DispatchSource::PeerMessage { .. }, other) => {
+                    Err(ExecError::Diverged(super::truncate_reason(
+                        format!("diverged at step {}: {other}", self.state.agreed_step()),
+                        arena0_protocol::MAX_TERMINAL_REASON_BYTES,
+                    )))
+                }
+                // A local event or an authored own message is a plain
+                // rejection; the caller keeps the session live.
+                (
                     DispatchSource::Local
+                    | DispatchSource::Answer(_)
                     | DispatchSource::Timer(_)
+                    | DispatchSource::OwnMessage,
+                    other,
+                ) => Ok(DispatchOutcome::Rejected {
+                    reason: Some(super::truncate_reason(
+                        other.to_string(),
+                        arena0_program::MAX_REJECTION_REASON_BYTES,
+                    )),
+                }),
+            };
+        }
+        // The receiver rebuilds the entry itself; its commitment must equal
+        // the author's in every field. Compare before anything is persisted
+        // so recovery can never sign an incompatible proposal.
+        if let DispatchSource::PeerMessage { commitment } = &source {
+            let local = next
+                .proposal_commitment()
+                .expect("a peer dispatch stages a proposal");
+            if local != *commitment {
+                let cause = if local.post_state != commitment.post_state {
+                    "post-state mismatch"
+                } else if local.entry_hash != commitment.entry_hash {
+                    "entry mismatch"
+                } else if local.link != commitment.link {
+                    "link mismatch"
+                } else {
+                    "commitment mismatch"
+                };
+                return Err(ExecError::Diverged(super::truncate_reason(
+                    format!("diverged at step {}: {cause}", self.state.agreed_step()),
+                    arena0_protocol::MAX_TERMINAL_REASON_BYTES,
+                )));
+            }
+        }
+        let proposal_staged = next.pending_shared().is_some();
+        self.persist(
+            next,
+            Change::Dispatch {
+                event,
+                effects,
+                timer_id: match &source {
+                    DispatchSource::Timer(timer_id) => Some(*timer_id),
+                    DispatchSource::Local
+                    | DispatchSource::Answer(_)
                     | DispatchSource::PeerMessage { .. }
                     | DispatchSource::OwnMessage => None,
                 },
-                result.callout,
-            ) {
-                self.discard_candidate()?;
-                return match (&source, error) {
-                    // An agreed step whose broadcasts would overflow the local
-                    // outgoing queue fails the session; the Host does not sign
-                    // it. The failure boundary records the Host-signed `Fail`.
-                    (_, arena0_protocol::ProtocolError::OutgoingQueueFull { .. }) => {
-                        Err(ExecError::OutgoingQueueOverflow)
-                    }
-                    // A local receipt-budget limit is a session-level stop, not
-                    // a program divergence.
-                    (_, arena0_protocol::ProtocolError::ReceiptBudgetExhausted { step }) => {
-                        Err(ExecError::ReceiptBudgetExhausted { step })
-                    }
-                    // A peer message the local program cannot apply is a
-                    // divergence, not an agent rejection.
-                    (DispatchSource::PeerMessage { .. }, other) => {
-                        Err(ExecError::Diverged(super::truncate_reason(
-                            format!("diverged at step {}: {other}", self.state.agreed_step()),
-                            arena0_protocol::MAX_TERMINAL_REASON_BYTES,
-                        )))
-                    }
-                    // A local event or an authored own message is a plain
-                    // rejection; the caller keeps the session live.
-                    (
-                        DispatchSource::Local
-                        | DispatchSource::Answer(_)
-                        | DispatchSource::Timer(_)
-                        | DispatchSource::OwnMessage,
-                        other,
-                    ) => Ok(DispatchOutcome::Rejected {
-                        reason: Some(super::truncate_reason(
-                            other.to_string(),
-                            arena0_program::MAX_REJECTION_REASON_BYTES,
-                        )),
-                    }),
-                };
+            },
+        )
+        .await?;
+        if !proposal_staged {
+            if let Err(error) = self.resident_mut()?.commit() {
+                self.instance = None;
+                return Err(error.into());
             }
-            // The receiver rebuilds the entry itself; its commitment must equal
-            // the author's in every field. Compare before anything is persisted
-            // so recovery can never sign an incompatible proposal.
-            if let DispatchSource::PeerMessage { commitment } = &source {
-                let local = next
-                    .pending_shared()
-                    .expect("a peer dispatch stages a proposal")
-                    .commitment();
-                if local != commitment {
-                    self.discard_candidate()?;
-                    let cause = if local.post_state != commitment.post_state {
-                        "post-state mismatch"
-                    } else if local.entry_hash != commitment.entry_hash {
-                        "entry mismatch"
-                    } else if local.link != commitment.link {
-                        "link mismatch"
-                    } else {
-                        "commitment mismatch"
-                    };
-                    return Err(ExecError::Diverged(super::truncate_reason(
-                        format!("diverged at step {}: {cause}", self.state.agreed_step()),
-                        arena0_protocol::MAX_TERMINAL_REASON_BYTES,
-                    )));
-                }
-            }
-            let proposal_staged = next.pending_shared().is_some();
-            self.persist(
-                next,
-                Change::Dispatch {
-                    event,
-                    effects,
-                    timer_id: match &source {
-                        DispatchSource::Timer(timer_id) => Some(*timer_id),
-                        DispatchSource::Local
-                        | DispatchSource::Answer(_)
-                        | DispatchSource::PeerMessage { .. }
-                        | DispatchSource::OwnMessage => None,
-                    },
-                },
-            )
-            .await?;
-            if proposal_staged {
-                self.discard_candidate()?;
-            } else {
-                let (shared, local) = match self.resident_mut()?.commit_payloads() {
-                    Ok(payloads) => payloads,
-                    Err(error) => {
-                        self.instance = None;
-                        self.reconcile_resident()?;
-                        return Err(error.into());
-                    }
-                };
-                if shared != candidate_shared || local != candidate_local {
-                    self.reconcile_resident()?;
-                    return Err(ExecError::InvalidState(
-                        "committed payloads differ from the resident dispatch result".into(),
-                    ));
-                }
-            }
-            Ok(DispatchOutcome::Committed)
         }
+        Ok(DispatchOutcome::Committed)
     }
 
     /// Discard an uncommitted candidate. If the resident cannot restore its
@@ -617,27 +629,6 @@ impl ExecutionActor {
             self.instance = None;
         }
         restored
-    }
-
-    pub(super) fn reconcile_resident(&mut self) -> Result<(), ExecError> {
-        let state = &self.state;
-        if self.instance.as_ref().is_some_and(|instance| {
-            instance.committed_payloads().0 == state.shared_state()
-                && instance.committed_payloads().1 == state.local_state()
-        }) {
-            return Ok(());
-        }
-        if let Some(instance) = self.instance.as_mut() {
-            let restored = instance
-                .restore_payloads(state.shared_state().clone(), state.local_state().clone())
-                .map_err(ExecError::from);
-            if restored.is_err() {
-                self.instance = None;
-            }
-            restored
-        } else {
-            self.restore_resident()
-        }
     }
 
     fn terminal_outcome(
@@ -697,19 +688,24 @@ impl ExecutionActor {
         {
             return Ok(());
         }
+        let commitment = self
+            .state
+            .proposal_commitment()
+            .expect("signature needs a staged proposal");
         let signature = ParticipantStepSignature::new(
             self.context.identity.peer_id(),
-            proposal.commitment().step,
-            self.context
-                .execution_key
-                .sign(&proposal.commitment().signing_bytes()),
+            commitment.step,
+            self.context.execution_key.sign(&commitment.signing_bytes()),
         );
         let mut next = self.state.clone();
         let certified = next.add_step_signature(signature)?;
         let agreed_step = certified.as_ref().map(|proposal| proposal.entry().step);
         self.persist(next, Change::StepSignature { certified })
             .await?;
-        self.reconcile_resident()?;
+        if agreed_step.is_some() {
+            // Certification replaced the committed images.
+            self.reload_resident()?;
+        }
         self.emit_trace_appended(agreed_step).await;
         Ok(())
     }

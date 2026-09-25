@@ -4,8 +4,8 @@
 //! dispatches. Read-only projections continue to use fresh instances.
 
 use arena0_program::{
-    DispatchInput, InitInput, JsonBytes, MAX_CALL_ENVELOPE_BYTES, OutcomeInput, QueryInput,
-    SharedStateBytes, ViewInput, WriterInput,
+    DispatchInput, InitInput, JsonBytes, OutcomeInput, QueryInput, SharedStateBytes, ViewInput,
+    WriterInput,
 };
 use arena0_protocol::{Committed, Ensemble, Event, PeerId};
 use borsh::BorshSerialize;
@@ -240,18 +240,12 @@ impl OutcomeCall {
     }
 }
 
-// ponytail: one bounded path keeps call-byte limits and faults consistent.
+// Encode one call input. Envelope size is enforced once per direction by the
+// resident and fresh execution paths against the profile limit, which owns
+// it; this helper only serializes.
 pub(crate) fn serialize<T: BorshSerialize>(value: &T) -> Result<Vec<u8>, crate::SandboxError> {
-    let bytes = borsh::to_vec(value)
-        .map_err(|error| crate::SandboxError::SerializationFailed(error.to_string()))?;
-    if bytes.len() > MAX_CALL_ENVELOPE_BYTES as usize {
-        return Err(crate::SandboxError::input_limit(format!(
-            "ABI envelope is {} bytes; maximum is {}",
-            bytes.len(),
-            MAX_CALL_ENVELOPE_BYTES
-        )));
-    }
-    Ok(bytes)
+    borsh::to_vec(value)
+        .map_err(|error| crate::SandboxError::SerializationFailed(error.to_string()))
 }
 
 #[cfg(test)]

@@ -6,10 +6,10 @@ use std::time::Instant;
 
 use crate::call::DispatchKind;
 use arena0_program::ExecutionProfile;
-use wasmtime::{Linker, Module, Store};
+use wasmtime::Module;
 
 use super::imports::{register_always_available, register_metadata_imports};
-use super::{CallKind, HostState, InstanceConfig, instantiate_module};
+use super::{CallKind, InstanceConfig, instantiate_module};
 use crate::validation;
 use crate::{Program, SandboxError};
 
@@ -176,38 +176,22 @@ impl super::WasmtimeEngine {
         let module = Module::new(&self.engine, binary)
             .map_err(|error| SandboxError::compilation_failed(error.to_string()))?;
         validation::validate_raw_exports(&module)?;
-        let mut store = Store::new(
+        // The probe shares the fresh-instance bootstrap; only its import set
+        // (every capability, since none are declared yet) differs.
+        let mut instance = super::prepare_instance(
             &self.engine,
-            HostState::new(
-                self.profile.clone(),
-                CallKind::Metadata,
-                DispatchKind::Local,
-                Vec::new(),
-            ),
-        );
-        store.limiter(|state| &mut state.limits);
-        store
-            .set_fuel(self.profile.fuel.per_call)
-            .map_err(|error| SandboxError::instantiation_failed(error.to_string()))?;
-        let mut linker = Linker::new(&self.engine);
-        register_always_available(&mut linker)?;
-        register_metadata_imports(&mut linker)?;
-        let instance = linker
-            .instantiate(&mut store, &module)
-            .map_err(|error| SandboxError::instantiation_failed(error.to_string()))?;
-        validation::check_abi_version(&mut store, &instance)?;
-        {
-            let mut guest = super::memory::Guest::new(&mut store, &instance);
-            guest
-                .prepare()
-                .map_err(|error| SandboxError::instantiation_failed(error.to_string()))?;
-        }
-        store.data_mut().reset_after_prepare(CallKind::Metadata);
-        store
-            .set_fuel(self.profile.fuel.per_call)
-            .map_err(|error| SandboxError::instantiation_failed(error.to_string()))?;
+            &module,
+            &self.profile,
+            CallKind::Metadata,
+            DispatchKind::Local,
+            Vec::new(),
+            |linker| {
+                register_always_available(linker)?;
+                register_metadata_imports(linker)
+            },
+        )?;
         let (ptr, len) = {
-            let mut guest = super::memory::Guest::new(&mut store, &instance);
+            let mut guest = super::memory::Guest::new(&mut instance.store, &instance.instance);
             guest.call_metadata()?
         };
         if len as usize > self.profile.limits.max_metadata_bytes as usize {
@@ -217,7 +201,7 @@ impl super::WasmtimeEngine {
             )));
         }
         let bytes = {
-            let mut guest = super::memory::Guest::new(&mut store, &instance);
+            let mut guest = super::memory::Guest::new(&mut instance.store, &instance.instance);
             let bytes = guest.read_mem(ptr, len)?;
             guest.dealloc(ptr, len)?;
             bytes
