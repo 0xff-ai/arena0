@@ -2,11 +2,11 @@
 
 use arena0_crypto::SignScheme;
 use arena0_program::ProgramHash;
+use arena0_program::bounded;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::io;
 
-use crate::bounded::read_bytes;
 use crate::{ExecId, SessionHash};
 
 use super::{MAX_EFFECT_PAYLOAD_BYTES, ProtocolError, ensure_payload};
@@ -15,7 +15,7 @@ use super::{MAX_EFFECT_PAYLOAD_BYTES, ProtocolError, ensure_payload};
 /// guest signing call. The guest payload is data inside this contract, never
 /// the protocol message itself, so it cannot be used as a signing oracle for
 /// step, terminal, activation, or receipt commitments.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, BorshSerialize)]
 pub struct GuestSignData {
     domain: [u8; 24],
     version: u16,
@@ -25,38 +25,43 @@ pub struct GuestSignData {
     event_position: u64,
     call_index: u32,
     scheme: SignScheme,
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_EFFECT_PAYLOAD_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_EFFECT_PAYLOAD_BYTES>"
+    )]
     payload: Vec<u8>,
 }
 
-impl BorshSerialize for GuestSignData {
-    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        BorshSerialize::serialize(&self.domain, writer)?;
-        BorshSerialize::serialize(&self.version, writer)?;
-        BorshSerialize::serialize(&self.session_id, writer)?;
-        BorshSerialize::serialize(&self.program_hash, writer)?;
-        BorshSerialize::serialize(&self.execution_id, writer)?;
-        BorshSerialize::serialize(&self.event_position, writer)?;
-        BorshSerialize::serialize(&self.call_index, writer)?;
-        BorshSerialize::serialize(&self.scheme, writer)?;
-        let length = u32::try_from(self.payload.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "signing payload too long"))?;
-        BorshSerialize::serialize(&length, writer)?;
-        writer.write_all(&self.payload)
-    }
+#[derive(BorshDeserialize)]
+struct GuestSignDataRaw {
+    domain: [u8; 24],
+    version: u16,
+    session_id: SessionHash,
+    program_hash: ProgramHash,
+    execution_id: ExecId,
+    event_position: u64,
+    call_index: u32,
+    scheme: SignScheme,
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_EFFECT_PAYLOAD_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_EFFECT_PAYLOAD_BYTES>"
+    )]
+    payload: Vec<u8>,
 }
 
 impl BorshDeserialize for GuestSignData {
     fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> io::Result<Self> {
+        let raw = GuestSignDataRaw::deserialize_reader(reader)?;
         let data = Self {
-            domain: <[u8; 24]>::deserialize_reader(reader)?,
-            version: u16::deserialize_reader(reader)?,
-            session_id: crate::SessionHash::deserialize_reader(reader)?,
-            program_hash: ProgramHash::deserialize_reader(reader)?,
-            execution_id: crate::ExecId::deserialize_reader(reader)?,
-            event_position: u64::deserialize_reader(reader)?,
-            call_index: u32::deserialize_reader(reader)?,
-            scheme: SignScheme::deserialize_reader(reader)?,
-            payload: read_bytes(reader, MAX_EFFECT_PAYLOAD_BYTES, "signing payload")?,
+            domain: raw.domain,
+            version: raw.version,
+            session_id: raw.session_id,
+            program_hash: raw.program_hash,
+            execution_id: raw.execution_id,
+            event_position: raw.event_position,
+            call_index: raw.call_index,
+            scheme: raw.scheme,
+            payload: raw.payload,
         };
         data.validate()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;

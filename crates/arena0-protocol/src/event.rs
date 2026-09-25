@@ -5,11 +5,11 @@
 //! Every event uses the same dispatch path and may affect either state and
 //! emit any [`Effect`](crate::Effect).
 
+use arena0_program::bounded;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
-use std::io;
 
-use crate::bounded::{read_bytes as read_bounded_bytes, write_bytes as serialize_bounded_bytes};
+use crate::execution::MAX_EFFECT_PAYLOAD_BYTES;
 use crate::{Ensemble, PeerId, TimerPayload};
 
 /// An event dispatched to a program during a single execution step.
@@ -17,7 +17,7 @@ use crate::{Ensemble, PeerId, TimerPayload};
 /// The type parameter `M` controls the message payload type. The runtime uses
 /// `Event<Vec<u8>>` (raw bytes); the SDK decodes to `Event<M>` where `M` is the
 /// program's typed message enum.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub enum Event<M = Vec<u8>> {
     /// A session has been established with a committed participant ensemble.
     /// The session boundary. Portable traces normalize this event at step 0.
@@ -32,7 +32,14 @@ pub enum Event<M = Vec<u8>> {
     /// the frame. See [`crate::StepEvent`].
     MessageReceived { from: PeerId, msg: M },
     /// The controlling agent submitted input in response to a callout.
-    InputReceived { callout_index: u32, data: Vec<u8> },
+    InputReceived {
+        callout_index: u32,
+        #[borsh(
+            serialize_with = "bounded::write_bytes::<MAX_EFFECT_PAYLOAD_BYTES>",
+            deserialize_with = "bounded::read_bytes::<MAX_EFFECT_PAYLOAD_BYTES>"
+        )]
+        data: Vec<u8>,
+    },
     /// A previously set timer fired with its scheduled payload.
     TimerFired { timer: TimerPayload },
 }
@@ -61,77 +68,10 @@ impl Event<Vec<u8>> {
     }
 }
 
-const EVENT_SESSION_STARTED: u8 = 0;
-const EVENT_MESSAGE_RECEIVED: u8 = 1;
-const EVENT_INPUT_RECEIVED: u8 = 2;
-const EVENT_TIMER_FIRED: u8 = 3;
-
-impl<M: BorshSerialize> BorshSerialize for Event<M> {
-    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        match self {
-            Self::SessionStarted { ensemble } => {
-                BorshSerialize::serialize(&EVENT_SESSION_STARTED, writer)?;
-                BorshSerialize::serialize(ensemble, writer)
-            }
-            Self::MessageReceived { from, msg } => {
-                BorshSerialize::serialize(&EVENT_MESSAGE_RECEIVED, writer)?;
-                BorshSerialize::serialize(from, writer)?;
-                BorshSerialize::serialize(msg, writer)
-            }
-            Self::InputReceived {
-                callout_index,
-                data,
-            } => {
-                BorshSerialize::serialize(&EVENT_INPUT_RECEIVED, writer)?;
-                BorshSerialize::serialize(callout_index, writer)?;
-                serialize_bounded_bytes(
-                    writer,
-                    data,
-                    crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
-                    "event input payload",
-                )?;
-                Ok(())
-            }
-            Self::TimerFired { timer } => {
-                BorshSerialize::serialize(&EVENT_TIMER_FIRED, writer)?;
-                timer.serialize_bounded(writer)
-            }
-        }
-    }
-}
-
-impl<M: BorshDeserialize> BorshDeserialize for Event<M> {
-    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> io::Result<Self> {
-        match u8::deserialize_reader(reader)? {
-            EVENT_SESSION_STARTED => Ok(Self::SessionStarted {
-                ensemble: borsh::BorshDeserialize::deserialize_reader(reader)?,
-            }),
-            EVENT_MESSAGE_RECEIVED => Ok(Self::MessageReceived {
-                from: borsh::BorshDeserialize::deserialize_reader(reader)?,
-                msg: M::deserialize_reader(reader)?,
-            }),
-            EVENT_INPUT_RECEIVED => Ok(Self::InputReceived {
-                callout_index: borsh::BorshDeserialize::deserialize_reader(reader)?,
-                data: read_bounded_bytes(
-                    reader,
-                    crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
-                    "event input payload",
-                )?,
-            }),
-            EVENT_TIMER_FIRED => Ok(Self::TimerFired {
-                timer: TimerPayload::deserialize_bounded(reader)?,
-            }),
-            tag => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown event tag {tag}"),
-            )),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
 
     #[test]
     fn borsh_round_trip_all_variants() {

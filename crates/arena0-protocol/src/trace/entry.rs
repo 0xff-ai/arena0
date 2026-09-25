@@ -1,10 +1,10 @@
 //! Portable trace entries.
 
-use crate::bounded::{
-    read_bytes as read_bounded_bytes, read_string as read_bounded_string,
-    write_bytes as serialize_bounded_bytes, write_string as serialize_bounded_string,
+use crate::execution::{
+    MAX_EFFECT_PAYLOAD_BYTES, MAX_TERMINAL_OUTCOME_BYTES, MAX_TERMINAL_REASON_BYTES,
 };
 use crate::{Effect, Ensemble, Event, MessageId, PeerId, SessionHash, StateHash};
+use arena0_program::bounded;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -16,7 +16,7 @@ use super::commitment::AggregateAttestation;
 /// Only the two events every participant observes at the same position are
 /// representable here. The type makes a non-agreed event in a portable entry
 /// unrepresentable, so no runtime shape check is needed.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub enum StepEvent {
     /// The session boundary at step 0.
     SessionStarted {
@@ -28,26 +28,42 @@ pub enum StepEvent {
         /// Authenticated author.
         from: PeerId,
         /// Opaque program payload.
+        #[borsh(
+            serialize_with = "bounded::write_bytes::<MAX_EFFECT_PAYLOAD_BYTES>",
+            deserialize_with = "bounded::read_bytes::<MAX_EFFECT_PAYLOAD_BYTES>"
+        )]
         data: Vec<u8>,
     },
 }
 
 /// The terminal value of one step, if that step ended the session.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub enum StepTerminal {
     /// Successful completion with opaque outcome bytes.
     End {
         /// Opaque outcome bytes.
+        #[borsh(
+            serialize_with = "bounded::write_bytes::<MAX_TERMINAL_OUTCOME_BYTES>",
+            deserialize_with = "bounded::read_bytes::<MAX_TERMINAL_OUTCOME_BYTES>"
+        )]
         outcome: Vec<u8>,
     },
     /// A shared program abort.
     Abort {
         /// Human-readable reason.
+        #[borsh(
+            serialize_with = "bounded::write_string::<MAX_TERMINAL_REASON_BYTES>",
+            deserialize_with = "bounded::read_string::<MAX_TERMINAL_REASON_BYTES>"
+        )]
         reason: String,
     },
     /// A shared program failure.
     Fail {
         /// Human-readable reason.
+        #[borsh(
+            serialize_with = "bounded::write_string::<MAX_TERMINAL_REASON_BYTES>",
+            deserialize_with = "bounded::read_string::<MAX_TERMINAL_REASON_BYTES>"
+        )]
         reason: String,
     },
 }
@@ -129,7 +145,7 @@ impl StepTerminal {
 /// The entry owns the trace coordinates and the terminal value. The aggregate
 /// agreement is a log join and is intentionally excluded from
 /// [`Self::entry_hash`].
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, BorshSerialize)]
 pub struct TraceEntry {
     /// Trace schema version.
     pub trace_version: u32,
@@ -147,138 +163,28 @@ pub struct TraceEntry {
     pub agreement: AggregateAttestation,
 }
 
-impl BorshSerialize for StepEvent {
-    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        match self {
-            Self::SessionStarted { ensemble } => {
-                BorshSerialize::serialize(&0u8, writer)?;
-                BorshSerialize::serialize(ensemble, writer)
-            }
-            Self::Message { from, data } => {
-                BorshSerialize::serialize(&1u8, writer)?;
-                BorshSerialize::serialize(from, writer)?;
-                serialize_bounded_bytes(
-                    writer,
-                    data,
-                    crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
-                    "step message payload",
-                )
-            }
-        }
-    }
-}
-
-impl BorshDeserialize for StepEvent {
-    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> io::Result<Self> {
-        match u8::deserialize_reader(reader)? {
-            0 => Ok(Self::SessionStarted {
-                ensemble: BorshDeserialize::deserialize_reader(reader)?,
-            }),
-            1 => Ok(Self::Message {
-                from: BorshDeserialize::deserialize_reader(reader)?,
-                data: read_bounded_bytes(
-                    reader,
-                    crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
-                    "step message payload",
-                )?,
-            }),
-            tag => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown step event tag {tag}"),
-            )),
-        }
-    }
-}
-
-impl BorshSerialize for StepTerminal {
-    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        match self {
-            Self::End { outcome } => {
-                BorshSerialize::serialize(&0u8, writer)?;
-                serialize_bounded_bytes(
-                    writer,
-                    outcome,
-                    crate::execution::MAX_TERMINAL_OUTCOME_BYTES,
-                    "terminal outcome",
-                )
-            }
-            Self::Abort { reason } => {
-                BorshSerialize::serialize(&1u8, writer)?;
-                serialize_bounded_string(
-                    writer,
-                    reason,
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "terminal reason",
-                )
-            }
-            Self::Fail { reason } => {
-                BorshSerialize::serialize(&2u8, writer)?;
-                serialize_bounded_string(
-                    writer,
-                    reason,
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "failure reason",
-                )
-            }
-        }
-    }
-}
-
-impl BorshDeserialize for StepTerminal {
-    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> io::Result<Self> {
-        match u8::deserialize_reader(reader)? {
-            0 => Ok(Self::End {
-                outcome: read_bounded_bytes(
-                    reader,
-                    crate::execution::MAX_TERMINAL_OUTCOME_BYTES,
-                    "terminal outcome",
-                )?,
-            }),
-            1 => Ok(Self::Abort {
-                reason: read_bounded_string(
-                    reader,
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "terminal reason",
-                )?,
-            }),
-            2 => Ok(Self::Fail {
-                reason: read_bounded_string(
-                    reader,
-                    crate::execution::MAX_TERMINAL_REASON_BYTES,
-                    "failure reason",
-                )?,
-            }),
-            tag => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown step terminal tag {tag}"),
-            )),
-        }
-    }
-}
-
-impl BorshSerialize for TraceEntry {
-    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        validate_version(self.trace_version)?;
-        BorshSerialize::serialize(&self.trace_version, writer)?;
-        BorshSerialize::serialize(&self.step, writer)?;
-        BorshSerialize::serialize(&self.event, writer)?;
-        BorshSerialize::serialize(&self.pre_state, writer)?;
-        BorshSerialize::serialize(&self.post_state, writer)?;
-        BorshSerialize::serialize(&self.terminal, writer)?;
-        BorshSerialize::serialize(&self.agreement, writer)
-    }
+#[derive(BorshDeserialize)]
+struct TraceEntryRaw {
+    trace_version: u32,
+    step: u64,
+    event: StepEvent,
+    pre_state: StateHash,
+    post_state: StateHash,
+    terminal: Option<StepTerminal>,
+    agreement: AggregateAttestation,
 }
 
 impl BorshDeserialize for TraceEntry {
     fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> io::Result<Self> {
+        let raw = TraceEntryRaw::deserialize_reader(reader)?;
         let entry = Self {
-            trace_version: u32::deserialize_reader(reader)?,
-            step: u64::deserialize_reader(reader)?,
-            event: StepEvent::deserialize_reader(reader)?,
-            pre_state: StateHash::deserialize_reader(reader)?,
-            post_state: StateHash::deserialize_reader(reader)?,
-            terminal: Option::<StepTerminal>::deserialize_reader(reader)?,
-            agreement: AggregateAttestation::deserialize_reader(reader)?,
+            trace_version: raw.trace_version,
+            step: raw.step,
+            event: raw.event,
+            pre_state: raw.pre_state,
+            post_state: raw.post_state,
+            terminal: raw.terminal,
+            agreement: raw.agreement,
         };
         validate_version(entry.trace_version)?;
         Ok(entry)
@@ -355,16 +261,54 @@ mod tests {
 
     #[test]
     fn incompatible_trace_versions_are_rejected_at_the_codec_boundary() {
-        let mut value = entry(StepEvent::SessionStarted {
+        let value = entry(StepEvent::SessionStarted {
             ensemble: Ensemble::from_peers(vec![PeerId([1; 32]), PeerId([2; 32])]).unwrap(),
         });
-        value.trace_version = 1;
-        assert!(borsh::to_vec(&value).is_err());
-
-        value.trace_version = crate::TRACE_FORMAT_VERSION;
+        // The derived serializer carries the version verbatim; decode enforces it.
         let mut encoded = borsh::to_vec(&value).unwrap();
         encoded[..std::mem::size_of::<u32>()].copy_from_slice(&1u32.to_le_bytes());
         assert!(TraceEntry::try_from_slice(&encoded).is_err());
+    }
+
+    #[test]
+    fn step_events_step_terminals_and_entries_round_trip() {
+        let ensemble = Ensemble::from_peers(vec![PeerId([1; 32]), PeerId([2; 32])]).unwrap();
+        for event in [
+            StepEvent::SessionStarted {
+                ensemble: ensemble.clone(),
+            },
+            StepEvent::Message {
+                from: PeerId([4; 32]),
+                data: vec![5, 6],
+            },
+        ] {
+            assert_eq!(
+                borsh::from_slice::<StepEvent>(&borsh::to_vec(&event).unwrap()).unwrap(),
+                event
+            );
+        }
+        for terminal in [
+            StepTerminal::End { outcome: vec![7] },
+            StepTerminal::Abort {
+                reason: "stop".into(),
+            },
+            StepTerminal::Fail {
+                reason: "fail".into(),
+            },
+        ] {
+            assert_eq!(
+                borsh::from_slice::<StepTerminal>(&borsh::to_vec(&terminal).unwrap()).unwrap(),
+                terminal
+            );
+        }
+        let value = entry(StepEvent::Message {
+            from: PeerId([4; 32]),
+            data: vec![5],
+        });
+        assert_eq!(
+            TraceEntry::try_from_slice(&borsh::to_vec(&value).unwrap()).unwrap(),
+            value
+        );
     }
 
     #[test]

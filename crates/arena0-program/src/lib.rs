@@ -7,6 +7,7 @@
 //! dependency: those layers consume these contracts directly.
 
 pub mod abi;
+pub mod bounded;
 mod id;
 pub mod profile;
 pub mod program;

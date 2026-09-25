@@ -237,29 +237,14 @@ impl Ensemble<Committed> {
 
 impl BorshSerialize for Ensemble<Committed> {
     fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> borsh::io::Result<()> {
-        if self.peers.len() > crate::MAX_PARTICIPANTS {
-            return Err(borsh::io::Error::new(
-                borsh::io::ErrorKind::InvalidInput,
-                "ensemble participant count exceeds bound",
-            ));
-        }
-        BorshSerialize::serialize(&self.peers, writer)
+        arena0_program::bounded::write_vec::<{ crate::MAX_PARTICIPANTS }, _>(&self.peers, writer)
     }
 }
 
 impl BorshDeserialize for Ensemble<Committed> {
     fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
-        let len = u32::deserialize_reader(reader)? as usize;
-        if len > crate::MAX_PARTICIPANTS {
-            return Err(borsh::io::Error::new(
-                borsh::io::ErrorKind::InvalidData,
-                "ensemble participant count exceeds bound",
-            ));
-        }
-        let mut peers = Vec::with_capacity(len);
-        for _ in 0..len {
-            peers.push(PeerId::deserialize_reader(reader)?);
-        }
+        let peers =
+            arena0_program::bounded::read_vec::<{ crate::MAX_PARTICIPANTS }, PeerId>(reader)?;
         Self::from_peers(peers).map_err(|err| {
             borsh::io::Error::new(
                 borsh::io::ErrorKind::InvalidData,

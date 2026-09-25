@@ -17,6 +17,8 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::de::{self, IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::bounded;
+
 /// Maximum accepted serialized shared-state length.
 pub const MAX_SHARED_STATE_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum accepted serialized participant-local-state length.
@@ -137,7 +139,7 @@ macro_rules! bounded_state_bytes {
 
         impl BorshDeserialize for $name {
             fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-                read_borsh_bounded(reader, Self::MAX_LEN, $label).map(Self)
+                bounded::read_bytes::<{ Self::MAX_LEN }>(reader).map(Self)
             }
         }
 
@@ -175,22 +177,6 @@ bounded_state_bytes! {
 bounded_state_bytes! {
     /// Opaque, bounded bytes for participant-local program state.
     LocalStateBytes, MAX_LOCAL_STATE_BYTES, "local", LocalTooLarge
-}
-
-/// Read a Borsh `Vec<u8>` after checking its length prefix, so a hostile
-/// length cannot trigger an unbounded allocation.
-fn read_borsh_bounded<R: io::Read>(reader: &mut R, max: usize, label: &str) -> io::Result<Vec<u8>> {
-    let length = u32::deserialize_reader(reader)?;
-    let length = usize::try_from(length).expect("u32 length fits usize");
-    if length > max {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{label} state is {length} bytes; maximum is {max}"),
-        ));
-    }
-    let mut bytes = vec![0; length];
-    reader.read_exact(&mut bytes)?;
-    Ok(bytes)
 }
 
 /// Deserialize a byte sequence without allowing its backing allocation to
@@ -360,8 +346,9 @@ mod tests {
             <SharedStateBytes as BorshDeserialize>::try_from_slice(&prefix).unwrap_err();
         let local_error =
             <LocalStateBytes as BorshDeserialize>::try_from_slice(&prefix).unwrap_err();
-        assert!(shared_error.to_string().contains("maximum"));
-        assert!(local_error.to_string().contains("maximum"));
+        // The shared bounded codec names the length and bound, not the field.
+        assert!(shared_error.to_string().contains("exceeds bound"));
+        assert!(local_error.to_string().contains("exceeds bound"));
     }
 
     fn oversized_json(len: usize) -> String {

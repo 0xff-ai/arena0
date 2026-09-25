@@ -4,13 +4,13 @@ use serde::{Deserialize, Serialize};
 use std::io;
 
 use crate::PeerId;
-use crate::bounded::{read_bytes as read_bounded_bytes, write_bytes};
 use crate::negotiation::MAX_PARAMS_LEN;
 use crate::trace::{AggregateAttestation, SessionHeader, StepCommitment, StepSig, TraceEntry};
+use arena0_program::bounded;
 
 use super::{
-    ExecutionBinding, MAX_RECEIPT_BYTES, ProtocolError, SharedProposal, StepCertificate,
-    ensure_payload,
+    ExecutionBinding, MAX_RECEIPT_BYTES, MAX_RECEIPT_TRACE_ENTRIES, MAX_TERMINAL_OUTCOME_BYTES,
+    ProtocolError, SharedProposal, StepCertificate, ensure_payload,
 };
 
 impl StepCertificate {
@@ -191,44 +191,11 @@ impl ReceiptBody {
 
 impl BorshSerialize for ReceiptBody {
     fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        if self.outcome.len() > super::MAX_TERMINAL_OUTCOME_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "receipt outcome exceeds bound",
-            ));
-        }
-        if self.params.len() > MAX_PARAMS_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "receipt params exceed bound",
-            ));
-        }
-        if self.trace.len() > super::MAX_RECEIPT_TRACE_ENTRIES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "receipt trace exceeds bound",
-            ));
-        }
         BorshSerialize::serialize(&RECEIPT_BODY_VERSION, writer)?;
         BorshSerialize::serialize(&self.header, writer)?;
-        write_bytes(
-            writer,
-            &self.outcome,
-            super::MAX_TERMINAL_OUTCOME_BYTES,
-            "receipt outcome",
-        )?;
-        write_bytes(writer, &self.params, MAX_PARAMS_LEN, "receipt params")?;
-        let count = u32::try_from(self.trace.len()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "receipt trace count overflows u32",
-            )
-        })?;
-        BorshSerialize::serialize(&count, writer)?;
-        for entry in &self.trace {
-            BorshSerialize::serialize(entry, writer)?;
-        }
-        Ok(())
+        bounded::write_bytes::<MAX_TERMINAL_OUTCOME_BYTES>(&self.outcome, writer)?;
+        bounded::write_bytes::<MAX_PARAMS_LEN>(&self.params, writer)?;
+        bounded::write_vec::<MAX_RECEIPT_TRACE_ENTRIES, TraceEntry>(&self.trace, writer)
     }
 }
 
@@ -242,20 +209,9 @@ impl BorshDeserialize for ReceiptBody {
             ));
         }
         let header = SessionHeader::deserialize_reader(reader)?;
-        let outcome =
-            read_bounded_bytes(reader, super::MAX_TERMINAL_OUTCOME_BYTES, "receipt outcome")?;
-        let params = read_bounded_bytes(reader, MAX_PARAMS_LEN, "receipt params")?;
-        let count = u32::deserialize_reader(reader)? as usize;
-        if count > super::MAX_RECEIPT_TRACE_ENTRIES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "receipt trace exceeds bound",
-            ));
-        }
-        let mut trace = Vec::with_capacity(count);
-        for _ in 0..count {
-            trace.push(TraceEntry::deserialize_reader(reader)?);
-        }
+        let outcome = bounded::read_bytes::<MAX_TERMINAL_OUTCOME_BYTES>(reader)?;
+        let params = bounded::read_bytes::<MAX_PARAMS_LEN>(reader)?;
+        let trace = bounded::read_vec::<MAX_RECEIPT_TRACE_ENTRIES, TraceEntry>(reader)?;
         let body = Self {
             header,
             outcome,

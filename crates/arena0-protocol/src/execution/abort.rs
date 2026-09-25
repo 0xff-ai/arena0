@@ -1,6 +1,7 @@
 //! Signed, portable abort and failure occurrences.
 
 use arena0_crypto::{Ed25519Signature, SignScheme};
+use arena0_program::bounded;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +22,7 @@ const ABORT_OCCURRENCE_DIGEST_DOMAIN: &[u8] = b"arena0/abort-occurrence-digest/v
 /// The terminal meaning authenticated by an [`AbortOccurrence`].
 ///
 /// The explicit tags are part of the version-1 wire and proof contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
 pub enum AbortKind {
     /// Explicitly stop the execution without classifying it as a failure.
     Abort,
@@ -52,18 +53,6 @@ impl AbortKind {
     }
 }
 
-impl BorshSerialize for AbortKind {
-    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> borsh::io::Result<()> {
-        BorshSerialize::serialize(&self.tag(), writer)
-    }
-}
-
-impl BorshDeserialize for AbortKind {
-    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
-        Self::from_tag(u8::deserialize_reader(reader)?)
-    }
-}
-
 impl Serialize for AbortKind {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_u8(self.tag())
@@ -84,7 +73,7 @@ impl<'de> Deserialize<'de> for AbortKind {
 /// stream generation is intentionally absent: Phase 1 has no independent
 /// portable stream-generation authority, so inventing one would weaken the
 /// contract rather than bind it.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, BorshSerialize)]
 pub struct AbortOccurrence {
     domain: [u8; 24],
     version: u16,
@@ -92,67 +81,45 @@ pub struct AbortOccurrence {
     sender: PeerId,
     kind: AbortKind,
     code: u32,
+    #[borsh(
+        serialize_with = "bounded::write_string::<MAX_TERMINAL_REASON_BYTES>",
+        deserialize_with = "bounded::read_string::<MAX_TERMINAL_REASON_BYTES>"
+    )]
     reason: String,
     coordinate: StepCursor,
     signature: Ed25519Signature,
 }
 
-impl BorshSerialize for AbortOccurrence {
-    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> borsh::io::Result<()> {
-        if self.reason.len() > MAX_TERMINAL_REASON_BYTES {
-            return Err(borsh::io::Error::new(
-                borsh::io::ErrorKind::InvalidInput,
-                "abort reason exceeds bound",
-            ));
-        }
-        BorshSerialize::serialize(&self.domain, writer)?;
-        BorshSerialize::serialize(&self.version, writer)?;
-        BorshSerialize::serialize(&self.session_id, writer)?;
-        BorshSerialize::serialize(&self.sender, writer)?;
-        BorshSerialize::serialize(&self.kind, writer)?;
-        BorshSerialize::serialize(&self.code, writer)?;
-        let length = u32::try_from(self.reason.len()).map_err(|_| {
-            borsh::io::Error::new(borsh::io::ErrorKind::InvalidInput, "abort reason too long")
-        })?;
-        BorshSerialize::serialize(&length, writer)?;
-        writer.write_all(self.reason.as_bytes())?;
-        BorshSerialize::serialize(&self.coordinate, writer)?;
-        BorshSerialize::serialize(&self.signature, writer)
-    }
+#[derive(BorshDeserialize)]
+struct AbortOccurrenceRaw {
+    domain: [u8; 24],
+    version: u16,
+    session_id: SessionHash,
+    sender: PeerId,
+    kind: AbortKind,
+    code: u32,
+    #[borsh(
+        serialize_with = "bounded::write_string::<MAX_TERMINAL_REASON_BYTES>",
+        deserialize_with = "bounded::read_string::<MAX_TERMINAL_REASON_BYTES>"
+    )]
+    reason: String,
+    coordinate: StepCursor,
+    signature: Ed25519Signature,
 }
 
 impl BorshDeserialize for AbortOccurrence {
     fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
-        let domain = <[u8; 24]>::deserialize_reader(reader)?;
-        let version = u16::deserialize_reader(reader)?;
-        let session_id = SessionHash::deserialize_reader(reader)?;
-        let sender = PeerId::deserialize_reader(reader)?;
-        let kind = AbortKind::deserialize_reader(reader)?;
-        let code = u32::deserialize_reader(reader)?;
-        let length = u32::deserialize_reader(reader)? as usize;
-        if length > MAX_TERMINAL_REASON_BYTES {
-            return Err(borsh::io::Error::new(
-                borsh::io::ErrorKind::InvalidData,
-                "abort reason exceeds bound",
-            ));
-        }
-        let mut reason_bytes = vec![0; length];
-        reader.read_exact(&mut reason_bytes)?;
-        let reason = String::from_utf8(reason_bytes).map_err(|error| {
-            borsh::io::Error::new(borsh::io::ErrorKind::InvalidData, error.to_string())
-        })?;
-        let coordinate = StepCursor::deserialize_reader(reader)?;
-        let signature = Ed25519Signature::deserialize_reader(reader)?;
+        let raw = AbortOccurrenceRaw::deserialize_reader(reader)?;
         let occurrence = Self {
-            domain,
-            version,
-            session_id,
-            sender,
-            kind,
-            code,
-            reason,
-            coordinate,
-            signature,
+            domain: raw.domain,
+            version: raw.version,
+            session_id: raw.session_id,
+            sender: raw.sender,
+            kind: raw.kind,
+            code: raw.code,
+            reason: raw.reason,
+            coordinate: raw.coordinate,
+            signature: raw.signature,
         };
         occurrence.validate_shape().map_err(|error| {
             borsh::io::Error::new(borsh::io::ErrorKind::InvalidData, error.to_string())
@@ -336,5 +303,33 @@ impl AbortOccurrence {
             self.reason.len(),
             MAX_TERMINAL_REASON_BYTES,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arena0_crypto::Ed25519Signature;
+
+    fn occurrence() -> AbortOccurrence {
+        AbortOccurrence::new(
+            SessionHash([1; 32]),
+            PeerId([2; 32]),
+            AbortKind::Abort,
+            0,
+            "stop",
+            StepCursor::new(0, crate::StateHash([3; 32]), crate::CHAIN_START),
+            Ed25519Signature([0; 64]),
+        )
+        .expect("valid abort occurrence")
+    }
+
+    #[test]
+    fn abort_occurrence_round_trips() {
+        let value = occurrence();
+        assert_eq!(
+            borsh::from_slice::<AbortOccurrence>(&borsh::to_vec(&value).unwrap()).unwrap(),
+            value
+        );
     }
 }

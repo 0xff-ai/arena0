@@ -8,7 +8,8 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::bounded::{read_bytes as read_bounded_bytes, write_bytes as write_bounded_bytes};
+use arena0_program::MAX_CALLOUT_CONTEXT_BYTES;
+use arena0_program::bounded;
 
 /// The stable identity of one open callout.
 ///
@@ -51,41 +52,18 @@ impl PendingId {
 /// computes at most one open callout from the resulting state image. The host
 /// stores it with that image, so the callout is never emitted as an effect and
 /// never acts as a lock.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct OpenCallout {
     /// Stable identity of this open callout.
     pub id: PendingId,
     /// Program-local callout variant index.
     pub callout_index: u32,
     /// Agent-facing JSON context for that callout.
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_CALLOUT_CONTEXT_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_CALLOUT_CONTEXT_BYTES>"
+    )]
     pub context: Vec<u8>,
-}
-
-impl BorshSerialize for OpenCallout {
-    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        BorshSerialize::serialize(&self.id, writer)?;
-        BorshSerialize::serialize(&self.callout_index, writer)?;
-        write_bounded_bytes(
-            writer,
-            &self.context,
-            arena0_program::MAX_CALLOUT_CONTEXT_BYTES,
-            "callout context",
-        )
-    }
-}
-
-impl BorshDeserialize for OpenCallout {
-    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        Ok(Self {
-            id: PendingId::deserialize_reader(reader)?,
-            callout_index: u32::deserialize_reader(reader)?,
-            context: read_bounded_bytes(
-                reader,
-                arena0_program::MAX_CALLOUT_CONTEXT_BYTES,
-                "callout context",
-            )?,
-        })
-    }
 }
 
 /// Derive a callout identity from the execution event position that

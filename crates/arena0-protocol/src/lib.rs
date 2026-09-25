@@ -10,7 +10,6 @@
 //! Ids live with their domain (`peer::Id`, `session::Id`, `state::Hash`, ...) and
 //! are re-exported here under flat names (`PeerId`, `SessionHash`, `StateHash`).
 
-mod bounded;
 mod id;
 
 pub mod admission;

@@ -9,9 +9,9 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 use crate::TraceEntry;
-use crate::bounded::read_string as read_bounded_string;
 use crate::exec::ExecLifecycle;
 use crate::trace::StepCommitment;
+use arena0_program::bounded;
 
 use super::{
     AbortKind, AbortOccurrence, ExecutionBinding, MAX_TERMINAL_REASON_BYTES, ProtocolError,
@@ -59,7 +59,7 @@ pub enum ReceiptWork {
 /// The one terminal-cause type used by [`ExecutionStatus`]. Local versus peer
 /// authorship is derived from an authenticated occurrence's sender and the
 /// execution producer; it is not a second persisted status dimension.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub enum StopCause {
     /// A signed local or peer abort/failure occurrence.
     Authenticated(AbortOccurrence),
@@ -67,54 +67,12 @@ pub enum StopCause {
     Shared {
         kind: AbortKind,
         commitment: StepCommitment,
+        #[borsh(
+            serialize_with = "bounded::write_string::<MAX_TERMINAL_REASON_BYTES>",
+            deserialize_with = "bounded::read_string::<MAX_TERMINAL_REASON_BYTES>"
+        )]
         reason: String,
     },
-}
-
-impl BorshSerialize for StopCause {
-    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        match self {
-            Self::Authenticated(occurrence) => {
-                BorshSerialize::serialize(&0u8, writer)?;
-                BorshSerialize::serialize(occurrence, writer)
-            }
-            Self::Shared {
-                kind,
-                commitment,
-                reason,
-            } => {
-                if reason.len() > MAX_TERMINAL_REASON_BYTES {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "terminal reason exceeds bound",
-                    ));
-                }
-                BorshSerialize::serialize(&1u8, writer)?;
-                BorshSerialize::serialize(kind, writer)?;
-                BorshSerialize::serialize(commitment, writer)?;
-                BorshSerialize::serialize(reason, writer)
-            }
-        }
-    }
-}
-
-impl BorshDeserialize for StopCause {
-    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        match u8::deserialize_reader(reader)? {
-            0 => Ok(Self::Authenticated(AbortOccurrence::deserialize_reader(
-                reader,
-            )?)),
-            1 => Ok(Self::Shared {
-                kind: AbortKind::deserialize_reader(reader)?,
-                commitment: StepCommitment::deserialize_reader(reader)?,
-                reason: read_bounded_string(reader, MAX_TERMINAL_REASON_BYTES, "terminal reason")?,
-            }),
-            tag => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("unknown stop cause tag {tag}"),
-            )),
-        }
-    }
 }
 
 impl StopCause {
@@ -322,4 +280,50 @@ fn ensure_reason(reason: &str) -> Result<(), ProtocolError> {
         reason.len(),
         super::MAX_TERMINAL_REASON_BYTES,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{PeerId, SessionHash, StateHash};
+    use arena0_crypto::Ed25519Signature;
+
+    fn occurrence() -> AbortOccurrence {
+        AbortOccurrence::new(
+            SessionHash([1; 32]),
+            PeerId([2; 32]),
+            AbortKind::Fail,
+            0,
+            "stop",
+            StepCursor::new(0, StateHash([3; 32]), crate::CHAIN_START),
+            Ed25519Signature([0; 64]),
+        )
+        .expect("valid abort occurrence")
+    }
+
+    #[test]
+    fn stop_causes_round_trip() {
+        let causes = [
+            StopCause::Authenticated(occurrence()),
+            StopCause::Shared {
+                kind: AbortKind::Abort,
+                commitment: StepCommitment {
+                    domain: crate::STEP_COMMIT_DOMAIN,
+                    session_id: SessionHash([1; 32]),
+                    step: 0,
+                    entry_hash: [0; 32],
+                    pre_state: StateHash([3; 32]),
+                    post_state: StateHash([3; 32]),
+                    link: crate::CHAIN_START,
+                },
+                reason: "stop".into(),
+            },
+        ];
+        for cause in &causes {
+            assert_eq!(
+                borsh::from_slice::<StopCause>(&borsh::to_vec(cause).unwrap()).unwrap(),
+                *cause
+            );
+        }
+    }
 }
