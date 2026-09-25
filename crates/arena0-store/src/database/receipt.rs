@@ -358,7 +358,7 @@ impl Database {
             || self.receipt_production(receipt_id)? != Some(execution_id)
         {
             return Err(StoreError::Corruption(
-                "terminal proof does not match published execution state".into(),
+                "terminal record does not match published execution state".into(),
             ));
         }
         if receipt.body().trace() != self.load_agreed_trace_in_transaction(state)? {

@@ -245,7 +245,7 @@ impl ExecutionActor {
     /// Start at most one send per peer. Opening a stream and waiting for its
     /// acknowledgement share a deadline. JoinSet owns cancellation when the
     /// actor exits, and each task owns its stream until settlement.
-    pub(super) fn deliver_frames(&mut self) -> Result<bool, ExecError> {
+    pub(super) fn deliver_frames(&mut self) -> Result<(), ExecError> {
         let ending = self.state.status().is_terminal();
         let frames = if ending {
             self.state.terminal_evidence().into_iter().collect()
@@ -256,7 +256,6 @@ impl ExecutionActor {
             .into_iter()
             .map(|frame| Ok((frame_digest(&frame)?, frame)))
             .collect::<Result<Vec<_>, ExecError>>()?;
-        let mut delivered = true;
         for ticket in self.context.activation.tickets() {
             let peer = ticket.data.signer;
             if peer == self.context.producer {
@@ -277,7 +276,6 @@ impl ExecutionActor {
             lane.rejected
                 .retain(|digest| frames.iter().any(|(current, _)| current == digest));
             if lane.suppressed {
-                delivered = false;
                 continue;
             }
             let Some((digest, frame)) = frames.iter().find(|(digest, _)| {
@@ -285,7 +283,6 @@ impl ExecutionActor {
             }) else {
                 continue;
             };
-            delivered = false;
             if lane.busy
                 || lane
                     .retry_at
@@ -321,7 +318,7 @@ impl ExecutionActor {
                 }
             });
         }
-        Ok(delivered)
+        Ok(())
     }
 
     async fn confirm_peer(&mut self, peer: PeerId) -> Result<(), ExecError> {

@@ -31,11 +31,11 @@ pub enum ExecError {
     #[error("execution {0} was not found")]
     NotFound(ExecId),
     /// An agent answer raced with another answer and no longer names the
-    /// durable callout continuation.
+    /// open callout.
     #[error("callout is no longer pending")]
     CalloutNotPending,
-    /// The guest rejected an agent answer without consuming the callout
-    /// continuation. The contained message is safe to expose to the caller.
+    /// The guest rejected an agent answer and the callout stays open. The
+    /// contained message is safe to expose to the caller.
     #[error("callout answer rejected: {0}")]
     InputRejected(String),
     /// A valid writer message was rejected or did not reproduce its post-state.
@@ -176,10 +176,9 @@ pub enum SessionMessage {
 
 /// All capabilities needed to construct one execution actor.
 ///
-/// The context is consumed by [`crate::Host::spawn`].  It contains no
-/// mutable protocol state: the SQLite [`ExecutionStore`] is the sole writer
-/// for that execution, while the actor owns only this loaded guest and its
-/// live external capabilities.
+/// The context is consumed by [`crate::Host::spawn`]. The actor loads and owns
+/// the execution state; the SQLite [`ExecutionStore`] persists each transition
+/// the actor hands it.
 pub struct ExecContext {
     /// Stable execution identity.
     pub(crate) exec_id: ExecId,
@@ -200,7 +199,7 @@ pub struct ExecContext {
 
 impl ExecContext {
     /// Collect the already-validated capabilities consumed by one execution
-    /// actor. Mutable protocol state remains owned by [`HostExecutionStore`].
+    /// actor.
     #[must_use]
     pub fn new(
         exec_id: ExecId,

@@ -115,14 +115,12 @@ pub use fault::{ProgramFault, ProtocolFault};
 pub use io_alloc::prepare_allocator as __prepare_allocator;
 pub use primitive::Primitive;
 pub use program::{
-    ApplyDecision, MessageApply, PhasedProgram, PhaselessTransition, Program, ProgramQuery,
-    ProgramTransition, ProgramView,
+    ApplyDecision, MessageApply, Program, ProgramQuery, ProgramTransition, ProgramView,
 };
 pub use sdk_prelude::prelude;
 pub use state::{
-    Arena0Callout, Arena0CalloutRequest, Arena0Phase, Arena0Query, Arena0TypedCalloutRequest,
-    CalloutSpec, LocalDebug, LocalState, ManagedPhase, PhaseDecl, PhasedSharedState, ProgramValue,
-    SharedState,
+    Arena0Callout, Arena0CalloutRequest, Arena0Phase, Arena0Query, LocalDebug, LocalState,
+    ManagedPhase, PhaseDecl, PhasedSharedState, ProgramValue, SharedState,
 };
 pub use timer::{IntoTimerEffect, TimerSchedule, decode_timer_payload, timer_payload};
 pub use transition::{AbortReason, Transition};
@@ -143,9 +141,8 @@ pub use arena0_program::{
 };
 pub use arena0_protocol as types;
 pub use arena0_protocol::{
-    Committed, DisconnectReason, Effect, Ensemble, EnsembleError, Event, LogLevel, Open,
-    Participant, PeerId, SessionHash, StateHash, TimerPayload, TimerSpec, TraceEntry, View,
-    Viewport,
+    Committed, Effect, Ensemble, EnsembleError, Event, LogLevel, Open, Participant, PeerId,
+    SessionHash, StateHash, TimerPayload, TimerSpec, TraceEntry, View, Viewport,
 };
 pub use blake3;
 pub use borsh;
@@ -173,12 +170,6 @@ pub fn __truncate_rejection_reason(error: &anyhow::Error) -> String {
         end -= 1;
     }
     reason[..end].to_owned()
-}
-
-/// Inverse of [`__parse_input_data`]: serialize a value to JSON event bytes.
-#[doc(hidden)]
-pub fn __serialize_input_data<T: serde::Serialize>(value: &T) -> Vec<u8> {
-    serde_json::to_vec(value).expect("input data serialization failed")
 }
 
 #[macro_export]

@@ -3,12 +3,10 @@
 use arena0_protocol::TimerPayload;
 use arena0_protocol::{Ensemble, Participant, View, Viewport};
 use borsh::BorshDeserialize;
-use core::convert::Infallible;
 
 use crate::{
     Arena0Callout, Arena0Phase, Arena0Query, CalloutContext, Context, LocalContext, LocalState,
-    PhaseDecl, PhasedSharedState, PrimitiveRouteSchema, ProgramFault, ProtocolFault, SharedState,
-    Transition,
+    PhaseDecl, PrimitiveRouteSchema, ProgramFault, ProtocolFault, SharedState, Transition,
 };
 
 pub type ProgramTransition<P> = Transition<<P as Program>::Phase>;
@@ -179,31 +177,6 @@ pub trait Program: Sized {
         <Self::Shared as SharedState>::__primitive_routes()
     }
 }
-
-/// Phase-aware extension for programs whose shared state carries a managed phase.
-pub trait PhasedProgram: Program {
-    fn phase(shared: &Self::Shared) -> Self::Phase;
-
-    #[doc(hidden)]
-    fn __set_managed_phase(shared: &mut Self::Shared, phase: Self::Phase);
-}
-
-impl<P> PhasedProgram for P
-where
-    P: Program,
-    P::Shared: PhasedSharedState<Phase = P::Phase>,
-{
-    fn phase(shared: &Self::Shared) -> Self::Phase {
-        P::Shared::phase(shared)
-    }
-
-    fn __set_managed_phase(shared: &mut Self::Shared, phase: Self::Phase) {
-        P::Shared::__set_phase(shared, phase);
-    }
-}
-
-/// A genuinely phaseless transition type for lower-level `Program` canaries.
-pub type PhaselessTransition = Transition<Infallible>;
 
 /// Read-only query surface separated from transition handlers.
 pub trait ProgramQuery: Program {

@@ -81,13 +81,6 @@ impl StoreConfig {
             busy_timeout: DEFAULT_BUSY_TIMEOUT,
         }
     }
-
-    /// Set SQLite's busy timeout.
-    #[must_use]
-    pub const fn with_busy_timeout(mut self, timeout: Duration) -> Self {
-        self.busy_timeout = timeout;
-        self
-    }
 }
 
 /// Result of inserting one content-addressed Wasm program.
@@ -400,9 +393,6 @@ pub enum StoreError {
     /// Execution creation requires a committed activation record.
     #[error("activation for execution {0} is not committed")]
     ActivationNotCommitted(ExecId),
-    /// A receipt was not found.
-    #[error("receipt {0:?} was not found")]
-    ReceiptNotFound(ReceiptId),
     /// The database contains malformed, tampered, or internally inconsistent data.
     #[error("store corruption: {0}")]
     Corruption(String),
@@ -411,7 +401,7 @@ pub enum StoreError {
     Protocol(#[from] ProtocolError),
     /// An operation's payload exceeds its size bound.
     #[error("store payload requires {required} bytes, limit is {capacity}")]
-    CommandTooLarge { required: usize, capacity: usize },
+    PayloadTooLarge { required: usize, capacity: usize },
     /// A store configuration is invalid.
     #[error("invalid store configuration: {0}")]
     InvalidConfiguration(&'static str),
@@ -1080,7 +1070,7 @@ impl StoreHandle {
             StoreError::InvalidConfiguration("program size bound does not fit usize")
         })?;
         if wasm.is_empty() || wasm.len() > max {
-            return Err(StoreError::CommandTooLarge {
+            return Err(StoreError::PayloadTooLarge {
                 required: wasm.len(),
                 capacity: max,
             });
@@ -1129,23 +1119,6 @@ impl StoreHandle {
         execution_id: ExecId,
     ) -> Result<Option<ExecutionState>, StoreError> {
         self.run(move |db| db.load_execution(execution_id)).await
-    }
-
-    /// Load the unique local execution bound to a session identity.
-    pub async fn load_execution_by_session(
-        &self,
-        session_id: SessionHash,
-    ) -> Result<Option<ExecutionState>, StoreError> {
-        self.run(move |db| db.load_execution_by_session(session_id))
-            .await
-    }
-
-    /// List bounded permanent activation records for restart recovery.
-    pub async fn list_activations(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<ActivationRecord>, StoreError> {
-        self.run(move |db| db.list_activations(limit)).await
     }
 
     /// List bounded execution aggregates for restart recovery.
@@ -1301,7 +1274,7 @@ impl ExecutionStore {
     ) -> Result<ExecutionRequestOutcome, StoreError> {
         let params_len = params.as_ref().map_or(0, JsonBytes::len);
         if params_len > arena0_protocol::MAX_PARAMS_LEN {
-            return Err(StoreError::CommandTooLarge {
+            return Err(StoreError::PayloadTooLarge {
                 required: params_len,
                 capacity: arena0_protocol::MAX_PARAMS_LEN,
             });

@@ -1,7 +1,7 @@
 //! M3: two in-process executions play a full turn-based chess game (Scholar's
 //! mate) bilaterally over `LocalTransport`; portable verification accepts both
-//! traces. Exercises the callout-await-inside-`on_message` continuation path and
-//! the send-before-End ordering through the real runtime.
+//! traces. Exercises callouts derived after each agreed move and the final
+//! broadcast before `SessionEnd` through the real runtime.
 
 use arena0_protocol::{ColorDepth, Slot, Viewport};
 use arena0_tests::arena::Arena;

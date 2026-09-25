@@ -135,10 +135,7 @@ mod tests {
         assert_eq!(borsh::to_vec(&event).unwrap(), event_bytes);
         assert_eq!(Event::try_from_slice(&event_bytes).unwrap(), event);
 
-        let effect = crate::Effect::SetTimer {
-            delay_ms: 0,
-            timer,
-        };
+        let effect = crate::Effect::SetTimer { delay_ms: 0, timer };
         let mut effect_bytes = vec![3, 0, 0, 0, 0, 0, 0, 0, 0];
         effect_bytes.extend_from_slice(&event_bytes[1..]);
         assert_eq!(borsh::to_vec(&effect).unwrap(), effect_bytes);

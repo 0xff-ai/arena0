@@ -191,7 +191,7 @@ Only generated guest code performs concrete DTO conversion to and from Borsh.
 - `Failed { reason }`.
 
 `pending_id` is always a decimal JSON string, including in `exec.next`,
-`exec.status`, and `exec.submit`. It is an opaque continuation identity; keep
+`exec.status`, and `exec.submit`. It is an opaque callout identity; keep
 the string unchanged when submitting an answer. This avoids precision loss in
 JSON clients whose number type cannot represent every `u64` value.
 

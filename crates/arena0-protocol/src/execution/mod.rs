@@ -2,7 +2,7 @@
 //!
 //! The actor dispatches one flat [`crate::Event`] through the program. This
 //! module contains the durable coordinates and evidence needed around that
-//! dispatch; it intentionally has no reducer, plan, or split transition layer.
+//! dispatch.
 
 mod abort;
 mod binding;
@@ -16,7 +16,6 @@ mod signing;
 mod state;
 mod status;
 mod timer;
-mod timer_firing;
 mod validation;
 
 /// Maximum number of effects retained for one event dispatch.
@@ -25,9 +24,8 @@ pub const MAX_EFFECTS: usize = 128;
 pub const MAX_OUTGOING_MESSAGES: usize = 16;
 /// Maximum number of active one-shot timers in one execution.
 pub const MAX_ACTIVE_TIMERS: usize = 64;
-/// Maximum number of signatures retained for one pending proof.
+/// Maximum number of signatures retained for one step proposal.
 pub const MAX_PROOF_SIGNATURES: usize = crate::MAX_PARTICIPANTS;
-/// Maximum encoded bytes accepted for one execution state.
 /// Maximum encoded bytes accepted for one execution aggregate. A staged
 /// proposal can retain both the current and proposed shared/local memories,
 /// plus up to the program's complete dispatch-effect budget.
@@ -62,7 +60,6 @@ pub use signing::GuestSignData;
 pub use state::{ExecutionState, SharedProposal, StepCertificate};
 pub use status::{ExecutionStatus, ReceiptWork, StopCause};
 pub use timer::TimerId;
-pub use timer_firing::TimerFiring;
 
 pub use validation::check_effect_budget;
 pub(crate) use validation::{

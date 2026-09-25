@@ -9,8 +9,8 @@
 //! The state-machine primitive [`commit_reveal`] uses an explicit pair of
 //! DTOs: [`commit_reveal::CommitReveal`] contains shared-visible fields, while
 //! [`commit_reveal::CommitRevealLocal`] carries the participant-local secret
-//! stash and never enters the session hash. A unified SDK [`arena0::Context`] can
-//! update both values during one accepted event.
+//! stash and never enters the session hash. A local handler updates only the
+//! local value; shared state changes when an agreed handler applies a message.
 
 /// Single-proposal agreement lifecycle composed over [`ballot`].
 pub mod agreement;

@@ -11,7 +11,7 @@ impl Database {
     ) -> Result<ExecutionRequestOutcome, StoreError> {
         let params_len = params_bytes.as_ref().map_or(0, Vec::len);
         if params_len > arena0_protocol::MAX_PARAMS_LEN {
-            return Err(StoreError::CommandTooLarge {
+            return Err(StoreError::PayloadTooLarge {
                 required: params_len,
                 capacity: arena0_protocol::MAX_PARAMS_LEN,
             });
@@ -34,7 +34,7 @@ impl Database {
                 StoreError::InvalidAdmission(format!("admission encoding failed: {error}"))
             })?;
             if admission_bytes.len() > MAX_ADMISSION_BYTES {
-                return Err(StoreError::CommandTooLarge {
+                return Err(StoreError::PayloadTooLarge {
                     required: admission_bytes.len(),
                     capacity: MAX_ADMISSION_BYTES,
                 });
@@ -105,7 +105,7 @@ impl Database {
                 StoreError::InvalidAdmission(format!("admission encoding failed: {error}"))
             })?;
             if admission_bytes.len() > MAX_ADMISSION_BYTES {
-                return Err(StoreError::CommandTooLarge {
+                return Err(StoreError::PayloadTooLarge {
                     required: admission_bytes.len(),
                     capacity: MAX_ADMISSION_BYTES,
                 });
@@ -213,7 +213,7 @@ impl Database {
                         .as_ref()
                         .map_or(0, JsonBytes::len)
                         .checked_add(128)
-                        .ok_or(StoreError::CommandTooLarge {
+                        .ok_or(StoreError::PayloadTooLarge {
                             required: usize::MAX,
                             capacity: MAX_RESPONSE_BYTES,
                         })?,

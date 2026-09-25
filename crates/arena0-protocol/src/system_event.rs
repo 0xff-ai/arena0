@@ -6,7 +6,7 @@
 use crate::PendingId;
 use valuable::Valuable;
 
-use crate::{ExecId, ExecLifecycle, NegotiationId, PeerId, SessionHash, StateHash, TicketHash};
+use crate::{ExecId, ExecLifecycle, NegotiationId, PeerId, SessionHash, TicketHash};
 use arena0_program::ProgramHash;
 
 /// One safe host or protocol occurrence for structured tracing.
@@ -124,14 +124,6 @@ pub enum ExecutionEvent {
     },
     SessionStarted {
         ensemble: Vec<PeerId>,
-    },
-    StepCommitted {
-        step: u64,
-        pre_state: StateHash,
-        post_state: StateHash,
-        fuel_used: u64,
-        signer_count: u16,
-        participant_count: u16,
     },
     CalloutRequested {
         pending_id: PendingId,

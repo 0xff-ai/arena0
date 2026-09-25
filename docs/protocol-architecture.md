@@ -338,8 +338,8 @@ dropping the claim permits a recovery actor to resume the same execution.
 `arena0-store::Store` opens one SQLite database for each Host. A process lock
 prevents two processes from writing the same file. The actor supplies complete
 transition records; SQLite persists the execution aggregate, accepted event and
-occurrence identities, shared and local state images, effects, terminal proof
-rows, active timers, and receipt artifacts in one authoritative transaction.
+occurrence identities, shared and local state images, effects, terminal
+records, active timers, and receipt artifacts in one authoritative transaction.
 The store does not receive individual effect commands or lease delivery work,
 and a failed transaction cannot change later reads.
 
@@ -780,8 +780,8 @@ A monitor may submit one answer for the open callout through the ordinary
 `exec.submit` operation. The answer must name the exact open `PendingId`;
 reading a callout grants no ownership or reservation. The execution actor
 serializes competing answers. A stale or losing submission reports
-`CalloutNotPending`; a resubmission while the answered result is staged reports
-`AgreementPending`. The Host validates the answer against the callout schema,
+`CalloutNotPending`; a resubmission while the answered result is staged waits
+for agreement and then reports `CalloutNotPending`. The Host validates the answer against the callout schema,
 and a program rejection or input-handler trap returns `InputRejected` without
 ending the session. A lost submission response is an unknown outcome and must
 not trigger automatic resubmission.
@@ -807,7 +807,7 @@ does not apply to the process-replacing, persistent `arena0 serve` path or to
 `arena0_protocol::system_event::SystemEvent` is Host-only and non-Borsh. The
 daemon records redacted values as structured tracing on
 `arena0::system_event`. System events never carry params, outcomes, callout
-context, signatures, or raw private key material. Terminal proof progress remains internal to the store and protocol. The daemon emits
+context, signatures, or raw private key material. Terminal evidence assembly remains internal to the store and protocol. The daemon emits
 only the safe lifecycle and execution observations defined by `arena0-api`.
 
 The Unix API uses its own safe event DTOs. `DaemonInfo.host` and each

@@ -15,10 +15,6 @@ const _: () = assert!(ABORT_OCCURRENCE_DOMAIN.len() == 24);
 /// Version of the portable abort occurrence contract.
 pub const ABORT_OCCURRENCE_VERSION: u16 = 1;
 
-/// Domain separator for the stable digest of an abort occurrence's signed
-/// semantic content. The Ed25519 signature itself is intentionally excluded.
-const ABORT_OCCURRENCE_DIGEST_DOMAIN: &[u8] = b"arena0/abort-occurrence-digest/v1";
-
 /// The terminal meaning authenticated by an [`AbortOccurrence`].
 ///
 /// The explicit tags are part of the version-1 wire and proof contract.
@@ -69,10 +65,7 @@ impl<'de> Deserialize<'de> for AbortKind {
 /// A portable, signed abort/failure occurrence.
 ///
 /// The signature covers every field except itself, including the session,
-/// sender, terminal kind/code/reason, and exact public chain coordinate.  A
-/// stream generation is intentionally absent: Phase 1 has no independent
-/// portable stream-generation authority, so inventing one would weaken the
-/// contract rather than bind it.
+/// sender, terminal kind/code/reason, and exact agreed chain coordinate.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, BorshSerialize)]
 pub struct AbortOccurrence {
     domain: [u8; 24],
@@ -226,7 +219,7 @@ impl AbortOccurrence {
         &self.reason
     }
 
-    /// Borrow the exact public chain coordinate.
+    /// Borrow the exact agreed chain coordinate.
     #[must_use]
     pub const fn coordinate(&self) -> &StepCursor {
         &self.coordinate
@@ -251,15 +244,6 @@ impl AbortOccurrence {
             coordinate: &self.coordinate,
         })
         .map_err(|error| ProtocolError::Serialization(error.to_string()))
-    }
-
-    /// Return a stable digest of the signed semantic content (excluding the
-    /// signature bytes themselves).
-    pub fn digest(&self) -> Result<[u8; 32], ProtocolError> {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(ABORT_OCCURRENCE_DIGEST_DOMAIN);
-        hasher.update(&self.signing_bytes()?);
-        Ok(*hasher.finalize().as_bytes())
     }
 
     /// Verify the Ed25519 signature against the sender's public identity key.

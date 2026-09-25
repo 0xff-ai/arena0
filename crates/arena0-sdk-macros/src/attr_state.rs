@@ -9,7 +9,6 @@ use crate::util::to_pascal_case;
 // Every method name on `arena0::Ctx`, across all modes. Keep in sync with context.rs.
 const RESERVED_PRIMITIVE_ACCESSORS: &[&str] = &[
     "__apply_transition",
-    "__committed_ensemble",
     "__into_parts",
     "__new",
     "__primitive_field",

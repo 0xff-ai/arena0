@@ -20,7 +20,7 @@ pub struct LightVerified {
     pub terminal: LightVerifiedTerminal,
 }
 
-/// The terminal proof evidence accepted by light verification.
+/// The terminal evidence accepted by light verification.
 ///
 /// Light verification authenticates the opaque Borsh outcome but cannot run the
 /// guest to produce its JSON projection. A stopped result never carries an
@@ -29,7 +29,7 @@ pub struct LightVerified {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LightVerifiedTerminal {
-    /// The final public entry carries one successful `SessionEnd` effect.
+    /// The final certified entry carries a `SessionEnd` terminal.
     Completed {
         /// Opaque stock-Borsh outcome bytes authenticated by the terminal.
         outcome_borsh: Vec<u8>,

@@ -306,8 +306,8 @@ and uses the same terminal observatory for multiparty execution tables,
 guest-owned textual views, activity, and public agreement. The monitor can
 answer the current open callout through the existing Host submission boundary;
 the answer must name its exact `PendingId`. Competing stale answers receive
-`CalloutNotPending`, and a resubmission while the answer is staged receives
-`AgreementPending`. Adapter activity has its own bounded operational stream,
+`CalloutNotPending`, and a resubmission while the answer is staged waits for
+agreement and then receives `CalloutNotPending`. Adapter activity has its own bounded operational stream,
 separate from semantic Host events.
 
 ## Fixed Phase 1 constraints

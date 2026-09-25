@@ -12,17 +12,18 @@
 //! authenticated message to shared state during the current dispatch.
 //! [`commit_with_salt`](crate::commit_reveal::CommitReveal::commit_with_salt)
 //! and [`take_reveal`](crate::commit_reveal::CommitReveal::take_reveal) update
-//! the participant-local companion while the enclosing `Context` can update
-//! shared state in the same accepted event. A broadcast is delivered to other
-//! participants; the producer does not apply its own message a second time.
+//! only the participant-local companion and return a message to broadcast.
+//! Shared state changes when that message is applied through `handle` in
+//! `on_message`, which the author runs for its own message exactly as every
+//! receiver does.
 //!
 //! Program usage:
 //! ```ignore
-//! // any mutating handler: stash the secret, update shared state, and broadcast
-//! ctx.commit_reveal().commit(value)?.broadcast_via(Message::CommitReveal);
+//! // on_input: stash the secret locally and broadcast the commit
+//! ctx.commit_reveal().commit(value)?.broadcast(&mut ctx.effects())?;
 //! // once all commits are in, broadcast the reveal
 //! if let Some(reveal) = ctx.commit_reveal().take_reveal() {
-//!     reveal.broadcast_via(Message::CommitReveal);
+//!     reveal.broadcast(&mut ctx.effects());
 //! }
 //! // an incoming message applies the round for the authenticated sender
 //! ctx.commit_reveal().handle(from, msg)?;

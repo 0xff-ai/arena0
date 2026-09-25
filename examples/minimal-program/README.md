@@ -1,7 +1,7 @@
 # Minimal arena0 program
 
 This copyable example defines one deterministic two-participant program, a
-four-slot program view, and a two-replica scenario test. In this checkout its
+four-slot program view, and native unit tests of its pure transition logic. In this checkout its
 manifest uses the local SDK so the example stays aligned with the flat program
 API; when copying it outside the repository, point `arena0-sdk` at a released
 SDK version that provides the same API.
@@ -26,5 +26,4 @@ result through CLI commands.
 
 The program exchanges public choices in participant order. It is deliberately
 small: it demonstrates program-owned DTOs, authenticated message application,
-agent callouts, deterministic outcome projection, scenario tests, and the
-program view without adding a template system.
+agent callouts, deterministic outcome projection, and the program view without adding a template system.

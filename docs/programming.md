@@ -112,8 +112,9 @@ projection, not an alternate execution format or part of the signed commitment.
 ## Effects and capabilities
 
 Request runtime work through the explicit `SessionEnd`, `SessionAbort`, `Fail`,
-`Broadcast`, and `SetTimer` effects. Any event callback may emit those effects,
-and the runtime performs permitted effects after accepting the corresponding
+`Broadcast`, and `SetTimer` effects. Agreed handlers may emit any of them;
+local handlers (`on_input`, `on_timer`) may emit only `Broadcast` and
+`SetTimer`, and the runtime performs permitted effects after accepting the corresponding
 execution work. Programs have no ambient access to the network, filesystem,
 credentials, or clock. Callouts are state projections and signing is a
 synchronous host call; neither is an effect. `SetTimer` carries a typed

@@ -187,8 +187,7 @@ impl ExecutionHandle {
         }
     }
 
-    /// Wait for and project the next durable agent-facing event. Signing
-    /// continuations remain internal to the actor and are never projected.
+    /// Wait for and project the next durable agent-facing event.
     pub(crate) async fn next(&self, schema: &ProgramSchema) -> Result<NextEvent, ApiError> {
         loop {
             let notified = self.changed.notified();
@@ -656,11 +655,11 @@ impl Supervisor {
         }
     }
 
-    async fn handle_message(&mut self, message: SessionMessage) -> bool {
+    async fn handle_message(&mut self, message: SessionMessage) {
         match message {
             SessionMessage::SessionStarted { .. } => {
                 let Ok(Some(state)) = self.entry.execution().await else {
-                    return false;
+                    return;
                 };
                 let source = EventSource::Session {
                     peer_id: self.entry.store.host_id(),
@@ -686,13 +685,13 @@ impl Supervisor {
                     .read_trace(self.entry.exec_id, step, step.saturating_add(1))
                     .await
                 else {
-                    return false;
+                    return;
                 };
                 let Some(entry) = entries.into_iter().next() else {
-                    return false;
+                    return;
                 };
                 let Ok(Some(state)) = self.entry.execution().await else {
-                    return false;
+                    return;
                 };
                 let source = EventSource::Session {
                     peer_id: self.entry.store.host_id(),
@@ -748,7 +747,6 @@ impl Supervisor {
                         .and_then(|json| serde_json::from_slice(json).ok());
                     self.events
                         .emit(HostEvent::SessionCompleted { source, outcome });
-                    return true;
                 }
             }
             SessionMessage::Aborted { .. } => {
@@ -776,7 +774,6 @@ impl Supervisor {
                                 arena0_protocol::ExecutionFailureCode::Runtime
                             },
                         });
-                        return true;
                     }
                 }
             }
@@ -799,12 +796,10 @@ impl Supervisor {
                             failure: arena0_protocol::ExecutionFailureCode::Runtime,
                         });
                     }
-                    return state.lifecycle().is_terminal();
                 }
             }
             SessionMessage::ReceiptPublished { .. } => {}
         }
-        false
     }
 
     async fn project_callout(

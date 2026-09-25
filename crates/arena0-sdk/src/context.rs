@@ -198,14 +198,6 @@ impl<Shared, Local, M: Mode> Ctx<Shared, Local, M> {
         self.committed_ensemble = Some(ensemble);
     }
 
-    /// The confirmed session ensemble, or `None` before a session starts. The
-    /// dispatch glue uses this to resolve a message sender to its participant.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn __committed_ensemble(&self) -> Option<&Ensemble<Committed>> {
-        self.committed_ensemble.as_ref()
-    }
-
     #[doc(hidden)]
     pub fn __into_parts(self) -> (Shared, Local) {
         (self.shared, self.local)
@@ -324,8 +316,8 @@ impl<Shared, Local, M: Mode> Ctx<Shared, Local, M> {
     /// Resolve a session participant to its transport identity.
     ///
     /// The committed ensemble is authoritative for N-party sessions. The
-    /// bilateral fallback keeps this convenience usable while a session is
-    /// being assembled in native tests.
+    /// bilateral fallback applies only before a committed ensemble is
+    /// installed.
     pub fn peer_for(&self, participant: Participant) -> PeerId {
         if let Some(ensemble) = self.committed_ensemble.as_ref() {
             return ensemble
@@ -399,8 +391,8 @@ impl<Shared, Local, M: EffectMode> Ctx<Shared, Local, M> {
 
     /// Emit an informational local diagnostic log.
     ///
-    /// Logs are local telemetry, not protocol effects. They are useful in
-    /// native tests and dev tooling, but they are not part of transition,
+    /// Logs are local telemetry, not protocol effects. They are useful in dev
+    /// tooling, but they are not part of transition,
     /// effect, or shared-state convergence.
     pub fn log(&mut self, msg: &str) {
         self.log_level(LogLevel::Info, msg);
@@ -507,8 +499,7 @@ impl<Shared, Local> Ctx<Shared, Local, AgreedMode> {
     /// Only the dispatch of an agreed event may build this context. Its
     /// effect handle emits with agreed semantics, so a context built inside a
     /// callout or local handler would let that handler broadcast outside its
-    /// mode. Generated dispatch glue and the native dispatch harness meet
-    /// this precondition.
+    /// mode. Generated dispatch glue meets this precondition.
     #[doc(hidden)]
     pub unsafe fn __new(shared: Shared, local: Local, peer_id: PeerId) -> Self {
         Self {
@@ -566,8 +557,7 @@ impl<Shared, Local> Ctx<Shared, Local, LocalMode> {
     /// Host will compare against. `callout` derives from the shared image, so
     /// passing any other value would let a local handler expose a replacement
     /// view to `callout`, influencing a callout from state the Host never
-    /// commits. Generated dispatch glue and the native dispatch harness meet
-    /// this precondition; a test may deliberately violate it only to exercise
+    /// commits. Generated dispatch glue meets this precondition; a test may deliberately violate it only to exercise
     /// the byte guard that rejects the resulting dispatch.
     #[doc(hidden)]
     pub unsafe fn __new(shared: Shared, local: Local, peer_id: PeerId) -> Self {
@@ -643,8 +633,7 @@ pub struct Signed {
 /// Primitive message routing metadata.
 ///
 /// Generated primitive accessors use a zero-sized route type to wrap primitive
-/// messages in the program-level `Message` envelope before emitting a send
-/// effect. [`RawPrimitiveRoute`] is the escape hatch for primitives that already
+/// messages in the program-level `Message` envelope before broadcasting them. [`RawPrimitiveRoute`] is the escape hatch for primitives that already
 /// produce the final wire message.
 pub trait PrimitiveRoute<T> {
     type Message: BorshSerialize;
@@ -680,9 +669,8 @@ pub struct PrimitiveOutput<T, Route = RawPrimitiveRoute> {
 
 /// Batch of detached primitive outputs that share a flush boundary.
 ///
-/// A dispatch may emit at most one broadcast. Keep a batch only when selecting
-/// one output or inspecting several; [`Self::broadcast`] and
-/// [`Self::broadcast_via`] reject multi-output batches before emitting anything.
+/// [`Self::broadcast`] and [`Self::broadcast_via`] broadcast every output in
+/// the batch, in order, through the enclosing context's effect handle.
 #[derive(Debug, Clone, Default)]
 #[must_use = "primitive output batches must be sent or intentionally dropped"]
 pub struct PrimitiveOutputs<T, Route = RawPrimitiveRoute> {

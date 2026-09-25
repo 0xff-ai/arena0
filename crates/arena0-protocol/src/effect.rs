@@ -72,27 +72,6 @@ pub enum LogLevel {
     Error,
 }
 
-/// Why a peer was disconnected from a session.
-#[derive(
-    Serialize,
-    Deserialize,
-    BorshSerialize,
-    BorshDeserialize,
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-)]
-pub enum DisconnectReason {
-    Normal,
-    Timeout,
-    ProtocolError,
-    ConnectionLost,
-    Kicked,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

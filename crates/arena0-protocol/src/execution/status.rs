@@ -98,13 +98,9 @@ impl StopCause {
         match self {
             Self::Authenticated(occurrence) => occurrence.validate_shape(),
             Self::Shared {
-                kind,
-                commitment,
-                reason,
+                commitment, reason, ..
             } => {
-                if (*kind != AbortKind::Abort && *kind != AbortKind::Fail)
-                    || commitment.domain != crate::STEP_COMMIT_DOMAIN
-                {
+                if commitment.domain != crate::STEP_COMMIT_DOMAIN {
                     return Err(ProtocolError::InvalidTerminalStatus);
                 }
                 ensure_reason(reason)

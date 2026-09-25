@@ -46,10 +46,6 @@ pub const ABORT_KIND_FAIL: u8 = 0x01;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
 pub struct SessionHashBytes(pub [u8; 32]);
 
-/// A fixed-width raw message identity in a wire frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
-pub struct MessageIdBytes(pub [u8; 32]);
-
 /// A fixed-width raw shared-state hash in a wire frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
 pub struct StateHashBytes(pub [u8; 32]);

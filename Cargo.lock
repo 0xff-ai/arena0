@@ -407,13 +407,11 @@ dependencies = [
  "arena0-test-engine",
  "arena0-transport",
  "arena0-verify",
- "blake3",
  "borsh",
  "hex",
  "serde_json",
  "tempfile",
  "tokio",
- "tracing",
  "tracing-subscriber",
  "wat",
 ]

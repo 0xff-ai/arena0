@@ -186,7 +186,7 @@ pub(crate) fn lifecycle_tag(lifecycle: ExecLifecycle) -> i64 {
 
 pub(crate) fn bounded_reason(reason: String) -> Result<String, StoreError> {
     if reason.len() > MAX_ERROR_BYTES {
-        return Err(StoreError::CommandTooLarge {
+        return Err(StoreError::PayloadTooLarge {
             required: reason.len(),
             capacity: MAX_ERROR_BYTES,
         });
@@ -197,12 +197,12 @@ pub(crate) fn bounded_reason(reason: String) -> Result<String, StoreError> {
 pub(crate) fn account_response(current: &mut usize, additional: usize) -> Result<(), StoreError> {
     let next = current
         .checked_add(additional)
-        .ok_or(StoreError::CommandTooLarge {
+        .ok_or(StoreError::PayloadTooLarge {
             required: usize::MAX,
             capacity: MAX_RESPONSE_BYTES,
         })?;
     if next > MAX_RESPONSE_BYTES {
-        return Err(StoreError::CommandTooLarge {
+        return Err(StoreError::PayloadTooLarge {
             required: next,
             capacity: MAX_RESPONSE_BYTES,
         });

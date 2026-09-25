@@ -168,18 +168,6 @@ pub enum ProtocolError {
     /// An authored message is not the head of the durable outgoing queue.
     #[error("authored message is not the head of the outgoing queue")]
     NotQueuedMessage,
-    /// A timer firing did not match an active timer identity.
-    #[error("timer firing does not match an active timer")]
-    StaleTimerFiring,
-    /// A timer deadline overflowed the supplied deterministic base time.
-    #[error("timer deadline overflowed")]
-    TimerDeadlineOverflow,
-    /// An active timer set is not canonical.
-    #[error("active timer set is not canonical")]
-    TimerSetNotCanonical,
-    /// The active timer count exceeded its bound.
-    #[error("active timer set has {actual} entries; maximum is {max}")]
-    TooManyTimers { actual: usize, max: usize },
     /// A bounded opaque payload exceeded its limit.
     #[error("{kind} is {actual} bytes; maximum is {max}")]
     PayloadTooLarge {

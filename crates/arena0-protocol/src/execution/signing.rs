@@ -14,7 +14,7 @@ use super::{MAX_EFFECT_PAYLOAD_BYTES, ProtocolError, ensure_payload};
 /// Versioned, execution-bound preimage presented to a local signer for one
 /// guest signing call. The guest payload is data inside this contract, never
 /// the protocol message itself, so it cannot be used as a signing oracle for
-/// step, terminal, activation, or receipt commitments.
+/// step, activation, or receipt commitments.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, BorshSerialize)]
 pub struct GuestSignData {
     domain: [u8; 24],

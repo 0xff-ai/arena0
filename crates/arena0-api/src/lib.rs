@@ -21,7 +21,7 @@ mod response;
 
 pub use activity::{ActivityData, ActivityFrame, ActivityResult};
 pub use arena0_protocol::{
-    ColorDepth, ExecLifecycle, NegotiationTarget, PendingId, ReceiptArtifact, TerminalResult, View,
+    ColorDepth, ExecLifecycle, NegotiationTarget, PendingId, ReceiptArtifact, View,
 };
 pub use events::{
     EventData, EventFilter, EventFrame, ExecOrigin, ExecutionFailureKind, NegotiationStage,
@@ -384,13 +384,6 @@ mod tests {
 
     #[test]
     fn public_terminal_json_contains_only_agent_values() {
-        let terminal = TerminalResult::Completed {
-            outcome: Some(serde_json::json!({"winner": "Rock"})),
-        };
-        let json = serde_json::to_value(terminal).unwrap();
-        assert_eq!(json["Completed"]["outcome"]["winner"], "Rock");
-        assert!(json["Completed"].get("outcome_raw").is_none());
-
         let verified = LightVerifiedTerminal::Completed {
             outcome_borsh: vec![0],
         };

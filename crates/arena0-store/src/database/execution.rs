@@ -127,62 +127,6 @@ impl Database {
         self.load_execution_in_transaction(execution_id)
     }
 
-    pub(crate) fn load_execution_by_session(
-        &mut self,
-        session_id: SessionHash,
-    ) -> Result<Option<ExecutionState>, StoreError> {
-        let Some(bytes) = self
-            .connection
-            .query_row(
-                "SELECT execution_id FROM executions WHERE session_id = ?1",
-                params![session_id.0.to_vec()],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?
-        else {
-            return Ok(None);
-        };
-        self.load_execution(ExecId(array32(&bytes, "execution id")?))
-    }
-
-    pub(crate) fn list_activations(
-        &mut self,
-        limit: usize,
-    ) -> Result<Vec<ActivationRecord>, StoreError> {
-        let limit = i64::try_from(limit)
-            .map_err(|_| StoreError::InvalidConfiguration("activation limit is too large"))?;
-        let mut statement = self.connection.prepare(
-            "SELECT execution_id FROM activation_records
-             ORDER BY execution_id LIMIT ?1",
-        )?;
-        let mut rows = statement.query(params![limit])?;
-        let mut ids = Vec::new();
-        while let Some(row) = rows.next()? {
-            ids.push(ExecId(array32(
-                &row.get::<_, Vec<u8>>(0)?,
-                "activation execution id",
-            )?));
-        }
-        drop(rows);
-        drop(statement);
-        let mut response_bytes = 0;
-        ids.into_iter()
-            .map(|id| {
-                let activation = self.load_activation(id)?.ok_or_else(|| {
-                    StoreError::Corruption("activation disappeared while listing".into())
-                })?;
-                account_response(
-                    &mut response_bytes,
-                    prepared_activation_bytes(activation.prepared())?.len(),
-                )?;
-                if let Some(committed) = activation.activation() {
-                    account_response(&mut response_bytes, activation_bytes(committed)?.len())?;
-                }
-                Ok(activation)
-            })
-            .collect()
-    }
-
     pub(crate) fn list_executions(
         &mut self,
         limit: usize,
@@ -410,7 +354,6 @@ impl Database {
                         next.version(),
                         &indexed_effects(&effects)?,
                         now_ms,
-                        &next,
                     )?;
                 }
                 if let Some(timer_id) = timer_id {
@@ -419,13 +362,7 @@ impl Database {
             }
             Change::StepSignature { certified } => {
                 if let Some(proposal) = certified.as_ref() {
-                    self.commit_staged_event(
-                        execution_id,
-                        proposal,
-                        next.version(),
-                        now_ms,
-                        &next,
-                    )?;
+                    self.commit_staged_event(execution_id, proposal, next.version(), now_ms)?;
                 }
             }
             Change::Stop | Change::End | Change::DropOutgoing => {}
@@ -738,7 +675,6 @@ impl Database {
         proposal: &arena0_protocol::SharedProposal,
         version: ExecutionVersion,
         now_ms: u64,
-        state: &ExecutionState,
     ) -> Result<(), StoreError> {
         let release_effects = proposal.effects().to_vec();
         let event_exists = self
@@ -770,7 +706,6 @@ impl Database {
             version,
             &release_effects,
             now_ms,
-            state,
         )?;
         Ok(())
     }
@@ -969,7 +904,7 @@ fn indexed_effects(effects: &[Effect]) -> Result<Vec<(u32, Effect)>, StoreError>
         .enumerate()
         .map(|(index, effect)| {
             Ok((
-                u32::try_from(index).map_err(|_| StoreError::CommandTooLarge {
+                u32::try_from(index).map_err(|_| StoreError::PayloadTooLarge {
                     required: index,
                     capacity: u32::MAX as usize,
                 })?,

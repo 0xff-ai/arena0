@@ -4,10 +4,8 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
+use crate::SessionHash;
 use crate::negotiation::Activation;
-use arena0_crypto::BlsPublicKey;
-
-use crate::{PeerId, SessionHash};
 use arena0_program::ProgramHash;
 
 /// Proof-bearing terminal evidence carried by a portable receipt header.
@@ -22,17 +20,6 @@ pub enum ReceiptTermination {
     Completed,
     /// An authenticated abort/failure occurrence or certified shared stop.
     Stopped { cause: crate::execution::StopCause },
-}
-
-impl ReceiptTermination {
-    /// Return the stopping evidence, if this receipt was stopped.
-    #[must_use]
-    pub const fn stopped(&self) -> Option<&crate::execution::StopCause> {
-        match self {
-            Self::Completed => None,
-            Self::Stopped { cause } => Some(cause),
-        }
-    }
 }
 
 /// A self-describing label for a session trace: which program produced it, under
@@ -72,34 +59,5 @@ impl SessionHeader {
     #[must_use]
     pub fn session_hash(&self) -> SessionHash {
         self.activation.session_hash()
-    }
-
-    /// Participant per-session BLS public keys in committed (participant) order, the
-    /// order the signer bitmaps index into and the aggregates verify against.
-    ///
-    /// The committed participant order is the ensemble order: peers sorted by
-    /// `PeerId`. The activation's tickets are in frozen (creator-first) order,
-    /// so the keys are sorted here to match the bitmaps the execution records
-    /// against the sorted ensemble.
-    #[must_use]
-    pub fn participant_keys(&self) -> Vec<BlsPublicKey> {
-        let mut tickets = self.activation.tickets().to_vec();
-        tickets.sort_by_key(|ticket| ticket.data.signer);
-        tickets
-            .iter()
-            .map(|ticket| match &ticket.data.action {
-                crate::TicketAction::Active { execution_bls, .. } => *execution_bls,
-                crate::TicketAction::Withdrawn => unreachable!("activation tickets are Active"),
-            })
-            .collect()
-    }
-
-    /// The ensemble as `PeerId`s in committed (participant) order: sorted by
-    /// `PeerId`, matching the order the signer bitmaps index into.
-    #[must_use]
-    pub fn ensemble(&self) -> Vec<PeerId> {
-        let mut tickets = self.activation.tickets().to_vec();
-        tickets.sort_by_key(|ticket| ticket.data.signer);
-        tickets.iter().map(|ticket| ticket.data.signer).collect()
     }
 }

@@ -156,10 +156,6 @@ CREATE TABLE active_timers (
     FOREIGN KEY (execution_id) REFERENCES executions(execution_id)
 ) STRICT;
 
-CREATE INDEX event_records_position
-    ON event_records (execution_id, event_position);
-CREATE INDEX agreed_steps_position
-    ON agreed_steps (execution_id, step);
 
 CREATE INDEX agreed_steps_origin
     ON agreed_steps (execution_id, origin_event_position, step);

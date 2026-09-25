@@ -44,9 +44,11 @@ program still determines when that bid may be committed or revealed.
 
 Shared state contains the facts participants must agree on. Local state holds
 information used by one participant, such as an unrevealed bid and its salt.
-The program receives both through one dispatch context: any event may mutate
-shared state, local state, or both, and may emit any existing `Effect`. Local
-state does not enter public state commitments. The program determines when
+The program receives both through one dispatch context. Agreed events
+(`SessionStarted`, `MessageReceived`) may mutate both states and emit any
+`Effect`; local events (`InputReceived`, `TimerFired`) see shared state
+read-only, may not emit lifecycle effects, and may sign. Local state does not
+enter public state commitments. The program determines when
 information is disclosed and which public transitions accept it.
 
 This separation lets participants keep private strategies while checking the

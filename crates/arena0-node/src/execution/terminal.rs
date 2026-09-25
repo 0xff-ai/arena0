@@ -50,13 +50,12 @@ impl ExecutionActor {
         kind: AbortKind,
         code: u32,
         reason: String,
-    ) -> Result<bool, ExecError> {
+    ) -> Result<(), ExecError> {
         if self.state.status().is_terminal() {
-            return Ok(false);
+            return Ok(());
         }
         let next = stopped_state(&self.state, &self.context.identity, kind, code, reason)?;
-        self.persist(next, Change::Stop).await?;
-        Ok(true)
+        self.persist(next, Change::Stop).await
     }
 
     pub(super) async fn finalize_receipt(&mut self) -> Result<(), ExecError> {

@@ -26,7 +26,6 @@ pub mod peer;
 pub mod session;
 pub mod state;
 pub mod system_event;
-pub mod terminal;
 pub mod timer;
 pub mod topic;
 pub mod trace;
@@ -48,7 +47,7 @@ pub use arena0_program::{
 pub use state::Hash as StateHash;
 pub use topic::Hash as TopicHash;
 
-pub use effect::{DisconnectReason, Effect, LogLevel};
+pub use effect::{Effect, LogLevel};
 pub use event::Event;
 pub use exec::ExecLifecycle;
 pub use exec_frame::{ExecFrame, ExecFrameError};
@@ -60,7 +59,7 @@ pub use execution::{
     MAX_TIMER_PAYLOAD_BYTES, MAX_TRACE_ENTRY_BYTES, OpenCallout, ParticipantStepSignature,
     PendingId, PendingIdParseError, ProtocolError, Receipt, ReceiptArtifact, ReceiptBody,
     ReceiptId, ReceiptKind, ReceiptWork, SharedProposal, StepCertificate, StepCursor, StopCause,
-    StopReport, TerminalOutcome, TimerFiring, TimerId, pending_id,
+    StopReport, TerminalOutcome, TimerId, pending_id,
 };
 pub use fetch_frame::{FetchFrame, FetchFrameError};
 pub use id::IdParseError;
@@ -83,7 +82,6 @@ pub use system_event::{
     EventSource, ExecCreationOrigin, ExecutionEvent, ExecutionFailureCode, NegotiationEvent,
     NegotiationStage, SystemEvent, TerminalKind,
 };
-pub use terminal::TerminalResult;
 pub use timer::{TimerPayload, TimerSpec};
 pub use trace::{
     AggregateAttestation, AttestationError, CHAIN_START, ReceiptTermination, STEP_COMMIT_DOMAIN,

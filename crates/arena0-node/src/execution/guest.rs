@@ -41,8 +41,8 @@ pub(super) enum DispatchSource {
 /// Classification for the agent-facing input command.
 ///
 /// A callout can become unavailable for an expected protocol reason (for
-/// example, a proposal froze the execution or another answer consumed the
-/// continuation), in which case the command reports the error and the actor
+/// example, a proposal froze the execution or another answer closed the
+/// callout), in which case the command reports the error and the actor
 /// remains live. An input-handler trap is also an expected input rejection;
 /// traps from other guest events, invalid durable state, and store failures
 /// remain fatal execution errors and return to `run` so its normal failure
@@ -113,8 +113,8 @@ impl GuestSigner for DispatchSigner {
 }
 
 impl ExecutionActor {
-    /// Submit the answer to the current callout continuation. A rejected
-    /// guest event leaves the continuation and both durable memories intact;
+    /// Submit the answer to the open callout. A rejected guest event leaves
+    /// the callout open and both durable memories intact;
     /// the command reports that rejection without taking the actor down.
     pub(super) async fn submit_input(
         &mut self,
@@ -237,10 +237,9 @@ impl ExecutionActor {
         Ok(())
     }
 
-    /// Apply one authenticated or locally generated message envelope. The
-    /// receiver checks both advertised frame hashes before it can sign the
-    /// resulting proposal. The producer retains its own broadcast as staged
-    /// state and sends it only to remote participants.
+    /// Apply one authenticated peer message frame. The receiver checks both
+    /// advertised frame hashes before it can sign the resulting proposal. The
+    /// Host's own messages go through `author_next_message` instead.
     pub(super) async fn apply_message(
         &mut self,
         source: arena0_protocol::PeerId,
@@ -423,7 +422,7 @@ impl ExecutionActor {
                 // missing instance means there is nothing to discard. Every
                 // other error leaves candidate state behind and must restore
                 // it. A discard failure drops the resident and masks the
-                // original error, exactly as the former per-site `?` did.
+                // original error.
                 if self.instance.is_some() {
                     self.discard_candidate()?;
                 }

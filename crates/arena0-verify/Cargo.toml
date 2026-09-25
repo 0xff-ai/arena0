@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Standalone light verification of arena0 session proofs"
+description = "Standalone light verification of arena0 session receipts"
 publish.workspace = true
 
 [dependencies]

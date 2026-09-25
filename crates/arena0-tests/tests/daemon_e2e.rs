@@ -2,7 +2,7 @@
 //! negotiation (one creator, one joiner), get driven through the shared Unix
 //! socket with JSON answers (no hex), and produce matching, verifiable receipts
 //! whose verify call returns the recovered portable evidence (program, ensemble,
-//! steps, and terminal proof).
+//! steps, and terminal evidence).
 
 mod common;
 

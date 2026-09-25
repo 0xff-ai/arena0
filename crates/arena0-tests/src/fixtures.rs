@@ -107,33 +107,6 @@ pub fn activation_for(
     Activation::new(prepared, aggregate).expect("valid activation")
 }
 
-/// The collective signature over the activation data signed only by the given
-/// participant indices (for consensus-gate tests: a partial aggregate fails
-/// verification against the complete ticket set).
-pub fn partial_aggregate(
-    cryptos: &[&NodeKeys],
-    activation: &Activation,
-    indices: &[usize],
-) -> BlsSignature {
-    let msg = activation.activation_data().signing_bytes();
-    let sigs: Vec<BlsSignature> = indices
-        .iter()
-        .map(|&i| execution_key(cryptos[i]).sign(&msg))
-        .collect();
-    BlsSignature::aggregate(&sigs).expect("aggregate")
-}
-
-pub fn session_bls_seed(seed: &[u8; 32]) -> [u8; 32] {
-    let mut preimage = seed.to_vec();
-    preimage.extend_from_slice(b"/arena0/session-bls");
-    *blake3::hash(&preimage).as_bytes()
-}
-
-/// The node identity for a test seed.
-pub fn session_crypto(seed: &[u8; 32]) -> NodeKeys {
-    NodeKeys::from_secret(SecretKey::from_bytes(*seed))
-}
-
 /// Agent JSON for `Params { target_size }`.
 pub fn encode_params(target_size: u32) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({ "target_size": target_size }))

@@ -26,7 +26,7 @@ use super::{
 /// staged before agreement. It keeps both state memories, the outgoing queue,
 /// and the post-agreement timer effects because agreement commits the
 /// dispatch atomically: a failed or incomplete agreement must not expose
-/// either memory or any deferred effect. `event_position` identifies the event
+/// either memory or any queued effect. `event_position` identifies the event
 /// that produced the result; it is independent of the agreed trace step.
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct SharedProposal {

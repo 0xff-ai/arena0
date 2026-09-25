@@ -47,7 +47,6 @@ impl Database {
         version: ExecutionVersion,
         effects: &[(u32, Effect)],
         now_ms: u64,
-        _state: &ExecutionState,
     ) -> Result<(), StoreError> {
         for (ordinal, effect) in effects {
             match effect {

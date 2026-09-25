@@ -195,13 +195,9 @@ mod tests {
         let bytes = serde_json::to_vec(&value).expect("string JSON encoding");
         let decoded: String = crate::__parse_input_data(&bytes).unwrap();
         assert_eq!(decoded, value);
-        assert_eq!(crate::__serialize_input_data(&value), bytes);
 
-        let input = CalloutFixture::from_raw(0, bytes.clone()).unwrap();
+        let input = CalloutFixture::from_raw(0, bytes).unwrap();
         let CalloutFixtureInput::Choose(answer) = input;
         assert_eq!(answer, value);
-
-        let encoded = CalloutFixture::to_event_data(&CalloutFixtureInput::Choose(value));
-        assert_eq!(encoded, (0, bytes));
     }
 }
