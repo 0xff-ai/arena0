@@ -50,7 +50,7 @@ pub use topic::Hash as TopicHash;
 pub use effect::{Effect, EffectKind, EffectSummary, LogLevel};
 pub use event::{Event, EventKind};
 pub use exec::ExecLifecycle;
-pub use exec_frame::ExecFrame;
+pub use exec_frame::{ExecFrame, MAX_EXEC_FRAME_BYTES};
 pub use execution::{
     ABORT_OCCURRENCE_DOMAIN, ABORT_OCCURRENCE_VERSION, AbortKind, AbortOccurrence, EndMatch,
     EndPhase, ExecutionBinding, ExecutionState, ExecutionStatus, ExecutionVersion,

@@ -413,7 +413,7 @@ mod tests {
         );
         assert_eq!(
             StreamProtocol::Exec.max_frame_body(),
-            DEFAULT_MAX_MESSAGE_SIZE
+            crate::MAX_EXEC_FRAME_BYTES
         );
     }
 }

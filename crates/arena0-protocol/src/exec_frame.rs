@@ -26,6 +26,15 @@ const EXEC_KIND_ABORT: u8 = 0x02;
 const EXEC_KIND_STEP_CERTIFICATE: u8 = 0x03;
 /// Maximum signer bitmap size for the protocol's participant bound.
 const MAX_EXEC_SIGNER_BYTES: usize = crate::negotiation::MAX_PARTICIPANTS.div_ceil(8);
+/// Borsh size of a [`StepCommitment`]: domain, session, step, entry hash,
+/// pre/post state hashes, and chain link.
+const STEP_COMMITMENT_BYTES: usize = 24 + 32 + 8 + 32 + 32 + 32 + 32;
+/// The largest canonical frame body: a message with a maximal payload. Signature,
+/// certificate, and abort frames are bounded far below it. The exec stream's
+/// transport cap is exactly this bound.
+pub const MAX_EXEC_FRAME_BYTES: usize =
+    1 + STEP_COMMITMENT_BYTES + size_of::<u32>() + MAX_EFFECT_PAYLOAD_BYTES;
+const _: () = assert!(MAX_EXEC_FRAME_BYTES == arena0_wire::MAX_EXEC_FRAME_BYTES);
 
 /// A validated execution fact used by protocol machinery.
 ///
@@ -286,6 +295,31 @@ mod tests {
                 frame
             );
         }
+    }
+
+    #[test]
+    fn largest_frames_fit_the_exec_stream_cap() {
+        let stream = Codec::new(arena0_wire::StreamProtocol::Exec.max_frame_body());
+        let message = ExecFrame::Message {
+            commitment: commitment(),
+            data: vec![0; MAX_EFFECT_PAYLOAD_BYTES],
+        };
+        assert_eq!(borsh::to_vec(&message).unwrap().len(), MAX_EXEC_FRAME_BYTES);
+        let encoded = stream.encode(&message).unwrap();
+        assert_eq!(stream.decode::<ExecFrame>(&encoded).unwrap(), message);
+        let abort = AbortOccurrence::new(
+            SessionHash([1; 32]),
+            crate::PeerId([2; 32]),
+            AbortKind::Fail,
+            1,
+            "x".repeat(crate::MAX_TERMINAL_REASON_BYTES),
+            crate::StepCursor::new(3, StateHash([4; 32]), [5; 32]),
+            Ed25519Signature([6; 64]),
+        )
+        .unwrap();
+        let abort = ExecFrame::Abort { occurrence: abort };
+        assert!(borsh::to_vec(&abort).unwrap().len() < MAX_EXEC_FRAME_BYTES);
+        stream.encode(&abort).unwrap();
     }
 
     #[test]

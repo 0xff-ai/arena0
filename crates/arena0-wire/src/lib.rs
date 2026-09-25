@@ -29,7 +29,7 @@ pub use fetch::{
     FETCH_KIND_REQUEST, FETCH_KIND_RESPONSE, FetchFrame, MAX_FETCH_RESPONSE_BYTES,
     MAX_FETCH_TICKET_BYTES, MAX_FETCH_TICKETS, SessionHashBytes,
 };
-pub use stream::{PROTO_EXEC, PROTO_FETCH, StreamProtocol};
+pub use stream::{MAX_EXEC_FRAME_BYTES, PROTO_EXEC, PROTO_FETCH, StreamProtocol};
 
 /// Write length-prefixed bytes, reporting an over-bound value as a typed
 /// [`WireError::ValueTooLarge`] naming `field`.

@@ -6,6 +6,11 @@ use crate::WireError;
 pub const PROTO_FETCH: u8 = 0x01;
 /// The committed-execution stream discriminator.
 pub const PROTO_EXEC: u8 = 0x02;
+/// Maximum encoded body bytes in one execution frame: the protocol's largest
+/// frame, a message carrying a maximal payload (kind, commitment, length, and
+/// 64 KiB of data). `arena0-protocol` derives this value from its own bounds
+/// and asserts the equality at compile time.
+pub const MAX_EXEC_FRAME_BYTES: usize = 1 + 192 + 4 + 64 * 1024;
 
 /// Which multiplexed protocol a stream carries.
 ///
@@ -44,7 +49,7 @@ impl StreamProtocol {
     pub const fn max_frame_body(self) -> usize {
         match self {
             Self::Fetch => super::fetch::MAX_FETCH_RESPONSE_BYTES,
-            Self::Exec => super::DEFAULT_MAX_MESSAGE_SIZE,
+            Self::Exec => MAX_EXEC_FRAME_BYTES,
         }
     }
 }
