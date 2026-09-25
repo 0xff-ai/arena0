@@ -2,16 +2,17 @@
 
 use crate::call::DispatchKind;
 use arena0_program::{
-    CallStatus, DispatchInput, DispatchOutput, InitInput, LocalStateBytes, OutcomeInput,
+    CallStatus, DispatchInput, DispatchOutput, InitInput, JsonBytes, LocalStateBytes, OutcomeInput,
     OutcomeOutput, QueryInput, QueryOutput, SharedStateBytes, ViewInput, ViewOutput, WriterInput,
     WriterOutput, abi,
 };
+use arena0_protocol::{Committed, Ensemble};
 use borsh::{BorshDeserialize, BorshSerialize};
 use wasmtime::{Global, Instance, Memory, Store, StoreLimitsBuilder, Val};
 
 use super::memory::Guest;
 use super::{CallInstance, CallKind, InstanceConfig, instantiate_module, max_output};
-use crate::call::{DispatchCall, InitializeCall, OutcomeCall, QueryCall, ViewCall, WriterCall};
+use crate::call::{DispatchCall, serialize};
 use crate::finalize::MUTABLE_GLOBAL_EXPORT_PREFIX;
 use crate::{
     CallObservations, DispatchCallResult, GuestOutcomeResult, GuestProjectionResult,
@@ -20,8 +21,9 @@ use crate::{
 
 impl super::LoadedProgram {
     /// Execute initialization in a fresh guest instance.
-    pub fn initialize(&self, call: InitializeCall) -> Result<InitializedState, SandboxError> {
-        let input = call.into_input()?;
+    pub fn initialize(&self, params: JsonBytes) -> Result<InitializedState, SandboxError> {
+        let input = InitInput::try_new(params.into_bytes())
+            .map_err(|error| SandboxError::input_limit(error.to_string()))?;
         let (output, observations) = self.invoke::<InitInput, arena0_program::InitializedState>(
             CallKind::Initialize,
             DispatchKind::Local,
@@ -121,16 +123,22 @@ impl super::LoadedProgram {
         Ok(resident)
     }
 
-    /// Execute one read-only query in a fresh guest instance.
-    pub fn writer(&self, call: WriterCall) -> Result<GuestWriterResult, SandboxError> {
-        let participant_count = call.session.len();
-        let input = call.into_input();
+    /// Execute the pure next-writer projection in a fresh guest instance.
+    pub fn writer(
+        &self,
+        shared: &SharedStateBytes,
+        session: &Ensemble<Committed>,
+    ) -> Result<GuestWriterResult, SandboxError> {
+        self.validate_shared_state(shared)?;
+        let participant_count = session.len();
+        let input = WriterInput {
+            shared: shared.clone(),
+        };
         let (output, fuel_used) = self.project::<WriterInput, WriterOutput>(
             CallKind::Writer,
             abi::exports::WRITER,
             "writer",
             input,
-            |input: &WriterInput| &input.shared,
         )?;
         let writer = output.participant.map(arena0_protocol::Participant::new);
         if writer.is_some_and(|participant| participant.index() >= participant_count) {
@@ -141,29 +149,39 @@ impl super::LoadedProgram {
         Ok(GuestWriterResult { writer, fuel_used })
     }
 
-    /// Execute one read-only query in a fresh guest instance.
-    pub fn query(&self, call: QueryCall) -> Result<GuestProjectionResult, SandboxError> {
+    /// Execute one read-only query in a fresh guest instance. `query_index`
+    /// selects the advertised query schema.
+    pub fn query(
+        &self,
+        shared: &SharedStateBytes,
+        session: &Ensemble<Committed>,
+        query_index: u32,
+        query: JsonBytes,
+    ) -> Result<GuestProjectionResult, SandboxError> {
         let schema = self
             .program
             .definition()
             .schema
             .queries
-            .get(call.query_index as usize)
+            .get(query_index as usize)
             .ok_or_else(|| {
                 SandboxError::DeserializationFailed(format!(
-                    "query index {} is not advertised",
-                    call.query_index
+                    "query index {query_index} is not advertised",
                 ))
             })?;
-        let input = call.into_input()?;
-        self.validate_shared_state(&input.shared)?;
-        let query_index = input.query_index;
+        self.validate_shared_state(shared)?;
+        let input = QueryInput::try_new(
+            shared.clone(),
+            serialize(session)?,
+            query_index,
+            query.into_bytes(),
+        )
+        .map_err(|error| SandboxError::input_limit(error.to_string()))?;
         let (output, fuel_used) = self.project::<QueryInput, QueryOutput>(
             CallKind::Query,
             abi::exports::QUERY,
             "query",
             input,
-            |input: &QueryInput| &input.shared,
         )?;
         if output.query_index != query_index {
             return Err(SandboxError::DispatchFailed(
@@ -179,27 +197,38 @@ impl super::LoadedProgram {
     }
 
     /// Execute one read-only viewport projection in a fresh guest instance.
-    pub fn view(&self, call: ViewCall) -> Result<GuestProjectionResult, SandboxError> {
-        let input = call.into_input()?;
+    pub fn view(
+        &self,
+        shared: &SharedStateBytes,
+        session: &Ensemble<Committed>,
+        viewport: JsonBytes,
+    ) -> Result<GuestProjectionResult, SandboxError> {
+        self.validate_shared_state(shared)?;
+        let input = ViewInput::try_new(shared.clone(), serialize(session)?, viewport.into_bytes())
+            .map_err(|error| SandboxError::input_limit(error.to_string()))?;
         let (output, fuel_used) = self.project::<ViewInput, ViewOutput>(
             CallKind::View,
             abi::exports::VIEW,
             "view",
             input,
-            |input: &ViewInput| &input.shared,
         )?;
         projection_result(output.json, fuel_used, max_output(&self.profile), None)
     }
 
     /// Execute the pure terminal-outcome projection in a fresh guest instance.
-    pub fn outcome(&self, call: OutcomeCall) -> Result<GuestOutcomeResult, SandboxError> {
-        let input = call.into_input()?;
+    pub fn outcome(
+        &self,
+        shared: &SharedStateBytes,
+        session: &Ensemble<Committed>,
+    ) -> Result<GuestOutcomeResult, SandboxError> {
+        self.validate_shared_state(shared)?;
+        let input = OutcomeInput::try_new(shared.clone(), serialize(session)?)
+            .map_err(|error| SandboxError::input_limit(error.to_string()))?;
         let (output, fuel_used) = self.project::<OutcomeInput, OutcomeOutput>(
             CallKind::Outcome,
             abi::exports::OUTCOME,
             "outcome",
             input,
-            |input: &OutcomeInput| &input.shared,
         )?;
         outcome_result(
             output,
@@ -209,23 +238,19 @@ impl super::LoadedProgram {
         )
     }
 
-    /// Run one read-only projection: validate the shared state bound,
-    /// invoke the export in a fresh instance, and reject any guest effect.
-    /// This folds the validate/invoke/read-only triple the four fresh
-    /// projections share; each caller keeps only its result check.
+    /// Run one read-only projection in a fresh instance
+    /// and reject any guest effect. Callers validate the shared-state bound first.
     fn project<I, O>(
         &self,
         kind: CallKind,
         export: &str,
         operation: &str,
         input: I,
-        shared: impl FnOnce(&I) -> &SharedStateBytes,
     ) -> Result<(O, u64), SandboxError>
     where
         I: BorshSerialize,
         O: BorshDeserialize,
     {
-        self.validate_shared_state(shared(&input))?;
         let (output, observations) = self.invoke(kind, DispatchKind::Local, export, input)?;
         let fuel_used = observations.fuel_used;
         ensure_read_only(&observations, operation)?;

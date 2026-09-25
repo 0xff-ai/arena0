@@ -9,7 +9,7 @@ use arena0_protocol::{
     AbortKind, AbortOccurrence, ExecId, ExecLifecycle, ExecutionAdmission, ExecutionVersion,
     NegotiationId, PeerIdSource, StateHash,
 };
-use arena0_sandbox::{InitializeCall, Program};
+use arena0_sandbox::Program;
 use arena0_store::{RecoveryCursor, Store, StoreConfig};
 use arena0_test_engine::shared_test_engine;
 use arena0_tests::fixtures::{activation_for, execution_key, ordering_program_wasm, provider};
@@ -45,9 +45,7 @@ async fn recover_after(cut: CrashAfter) {
         let program = Program::try_from(wasm.clone()).expect("program");
         let loaded = shared_test_engine().load(&program).unwrap();
         let params = JsonBytes::try_new(br#"{}"#.to_vec()).unwrap();
-        let initialized = loaded
-            .initialize(InitializeCall::new(params.clone()))
-            .unwrap();
+        let initialized = loaded.initialize(params.clone()).unwrap();
         let exec_id = ExecId([0x73; 32]);
         let negotiation_id = NegotiationId([0x74; 32]);
         let activation = activation_for(

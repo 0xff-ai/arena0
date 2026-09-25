@@ -10,7 +10,7 @@ use std::sync::Arc;
 use arena0_protocol::{
     Committed, Ensemble, ExecLifecycle, ExecutionState, PeerIdSource, ReceiptWork, TicketAction,
 };
-use arena0_sandbox::{InitializeCall, ProgramInstance};
+use arena0_sandbox::ProgramInstance;
 use arena0_store::{Change, TransitionRecord};
 use arena0_transport::RecvHandle;
 use tokio::sync::mpsc;
@@ -355,9 +355,7 @@ impl ExecutionActor {
             }
             return Ok(state);
         }
-        let initialized = context
-            .program
-            .initialize(InitializeCall::new(context.params.clone()))?;
+        let initialized = context.program.initialize(context.params.clone())?;
         context
             .store
             .create_execution(

@@ -22,7 +22,7 @@ use arena0_protocol::{
     EventSource, ExecId, ExecutionAdmission, NegotiationEvent, NegotiationId, OfferData, PeerId,
     PeerIdSource, ReceiptArtifact, SessionHash, SessionTermination, StateHash, TraceEntry,
 };
-use arena0_sandbox::{InitializeCall, Program};
+use arena0_sandbox::Program;
 use arena0_store::{Store, StoreConfig, StoreHandle};
 use arena0_test_engine::shared_test_engine;
 use arena0_transport::Transport;
@@ -226,9 +226,7 @@ impl Arena {
         // the same compiled module through the process-wide test engine.
         let loaded = shared_test_engine().load(&program).expect("load");
         let initialized = loaded
-            .initialize(InitializeCall::new(
-                JsonBytes::try_new(creator_params.clone()).expect("valid creator params"),
-            ))
+            .initialize(JsonBytes::try_new(creator_params.clone()).expect("valid creator params"))
             .expect("initialize program");
         let initial_state = StateHash::of_shared(&initialized.shared);
 
@@ -410,10 +408,10 @@ impl Arena {
                 );
                 let recompute_initial_state = Box::new(move |params: &[u8]| {
                     let initialized = recompute_loaded
-                        .initialize(InitializeCall::new(
+                        .initialize(
                             JsonBytes::try_new(params.to_vec())
                                 .map_err(|error| error.to_string())?,
-                        ))
+                        )
                         .map_err(|error| error.to_string())?;
                     Ok(StateHash::of_shared(&initialized.shared))
                 });

@@ -5,9 +5,7 @@ use std::path::PathBuf;
 
 use arena0_program::{CallStatus, JsonBytes, LocalStateBytes, SharedStateBytes};
 use arena0_protocol::{Committed, Ensemble, Event, PeerId, StateHash};
-use arena0_sandbox::{
-    DispatchCall, DispatchCallResult, InitializeCall, Program, ProgramInstance, WasmtimeEngine,
-};
+use arena0_sandbox::{DispatchCall, DispatchCallResult, Program, ProgramInstance, WasmtimeEngine};
 
 /// Borrow one accepted dispatch's images. Accepted results always carry them;
 /// rejected results carry none, so rejection clones nothing.
@@ -89,9 +87,7 @@ fn resident_from_cumulative_guest_with_target_size(
     let loaded = engine.load(&program).expect("load cumulative-sum guest");
     let params = format!(r#"{{"target_size":{target_size}}}"#);
     let initialized = loaded
-        .initialize(InitializeCall::new(
-            JsonBytes::try_new(params.into_bytes()).expect("valid params JSON"),
-        ))
+        .initialize(JsonBytes::try_new(params.into_bytes()).expect("valid params JSON"))
         .expect("initialize cumulative-sum guest");
     let session = Ensemble::from_peers(
         (0..target_size)
@@ -295,9 +291,7 @@ fn sdk_guest_rejects_a_local_handler_that_forges_its_shared_view() {
     let program = Program::try_from(local_context_forge_wasm()).expect("parse forge guest");
     let loaded = engine.load(&program).expect("load forge guest");
     let initialized = loaded
-        .initialize(InitializeCall::new(
-            JsonBytes::try_new(b"null".to_vec()).expect("valid params JSON"),
-        ))
+        .initialize(JsonBytes::try_new(b"null".to_vec()).expect("valid params JSON"))
         .expect("initialize forge guest");
     let session = Ensemble::from_peers(vec![PeerId([0; 32]), PeerId([1; 32])])
         .expect("valid committed session");

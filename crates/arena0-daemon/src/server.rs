@@ -42,7 +42,7 @@ use arena0_protocol::{
     PendingId, ReceiptArtifact, SessionHash, StateHash, TerminalKind, Ticket, TicketAction,
     TicketData, TicketHash, Viewport, system_event::SystemEvent,
 };
-use arena0_sandbox::{InitializeCall, LoadedProgram, Program, ViewCall, WasmtimeEngine};
+use arena0_sandbox::{LoadedProgram, Program, WasmtimeEngine};
 use arena0_transport::{NegotiationTopic, ProgramTopicEvent, Transport};
 use arena0_verify::{LightVerifiedTerminal as VerifiedLightTerminal, verify_light};
 use retry::delay::{Exponential, jitter};
@@ -1019,7 +1019,7 @@ fn load_and_initialize(
     let params =
         JsonBytes::try_new(params).map_err(|error| anyhow::anyhow!("{context} params: {error}"))?;
     let initialized = loaded
-        .initialize(InitializeCall::new(params))
+        .initialize(params)
         .map_err(|error| anyhow::anyhow!("{context} initialize: {error}"))?;
     Ok((loaded, StateHash::of_shared(&initialized.shared)))
 }
@@ -3463,9 +3463,7 @@ impl HostService {
             let step = state.agreed_step();
             let shared = state.shared_state().clone();
             let projection = tokio::task::spawn_blocking(move || {
-                engine
-                    .load(&program)?
-                    .view(ViewCall::new(shared, ensemble, viewport))
+                engine.load(&program)?.view(&shared, &ensemble, viewport)
             })
             .await
             .map_err(|error| ApiError::new(ApiErrorCode::Internal, error.to_string()))?

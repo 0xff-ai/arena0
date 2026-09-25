@@ -17,7 +17,7 @@ use arena0_protocol::{
     ExecutionAdmission, ExecutionStatus, NegotiationId, Offer, OfferData, PeerId, PeerIdSource,
     PendingId, PreparedActivation, StateHash, Ticket, TicketAction, TicketData, TicketHash,
 };
-use arena0_sandbox::{InitializeCall, LoadedProgram, Program};
+use arena0_sandbox::{LoadedProgram, Program};
 use arena0_store::{Change, Store, StoreConfig};
 use arena0_test_engine::shared_test_engine;
 use arena0_transport::Transport;
@@ -142,7 +142,7 @@ impl Fixture {
         let initialized = shared_test_engine()
             .load(&program)
             .expect("loaded program")
-            .initialize(InitializeCall::new(params.clone()))
+            .initialize(params.clone())
             .expect("initialize program");
         let activation = peer.map_or_else(
             || {

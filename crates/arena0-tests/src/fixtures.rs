@@ -14,7 +14,7 @@ use arena0_protocol::{
     Offer, OfferData, OfferHash, PeerId, PeerIdSource, PreparedActivation, StateHash, Ticket,
     TicketAction, TicketData, TicketHash,
 };
-use arena0_sandbox::{InitializeCall, Program};
+use arena0_sandbox::Program;
 use arena0_store::{Store, StoreConfig, StoreHandle};
 use arena0_test_engine::shared_test_engine;
 use arena0_transport::local::{LocalNetwork, LocalTransport};
@@ -193,7 +193,7 @@ pub async fn spawn_live_execution_with_delivery(
     let loaded = shared_test_engine().load(&program).expect("load program");
     let params_json = arena0_program::JsonBytes::try_new(params.clone()).expect("JSON params");
     let initialized = loaded
-        .initialize(InitializeCall::new(params_json.clone()))
+        .initialize(params_json.clone())
         .expect("initialize program");
     let initial_state = StateHash::of_shared(&initialized.shared);
     let activation = activation_for(

@@ -1,36 +1,11 @@
-//! Typed inputs for loaded-program invocations.
-//!
-//! A loaded program owns one non-cloneable resident instance per actor for
-//! dispatches. Read-only projections continue to use fresh instances.
+//! Typed input for resident dispatch and the shared input encoder.
 
-use arena0_program::{
-    DispatchInput, InitInput, JsonBytes, OutcomeInput, QueryInput, SharedStateBytes, ViewInput,
-    WriterInput,
-};
+use arena0_program::DispatchInput;
 use arena0_protocol::{Committed, Ensemble, Event, PeerId};
 use borsh::BorshSerialize;
 use std::sync::Arc;
 
 use crate::GuestSigner;
-
-/// Initialize a fresh program's shared and local state.
-#[derive(Debug, Clone)]
-pub struct InitializeCall {
-    pub(crate) params: JsonBytes,
-}
-
-impl InitializeCall {
-    /// Construct an initialization call from the agent-facing parameter JSON.
-    #[must_use]
-    pub fn new(params: JsonBytes) -> Self {
-        Self { params }
-    }
-
-    pub(crate) fn into_input(self) -> Result<InitInput, crate::SandboxError> {
-        InitInput::try_new(self.params.into_bytes())
-            .map_err(|error| crate::SandboxError::input_limit(error.to_string()))
-    }
-}
 
 /// Whether a dispatch event is an agreed event or a local event.
 ///
@@ -125,118 +100,6 @@ impl DispatchCall {
             Event::InputReceived { .. } | Event::TimerFired { .. } => DispatchKind::Local,
         };
         Ok((input, dispatch, outgoing_len, signer))
-    }
-}
-
-/// Execute one read-only query, whose request is validated agent-facing JSON.
-#[derive(Debug, Clone)]
-pub struct QueryCall {
-    pub(crate) shared: SharedStateBytes,
-    pub(crate) query: JsonBytes,
-    /// Exact advertised query schema selected by the caller.
-    pub(crate) query_index: u32,
-    pub(crate) session: Ensemble<Committed>,
-}
-
-impl QueryCall {
-    /// Construct a query from agent-facing JSON bytes.
-    #[must_use]
-    pub fn new(
-        shared: SharedStateBytes,
-        session: Ensemble<Committed>,
-        query: JsonBytes,
-        query_index: u32,
-    ) -> Self {
-        Self {
-            shared,
-            query,
-            query_index,
-            session,
-        }
-    }
-
-    pub(crate) fn into_input(self) -> Result<QueryInput, crate::SandboxError> {
-        let session = serialize(&self.session)?;
-        QueryInput::try_new(
-            self.shared,
-            session,
-            self.query_index,
-            self.query.into_bytes(),
-        )
-        .map_err(|error| crate::SandboxError::input_limit(error.to_string()))
-    }
-}
-
-/// Execute one read-only viewport projection, whose request is validated
-/// agent-facing JSON.
-#[derive(Debug, Clone)]
-pub struct ViewCall {
-    pub(crate) shared: SharedStateBytes,
-    pub(crate) viewport: JsonBytes,
-    pub(crate) session: Ensemble<Committed>,
-}
-
-impl ViewCall {
-    /// Construct a viewport projection call from validated JSON bytes.
-    #[must_use]
-    pub fn new(
-        shared: SharedStateBytes,
-        session: Ensemble<Committed>,
-        viewport: JsonBytes,
-    ) -> Self {
-        Self {
-            shared,
-            viewport,
-            session,
-        }
-    }
-
-    pub(crate) fn into_input(self) -> Result<ViewInput, crate::SandboxError> {
-        let session = serialize(&self.session)?;
-        ViewInput::try_new(self.shared, session, self.viewport.into_bytes())
-            .map_err(|error| crate::SandboxError::input_limit(error.to_string()))
-    }
-}
-
-/// Execute the pure terminal-outcome projection against explicit state bytes.
-#[derive(Debug, Clone)]
-pub struct OutcomeCall {
-    pub(crate) shared: SharedStateBytes,
-    pub(crate) session: Ensemble<Committed>,
-}
-
-/// Execute the pure next-writer projection against explicit shared state.
-#[derive(Debug, Clone)]
-pub struct WriterCall {
-    pub(crate) shared: SharedStateBytes,
-    pub(crate) session: Ensemble<Committed>,
-}
-
-impl WriterCall {
-    /// Construct a next-writer projection call.
-    #[must_use]
-    pub fn new(shared: SharedStateBytes, session: Ensemble<Committed>) -> Self {
-        Self { shared, session }
-    }
-
-    pub(crate) fn into_input(self) -> WriterInput {
-        WriterInput {
-            shared: self.shared,
-        }
-    }
-}
-
-impl OutcomeCall {
-    /// Construct an outcome projection call.
-    #[must_use]
-    pub fn new(shared: SharedStateBytes, session: Ensemble<Committed>) -> Self {
-        Self { shared, session }
-    }
-
-    pub(crate) fn into_input(self) -> Result<OutcomeInput, crate::SandboxError> {
-        let session = serialize(&self.session)?;
-        OutcomeInput::try_new(self.shared, session)
-            .map_err(|error| crate::SandboxError::input_limit(error.to_string()))
     }
 }
 

@@ -15,7 +15,7 @@ use arena0_protocol::{
     Committed, Effect, Ensemble, Event, ExecFrame, ExecLifecycle, ExecutionState, ExecutionStatus,
     ParticipantStepSignature, PeerIdSource, PendingId, SessionHash, StepEvent, TerminalOutcome,
 };
-use arena0_sandbox::{DispatchCall, GuestSigner, OutcomeCall, QueryCall, ViewCall, WriterCall};
+use arena0_sandbox::{DispatchCall, GuestSigner};
 use arena0_store::Change;
 use std::sync::Arc;
 
@@ -161,12 +161,12 @@ impl ExecutionActor {
 
     pub(super) fn query(&self, query_index: u32, query: JsonBytes) -> Result<JsonBytes, ExecError> {
         let state = &self.state;
-        let projection = self.context.program.query(QueryCall::new(
-            state.shared_state().clone(),
-            self.ensemble(),
-            query,
+        let projection = self.context.program.query(
+            state.shared_state(),
+            &self.ensemble(),
             query_index,
-        ))?;
+            query,
+        )?;
         Ok(projection.output)
     }
 
@@ -175,11 +175,10 @@ impl ExecutionActor {
         viewport: JsonBytes,
     ) -> Result<(u64, arena0_protocol::View), ExecError> {
         let state = &self.state;
-        let projection = self.context.program.view(ViewCall::new(
-            state.shared_state().clone(),
-            self.ensemble(),
-            viewport,
-        ))?;
+        let projection =
+            self.context
+                .program
+                .view(state.shared_state(), &self.ensemble(), viewport)?;
         let view = serde_json::from_slice(projection.output.as_bytes()).map_err(|error| {
             ExecError::Unavailable(format!("view projection is not a View: {error}"))
         })?;
@@ -307,11 +306,7 @@ impl ExecutionActor {
         shared: &arena0_program::SharedStateBytes,
         ensemble: &Ensemble<Committed>,
     ) -> Result<Option<arena0_protocol::PeerId>, ExecError> {
-        let writer = self
-            .context
-            .program
-            .writer(WriterCall::new(shared.clone(), ensemble.clone()))?
-            .writer;
+        let writer = self.context.program.writer(shared, ensemble)?.writer;
         Ok(writer.and_then(|participant| ensemble.peer_at(participant)))
     }
 
@@ -642,10 +637,7 @@ impl ExecutionActor {
         }) else {
             return Ok(None);
         };
-        let projection = self
-            .context
-            .program
-            .outcome(OutcomeCall::new(shared.clone(), self.ensemble()))?;
+        let projection = self.context.program.outcome(shared, &self.ensemble())?;
         if projection.borsh.as_bytes() != outcome_bytes {
             return Err(ExecError::InvalidState(
                 "SessionEnd outcome differs from the guest outcome projection".into(),
