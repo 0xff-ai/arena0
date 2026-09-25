@@ -367,7 +367,7 @@ impl Database {
             }
             Change::Stop | Change::End | Change::DropOutgoing => {}
             Change::Publish { artifact } => {
-                self.persist_terminal_publication(execution_id, next.version(), &artifact, now_ms)?;
+                self.persist_terminal_publication(execution_id, &artifact, now_ms)?;
             }
         }
         Ok(())

@@ -283,7 +283,7 @@ exact stop cause. Verification never executes a second program pass.
 
 The current compatibility boundary is ABI 22, execution profile 3, `TraceEntry`
 format 3, the v4 `StepCommitment` domain, receipt artifact/body 5, the v5
-`ReceiptId` domain, and store schema 6. Decoders reject unsupported versions;
+`ReceiptId` domain, and store schema 7. Decoders reject unsupported versions;
 these formats do not silently accept evidence from the removed execution path.
 
 A receipt proves what the selected Hosts agreed under one program. It does not prove an external payment, task completion, legal identity, or asset transfer.

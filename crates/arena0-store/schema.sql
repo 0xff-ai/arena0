@@ -102,15 +102,6 @@ CREATE TABLE agreed_steps (
     FOREIGN KEY (execution_id) REFERENCES executions(execution_id)
 ) STRICT;
 
-CREATE TABLE terminal_proofs (
-    execution_id BLOB NOT NULL CHECK (length(execution_id) = 32),
-    version INTEGER NOT NULL CHECK (version >= 0),
-    receipt_id BLOB NOT NULL CHECK (length(receipt_id) = 32),
-    PRIMARY KEY (execution_id, version),
-    FOREIGN KEY (execution_id) REFERENCES executions(execution_id),
-    FOREIGN KEY (receipt_id) REFERENCES receipts(receipt_id)
-) STRICT;
-
 CREATE TABLE receipts (
     -- One immutable artifact row serves both local publications and foreign
     -- imports.  Provenance is derived from the independent fact tables below.

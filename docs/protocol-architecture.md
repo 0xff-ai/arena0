@@ -691,7 +691,7 @@ bytes. A stopped result includes the exact `StopCause`, preserving the
 distinction between an authenticated unilateral report and a shared N-of-N
 stop. Verification does not execute Wasm and stops at these checks.
 
-This release uses store schema version 6 and rejects earlier databases with an
+This release uses store schema version 7 and rejects earlier databases with an
 unsupported-schema error. It does not rewrite or delete old evidence. Version-1
 producer-sealed receipts are also rejected; they must be inspected with the
 matching older release. Automatic migration is not provided.

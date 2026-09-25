@@ -2412,12 +2412,10 @@ async fn unpublished_execution_rejects_terminal_projection_rows_on_restart() {
         .expect("disable foreign keys");
     connection
         .execute(
-            "INSERT INTO terminal_proofs
-             (execution_id, version, receipt_id)
-             VALUES (?1, 1, ?2)",
-            rusqlite::params![execution_id.0.to_vec(), [2u8; 32].to_vec(),],
+            "INSERT INTO receipt_productions (receipt_id, execution_id) VALUES (?1, ?2)",
+            rusqlite::params![[2u8; 32].to_vec(), execution_id.0.to_vec()],
         )
-        .expect("insert unexpected terminal row");
+        .expect("insert unexpected production row");
     drop(connection);
     assert!(matches!(
         Store::open(StoreConfig::new(&path, fixture.producer)),
@@ -2426,7 +2424,7 @@ async fn unpublished_execution_rejects_terminal_projection_rows_on_restart() {
 }
 
 #[tokio::test]
-async fn published_receipts_require_terminal_proof_and_production_rows_on_restart() {
+async fn published_receipts_require_receipt_and_production_rows_on_restart() {
     let fixture = activation_fixture();
     let directory = tempfile::tempdir().expect("tempdir");
     for (byte, row, delete) in [
@@ -2436,14 +2434,9 @@ async fn published_receipts_require_terminal_proof_and_production_rows_on_restar
             "DELETE FROM receipt_productions WHERE execution_id = ?1",
         ),
         (
-            0x35,
-            "terminal-proof",
-            "DELETE FROM terminal_proofs WHERE execution_id = ?1",
-        ),
-        (
             0x36,
             "receipt",
-            "DELETE FROM receipts WHERE receipt_id IN (SELECT receipt_id FROM terminal_proofs WHERE execution_id = ?1)",
+            "DELETE FROM receipts WHERE receipt_id IN (SELECT receipt_id FROM receipt_productions WHERE execution_id = ?1)",
         ),
     ] {
         let path = directory.path().join(format!("missing-{row}.sqlite"));

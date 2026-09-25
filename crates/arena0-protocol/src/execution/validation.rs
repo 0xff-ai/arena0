@@ -249,7 +249,7 @@ pub(crate) fn validate_receipt_body_shape(body: &ReceiptBody) -> Result<(), Prot
     Ok(())
 }
 
-/// Validate receipt identity, activation binding, ordered trace, and terminal proof.
+/// Validate receipt identity, activation binding, ordered trace, and terminal evidence.
 pub(crate) fn validate_receipt_body(
     binding: &ExecutionBinding,
     body: &ReceiptBody,

@@ -255,7 +255,7 @@ local production and import facts independently yield `Produced`, `Imported`, or
 
 The earlier `{key:{session_id,producer}}` API and producer-sealed JSON format are
 replaced by these references and artifacts. Receipt artifact and body format
-and their `ReceiptId` domain are version 5, and the store schema is version 6;
+and their `ReceiptId` domain are version 5, and the store schema is version 7;
 older evidence and databases require their matching older release.
 
 `receipt.verify` performs portable verification only. It checks the

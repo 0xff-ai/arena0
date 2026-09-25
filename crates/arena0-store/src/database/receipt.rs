@@ -253,58 +253,36 @@ impl Database {
     pub(super) fn persist_terminal_publication(
         &mut self,
         execution_id: ExecId,
-        version: ExecutionVersion,
         receipt: &ReceiptArtifact,
         now_ms: u64,
     ) -> Result<(), StoreError> {
         self.insert_artifact(receipt, now_ms)?;
-        let existing = self
+        let published = self
             .connection
             .query_row(
-                "SELECT version, receipt_id FROM terminal_proofs
-             WHERE execution_id = ?1",
+                "SELECT receipt_id FROM receipt_productions WHERE execution_id = ?1",
                 params![execution_id.0.to_vec()],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                |row| row.get::<_, Vec<u8>>(0),
             )
             .optional()?;
-        if let Some((old_version, old_id)) = existing {
-            if sqlite_i64(old_version)? != version.get()
-                || old_id != receipt.receipt_id().as_bytes().to_vec()
-            {
+        if let Some(published) = published {
+            if published != receipt.receipt_id().as_bytes().to_vec() {
                 return Err(StoreError::Corruption(
                     "terminal publication identity was reused with different evidence".into(),
                 ));
             }
-            if self.receipt_production(receipt.receipt_id())? != Some(execution_id) {
-                return Err(StoreError::Corruption(
-                    "terminal publication is missing its execution relation".into(),
-                ));
-            }
             return Ok(());
         }
-        let production = self.receipt_production(receipt.receipt_id())?;
-        if production.is_some_and(|existing| existing != execution_id) {
+        if self.receipt_production(receipt.receipt_id())?.is_some() {
             return Err(StoreError::Corruption(
                 "receipt is already produced by another execution".into(),
             ));
         }
-        if production.is_none() {
-            self.connection.execute(
-                "INSERT INTO receipt_productions (receipt_id, execution_id) VALUES (?1, ?2)",
-                params![
-                    receipt.receipt_id().as_bytes().to_vec(),
-                    execution_id.0.to_vec()
-                ],
-            )?;
-        }
         self.connection.execute(
-            "INSERT INTO terminal_proofs
-             (execution_id, version, receipt_id)
-             VALUES (?1, ?2, ?3)",
+            "INSERT INTO receipt_productions (receipt_id, execution_id) VALUES (?1, ?2)",
             params![
-                execution_id.0.to_vec(),
-                sqlite_u64(version.get())?,
                 receipt.receipt_id().as_bytes().to_vec(),
+                execution_id.0.to_vec()
             ],
         )?;
         Ok(())
@@ -319,18 +297,12 @@ impl Database {
         trace: &[arena0_protocol::TraceEntry],
     ) -> Result<(), StoreError> {
         let execution_id = state.execution_id();
-        let count: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM terminal_proofs WHERE execution_id = ?1",
-            params![execution_id.0.to_vec()],
-            |row| row.get(0),
-        )?;
         let production_count: i64 = self.connection.query_row(
             "SELECT COUNT(*) FROM receipt_productions WHERE execution_id = ?1",
             params![execution_id.0.to_vec()],
             |row| row.get(0),
         )?;
-        let expected = i64::from(state.published_receipt_id().is_some());
-        if count != expected || production_count != expected {
+        if production_count != i64::from(state.published_receipt_id().is_some()) {
             return Err(StoreError::Corruption(
                 "terminal publication rows do not match execution status".into(),
             ));
@@ -338,20 +310,11 @@ impl Database {
         let Some(receipt_id) = state.published_receipt_id() else {
             return Ok(());
         };
-        let (version, row_id): (i64, Vec<u8>) = self.connection.query_row(
-            "SELECT version, receipt_id FROM terminal_proofs WHERE execution_id = ?1",
-            params![execution_id.0.to_vec()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
         let row = self
             .receipt_row_by_id(receipt_id)?
             .ok_or_else(|| StoreError::Corruption("published receipt row is missing".into()))?;
         let receipt = self.decode_stored_receipt(row)?.receipt;
-        // End confirmations advance local state after publication without
-        // changing any portable evidence or the publication's original version.
-        if sqlite_i64(version)? > state.version().get()
-            || row_id != receipt_id.as_bytes().to_vec()
-            || receipt.receipt_id() != receipt_id
+        if receipt.receipt_id() != receipt_id
             || receipt.body().header().activation != *state.binding().activation()
             || state.producer() != self.host_id
             || self.receipt_production(receipt_id)? != Some(execution_id)
