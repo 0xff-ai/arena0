@@ -1,7 +1,10 @@
 //! Host imports that are present for every generated guest module.
 
-use arena0_program::StateMemoryKind;
 use arena0_program::abi::{self, imports};
+use arena0_program::{
+    CANONICAL_STATE_PREFIX_BYTES as STATE_PREFIX, StateFrameError, StateMemoryKind,
+    state_frame_len, write_state_frame,
+};
 use arena0_protocol::{Effect, LogLevel};
 use wasmtime::{Caller, Linker};
 
@@ -25,29 +28,11 @@ pub(crate) fn register_always_available(
                 caller.begin_import(imports::STATE_LEN)?;
                 caller.reject_state_io(imports::STATE_LEN)?;
                 let memory = caller.state_memory(kind)?;
-                let data = memory.data(&caller);
-                if data.len() < arena0_program::CANONICAL_STATE_PREFIX_BYTES {
-                    return Err(wasmtime::Error::msg(
-                        "state_len: state memory is smaller than its length prefix",
-                    ));
-                }
-                let payload_len = u32::from_le_bytes(data[..4].try_into().unwrap());
                 let max_payload = state_payload_max(&caller, kind)?;
-                if payload_len as usize > max_payload {
-                    return Err(wasmtime::Error::msg(format!(
-                        "state_len: payload length {} exceeds maximum {max_payload}",
-                        payload_len
-                    )));
-                }
-                let end = arena0_program::CANONICAL_STATE_PREFIX_BYTES
-                    .checked_add(payload_len as usize)
-                    .ok_or_else(|| wasmtime::Error::msg("state_len: payload length overflow"))?;
-                if end > data.len() {
-                    return Err(wasmtime::Error::msg(
-                        "state_len: state length exceeds memory capacity",
-                    ));
-                }
-                Ok(payload_len)
+                let payload_len = state_frame_len(memory.data(&caller), max_payload)
+                    .map_err(|error| frame_error(imports::STATE_LEN, error))?;
+                // The length was read from the frame's `u32` prefix.
+                Ok(payload_len as u32)
             },
         )
         .map_err(map_err)?;
@@ -60,36 +45,15 @@ pub(crate) fn register_always_available(
                 caller.begin_import(imports::STATE_READ)?;
                 caller.reject_state_io(imports::STATE_READ)?;
                 let state = caller.state_memory(kind)?;
-                let requested_end = {
-                    let state_data = state.data(&caller);
-                    if state_data.len() < arena0_program::CANONICAL_STATE_PREFIX_BYTES {
-                        return Err(wasmtime::Error::msg(
-                            "state_read: state memory is smaller than its length prefix",
-                        ));
-                    }
-                    let payload_len = u32::from_le_bytes(state_data[..4].try_into().unwrap());
-                    let max_payload = state_payload_max(&caller, kind)?;
-                    if payload_len as usize > max_payload {
-                        return Err(wasmtime::Error::msg(format!(
-                            "state_read: payload length {} exceeds maximum {max_payload}",
-                            payload_len
-                        )));
-                    }
-                    let payload_end = arena0_program::CANONICAL_STATE_PREFIX_BYTES
-                        .checked_add(payload_len as usize)
-                        .ok_or_else(|| {
-                            wasmtime::Error::msg("state_read: payload length overflow")
-                        })?;
-                    let requested_end = arena0_program::CANONICAL_STATE_PREFIX_BYTES
-                        .checked_add(len as usize)
-                        .ok_or_else(|| wasmtime::Error::msg("state_read: length overflow"))?;
-                    if payload_end > state_data.len() || requested_end > payload_end {
-                        return Err(wasmtime::Error::msg(
-                            "state_read: requested range exceeds state payload",
-                        ));
-                    }
-                    requested_end
-                };
+                let max_payload = state_payload_max(&caller, kind)?;
+                let payload_len = state_frame_len(state.data(&caller), max_payload)
+                    .map_err(|error| frame_error(imports::STATE_READ, error))?;
+                if len as usize > payload_len {
+                    return Err(wasmtime::Error::msg(
+                        "state_read: requested range exceeds state payload",
+                    ));
+                }
+                let requested_end = STATE_PREFIX + len as usize;
                 let work = caller.work_memory()?;
                 let start = dst as usize;
                 let end = start
@@ -106,10 +70,7 @@ pub(crate) fn register_always_available(
                     .ledger
                     .copy_bytes(len as usize, max_host_bytes)
                     .map_err(wasmtime::Error::new)?;
-                let payload = {
-                    let state_data = state.data(&caller);
-                    state_data[arena0_program::CANONICAL_STATE_PREFIX_BYTES..requested_end].to_vec()
-                };
+                let payload = state.data(&caller)[STATE_PREFIX..requested_end].to_vec();
                 work.write(&mut caller, start, &payload)
                     .map_err(|error| wasmtime::Error::msg(error.to_string()))
             },
@@ -134,42 +95,15 @@ pub(crate) fn register_always_available(
                     ));
                 }
                 let state = caller.state_memory(kind)?;
-                let payload_start = arena0_program::CANONICAL_STATE_PREFIX_BYTES;
-                let payload_end = payload_start
-                    .checked_add(len as usize)
-                    .ok_or_else(|| wasmtime::Error::msg("state_write: payload overflow"))?;
                 let max_payload = state_payload_max(&caller, kind)?;
                 if len as usize > max_payload {
                     return Err(wasmtime::Error::msg(format!(
                         "state_write: payload length {len} exceeds maximum {max_payload}"
                     )));
                 }
-                let (state_bytes, old_len) = {
-                    let state_data = state.data(&caller);
-                    if state_data.len() < payload_start {
-                        return Err(wasmtime::Error::msg(
-                            "state_write: state memory is smaller than its length prefix",
-                        ));
-                    }
-                    let old_len =
-                        u32::from_le_bytes(state_data[..payload_start].try_into().unwrap())
-                            as usize;
-                    if old_len > max_payload {
-                        return Err(wasmtime::Error::msg(format!(
-                            "state_write: existing payload length {old_len} exceeds maximum {max_payload}"
-                        )));
-                    }
-                    let old_end = payload_start
-                        .checked_add(old_len)
-                        .ok_or_else(|| wasmtime::Error::msg("state_write: old length overflow"))?;
-                    if old_end > state_data.len() {
-                        return Err(wasmtime::Error::msg(
-                            "state_write: existing payload exceeds state memory",
-                        ));
-                    }
-                    (state_data.len(), old_len)
-                };
-                if payload_end > state_bytes {
+                let old_len = state_frame_len(state.data(&caller), max_payload)
+                    .map_err(|error| frame_error(imports::STATE_WRITE, error))?;
+                if STATE_PREFIX + len as usize > state.data_size(&caller) {
                     return Err(wasmtime::Error::msg(
                         "state_write: payload exceeds state memory",
                     ));
@@ -185,15 +119,8 @@ pub(crate) fn register_always_available(
                     .copy_bytes(host_bytes, max_host_bytes)
                     .map_err(wasmtime::Error::new)?;
                 let payload = work.data(&caller)[start..end].to_vec();
-                let state_data = state.data_mut(&mut caller);
-                if stale_clear_bytes != 0 {
-                    let stale_start = payload_start + len as usize;
-                    let stale_end = stale_start + stale_clear_bytes;
-                    state_data[stale_start..stale_end].fill(0);
-                }
-                state_data[..payload_start].copy_from_slice(&len.to_le_bytes());
-                state_data[payload_start..payload_end].copy_from_slice(&payload);
-                Ok(())
+                write_state_frame(state.data_mut(&mut caller), old_len, &payload)
+                    .map_err(|error| frame_error(imports::STATE_WRITE, error))
             },
         )
         .map_err(map_err)?;
@@ -319,6 +246,10 @@ pub(crate) fn register_always_available(
         .map_err(map_err)?;
 
     Ok(())
+}
+
+fn frame_error(import: &str, error: StateFrameError) -> wasmtime::Error {
+    wasmtime::Error::msg(format!("{import}: {error}"))
 }
 
 fn state_payload_max(caller: &Caller<'_, HostState>, kind: u32) -> Result<usize, wasmtime::Error> {

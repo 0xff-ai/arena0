@@ -47,5 +47,6 @@ pub use schema::{
 pub use state::{
     CANONICAL_STATE_MEMORY_BYTES, CANONICAL_STATE_MEMORY_PAGES, CANONICAL_STATE_PREFIX_BYTES,
     LocalStateBytes, MAX_LOCAL_STATE_BYTES, MAX_SHARED_STATE_BYTES, SharedStateBytes,
-    StateBytesError, canonical_state_image,
+    StateBytesError, StateFrameError, canonical_state_image, canonical_state_payload,
+    state_frame_len, write_state_frame,
 };

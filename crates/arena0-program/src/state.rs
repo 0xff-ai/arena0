@@ -45,6 +45,97 @@ pub enum StateBytesError {
     CanonicalTooLarge { actual: usize, max: usize },
 }
 
+/// A state-memory frame that violates `len || payload || zero_tail`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum StateFrameError {
+    /// The memory cannot hold the length prefix.
+    #[error("state memory is smaller than its length prefix")]
+    MissingPrefix,
+    /// The memory is not exactly one canonical state memory.
+    #[error("state memory has {actual} bytes; expected {expected}")]
+    WrongSize { actual: usize, expected: usize },
+    /// The payload exceeds the caller's bound.
+    #[error("payload length {actual} exceeds maximum {max}")]
+    TooLarge { actual: usize, max: usize },
+    /// The payload does not fit after the prefix.
+    #[error("payload length {actual} exceeds the {capacity}-byte state memory")]
+    ExceedsMemory { actual: usize, capacity: usize },
+    /// A byte after the payload is not zero.
+    #[error("state memory has non-zero bytes after its payload")]
+    NonZeroTail,
+}
+
+/// The payload length recorded in a state-memory frame, after checking that
+/// it is within `max_payload` and fits in `frame`. The tail is not scanned.
+pub fn state_frame_len(frame: &[u8], max_payload: usize) -> Result<usize, StateFrameError> {
+    let prefix: [u8; CANONICAL_STATE_PREFIX_BYTES] = frame
+        .get(..CANONICAL_STATE_PREFIX_BYTES)
+        .and_then(|prefix| prefix.try_into().ok())
+        .ok_or(StateFrameError::MissingPrefix)?;
+    let len = u32::from_le_bytes(prefix) as usize;
+    if len > max_payload {
+        return Err(StateFrameError::TooLarge {
+            actual: len,
+            max: max_payload,
+        });
+    }
+    if len > frame.len() - CANONICAL_STATE_PREFIX_BYTES {
+        return Err(StateFrameError::ExceedsMemory {
+            actual: len,
+            capacity: frame.len(),
+        });
+    }
+    Ok(len)
+}
+
+/// The payload of one complete canonical state memory: exactly
+/// [`CANONICAL_STATE_MEMORY_BYTES`] bytes, a payload within `max_payload`, and
+/// an all-zero tail.
+pub fn canonical_state_payload(frame: &[u8], max_payload: usize) -> Result<&[u8], StateFrameError> {
+    if frame.len() != CANONICAL_STATE_MEMORY_BYTES {
+        return Err(StateFrameError::WrongSize {
+            actual: frame.len(),
+            expected: CANONICAL_STATE_MEMORY_BYTES,
+        });
+    }
+    let end = CANONICAL_STATE_PREFIX_BYTES + state_frame_len(frame, max_payload)?;
+    if frame[end..].iter().any(|byte| *byte != 0) {
+        return Err(StateFrameError::NonZeroTail);
+    }
+    Ok(&frame[CANONICAL_STATE_PREFIX_BYTES..end])
+}
+
+/// Replace the payload of a state-memory frame whose current payload is
+/// `old_len` bytes, zeroing the bytes the shorter payload no longer covers.
+/// With a zero tail before the write, the frame keeps a zero tail after it.
+pub fn write_state_frame(
+    frame: &mut [u8],
+    old_len: usize,
+    payload: &[u8],
+) -> Result<(), StateFrameError> {
+    let capacity = frame
+        .len()
+        .checked_sub(CANONICAL_STATE_PREFIX_BYTES)
+        .ok_or(StateFrameError::MissingPrefix)?;
+    if payload.len().max(old_len) > capacity {
+        return Err(StateFrameError::ExceedsMemory {
+            actual: payload.len().max(old_len),
+            capacity: frame.len(),
+        });
+    }
+    let payload_len = u32::try_from(payload.len()).map_err(|_| StateFrameError::ExceedsMemory {
+        actual: payload.len(),
+        capacity: frame.len(),
+    })?;
+    let end = CANONICAL_STATE_PREFIX_BYTES + payload.len();
+    if old_len > payload.len() {
+        frame[end..CANONICAL_STATE_PREFIX_BYTES + old_len].fill(0);
+    }
+    frame[..CANONICAL_STATE_PREFIX_BYTES].copy_from_slice(&payload_len.to_le_bytes());
+    frame[CANONICAL_STATE_PREFIX_BYTES..end].copy_from_slice(payload);
+    Ok(())
+}
+
 /// Reconstruct one fixed canonical state-memory image from its payload.
 ///
 /// The result is exactly [`CANONICAL_STATE_MEMORY_BYTES`] bytes containing a
@@ -62,10 +153,7 @@ pub fn canonical_state_image(payload: impl AsRef<[u8]>) -> Result<Vec<u8>, State
     }
 
     let mut image = vec![0; CANONICAL_STATE_MEMORY_BYTES];
-    let payload_len = u32::try_from(payload.len()).expect("canonical state length fits in u32");
-    image[..CANONICAL_STATE_PREFIX_BYTES].copy_from_slice(&payload_len.to_le_bytes());
-    let end = CANONICAL_STATE_PREFIX_BYTES + payload.len();
-    image[CANONICAL_STATE_PREFIX_BYTES..end].copy_from_slice(payload);
+    write_state_frame(&mut image, 0, payload).expect("payload fits the canonical frame");
     Ok(image)
 }
 
@@ -303,6 +391,35 @@ mod tests {
             local_image[CANONICAL_STATE_PREFIX_BYTES + local.len()..]
                 .iter()
                 .all(|byte| *byte == 0)
+        );
+    }
+
+    #[test]
+    fn state_frame_rewrite_zeroes_the_stale_tail() {
+        let mut frame = canonical_state_image(b"longer").unwrap();
+        write_state_frame(&mut frame, 6, b"ab").unwrap();
+        assert_eq!(canonical_state_payload(&frame, 8), Ok(&b"ab"[..]));
+        assert_eq!(frame, canonical_state_image(b"ab").unwrap());
+        assert_eq!(
+            state_frame_len(&frame, 1),
+            Err(StateFrameError::TooLarge { actual: 2, max: 1 })
+        );
+        assert_eq!(
+            state_frame_len(&[0; 3], 8),
+            Err(StateFrameError::MissingPrefix)
+        );
+        assert_eq!(
+            state_frame_len(&[9, 0, 0, 0, 0], 16),
+            Err(StateFrameError::ExceedsMemory {
+                actual: 9,
+                capacity: 5
+            })
+        );
+
+        frame[CANONICAL_STATE_PREFIX_BYTES + 2] = 1;
+        assert_eq!(
+            canonical_state_payload(&frame, 8),
+            Err(StateFrameError::NonZeroTail)
         );
     }
 

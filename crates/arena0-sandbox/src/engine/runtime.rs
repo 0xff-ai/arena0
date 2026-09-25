@@ -3,8 +3,8 @@
 use crate::call::DispatchKind;
 use arena0_program::{
     CallStatus, DispatchInput, DispatchOutput, InitInput, JsonBytes, LocalStateBytes, OutcomeInput,
-    OutcomeOutput, QueryInput, QueryOutput, SharedStateBytes, ViewInput, ViewOutput, WriterInput,
-    WriterOutput, abi,
+    OutcomeOutput, QueryInput, QueryOutput, SharedStateBytes, StateFrameError, ViewInput,
+    ViewOutput, WriterInput, WriterOutput, abi,
 };
 use arena0_protocol::{Committed, Ensemble};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -724,54 +724,22 @@ fn canonical_state_payload<'a>(
     max_payload: usize,
     label: &str,
 ) -> Result<&'a [u8], SandboxError> {
-    let data = memory.data(store);
-    let prefix = arena0_program::CANONICAL_STATE_PREFIX_BYTES;
-    if data.len() < prefix {
-        return Err(SandboxError::dispatch_failed(format!(
-            "{label} memory is smaller than its length prefix"
-        )));
-    }
-    if data.len() != arena0_program::CANONICAL_STATE_MEMORY_BYTES {
-        return Err(SandboxError::dispatch_failed(format!(
-            "{label} memory has {} bytes; expected {}",
-            data.len(),
-            arena0_program::CANONICAL_STATE_MEMORY_BYTES
-        )));
-    }
-    let length = u32::from_le_bytes(data[..prefix].try_into().unwrap()) as usize;
-    let end = prefix
-        .checked_add(length)
-        .ok_or_else(|| SandboxError::dispatch_failed(format!("{label} length overflow")))?;
-    if end > data.len() {
-        return Err(SandboxError::dispatch_failed(format!(
-            "{label} length {length} exceeds {}-byte memory",
-            data.len()
-        )));
-    }
-    if data[end..].iter().any(|byte| *byte != 0) {
-        return Err(SandboxError::dispatch_failed(format!(
-            "{label} memory has non-zero bytes after its payload"
-        )));
-    }
-    if length > max_payload {
-        return Err(SandboxError::MemoryLimitExceeded(length as u64));
-    }
-    Ok(&data[prefix..end])
+    arena0_program::canonical_state_payload(memory.data(store), max_payload).map_err(|error| {
+        match error {
+            StateFrameError::TooLarge { actual, .. } => {
+                SandboxError::MemoryLimitExceeded(actual as u64)
+            }
+            error => SandboxError::dispatch_failed(format!("{label} {error}")),
+        }
+    })
 }
 
+/// Overwrite a state memory with the canonical image of `payload`.
 fn write_state_payload(
     store: &mut Store<super::HostState>,
     memory: Memory,
     payload: &[u8],
 ) -> Result<(), SandboxError> {
-    let prefix = arena0_program::CANONICAL_STATE_PREFIX_BYTES;
-    let max_payload = arena0_program::CANONICAL_STATE_MEMORY_BYTES - prefix;
-    if payload.len() > max_payload {
-        return Err(SandboxError::dispatch_failed(format!(
-            "state payload is {} bytes; canonical frame allows {max_payload}",
-            payload.len()
-        )));
-    }
     let data = memory.data_mut(store);
     if data.len() != arena0_program::CANONICAL_STATE_MEMORY_BYTES {
         return Err(SandboxError::MemoryLimitExceeded(
@@ -779,11 +747,8 @@ fn write_state_payload(
         ));
     }
     data.fill(0);
-    let payload_len = u32::try_from(payload.len()).expect("canonical state length fits in u32");
-    data[..prefix].copy_from_slice(&payload_len.to_le_bytes());
-    let end = prefix + payload.len();
-    data[prefix..end].copy_from_slice(payload);
-    Ok(())
+    arena0_program::write_state_frame(data, 0, payload)
+        .map_err(|error| SandboxError::dispatch_failed(error.to_string()))
 }
 
 impl super::LoadedProgram {
