@@ -1045,6 +1045,12 @@ impl StoreHandle {
         self.run(move |db| db.load_execution(execution_id)).await
     }
 
+    /// Whether an execution aggregate exists. Unlike [`Self::load_execution`],
+    /// this neither loads nor validates the aggregate.
+    pub async fn execution_exists(&self, execution_id: ExecId) -> Result<bool, StoreError> {
+        self.run(move |db| db.execution_exists(execution_id)).await
+    }
+
     /// List bounded execution aggregates for restart recovery.
     pub async fn list_executions(&self, limit: usize) -> Result<Vec<ExecutionState>, StoreError> {
         self.run(move |db| db.list_executions(limit)).await

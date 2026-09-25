@@ -106,14 +106,19 @@ impl Database {
         Ok(())
     }
 
-    /// Timer scans need an execution identity, not its guest memory images.
-    pub(super) fn require_execution(&self, execution_id: ExecId) -> Result<(), StoreError> {
-        let exists: bool = self.connection.query_row(
+    /// Whether an execution aggregate row exists, without loading or
+    /// validating its guest memory images.
+    pub(crate) fn execution_exists(&self, execution_id: ExecId) -> Result<bool, StoreError> {
+        Ok(self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM executions WHERE execution_id = ?1)",
             params![execution_id.0.to_vec()],
             |row| row.get(0),
-        )?;
-        if exists {
+        )?)
+    }
+
+    /// Timer scans need an execution identity, not its guest memory images.
+    pub(super) fn require_execution(&self, execution_id: ExecId) -> Result<(), StoreError> {
+        if self.execution_exists(execution_id)? {
             Ok(())
         } else {
             Err(StoreError::ExecutionNotFound(execution_id))

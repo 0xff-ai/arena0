@@ -1485,8 +1485,10 @@ impl HostService {
                 )
                 .await;
         }
-        let execution = match self.store.load_execution(exec_id).await {
-            Ok(execution) => execution,
+        // Store open validated every aggregate, and the actor loads it at
+        // startup; recovery needs only its presence.
+        let execution_present = match self.store.execution_exists(exec_id).await {
+            Ok(present) => present,
             Err(error) => {
                 return self
                     .fail_recovery_candidate(
@@ -1497,7 +1499,6 @@ impl HostService {
                     .await;
             }
         };
-        let execution_present = execution.is_some();
         if execution_present != page_execution_present {
             return self
                 .fail_recovery_candidate(
