@@ -91,20 +91,5 @@ async fn chess_bilateral_scholars_mate_runs_and_verifies() {
         }
     }
 
-    let outcomes = run.expect_completed_all().await;
-    assert_eq!(
-        outcomes[0], outcomes[1],
-        "both participants must derive the identical outcome receipt"
-    );
-
-    assert_eq!(run.session_hash(0), run.session_hash(1));
-    let verified = run.verify_all().expect("both traces must verify");
-    for (verified, expected_outcome) in verified.into_iter().zip(&outcomes) {
-        assert_eq!(
-            verified.terminal,
-            arena0_protocol::ReceiptTermination::Completed,
-            "checkmate must complete the session"
-        );
-        assert_eq!(verified.outcome_borsh.as_ref(), Some(expected_outcome));
-    }
+    run.expect_agreed_completion().await;
 }

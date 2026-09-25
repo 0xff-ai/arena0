@@ -721,6 +721,39 @@ impl Run {
             .collect()
     }
 
+    /// Wait for every participant to complete, then check that they agree:
+    /// one session, one outcome, and for each participant a verified
+    /// completed receipt carrying that outcome. Returns the verified receipt
+    /// summaries in participant order.
+    pub async fn expect_agreed_completion(&mut self) -> Vec<arena0_protocol::ReceiptSummary> {
+        let outcomes = self.expect_completed_all().await;
+        for i in 1..self.node_count() {
+            assert_eq!(
+                self.session_hash(i),
+                self.session_hash(0),
+                "participant {i} confirmed a different session"
+            );
+            assert_eq!(
+                outcomes[i], outcomes[0],
+                "participant {i} derived a different outcome"
+            );
+        }
+        let verified = self.verify_all().expect("every receipt verifies");
+        for (i, (summary, outcome)) in verified.iter().zip(&outcomes).enumerate() {
+            assert_eq!(
+                summary.terminal,
+                arena0_protocol::ReceiptTermination::Completed,
+                "participant {i}: expected a completed receipt"
+            );
+            assert_eq!(
+                summary.outcome_borsh.as_ref(),
+                Some(outcome),
+                "participant {i}: receipt outcome differs from the completion"
+            );
+        }
+        verified
+    }
+
     /// Wait until every node reaches a terminal state without asserting success.
     pub async fn wait_all_terminal(&mut self) -> Vec<SessionTermination> {
         self.wait_for_all_terminal("terminate").await

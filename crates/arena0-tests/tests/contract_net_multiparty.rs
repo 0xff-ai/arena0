@@ -1,7 +1,7 @@
 //! Three independent replicas agree on one bounded task assignment and verify
 //! every producer receipt's portable proof.
 
-use arena0_protocol::{ColorDepth, ReceiptTermination, Slot, Viewport};
+use arena0_protocol::{ColorDepth, Slot, Viewport};
 use arena0_tests::arena::Arena;
 use arena0_tests::wasm::program_wasm;
 
@@ -96,23 +96,5 @@ async fn contract_net_runs_and_every_producer_verifies() {
         )
         .await;
 
-    let outcomes = run.expect_completed_all().await;
-    assert!(outcomes.iter().all(|outcome| outcome == &outcomes[0]));
-    assert_eq!(run.session_hash(0), run.session_hash(1));
-    assert_eq!(run.session_hash(1), run.session_hash(2));
-
-    let verified = run
-        .verify_all()
-        .expect("all three contract-net receipts verify");
-
-    for (participant, (verified, expected_outcome)) in
-        verified.into_iter().zip(&outcomes).enumerate()
-    {
-        assert_eq!(
-            verified.terminal,
-            ReceiptTermination::Completed,
-            "participant {participant}: expected completed receipt"
-        );
-        assert_eq!(verified.outcome_borsh.as_ref(), Some(expected_outcome));
-    }
+    run.expect_agreed_completion().await;
 }

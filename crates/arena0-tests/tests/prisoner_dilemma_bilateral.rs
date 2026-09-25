@@ -99,12 +99,5 @@ async fn prisoner_dilemma_bilateral_runs_and_verifies() {
             .await;
     }
 
-    let outcomes = run.expect_completed_all().await;
-    assert_eq!(
-        outcomes[0], outcomes[1],
-        "both participants must derive the identical outcome receipt"
-    );
-
-    assert_eq!(run.session_hash(0), run.session_hash(1));
-    run.verify_all().expect("both traces must verify");
+    run.expect_agreed_completion().await;
 }

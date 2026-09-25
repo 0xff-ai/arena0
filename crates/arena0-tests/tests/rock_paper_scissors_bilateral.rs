@@ -5,14 +5,19 @@
 
 use std::time::Duration;
 
-use arena0_protocol::{ColorDepth, ReceiptTermination, Slot, Viewport};
+use arena0_protocol::{ColorDepth, Slot, Viewport};
 use arena0_tests::arena::Arena;
 use arena0_tests::wasm::program_wasm;
 
 const CHOICE_ROCK: &[u8] = br#""Rock""#;
 const CHOICE_SCISSORS: &[u8] = br#""Scissors""#;
 
-async fn completed_run(wasm: &[u8]) -> arena0_tests::arena::Run {
+async fn completed_run(
+    wasm: &[u8],
+) -> (
+    arena0_tests::arena::Run,
+    Vec<arena0_protocol::ReceiptSummary>,
+) {
     let mut arena = Arena::new();
     arena
         .program(wasm.to_vec())
@@ -85,17 +90,15 @@ async fn completed_run(wasm: &[u8]) -> arena0_tests::arena::Run {
     run.expect_input(1)
         .respond_bytes(CHOICE_SCISSORS.to_vec())
         .await;
-    run.expect_completed_all().await;
-    run
+    let verified = run.expect_agreed_completion().await;
+    (run, verified)
 }
 
 #[tokio::test]
 async fn rock_paper_scissors_bilateral_runs_and_verifies_receipts() {
     let wasm = program_wasm("rock_paper_scissors");
-    let run = completed_run(&wasm).await;
+    let (run, verified) = completed_run(&wasm).await;
 
-    assert_eq!(run.completed_outcome(0), run.completed_outcome(1));
-    assert_eq!(run.session_hash(0), run.session_hash(1));
     assert_eq!(run.trace(0), run.trace(1));
     assert_eq!(run.receipt_bytes(0), run.receipt_bytes(1));
     assert_eq!(run.receipt(0).receipt_id(), run.receipt(1).receipt_id());
@@ -103,12 +106,9 @@ async fn rock_paper_scissors_bilateral_runs_and_verifies_receipts() {
         serde_json::to_value(run.receipt(0)).unwrap(),
         serde_json::to_value(run.receipt(1)).unwrap()
     );
-    let verified = run.verify_all().expect("both receipts verify");
-
     for (i, verified) in verified.into_iter().enumerate() {
         assert_eq!(verified.program_id, arena0_program::ProgramHash::of(&wasm));
         assert_eq!(verified.session_id, run.session_hash(i));
-        assert_eq!(verified.terminal, ReceiptTermination::Completed);
     }
 
     let mut trace = run.trace(0);

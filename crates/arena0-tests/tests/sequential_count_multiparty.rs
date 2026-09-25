@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use arena0_protocol::{ColorDepth, ReceiptTermination, Slot, Viewport};
+use arena0_protocol::{ColorDepth, Slot, Viewport};
 use arena0_tests::arena::{Arena, ArenaProgress};
 use arena0_tests::wasm::program_wasm;
 
@@ -60,26 +60,7 @@ async fn five_peers_count_in_commit_reveal_selected_round_robin_order() {
         "mono view contains SGR"
     );
 
-    let outcomes = run.expect_completed_all().await;
-    assert!(
-        outcomes.iter().all(|outcome| outcome == &outcomes[0]),
-        "all five participants must derive the same outcome"
-    );
-
-    let verified = run
-        .verify_all()
-        .expect("all five round-robin traces must verify");
-
-    for (participant, (verified, expected_outcome)) in
-        verified.into_iter().zip(&outcomes).enumerate()
-    {
-        assert_eq!(
-            verified.terminal,
-            ReceiptTermination::Completed,
-            "participant {participant}: expected completed receipt"
-        );
-        assert_eq!(verified.outcome_borsh.as_ref(), Some(expected_outcome));
-    }
+    run.expect_agreed_completion().await;
 
     let timeline = run.progress_timeline();
     for participant in 0..PARTICIPANTS {

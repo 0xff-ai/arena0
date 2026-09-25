@@ -55,18 +55,5 @@ async fn cumulative_sum_trilateral_runs_and_verifies() {
     }
     assert!(mono.slots[&Slot::State].contains("Contributions"));
 
-    let outcomes = run.expect_completed_all().await;
-    // All three nodes derive the identical total, and the same session id.
-    assert_eq!(
-        outcomes[0], outcomes[1],
-        "nodes 0 and 1 disagree on the total"
-    );
-    assert_eq!(
-        outcomes[1], outcomes[2],
-        "nodes 1 and 2 disagree on the total"
-    );
-    assert_eq!(run.session_hash(0), run.session_hash(1));
-    assert_eq!(run.session_hash(1), run.session_hash(2));
-
-    run.verify_all().expect("all three traces must verify");
+    run.expect_agreed_completion().await;
 }
