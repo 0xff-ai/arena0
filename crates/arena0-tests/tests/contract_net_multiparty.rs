@@ -1,10 +1,9 @@
 //! Three independent replicas agree on one bounded task assignment and verify
 //! every producer receipt's portable proof.
 
-use arena0_protocol::{ColorDepth, Slot, Viewport};
+use arena0_protocol::{ColorDepth, ReceiptTermination, Slot, Viewport};
 use arena0_tests::arena::Arena;
 use arena0_tests::wasm::program_wasm;
-use arena0_verify::LightVerifiedTerminal;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn contract_net_runs_and_every_producer_verifies() {
@@ -109,9 +108,11 @@ async fn contract_net_runs_and_every_producer_verifies() {
     for (participant, (verified, expected_outcome)) in
         verified.into_iter().zip(&outcomes).enumerate()
     {
-        let LightVerifiedTerminal::Completed { outcome_borsh } = verified.terminal else {
-            panic!("participant {participant}: expected completed receipt");
-        };
-        assert_eq!(&outcome_borsh, expected_outcome);
+        assert_eq!(
+            verified.terminal,
+            ReceiptTermination::Completed,
+            "participant {participant}: expected completed receipt"
+        );
+        assert_eq!(verified.outcome_borsh.as_ref(), Some(expected_outcome));
     }
 }

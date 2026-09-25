@@ -214,10 +214,13 @@ async fn recover_after(cut: CrashAfter) {
             receipts[0].receipt,
             arena0_protocol::ReceiptArtifact::StopReport(_)
         ));
-        let verified = arena0_verify::verify_light(&receipts[0].receipt.encode().unwrap()).unwrap();
+        let verified =
+            arena0_protocol::ReceiptArtifact::decode(&receipts[0].receipt.encode().unwrap())
+                .unwrap()
+                .summary();
         assert!(matches!(
             verified.terminal,
-            arena0_verify::LightVerifiedTerminal::Stopped { .. }
+            arena0_protocol::ReceiptTermination::Stopped { .. }
         ));
         progress.push((Milestone::ReceiptVerified, started.elapsed()));
         spawned.shutdown().await;

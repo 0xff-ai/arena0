@@ -187,7 +187,7 @@ participant retains its own evidence for later inspection or verification.
 
 ## Verification
 
-Portable/light verification is the only verification boundary. It checks
+Portable verification is the only verification boundary. It checks
 activation binding, signatures, the v3 trace chain, shared pre/post hashes,
 terminal evidence, and the v5 receipt identity without loading the program. A
 completed result includes authenticated opaque outcome bytes; a stopped result

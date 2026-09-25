@@ -20,7 +20,6 @@ use std::time::Instant;
 use arena0_api::{
     ActivityData, ActivityResult, ApiError, ApiErrorCode, ColorDepth, EnsembleSpec,
     ExecStatusState, HostRequest, NextEvent, PendingId, ProgramSummary, ReceiptRef, ResponseOk,
-    VerifiedResult,
 };
 use arena0_program::ParticipantCount;
 use arena0_protocol::{ExecId, NegotiationTarget, PeerId, SessionHash};
@@ -459,12 +458,12 @@ struct ParticipantOutput {
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
 struct VerifySessionOutput {
-    mode: Value,
     session: SessionRef,
     program: ProgramRef,
     participants: Vec<ParticipantOutput>,
     steps: u64,
     terminal: Value,
+    outcome_borsh: Option<Vec<u8>>,
 }
 
 fn output_schema<T: schemars::JsonSchema + std::any::Any>() -> Arc<rmcp::model::JsonObject> {
@@ -978,29 +977,20 @@ impl Arena0Mcp {
             )
             .await?
         {
-            ResponseOk::Verified {
-                receipt_id: _,
-                program_id,
-                session_id,
-                ensemble,
-                steps,
-                result,
-            } => {
-                let VerifiedResult::Light { terminal } = result;
-                Ok(Json(VerifySessionOutput {
-                    mode: serialized_value(&"light")?,
-                    session: session_ref(session_id),
-                    program: ProgramRef {
-                        program_id: program_id.to_string(),
-                    },
-                    participants: ensemble
-                        .into_iter()
-                        .map(|peer| self.participant(peer))
-                        .collect(),
-                    steps,
-                    terminal: serialized_value(&terminal)?,
-                }))
-            }
+            ResponseOk::Verified(summary) => Ok(Json(VerifySessionOutput {
+                session: session_ref(summary.session_id),
+                program: ProgramRef {
+                    program_id: summary.program_id.to_string(),
+                },
+                participants: summary
+                    .ensemble
+                    .into_iter()
+                    .map(|peer| self.participant(peer))
+                    .collect(),
+                steps: summary.steps,
+                terminal: serialized_value(&summary.terminal)?,
+                outcome_borsh: summary.outcome_borsh,
+            })),
             other => Err(unexpected(&other)),
         }
     }
@@ -2300,7 +2290,8 @@ mod tests {
                 assert_eq!(participants.len(), 2);
                 assert!(participants.iter().all(|participant| participant.get("host").is_none()));
                 assert!(verified["steps"].as_u64().is_some_and(|steps| steps > 0));
-                assert!(verified["terminal"].get("Completed").is_some());
+                assert_eq!(verified["terminal"], "Completed");
+                assert!(verified["outcome_borsh"].is_array());
             }
             for client in clients { client.cancel().await.unwrap(); }
             test.daemon.stop().await;

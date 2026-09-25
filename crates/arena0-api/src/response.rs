@@ -6,7 +6,7 @@ use arena0_crypto::AgentPubKey;
 use arena0_program::{JsonSchemaDocument, ParticipantCount, ProgramHash, ProgramSchema};
 use arena0_protocol::{
     ExecId, ExecLifecycle, NegotiationId, OfferHash, PeerId, PendingId, ReceiptArtifact,
-    SessionHash, StateHash, StopCause, TicketHash, TraceEntry, View,
+    ReceiptSummary, SessionHash, StateHash, TicketHash, TraceEntry, View,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -62,14 +62,7 @@ pub enum ResponseOk {
     ReceiptList(Vec<ReceiptListEntry>),
     /// `receipt.verify`: the recovered structural and cryptographic evidence,
     /// not a bool.
-    Verified {
-        receipt_id: arena0_protocol::ReceiptId,
-        program_id: ProgramHash,
-        session_id: SessionHash,
-        ensemble: Vec<PeerId>,
-        steps: u64,
-        result: VerifiedResult,
-    },
+    Verified(ReceiptSummary),
     DaemonInfo(DaemonInfo),
     /// The ack for `events.subscribe`; `EventFrame`s follow on the same connection.
     Subscribed,
@@ -517,31 +510,4 @@ pub struct ReceiptListEntry {
     pub program_id: ProgramHash,
     pub completed: bool,
     pub provenance: ReceiptProvenance,
-}
-
-/// The result of receipt verification.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub enum VerifiedResult {
-    /// Structural and cryptographic verification without Wasm.
-    Light {
-        /// Terminal evidence available without executing the guest.
-        terminal: LightVerifiedTerminal,
-    },
-}
-
-/// Terminal evidence returned by light verification.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub enum LightVerifiedTerminal {
-    /// The receipt records a signed completion. Light verification leaves the
-    /// JSON projection unavailable because it does not load the guest.
-    Completed {
-        /// Opaque stock-Borsh outcome bytes committed by the receipt.
-        outcome_borsh: Vec<u8>,
-    },
-    /// The receipt records an authenticated unilateral stop or a shared
-    /// N-of-N stop. The protocol evidence remains intact for callers.
-    Stopped { cause: StopCause },
 }

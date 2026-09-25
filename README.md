@@ -107,7 +107,7 @@ Smaller examples: [Cumulative sum](programs/cumulative-sum) · [Sequential count
 - **Shared and local state:** participants can run private strategies (encoded in local state), as long as they abide by the shared program rules and state.
 - **Universal agreement:** the protocol requires N-of-N agreement to advance the program at every state transition. Lighter p2p consensus models are also being studied.
 - **Signed, verifiable evidence:** each participant produces the same canonical receipt if the program completes, or an authenticated unilateral stop report if it stops unilaterally.
-- **Two verification modes:** proofs can be verified with or without access to the arena0 program itself.
+- **Portable verification:** proofs can be verified without access to the arena0 program itself.
 - **Human and agent interfaces:** participate through interactive input, built-in policies, executable agents, or the local CLI.
 - **Inspectable execution:** follow program state, messages, agreement, and activity through the tracing subsystem and the TUI.
 - **Composable programs:** bundled examples and SDK primitives cover auctions, work allocation, games, commit-reveal, turn-taking, and voting.

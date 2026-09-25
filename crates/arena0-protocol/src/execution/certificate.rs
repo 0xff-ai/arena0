@@ -3,9 +3,10 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::io;
 
-use crate::PeerId;
 use crate::negotiation::MAX_PARAMS_LEN;
 use crate::trace::{AggregateAttestation, SessionHeader, StepCommitment, StepSig, TraceEntry};
+use crate::{PeerId, SessionHash};
+use arena0_program::ProgramHash;
 use arena0_program::bounded;
 
 use super::{
@@ -305,6 +306,29 @@ pub enum ReceiptArtifact {
     StopReport(StopReport),
 }
 
+/// The portable facts established by an authenticated [`ReceiptArtifact`].
+///
+/// Verification authenticates the opaque Borsh outcome but does not run the
+/// guest to produce its JSON projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptSummary {
+    /// The content identity of the verified artifact.
+    pub receipt_id: ReceiptId,
+    /// The content-addressed program named by the activation.
+    pub program_id: ProgramHash,
+    /// The activation-derived session identity.
+    pub session_id: SessionHash,
+    /// The canonical participant order used by signer bitmaps.
+    pub ensemble: Vec<PeerId>,
+    /// Number of contiguous certified trace entries.
+    pub steps: u64,
+    /// The authenticated terminal classification and, for a stop, its cause.
+    pub terminal: crate::ReceiptTermination,
+    /// Opaque stock-Borsh outcome bytes, present exactly for a completion.
+    pub outcome_borsh: Option<Vec<u8>>,
+}
+
 /// Whether an artifact proves unanimous agreement or reports a unilateral stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -449,6 +473,35 @@ impl ReceiptArtifact {
         }
     }
 
+    /// Project the portable facts this authenticated artifact establishes.
+    ///
+    /// Every `ReceiptArtifact` is authenticated at construction, so this is
+    /// the complete receipt verification: it never loads Wasm or a sandbox.
+    #[must_use]
+    pub fn summary(&self) -> ReceiptSummary {
+        let body = self.body();
+        let activation = &body.header().activation;
+        let mut ensemble = activation
+            .tickets()
+            .iter()
+            .map(|ticket| ticket.data.signer)
+            .collect::<Vec<_>>();
+        ensemble.sort_unstable();
+        let terminal = body.termination().clone();
+        let outcome_borsh = matches!(terminal, crate::ReceiptTermination::Completed)
+            .then(|| body.outcome().to_vec());
+        ReceiptSummary {
+            receipt_id: self.receipt_id(),
+            program_id: activation.offer().data().program_hash,
+            session_id: activation.session_hash(),
+            ensemble,
+            // The trace is bounded by `MAX_RECEIPT_TRACE_ENTRIES`.
+            steps: body.trace().len() as u64,
+            terminal,
+            outcome_borsh,
+        }
+    }
+
     /// Encode under the portable artifact bound.
     pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
         let bytes =
@@ -516,5 +569,262 @@ impl ParticipantStepSignature {
     #[must_use]
     pub const fn signature(&self) -> &StepSig {
         &self.signature
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        Activation, AggregateAttestation, CHAIN_START, Committed, Ensemble, Offer, OfferData,
+        PreparedActivation, ReceiptBody, SessionHeader, SignerSet, StateHash, StepCommitment,
+        StepEvent, StepTerminal, TRACE_FORMAT_VERSION, Ticket, TicketAction, TicketData,
+        TraceEntry,
+    };
+    use crate::{PeerId, ReceiptTermination};
+    use arena0_crypto::{BlsSignature, ExecutionKey, ExecutionSalt, NodeKeys, SecretKey};
+    use arena0_program::ExecutionProfile;
+
+    fn fixture() -> Vec<u8> {
+        fixture_with_binding(ProgramHash([0x44; 32]), StateHash([0x11; 32]), false)
+            .expect("valid fixture")
+    }
+
+    fn fixture_with_binding(
+        program_hash: ProgramHash,
+        initial_state: StateHash,
+        two_steps: bool,
+    ) -> Result<Vec<u8>, crate::ProtocolError> {
+        fixture_with_message_sender(program_hash, initial_state, two_steps, None)
+    }
+
+    fn fixture_with_message_sender(
+        program_hash: ProgramHash,
+        initial_state: StateHash,
+        two_steps: bool,
+        message_sender: Option<PeerId>,
+    ) -> Result<Vec<u8>, crate::ProtocolError> {
+        let negotiation = crate::NegotiationId([9; 32]);
+        let keys = [
+            NodeKeys::from_secret(SecretKey::from_bytes([1; 32])),
+            NodeKeys::from_secret(SecretKey::from_bytes([2; 32])),
+        ];
+        let mut participants = keys
+            .iter()
+            .enumerate()
+            .map(|(index, identity)| {
+                let peer = PeerId(identity.ed25519_public_key().0);
+                let execution = ExecutionKey::derive(
+                    &ExecutionSalt::try_from_bytes([index as u8 + 10; 32])
+                        .expect("non-zero test salt"),
+                    &[index as u8 + 20; 32],
+                    &negotiation.0,
+                )
+                .expect("fixture execution key");
+                (peer, identity, execution)
+            })
+            .collect::<Vec<_>>();
+        participants.sort_by_key(|(peer, _, _)| *peer);
+        let creator = participants[0].0;
+        let params = br#"{"seed":1}"#.to_vec();
+        let profile = ExecutionProfile::current().hash();
+        let data = OfferData::new(
+            negotiation,
+            0,
+            creator,
+            program_hash,
+            profile,
+            arena0_program::JsonBytes::try_new(params.clone()).expect("fixture JSON params"),
+            2,
+            initial_state,
+            1,
+        )
+        .expect("fixture offer");
+        let offer_hash = crate::OfferHash::of(&data);
+        let mut tickets = Vec::new();
+        for (peer, identity, execution) in &participants {
+            let action = TicketAction::Active {
+                execution_bls: execution.public_key(),
+                key_binding: execution.key_binding(&offer_hash.0, &peer.0),
+                issued_at_unix_ms: 0,
+                valid_for_ms: 1,
+            };
+            let ticket_data =
+                TicketData::new(negotiation, 0, *peer, 0, action).expect("fixture ticket data");
+            let signature = identity.sign(&ticket_data.signing_bytes());
+            tickets.push(Ticket {
+                data: ticket_data,
+                signature,
+            });
+        }
+        let ticket_hashes = tickets
+            .iter()
+            .map(|ticket| crate::TicketHash::of(&ticket.data))
+            .collect::<Vec<_>>();
+        let offer = Offer::new(data, ticket_hashes).expect("fixture offer");
+        let prepared = PreparedActivation::new(offer, tickets).expect("fixture preparation");
+        let activation_signatures = participants
+            .iter()
+            .map(|(_, _, execution)| execution.sign(&prepared.activation_data().signing_bytes()))
+            .collect::<Vec<_>>();
+        let activation = Activation::new(
+            prepared,
+            BlsSignature::aggregate(&activation_signatures).expect("aggregate"),
+        )
+        .expect("fixture activation");
+        let session = activation.session_hash();
+        let ensemble = Ensemble::<Committed>::from_peers(
+            participants.iter().map(|(peer, _, _)| *peer).collect(),
+        )
+        .expect("fixture ensemble");
+        let outcome = vec![7, 8, 9];
+        let first_post_state = StateHash::of(&[1]);
+        let final_state = if two_steps {
+            StateHash::of(&[2])
+        } else {
+            first_post_state
+        };
+        let mut entries = Vec::new();
+        let mut first = TraceEntry {
+            trace_version: TRACE_FORMAT_VERSION,
+            step: 0,
+            event: StepEvent::SessionStarted {
+                ensemble: ensemble.clone(),
+            },
+            pre_state: initial_state,
+            post_state: first_post_state,
+            terminal: (!two_steps).then(|| StepTerminal::End {
+                outcome: outcome.clone(),
+            }),
+            agreement: AggregateAttestation::empty(),
+        };
+        let first_commitment = StepCommitment::for_entry(session, &first, CHAIN_START);
+        let step_signatures = participants
+            .iter()
+            .map(|(_, _, execution)| execution.sign(&first_commitment.signing_bytes()))
+            .collect::<Vec<_>>();
+        first.agreement = AggregateAttestation::from_signatures(
+            SignerSet::full(participants.len()).expect("full signer set"),
+            &step_signatures,
+        )
+        .expect("step aggregate");
+        entries.push(first);
+        if two_steps {
+            let msg = vec![42];
+            let sender = message_sender.unwrap_or(participants[1].0);
+            let mut second = TraceEntry {
+                trace_version: TRACE_FORMAT_VERSION,
+                step: 1,
+                event: StepEvent::Message {
+                    from: sender,
+                    data: msg,
+                },
+                pre_state: first_post_state,
+                post_state: final_state,
+                terminal: Some(StepTerminal::End {
+                    outcome: outcome.clone(),
+                }),
+                agreement: AggregateAttestation::empty(),
+            };
+            let second_commitment =
+                StepCommitment::for_entry(session, &second, first_commitment.link_hash());
+            let step_signatures = participants
+                .iter()
+                .map(|(_, _, execution)| execution.sign(&second_commitment.signing_bytes()))
+                .collect::<Vec<_>>();
+            second.agreement = AggregateAttestation::from_signatures(
+                SignerSet::full(participants.len()).expect("full signer set"),
+                &step_signatures,
+            )
+            .expect("step aggregate");
+            entries.push(second);
+        }
+        let body = ReceiptBody::new(
+            SessionHeader::new(activation, ReceiptTermination::Completed),
+            outcome,
+            params,
+            entries,
+        )
+        .expect("fixture body");
+
+        crate::ReceiptArtifact::new(body)?.encode()
+    }
+
+    #[test]
+    fn invalid_receipt_encodings_fail_closed() {
+        let mut samples = vec![Vec::new(), vec![0xff], vec![1], vec![1, 99]];
+        samples.push(vec![0u8; crate::MAX_RECEIPT_BYTES + 1]);
+        for bytes in samples {
+            assert!(ReceiptArtifact::decode(&bytes).is_err());
+        }
+
+        let original = fixture();
+        let cases = [0, 1, original.len() / 2, original.len() - 1];
+        for offset in cases {
+            let mut bytes = original.clone();
+            bytes[offset] ^= 1;
+            assert!(ReceiptArtifact::decode(&bytes).is_err());
+        }
+
+        for end in 0..original.len() {
+            assert!(
+                ReceiptArtifact::decode(&original[..end]).is_err(),
+                "invalid prefix at {end}"
+            );
+        }
+        let mut unknown = original;
+        unknown[0] = 0xff;
+        assert!(ReceiptArtifact::decode(&unknown).is_err());
+    }
+
+    #[test]
+    fn obsolete_receipt_and_body_versions_are_rejected() {
+        let original = fixture();
+        for (offset, version) in [(0, 2), (1, 2), (0, 3), (1, 3)] {
+            let mut bytes = original.clone();
+            bytes[offset] = version;
+            assert!(
+                ReceiptArtifact::decode(&bytes).is_err(),
+                "obsolete version at {offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_canonical_receipt_is_accepted() {
+        let bytes = fixture();
+        let summary = ReceiptArtifact::decode(&bytes)
+            .expect("fixture verifies")
+            .summary();
+        assert_eq!(summary.steps, 1);
+        assert_eq!(summary.terminal, ReceiptTermination::Completed);
+        assert_eq!(summary.outcome_borsh, Some(vec![7, 8, 9]));
+    }
+
+    #[test]
+    fn valid_multi_step_message_receipt_is_accepted() {
+        let bytes = fixture_with_binding(ProgramHash([0x44; 32]), StateHash([0x11; 32]), true)
+            .expect("valid multi-step fixture");
+        let summary = ReceiptArtifact::decode(&bytes)
+            .expect("multi-step fixture verifies")
+            .summary();
+        assert_eq!(summary.steps, 2);
+        assert_eq!(summary.terminal, ReceiptTermination::Completed);
+        assert_eq!(summary.outcome_borsh, Some(vec![7, 8, 9]));
+    }
+
+    #[test]
+    fn message_receipt_rejects_sender_outside_ensemble() {
+        let error = fixture_with_message_sender(
+            ProgramHash([0x44; 32]),
+            StateHash([0x11; 32]),
+            true,
+            Some(PeerId([0x77; 32])),
+        )
+        .expect_err("outsider message must not become authenticated evidence");
+        assert!(matches!(
+            error,
+            crate::ProtocolError::UnknownParticipant { .. }
+        ));
     }
 }

@@ -133,7 +133,7 @@ arena0 verify <session-id> --hosts host-01,host-02
 ```
 
 Name the execution's actual participant set. Without `--hosts`, verification
-uses the selected participant. Verification is portable/light: it checks the
+uses the selected participant. Verification is portable: it checks the
 activation, ordered trace, N-of-N signatures, shared state hashes, terminal
 evidence, and receipt identity without loading or executing the Wasm program.
 Retained copies of the same canonical receipt have the same identifier;

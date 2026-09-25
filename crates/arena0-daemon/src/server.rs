@@ -21,8 +21,8 @@ use arena0_api::{
     EffectSummary as ApiEffectSummary, EnsembleSpec, EventData, EventFilter, EventFrame,
     EventKind as ApiEventKind, EventRecordSummary as ApiEventRecordSummary, ExecLifecycle,
     ExecOrigin, ExecStatus, ExecStatusState, ExecutionFailureKind, ExecutionInspection, HostInfo,
-    LightVerifiedTerminal, NegotiationStage, NextEvent, PendingCalloutStatus, ProgramRefError,
-    ReceiptRef, Response, ResponseOk, SessionProgress, SessionStatus, VerifiedResult, frame,
+    NegotiationStage, NextEvent, PendingCalloutStatus, ProgramRefError, ReceiptRef, Response,
+    ResponseOk, SessionProgress, SessionStatus, frame,
 };
 use arena0_api::{HostRequest, HostStatus};
 use arena0_crypto::{AgentPubKey, ExecutionKey, NodeKeys};
@@ -44,7 +44,6 @@ use arena0_protocol::{
 };
 use arena0_sandbox::{LoadedProgram, Program, WasmtimeEngine};
 use arena0_transport::{NegotiationTopic, ProgramTopicEvent, Transport};
-use arena0_verify::{LightVerifiedTerminal as VerifiedLightTerminal, verify_light};
 use retry::delay::{Exponential, jitter};
 use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
@@ -3513,11 +3512,7 @@ impl HostService {
 
     /// Verify and persist a foreign receipt as an immutable artifact.
     async fn import_receipt(&self, receipt: ReceiptArtifact) -> Response {
-        let receipt_bytes = receipt
-            .encode()
-            .map_err(|error| ApiError::new(ApiErrorCode::Verification, error.to_string()))?;
-        verify_light(&receipt_bytes)
-            .map_err(|e| ApiError::new(ApiErrorCode::Verification, format!("light: {e:?}")))?;
+        // Deserialization authenticated the artifact.
         let receipt_id = receipt.receipt_id();
         self.store
             .import_receipt(receipt, unix_time_ms())
@@ -3549,26 +3544,7 @@ impl HostService {
     /// Verify a receipt and return its portable structural evidence.
     async fn verify(&self, receipt: ReceiptRef) -> Response {
         let receipt = self.resolve_receipt(receipt).await?;
-        let receipt_bytes = receipt
-            .encode()
-            .map_err(|error| ApiError::new(ApiErrorCode::Verification, error.to_string()))?;
-        let light = verify_light(&receipt_bytes)
-            .map_err(|e| ApiError::new(ApiErrorCode::Verification, format!("light: {e:?}")))?;
-
-        let terminal = match light.terminal {
-            VerifiedLightTerminal::Completed { outcome_borsh } => {
-                LightVerifiedTerminal::Completed { outcome_borsh }
-            }
-            VerifiedLightTerminal::Stopped { cause } => LightVerifiedTerminal::Stopped { cause },
-        };
-        Ok(ResponseOk::Verified {
-            receipt_id: receipt.receipt_id(),
-            program_id: light.program_id,
-            session_id: light.session_id,
-            ensemble: light.ensemble,
-            steps: light.steps,
-            result: VerifiedResult::Light { terminal },
-        })
+        Ok(ResponseOk::Verified(receipt.summary()))
     }
 }
 

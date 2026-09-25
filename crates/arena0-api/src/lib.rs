@@ -21,7 +21,8 @@ mod response;
 
 pub use activity::{ActivityData, ActivityFrame, ActivityResult};
 pub use arena0_protocol::{
-    ColorDepth, ExecLifecycle, NegotiationTarget, PendingId, ReceiptArtifact, View,
+    ColorDepth, ExecLifecycle, NegotiationTarget, PendingId, ReceiptArtifact, ReceiptSummary,
+    ReceiptTermination, View,
 };
 pub use events::{
     EventData, EventFilter, EventFrame, ExecOrigin, ExecutionFailureKind, NegotiationStage,
@@ -32,9 +33,8 @@ pub use response::{
     ActivationInspection, ActivationInspectionState, ActivationParticipant, ApiError, ApiErrorCode,
     DaemonInfo, EffectKind, EffectSummary, EventKind, EventRecordSummary, ExecEndPhase,
     ExecEndStatus, ExecStatus, ExecStatusState, ExecutionInspection, HostInfo, HostStatus, IdInfo,
-    LightVerifiedTerminal, NextEvent, PendingCalloutStatus, ProgramDetail, ProgramSummary,
-    ReceiptListEntry, ReceiptProvenance, Response, ResponseOk, SessionProgress, SessionStatus,
-    VerifiedResult,
+    NextEvent, PendingCalloutStatus, ProgramDetail, ProgramSummary, ReceiptListEntry,
+    ReceiptProvenance, Response, ResponseOk, SessionProgress, SessionStatus,
 };
 
 #[cfg(test)]
@@ -383,53 +383,28 @@ mod tests {
     }
 
     #[test]
-    fn public_terminal_json_contains_only_agent_values() {
-        let verified = LightVerifiedTerminal::Completed {
-            outcome_borsh: vec![0],
-        };
-        let json = serde_json::to_value(verified).unwrap();
-        assert_eq!(json["Completed"]["outcome_borsh"], serde_json::json!([0]));
-        assert!(json["Completed"].get("outcome_json").is_none());
-        assert!(
-            serde_json::from_value::<LightVerifiedTerminal>(serde_json::json!({
-                "Completed": {"outcome_borsh": [0], "outcome_json": null}
-            }))
-            .is_err()
-        );
-
-        let verified = VerifiedResult::Light {
-            terminal: LightVerifiedTerminal::Completed {
-                outcome_borsh: vec![0],
-            },
-        };
-        let json = serde_json::to_value(verified).unwrap();
-        assert!(
-            json["Light"]["terminal"]["Completed"]
-                .get("outcome_json")
-                .is_none()
-        );
-
-        let response = Ok(ResponseOk::Verified {
+    fn verified_json_contains_only_agent_values() {
+        let response = Ok(ResponseOk::Verified(ReceiptSummary {
             receipt_id: arena0_protocol::ReceiptId::from_bytes([9; 32]),
             program_id: ProgramHash([1; 32]),
             session_id: SessionHash([2; 32]),
             ensemble: vec![PeerId([3; 32])],
             steps: 1,
-            result: VerifiedResult::Light {
-                terminal: LightVerifiedTerminal::Completed {
-                    outcome_borsh: vec![0],
-                },
-            },
-        });
+            terminal: ReceiptTermination::Completed,
+            outcome_borsh: Some(vec![0]),
+        }));
         let encoded = serde_json::to_value(&response).unwrap();
-        assert!(
-            encoded["Ok"]["Verified"]["result"]["Light"]["terminal"]["Completed"]
-                .get("outcome_json")
-                .is_none()
-        );
+        let verified = &encoded["Ok"]["Verified"];
+        assert_eq!(verified["terminal"], serde_json::json!("Completed"));
+        assert_eq!(verified["outcome_borsh"], serde_json::json!([0]));
+        assert!(verified.get("outcome_json").is_none());
         assert_eq!(
-            serde_json::from_value::<Response>(encoded).unwrap(),
+            serde_json::from_value::<Response>(encoded.clone()).unwrap(),
             response
         );
+
+        let mut unknown = encoded;
+        unknown["Ok"]["Verified"]["outcome_json"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<Response>(unknown).is_err());
     }
 }

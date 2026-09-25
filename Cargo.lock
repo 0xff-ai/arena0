@@ -140,7 +140,6 @@ dependencies = [
  "anyhow",
  "arena0-client",
  "arena0-home",
- "arena0-verify",
  "clap",
  "crossterm",
  "futures",
@@ -209,7 +208,6 @@ dependencies = [
  "arena0-store",
  "arena0-test-engine",
  "arena0-transport",
- "arena0-verify",
  "axum",
  "fs2",
  "futures",
@@ -406,7 +404,6 @@ dependencies = [
  "arena0-store",
  "arena0-test-engine",
  "arena0-transport",
- "arena0-verify",
  "borsh",
  "hex",
  "serde_json",
@@ -430,16 +427,6 @@ dependencies = [
  "bytes",
  "thiserror 2.0.18",
  "tokio",
-]
-
-[[package]]
-name = "arena0-verify"
-version = "0.1.0"
-dependencies = [
- "arena0-crypto",
- "arena0-program",
- "arena0-protocol",
- "thiserror 2.0.18",
 ]
 
 [[package]]

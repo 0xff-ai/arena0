@@ -78,7 +78,7 @@ protocol foundations
     arena0-crypto -> arena0-wire -> arena0-program -> arena0-protocol
 
 host capabilities
-    arena0-store + arena0-transport + arena0-sandbox + arena0-verify
+    arena0-store + arena0-transport + arena0-sandbox
 
 guest authoring and Host runtime
     arena0-sdk-macros + arena0-sdk + arena0-primitives + programs
@@ -96,7 +96,7 @@ Protocol crates do not depend on Tokio, SQLite, Wasmtime, a transport implementa
 The three executables retain narrow dependency closures:
 
 ```text
-arena0       -> arena0-home + arena0-client + arena0-verify
+arena0       -> arena0-home + arena0-client
 arena0d      -> arena0-home + arena0-daemon
 cargo-arena0 -> arena0-sandbox
 ```
@@ -275,7 +275,7 @@ window elapses. Startup resumes executions that are still `Ending`; a frame
 from a peer that never confirmed wakes a retired execution. The daemon
 supervisor does not stop the actor merely because it observed the receipt.
 
-Portable/light verification is the only verification boundary. It checks the
+Portable verification is the only verification boundary. It checks the
 activation, identities, v3 trace chain, aggregate agreements, terminal
 evidence, and v5 receipt identity without loading Wasm. A completed result
 contains authenticated opaque outcome bytes; a stopped result contains its

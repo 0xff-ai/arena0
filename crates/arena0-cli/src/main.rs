@@ -2,8 +2,8 @@
 //!
 //! This binary is deliberately a local client: it sends typed requests to one
 //! daemon socket with an explicit Host target and renders the response. Persistent and command-scoped Host
-//! supervision both execute `arena0d`; offline proof verification lives in
-//! `arena0-verify`.
+//! supervision both execute `arena0d`; offline proof verification is
+//! `arena0-protocol`'s `ReceiptArtifact` authentication.
 
 mod agent;
 mod context;
@@ -33,10 +33,10 @@ use anyhow::{Context, anyhow, bail};
 use arena0_client::answer;
 use arena0_client::api::{
     ApiErrorCode, AwaitState, EnsembleSpec, ExecStatus, HostRequest, NextEvent, PendingId,
-    ResponseOk, VerifiedResult,
+    ReceiptSummary, ResponseOk,
 };
 use arena0_client::proto::DaemonClient;
-use arena0_client::protocol::{ExecId, PeerId, ReceiptTermination, SessionHash, View, Viewport};
+use arena0_client::protocol::{ExecId, PeerId, ReceiptTermination, View, Viewport};
 use arena0_home::HostName;
 use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::{Value, json};
@@ -1065,7 +1065,7 @@ fn render_coordinated_result(
             .map(|receipt| {
                 json!({
                     "peer_id": receipt.peer_id.to_string(),
-                    "receipt_id": receipt.receipt_id.to_string(),
+                    "receipt_id": receipt.summary.receipt_id.to_string(),
                     "result": "valid",
                 })
             })
@@ -1778,16 +1778,7 @@ async fn receipt(ctx: &Ctx, command: ReceiptCommand) -> anyhow::Result<()> {
                 .resolve_receipt_ref(&ctx.host, &session)
                 .await?;
             match ctx.call(&HostRequest::ReceiptVerify { receipt }).await? {
-                ResponseOk::Verified {
-                    receipt_id,
-                    program_id,
-                    session_id,
-                    ensemble,
-                    steps,
-                    result,
-                } => render_verified(
-                    ctx, receipt_id, program_id, session_id, ensemble, steps, result,
-                ),
+                ResponseOk::Verified(summary) => render_verified(ctx, &summary),
                 other => bail!("unexpected response to receipt.verify: {other:?}"),
             }
         }
@@ -1810,33 +1801,17 @@ fn render_receipt(receipt: &arena0_client::protocol::ReceiptArtifact) {
     );
 }
 
-fn render_verified(
-    ctx: &Ctx,
-    receipt_id: arena0_client::protocol::ReceiptId,
-    program_id: arena0_client::protocol::ProgramHash,
-    session_id: SessionHash,
-    ensemble: Vec<PeerId>,
-    steps: u64,
-    result: VerifiedResult,
-) {
-    let document = json!({
-        "receipt_id": receipt_id.to_string(),
-        "program_id": program_id.to_string(),
-        "session_id": session_id.to_string(),
-        "ensemble": ensemble.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "steps": steps,
-        "result": result,
-    });
+fn render_verified(ctx: &Ctx, summary: &ReceiptSummary) {
     if ctx.mode.is_json() {
-        ui::print_json(&document);
+        ui::print_json(&json!(summary));
     } else {
         println!("verified");
-        println!("  receipt  {}", receipt_id);
-        println!("  program  {}", program_id);
-        println!("  session  {}", session_id);
-        println!("  ensemble {} participants", ensemble.len());
-        println!("  steps    {steps}");
-        println!("  result   {:?}", result);
+        println!("  receipt  {}", summary.receipt_id);
+        println!("  program  {}", summary.program_id);
+        println!("  session  {}", summary.session_id);
+        println!("  ensemble {} participants", summary.ensemble.len());
+        println!("  steps    {}", summary.steps);
+        println!("  terminal {:?}", summary.terminal);
     }
 }
 

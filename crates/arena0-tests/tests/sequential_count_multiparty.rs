@@ -3,10 +3,9 @@
 
 use std::time::Duration;
 
-use arena0_protocol::{ColorDepth, Slot, Viewport};
+use arena0_protocol::{ColorDepth, ReceiptTermination, Slot, Viewport};
 use arena0_tests::arena::{Arena, ArenaProgress};
 use arena0_tests::wasm::program_wasm;
-use arena0_verify::LightVerifiedTerminal;
 
 fn encode_params(target_size: u32, count_to: u32) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({ "target_size": target_size, "count_to": count_to }))
@@ -74,10 +73,12 @@ async fn five_peers_count_in_commit_reveal_selected_round_robin_order() {
     for (participant, (verified, expected_outcome)) in
         verified.into_iter().zip(&outcomes).enumerate()
     {
-        let LightVerifiedTerminal::Completed { outcome_borsh } = verified.terminal else {
-            panic!("participant {participant}: expected completed receipt");
-        };
-        assert_eq!(&outcome_borsh, expected_outcome);
+        assert_eq!(
+            verified.terminal,
+            ReceiptTermination::Completed,
+            "participant {participant}: expected completed receipt"
+        );
+        assert_eq!(verified.outcome_borsh.as_ref(), Some(expected_outcome));
     }
 
     let timeline = run.progress_timeline();

@@ -17,7 +17,8 @@ use anyhow::{Context, anyhow, bail};
 use arena0_client::answer;
 use arena0_client::api::{
     ApiErrorCode, AwaitState, EnsembleSpec, EventData, EventFilter, HostRequest, NextEvent,
-    ProgramDetail, ProgramSummary, ReceiptRef, Request, ResponseOk, VerifiedResult,
+    ProgramDetail, ProgramSummary, ReceiptRef, ReceiptSummary, ReceiptTermination, Request,
+    ResponseOk,
 };
 use arena0_client::proto::{DaemonClient, Subscription};
 use arena0_client::protocol::{
@@ -238,23 +239,7 @@ impl AggregateTerminal {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct HostEvidence {
     pub(crate) peer_id: PeerId,
-    pub(crate) receipt_id: arena0_client::protocol::ReceiptId,
-    pub(crate) program_id: ProgramHash,
-    pub(crate) session_id: SessionHash,
-    pub(crate) ensemble: Vec<PeerId>,
-    pub(crate) steps: u64,
-    pub(crate) result: VerifiedResult,
-}
-
-/// Shared facts recovered from every Host receipt.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct EvidenceAgreement {
-    pub(crate) receipt_id: arena0_client::protocol::ReceiptId,
-    pub(crate) program_id: ProgramHash,
-    pub(crate) session_id: SessionHash,
-    pub(crate) ensemble: Vec<PeerId>,
-    pub(crate) steps: u64,
-    pub(crate) result: VerifiedResult,
+    pub(crate) summary: ReceiptSummary,
 }
 
 /// One result document for the CLI to render.  It contains no receipt body and
@@ -735,7 +720,7 @@ impl Coordinator {
                 self.participants.len()
             );
         }
-        let terminal = bind_verified_terminal(terminal, &agreement.result)?;
+        let terminal = bind_verified_terminal(terminal, &agreement.terminal)?;
 
         Ok(AggregateResult {
             receipt_id: agreement.receipt_id,
@@ -2049,23 +2034,8 @@ async fn verify_one_receipt(
             )
             .await?
         {
-            Ok(ResponseOk::Verified {
-                receipt_id,
-                program_id,
-                session_id,
-                ensemble,
-                steps,
-                result,
-            }) => {
-                return Ok(HostEvidence {
-                    receipt_id,
-                    peer_id,
-                    program_id,
-                    session_id,
-                    ensemble,
-                    steps,
-                    result,
-                });
+            Ok(ResponseOk::Verified(summary)) => {
+                return Ok(HostEvidence { peer_id, summary });
             }
             Ok(other) => bail!("unexpected receipt.verify response: {other:?}"),
             Err(error) if error.code == ApiErrorCode::NotFound => {
@@ -2132,11 +2102,11 @@ fn compare_terminals(terminals: &[HostTerminal]) -> anyhow::Result<TerminalConse
 
 /// Compare the facts every Host receipt claims.  This is intentionally a
 /// pure function so disagreement remains easy to test without a daemon.
-pub(crate) fn compare_evidence(receipts: &[HostEvidence]) -> anyhow::Result<EvidenceAgreement> {
-    let Some(first) = receipts.first() else {
+pub(crate) fn compare_evidence(receipts: &[HostEvidence]) -> anyhow::Result<ReceiptSummary> {
+    let Some(first) = receipts.first().map(|receipt| &receipt.summary) else {
         bail!("no Host receipts were verified");
     };
-    for receipt in &receipts[1..] {
+    for receipt in receipts[1..].iter().map(|receipt| &receipt.summary) {
         if receipt.receipt_id != first.receipt_id {
             bail!("Hosts retained different receipt artifacts");
         }
@@ -2152,37 +2122,24 @@ pub(crate) fn compare_evidence(receipts: &[HostEvidence]) -> anyhow::Result<Evid
         if receipt.steps != first.steps {
             bail!("Host receipts disagree on step count");
         }
-        if receipt.result != first.result {
+        if receipt.terminal != first.terminal || receipt.outcome_borsh != first.outcome_borsh {
             bail!("Host receipts disagree on terminal result");
         }
     }
-    Ok(EvidenceAgreement {
-        receipt_id: first.receipt_id,
-        program_id: first.program_id,
-        session_id: first.session_id,
-        ensemble: first.ensemble.clone(),
-        steps: first.steps,
-        result: first.result.clone(),
-    })
+    Ok(first.clone())
 }
 
 fn bind_verified_terminal(
     live: TerminalConsensus,
-    verified: &VerifiedResult,
+    verified: &ReceiptTermination,
 ) -> anyhow::Result<AggregateTerminal> {
     match (live, verified) {
-        (
-            TerminalConsensus::Completed { outcome, .. },
-            VerifiedResult::Light {
-                terminal: arena0_client::api::LightVerifiedTerminal::Completed { .. },
-            },
-        ) => Ok(AggregateTerminal::Completed { outcome }),
-        (
-            TerminalConsensus::Stopped,
-            VerifiedResult::Light {
-                terminal: arena0_client::api::LightVerifiedTerminal::Stopped { cause },
-            },
-        ) => Ok(classify_stop(cause)),
+        (TerminalConsensus::Completed { outcome, .. }, ReceiptTermination::Completed) => {
+            Ok(AggregateTerminal::Completed { outcome })
+        }
+        (TerminalConsensus::Stopped, ReceiptTermination::Stopped { cause }) => {
+            Ok(classify_stop(cause))
+        }
         (TerminalConsensus::Completed { .. }, _) => {
             bail!("live completion disagrees with stopped receipt evidence")
         }
@@ -2327,9 +2284,7 @@ fn first_allowed_value(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arena0_client::api::{
-        ApiError, ExecStatus, ExecStatusState, LightVerifiedTerminal, Response, SessionStatus,
-    };
+    use arena0_client::api::{ApiError, ExecStatus, ExecStatusState, Response, SessionStatus};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
@@ -2958,11 +2913,6 @@ mod tests {
         let mut connections = Vec::new();
 
         for (index, name) in ["first", "second"].into_iter().enumerate() {
-            let terminal = VerifiedResult::Light {
-                terminal: LightVerifiedTerminal::Completed {
-                    outcome_borsh: vec![1],
-                },
-            };
             let responses = vec![
                 host_info_response(name, peers[index]),
                 program_response(program_id),
@@ -2977,14 +2927,15 @@ mod tests {
                     session_id,
                     outcome: Some(json!({"winner": "none"})),
                 })),
-                Ok(ResponseOk::Verified {
+                Ok(ResponseOk::Verified(ReceiptSummary {
                     receipt_id: arena0_client::protocol::ReceiptId::from_bytes([9; 32]),
                     program_id,
                     session_id,
                     ensemble: peers.to_vec(),
                     steps: 3,
-                    result: terminal,
-                }),
+                    terminal: ReceiptTermination::Completed,
+                    outcome_borsh: Some(vec![1]),
+                })),
             ];
             scripts.push((host(name), responses));
             connections.push(HostConnection {
@@ -3525,36 +3476,25 @@ mod tests {
         let session_id = SessionHash([3; 32]);
         let program_id = ProgramHash([4; 32]);
         let ensemble = vec![peer_a, peer_b];
-        let result = VerifiedResult::Light {
-            terminal: arena0_client::api::LightVerifiedTerminal::Completed {
-                outcome_borsh: vec![1],
-            },
+        let first = ReceiptSummary {
+            receipt_id: arena0_client::protocol::ReceiptId::from_bytes([9; 32]),
+            program_id,
+            session_id,
+            ensemble,
+            steps: 1,
+            terminal: ReceiptTermination::Completed,
+            outcome_borsh: Some(vec![1]),
         };
-        let mut second = result.clone();
-        if let VerifiedResult::Light {
-            terminal: arena0_client::api::LightVerifiedTerminal::Completed { outcome_borsh },
-        } = &mut second
-        {
-            outcome_borsh.push(2);
-        }
+        let mut second = first.clone();
+        second.outcome_borsh = Some(vec![1, 2]);
         let receipts = vec![
             HostEvidence {
-                receipt_id: arena0_client::protocol::ReceiptId::from_bytes([9; 32]),
                 peer_id: peer_a,
-                program_id,
-                session_id,
-                ensemble: ensemble.clone(),
-                steps: 1,
-                result,
+                summary: first,
             },
             HostEvidence {
-                receipt_id: arena0_client::protocol::ReceiptId::from_bytes([9; 32]),
                 peer_id: peer_b,
-                program_id,
-                session_id,
-                ensemble,
-                steps: 1,
-                result: second,
+                summary: second,
             },
         ];
         assert!(
@@ -3569,21 +3509,20 @@ mod tests {
     fn matching_outcomes_do_not_hide_different_receipt_ids() {
         let first = HostEvidence {
             peer_id: PeerId([1; 32]),
-            receipt_id: arena0_client::protocol::ReceiptId::from_bytes([3; 32]),
-            program_id: ProgramHash([4; 32]),
-            session_id: SessionHash([5; 32]),
-            ensemble: vec![PeerId([1; 32]), PeerId([2; 32])],
-            steps: 1,
-            result: VerifiedResult::Light {
-                terminal: LightVerifiedTerminal::Completed {
-                    outcome_borsh: vec![7],
-                },
+            summary: ReceiptSummary {
+                receipt_id: arena0_client::protocol::ReceiptId::from_bytes([3; 32]),
+                program_id: ProgramHash([4; 32]),
+                session_id: SessionHash([5; 32]),
+                ensemble: vec![PeerId([1; 32]), PeerId([2; 32])],
+                steps: 1,
+                terminal: ReceiptTermination::Completed,
+                outcome_borsh: Some(vec![7]),
             },
         };
         let mut second = first.clone();
         second.peer_id = PeerId([2; 32]);
         assert!(compare_evidence(&[first.clone(), second.clone()]).is_ok());
-        second.receipt_id = arena0_client::protocol::ReceiptId::from_bytes([6; 32]);
+        second.summary.receipt_id = arena0_client::protocol::ReceiptId::from_bytes([6; 32]);
         assert!(
             compare_evidence(&[first, second])
                 .unwrap_err()
@@ -3593,12 +3532,8 @@ mod tests {
     }
 
     #[test]
-    fn light_verification_keeps_live_terminal_outcome() {
-        let verified = VerifiedResult::Light {
-            terminal: arena0_client::api::LightVerifiedTerminal::Completed {
-                outcome_borsh: vec![1],
-            },
-        };
+    fn verification_keeps_live_terminal_outcome() {
+        let verified = ReceiptTermination::Completed;
         let live = || TerminalConsensus::Completed {
             session_id: SessionHash([7; 32]),
             outcome: Some(json!({"winner": 2})),
@@ -3615,21 +3550,19 @@ mod tests {
     fn authenticated_stop_is_classified_only_from_verified_evidence() {
         use arena0_client::protocol::{CHAIN_START, STEP_COMMIT_DOMAIN, StateHash, StepCommitment};
 
-        let stopped = VerifiedResult::Light {
-            terminal: arena0_client::api::LightVerifiedTerminal::Stopped {
-                cause: StopCause::Shared {
-                    kind: AbortKind::Abort,
-                    commitment: StepCommitment {
-                        domain: STEP_COMMIT_DOMAIN,
-                        session_id: SessionHash([8; 32]),
-                        step: 2,
-                        entry_hash: [9; 32],
-                        pre_state: StateHash([10; 32]),
-                        post_state: StateHash([11; 32]),
-                        link: CHAIN_START,
-                    },
-                    reason: "operator stopped".to_owned(),
+        let stopped = ReceiptTermination::Stopped {
+            cause: StopCause::Shared {
+                kind: AbortKind::Abort,
+                commitment: StepCommitment {
+                    domain: STEP_COMMIT_DOMAIN,
+                    session_id: SessionHash([8; 32]),
+                    step: 2,
+                    entry_hash: [9; 32],
+                    pre_state: StateHash([10; 32]),
+                    post_state: StateHash([11; 32]),
+                    link: CHAIN_START,
                 },
+                reason: "operator stopped".to_owned(),
             },
         };
         assert_eq!(

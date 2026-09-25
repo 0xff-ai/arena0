@@ -117,5 +117,6 @@ Example neutral wait:
 ## Verify completion
 
 Run `arena0 --json receipt verify <session-id>` with the exact returned session
-id. Report the outcome and verification result. Keep the same harness context so
+id. Report the outcome and the verified `terminal`: `"Completed"` with its
+authenticated `outcome_borsh`, or `Stopped` with its exact cause. Keep the same harness context so
 verification reads the participating Host's receipt.

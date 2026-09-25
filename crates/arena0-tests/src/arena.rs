@@ -28,7 +28,6 @@ use arena0_store::{Store, StoreConfig, StoreHandle};
 use arena0_test_engine::shared_test_engine;
 use arena0_transport::Transport;
 use arena0_transport::local::LocalTransport;
-use arena0_verify::verify_light;
 use tempfile::TempDir;
 use tokio::sync::Barrier;
 
@@ -866,7 +865,7 @@ impl Run {
 
     /// Verify every participant's complete durable receipt, returning the
     /// authenticated proof evidence in participant order.
-    pub fn verify_all(&self) -> Result<Vec<arena0_verify::LightVerified>, String> {
+    pub fn verify_all(&self) -> Result<Vec<arena0_protocol::ReceiptSummary>, String> {
         let jobs = (0..self.node_count())
             .map(|i| {
                 let receipt = self.participants[i]
@@ -886,7 +885,8 @@ impl Run {
                 let timeline_started = self.timeline_started;
                 verifications.push(scope.spawn(move || {
                     let verification_started = Instant::now();
-                    let result = verify_light(&bytes)
+                    let result = arena0_protocol::ReceiptArtifact::decode(&bytes)
+                        .map(|receipt| receipt.summary())
                         .map_err(|error| format!("node {i}: {error:?}"))
                         .and_then(|verified| {
                             if verified.session_id != expected_session {

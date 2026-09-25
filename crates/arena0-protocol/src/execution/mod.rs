@@ -49,7 +49,7 @@ pub use abort::{ABORT_OCCURRENCE_DOMAIN, ABORT_OCCURRENCE_VERSION, AbortKind, Ab
 pub use binding::ExecutionBinding;
 pub use certificate::{
     ParticipantStepSignature, Receipt, ReceiptArtifact, ReceiptBody, ReceiptId, ReceiptKind,
-    StopReport,
+    ReceiptSummary, StopReport,
 };
 pub use cursor::{ExecutionVersion, StepCursor};
 pub use end::{EndMatch, EndPhase};

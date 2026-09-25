@@ -103,6 +103,8 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 assert result["all_verified"] is True, result
 assert result["shared_evidence_agrees"] is True, result
 assert len(result["ensemble"]) == 2, result
+assert result["terminal"] == "Completed", result
+assert isinstance(result["outcome_borsh"], list), result
 assert len(result["producers"]) == 2, result
 assert {entry["host"] for entry in result["producers"]} == {"host-01", "host-02"}, result
 assert all(entry["result"] == "valid" for entry in result["producers"]), result

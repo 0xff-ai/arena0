@@ -1,7 +1,7 @@
 //! Authenticated stop evidence through a real Wasm-backed Host execution.
 //!
 //! A peer abort is acknowledged only after transport attribution, occurrence
-//! validation, and persistence of the resulting stop. The light verifier then checks the
+//! validation, and persistence of the resulting stop. Receipt verification then checks the
 //! resulting stopped receipt.
 
 use arena0_crypto::NodeKeys;
@@ -14,7 +14,6 @@ use arena0_tests::fixtures::{
     LIVE_EXECUTION_TIMEOUT, establish_live_session, provider, spawn_live_execution,
 };
 use arena0_tests::wasm::program_wasm;
-use arena0_verify::{LightVerifiedTerminal, verify_light};
 
 const EXEC_ID: ExecId = ExecId([0xA0; 32]);
 const NEGOTIATION_ID: NegotiationId = NegotiationId([0xA1; 32]);
@@ -98,10 +97,12 @@ async fn bilateral_peer_abort_publishes_a_stopped_receipt() {
         arena0_protocol::ReceiptTermination::Stopped { .. }
     ));
     let bytes = receipt.encode().expect("encode stopped receipt");
-    let light = verify_light(&bytes).expect("light verify stopped receipt");
+    let verified = arena0_protocol::ReceiptArtifact::decode(&bytes)
+        .expect("verify stopped receipt")
+        .summary();
     assert!(matches!(
-        light.terminal,
-        LightVerifiedTerminal::Stopped { .. }
+        verified.terminal,
+        arena0_protocol::ReceiptTermination::Stopped { .. }
     ));
 }
 
@@ -124,10 +125,12 @@ async fn shared_program_stop_produces_one_canonical_receipt() {
         ));
         assert_eq!(run.receipt_bytes(i), expected);
         assert_eq!(run.receipt(i).receipt_id(), run.receipt(0).receipt_id());
-        let verified = verify_light(&run.receipt_bytes(i)).expect("shared stop verification");
+        let verified = arena0_protocol::ReceiptArtifact::decode(&run.receipt_bytes(i))
+            .expect("shared stop verification")
+            .summary();
         assert!(matches!(
             verified.terminal,
-            LightVerifiedTerminal::Stopped {
+            arena0_protocol::ReceiptTermination::Stopped {
                 cause: arena0_protocol::StopCause::Shared { .. }
             }
         ));

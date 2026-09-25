@@ -258,13 +258,16 @@ replaced by these references and artifacts. Receipt artifact and body format
 and their `ReceiptId` domain are version 5, and the store schema is version 6;
 older evidence and databases require their matching older release.
 
-`receipt.verify` performs portable/light verification only. It checks the
+`receipt.verify` performs portable verification only. It checks the
 activation binding, ordered v3 trace chain, N-of-N aggregate agreements,
 shared pre/post hashes, terminal evidence, and v5 receipt identity without
-loading or executing Wasm. The Host keeps outcome Borsh bytes opaque, so a
-completed result contains authenticated `outcome_borsh`; a stopped result
-contains no outcome and instead carries the exact `Stopped { cause }`. There is
-no second verification mode or program execution endpoint.
+loading or executing Wasm. `Verified` carries the receipt summary:
+`receipt_id`, `program_id`, `session_id`, the ordered `ensemble`, `steps`,
+`terminal`, and `outcome_borsh`. `terminal` is the receipt's own termination,
+`"Completed"` or `{"Stopped":{"cause":...}}` with the exact stop cause. The
+Host keeps outcome Borsh bytes opaque, so a completion carries authenticated
+`outcome_borsh` bytes and a stop carries `null`. There is no program execution
+endpoint.
 
 ## Daemon lifecycle and Host information
 

@@ -5,10 +5,9 @@
 
 use std::time::Duration;
 
-use arena0_protocol::{ColorDepth, Slot, Viewport};
+use arena0_protocol::{ColorDepth, ReceiptTermination, Slot, Viewport};
 use arena0_tests::arena::Arena;
 use arena0_tests::wasm::program_wasm;
-use arena0_verify::LightVerifiedTerminal;
 
 const CHOICE_ROCK: &[u8] = br#""Rock""#;
 const CHOICE_SCISSORS: &[u8] = br#""Scissors""#;
@@ -109,10 +108,7 @@ async fn rock_paper_scissors_bilateral_runs_and_verifies_receipts() {
     for (i, verified) in verified.into_iter().enumerate() {
         assert_eq!(verified.program_id, arena0_program::ProgramHash::of(&wasm));
         assert_eq!(verified.session_id, run.session_hash(i));
-        assert!(matches!(
-            verified.terminal,
-            LightVerifiedTerminal::Completed { .. }
-        ));
+        assert_eq!(verified.terminal, ReceiptTermination::Completed);
     }
 
     let mut trace = run.trace(0);

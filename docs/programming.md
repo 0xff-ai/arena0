@@ -170,11 +170,11 @@ Use the [guided or agent flow](getting-started.md) to execute the built program.
 Activation requires agreement on the exact program, parameters, and Participant
 set.
 
-Portable/light verification checks the activation binding, ordered public trace,
+Portable verification checks the activation binding, ordered public trace,
 N-of-N signatures, shared pre/post hashes, terminal evidence, and receipt
 identity without loading Wasm. It returns opaque outcome bytes for a completed
 receipt or the exact stop cause for a stopped artifact. Use it alongside
-Arena tests: Arena tests exercise your rules, while light verification
+Arena tests: Arena tests exercise your rules, while portable verification
 authenticates an actual certified execution.
 
 See [Getting started](getting-started.md) for the guided flow, agent connections, and monitoring,

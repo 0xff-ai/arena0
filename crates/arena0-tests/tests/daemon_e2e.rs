@@ -7,8 +7,8 @@
 mod common;
 
 use arena0_api::{
-    EnsembleSpec, EventData, EventFilter, EventFrame, HostRequest, LightVerifiedTerminal,
-    NextEvent, ReceiptRef, Response, ResponseOk, VerifiedResult,
+    EnsembleSpec, EventData, EventFilter, EventFrame, HostRequest, NextEvent, ReceiptRef,
+    ReceiptTermination, Response, ResponseOk,
 };
 use arena0_protocol::{NegotiationTarget, SessionHash};
 use arena0_sandbox::Program;
@@ -213,23 +213,18 @@ async fn assert_verified(target: &HostTarget, session_id: SessionHash) {
     )
     .await);
     match resp {
-        ResponseOk::Verified {
-            receipt_id: _,
-            program_id: _,
-            session_id: verified_sid,
-            ensemble,
-            steps,
-            result,
-        } => {
-            assert_eq!(verified_sid, session_id, "verify recovers the session id");
-            assert_eq!(ensemble.len(), 2, "two participants");
-            assert!(steps > 0, "at least one step");
-            match result {
-                VerifiedResult::Light {
-                    terminal: LightVerifiedTerminal::Completed { .. },
-                } => {}
-                result => panic!("expected completed portable evidence: {result:?}"),
-            }
+        ResponseOk::Verified(summary) => {
+            assert_eq!(
+                summary.session_id, session_id,
+                "verify recovers the session id"
+            );
+            assert_eq!(summary.ensemble.len(), 2, "two participants");
+            assert!(summary.steps > 0, "at least one step");
+            assert_eq!(
+                summary.terminal,
+                ReceiptTermination::Completed,
+                "expected completed portable evidence"
+            );
         }
         other => panic!("unexpected verify response: {other:?}"),
     }
@@ -289,14 +284,13 @@ async fn joiner_without_params_adopts_creator_terms() {
         )
         .await);
         match resp {
-            ResponseOk::Verified { steps, result, .. } => {
-                assert!(steps > 0, "at least one step");
-                match result {
-                    VerifiedResult::Light {
-                        terminal: LightVerifiedTerminal::Completed { .. },
-                    } => {}
-                    result => panic!("expected light completed evidence: {result:?}"),
-                }
+            ResponseOk::Verified(summary) => {
+                assert!(summary.steps > 0, "at least one step");
+                assert_eq!(
+                    summary.terminal,
+                    ReceiptTermination::Completed,
+                    "expected completed evidence"
+                );
             }
             other => panic!("unexpected verify response: {other:?}"),
         }

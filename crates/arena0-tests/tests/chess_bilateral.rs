@@ -100,10 +100,11 @@ async fn chess_bilateral_scholars_mate_runs_and_verifies() {
     assert_eq!(run.session_hash(0), run.session_hash(1));
     let verified = run.verify_all().expect("both traces must verify");
     for (verified, expected_outcome) in verified.into_iter().zip(&outcomes) {
-        let arena0_verify::LightVerifiedTerminal::Completed { outcome_borsh } = verified.terminal
-        else {
-            panic!("checkmate must complete the session");
-        };
-        assert_eq!(&outcome_borsh, expected_outcome);
+        assert_eq!(
+            verified.terminal,
+            arena0_protocol::ReceiptTermination::Completed,
+            "checkmate must complete the session"
+        );
+        assert_eq!(verified.outcome_borsh.as_ref(), Some(expected_outcome));
     }
 }

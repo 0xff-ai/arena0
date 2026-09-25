@@ -15,7 +15,6 @@ members = [
     "crates/arena0-primitives",
     "crates/arena0-transport",
     "crates/arena0-wire",
-    "crates/arena0-verify",
     "crates/arena0-node",
     "crates/arena0-tests",
     "crates/arena0-daemon",
