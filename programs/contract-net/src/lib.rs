@@ -149,6 +149,11 @@ impl Shared {
         }
     }
 
+    /// Whether `participant` is the unique writer the state waits for.
+    fn is_writer(&self, participant: Participant) -> bool {
+        self.expected_writer() == Some(participant)
+    }
+
     fn plan(&self) -> AssignmentPlan {
         allocate(&self.tasks, &self.offers)
     }
@@ -215,7 +220,7 @@ pub mod contract_net {
     fn callout(ctx: &CalloutContext<Shared, Local>) -> Option<Callout> {
         (ctx.shared().phase() == Phase::CollectingOffers
             && ctx.me() != COORDINATOR
-            && ctx.shared().expected_writer() == Some(ctx.me())
+            && ctx.shared().is_writer(ctx.me())
             && !ctx.local().offer_sent)
             .then(|| {
                 let tasks = ctx.shared().tasks.clone();
@@ -289,7 +294,7 @@ pub mod contract_net {
         from: Participant,
         message: Message,
     ) -> MessageApply<ContractNet> {
-        if ctx.shared().expected_writer() != Some(from) {
+        if !ctx.shared().is_writer(from) {
             return Ok(ApplyDecision::Reject);
         }
 

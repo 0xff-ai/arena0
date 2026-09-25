@@ -81,6 +81,11 @@ impl Shared {
         self.contributions.iter().position(Option::is_none)
     }
 
+    /// Whether `participant` owns the first empty contribution slot.
+    fn is_writer(&self, participant: Participant) -> bool {
+        self.expected_writer() == Some(participant.index())
+    }
+
     fn display_total(&self) -> u64 {
         if self.finalized {
             self.total
@@ -249,7 +254,7 @@ pub mod cumulative_sum {
         let Message::Contribute { value } = msg;
         // Unique-writer rule: only the expected writer's message applies;
         // anyone else is a deterministic reject (no sibling candidates).
-        if ctx.shared().expected_writer() != Some(from.index()) {
+        if !ctx.shared().is_writer(from) {
             return Ok(ApplyDecision::Reject);
         }
         let n = ctx.ensemble().len();
@@ -269,7 +274,7 @@ pub mod cumulative_sum {
     /// through [`on_message`], so the draw is deterministic per node and the
     /// unique-writer rule holds at every position.
     fn queue_contribution_if_due(ctx: &mut Context<Shared, Local>) -> arena0::anyhow::Result<()> {
-        if ctx.shared().expected_writer() != Some(ctx.me().index()) || ctx.local().sent {
+        if !ctx.shared().is_writer(ctx.me()) || ctx.local().sent {
             return Ok(());
         }
         let mut buf = [0u8; 8];
