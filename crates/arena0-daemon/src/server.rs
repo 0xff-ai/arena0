@@ -36,11 +36,11 @@ use arena0_program::{
 };
 use arena0_protocol::{
     ActivationAnnouncement, EventSource, ExecCreationOrigin, ExecId, ExecutionAdmission,
-    ExecutionEvent, ExecutionFailureCode, ExecutionStatus, FetchFrame, MAX_CLOCK_SKEW_MS,
-    MAX_TICKET_LIFETIME_MS, NegotiationEvent, NegotiationFact, NegotiationGossip, NegotiationId,
-    NegotiationTarget, Offer, OfferData, OfferHash, PREPARE_WINDOW_MS, PeerId, PendingId,
-    ReceiptArtifact, SessionHash, StateHash, TerminalKind, Ticket, TicketAction, TicketData,
-    TicketHash, Viewport, system_event::SystemEvent,
+    ExecutionEvent, ExecutionFailureCode, FetchFrame, MAX_CLOCK_SKEW_MS, MAX_TICKET_LIFETIME_MS,
+    NegotiationEvent, NegotiationFact, NegotiationGossip, NegotiationId, NegotiationTarget, Offer,
+    OfferData, OfferHash, PREPARE_WINDOW_MS, PeerId, PendingId, ReceiptArtifact, SessionHash,
+    StateHash, TerminalKind, Ticket, TicketAction, TicketData, TicketHash, Viewport,
+    system_event::SystemEvent,
 };
 use arena0_sandbox::{LoadedProgram, Program, WasmtimeEngine};
 use arena0_transport::{NegotiationTopic, ProgramTopicEvent, Transport};
@@ -55,7 +55,7 @@ use tracing::Instrument as _;
 use crate::catalog::{CatalogError, ProgramCatalog};
 use crate::exec_manager::{
     ExecutionHandle, ExecutionHandles, NEGOTIATION_TIMEOUT, Supervisor, project_durable_next,
-    satisfies,
+    project_lifecycle, satisfies,
 };
 use crate::schema;
 use crate::startup::{StartupStage, StartupTimeline};
@@ -2175,7 +2175,7 @@ impl HostService {
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
         Ok(executions
             .iter()
-            .filter(|state| !state.status().is_terminal())
+            .filter(|state| !state.lifecycle().is_terminal())
             .count())
     }
 
@@ -3569,50 +3569,45 @@ fn project_exec_status_facts(
         .as_ref()
         .map(|state| arena0_api::ExecEndStatus::from(state.end_phase()))
         .unwrap_or_default();
-    let state = match state {
-        Some(state) => match state.status() {
-            ExecutionStatus::Activating => ExecStatusState::Activating {
-                session_id: Some(state.binding().session_id()),
-            },
-            ExecutionStatus::Active | ExecutionStatus::Certified { .. } => {
-                ExecStatusState::Active {
-                    session: session_status(&state),
-                }
-            }
-            ExecutionStatus::Completed { .. } => ExecStatusState::Completed {
-                session: session_status(&state),
-            },
-            ExecutionStatus::Stopped { cause }
-            | ExecutionStatus::StoppedPublished { cause, .. } => {
-                if cause.kind() == arena0_protocol::AbortKind::Abort {
-                    ExecStatusState::Aborted {
-                        session: session_status(&state),
-                    }
-                } else {
-                    ExecStatusState::Failed {
-                        session: Some(SessionProgress::Started {
-                            session: session_status(&state),
-                        }),
-                    }
-                }
-            }
-        },
-        None if request.failure().is_some() => ExecStatusState::Failed {
-            session: activation.as_ref().and_then(|record| {
-                record.is_committed().then(|| SessionProgress::Activated {
-                    session_id: record.session_id(),
-                })
-            }),
-        },
-        None if activation.is_some() => ExecStatusState::Activating {
-            // A prepared activation fixes a candidate hash but is not yet a
-            // formed session. Expose the SessionHash only after commit.
-            session_id: activation
-                .and_then(|record| record.is_committed().then(|| record.session_id())),
-        },
-        None => ExecStatusState::Negotiating {
+    // A prepared activation fixes a candidate hash but is not yet a formed
+    // session. Expose the SessionHash only after commit.
+    let committed_session = activation
+        .as_ref()
+        .and_then(|record| record.is_committed().then(|| record.session_id()));
+    let lifecycle = project_lifecycle(
+        request.failure().is_some(),
+        activation.as_ref(),
+        state.as_ref(),
+    );
+    let state = match (lifecycle, state) {
+        (ExecLifecycle::Negotiating, _) => ExecStatusState::Negotiating {
             queue_position: None,
         },
+        (ExecLifecycle::Activating, state) => ExecStatusState::Activating {
+            session_id: state
+                .map(|state| state.binding().session_id())
+                .or(committed_session),
+        },
+        (ExecLifecycle::Waiting | ExecLifecycle::Active, Some(state)) => ExecStatusState::Active {
+            session: session_status(&state),
+        },
+        (ExecLifecycle::Completed, Some(state)) => ExecStatusState::Completed {
+            session: session_status(&state),
+        },
+        (ExecLifecycle::Aborted, Some(state)) => ExecStatusState::Aborted {
+            session: session_status(&state),
+        },
+        (ExecLifecycle::Failed, Some(state)) => ExecStatusState::Failed {
+            session: Some(SessionProgress::Started {
+                session: session_status(&state),
+            }),
+        },
+        (ExecLifecycle::Failed, None) => ExecStatusState::Failed {
+            session: committed_session.map(|session_id| SessionProgress::Activated { session_id }),
+        },
+        (lifecycle, None) => {
+            anyhow::bail!("{lifecycle:?} execution {exec_id} has no execution aggregate")
+        }
     };
     Ok(ExecStatus {
         end,
@@ -4780,22 +4775,27 @@ mod tests {
         daemon.stop().await;
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn recovery_fails_unrecoverable_committed_execution_durably() {
-        let (_dir, store, daemon, peer) = test_daemon();
-        let program_bytes = vec![1, 2, 3];
-        let (program_hash, _) = store
-            .handle()
-            .register_program(program_bytes, 1)
-            .await
-            .expect("program");
-        let execution_id = ExecId([0xA4; 32]);
-        let negotiation_id = NegotiationId([0xA5; 32]);
+    /// A committed two-party activation created by the test daemon's Host,
+    /// with the fixed BLS execution keys both participants signed with.
+    struct TwoPartyActivation {
+        other: PeerId,
+        producer_bls: BlsSecretKey,
+        other_bls: BlsSecretKey,
+        prepared: PreparedActivation,
+        activation: Activation,
+    }
+
+    fn two_party_activation(
+        daemon: &HostService,
+        peer: PeerId,
+        program_hash: ProgramHash,
+        negotiation_id: NegotiationId,
+        initial_shared: &SharedStateBytes,
+    ) -> TwoPartyActivation {
         let other_keys = NodeKeys::from_secret(SecretKey::from_bytes([2; 32]));
         let other = PeerId::from_ed25519(&other_keys.ed25519_public_key());
         let producer_bls = BlsSecretKey::from_seed(&[11; 32]).expect("producer bls");
         let other_bls = BlsSecretKey::from_seed(&[12; 32]).expect("other bls");
-        let initial_shared = SharedStateBytes::try_new(vec![0]).expect("shared state");
         let offer_data = OfferData::new(
             negotiation_id,
             0,
@@ -4804,7 +4804,7 @@ mod tests {
             arena0_program::ExecutionProfile::current().hash(),
             JsonBytes::try_new(b"null".to_vec()).expect("params"),
             2,
-            StateHash::of_shared(&initial_shared),
+            StateHash::of_shared(initial_shared),
             u64::MAX,
         )
         .expect("offer");
@@ -4853,6 +4853,181 @@ mod tests {
         let offer = Offer::new(offer_data, ticket_hashes).expect("offer");
         let prepared = PreparedActivation::new(offer, tickets).expect("prepared");
         let activation = Activation::new(prepared.clone(), aggregate).expect("activation");
+        TwoPartyActivation {
+            other,
+            producer_bls,
+            other_bls,
+            prepared,
+            activation,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn certified_execution_is_active_until_its_receipt_is_published() {
+        use arena0_protocol::{Effect, Event, ParticipantStepSignature, TerminalOutcome};
+        use arena0_store::{Change, TransitionRecord};
+
+        let (_dir, store, daemon, peer) = test_daemon();
+        let (program_hash, _) = store
+            .handle()
+            .register_program(vec![1, 2, 3], 1)
+            .await
+            .expect("program");
+        let execution_id = ExecId([0xB4; 32]);
+        let negotiation_id = NegotiationId([0xB5; 32]);
+        let initial_shared = SharedStateBytes::try_new(vec![0]).expect("shared state");
+        let TwoPartyActivation {
+            other,
+            producer_bls,
+            other_bls,
+            prepared,
+            activation,
+        } = two_party_activation(&daemon, peer, program_hash, negotiation_id, &initial_shared);
+        let mut writer = daemon.runtime.claim_execution(execution_id).unwrap();
+        writer
+            .create_execution_request(
+                program_hash,
+                Some(JsonBytes::try_new(b"null".to_vec()).expect("params")),
+                ExecutionAdmission::explicit(negotiation_id, vec![peer, other]).expect("admission"),
+                1,
+            )
+            .await
+            .expect("request");
+        writer
+            .prepare_activation(prepared, 2)
+            .await
+            .expect("prepare");
+        writer
+            .commit_activation(activation.clone(), 3)
+            .await
+            .expect("commit");
+        writer
+            .create_execution(
+                activation,
+                peer,
+                initial_shared,
+                LocalStateBytes::try_new(Vec::new()).expect("local state"),
+                4,
+            )
+            .await
+            .expect("execution");
+        drop(writer);
+
+        // Certify a session-start step that ends the session, leaving the
+        // receipt unpublished.
+        let mut writer = store.handle().claim_execution(execution_id).unwrap();
+        let mut state = writer.load_execution().await.unwrap().unwrap();
+        let mut next = state.clone();
+        next.activate().expect("activate");
+        writer
+            .persist(TransitionRecord {
+                expected: state.version(),
+                next: next.clone(),
+                change: Change::State,
+                now_ms: 5,
+            })
+            .await
+            .expect("persist activation");
+        state = next;
+        let event = Event::SessionStarted {
+            ensemble: state.binding().ensemble().expect("ensemble"),
+        };
+        let effects = vec![Effect::SessionEnd {
+            outcome: Vec::new(),
+        }];
+        let mut next = state.clone();
+        next.apply_dispatch(
+            &event,
+            SharedStateBytes::try_new(vec![1]).expect("next shared"),
+            LocalStateBytes::try_new(Vec::new()).expect("local state"),
+            &effects,
+            Some(TerminalOutcome::new(Vec::new(), b"null".to_vec()).expect("outcome")),
+            None,
+            None,
+        )
+        .expect("dispatch");
+        writer
+            .persist(TransitionRecord {
+                expected: state.version(),
+                next: next.clone(),
+                change: Change::Dispatch {
+                    event,
+                    effects,
+                    timer_id: None,
+                },
+                now_ms: 5,
+            })
+            .await
+            .expect("persist proposal");
+        state = next;
+        let commitment = state.proposal_commitment().expect("proposal");
+        for (signer, key) in [(peer, &producer_bls), (other, &other_bls)] {
+            let mut next = state.clone();
+            let certified = next
+                .add_step_signature(ParticipantStepSignature::new(
+                    signer,
+                    commitment.step,
+                    key.sign(&commitment.signing_bytes()),
+                ))
+                .expect("step signature");
+            writer
+                .persist(TransitionRecord {
+                    expected: state.version(),
+                    next: next.clone(),
+                    change: Change::StepSignature { certified },
+                    now_ms: 6,
+                })
+                .await
+                .expect("persist signature");
+            state = next;
+        }
+        assert!(matches!(
+            state.status(),
+            arena0_protocol::ExecutionStatus::Certified { .. }
+        ));
+        drop(writer);
+
+        // The status projection and the active count agree: certification
+        // stays active until the receipt is published.
+        match daemon
+            .dispatch(HostRequest::ExecStatus {
+                exec_id: execution_id,
+            })
+            .await
+        {
+            Ok(ResponseOk::Status(status)) => {
+                assert_eq!(status.lifecycle(), ExecLifecycle::Active);
+            }
+            other => panic!("expected exec.status, got {other:?}"),
+        }
+        assert_eq!(
+            daemon
+                .active_execution_count()
+                .await
+                .expect("active execution count"),
+            1
+        );
+        daemon.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovery_fails_unrecoverable_committed_execution_durably() {
+        let (_dir, store, daemon, peer) = test_daemon();
+        let program_bytes = vec![1, 2, 3];
+        let (program_hash, _) = store
+            .handle()
+            .register_program(program_bytes, 1)
+            .await
+            .expect("program");
+        let execution_id = ExecId([0xA4; 32]);
+        let negotiation_id = NegotiationId([0xA5; 32]);
+        let initial_shared = SharedStateBytes::try_new(vec![0]).expect("shared state");
+        let TwoPartyActivation {
+            other,
+            prepared,
+            activation,
+            ..
+        } = two_party_activation(&daemon, peer, program_hash, negotiation_id, &initial_shared);
         let mut writer = daemon.runtime.claim_execution(execution_id).unwrap();
         writer
             .create_execution_request(

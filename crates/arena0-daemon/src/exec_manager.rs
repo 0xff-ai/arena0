@@ -111,20 +111,14 @@ impl ExecutionHandle {
     /// Derive the public lifecycle from durable state, including phases before
     /// an execution aggregate exists.
     pub(crate) async fn lifecycle(&self) -> anyhow::Result<ExecLifecycle> {
-        if let Some(state) = self.execution().await? {
-            return Ok(state.lifecycle());
-        }
-        if self
-            .request()
-            .await?
-            .is_some_and(|request| request.failure().is_some())
-        {
-            return Ok(ExecLifecycle::Failed);
-        }
-        if self.activation().await?.is_some() {
-            return Ok(ExecLifecycle::Activating);
-        }
-        Ok(ExecLifecycle::Negotiating)
+        let state = self.execution().await?;
+        let request = self.request().await?;
+        let activation = self.activation().await?;
+        Ok(project_lifecycle(
+            request.is_some_and(|request| request.failure().is_some()),
+            activation.as_ref(),
+            state.as_ref(),
+        ))
     }
 
     /// Build the source for a safe daemon event from durable request and
@@ -419,6 +413,23 @@ impl ExecutionHandle {
     }
 }
 
+/// The one public lifecycle projection. An execution aggregate owns its
+/// lifecycle (a certified step stays `Active` until its receipt is published);
+/// before one exists, a recorded request failure, then a durable activation,
+/// decide the phase.
+pub(crate) fn project_lifecycle(
+    request_failed: bool,
+    activation: Option<&arena0_store::ActivationRecord>,
+    state: Option<&ExecutionState>,
+) -> ExecLifecycle {
+    match state {
+        Some(state) => state.lifecycle(),
+        None if request_failed => ExecLifecycle::Failed,
+        None if activation.is_some() => ExecLifecycle::Activating,
+        None => ExecLifecycle::Negotiating,
+    }
+}
+
 pub(crate) fn satisfies(lifecycle: ExecLifecycle, until: AwaitState) -> bool {
     match until {
         AwaitState::Active => {
@@ -483,8 +494,8 @@ pub(crate) fn project_durable_next(
             context: projection.context,
         }));
     }
-    match state.status() {
-        ExecutionStatus::Completed { .. } => Ok(Some(NextEvent::Completed {
+    match state.lifecycle() {
+        ExecLifecycle::Completed => Ok(Some(NextEvent::Completed {
             session_id: state.binding().session_id(),
             outcome: state
                 .terminal_outcome_json()
@@ -494,10 +505,15 @@ pub(crate) fn project_durable_next(
                     ApiError::new(ApiErrorCode::Storage, format!("decode outcome: {error}"))
                 })?,
         })),
-        ExecutionStatus::Stopped { cause } | ExecutionStatus::StoppedPublished { cause, .. } => {
-            Ok(Some(NextEvent::Failed {
-                reason: cause.reason().to_owned(),
-            }))
+        // The agent-facing stream reports every stop, abort or failure, as
+        // `Failed` with its cause.
+        ExecLifecycle::Aborted | ExecLifecycle::Failed => {
+            Ok(state
+                .status()
+                .terminal_cause()
+                .map(|cause| NextEvent::Failed {
+                    reason: cause.reason().to_owned(),
+                }))
         }
         _ => Ok(None),
     }
