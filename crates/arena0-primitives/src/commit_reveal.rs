@@ -21,8 +21,8 @@
 //! ```ignore
 //! // on_input: stash the secret locally and broadcast the commit
 //! ctx.commit_reveal().commit(value)?.broadcast(&mut ctx.effects())?;
-//! // once all commits are in, broadcast the reveal
-//! if let Some(reveal) = ctx.commit_reveal().take_reveal() {
+//! // on this node's turn, broadcast the reveal once all commits are in
+//! if let Some(MyTurn::Reveal(reveal)) = ctx.commit_reveal().my_turn() {
 //!     reveal.broadcast(&mut ctx.effects());
 //! }
 //! // an incoming message applies the round for the authenticated sender
@@ -40,6 +40,16 @@ use borsh::BorshSerialize;
 pub enum Message<T> {
     Commit([u8; 32]),
     Reveal { value: T, salt: [u8; 32] },
+}
+
+/// What this node owes on its turn as the expected writer; see
+/// [`CommitRevealAuthorExt::my_turn`].
+#[derive(Debug)]
+pub enum MyTurn<O> {
+    /// The reveal to broadcast, taken from the local stash.
+    Reveal(O),
+    /// This node still owes its commit; the program picks the value.
+    Commit,
 }
 
 /// Protocol phase, tracked in shared state.
@@ -175,6 +185,12 @@ pub trait CommitRevealAuthorExt<T, Route = RawPrimitiveRoute> {
     /// Take the reveal message owed this round, once every commitment is in.
     /// Returns `None` until the reveal is due and at most once per round.
     fn take_reveal(self) -> Option<PrimitiveOutput<Message<T>, Route>>;
+
+    /// What this node owes when it is the expected writer: its reveal once
+    /// due (taken as by [`take_reveal`](Self::take_reveal)), else its commit
+    /// if still owed. `None` when another participant writes next or nothing
+    /// is owed.
+    fn my_turn(self) -> Option<MyTurn<PrimitiveOutput<Message<T>, Route>>>;
 }
 
 /// Handle-side operations for `CommitReveal` primitives.
@@ -226,6 +242,25 @@ where
         let reveal =
             self.with_shared_local(|cr, local| cr.take_reveal(local.commit_reveal_local_mut()))?;
         Some(self.output(reveal))
+    }
+
+    fn my_turn(mut self) -> Option<MyTurn<PrimitiveOutput<Message<T>, Route>>> {
+        let me = self.me();
+        let turn = self.with_shared_local(|cr, local| {
+            if !cr.is_writer(me) {
+                return None;
+            }
+            let local = local.commit_reveal_local_mut();
+            if let Some(reveal) = cr.take_reveal(local) {
+                Some(MyTurn::Reveal(reveal))
+            } else {
+                cr.needs_commit(local).then_some(MyTurn::Commit)
+            }
+        })?;
+        Some(match turn {
+            MyTurn::Reveal(reveal) => MyTurn::Reveal(self.output(reveal)),
+            MyTurn::Commit => MyTurn::Commit,
+        })
     }
 }
 
@@ -280,6 +315,12 @@ impl<T> CommitReveal<T> {
             Phase::Complete => None,
         };
         slot.and_then(|index| Participant::try_from(index).ok())
+    }
+
+    /// Whether `participant` is the [`expected_writer`](Self::expected_writer).
+    #[must_use]
+    pub fn is_writer(&self, participant: Participant) -> bool {
+        self.expected_writer() == Some(participant)
     }
     /// Reset for a new round. Shared-handler code: bumps the shared round
     /// counter so each node's local stash keys itself to the fresh round.
@@ -522,8 +563,10 @@ mod tests {
         let b_commit = b.commit_with_salt(&mut b_local, 99, [0xBB; 32]).unwrap();
 
         // Canonical order: P0's commit then P1's, applied by both replicas.
+        assert!(a.is_writer(P0) && !a.is_writer(P1));
         apply_both(&mut a, &mut b, P0, &a_commit);
         assert_eq!(a.phase(), Phase::Idle);
+        assert!(a.is_writer(P1) && !a.is_writer(P0));
         apply_both(&mut a, &mut b, P1, &b_commit);
         assert_eq!(a.phase(), Phase::Revealing);
 

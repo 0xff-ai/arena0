@@ -12,7 +12,7 @@ use std::fmt::Write;
 use arena0::prelude::*;
 use arena0_primitives::commit_reveal::{
     self, CommitReveal, CommitRevealAuthorExt, CommitRevealFieldExt, CommitRevealLocal,
-    CommitRevealLocalState,
+    CommitRevealLocalState, MyTurn,
 };
 use arena0_primitives::joint_randomness;
 
@@ -339,7 +339,7 @@ pub mod vickrey_auction {
     fn callout(ctx: &CalloutContext<Shared, Local>) -> Option<Callout> {
         (ctx.shared().phase() == Phase::Bidding
             && ctx.me().index() != 0
-            && ctx.shared().bids.expected_writer() == Some(ctx.me())
+            && ctx.shared().bids.is_writer(ctx.me())
             && ctx.shared().bids.needs_commit(&ctx.local().bids))
         .then(|| {
             callouts::SubmitBid {
@@ -357,9 +357,7 @@ pub mod vickrey_auction {
     ) -> MessageApply<VickreyAuction> {
         match message {
             Message::Bid(message) => {
-                if ctx.shared().phase() != Phase::Bidding
-                    || ctx.shared().bids.expected_writer() != Some(from)
-                {
+                if ctx.shared().phase() != Phase::Bidding || !ctx.shared().bids.is_writer(from) {
                     return Ok(ApplyDecision::Reject);
                 }
                 if ctx.bids().handle(from, message).is_err() {
@@ -377,8 +375,7 @@ pub mod vickrey_auction {
                 Ok(ApplyDecision::Accept(transition))
             }
             Message::Entropy(message) => {
-                if ctx.shared().phase() != Phase::TieBreak
-                    || ctx.shared().entropy.expected_writer() != Some(from)
+                if ctx.shared().phase() != Phase::TieBreak || !ctx.shared().entropy.is_writer(from)
                 {
                     return Ok(ApplyDecision::Reject);
                 }
@@ -399,15 +396,14 @@ pub mod vickrey_auction {
 
     /// Queue the next owed bid commit or reveal when this node owns the writer.
     fn queue_bid_action_if_due(ctx: &mut Context<Shared, Local>) -> arena0::anyhow::Result<()> {
-        if ctx.shared().bids.expected_writer() != Some(ctx.me()) {
-            return Ok(());
-        }
-        if let Some(reveal) = ctx.bids().take_reveal() {
-            reveal.broadcast(&mut ctx.effects());
-        } else if ctx.bids().needs_commit() && ctx.me().index() == 0 {
-            ctx.bids()
-                .commit_with_salt(0, [0; 32])?
-                .broadcast(&mut ctx.effects());
+        match ctx.bids().my_turn() {
+            Some(MyTurn::Reveal(reveal)) => reveal.broadcast(&mut ctx.effects()),
+            Some(MyTurn::Commit) if ctx.me().index() == 0 => {
+                ctx.bids()
+                    .commit_with_salt(0, [0; 32])?
+                    .broadcast(&mut ctx.effects());
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -415,20 +411,18 @@ pub mod vickrey_auction {
     /// Queue the next owed entropy commit or reveal when this node owns the
     /// writer.
     fn queue_entropy_action_if_due(ctx: &mut Context<Shared, Local>) -> arena0::anyhow::Result<()> {
-        if ctx.shared().entropy.expected_writer() != Some(ctx.me()) {
-            return Ok(());
-        }
-        if let Some(reveal) = ctx.entropy().take_reveal() {
-            reveal.broadcast(&mut ctx.effects());
-        } else if ctx.entropy().needs_commit() {
-            if ctx.me().index() == 0 {
+        match ctx.entropy().my_turn() {
+            Some(MyTurn::Reveal(reveal)) => reveal.broadcast(&mut ctx.effects()),
+            Some(MyTurn::Commit) if ctx.me().index() == 0 => {
                 ctx.entropy()
                     .commit_with_salt([0; 32], [0; 32])?
                     .broadcast(&mut ctx.effects());
-            } else {
+            }
+            Some(MyTurn::Commit) => {
                 let nonce = ctx.random_bytes::<32>();
                 ctx.entropy().commit(nonce)?.broadcast(&mut ctx.effects());
             }
+            None => {}
         }
         Ok(())
     }
@@ -441,7 +435,7 @@ pub mod vickrey_auction {
         if ctx.shared().phase() != Phase::Bidding {
             return Err(anyhow!("bidding is closed"));
         }
-        if ctx.shared().bids.expected_writer() != Some(ctx.me()) {
+        if !ctx.shared().bids.is_writer(ctx.me()) {
             return Err(anyhow!("this participant does not own the next bid"));
         }
         ctx.bids().commit(amount)?.broadcast(&mut ctx.effects())?;

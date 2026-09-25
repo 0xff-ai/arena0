@@ -3,7 +3,7 @@ use std::fmt::Write;
 use arena0::prelude::*;
 use arena0_primitives::commit_reveal::{
     self, CommitReveal, CommitRevealAuthorExt, CommitRevealFieldExt, CommitRevealLocal,
-    CommitRevealLocalState,
+    CommitRevealLocalState, MyTurn,
 };
 
 #[arena0::data]
@@ -286,7 +286,7 @@ pub mod rock_paper_scissors {
     }
 
     fn callout(ctx: &CalloutContext<Shared, Local>) -> Option<Callout> {
-        (ctx.shared().commit_reveal.expected_writer() == Some(ctx.me())
+        (ctx.shared().commit_reveal.is_writer(ctx.me())
             && ctx
                 .shared()
                 .commit_reveal
@@ -295,7 +295,7 @@ pub mod rock_paper_scissors {
     }
 
     fn on_input(ctx: &mut LocalContext<Shared, Local>, input: Input) -> arena0::anyhow::Result<()> {
-        if ctx.shared().commit_reveal.expected_writer() != Some(ctx.me()) {
+        if !ctx.shared().commit_reveal.is_writer(ctx.me()) {
             return Err(anyhow!("this participant does not own the next choice"));
         }
         let Input::ChooseMove(choice) = input;
@@ -314,14 +314,14 @@ pub mod rock_paper_scissors {
         // Unique-writer rule: only the participant whose action is next (the
         // first missing commit, then the first missing reveal) may write;
         // any other sender is a deterministic reject.
-        if ctx.shared().commit_reveal.expected_writer() != Some(from) {
+        if !ctx.shared().commit_reveal.is_writer(from) {
             return Ok(ApplyDecision::Reject);
         }
         if ctx.commit_reveal().handle(from, msg).is_err() {
             return Ok(ApplyDecision::Reject);
         }
         if !ctx.shared().commit_reveal.is_complete() {
-            queue_reveal_if_due(ctx).map_err(ProtocolFault::shared_violation)?;
+            queue_reveal_if_due(ctx);
             return Ok(ApplyDecision::Accept(Transition::Stay));
         }
 
@@ -338,14 +338,10 @@ pub mod rock_paper_scissors {
 
     /// Queue the owed reveal once every commit is in, when this node owns the
     /// next writer position.
-    fn queue_reveal_if_due(ctx: &mut Context<Shared, Local>) -> arena0::anyhow::Result<()> {
-        if ctx.shared().commit_reveal.expected_writer() != Some(ctx.me()) {
-            return Ok(());
-        }
-        if let Some(reveal) = ctx.commit_reveal().take_reveal() {
+    fn queue_reveal_if_due(ctx: &mut Context<Shared, Local>) {
+        if let Some(MyTurn::Reveal(reveal)) = ctx.commit_reveal().my_turn() {
             reveal.broadcast(&mut ctx.effects());
         }
-        Ok(())
     }
 
     fn on_query(_shared: &Shared, _: ()) {}

@@ -10,7 +10,7 @@ use std::fmt::Write;
 use arena0::prelude::*;
 use arena0_primitives::commit_reveal::{
     self, CommitReveal, CommitRevealAuthorExt, CommitRevealFieldExt, CommitRevealLocal,
-    CommitRevealLocalState,
+    CommitRevealLocalState, MyTurn,
 };
 use arena0_primitives::turn_manager::TurnManager;
 
@@ -226,7 +226,7 @@ pub mod sequential_count {
                 // Unique-writer rule (Setup phase): only the participant whose
                 // commit or reveal is next may write; any other sender is a
                 // deterministic reject (no sibling candidates at one position).
-                if ctx.shared().commit_reveal.expected_writer() != Some(from) {
+                if !ctx.shared().commit_reveal.is_writer(from) {
                     return Ok(ApplyDecision::Reject);
                 }
                 if ctx.commit_reveal().handle(from, message).is_err() {
@@ -276,19 +276,16 @@ pub mod sequential_count {
 
     /// Queue this node's next commit or reveal when it owns the setup writer.
     fn queue_setup_action(ctx: &mut Context<Shared, Local>) -> arena0::anyhow::Result<()> {
-        if ctx.shared().commit_reveal.expected_writer() != Some(ctx.me()) {
-            return Ok(());
-        }
-        if let Some(reveal) = ctx.commit_reveal().take_reveal() {
-            reveal.broadcast(&mut ctx.effects());
-            return Ok(());
-        }
-        if ctx.commit_reveal().needs_commit() {
-            let mut nonce = [0u8; 32];
-            ctx.random(&mut nonce);
-            ctx.commit_reveal()
-                .commit(nonce)?
-                .broadcast(&mut ctx.effects());
+        match ctx.commit_reveal().my_turn() {
+            Some(MyTurn::Reveal(reveal)) => reveal.broadcast(&mut ctx.effects()),
+            Some(MyTurn::Commit) => {
+                let mut nonce = [0u8; 32];
+                ctx.random(&mut nonce);
+                ctx.commit_reveal()
+                    .commit(nonce)?
+                    .broadcast(&mut ctx.effects());
+            }
+            None => {}
         }
         Ok(())
     }

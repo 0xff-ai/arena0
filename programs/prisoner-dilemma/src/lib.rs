@@ -3,7 +3,7 @@ use std::fmt::Write;
 use arena0::prelude::*;
 use arena0_primitives::commit_reveal::{
     self, CommitReveal, CommitRevealAuthorExt, CommitRevealFieldExt, CommitRevealLocal,
-    CommitRevealLocalState,
+    CommitRevealLocalState, MyTurn,
 };
 
 #[arena0::data]
@@ -301,7 +301,7 @@ pub mod prisoner_dilemma {
     }
 
     fn callout(ctx: &CalloutContext<Shared, Local>) -> Option<Callout> {
-        (ctx.shared().commit_reveal.expected_writer() == Some(ctx.me())
+        (ctx.shared().commit_reveal.is_writer(ctx.me())
             && ctx
                 .shared()
                 .commit_reveal
@@ -317,14 +317,14 @@ pub mod prisoner_dilemma {
         let Message::CommitReveal(cr_msg) = msg;
         // Unique-writer rule: only the expected writer may write here; any
         // other sender is a deterministic reject (no sibling candidates).
-        if ctx.shared().commit_reveal.expected_writer() != Some(from) {
+        if !ctx.shared().commit_reveal.is_writer(from) {
             return Ok(ApplyDecision::Reject);
         }
         if ctx.commit_reveal().handle(from, cr_msg).is_err() {
             return Ok(ApplyDecision::Reject);
         }
         if !ctx.shared().commit_reveal.is_complete() {
-            queue_setup_action(ctx).map_err(ProtocolFault::shared_violation)?;
+            queue_setup_action(ctx);
             return Ok(ApplyDecision::Accept(Transition::Stay));
         }
 
@@ -338,7 +338,7 @@ pub mod prisoner_dilemma {
     }
 
     fn on_input(ctx: &mut LocalContext<Shared, Local>, input: Input) -> arena0::anyhow::Result<()> {
-        if ctx.shared().commit_reveal.expected_writer() != Some(ctx.me()) {
+        if !ctx.shared().commit_reveal.is_writer(ctx.me()) {
             return Err(anyhow!("this participant does not own the next choice"));
         }
         let Input::Choose(choice) = input;
@@ -352,14 +352,10 @@ pub mod prisoner_dilemma {
 
     /// Queue the owed reveal once every commit is in, when this node is the
     /// expected writer.
-    fn queue_setup_action(ctx: &mut Context<Shared, Local>) -> arena0::anyhow::Result<()> {
-        if ctx.shared().commit_reveal.expected_writer() != Some(ctx.me()) {
-            return Ok(());
-        }
-        if let Some(reveal) = ctx.commit_reveal().take_reveal() {
+    fn queue_setup_action(ctx: &mut Context<Shared, Local>) {
+        if let Some(MyTurn::Reveal(reveal)) = ctx.commit_reveal().my_turn() {
             reveal.broadcast(&mut ctx.effects());
         }
-        Ok(())
     }
 
     /// Score a completed reveal round and either reset the protocol for the
