@@ -20,7 +20,7 @@ cargo arena0 build
 
 The [minimal program](../examples/minimal-program/src/lib.rs) lets two participants
 choose a number in public order. It includes concrete types, a program module,
-a two-replica scenario test, and a terminal view. Its manifest uses versioned
+native unit tests for the outcome and the terminal view. Its manifest uses versioned
 SDK dependencies rather than repository paths.
 
 `cargo arena0 build` builds the Wasm, validates the required guest exports, and
@@ -150,10 +150,13 @@ interfaces. Bundled programs provide examples of composition:
 
 ## Test the rules
 
-Run scenario tests through the program's real handlers. The minimal example
-submits choices to two replicas, delivers their messages, checks shared-state
-alignment, and asserts the recorded choices. Extend those tests with invalid
-senders, invalid phase actions, or other failure conditions your program owns.
+Pure logic gets native unit tests in the program crate: call pure program
+functions and types directly (rules, scoring, legality, allocation, codecs,
+`Program::outcome` / `ProgramView::view` on a constructed state, schema
+metadata). Behavior gets Arena tests in `crates/arena0-tests`, which drive the
+compiled program on real Hosts over real transport; run `just build-programs`
+first so the Wasm artifacts exist. Extend those tests with invalid senders,
+invalid phase actions, or other failure conditions your program owns.
 
 Test views separately. The terminal contract has `Header`, `Agents`, `State`,
 and `StatusBar` slots. Rendering must leave state unchanged and support plain
@@ -170,7 +173,7 @@ Portable/light verification checks the activation binding, ordered public trace,
 N-of-N signatures, shared pre/post hashes, terminal evidence, and receipt
 identity without loading Wasm. It returns opaque outcome bytes for a completed
 receipt or the exact stop cause for a stopped artifact. Use it alongside
-scenario tests: scenario tests exercise your rules, while light verification
+Arena tests: Arena tests exercise your rules, while light verification
 authenticates an actual certified execution.
 
 See [Getting started](getting-started.md) for the guided flow, agent connections, and monitoring,

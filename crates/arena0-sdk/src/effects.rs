@@ -1,10 +1,11 @@
 //! Host effect dispatch via wasm imports.
 //!
 //! Module-level functions forward runtime effects to the host through the
-//! `arena0` wasm import module. On non-wasm targets the calls are no-ops,
-//! allowing unit testing without a host.
+//! `arena0` wasm import module. On non-wasm targets the SDK never reaches a
+//! host import: native builds compile pure program logic only.
 
 use arena0_crypto::SignScheme;
+use arena0_program::abi::imports;
 use arena0_protocol::{LogLevel, TimerSpec};
 
 /// State-memory selector used by the always-available state imports.
@@ -30,6 +31,14 @@ unsafe extern "C" {
     fn state_write(kind: u32, ptr: u32, len: u32);
 }
 
+/// Host imports exist only inside the Wasm guest. Native builds compile the
+/// SDK for pure program tests, which never reach a host import.
+#[cfg(not(target_arch = "wasm32"))]
+#[cold]
+fn native_host_unavailable(import: &'static str) -> ! {
+    panic!("arena0 host import `{import}` is only available inside the Wasm guest")
+}
+
 /// Return the encoded byte length of one host-owned state value.
 #[doc(hidden)]
 pub fn host_state_len(kind: u32) -> usize {
@@ -40,7 +49,7 @@ pub fn host_state_len(kind: u32) -> usize {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = kind;
-        0
+        native_host_unavailable(imports::STATE_LEN)
     }
 }
 
@@ -53,8 +62,8 @@ pub fn host_state_read(kind: u32, buffer: &mut [u8]) {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let _ = kind;
-        buffer.fill(0);
+        let _ = (kind, buffer);
+        native_host_unavailable(imports::STATE_READ)
     }
 }
 
@@ -68,6 +77,7 @@ pub fn host_state_write(kind: u32, buffer: &[u8]) {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = (kind, buffer);
+        native_host_unavailable(imports::STATE_WRITE)
     }
 }
 
@@ -77,7 +87,10 @@ pub fn host_log(level: LogLevel, msg: &str) {
         log(log_level_tag(level), msg.as_ptr() as u32, msg.len() as u32);
     }
     #[cfg(not(target_arch = "wasm32"))]
-    crate::testing::push_log(format!("{level:?}"), msg.to_string());
+    {
+        let _ = (level, msg);
+        native_host_unavailable(imports::LOG)
+    }
 }
 
 #[inline]
@@ -106,7 +119,10 @@ pub(crate) fn host_random(buf: &mut [u8]) {
         random(buf.as_mut_ptr() as u32, buf.len() as u32);
     }
     #[cfg(not(target_arch = "wasm32"))]
-    buf.fill(0); // deterministic for tests
+    {
+        let _ = buf;
+        native_host_unavailable(imports::RANDOM)
+    }
 }
 
 /// Broadcast a message to every participant.
@@ -123,10 +139,8 @@ pub(crate) fn host_broadcast(msg_bytes: &[u8]) -> Result<(), crate::context::Bro
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        crate::testing::push_effect(arena0_protocol::Effect::Broadcast {
-            data: msg_bytes.to_vec(),
-        });
-        Ok(())
+        let _ = msg_bytes;
+        native_host_unavailable(imports::BROADCAST)
     }
 }
 
@@ -143,10 +157,10 @@ pub(crate) fn host_set_timer_spec(spec: &TimerSpec) {
         );
     }
     #[cfg(not(target_arch = "wasm32"))]
-    crate::testing::push_effect(arena0_protocol::Effect::SetTimer {
-        delay_ms: spec.delay_ms,
-        timer: spec.payload.clone(),
-    });
+    {
+        let _ = spec;
+        native_host_unavailable(imports::SET_TIMER)
+    }
 }
 
 pub(crate) fn host_guest_sign(scheme: SignScheme, payload: &[u8]) -> (Vec<u8>, Vec<u8>) {
@@ -173,25 +187,9 @@ pub(crate) fn host_guest_sign(scheme: SignScheme, payload: &[u8]) -> (Vec<u8>, V
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        fake_sign(scheme, payload)
+        let _ = (scheme, payload);
+        native_host_unavailable(imports::SIGN)
     }
-}
-
-/// Deterministic stand-in for the host signer in native builds. The harness
-/// cannot reach a real key, so it returns the payload unchanged with a
-/// deterministic 64-byte signature over it.
-#[cfg(not(target_arch = "wasm32"))]
-fn fake_sign(scheme: SignScheme, payload: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let _ = scheme;
-    let first = blake3::hash(payload);
-    let mut second_input = Vec::with_capacity(1 + payload.len());
-    second_input.push(0);
-    second_input.extend_from_slice(payload);
-    let second = blake3::hash(&second_input);
-    let mut signature = Vec::with_capacity(64);
-    signature.extend_from_slice(first.as_bytes());
-    signature.extend_from_slice(second.as_bytes());
-    (payload.to_vec(), signature)
 }
 
 pub(crate) fn host_end_session(outcome: &[u8]) {
@@ -200,9 +198,10 @@ pub(crate) fn host_end_session(outcome: &[u8]) {
         end_session(outcome.as_ptr() as u32, outcome.len() as u32);
     }
     #[cfg(not(target_arch = "wasm32"))]
-    crate::testing::push_effect(arena0_protocol::Effect::SessionEnd {
-        outcome: outcome.to_vec(),
-    });
+    {
+        let _ = outcome;
+        native_host_unavailable(imports::END_SESSION)
+    }
 }
 
 pub(crate) fn host_abort_session(reason: &str) {
@@ -211,9 +210,10 @@ pub(crate) fn host_abort_session(reason: &str) {
         abort_session(reason.as_ptr() as u32, reason.len() as u32);
     }
     #[cfg(not(target_arch = "wasm32"))]
-    crate::testing::push_effect(arena0_protocol::Effect::SessionAbort {
-        reason: reason.to_string(),
-    });
+    {
+        let _ = reason;
+        native_host_unavailable(imports::ABORT_SESSION)
+    }
 }
 
 pub fn host_fail(reason: &str) {
@@ -222,7 +222,8 @@ pub fn host_fail(reason: &str) {
         fail(reason.as_ptr() as u32, reason.len() as u32);
     }
     #[cfg(not(target_arch = "wasm32"))]
-    crate::testing::push_effect(arena0_protocol::Effect::Fail {
-        reason: reason.to_string(),
-    });
+    {
+        let _ = reason;
+        native_host_unavailable(imports::FAIL)
+    }
 }

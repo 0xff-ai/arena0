@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use arena0_protocol::{ColorDepth, Slot, Viewport};
 use arena0_tests::arena::Arena;
 use arena0_tests::wasm::program_wasm;
 use arena0_verify::LightVerifiedTerminal;
@@ -19,15 +20,72 @@ async fn completed_run(wasm: &[u8]) -> arena0_tests::arena::Run {
         .participants(2)
         .timeout(Duration::from_secs(120));
     let mut run = arena.run().await;
-    // Two rounds: participant 0 plays rock and participant 1 scissors.
-    for _ in 0..2 {
-        run.expect_input(0)
-            .respond_bytes(CHOICE_ROCK.to_vec())
-            .await;
-        run.expect_input(1)
-            .respond_bytes(CHOICE_SCISSORS.to_vec())
-            .await;
+
+    // The opening callout names the round, the match length, and the scores.
+    let callout = run.callout(0).await;
+    assert_eq!(callout.callout_index, 0);
+    assert_eq!(callout.context["round"], 1);
+    assert_eq!(callout.context["total_rounds"], 3);
+    assert_eq!(callout.context["your_score"], 0);
+    assert_eq!(callout.context["their_score"], 0);
+
+    // A choice outside the enum is rejected with the program's reason and the
+    // callout stays open, so the same round is answered below.
+    let reason = run
+        .expect_input(0)
+        .respond_rejected(br#""Lizard""#.to_vec())
+        .await;
+    assert!(
+        reason.contains("unknown variant"),
+        "unexpected rejection reason: {reason}"
+    );
+
+    // Round one: participant 0 plays rock and participant 1 scissors.
+    run.expect_input(0)
+        .respond_bytes(CHOICE_ROCK.to_vec())
+        .await;
+    run.expect_input(1)
+        .respond_bytes(CHOICE_SCISSORS.to_vec())
+        .await;
+    // The second round's callout opening proves the first round was applied:
+    // rock beats scissors, so participant 0 leads 1-0 in round 2.
+    let callout = run.callout(0).await;
+    assert_eq!(callout.context["round"], 2);
+    assert_eq!(callout.context["your_score"], 1);
+    assert_eq!(callout.context["their_score"], 0);
+
+    // Mid-game views render the choosing state: the header names round 2,
+    // the agents carry the round-one scores, and mono has no escapes.
+    let viewport = Viewport {
+        width: 80,
+        color: ColorDepth::Ansi16,
+    };
+    let view = run.view(0, viewport).await;
+    assert!(view.slots[&Slot::Header].contains("round 2 of 3"));
+    assert!(view.slots[&Slot::State].contains("Waiting for choices"));
+    assert!(view.slots[&Slot::Agents].contains("P0"));
+    assert!(view.slots[&Slot::Agents].contains("1 point"));
+    assert!(view.slots[&Slot::StatusBar].contains("playing"));
+    let mono = run
+        .view(
+            0,
+            Viewport {
+                width: 80,
+                color: ColorDepth::Mono,
+            },
+        )
+        .await;
+    for text in mono.slots.values() {
+        assert!(!text.contains("\x1b["), "mono view contains SGR: {text:?}");
     }
+
+    // Round two clinches the match 2-0.
+    run.expect_input(0)
+        .respond_bytes(CHOICE_ROCK.to_vec())
+        .await;
+    run.expect_input(1)
+        .respond_bytes(CHOICE_SCISSORS.to_vec())
+        .await;
     run.expect_completed_all().await;
     run
 }

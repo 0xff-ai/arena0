@@ -13,14 +13,15 @@ use std::time::{Duration, Instant};
 
 use arena0_crypto::{ExecutionKey, ExecutionSalt, NodeKeys, SecretKey};
 use arena0_node::{
-    DurableOutcome, ExecCommand, Host, NegotiationAttempt, NegotiationEffects, NegotiationStart,
-    PrepareOutcome, SessionMessage, SpawnedExec,
+    DurableOutcome, ExecCommand, ExecError, Host, NegotiationAttempt, NegotiationEffects,
+    NegotiationStart, PrepareOutcome, SessionMessage, SpawnedExec,
 };
 use arena0_node::{ExecContext, NegotiationBook};
 use arena0_program::JsonBytes;
 use arena0_protocol::{
     EventSource, ExecId, ExecutionAdmission, NegotiationEvent, NegotiationId, OfferData, PeerId,
-    PeerIdSource, ReceiptArtifact, SessionHash, SessionTermination, StateHash, TraceEntry,
+    PeerIdSource, ReceiptArtifact, SessionHash, SessionTermination, StateHash, TraceEntry, View,
+    Viewport,
 };
 use arena0_sandbox::Program;
 use arena0_store::{Store, StoreConfig, StoreHandle};
@@ -605,6 +606,76 @@ impl Run {
         }
     }
 
+    /// Wait until `participant` has an open callout and return it without
+    /// answering it. A later `expect_input(participant)` answers the same callout.
+    pub async fn callout(&mut self, participant: usize) -> ObservedCallout {
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        loop {
+            self.drain_events();
+            let handle = &mut self.participants[participant];
+            if let Some(observed) = handle.events.iter().rev().find_map(|event| match event {
+                SessionMessage::CalloutRequested {
+                    callout_index,
+                    context,
+                    ..
+                } => Some(ObservedCallout {
+                    callout_index: *callout_index,
+                    context: serde_json::from_slice(context).expect("callout context is JSON"),
+                }),
+                _ => None,
+            }) {
+                return observed;
+            }
+            if let Some(termination) = &handle.termination {
+                panic!(
+                    "participant {participant}: expected CalloutRequested, got termination: {termination:?}"
+                );
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let participant_events = handle.events.clone();
+                let mut states = Vec::with_capacity(self.participants.len());
+                for participant in &self.participants {
+                    states.push(
+                        participant
+                            .store_handle
+                            .load_execution(participant.exec_id)
+                            .await
+                            .expect("execution state"),
+                    );
+                }
+                let progress = self.progress_summary();
+                panic!(
+                    "participant {participant}: timeout waiting for CalloutRequested; progress: {progress}; events: {:?}; states: {states:?}",
+                    participant_events,
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Render one view on `participant` through its execution actor
+    /// (`ExecCommand::View`).
+    pub async fn view(&mut self, participant: usize, viewport: Viewport) -> View {
+        let json =
+            JsonBytes::try_new(serde_json::to_vec(&viewport).expect("viewport encodes as JSON"))
+                .expect("viewport must be valid JSON");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.participants[participant]
+            .spawned
+            .cmd_tx
+            .send(ExecCommand::View {
+                viewport: json,
+                reply: tx,
+            })
+            .await
+            .expect("execution gone");
+        match rx.await {
+            Ok(Ok((_, view))) => view,
+            Ok(Err(error)) => panic!("participant {participant}: view failed: {error}"),
+            Err(_) => panic!("participant {participant}: execution gone"),
+        }
+    }
+
     async fn wait_for_all_terminal(&mut self, timeout_action: &str) -> Vec<SessionTermination> {
         let deadline = tokio::time::Instant::now() + self.timeout;
         while self
@@ -880,6 +951,13 @@ impl Run {
     }
 }
 
+/// One open callout on a participant, as the Host reported it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObservedCallout {
+    pub callout_index: u32,
+    pub context: serde_json::Value,
+}
+
 #[allow(missing_debug_implementations)]
 pub struct Expect<'a> {
     run: &'a mut Run,
@@ -889,6 +967,34 @@ pub struct Expect<'a> {
 impl Expect<'_> {
     /// Respond to the expected callout with validated agent-facing JSON bytes.
     pub async fn respond_bytes(self, data: Vec<u8>) {
+        let mut this = self;
+        if let Err(error) = this.submit(data).await {
+            panic!("participant {}: input rejected: {error}", this.participant);
+        }
+        this.run.participants[this.participant]
+            .events
+            .retain(|event| !matches!(event, SessionMessage::CalloutRequested { .. }));
+    }
+
+    /// Answer the open callout with bytes the program must reject. Return the
+    /// program's rejection reason, or panic if the answer was accepted. The
+    /// callout stays open, so a later `respond_bytes` answers it.
+    pub async fn respond_rejected(self, data: Vec<u8>) -> String {
+        let mut this = self;
+        match this.submit(data).await {
+            Err(ExecError::InputRejected(reason)) => reason,
+            Ok(()) => panic!(
+                "participant {}: callout answer was accepted, expected a rejection",
+                this.participant
+            ),
+            Err(error) => panic!(
+                "participant {}: expected an input rejection, got: {error}",
+                this.participant
+            ),
+        }
+    }
+
+    async fn submit(&mut self, data: Vec<u8>) -> Result<(), ExecError> {
         let json = JsonBytes::try_new(data).expect("callout response must be valid JSON");
         let deadline = tokio::time::Instant::now() + self.run.timeout;
         loop {
@@ -899,9 +1005,6 @@ impl Expect<'_> {
                 _ => None,
             });
             if let Some(pending_id) = pending {
-                participant
-                    .events
-                    .retain(|event| !matches!(event, SessionMessage::CalloutRequested { .. }));
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 participant
                     .spawned
@@ -914,10 +1017,7 @@ impl Expect<'_> {
                     .await
                     .expect("execution gone");
                 match rx.await {
-                    Ok(Ok(())) => return,
-                    Ok(Err(error)) => {
-                        panic!("participant {}: input rejected: {error}", self.participant)
-                    }
+                    Ok(result) => return result,
                     Err(_) => panic!("participant {}: execution gone", self.participant),
                 }
             }

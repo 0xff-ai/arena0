@@ -190,34 +190,59 @@ pub mod minimal_choice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arena0::testing::{ALICE, BOB, Harness, Scenario};
     use arena0::types::{ColorDepth, Slot};
 
     #[test]
-    fn two_replicas_converge_on_the_choices() {
-        let pair = Scenario::<minimal_choice::MinimalChoice>::named("two public choices")
-            .input(ALICE, Input::Choose(Choice::One))
-            .deliver_all()
-            .input(BOB, Input::Choose(Choice::Two))
-            .deliver_all()
-            .run(());
-
-        pair.trace().assert_shared_aligned();
-        assert_eq!(pair.alice().shared().choices[0], Some(Choice::One));
-        assert_eq!(pair.alice().shared().choices[1], Some(Choice::Two));
+    fn outcome_ranks_choices_by_score() {
+        // The phase plays no role in the outcome projection; struct-update
+        // syntax leaves it at its default (the `#[arena0::state]` phase field
+        // is a `ManagedPhase`, not the plain phase enum).
+        let won = Shared {
+            choices: [Some(Choice::One), Some(Choice::Two)],
+            ..Default::default()
+        };
+        assert!(matches!(
+            <minimal_choice::MinimalChoice as Program>::outcome(&won),
+            Outcome::Win {
+                winner,
+                choices: [Choice::One, Choice::Two],
+            } if winner == Participant::new(1)
+        ));
+        let drawn = Shared {
+            choices: [Some(Choice::Two), Some(Choice::Two)],
+            ..Default::default()
+        };
+        assert!(matches!(
+            <minimal_choice::MinimalChoice as Program>::outcome(&drawn),
+            Outcome::Draw {
+                choices: [Choice::Two, Choice::Two],
+            }
+        ));
     }
 
-    #[arena0::test(MinimalChoice, ())]
-    fn view_uses_all_four_slots_and_plain_text(h: ()) {
-        h.session_started(PeerId([1; 32]));
-        let view = h.view(Viewport {
-            width: 80,
-            color: ColorDepth::Mono,
-        });
-
+    #[test]
+    fn view_uses_all_four_slots_and_plain_text() {
+        let state = Shared {
+            choices: [Some(Choice::One), None],
+            ..Default::default()
+        };
+        let ensemble =
+            Ensemble::from_peers(vec![PeerId([1; 32]), PeerId([2; 32])])
+                .expect("valid view ensemble");
+        let view = <minimal_choice::MinimalChoice as ProgramView>::view(
+            &state,
+            &ensemble,
+            &Viewport {
+                width: 80,
+                color: ColorDepth::Mono,
+            },
+        );
         for slot in [Slot::Header, Slot::Agents, Slot::State, Slot::StatusBar] {
-            assert!(view.slots.contains_key(&slot));
+            assert!(view.slots.contains_key(&slot), "missing {slot:?} view slot");
         }
         assert!(view.slots.values().all(|text| !text.contains("\x1b[")));
+        assert!(view.slots[&Slot::Agents].contains("P0: one"));
+        assert!(view.slots[&Slot::Agents].contains("P1: waiting"));
+        assert_eq!(view.slots[&Slot::StatusBar], "choosing");
     }
 }

@@ -597,7 +597,6 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arena0::testing::{FaultStatus, Harness, TestHarness};
     use arena0::types::{ColorDepth, Slot};
     use borsh::BorshSerialize;
 
@@ -685,66 +684,6 @@ mod tests {
                 price: 180,
             })
         );
-    }
-
-    fn bid_commit(value: u64, salt: u8) -> Message {
-        let mut protocol = CommitReveal::default();
-        protocol.set_participant_count(3).unwrap();
-        let mut local = CommitRevealLocal::default();
-        Message::Bid(
-            protocol
-                .commit_with_salt(&mut local, value, [salt; 32])
-                .unwrap(),
-        )
-    }
-
-    #[test]
-    fn missing_reveal_keeps_auction_pending() {
-        let seller = PeerId([0; 32]);
-        let first_bidder = PeerId([1; 32]);
-        let missing_bidder = PeerId([2; 32]);
-        let ensemble = Ensemble::from_peers(vec![seller, first_bidder, missing_bidder]).unwrap();
-        let mut h = TestHarness::<vickrey_auction::VickreyAuction>::with_peer_id(
-            seller,
-            Params {
-                item: "demo item".into(),
-                reserve: None,
-            },
-        );
-
-        let started = h.session_started_with_ensemble(ensemble);
-        assert!(matches!(started.fault, FaultStatus::None));
-        // Session start queues the seller's commit; the author applies its own
-        // message through `on_message`.
-        let _seller_commit = started
-            .messages::<Message>()
-            .into_iter()
-            .find(|message| matches!(message, Message::Bid(commit_reveal::Message::Commit(_))))
-            .expect("seller queues its commit");
-        h.author_queued(&started.effects);
-        h.message(first_bidder, bid_commit(120, 1));
-        let committed = h.message(missing_bidder, bid_commit(80, 2));
-        let _seller_reveal = committed
-            .messages::<Message>()
-            .into_iter()
-            .find(|message| matches!(message, Message::Bid(commit_reveal::Message::Reveal { .. })))
-            .expect("seller reveal is queued once every commit is applied");
-        // The author applies its own reveal through `on_message`.
-        h.author_queued(&committed.effects);
-        let pending = h.message(
-            first_bidder,
-            Message::Bid(commit_reveal::Message::Reveal {
-                value: 120,
-                salt: [1; 32],
-            }),
-        );
-
-        assert!(matches!(h.shared().phase(), Phase::Bidding));
-        assert_eq!(h.shared().bids.phase(), commit_reveal::Phase::Revealing);
-        assert_eq!(h.shared().bids.expected_writer(), Some(Participant::new(2)));
-        assert!(h.shared().settlement.is_none());
-        assert!(!pending.has_session_end());
-        assert!(h.trace().iter().all(|step| !step.is_terminal()));
     }
 
     #[test]

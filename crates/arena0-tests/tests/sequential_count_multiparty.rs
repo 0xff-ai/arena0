@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use arena0_protocol::{ColorDepth, Slot, Viewport};
 use arena0_tests::arena::{Arena, ArenaProgress};
 use arena0_tests::wasm::program_wasm;
 use arena0_verify::LightVerifiedTerminal;
@@ -31,6 +32,34 @@ async fn five_peers_count_in_commit_reveal_selected_round_robin_order() {
         .timeout(Duration::from_secs(90))
         .params(encode_params(PARTICIPANTS as u32, COUNT_TO as u32));
     let mut run = arena.run().await;
+
+    // The program-state projection fills every slot in both color depths,
+    // with no escape sequences in mono. The game selects its order and
+    // counts without agent input, so the state slot shows either the
+    // commit-reveal selection or the running count.
+    let view = run
+        .view(
+            0,
+            Viewport {
+                width: 80,
+                color: ColorDepth::Mono,
+            },
+        )
+        .await;
+    assert!(view.slots[&Slot::Header].contains("Sequential count - "));
+    assert!(view.slots[&Slot::Header].contains(" of 15"));
+    assert!(view.slots[&Slot::Agents].contains("P0"));
+    assert!(view.slots[&Slot::Agents].contains("P4"));
+    let state = view.slots[&Slot::State].clone();
+    assert!(
+        state.contains("commit-reveal") || state.contains("Count:"),
+        "state should show order selection or the running count: {state:?}"
+    );
+    assert!(view.slots[&Slot::StatusBar].contains("5 participants"));
+    assert!(
+        view.slots.values().all(|text| !text.contains("\x1b[")),
+        "mono view contains SGR"
+    );
 
     let outcomes = run.expect_completed_all().await;
     assert!(

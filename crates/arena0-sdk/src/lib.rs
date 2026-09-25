@@ -4,8 +4,7 @@
 //! for accessing shared and local state plus issuing host effects during each dispatch
 //! step. The [`prelude`] re-exports everything a typical program needs.
 //!
-//! Guest ABI buffers are available only inside Wasm. Native tests use
-//! [`testing`] and cannot access the guest's single-threaded allocator.
+//! Guest ABI buffers are available only inside Wasm.
 //!
 //! ```compile_fail
 //! let _ = arena0::io_alloc::io_alloc(8);
@@ -84,8 +83,6 @@ mod schema_primitives;
 #[path = "prelude.rs"]
 mod sdk_prelude;
 mod state;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod testing;
 pub mod timer;
 mod transition;
 
@@ -98,7 +95,6 @@ pub const RESIDENT_ALLOCATOR_RESERVE_BYTES: usize = arena0_program::MIN_PREPARED
 
 pub use arena0_sdk_macros::{
     callout, callouts, data, local, message, outcome, phases, primitive, program, query, state,
-    test,
 };
 pub use context::{
     AgreedMode, BroadcastError, CalloutContext, Context, Crypto, Ctx, EffectMode, Effects,
@@ -147,9 +143,9 @@ pub use arena0_program::{
 };
 pub use arena0_protocol as types;
 pub use arena0_protocol::{
-    Committed, DisconnectReason, DivergenceDiagnostic, DivergenceKind, Effect, Ensemble,
-    EnsembleError, Event, LogLevel, Open, Participant, PeerId, SessionHash, StateHash,
-    TimerPayload, TimerSpec, TraceEntry, View, Viewport,
+    Committed, DisconnectReason, Effect, Ensemble, EnsembleError, Event, LogLevel, Open,
+    Participant, PeerId, SessionHash, StateHash, TimerPayload, TimerSpec, TraceEntry, View,
+    Viewport,
 };
 pub use blake3;
 pub use borsh;

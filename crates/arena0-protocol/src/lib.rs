@@ -86,8 +86,8 @@ pub use system_event::{
 pub use terminal::TerminalResult;
 pub use timer::{TimerPayload, TimerSpec};
 pub use trace::{
-    AggregateAttestation, AttestationError, CHAIN_START, DivergenceDiagnostic, DivergenceKind,
-    ReceiptTermination, STEP_COMMIT_DOMAIN, SessionHeader, SignerSet, StepCommitment, StepEvent,
-    StepSig, StepTerminal, TRACE_FORMAT_VERSION, TraceEntry,
+    AggregateAttestation, AttestationError, CHAIN_START, ReceiptTermination, STEP_COMMIT_DOMAIN,
+    SessionHeader, SignerSet, StepCommitment, StepEvent, StepSig, StepTerminal,
+    TRACE_FORMAT_VERSION, TraceEntry,
 };
 pub use view::{ColorDepth, Slot, View, Viewport};

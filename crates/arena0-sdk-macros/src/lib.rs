@@ -8,7 +8,6 @@
 //! runtime expects. Programs re-export these through `arena0`; direct use is
 //! uncommon.
 
-mod arena0_test;
 mod attr_callout;
 mod attr_local;
 mod attr_phases;
@@ -139,12 +138,4 @@ pub fn program(args: TokenStream, input: TokenStream) -> TokenStream {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }
-}
-
-/// Generates dual test functions (native + sandbox) from a single test definition.
-#[proc_macro_attribute]
-pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
-    arena0_test::expand(attr.into(), item.into())
-        .unwrap_or_else(|e| e.to_compile_error())
-        .into()
 }
