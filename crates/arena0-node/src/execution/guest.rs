@@ -122,14 +122,10 @@ impl ExecutionActor {
         pending_id: CalloutId,
         data: JsonBytes,
     ) -> Result<(), SubmitInputError> {
-        let state = &self.state;
-        let Some(open) = state.callout() else {
+        // `dispatch_event` checks that `pending_id` names the open callout.
+        let Some(callout_index) = self.state.callout().map(|open| open.callout_index) else {
             return Err(SubmitInputError::Expected(ExecError::CalloutNotPending));
         };
-        if open.id != pending_id {
-            return Err(SubmitInputError::Expected(ExecError::CalloutNotPending));
-        }
-        let callout_index = open.callout_index;
         let accepted = self
             .dispatch_event(
                 Event::InputReceived {
