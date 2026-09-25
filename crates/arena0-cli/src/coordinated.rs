@@ -468,6 +468,8 @@ impl Coordinator {
             None
         };
         let tui_handle = tui.as_ref().map(TuiSession::handle);
+        // One short-lived value per run; boxing the result buys nothing.
+        #[allow(clippy::large_enum_variant)]
         enum RunOutcome {
             Finished(anyhow::Result<AggregateResult>),
             Cancelled(anyhow::Result<String>),
