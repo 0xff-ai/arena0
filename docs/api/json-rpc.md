@@ -209,7 +209,6 @@ clients immediately. The `end` object in `exec.status` then tracks which remote
 participants have not yet confirmed the same conclusion; the `open`, `ending`,
 and `ended` phases and their confirmation rules are specified in
 [terminal evidence and publication](../protocol-architecture.md#terminal-evidence-and-publication).
-The confirmation window defaults to ten minutes from actor start or wake.
 
 ## Receipts
 
