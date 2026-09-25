@@ -4137,6 +4137,7 @@ mod tests {
     use arena0_program::{LocalStateBytes, SharedStateBytes};
     use arena0_protocol::execution::ExecutionState;
     use arena0_protocol::{AbortKind, Activation, ActivationData, PreparedActivation};
+    use arena0_test_engine::shared_test_engine;
     use arena0_transport::local::{LocalNetwork, LocalTransport};
 
     fn test_daemon() -> (
@@ -4158,7 +4159,7 @@ mod tests {
         .unwrap();
         let store_handle = store.handle().clone();
         let catalog = ProgramCatalog::new(store_handle.clone());
-        let engine = Arc::new(WasmtimeEngine::new().unwrap());
+        let engine = shared_test_engine();
 
         let network = LocalNetwork::new();
         let mut transports =

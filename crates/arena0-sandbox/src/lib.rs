@@ -36,6 +36,9 @@ pub use signing::GuestSigner;
 mod program;
 pub use program::Program;
 
+#[cfg(test)]
+mod test_support;
+
 use arena0_program::{
     CallStatus, CalloutRequest, JsonBytes, LocalStateBytes, OutcomeBytes, SharedStateBytes,
 };

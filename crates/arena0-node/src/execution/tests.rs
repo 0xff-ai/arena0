@@ -17,8 +17,9 @@ use arena0_protocol::{
     ExecutionAdmission, ExecutionStatus, NegotiationId, Offer, OfferData, PeerId, PeerIdSource,
     PendingId, PreparedActivation, StateHash, Ticket, TicketAction, TicketData, TicketHash,
 };
-use arena0_sandbox::{InitializeCall, LoadedProgram, Program, WasmtimeEngine};
+use arena0_sandbox::{InitializeCall, LoadedProgram, Program};
 use arena0_store::{Change, Store, StoreConfig};
+use arena0_test_engine::shared_test_engine;
 use arena0_transport::Transport;
 use arena0_transport::local::{LocalNetwork, LocalTransport};
 use tempfile::TempDir;
@@ -138,8 +139,7 @@ impl Fixture {
             ExecutionSalt::try_from_bytes([remote_salt; 32]).expect("non-zero test salt");
         let program = Program::parse(wasm.clone()).expect("program");
         let params = JsonBytes::try_new(b"null".to_vec()).expect("params");
-        let initialized = WasmtimeEngine::new()
-            .expect("sandbox engine")
+        let initialized = shared_test_engine()
             .load(&program)
             .expect("loaded program")
             .initialize(InitializeCall::new(params.clone()))
@@ -223,10 +223,7 @@ impl Fixture {
 
     fn loaded_program(&self) -> Arc<LoadedProgram> {
         let program = Program::parse(self.wasm.clone()).expect("program");
-        WasmtimeEngine::new()
-            .expect("sandbox engine")
-            .load(&program)
-            .expect("loaded program")
+        shared_test_engine().load(&program).expect("loaded program")
     }
 
     fn context(&self) -> ExecContext {
@@ -2889,8 +2886,7 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
         timer_body = timer_body,
     );
     let raw = wat::parse_str(wat).expect("wat");
-    WasmtimeEngine::new()
-        .expect("sandbox engine")
+    shared_test_engine()
         .build_program(&raw)
         .expect("finalize test program")
         .bytes()

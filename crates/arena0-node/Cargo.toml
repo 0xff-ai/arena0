@@ -24,6 +24,8 @@ blake3 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+arena0-test-engine = { path = "../arena0-test-engine" }
+tokio = { workspace = true, features = ["test-util"] }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 tempfile = { workspace = true }

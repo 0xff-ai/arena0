@@ -217,7 +217,7 @@ pub async fn daemon(wasm: &[u8]) -> DaemonHarness {
     let host_a = HostName::try_from("a").unwrap();
     let host_b = HostName::try_from("b").unwrap();
     let mcp = McpConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)), None).unwrap();
-    let engine = Arc::new(arena0_sandbox::WasmtimeEngine::new().expect("sandbox engine"));
+    let engine = arena0_test_engine::shared_test_engine();
     let supervisor = Daemon::start(
         vec![host_a.clone(), host_b.clone()],
         mcp,

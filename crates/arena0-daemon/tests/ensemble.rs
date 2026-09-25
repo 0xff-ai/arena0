@@ -57,7 +57,7 @@ async fn start(
     let daemon = Daemon::start(
         names.iter().map(|name| name.parse().unwrap()).collect(),
         McpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap(),
-        Arc::new(arena0_sandbox::WasmtimeEngine::new().expect("sandbox engine")),
+        arena0_test_engine::shared_test_engine(),
         home,
         true,
     )

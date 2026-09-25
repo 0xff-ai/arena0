@@ -539,7 +539,13 @@ impl<'store, 'effects> NegotiationDriver<'store, 'effects> {
         let fact = match event {
             ProgramTopicEvent::Joined => return Ok(None),
             ProgramTopicEvent::NeighborUp(peer) => {
-                self.neighbors.insert(peer);
+                // A subscriber that joins after the first emission missed the
+                // current facts and would otherwise wait for the next cadence
+                // tick. Send them right away; the cadence stays as the
+                // loss-recovery resend.
+                if self.neighbors.insert(peer) {
+                    return self.emit_periodic().await;
+                }
                 return Ok(None);
             }
             ProgramTopicEvent::NeighborDown(peer) => {
@@ -1762,11 +1768,11 @@ mod tests {
     use arena0_crypto::{ExecutionKey, ExecutionSalt, NodeKeys, SecretKey};
     use arena0_program::ProgramHash;
     use arena0_protocol::{
-        EventSource, ExecId, ExecutionAdmission, NegotiationEvent, NegotiationId, OfferData,
-        PeerIdSource, StateHash,
+        EventSource, ExecId, ExecutionAdmission, FetchFrame, NegotiationEvent, NegotiationId,
+        Offer, OfferData, PeerId, PeerIdSource, StateHash,
     };
     use arena0_store::{ExecutionStore, Store, StoreConfig};
-    use arena0_transport::{LocalNetwork, LocalTransport, Transport};
+    use arena0_transport::{LocalNetwork, LocalTransport, ProgramTopicEvent, Transport};
     use tokio::time::Instant;
 
     use super::super::NegotiationBook;
@@ -1776,6 +1782,7 @@ mod tests {
         RecomputeInitialStateEffect, unix_time_ms,
     };
     use super::NegotiationDriver;
+    use crate::machines::activation::ActivatedSession;
     use crate::router::FetchRegistry;
 
     async fn test_driver<'a>(
@@ -2081,5 +2088,392 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Phase 1 of the late-join scenario. The creator's real `run()` starts
+    /// and publishes its first emission before the participant exists at all;
+    /// an observer on the same topic proves the emission landed. Only then
+    /// may the participant subscribe, so it provably missed those facts and
+    /// the transport's real `NeighborUp` is its only way forward. Nothing is
+    /// injected and the creator emits nothing else while the clock is frozen.
+    struct CreatorFirst {
+        creator_task: tokio::task::JoinHandle<Result<ActivatedSession, NegotiationDriveError>>,
+        participant_transport: LocalTransport,
+        creator_peer: PeerId,
+        offer: Offer,
+        program_hash: ProgramHash,
+        negotiation_id: NegotiationId,
+        emit: &'static (dyn Fn(EventSource, NegotiationEvent) + Send + Sync),
+    }
+
+    async fn test_creator_first(
+        creator_crypto: &'static NodeKeys,
+        participant_crypto: &'static NodeKeys,
+        negotiation_id: NegotiationId,
+        emit: &'static (dyn Fn(EventSource, NegotiationEvent) + Send + Sync),
+    ) -> CreatorFirst {
+        let observer_crypto = NodeKeys::from_secret(SecretKey::from_bytes([3; 32]));
+        let network = LocalNetwork::new();
+        let [creator_transport, participant_transport, observer_transport]: [LocalTransport; 3] =
+            LocalTransport::create_network(
+                &network,
+                vec![
+                    creator_crypto.peer_id(),
+                    participant_crypto.peer_id(),
+                    observer_crypto.peer_id(),
+                ],
+            )
+            .expect("attach local transports")
+            .try_into()
+            .expect("three transports");
+        let creator_transport = Arc::new(creator_transport);
+        let wasm = vec![9; 4];
+        let program_hash = ProgramHash::of(&wasm);
+        let params = br#"{}"#.to_vec();
+        // The observer subscribes before the creator runs, with an empty
+        // bootstrap so it queues no `NeighborUp` on either side.
+        let mut observer_topic = observer_transport
+            .subscribe_program(program_hash, Vec::new())
+            .await
+            .expect("observer topic");
+
+        // Creator side: offer, ticket, and first emission happen before the
+        // participant subscribes.
+        let creator_directory = Box::leak(Box::new(tempfile::tempdir().expect("creator store")));
+        let creator_store = Box::leak(Box::new(
+            Store::open(StoreConfig::new(
+                creator_directory.path().join("execution.sqlite"),
+                creator_crypto.peer_id(),
+            ))
+            .expect("creator store"),
+        ));
+        creator_store
+            .handle()
+            .register_program(wasm.clone(), 1)
+            .await
+            .expect("creator program");
+        let creator_exec_store = Box::leak(Box::new(
+            creator_store
+                .handle()
+                .claim_execution(ExecId([7; 32]))
+                .expect("creator execution"),
+        ));
+        creator_exec_store
+            .create_execution_request(
+                program_hash,
+                Some(arena0_program::JsonBytes::try_new(params.clone()).expect("params")),
+                ExecutionAdmission::explicit(
+                    negotiation_id,
+                    vec![creator_crypto.peer_id(), participant_crypto.peer_id()],
+                )
+                .expect("creator admission"),
+                1,
+            )
+            .await
+            .expect("creator request");
+        let creator_execution = Box::leak(Box::new(
+            ExecutionKey::derive(
+                &ExecutionSalt::try_from_bytes([7; 32]).expect("creator salt"),
+                &[7; 32],
+                &negotiation_id.0,
+            )
+            .expect("creator execution key"),
+        ));
+        let offer_data = OfferData::new(
+            negotiation_id,
+            0,
+            creator_crypto.peer_id(),
+            program_hash,
+            arena0_program::ExecutionProfile::current().hash(),
+            arena0_program::JsonBytes::try_new(params.clone()).expect("valid JSON"),
+            2,
+            StateHash(*blake3::hash(&params).as_bytes()),
+            unix_time_ms().saturating_add(30_000),
+        )
+        .expect("valid offer");
+        let creator_book = NegotiationBook::new(creator_crypto, creator_execution);
+        let (offer, creator_ticket) = creator_book
+            .create_creator_offer(offer_data, unix_time_ms())
+            .expect("creator offer");
+        let creator_topic = creator_transport
+            .subscribe_program(program_hash, Vec::new())
+            .await
+            .expect("creator topic");
+        let creator_fetch_registry: FetchRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let creator_pump = Arc::clone(&creator_transport);
+        let creator = NegotiationDriver::new(
+            creator_transport,
+            Arc::clone(&creator_fetch_registry),
+            creator_crypto,
+            creator_execution,
+            creator_exec_store,
+            NegotiationAttempt {
+                topic: creator_topic,
+                exec_id: ExecId([7; 32]),
+                start: NegotiationStart::Fresh {
+                    offer: offer.clone(),
+                    creator_ticket: Some(creator_ticket),
+                    preferred_params: None,
+                },
+                supervision: None,
+                deadline: Some(Instant::now() + Duration::from_secs(30)),
+            },
+            NegotiationEffects {
+                prepare: test_prepare_effect(),
+                persist_activation: test_persist_effect(),
+                recompute_initial_state: test_recompute_effect(),
+                emit,
+            },
+        )
+        .expect("creator driver");
+        spawn_fetch_pump(creator_pump, creator_fetch_registry);
+        let creator_task = tokio::spawn(async move { creator.run().await });
+        // Synchronize on the first emission reaching the topic: the observer
+        // receives exactly the unfrozen offer and ticket.
+        for _ in 0..2 {
+            let event = observer_topic
+                .recv()
+                .await
+                .expect("first emission is published");
+            assert!(matches!(event, ProgramTopicEvent::Fact(_)));
+        }
+        CreatorFirst {
+            creator_task,
+            participant_transport,
+            creator_peer: creator_crypto.peer_id(),
+            offer,
+            program_hash,
+            negotiation_id,
+            emit,
+        }
+    }
+
+    /// Phase 2: subscribe the participant late over the same network and run
+    /// it. The join queues the real `NeighborUp` on the creator's topic; the
+    /// re-emit it triggers is the only post-subscription emission the
+    /// creator can make while the clock is frozen.
+    async fn test_join_participant(
+        started: CreatorFirst,
+        participant_crypto: &'static NodeKeys,
+    ) -> (
+        tokio::task::JoinHandle<Result<ActivatedSession, NegotiationDriveError>>,
+        tokio::task::JoinHandle<Result<ActivatedSession, NegotiationDriveError>>,
+    ) {
+        let CreatorFirst {
+            creator_task,
+            participant_transport,
+            creator_peer,
+            offer,
+            program_hash,
+            negotiation_id,
+            emit,
+        } = started;
+        let wasm = vec![9; 4];
+        let params = br#"{}"#.to_vec();
+        let participant_topic = participant_transport
+            .subscribe_program(program_hash, vec![creator_peer])
+            .await
+            .expect("participant topic");
+        let participant_directory =
+            Box::leak(Box::new(tempfile::tempdir().expect("participant store")));
+        let participant_store = Box::leak(Box::new(
+            Store::open(StoreConfig::new(
+                participant_directory.path().join("execution.sqlite"),
+                participant_crypto.peer_id(),
+            ))
+            .expect("participant store"),
+        ));
+        participant_store
+            .handle()
+            .register_program(wasm, 1)
+            .await
+            .expect("participant program");
+        let participant_exec_store = Box::leak(Box::new(
+            participant_store
+                .handle()
+                .claim_execution(ExecId([9; 32]))
+                .expect("participant execution"),
+        ));
+        participant_exec_store
+            .create_execution_request(
+                program_hash,
+                Some(arena0_program::JsonBytes::try_new(params.clone()).expect("params")),
+                ExecutionAdmission::join(creator_peer, negotiation_id),
+                1,
+            )
+            .await
+            .expect("participant request");
+        let participant_execution = Box::leak(Box::new(
+            ExecutionKey::derive(
+                &ExecutionSalt::try_from_bytes([9; 32]).expect("participant salt"),
+                &[9; 32],
+                &negotiation_id.0,
+            )
+            .expect("participant execution key"),
+        ));
+        let participant_fetch_registry: FetchRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let participant_transport = Arc::new(participant_transport);
+        let participant_pump = Arc::clone(&participant_transport);
+        let participant = NegotiationDriver::new(
+            participant_transport,
+            Arc::clone(&participant_fetch_registry),
+            participant_crypto,
+            participant_execution,
+            participant_exec_store,
+            NegotiationAttempt {
+                topic: participant_topic,
+                exec_id: ExecId([9; 32]),
+                start: NegotiationStart::Fresh {
+                    offer: offer.clone(),
+                    creator_ticket: None,
+                    preferred_params: None,
+                },
+                supervision: None,
+                deadline: Some(Instant::now() + Duration::from_secs(30)),
+            },
+            NegotiationEffects {
+                prepare: test_prepare_effect(),
+                persist_activation: test_persist_effect(),
+                recompute_initial_state: test_recompute_effect(),
+                emit,
+            },
+        )
+        .expect("participant driver");
+        // Convergence-fetch routing, as run by each production Host: accept
+        // inbound fetch streams and file them by session hash so the drivers
+        // serve and consume evidence without any cadence tick.
+        spawn_fetch_pump(participant_pump, participant_fetch_registry);
+        let participant_task = tokio::spawn(async move { participant.run().await });
+        (creator_task, participant_task)
+    }
+
+    fn spawn_fetch_pump(transport: Arc<LocalTransport>, fetch_registry: FetchRegistry) {
+        tokio::spawn(async move {
+            loop {
+                let Ok(recv) = transport.accept_fetch().await else {
+                    return;
+                };
+                let Ok(frame) = recv.recv_fetch().await else {
+                    continue;
+                };
+                let session_hash = match &frame {
+                    FetchFrame::FetchActivationTickets(request) => request.session_hash,
+                    FetchFrame::ActivationTickets(response) => response.session_hash,
+                };
+                let sender = fetch_registry.lock().unwrap().get(&session_hash).cloned();
+                if let Some(sender) = sender {
+                    let _ = sender.send((recv, frame)).await;
+                }
+            }
+        });
+    }
+
+    fn test_prepare_effect() -> PrepareEffect {
+        Box::new(|store: &mut ExecutionStore, _| {
+            Box::pin(async move {
+                store
+                    .load_execution_request()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok::<PrepareOutcome, String>(PrepareOutcome::Accepted)
+            })
+        })
+    }
+
+    fn test_persist_effect() -> PersistActivationEffect {
+        Box::new(|store: &mut ExecutionStore, _| {
+            Box::pin(async move {
+                store
+                    .load_execution_request()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok::<DurableOutcome, String>(DurableOutcome::Accepted)
+            })
+        })
+    }
+
+    fn test_recompute_effect() -> RecomputeInitialStateEffect {
+        Box::new(|input: &[u8]| Ok::<StateHash, String>(StateHash(*blake3::hash(input).as_bytes())))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_subscriber_activates_before_next_cadence() {
+        // Leaked like the stores and keys: the driven futures are spawned.
+        let creator_crypto: &NodeKeys = Box::leak(Box::new(NodeKeys::from_secret(
+            SecretKey::from_bytes([1; 32]),
+        )));
+        let participant_crypto: &NodeKeys = Box::leak(Box::new(NodeKeys::from_secret(
+            SecretKey::from_bytes([2; 32]),
+        )));
+        let emit: &(dyn Fn(EventSource, NegotiationEvent) + Send + Sync) =
+            &*Box::leak(Box::new(|_, _| {}));
+        let negotiation_id = NegotiationId([8; 32]);
+        // Phase 1 runs the creator and publishes the first emission before
+        // the participant exists; phase 2 subscribes it late over the same
+        // network. No topic event is injected anywhere in this path.
+        let frozen = tokio::time::Instant::now();
+        let started =
+            test_creator_first(creator_crypto, participant_crypto, negotiation_id, emit).await;
+        let (creator_task, participant_task) =
+            test_join_participant(started, participant_crypto).await;
+        // Both drives run with the clock frozen: the cadence tick can never
+        // fire, so reaching activation proves the late join rode the real
+        // NeighborUp re-emit rather than the periodic resend.
+        for _ in 0..10_000 {
+            if creator_task.is_finished() && participant_task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            creator_task.is_finished() && participant_task.is_finished(),
+            "late subscriber did not activate without a cadence tick"
+        );
+        let creator_session = creator_task
+            .await
+            .expect("creator task")
+            .expect("creator activates");
+        let participant_session = participant_task
+            .await
+            .expect("participant task")
+            .expect("participant activates");
+        assert_eq!(
+            creator_session.session_hash(),
+            participant_session.session_hash()
+        );
+        assert!(frozen.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn duplicate_neighbor_up_resends_nothing() {
+        let crypto = NodeKeys::from_secret(SecretKey::from_bytes([1; 32]));
+        let emit = |_, _| {};
+        let mut driver = test_driver(&crypto, ExecId([7; 32]), NegotiationId([8; 32]), &emit).await;
+        assert!(
+            driver
+                .emit_periodic()
+                .await
+                .expect("first emission")
+                .is_none()
+        );
+        assert_eq!(driver.cadence_counter, 1);
+        // A repeated NeighborUp for a known peer resends nothing.
+        let stranger = PeerId([0x77; 32]);
+        assert!(
+            driver
+                .on_topic_event(ProgramTopicEvent::NeighborUp(stranger))
+                .await
+                .expect("neighbor-up emit")
+                .is_none()
+        );
+        assert_eq!(driver.cadence_counter, 2);
+        assert!(
+            driver
+                .on_topic_event(ProgramTopicEvent::NeighborUp(stranger))
+                .await
+                .expect("duplicate neighbor-up")
+                .is_none()
+        );
+        assert_eq!(driver.cadence_counter, 2);
     }
 }

@@ -87,6 +87,7 @@ async fn serve_until_shutdown(
 
 #[cfg(test)]
 mod tests {
+    use arena0_test_engine::shared_test_engine;
     use std::net::SocketAddr;
     use std::time::Duration;
 
@@ -109,7 +110,7 @@ mod tests {
         let first = TempDir::new().expect("first Host home");
         let socket = first.path().join("arena0.sock");
         let mcp = McpConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)), None).expect("MCP config");
-        let engine = Arc::new(WasmtimeEngine::new().expect("sandbox engine"));
+        let engine = shared_test_engine();
         let daemon = Daemon::start(
             vec!["first".parse().unwrap(), "second".parse().unwrap()],
             mcp,

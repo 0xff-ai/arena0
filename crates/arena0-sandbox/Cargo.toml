@@ -26,6 +26,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+arena0-test-engine = { path = "../arena0-test-engine" }
 wat = { workspace = true }
 wasmtime = { workspace = true, features = ["wat"] }
 tracing-subscriber = { workspace = true }

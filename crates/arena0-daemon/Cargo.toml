@@ -38,6 +38,7 @@ zeroize = { workspace = true }
 fs2 = "0.4"
 
 [dev-dependencies]
+arena0-test-engine = { path = "../arena0-test-engine" }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
 rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }

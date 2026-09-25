@@ -22,8 +22,9 @@ use arena0_protocol::{
     EventSource, ExecId, ExecutionAdmission, NegotiationEvent, NegotiationId, OfferData, PeerId,
     PeerIdSource, ReceiptArtifact, SessionHash, SessionTermination, StateHash, TraceEntry,
 };
-use arena0_sandbox::{InitializeCall, Program, WasmtimeEngine};
+use arena0_sandbox::{InitializeCall, Program};
 use arena0_store::{Store, StoreConfig, StoreHandle};
+use arena0_test_engine::shared_test_engine;
 use arena0_transport::Transport;
 use arena0_transport::local::LocalTransport;
 use arena0_verify::verify_light;
@@ -221,11 +222,10 @@ impl Arena {
         let program = Program::try_from(wasm.clone()).expect("program");
         let program_id = program.hash();
         let creator_params = self.params.clone();
-        let creator_program = WasmtimeEngine::new()
-            .expect("sandbox")
-            .load(&program)
-            .expect("load");
-        let initialized = creator_program
+        // One shared load per run: every participant dispatches residents of
+        // the same compiled module through the process-wide test engine.
+        let loaded = shared_test_engine().load(&program).expect("load");
+        let initialized = loaded
             .initialize(InitializeCall::new(
                 JsonBytes::try_new(creator_params.clone()).expect("valid creator params"),
             ))
@@ -309,7 +309,7 @@ impl Arena {
             let exec_id = exec_id_for(i);
             let transport = Arc::clone(&transports[i]);
             let task_creator_ticket = (i == 0).then(|| creator_ticket.clone());
-            let recompute_wasm = wasm.clone();
+            let recompute_loaded = Arc::clone(&loaded);
             let mut execution_store = host.claim_execution(exec_id).expect("execution claim");
             let admission = if i == 0 {
                 ExecutionAdmission::explicit(negotiation_id, peer_ids.clone())
@@ -409,13 +409,7 @@ impl Arena {
                     },
                 );
                 let recompute_initial_state = Box::new(move |params: &[u8]| {
-                    let program = Program::try_from(recompute_wasm.clone())
-                        .map_err(|error| error.to_string())?;
-                    let loaded = WasmtimeEngine::new()
-                        .map_err(|error| error.to_string())?
-                        .load(&program)
-                        .map_err(|error| error.to_string())?;
-                    let initialized = loaded
+                    let initialized = recompute_loaded
                         .initialize(InitializeCall::new(
                             JsonBytes::try_new(params.to_vec())
                                 .map_err(|error| error.to_string())?,
@@ -484,11 +478,7 @@ impl Arena {
         for (i, ((directory, store), host)) in stores.into_iter().zip(hosts.iter()).enumerate() {
             let node = &identities[i];
             let node_params = creator_params.clone();
-            let program = Program::try_from(wasm.clone()).expect("program");
-            let loaded = WasmtimeEngine::new()
-                .expect("sandbox creation")
-                .load(&program)
-                .expect("load program");
+            let loaded = Arc::clone(&loaded);
             let exec_id = exec_id_for(i);
             let execution_key = host
                 .execution_key(&execution_salt_for(i), &exec_id, &negotiation_id)

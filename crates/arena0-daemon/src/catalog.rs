@@ -193,6 +193,7 @@ mod tests {
     use arena0_crypto::{NodeKeys, SecretKey};
     use arena0_protocol::PeerIdSource;
     use arena0_store::{Store, StoreConfig};
+    use arena0_test_engine::shared_test_engine;
     use tempfile::TempDir;
 
     fn store(seed: u8, directory: &TempDir) -> Store {
@@ -212,7 +213,7 @@ mod tests {
         let second = store(2, &second_dir);
         let first_catalog = ProgramCatalog::new(first.handle().clone());
         let second_catalog = ProgramCatalog::new(second.handle().clone());
-        let engine = WasmtimeEngine::new().expect("engine");
+        let engine = shared_test_engine();
         let (hash, _) = first_catalog
             .import(crate::assets::PROGRAMS[0].to_vec(), &engine, 1)
             .await
@@ -247,7 +248,7 @@ mod tests {
         let first = store(3, &directory);
         let catalog = ProgramCatalog::new(first.handle().clone());
         assert!(catalog.list().await.unwrap().is_empty());
-        let engine = WasmtimeEngine::new().expect("engine");
+        let engine = shared_test_engine();
         let wasm = crate::assets::PROGRAMS[0];
         let (hash, _) = catalog
             .import(wasm.to_vec(), &engine, 2)

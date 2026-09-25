@@ -785,7 +785,7 @@ fn validate_json_schema(
 #[cfg(test)]
 mod resident_runtime_tests {
     use super::*;
-    use crate::{Program, WasmtimeEngine};
+    use crate::{Program, test_support::shared_test_engine};
 
     use arena0_program::{
         Capability, JsonSchemaDocument, ProgramDefinition, ProgramMetadata, ProgramSchema,
@@ -1031,7 +1031,7 @@ mod resident_runtime_tests {
     }
 
     fn resident(body: &str, capabilities: Vec<Capability>, imports: &str) -> ProgramInstance {
-        let engine = WasmtimeEngine::new().unwrap();
+        let engine = shared_test_engine();
         let raw = dispatch_module(body, capabilities, imports);
         let program = engine.build_program(&raw).unwrap();
         engine
@@ -1117,7 +1117,7 @@ mod resident_runtime_tests {
     }
 
     fn allocator_failure_resident(allocator_body: &str) -> ProgramInstance {
-        let engine = WasmtimeEngine::new().unwrap();
+        let engine = shared_test_engine();
         let program = finalized_allocator_failure_program(allocator_body);
         engine
             .load(&program)
@@ -1131,7 +1131,7 @@ mod resident_runtime_tests {
 
     #[test]
     fn finalizer_produces_exact_idempotent_three_memory_artifact() {
-        let engine = WasmtimeEngine::new().unwrap();
+        let engine = shared_test_engine();
         let raw = dispatch_module(
             accepted_body(),
             vec![Capability::Messaging],
@@ -1163,7 +1163,7 @@ mod resident_runtime_tests {
 
     #[test]
     fn metadata_on_an_unfinalized_partial_artifact_is_rejected() {
-        let engine = WasmtimeEngine::new().unwrap();
+        let engine = shared_test_engine();
         let raw = dispatch_module("i64.const 0", Vec::new(), "");
         let definition = definition(Vec::new());
         let partial = Program::embed(&raw, &definition).unwrap();
@@ -1175,7 +1175,7 @@ mod resident_runtime_tests {
 
     #[test]
     fn non_zero_canonical_state_tail_rejects_and_restores_both_payloads() {
-        let engine = WasmtimeEngine::new().unwrap();
+        let engine = shared_test_engine();
         let program = finalized_tail_program();
         let mut instance = engine
             .load(&program)

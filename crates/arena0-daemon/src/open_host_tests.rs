@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use arena0_api::HostInfo;
 use arena0_home::{Home, HostName};
-use arena0_sandbox::WasmtimeEngine;
 use arena0_store::Store;
+use arena0_test_engine::shared_test_engine;
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
 
@@ -33,7 +33,7 @@ impl TestDaemon {
     async fn from_root_with_names(root: TempDir, names: Vec<HostName>) -> Self {
         let home = Home::from_root(root.path().to_path_buf()).expect("home");
         let mcp = McpConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)), None).expect("MCP config");
-        let engine = Arc::new(WasmtimeEngine::new().expect("sandbox engine"));
+        let engine = shared_test_engine();
         let daemon = Daemon::start(names, mcp, engine, home.clone(), true)
             .await
             .expect("start empty daemon");
@@ -263,7 +263,7 @@ async fn failed_initial_socket_startup_releases_all_resources_for_retry() {
     let home = Home::from_root(root.path().to_path_buf()).expect("home");
     let socket = home.socket();
     let mcp = McpConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)), None).expect("MCP config");
-    let engine = Arc::new(WasmtimeEngine::new().expect("sandbox engine"));
+    let engine = shared_test_engine();
     let daemon = Daemon::start(
         vec!["first".parse().unwrap(), "second".parse().unwrap()],
         mcp,

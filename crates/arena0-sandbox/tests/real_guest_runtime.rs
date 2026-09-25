@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use arena0_program::{CallStatus, JsonBytes};
 use arena0_protocol::{Committed, Ensemble, Event, PeerId, StateHash};
 use arena0_sandbox::{DispatchCall, InitializeCall, Program, ProgramInstance, WasmtimeEngine};
+use arena0_test_engine::shared_test_engine;
 use wasmparser::{ExternalKind, Parser, Payload};
 
 fn cumulative_sum_wasm() -> Vec<u8> {
@@ -98,7 +99,7 @@ fn sdk_guest_dispatch_has_exact_memories_and_rolls_back_rejected_state() {
     );
     assert!(has_dispatch, "SDK guest must export arena0_dispatch");
 
-    let engine = WasmtimeEngine::new().expect("sandbox engine");
+    let engine = shared_test_engine();
     let (mut resident, session) = resident_from_cumulative_guest(&engine);
     let peer0 = PeerId([0; 32]);
 
@@ -167,7 +168,7 @@ fn sdk_guest_repeated_allocations_preserve_commit_restore_and_rollback() {
     // the same accepted event repeatedly so the resident allocator is reused,
     // then exercise both rejection and a guest decode trap against the latest
     // committed checkpoint.
-    let engine = WasmtimeEngine::new().expect("sandbox engine");
+    let engine = shared_test_engine();
     let (mut resident, session) = resident_from_cumulative_guest_with_target_size(&engine, 64);
     let peer0 = PeerId([0; 32]);
 
@@ -282,7 +283,7 @@ fn local_context_forge_wasm() -> Vec<u8> {
 /// image is stored.
 #[test]
 fn sdk_guest_rejects_a_local_handler_that_forges_its_shared_view() {
-    let engine = WasmtimeEngine::new().expect("sandbox engine");
+    let engine = shared_test_engine();
     let program = Program::try_from(local_context_forge_wasm()).expect("parse forge guest");
     let loaded = engine.load(&program).expect("load forge guest");
     let initialized = loaded

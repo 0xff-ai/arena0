@@ -9,8 +9,9 @@ use arena0_protocol::{
     AbortKind, AbortOccurrence, ExecId, ExecLifecycle, ExecutionAdmission, ExecutionVersion,
     NegotiationId, PeerIdSource, StateHash,
 };
-use arena0_sandbox::{InitializeCall, Program, WasmtimeEngine};
+use arena0_sandbox::{InitializeCall, Program};
 use arena0_store::{RecoveryCursor, Store, StoreConfig};
+use arena0_test_engine::shared_test_engine;
 use arena0_tests::fixtures::{activation_for, execution_key, ordering_program_wasm, provider};
 use arena0_transport::Transport;
 use arena0_transport::local::{LocalNetwork, LocalTransport};
@@ -42,7 +43,7 @@ async fn recover_after(cut: CrashAfter) {
         let peers = keys.iter().map(PeerIdSource::peer_id).collect::<Vec<_>>();
         let wasm = ordering_program_wasm(false);
         let program = Program::try_from(wasm.clone()).expect("program");
-        let loaded = WasmtimeEngine::new().unwrap().load(&program).unwrap();
+        let loaded = shared_test_engine().load(&program).unwrap();
         let params = JsonBytes::try_new(br#"{}"#.to_vec()).unwrap();
         let initialized = loaded
             .initialize(InitializeCall::new(params.clone()))

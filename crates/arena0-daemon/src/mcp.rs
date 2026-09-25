@@ -25,7 +25,7 @@ use arena0_api::{
 use arena0_program::ParticipantCount;
 use arena0_protocol::{ExecId, NegotiationTarget, PeerId, SessionHash};
 #[cfg(test)]
-use arena0_sandbox::WasmtimeEngine;
+use arena0_test_engine::shared_test_engine;
 use axum::extract::{Request as HttpRequest, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
@@ -1493,7 +1493,7 @@ mod tests {
             daemon: Daemon::start(
                 vec!["alice".parse().unwrap(), "bob".parse().unwrap()],
                 mcp,
-                Arc::new(WasmtimeEngine::new().expect("sandbox engine")),
+                shared_test_engine(),
                 dynamic_home,
                 true,
             )
@@ -1804,7 +1804,7 @@ mod tests {
                 "occupied-port-b".parse().unwrap(),
             ],
             mcp,
-            Arc::new(WasmtimeEngine::new().expect("sandbox engine")),
+            shared_test_engine(),
             dynamic_home,
             true,
         )
@@ -2061,7 +2061,7 @@ mod tests {
     async fn hello_reopens_only_the_original_identity_after_restart() {
         let directory = tempfile::tempdir().unwrap();
         let home = arena0_home::Home::from_root(directory.path().to_owned()).unwrap();
-        let engine = Arc::new(WasmtimeEngine::new().unwrap());
+        let engine = shared_test_engine();
         let mut token = String::new();
         let mut wrong_identity_token = String::new();
         let mut original_peer = Value::Null;

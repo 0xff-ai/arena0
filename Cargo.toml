@@ -9,6 +9,7 @@ members = [
     "crates/arena0-protocol",
     "crates/arena0-sandbox",
     "crates/arena0-store",
+    "crates/arena0-test-engine",
     "crates/arena0-sdk-macros",
     "crates/arena0-sdk",
     "crates/arena0-primitives",

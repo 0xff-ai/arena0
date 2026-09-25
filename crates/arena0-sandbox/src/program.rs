@@ -165,7 +165,7 @@ mod tests {
 
     use arena0_program::{JsonSchemaDocument, ProgramMetadata, ProgramSchema, StateSchema};
 
-    use crate::WasmtimeEngine;
+    use crate::{WasmtimeEngine, test_support::shared_test_engine};
 
     fn unit_schema() -> JsonSchemaDocument {
         JsonSchemaDocument::new(serde_json::json!({
@@ -332,7 +332,7 @@ mod tests {
     #[test]
     fn embedding_exports_a_versioned_definition() {
         let wasm = metadata_export_module();
-        let engine = WasmtimeEngine::new().unwrap();
+        let engine = shared_test_engine();
         let embedded = engine.build_program(&wasm).unwrap().bytes().to_vec();
 
         assert_ne!(embedded, wasm);
@@ -397,8 +397,31 @@ mod tests {
 
     #[test]
     fn persistent_compilation_cache_survives_engine_restart() {
-        let builder = WasmtimeEngine::new().unwrap();
+        let builder = shared_test_engine();
         let program = builder.build_program(&metadata_export_module()).unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        let first = WasmtimeEngine::new_persistent(cache_dir.path()).unwrap();
+        first.load(&program).unwrap();
+        assert_eq!(first.persistent_cache.as_ref().unwrap().cache_misses(), 1);
+        drop(first);
+
+        let second = WasmtimeEngine::new_persistent(cache_dir.path()).unwrap();
+        second.load(&program).unwrap();
+        assert_eq!(second.persistent_cache.as_ref().unwrap().cache_hits(), 1);
+    }
+
+    #[test]
+    fn persistent_compilation_cache_reuses_a_real_guest_across_engines() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../programs/target/wasm32-unknown-unknown/release/rock_paper_scissors.wasm");
+        let wasm = std::fs::read(&path).unwrap_or_else(|error| {
+            panic!(
+                "cannot read required guest {}: {error}; run `just build-programs`",
+                path.display()
+            )
+        });
+        let program = Program::try_from(wasm).expect("parse rock-paper-scissors guest");
         let cache_dir = tempfile::tempdir().unwrap();
 
         let first = WasmtimeEngine::new_persistent(cache_dir.path()).unwrap();

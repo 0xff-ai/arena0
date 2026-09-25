@@ -14,8 +14,9 @@ use arena0_protocol::{
     Offer, OfferData, OfferHash, PeerId, PeerIdSource, PreparedActivation, StateHash, Ticket,
     TicketAction, TicketData, TicketHash,
 };
-use arena0_sandbox::{InitializeCall, Program, WasmtimeEngine};
+use arena0_sandbox::{InitializeCall, Program};
 use arena0_store::{Store, StoreConfig, StoreHandle};
+use arena0_test_engine::shared_test_engine;
 use arena0_transport::local::{LocalNetwork, LocalTransport};
 use arena0_transport::{RecvHandle, SendHandle, Transport};
 use tempfile::TempDir;
@@ -187,10 +188,9 @@ pub async fn spawn_live_execution_with_delivery(
     cryptos.sort_by_key(NodeKeys::peer_id);
     let peer_ids = cryptos.iter().map(NodeKeys::peer_id).collect::<Vec<_>>();
     let program = Program::try_from(wasm.clone()).expect("program");
-    let loaded = WasmtimeEngine::new()
-        .expect("sandbox engine")
-        .load(&program)
-        .expect("load program");
+    // One shared load: initialization and the actor dispatch residents of the
+    // same compiled module through the process-wide test engine.
+    let loaded = shared_test_engine().load(&program).expect("load program");
     let params_json = arena0_program::JsonBytes::try_new(params.clone()).expect("JSON params");
     let initialized = loaded
         .initialize(InitializeCall::new(params_json.clone()))
@@ -262,10 +262,6 @@ pub async fn spawn_live_execution_with_delivery(
         .commit_activation(activation.clone(), 4)
         .await
         .expect("commit activation");
-    let loaded = WasmtimeEngine::new()
-        .expect("sandbox engine")
-        .load(&program)
-        .expect("load program for actor");
     let context = ExecContext::new(
         exec_id,
         loaded,
@@ -609,8 +605,7 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
         metadata_len = metadata.len(),
     );
     let raw = wat::parse_str(wat).expect("ordering Wasm");
-    WasmtimeEngine::new()
-        .expect("sandbox engine")
+    shared_test_engine()
         .build_program(&raw)
         .expect("finalize ordering Wasm")
         .bytes()

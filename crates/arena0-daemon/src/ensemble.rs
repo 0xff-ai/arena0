@@ -1352,6 +1352,7 @@ async fn join_server_task(
 mod construction_tests {
     use super::*;
     use arena0_crypto::SecretKey;
+    use arena0_test_engine::shared_test_engine;
     use std::fs::{self, OpenOptions};
     use std::io::Write as _;
 
@@ -1403,7 +1404,7 @@ mod construction_tests {
         assert_eq!(config.keystore.node_keys().peer_id(), expected);
         assert_eq!(config.keystore.info().peer_id, expected);
 
-        let engine = Arc::new(WasmtimeEngine::new().unwrap());
+        let engine = shared_test_engine();
         let startup = Arc::new(StartupTimeline::new(1, 0));
         let runtime_ensemble = Ensemble::start(vec![(
             Arc::clone(&config.identity),
@@ -1437,7 +1438,7 @@ mod construction_tests {
             .map(HostName::for_local_index)
             .collect::<Vec<_>>();
         let mcp = McpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap();
-        let engine = Arc::new(WasmtimeEngine::new().unwrap());
+        let engine = shared_test_engine();
 
         let error = match Daemon::start(names.clone(), mcp, engine, home.clone(), true).await {
             Ok(_) => panic!("an over-capacity ensemble must be rejected"),
@@ -1455,7 +1456,7 @@ mod construction_tests {
     async fn cancelled_start_releases_home_only_after_store_cleanup() {
         let directory = tempfile::tempdir().unwrap();
         let home = Home::from_root(directory.path().to_owned()).unwrap();
-        let engine = Arc::new(WasmtimeEngine::new().unwrap());
+        let engine = shared_test_engine();
         let names = vec!["first".parse().unwrap(), "second".parse().unwrap()];
         let mcp = McpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap();
         let starting = tokio::spawn(Daemon::start(
