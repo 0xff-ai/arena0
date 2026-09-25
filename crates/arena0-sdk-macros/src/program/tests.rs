@@ -110,11 +110,11 @@ fn module_shell_generates_program_struct_and_impl() {
 
             fn on_message(
                 ctx: &mut Context,
-                from: Participant,
+                _from: Participant,
                 _msg: Message,
-            ) -> Result<Transition<Phase>, ProtocolFault> {
-                ctx.effects().send(from, &Message::Pong);
-                Ok(Transition::Stay)
+            ) -> MessageApply<Ping> {
+                ctx.effects().broadcast(&Message::Pong)?;
+                Ok(ApplyDecision::Accept(Transition::Stay))
             }
         }
     };
@@ -218,10 +218,10 @@ fn module_shell_wires_typed_timer_handler() {
                 Ok(Transition::Stay)
             }
 
-            fn on_timer(ctx: &mut Context, timer: Timer) -> Result<Transition<Phase>, ProgramFault> {
+            fn on_timer(ctx: &mut LocalContext, timer: Timer) -> Result<(), ProgramFault> {
                 let _ = timer;
-                ctx.mutate_shared(|state| state.round += 1);
-                Ok(Transition::Stay)
+                ctx.mutate_local(|local| local.fired += 1);
+                Ok(())
             }
         }
     };
@@ -284,9 +284,12 @@ fn infers_the_sign_scheme_of_a_literal_context_call() {
                 #[arena0::state(max = 256)]
                 pub struct Shared {{ round: u64 }}
 
-                fn on_input(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {{
+                fn on_input(
+                    ctx: &mut LocalContext<Shared, Local>,
+                    _input: Input,
+                ) -> arena0::anyhow::Result<()> {{
                     let _ = ctx.sign(SignScheme::{scheme}, b"payload");
-                    Ok(Transition::Stay)
+                    Ok(())
                 }}
             }}
             "#
@@ -301,6 +304,31 @@ fn infers_the_sign_scheme_of_a_literal_context_call() {
 }
 
 #[test]
+fn infers_sign_through_a_bare_local_context() {
+    let item: Item = syn::parse_quote! {
+        pub mod ping {
+            use arena0::prelude::*;
+
+            #[arena0::state(max = 256)]
+            pub struct Shared { round: u64 }
+
+            fn on_timer(ctx: &mut LocalContext) -> Result<(), ProgramFault> {
+                let _ = ctx.sign(SignScheme::Ed25519, b"payload");
+                Ok(())
+            }
+        }
+    };
+
+    let expanded = expand_sign_module(item);
+    assert!(expanded.contains("Capability :: Sign"), "{expanded}");
+    assert!(expanded.contains("SignScheme :: Ed25519"), "{expanded}");
+    assert!(
+        expanded.contains("ctx : & mut LocalContext < Shared , () >"),
+        "bare LocalContext is rewritten to its generic form: {expanded}"
+    );
+}
+
+#[test]
 fn infers_both_sign_schemes_for_a_dynamic_scheme() {
     let item: Item = syn::parse_quote! {
         pub mod ping {
@@ -309,10 +337,10 @@ fn infers_both_sign_schemes_for_a_dynamic_scheme() {
             #[arena0::state(max = 256)]
             pub struct Shared { round: u64 }
 
-            fn on_input(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
+            fn on_input(ctx: &mut LocalContext, _input: Input) -> arena0::anyhow::Result<()> {
                 let scheme = SignScheme::Bls;
                 let _ = ctx.sign(scheme, b"payload");
-                Ok(Transition::Stay)
+                Ok(())
             }
         }
     };
@@ -337,11 +365,11 @@ fn ignores_sign_calls_on_non_context_receivers() {
                 fn sign(&self, _payload: &[u8]) {}
             }
 
-            fn on_input(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
+            fn on_input(ctx: &mut LocalContext, _input: Input) -> arena0::anyhow::Result<()> {
                 let helper = Helper;
                 helper.sign(b"payload");
                 let _ = ctx;
-                Ok(Transition::Stay)
+                Ok(())
             }
         }
     };
@@ -359,10 +387,10 @@ fn infers_sign_through_a_context_alias() {
             #[arena0::state(max = 256)]
             pub struct Shared { round: u64 }
 
-            fn on_input(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
+            fn on_input(ctx: &mut LocalContext, _input: Input) -> arena0::anyhow::Result<()> {
                 let signer = &*ctx;
                 let _ = signer.sign(SignScheme::Bls, b"payload");
-                Ok(Transition::Stay)
+                Ok(())
             }
         }
     };
@@ -387,9 +415,9 @@ fn scopes_context_bindings_to_the_declaring_function() {
                 fn sign(&self, _scheme: SignScheme, _payload: &[u8]) {}
             }
 
-            fn on_input(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
+            fn on_input(ctx: &mut LocalContext, _input: Input) -> arena0::anyhow::Result<()> {
                 let _ = ctx;
-                Ok(Transition::Stay)
+                Ok(())
             }
 
             fn helper(ctx: &Helper) {
@@ -417,10 +445,10 @@ fn ignores_sign_calls_through_a_shadowing_local() {
                 fn sign(&self, _scheme: SignScheme, _payload: &[u8]) {}
             }
 
-            fn on_input(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
+            fn on_input(ctx: &mut LocalContext, _input: Input) -> arena0::anyhow::Result<()> {
                 let ctx = Helper;
                 ctx.sign(SignScheme::Ed25519, b"payload");
-                Ok(Transition::Stay)
+                Ok(())
             }
         }
     };
@@ -440,14 +468,14 @@ fn scopes_effect_bindings_to_the_declaring_function() {
 
             pub enum Message { Pong }
 
-            fn on_input(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
+            fn on_input(ctx: &mut LocalContext, _input: Input) -> arena0::anyhow::Result<()> {
                 let effects = ctx.effects();
                 let _ = effects;
-                Ok(Transition::Stay)
+                Ok(())
             }
 
             fn helper(effects: &mut Effects) {
-                effects.send(Participant::new(1), &Message::Pong);
+                let _ = effects.broadcast(&Message::Pong);
             }
         }
     };

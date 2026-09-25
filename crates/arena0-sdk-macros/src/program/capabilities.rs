@@ -1,7 +1,7 @@
 //! Inference of effect capabilities from handler bodies.
 //!
 //! Owns the `syn::visit` pass that scans handler bodies for `ctx.effects()`
-//! calls (`send`/`broadcast`, `set_timer`, ...) and synchronous
+//! calls (`broadcast`, `set_timer`, ...) and synchronous
 //! `ctx.sign(...)` calls, and derives the `Capability` set declared in program
 //! metadata when `capabilities(auto)` is set. This is the capability-inference
 //! seam.
@@ -66,13 +66,13 @@ impl<'ast> Visit<'ast> for EffectCapabilityVisitor {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         if receiver_is_effect_handle(&node.receiver, &self.effect_bindings) {
             match node.method.to_string().as_str() {
-                "send" | "broadcast" => self.messaging = true,
+                "broadcast" => self.messaging = true,
                 "set_timer" => self.timers = true,
                 _ => {}
             }
         }
-        // Guest signing is a synchronous `Context` call rather than an effect
-        // handle, so it is recognized by a `Context` receiver, not by method
+        // Guest signing is a synchronous `LocalContext` call rather than an
+        // effect handle, so it is recognized by a context receiver, not by method
         // name alone: a program's own `sign` helper must not grant the import.
         if node.method == "sign"
             && receiver_is_context_handle(&node.receiver, &self.context_bindings)
@@ -146,7 +146,7 @@ fn type_is_context(ty: &Type) -> bool {
             .path
             .segments
             .last()
-            .is_some_and(|segment| segment.ident == "Context"),
+            .is_some_and(|segment| super::is_context_ident(&segment.ident)),
         _ => false,
     }
 }

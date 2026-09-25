@@ -40,12 +40,22 @@ pub(crate) fn expand_arena0_program_item(
     }
 }
 
+/// Handler context type names: the agreed `Context`, the local-handler
+/// `LocalContext` (the only one with `sign`), and the read-only
+/// `CalloutContext`.
+pub(super) const CONTEXT_TYPE_NAMES: [&str; 3] = ["Context", "LocalContext", "CalloutContext"];
+
+/// Whether a path segment names one of the handler context types.
+pub(super) fn is_context_ident(ident: &syn::Ident) -> bool {
+    CONTEXT_TYPE_NAMES.iter().any(|name| ident == name)
+}
+
 /// Recursively rewrite bare context types to their generic forms inside a type.
 fn rewrite_context_type(ty: &mut Type, shared_ty: &Type, local_ty: &Type) {
     match ty {
         Type::Path(type_path) => {
             if let Some(segment) = type_path.path.segments.last_mut()
-                && segment.ident == "Context"
+                && is_context_ident(&segment.ident)
                 && segment.arguments.is_empty()
             {
                 segment.arguments =
