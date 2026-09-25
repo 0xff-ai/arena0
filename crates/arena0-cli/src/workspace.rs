@@ -783,7 +783,7 @@ fn render_setup(frame: &mut Frame<'_>, state: &State, area: Rect) {
                     format!("{}  ", execution.exec_id.fmt_short()),
                     state.palette.muted(),
                 ),
-                Span::raw(format!("{:?}", execution.lifecycle()).to_lowercase()),
+                Span::raw(crate::ui::lifecycle_label(execution.lifecycle()).to_lowercase()),
             ]));
         }
     }

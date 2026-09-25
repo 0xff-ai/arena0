@@ -141,10 +141,12 @@ fn render_hosts(
                 || {
                     state.host_status(host).map_or_else(
                         || "waiting".to_owned(),
-                        |status| format!("{:?}", status.lifecycle()).to_lowercase(),
+                        |status| crate::ui::lifecycle_label(status.lifecycle()).to_lowercase(),
                     )
                 },
-                |inspection| format!("{:?}", inspection.status.lifecycle()).to_lowercase(),
+                |inspection| {
+                    crate::ui::lifecycle_label(inspection.status.lifecycle()).to_lowercase()
+                },
             )),
             Cell::from(
                 inspection

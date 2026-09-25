@@ -290,7 +290,11 @@ pub(crate) fn event_summary(event: &EventFrame) -> String {
             target_size
         ),
         EventData::NegotiationPeers { lifecycle, peers } => {
-            format!("{} peers  {:?}", peers.len(), lifecycle)
+            format!(
+                "{} peers  {}",
+                peers.len(),
+                crate::ui::lifecycle_label(*lifecycle)
+            )
         }
         EventData::NegotiationPrepared { participants }
         | EventData::NegotiationResumed { participants }
@@ -330,7 +334,7 @@ pub(crate) fn event_summary(event: &EventFrame) -> String {
         } => format!("step {}  agreement {}/{}", step, signers, participants),
         EventData::SessionEnded { terminal } => match terminal {
             SessionTerminal::Completed { .. } => "completed".to_owned(),
-            SessionTerminal::Aborted { step, reason } => format!("aborted at {}  {}", step, reason),
+            SessionTerminal::Aborted { step, reason } => format!("stopped at {}  {}", step, reason),
         },
         EventData::Lagged { skipped } => format!("{} events dropped", skipped),
     }
@@ -1725,8 +1729,13 @@ impl ScreenState {
                 format!("waiting {observed}/{expected} Hosts")
             }
             ScopedRunState::Uniform { lifecycle, step } => step.map_or_else(
-                || format!("{:?}", lifecycle).to_lowercase(),
-                |step| format!("{} step {step}", format!("{:?}", lifecycle).to_lowercase()),
+                || crate::ui::lifecycle_label(lifecycle).to_lowercase(),
+                |step| {
+                    format!(
+                        "{} step {step}",
+                        crate::ui::lifecycle_label(lifecycle).to_lowercase()
+                    )
+                },
             ),
             ScopedRunState::Mixed => "mixed".to_owned(),
         }
@@ -3398,7 +3407,7 @@ fn render_monitor_table(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) 
                     )
             },
         );
-        let state_label = format!("{:?}", status.lifecycle()).to_ascii_uppercase();
+        let state_label = crate::ui::lifecycle_label(status.lifecycle()).to_ascii_uppercase();
         let step = status
             .step()
             .map_or_else(|| "-".to_owned(), |step| step.to_string());
@@ -3779,7 +3788,7 @@ fn render_hosts(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
     let aggregate = format!(
         "{} Hosts\n{}    agreement {}",
         state.config.host_count(),
-        format!("{:?}", state.lifecycle()).to_uppercase(),
+        crate::ui::lifecycle_label(state.lifecycle()).to_uppercase(),
         state.scoped_agreement_label()
     );
     let mut rows = vec![Row::new([Cell::from("ALL"), Cell::from(aggregate)]).height(2)];
@@ -3812,7 +3821,7 @@ fn render_hosts(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
                     ExecLifecycle::Waiting => "WAITING",
                     ExecLifecycle::Active => "ACTIVE",
                     ExecLifecycle::Completed => "COMPLETE",
-                    ExecLifecycle::Aborted => "ABORTED",
+                    ExecLifecycle::Aborted => "STOPPED",
                     ExecLifecycle::Failed => "FAILED",
                 });
         let step = state
@@ -4066,7 +4075,7 @@ fn lifecycle_line(state: &ScreenState, compact: bool) -> Line<'static> {
                 format!(
                     "{} {} #{}",
                     host,
-                    format!("{:?}", status.lifecycle()).to_lowercase(),
+                    crate::ui::lifecycle_label(status.lifecycle()).to_lowercase(),
                     status
                         .step()
                         .map_or_else(|| "-".to_owned(), |step| step.to_string())

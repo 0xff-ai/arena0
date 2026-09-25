@@ -229,7 +229,7 @@ fn render_overview_negotiation(
             format!(
                 "{} {host:<11} {:<11} step {step}",
                 if selected { ">" } else { " " },
-                format!("{:?}", inspection.status.lifecycle()).to_lowercase(),
+                crate::ui::lifecycle_label(inspection.status.lifecycle()).to_lowercase(),
             ),
             if selected {
                 state.palette.strong()

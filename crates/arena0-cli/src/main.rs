@@ -1412,7 +1412,7 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
                         vec![
                             status.exec_id.fmt_short().to_string(),
                             status.program_id.fmt_short().to_string(),
-                            format!("{:?}", status.lifecycle()),
+                            ui::lifecycle_label(status.lifecycle()).to_owned(),
                             status
                                 .step()
                                 .map_or_else(|| "-".into(), |step| step.to_string()),
@@ -1630,7 +1630,7 @@ fn render_exec_status(ctx: &Ctx, status: &ExecStatus) {
     }
     println!("exec {}", status.exec_id);
     println!("  program  {}", status.program_id);
-    println!("  state    {:?}", status.lifecycle());
+    println!("  state    {}", ui::lifecycle_label(status.lifecycle()));
     if let Some(session_id) = status.session_id() {
         println!("  session  {session_id}");
     }
@@ -1753,7 +1753,7 @@ async fn receipt(ctx: &Ctx, command: ReceiptCommand) -> anyhow::Result<()> {
                                 if entry.completed {
                                     "completed"
                                 } else {
-                                    "aborted"
+                                    "stopped"
                                 }
                                 .into(),
                             ]

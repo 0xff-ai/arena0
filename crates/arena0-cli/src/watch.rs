@@ -151,8 +151,9 @@ pub(crate) fn render_frame(
             participant.fmt_short()
         ),
         EventData::NegotiationPeers { lifecycle, peers } => format!(
-            "{} negotiation {lifecycle:?} ({} peers)",
+            "{} negotiation {} ({} peers)",
             short_exec(event),
+            crate::ui::lifecycle_label(*lifecycle),
             peers.len()
         ),
         EventData::NegotiationPrepared { participants }
@@ -245,7 +246,7 @@ fn render_terminal(result: &SessionTerminal, p: Palette) -> String {
                 .unwrap_or_else(|| "(none)".into())
         ),
         SessionTerminal::Aborted { step, reason } => {
-            p.red(&format!("aborted at step {step}: {reason}"))
+            p.red(&format!("stopped at step {step}: {reason}"))
         }
     }
 }
