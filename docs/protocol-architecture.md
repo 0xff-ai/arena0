@@ -612,8 +612,8 @@ explicit phase of each participant's execution state, much like a TCP close
 handshake. The phase is `Open` while the session runs. The transition that
 makes the execution terminal moves it to `Ending`, which holds the peers that
 have not yet confirmed the conclusion. It becomes `Ended` once that set is
-empty or the end-confirmation window elapses, and `Ended` keeps any peers that
-never confirmed. The phase is local: it never enters a commitment or receipt.
+empty or the end-confirmation window (ten minutes from actor start or wake by
+default) elapses, and `Ended` keeps any peers that never confirmed. The phase is local: it never enters a commitment or receipt.
 
 While `Ending`, the actor sends its terminal evidence, the final step
 certificate or the stop occurrence it adopted, to each unconfirmed peer. One
@@ -632,8 +632,8 @@ acknowledged as already applied.
 The actor retires at `Ended`. Startup resumes executions that are still
 `Ending`. An `Ended` execution with unconfirmed peers is dormant, not
 abandoned: an authenticated frame for it from one of those peers resumes the
-actor, which sends its terminal evidence again; the wake reports no new
-observations. A retired execution authenticates every frame with the actor's
+actor, which sends its terminal evidence again; the waking frame itself
+receives a retryable `not yet`, and the wake reports no new observations. A retired execution authenticates every frame with the actor's
 policy: an authentic frame from a confirmed peer is acknowledged as stale, a
 contradicting conclusion is answered with a conflict, and anything else is
 rejected. The daemon supervisor does not stop the actor because it observed
@@ -852,6 +852,12 @@ The public release guarantees:
 - JSON-only agent values and guest-owned concrete DTO conversion;
 - canonical receipt identity, distinct unilateral stop reports, and local provenance;
 - the `Transport` seam without changing runtime or proof semantics.
+
+The current compatibility boundary is `ABI_VERSION = 22`, execution profile
+version 3, `TraceEntry` format 3, the v4 `StepCommitment` domain, receipt
+artifact and body version 5, the v5 `ReceiptId` domain, and store schema
+version 7. Decoders reject unsupported versions, and no format silently accepts
+evidence from an earlier release.
 
 The public workspace has no remote discovery, addressing, relay, remote program
 transfer, public event aggregation, browser view, home screen, or program

@@ -139,12 +139,11 @@ An external observation becomes a shared fact only through an accepted public
 transition.
 
 The actor persists an accepted event, both state images, and emitted effects
-through one direct store operation. There are no inbox or outbox tables. Current
-protocol frames remain in the actor-owned execution state: the certificate for
-the last agreed step, a staged message and its signature, terminal evidence, or
-an abort occurrence. The actor resends those frames independently to each peer
-and tracks each peer's acknowledgement in memory; after a restart it reloads
-execution state and resends the current frames.
+through one direct store operation. There are no inbox or outbox tables:
+because N-of-N agreement stages one step at a time, every frame a peer can
+still lack is already part of execution state, and the actor resends it from
+there, including after a restart. The protocol architecture specifies the
+[delivery rules](protocol-architecture.md#durable-delivery).
 
 arena0 does not prescribe real-world identity, reputation, value exchange, or
 asset custody. Those can use blockchains or other infrastructure. Agreement on
@@ -187,12 +186,14 @@ participant retains its own evidence for later inspection or verification.
 
 ## Verification
 
-Portable verification is the only verification boundary. It checks
-activation binding, signatures, the v3 trace chain, shared pre/post hashes,
-terminal evidence, and the v5 receipt identity without loading the program. A
-completed result includes authenticated opaque outcome bytes; a stopped result
-includes the exact stop cause. It authenticates certified facts and does not
-execute Wasm or claim to reproduce participant-specific state.
+Portable verification is the only verification boundary. It checks the
+activation binding, signatures, the hash-linked trace, shared pre/post hashes,
+terminal evidence, and the receipt identity without loading the program; the
+[protocol architecture](protocol-architecture.md#11-receipts-and-verification)
+lists the exact checks and format versions. A completed result includes
+authenticated opaque outcome bytes; a stopped result includes the exact stop
+cause. It authenticates certified facts and does not execute Wasm or claim to
+reproduce participant-specific state.
 
 ## Failure and trust
 

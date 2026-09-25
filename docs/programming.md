@@ -57,12 +57,14 @@ views, and outcomes until the interaction requires disclosure.
 
 A callout is derived from program state. Define one read-only `callout` function
 that returns at most one callout for the current state; after every accepted
-dispatch, the runtime stores that result with the state image. The same callout
-index and context keep the same `CalloutId`, a different callout replaces it
-with a new ID, and `None` withdraws it. A terminal state has no open callout,
-and an open callout does not prevent other events from dispatching.
+dispatch, the runtime stores that result with the state image and identifies
+it by a `CalloutId`; returning `None` withdraws the open callout. When an ID is
+kept or replaced is specified in the
+[protocol architecture](protocol-architecture.md#10-execution-and-agreement).
+A terminal state has no open callout, and an open callout does not prevent
+other events from dispatching.
 
-An answer names the exact open `CalloutId` and enters the program as an
+An answer names the open callout's ID and enters the program as an
 `InputReceived` event. The Host validates the answer against the callout's
 output schema, then the guest decodes it fallibly. `on_input` receives a
 `LocalContext` and returns a plain `anyhow::Result<()>`; an error rejects the

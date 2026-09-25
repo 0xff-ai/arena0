@@ -163,14 +163,14 @@ otherwise healthy execution. This category is also preserved for a stale
 answer already queued at the execution actor. Other validation, storage, and
 execution errors remain distinct.
 
-Callouts are derived from committed program state. After a non-answer event,
-the same callout index and context retain their `pending_id`. An accepted answer
-consumes its ID; even an identical next question receives a new ID. The program
-can replace or withdraw a question after any accepted event. While an answered
-result is staged for agreement, the committed callout stays visible. A duplicate
-submission waits for agreement and then returns `CalloutNotPending`.
-`pending_callout` in `exec.status` contains only
-`pending_id` and `callout_index`.
+`pending_id` is the open callout's `CalloutId`. When an ID is kept, replaced,
+or consumed is specified once, in
+[execution and agreement](../protocol-architecture.md#10-execution-and-agreement)
+and [durable delivery](../protocol-architecture.md#durable-delivery). While an
+answered result is staged for agreement, the committed callout stays visible; a
+duplicate submission waits for agreement and then returns `CalloutNotPending`.
+`pending_callout` in `exec.status` contains only `pending_id` and
+`callout_index`.
 
 `exec.submit` returns `InputRejected` when the pending callout still belongs to
 the execution but the program rejects the answer. The response message carries
@@ -198,37 +198,18 @@ JSON clients whose number type cannot represent every `u64` value.
 Guest signing never reaches the client; the Host signs synchronously with its
 custodied identity or execution key inside the local handler dispatch.
 
-The execution actor authenticates inbound frames against the state it holds in
-memory. It acknowledges a frame after persisting its transition, or after
-recognizing a duplicate or stale frame. A frame whose prerequisite state has
-not arrived receives a retryable `NotYet` response; the sender retains
-responsibility and retries. Accepted events, state images, effects, and timer
-changes commit together in one SQLite transaction.
+Peer delivery between Hosts is not part of this API; the protocol
+architecture specifies it under
+[durable delivery](../protocol-architecture.md#durable-delivery). A pending
+callout is stored with execution state and keeps its `pending_id` and guest
+context across restart, so `exec.next` can return the same callout again.
 
-Each actor derives current messages, signatures, certificates, and its adopted
-abort occurrence from execution state. It sends those frames independently to
-each participant, with one bounded send per peer. A restart resends the current
-evidence. A pending callout retains its `pending_id` and guest context across
-restart, so `exec.next` can return the same callout again.
-
-A certified final `SessionEnd` step authenticates completion and its outcome
-bytes. Receipt publication exposes the terminal result and portable artifact
-to clients immediately. The terminal transition enters `ending` with every
-remote participant unconfirmed. Acknowledging terminal evidence, or returning
-matching terminal evidence, confirms a peer. Confirming the last peer moves
-the phase to `ended`. The node's confirmation window defaults to ten minutes
-from actor start or wake; expiry also moves the phase to `ended`, retaining
-unconfirmed peers. A rejection or conflicting conclusion leaves that peer
-unconfirmed and suppresses its sends for this actor run, while other lanes
-continue.
-
-Startup resumes `ending` executions. An authenticated frame from an unconfirmed
-peer wakes a dormant `ended` execution and receives `NotYet` until the actor
-can compare conclusions again; the wake emits no further events for the
-execution. Authenticated traffic from confirmed peers is acknowledged as
-stale. Completion and certified shared stops match the same final step
-certificate; unilateral stops match an authenticated occurrence at the same
-agreed cursor, even when another participant forwards it.
+Receipt publication exposes the terminal result and portable artifact to
+clients immediately. The `end` object in `exec.status` then tracks which remote
+participants have not yet confirmed the same conclusion; the `open`, `ending`,
+and `ended` phases and their confirmation rules are specified in
+[terminal evidence and publication](../protocol-architecture.md#terminal-evidence-and-publication).
+The confirmation window defaults to ten minutes from actor start or wake.
 
 ## Receipts
 
@@ -255,14 +236,13 @@ local production and import facts independently yield `Produced`, `Imported`, or
 `Both`. Each `Verified` response includes the exact verified `receipt_id`.
 
 The earlier `{key:{session_id,producer}}` API and producer-sealed JSON format are
-replaced by these references and artifacts. Receipt artifact and body format
-and their `ReceiptId` domain are version 5, and the store schema is version 7;
-older evidence and databases require their matching older release.
+replaced by these references and artifacts. Older evidence and databases
+require their matching older release; the current format and schema versions
+are listed with the
+[preserved invariants](../protocol-architecture.md#14-preserved-invariants).
 
-`receipt.verify` performs portable verification only. It checks the
-activation binding, ordered v3 trace chain, N-of-N aggregate agreements,
-shared pre/post hashes, terminal evidence, and v5 receipt identity without
-loading or executing Wasm. `Verified` carries the receipt summary:
+`receipt.verify` performs [portable verification](../protocol-architecture.md#11-receipts-and-verification)
+only, without loading or executing Wasm. `Verified` carries the receipt summary:
 `receipt_id`, `program_id`, `session_id`, the ordered `ensemble`, `steps`,
 `terminal`, and `outcome_borsh`. `terminal` is the receipt's own termination,
 `"Completed"` or `{"Stopped":{"cause":...}}` with the exact stop cause. The
