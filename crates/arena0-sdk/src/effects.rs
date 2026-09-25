@@ -5,6 +5,7 @@
 //! host import: native builds compile pure program logic only.
 
 use arena0_crypto::SignScheme;
+#[cfg(not(target_arch = "wasm32"))]
 use arena0_program::abi::imports;
 use arena0_protocol::{LogLevel, TimerSpec};
 
