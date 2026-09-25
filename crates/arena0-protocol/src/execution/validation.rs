@@ -74,17 +74,9 @@ pub(crate) fn validate_proposal(
     }
     let advanced = agreed.advance(&expected_commitment)?;
 
-    let lifecycle = proposal
-        .effects
-        .iter()
-        .filter_map(|(_, effect)| is_lifecycle_effect(effect).then_some(effect))
-        .collect::<Vec<_>>();
-    if lifecycle.len() > 1 {
-        return Err(ProtocolError::MultipleTerminalEffects);
-    }
-    let lifecycle_terminal = lifecycle
-        .first()
-        .and_then(|effect| StepTerminal::from_effect(effect));
+    let lifecycle_terminal =
+        single_lifecycle_effect(proposal.effects.iter().map(|(_, effect)| effect))?
+            .and_then(StepTerminal::from_effect);
     if lifecycle_terminal != proposal.entry.terminal {
         return Err(ProtocolError::InvalidCertificate(
             "proposal effects and trace terminal do not match".into(),
@@ -590,11 +582,16 @@ fn validate_effect_payload(effect: &Effect) -> Result<(), ProtocolError> {
     }
 }
 
-fn is_lifecycle_effect(effect: &Effect) -> bool {
-    matches!(
-        effect,
-        Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. }
-    )
+/// Return the dispatch's lifecycle effect, rejecting more than one.
+pub(crate) fn single_lifecycle_effect<'a>(
+    effects: impl IntoIterator<Item = &'a Effect>,
+) -> Result<Option<&'a Effect>, ProtocolError> {
+    let mut lifecycle = effects.into_iter().filter(|effect| effect.is_lifecycle());
+    let first = lifecycle.next();
+    if lifecycle.next().is_some() {
+        return Err(ProtocolError::MultipleTerminalEffects);
+    }
+    Ok(first)
 }
 
 pub(crate) fn terminal_effect_count(entry: &TraceEntry) -> usize {

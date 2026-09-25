@@ -63,6 +63,7 @@ pub use timer::TimerId;
 
 pub use validation::{check_effect_budget, validate_agreed_trace};
 pub(crate) use validation::{
-    ensure_encoded, ensure_payload, validate_effects, validate_proposal, validate_receipt_body,
-    validate_receipt_body_shape, verify_full_agreement, verify_step_signature,
+    ensure_encoded, ensure_payload, single_lifecycle_effect, validate_effects, validate_proposal,
+    validate_receipt_body, validate_receipt_body_shape, verify_full_agreement,
+    verify_step_signature,
 };

@@ -52,6 +52,18 @@ pub enum Effect {
     },
 }
 
+impl Effect {
+    /// Whether this effect ends the session: `SessionEnd`, `SessionAbort`,
+    /// or `Fail`. A dispatch may emit at most one.
+    #[must_use]
+    pub const fn is_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            Self::SessionEnd { .. } | Self::SessionAbort { .. } | Self::Fail { .. }
+        )
+    }
+}
+
 /// Severity level for program log output.
 #[derive(
     Serialize,

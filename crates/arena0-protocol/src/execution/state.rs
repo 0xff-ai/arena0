@@ -17,7 +17,8 @@ use super::{
     ExecutionBinding, ExecutionStatus, ExecutionVersion, MAX_EFFECTS, MAX_EXECUTION_STATE_BYTES,
     MAX_PROOF_SIGNATURES, ParticipantStepSignature, ProtocolError, ReceiptArtifact, ReceiptId,
     StepCursor, TerminalOutcome, check_effect_budget, ensure_encoded, ensure_payload,
-    validate_effects, validate_proposal, validate_receipt_body, verify_step_signature,
+    single_lifecycle_effect, validate_effects, validate_proposal, validate_receipt_body,
+    verify_step_signature,
 };
 
 /// A shared step waiting for N-of-N signatures.
@@ -557,7 +558,7 @@ impl ExecutionState {
         let event_position = self.event_position;
         let post_state = StateHash::of_shared(&shared_state);
         let indexed_effects = indexed_dispatch_effects(effects)?;
-        let lifecycle = dispatch_lifecycle_effect(effects)?;
+        let lifecycle = single_lifecycle_effect(effects)?;
         if lifecycle.is_some()
             && effects
                 .iter()
@@ -644,7 +645,7 @@ impl ExecutionState {
             event: trace_event,
             pre_state: self.agreed_state,
             post_state,
-            terminal: lifecycle.as_ref().and_then(StepTerminal::from_effect),
+            terminal: lifecycle.and_then(StepTerminal::from_effect),
             agreement: AggregateAttestation::empty(),
         };
         let commitment =
@@ -1201,22 +1202,6 @@ fn indexed_dispatch_effects(effects: &[Effect]) -> Result<Vec<(u32, Effect)>, Pr
             Ok((ordinal, effect.clone()))
         })
         .collect()
-}
-
-fn dispatch_lifecycle_effect(effects: &[Effect]) -> Result<Option<Effect>, ProtocolError> {
-    let mut lifecycle = None;
-    for effect in effects {
-        if matches!(
-            effect,
-            Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. }
-        ) {
-            if lifecycle.is_some() {
-                return Err(ProtocolError::MultipleTerminalEffects);
-            }
-            lifecycle = Some(effect.clone());
-        }
-    }
-    Ok(lifecycle)
 }
 
 fn validate_callout_dispatch(
@@ -3071,13 +3056,12 @@ mod tests {
         terminal.entry.terminal = Some(StepTerminal::Abort {
             reason: "invalid status".into(),
         });
-        terminal.effects = terminal
-            .entry
-            .terminal
-            .clone()
-            .map(|terminal| (0, terminal.to_effect()))
-            .into_iter()
-            .collect();
+        terminal.effects = vec![(
+            0,
+            Effect::SessionAbort {
+                reason: "invalid status".into(),
+            },
+        )];
         // The commitment derives from the mutated entry; no stored copy is
         // rebuilt here.
         terminal_status.event_position = 1;

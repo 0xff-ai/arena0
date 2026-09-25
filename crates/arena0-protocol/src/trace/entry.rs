@@ -37,6 +37,11 @@ pub enum StepEvent {
 }
 
 /// The terminal value of one step, if that step ended the session.
+///
+/// This mirrors the lifecycle [`Effect`] variants but stays a separate type:
+/// its Borsh tags (`End` 0, `Abort` 1, `Fail` 2) are part of the trace
+/// format, while `Effect`'s tags belong to the guest ABI. It is derived only
+/// through [`StepTerminal::from_effect`].
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub enum StepTerminal {
     /// Successful completion with opaque outcome bytes.
@@ -102,22 +107,6 @@ impl StepTerminal {
                 reason: reason.clone(),
             }),
             Effect::Broadcast { .. } | Effect::SetTimer { .. } => None,
-        }
-    }
-
-    /// The lifecycle effect this terminal value represents.
-    #[must_use]
-    pub fn to_effect(&self) -> Effect {
-        match self {
-            Self::End { outcome } => Effect::SessionEnd {
-                outcome: outcome.clone(),
-            },
-            Self::Abort { reason } => Effect::SessionAbort {
-                reason: reason.clone(),
-            },
-            Self::Fail { reason } => Effect::Fail {
-                reason: reason.clone(),
-            },
         }
     }
 
@@ -332,20 +321,42 @@ mod tests {
     }
 
     #[test]
-    fn terminal_round_trips_through_its_lifecycle_effect() {
+    fn terminal_is_derived_from_exactly_the_lifecycle_effects() {
+        for (effect, terminal) in [
+            (
+                Effect::SessionEnd { outcome: vec![7] },
+                StepTerminal::End { outcome: vec![7] },
+            ),
+            (
+                Effect::SessionAbort {
+                    reason: "stop".into(),
+                },
+                StepTerminal::Abort {
+                    reason: "stop".into(),
+                },
+            ),
+            (
+                Effect::Fail {
+                    reason: "fail".into(),
+                },
+                StepTerminal::Fail {
+                    reason: "fail".into(),
+                },
+            ),
+        ] {
+            assert!(effect.is_lifecycle());
+            assert_eq!(StepTerminal::from_effect(&effect), Some(terminal));
+        }
         for effect in [
-            Effect::SessionEnd { outcome: vec![7] },
-            Effect::SessionAbort {
-                reason: "stop".into(),
-            },
-            Effect::Fail {
-                reason: "fail".into(),
+            Effect::Broadcast { data: vec![] },
+            Effect::SetTimer {
+                delay_ms: 1,
+                timer: crate::TimerPayload::unit(),
             },
         ] {
-            let terminal = StepTerminal::from_effect(&effect).expect("lifecycle effect");
-            assert_eq!(terminal.to_effect(), effect);
+            assert!(!effect.is_lifecycle());
+            assert!(StepTerminal::from_effect(&effect).is_none());
         }
-        assert!(StepTerminal::from_effect(&Effect::Broadcast { data: vec![] }).is_none());
     }
 
     #[test]

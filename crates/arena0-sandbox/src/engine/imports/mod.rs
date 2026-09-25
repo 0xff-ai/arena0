@@ -132,7 +132,7 @@ impl CallerExt for Caller<'_, HostState> {
                         effect_name(&effect)
                     )));
                 }
-                if self.data().effect_queue.iter().any(is_lifecycle_effect) {
+                if self.data().effect_queue.iter().any(Effect::is_lifecycle) {
                     return Err(wasmtime::Error::msg(
                         "at most one lifecycle effect is allowed per dispatch",
                     ));
@@ -149,7 +149,7 @@ impl CallerExt for Caller<'_, HostState> {
                 }
             }
             Effect::SetTimer { .. } => {
-                if self.data().effect_queue.iter().any(is_lifecycle_effect) {
+                if self.data().effect_queue.iter().any(Effect::is_lifecycle) {
                     return Err(wasmtime::Error::msg(
                         "SetTimer cannot be combined with a lifecycle effect",
                     ));
@@ -181,13 +181,6 @@ impl CallerExt for Caller<'_, HostState> {
         self.data_mut().effect_queue.push(effect);
         Ok(())
     }
-}
-
-fn is_lifecycle_effect(effect: &Effect) -> bool {
-    matches!(
-        effect,
-        Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. }
-    )
 }
 
 fn effect_name(effect: &Effect) -> &'static str {
