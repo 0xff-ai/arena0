@@ -50,7 +50,7 @@ pub use binding::ExecutionBinding;
 pub use callout::{CalloutId, CalloutIdParseError, OpenCallout, callout_id};
 pub use certificate::{
     ParticipantStepSignature, Receipt, ReceiptArtifact, ReceiptBody, ReceiptId, ReceiptKind,
-    ReceiptSummary, StopReport,
+    ReceiptProvenance, ReceiptSummary, StopReport,
 };
 pub use cursor::{ExecutionVersion, StepCursor};
 pub use end::{EndMatch, EndPhase};

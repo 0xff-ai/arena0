@@ -111,7 +111,10 @@ impl Database {
         }
         Ok(StoredReceipt {
             receipt_id,
-            provenance: ReceiptProvenance::from_facts(imported, produced_execution.is_some())?,
+            provenance: ReceiptProvenance::from_facts(imported, produced_execution.is_some())
+                .ok_or_else(|| {
+                    StoreError::Corruption("receipt artifact has no provenance fact".into())
+                })?,
             receipt,
         })
     }

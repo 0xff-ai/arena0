@@ -22,7 +22,7 @@ mod response;
 pub use activity::{ActivityData, ActivityFrame, ActivityResult};
 pub use arena0_protocol::{
     CalloutId, ColorDepth, EffectKind, EffectSummary, EventKind, ExecLifecycle, NegotiationTarget,
-    ReceiptArtifact, ReceiptSummary, ReceiptTermination, View,
+    ReceiptArtifact, ReceiptProvenance, ReceiptSummary, ReceiptTermination, View,
 };
 pub use events::{
     EventData, EventFilter, EventFrame, ExecOrigin, ExecutionFailureKind, NegotiationStage,
@@ -33,8 +33,8 @@ pub use response::{
     ActivationInspection, ActivationInspectionState, ActivationParticipant, ApiError, ApiErrorCode,
     DaemonInfo, EventRecordSummary, ExecEndPhase, ExecEndStatus, ExecStatus, ExecStatusState,
     ExecutionInspection, HostInfo, HostStatus, IdInfo, NextEvent, PendingCalloutStatus,
-    ProgramDetail, ProgramSummary, ReceiptListEntry, ReceiptProvenance, Response, ResponseOk,
-    SessionProgress, SessionStatus,
+    ProgramDetail, ProgramSummary, ReceiptListEntry, Response, ResponseOk, SessionProgress,
+    SessionStatus,
 };
 
 #[cfg(test)]

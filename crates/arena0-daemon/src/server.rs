@@ -3673,11 +3673,7 @@ fn project_event_record_summary(summary: StoreEventRecordSummary) -> ApiEventRec
 }
 
 fn receipt_list_entry(stored: arena0_store::StoredReceipt) -> arena0_api::ReceiptListEntry {
-    let provenance = match stored.provenance() {
-        arena0_store::ReceiptProvenance::Produced => arena0_api::ReceiptProvenance::Produced,
-        arena0_store::ReceiptProvenance::Imported => arena0_api::ReceiptProvenance::Imported,
-        arena0_store::ReceiptProvenance::Both => arena0_api::ReceiptProvenance::Both,
-    };
+    let provenance = stored.provenance();
     arena0_api::ReceiptListEntry {
         receipt_id: hex::encode(stored.receipt_id.as_bytes()),
         session_id: stored.receipt.body().header().session_hash(),

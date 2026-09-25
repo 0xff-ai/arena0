@@ -58,8 +58,8 @@ pub use execution::{
     MAX_EXECUTION_STATE_BYTES, MAX_PROOF_SIGNATURES, MAX_RECEIPT_BYTES, MAX_TERMINAL_OUTCOME_BYTES,
     MAX_TERMINAL_REASON_BYTES, MAX_TIMER_PAYLOAD_BYTES, MAX_TRACE_ENTRY_BYTES, OpenCallout,
     ParticipantStepSignature, ProtocolError, Receipt, ReceiptArtifact, ReceiptBody, ReceiptId,
-    ReceiptKind, ReceiptSummary, ReceiptWork, SharedProposal, StepCertificate, StepCursor,
-    StopCause, StopReport, TerminalOutcome, TimerId, callout_id, validate_agreed_trace,
+    ReceiptKind, ReceiptProvenance, ReceiptSummary, ReceiptWork, SharedProposal, StepCertificate,
+    StepCursor, StopCause, StopReport, TerminalOutcome, TimerId, callout_id, validate_agreed_trace,
 };
 pub use fetch_frame::FetchFrame;
 pub use id::IdParseError;

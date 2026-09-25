@@ -12,7 +12,7 @@
 
 use arena0_protocol::{Effect, Event};
 // Diagnostic kinds are protocol-owned so the local API projects them as is.
-pub use arena0_protocol::{EffectKind, EffectSummary, EventKind};
+pub use arena0_protocol::{EffectKind, EffectSummary, EventKind, ReceiptProvenance};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
@@ -409,46 +409,6 @@ pub enum StoreError {
     /// A local admission request does not authorize the proposed activation.
     #[error("invalid execution admission: {0}")]
     InvalidAdmission(String),
-}
-
-/// Derived provenance of a receipt artifact retained by this Host.
-///
-/// The store records import and local-production facts independently. This
-/// value is their total projection, so an artifact can retain both facts
-/// instead of one operation overwriting the other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReceiptProvenance {
-    /// The local Host produced this artifact.
-    Produced,
-    /// The artifact was imported from another Host.
-    Imported,
-    /// The artifact was imported and was also produced locally.
-    Both,
-}
-
-impl ReceiptProvenance {
-    fn from_facts(imported: bool, produced: bool) -> Result<Self, StoreError> {
-        match (imported, produced) {
-            (false, true) => Ok(Self::Produced),
-            (true, false) => Ok(Self::Imported),
-            (true, true) => Ok(Self::Both),
-            (false, false) => Err(StoreError::Corruption(
-                "receipt artifact has no provenance fact".into(),
-            )),
-        }
-    }
-
-    /// Whether this artifact came from another Host.
-    #[must_use]
-    pub const fn is_imported(self) -> bool {
-        matches!(self, Self::Imported | Self::Both)
-    }
-
-    /// Whether this Host produced this artifact.
-    #[must_use]
-    pub const fn is_produced(self) -> bool {
-        matches!(self, Self::Produced | Self::Both)
-    }
 }
 
 /// Result of importing one portable receipt artifact.

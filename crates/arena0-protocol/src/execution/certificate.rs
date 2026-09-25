@@ -314,6 +314,48 @@ pub enum ReceiptKind {
     StopReport,
 }
 
+/// Derived provenance of a receipt artifact retained by a Host.
+///
+/// A Host records import and local-production facts independently. This
+/// value is their total projection, so an artifact can retain both facts
+/// instead of one operation overwriting the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptProvenance {
+    /// The local Host produced this artifact.
+    Produced,
+    /// The artifact was imported from another Host.
+    Imported,
+    /// The artifact was imported and was also produced locally.
+    Both,
+}
+
+impl ReceiptProvenance {
+    /// Project the import and local-production facts, or `None` when
+    /// neither holds.
+    #[must_use]
+    pub const fn from_facts(imported: bool, produced: bool) -> Option<Self> {
+        match (imported, produced) {
+            (false, true) => Some(Self::Produced),
+            (true, false) => Some(Self::Imported),
+            (true, true) => Some(Self::Both),
+            (false, false) => None,
+        }
+    }
+
+    /// Whether this artifact came from another Host.
+    #[must_use]
+    pub const fn is_imported(self) -> bool {
+        matches!(self, Self::Imported | Self::Both)
+    }
+
+    /// Whether this Host produced this artifact.
+    #[must_use]
+    pub const fn is_produced(self) -> bool {
+        matches!(self, Self::Produced | Self::Both)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ArtifactJson<T> {

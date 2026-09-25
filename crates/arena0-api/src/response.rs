@@ -458,18 +458,6 @@ pub enum NextEvent {
     Failed { reason: String },
 }
 
-/// The local facts known about a stored receipt artifact.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ReceiptProvenance {
-    /// The daemon produced the artifact.
-    Produced,
-    /// The daemon imported the artifact from another Host.
-    Imported,
-    /// The daemon imported the artifact and later produced the same artifact.
-    Both,
-}
-
 /// A `receipt.list` entry: the content address, its session and producer, program,
 /// completion, and the complete local provenance projection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -479,5 +467,5 @@ pub struct ReceiptListEntry {
     pub kind: arena0_protocol::ReceiptKind,
     pub program_id: ProgramHash,
     pub completed: bool,
-    pub provenance: ReceiptProvenance,
+    pub provenance: arena0_protocol::ReceiptProvenance,
 }
