@@ -13,6 +13,26 @@ use crate::execution::{
     MAX_EFFECT_PAYLOAD_BYTES, MAX_TERMINAL_OUTCOME_BYTES, MAX_TERMINAL_REASON_BYTES,
 };
 
+/// Kind of an [`Effect`], for diagnostics that never expose its payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectKind {
+    SessionEnd,
+    SessionAbort,
+    Broadcast,
+    SetTimer,
+    Fail,
+}
+
+/// Kind and bounded payload size of one effect. The payload itself is
+/// deliberately never returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectSummary {
+    pub kind: EffectKind,
+    pub payload_bytes: Option<u64>,
+}
+
 /// A side effect requested by a program during one event dispatch.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub enum Effect {

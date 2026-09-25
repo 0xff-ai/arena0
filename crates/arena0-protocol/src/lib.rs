@@ -47,8 +47,8 @@ pub use arena0_program::{
 pub use state::Hash as StateHash;
 pub use topic::Hash as TopicHash;
 
-pub use effect::{Effect, LogLevel};
-pub use event::Event;
+pub use effect::{Effect, EffectKind, EffectSummary, LogLevel};
+pub use event::{Event, EventKind};
 pub use exec::ExecLifecycle;
 pub use exec_frame::ExecFrame;
 pub use execution::{

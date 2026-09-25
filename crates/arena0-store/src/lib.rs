@@ -11,6 +11,8 @@
 //! authoritative for state and certificate validation.
 
 use arena0_protocol::{Effect, Event};
+// Diagnostic kinds are protocol-owned so the local API projects them as is.
+pub use arena0_protocol::{EffectKind, EffectSummary, EventKind};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
@@ -485,34 +487,6 @@ pub struct ActivationRecord {
     state: ActivationRecordState,
 }
 
-/// The event kind in one Host-local event record. Payloads remain opaque; this
-/// enum is the store's safe diagnostic projection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EventKind {
-    SessionStarted,
-    MessageReceived,
-    InputReceived,
-    TimerFired,
-}
-
-/// One effect's kind and bounded payload size. The store never returns
-/// the effect payload itself from inspection reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EffectSummary {
-    pub kind: EffectKind,
-    pub payload_bytes: Option<usize>,
-}
-
-/// The effect kind in one Host-local event record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EffectKind {
-    SessionEnd,
-    SessionAbort,
-    Broadcast,
-    SetTimer,
-    Fail,
-}
-
 /// A safe projection of one durable event record for local diagnostics.
 /// Event position is an authoritative local coordinate. An event may produce
 /// more than one agreed step (an authored message stages a proposal after its
@@ -524,7 +498,7 @@ pub struct EventRecordSummary {
     pub event_position: u64,
     pub agreed_steps: Vec<u64>,
     pub event: EventKind,
-    pub input_payload_bytes: Option<usize>,
+    pub input_payload_bytes: Option<u64>,
     pub effects: Vec<EffectSummary>,
 }
 
@@ -590,35 +564,30 @@ impl EventRecordSummary {
         event: &Event<Vec<u8>>,
         effects: &[Effect],
     ) -> Self {
+        // Payload lengths are bounded far below u64::MAX.
+        let bytes = |payload: &[u8]| Some(u64::try_from(payload.len()).unwrap_or(u64::MAX));
         let (event_kind, input_payload_bytes) = match event {
             Event::SessionStarted { .. } => (EventKind::SessionStarted, None),
-            Event::MessageReceived { msg, .. } => (EventKind::MessageReceived, Some(msg.len())),
-            Event::InputReceived { data, .. } => (EventKind::InputReceived, Some(data.len())),
-            Event::TimerFired { timer } => (EventKind::TimerFired, Some(timer.data.len())),
+            Event::MessageReceived { msg, .. } => (EventKind::MessageReceived, bytes(msg)),
+            Event::InputReceived { data, .. } => (EventKind::InputReceived, bytes(data)),
+            Event::TimerFired { timer } => (EventKind::TimerFired, bytes(&timer.data)),
         };
         let effects = effects
             .iter()
-            .map(|effect| match effect {
-                Effect::SessionEnd { outcome } => EffectSummary {
-                    kind: EffectKind::SessionEnd,
-                    payload_bytes: Some(outcome.len()),
-                },
-                Effect::SessionAbort { reason } => EffectSummary {
-                    kind: EffectKind::SessionAbort,
-                    payload_bytes: Some(reason.len()),
-                },
-                Effect::Broadcast { data } => EffectSummary {
-                    kind: EffectKind::Broadcast,
-                    payload_bytes: Some(data.len()),
-                },
-                Effect::SetTimer { timer, .. } => EffectSummary {
-                    kind: EffectKind::SetTimer,
-                    payload_bytes: Some(timer.data.len()),
-                },
-                Effect::Fail { reason } => EffectSummary {
-                    kind: EffectKind::Fail,
-                    payload_bytes: Some(reason.len()),
-                },
+            .map(|effect| {
+                let (kind, payload) = match effect {
+                    Effect::SessionEnd { outcome } => (EffectKind::SessionEnd, outcome.as_slice()),
+                    Effect::SessionAbort { reason } => {
+                        (EffectKind::SessionAbort, reason.as_bytes())
+                    }
+                    Effect::Broadcast { data } => (EffectKind::Broadcast, data.as_slice()),
+                    Effect::SetTimer { timer, .. } => (EffectKind::SetTimer, timer.data.as_slice()),
+                    Effect::Fail { reason } => (EffectKind::Fail, reason.as_bytes()),
+                };
+                EffectSummary {
+                    kind,
+                    payload_bytes: bytes(payload),
+                }
             })
             .collect();
         Self {

@@ -17,12 +17,10 @@ use std::{future::Future, path::PathBuf};
 use anyhow::Context as _;
 use arena0_api::{
     ActivationInspection, ActivationInspectionState, ActivationParticipant, ActivityData,
-    ActivityFrame, ApiError, ApiErrorCode, EffectKind as ApiEffectKind,
-    EffectSummary as ApiEffectSummary, EnsembleSpec, EventData, EventFilter, EventFrame,
-    EventKind as ApiEventKind, EventRecordSummary as ApiEventRecordSummary, ExecLifecycle,
-    ExecOrigin, ExecStatus, ExecStatusState, ExecutionFailureKind, ExecutionInspection, HostInfo,
-    NegotiationStage, NextEvent, PendingCalloutStatus, ProgramRefError, ReceiptRef, Response,
-    ResponseOk, SessionProgress, SessionStatus, frame,
+    ActivityFrame, ApiError, ApiErrorCode, EnsembleSpec, EventData, EventFilter, EventFrame,
+    EventRecordSummary as ApiEventRecordSummary, ExecLifecycle, ExecStatus, ExecStatusState,
+    ExecutionInspection, HostInfo, NextEvent, PendingCalloutStatus, ProgramRefError, ReceiptRef,
+    Response, ResponseOk, SessionProgress, SessionStatus, frame,
 };
 use arena0_api::{HostRequest, HostStatus};
 use arena0_crypto::{AgentPubKey, ExecutionKey, NodeKeys};
@@ -580,16 +578,13 @@ impl HostEvent {
                 },
                 negotiation_id: *negotiation_id,
                 queue_position: *queue_position,
-                origin: match origin {
-                    ExecCreationOrigin::Request => ExecOrigin::Request,
-                    ExecCreationOrigin::Recovery => ExecOrigin::Recovery,
-                },
+                origin: (*origin).into(),
             },
             Self::Failed {
                 reason, failure, ..
             } => EventData::Terminated {
                 reason: reason.clone(),
-                failed_class: Some(api_failure(*failure)),
+                failed_class: Some((*failure).into()),
             },
             Self::SessionStarted { ensemble, .. } => EventData::SessionStarted {
                 ensemble: ensemble.clone(),
@@ -646,20 +641,10 @@ impl HostEvent {
                 },
                 _ => EventData::Terminated {
                     reason: reason.clone(),
-                    failed_class: Some(api_failure(*failure)),
+                    failed_class: Some((*failure).into()),
                 },
             },
         }
-    }
-}
-
-fn api_failure(failure: ExecutionFailureCode) -> ExecutionFailureKind {
-    match failure {
-        ExecutionFailureCode::Negotiation => ExecutionFailureKind::Negotiation,
-        ExecutionFailureCode::HostStopped => ExecutionFailureKind::HostStopped,
-        ExecutionFailureCode::ProgramAborted => ExecutionFailureKind::ProgramAborted,
-        ExecutionFailureCode::Runtime => ExecutionFailureKind::Runtime,
-        ExecutionFailureCode::InvalidGuestOutput => ExecutionFailureKind::InvalidGuestOutput,
     }
 }
 
@@ -982,10 +967,7 @@ fn negotiation_api_event(event: &NegotiationEvent) -> EventData {
             target_size,
         } => EventData::NegotiationRetried {
             attempt: *attempt,
-            stage: match stage {
-                arena0_protocol::NegotiationStage::Gossiping => NegotiationStage::Gossiping,
-                arena0_protocol::NegotiationStage::Prepared => NegotiationStage::Prepared,
-            },
+            stage: (*stage).into(),
             ticket_count: *ticket_count,
             sig_count: *sig_count,
             target_size: *target_size,
@@ -997,10 +979,7 @@ fn negotiation_api_event(event: &NegotiationEvent) -> EventData {
             sig_count,
             target_size,
         } => EventData::NegotiationTimedOut {
-            stage: match stage {
-                arena0_protocol::NegotiationStage::Gossiping => NegotiationStage::Gossiping,
-                arena0_protocol::NegotiationStage::Prepared => NegotiationStage::Prepared,
-            },
+            stage: (*stage).into(),
             ticket_count: *ticket_count,
             sig_count: *sig_count,
             target_size: *target_size,
@@ -2146,7 +2125,7 @@ impl HostService {
             .into_summaries()
             .into_iter()
             .map(project_event_record_summary)
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect();
         Ok(ExecutionInspection {
             status,
             activation,
@@ -3683,49 +3662,14 @@ fn project_activation_inspection(record: ActivationRecord) -> ActivationInspecti
     }
 }
 
-fn project_event_record_summary(
-    summary: StoreEventRecordSummary,
-) -> Result<ApiEventRecordSummary, ApiError> {
-    let input_payload_bytes = summary
-        .input_payload_bytes
-        .map(u64::try_from)
-        .transpose()
-        .map_err(|_| ApiError::new(ApiErrorCode::Internal, "event input size overflows u64"))?;
-    let effects = summary
-        .effects
-        .into_iter()
-        .map(|effect| {
-            let payload_bytes = effect
-                .payload_bytes
-                .map(u64::try_from)
-                .transpose()
-                .map_err(|_| {
-                    ApiError::new(ApiErrorCode::Internal, "event effect size overflows u64")
-                })?;
-            Ok(ApiEffectSummary {
-                kind: match effect.kind {
-                    arena0_store::EffectKind::SessionEnd => ApiEffectKind::SessionEnd,
-                    arena0_store::EffectKind::SessionAbort => ApiEffectKind::SessionAbort,
-                    arena0_store::EffectKind::Broadcast => ApiEffectKind::Broadcast,
-                    arena0_store::EffectKind::SetTimer => ApiEffectKind::SetTimer,
-                    arena0_store::EffectKind::Fail => ApiEffectKind::Fail,
-                },
-                payload_bytes,
-            })
-        })
-        .collect::<Result<Vec<_>, ApiError>>()?;
-    Ok(ApiEventRecordSummary {
+fn project_event_record_summary(summary: StoreEventRecordSummary) -> ApiEventRecordSummary {
+    ApiEventRecordSummary {
         event_position: summary.event_position,
         agreed_steps: summary.agreed_steps,
-        event: match summary.event {
-            arena0_store::EventKind::SessionStarted => ApiEventKind::SessionStarted,
-            arena0_store::EventKind::MessageReceived => ApiEventKind::MessageReceived,
-            arena0_store::EventKind::InputReceived => ApiEventKind::InputReceived,
-            arena0_store::EventKind::TimerFired => ApiEventKind::TimerFired,
-        },
-        input_payload_bytes,
-        effects,
-    })
+        event: summary.event,
+        input_payload_bytes: summary.input_payload_bytes,
+        effects: summary.effects,
+    }
 }
 
 fn receipt_list_entry(stored: arena0_store::StoredReceipt) -> arena0_api::ReceiptListEntry {
@@ -4182,14 +4126,19 @@ mod tests {
                 payload_bytes: Some(8),
             }],
         };
-        let projected = project_event_record_summary(summary).expect("projection");
+        let projected = project_event_record_summary(summary);
         assert_eq!(projected.event_position, 4);
         assert_eq!(projected.agreed_steps, vec![3]);
-        assert_eq!(projected.event, ApiEventKind::InputReceived);
+        assert_eq!(projected.event, arena0_api::EventKind::InputReceived);
         assert_eq!(projected.input_payload_bytes, Some(2));
-        assert_eq!(projected.effects[0].kind, ApiEffectKind::Broadcast);
+        assert_eq!(projected.effects[0].kind, arena0_api::EffectKind::Broadcast);
         assert_eq!(projected.effects[0].payload_bytes, Some(8));
         let encoded = serde_json::to_value(projected).expect("projection JSON");
+        assert_eq!(encoded["event"], "input_received");
+        assert_eq!(
+            encoded["effects"],
+            serde_json::json!([{ "kind": "broadcast", "payload_bytes": 8 }])
+        );
         assert!(encoded.get("data").is_none());
         assert!(encoded.get("context").is_none());
         assert!(encoded.get("signature").is_none());

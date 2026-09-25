@@ -41,6 +41,42 @@ pub enum NegotiationStage {
     Prepared,
 }
 
+// The protocol's system-event classes serialize with their Rust variant
+// names in the structured Host log, while the API event stream uses
+// lowercase/snake_case names. The twins keep both encodings stable; these
+// conversions are their one mapping.
+
+impl From<arena0_protocol::ExecCreationOrigin> for ExecOrigin {
+    fn from(origin: arena0_protocol::ExecCreationOrigin) -> Self {
+        match origin {
+            arena0_protocol::ExecCreationOrigin::Request => Self::Request,
+            arena0_protocol::ExecCreationOrigin::Recovery => Self::Recovery,
+        }
+    }
+}
+
+impl From<arena0_protocol::ExecutionFailureCode> for ExecutionFailureKind {
+    fn from(failure: arena0_protocol::ExecutionFailureCode) -> Self {
+        use arena0_protocol::ExecutionFailureCode;
+        match failure {
+            ExecutionFailureCode::Negotiation => Self::Negotiation,
+            ExecutionFailureCode::HostStopped => Self::HostStopped,
+            ExecutionFailureCode::ProgramAborted => Self::ProgramAborted,
+            ExecutionFailureCode::Runtime => Self::Runtime,
+            ExecutionFailureCode::InvalidGuestOutput => Self::InvalidGuestOutput,
+        }
+    }
+}
+
+impl From<arena0_protocol::NegotiationStage> for NegotiationStage {
+    fn from(stage: arena0_protocol::NegotiationStage) -> Self {
+        match stage {
+            arena0_protocol::NegotiationStage::Gossiping => Self::Gossiping,
+            arena0_protocol::NegotiationStage::Prepared => Self::Prepared,
+        }
+    }
+}
+
 /// The terminal payload nested in `exec.session.ended`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

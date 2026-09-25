@@ -12,6 +12,16 @@ use serde::{Deserialize, Serialize};
 use crate::execution::MAX_EFFECT_PAYLOAD_BYTES;
 use crate::{Ensemble, PeerId, TimerPayload};
 
+/// Kind of an [`Event`], for diagnostics that never expose its payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    SessionStarted,
+    MessageReceived,
+    InputReceived,
+    TimerFired,
+}
+
 /// An event dispatched to a program during a single execution step.
 ///
 /// The type parameter `M` controls the message payload type. The runtime uses

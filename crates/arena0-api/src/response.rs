@@ -5,8 +5,8 @@
 use arena0_crypto::AgentPubKey;
 use arena0_program::{JsonSchemaDocument, ParticipantCount, ProgramHash, ProgramSchema};
 use arena0_protocol::{
-    ExecId, ExecLifecycle, NegotiationId, OfferHash, PeerId, PendingId, ReceiptArtifact,
-    ReceiptSummary, SessionHash, StateHash, TicketHash, TraceEntry, View,
+    EffectSummary, EventKind, ExecId, ExecLifecycle, NegotiationId, OfferHash, PeerId, PendingId,
+    ReceiptArtifact, ReceiptSummary, SessionHash, StateHash, TicketHash, TraceEntry, View,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -313,36 +313,6 @@ pub enum ActivationInspectionState {
 pub struct ActivationParticipant {
     pub peer_id: PeerId,
     pub ticket_hash: TicketHash,
-}
-
-/// Kind of event recorded for one Host-local dispatch.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum EventKind {
-    SessionStarted,
-    MessageReceived,
-    InputReceived,
-    TimerFired,
-}
-
-/// Kind and bounded payload size of one effect. The payload itself is
-/// deliberately never returned.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct EffectSummary {
-    pub kind: EffectKind,
-    pub payload_bytes: Option<u64>,
-}
-
-/// Kind of effect emitted by one Host-local dispatch.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum EffectKind {
-    SessionEnd,
-    SessionAbort,
-    Broadcast,
-    SetTimer,
-    Fail,
 }
 
 /// A bounded summary of one durable Host-local event record.
