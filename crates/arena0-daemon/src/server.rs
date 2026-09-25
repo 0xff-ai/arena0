@@ -1529,29 +1529,9 @@ impl HostService {
                 )
                 .await;
         }
-        if let Some(execution) = &execution {
-            let Some(activation) = record.as_ref().and_then(ActivationRecord::activation) else {
-                return self
-                    .fail_recovery_candidate(
-                        candidate,
-                        true,
-                        "execution aggregate has no committed activation",
-                    )
-                    .await;
-            };
-            if execution.binding().activation() != activation
-                || execution.binding().program_hash() != request.program_hash()
-                || execution.producer() != self.peer_id
-            {
-                return self
-                    .fail_recovery_candidate(
-                        candidate,
-                        true,
-                        "execution aggregate does not match its request, activation, or Host",
-                    )
-                    .await;
-            }
-        }
+        // The actor's startup check (`ensure_execution`) compares the
+        // aggregate's binding and producer with the request, the committed
+        // activation, and this Host, and fails the execution on a mismatch.
 
         let stored_program = match self.store.load_program(request.program_hash()).await {
             Ok(program) => program,
