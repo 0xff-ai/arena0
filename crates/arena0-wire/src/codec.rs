@@ -222,43 +222,11 @@ impl Write for BoundedWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        FetchFrame, MAX_FETCH_RESPONSE_BYTES, SessionHashBytes, StreamProtocol, WireError,
-    };
-    use borsh::BorshSerialize;
-
-    #[derive(BorshSerialize)]
-    enum DerivedFetchFrame {
-        FetchActivationTickets {
-            session_hash: SessionHashBytes,
-        },
-        ActivationTickets {
-            session_hash: SessionHashBytes,
-            tickets: Vec<Vec<u8>>,
-        },
-    }
-
-    fn codec() -> Codec {
-        Codec::default()
-    }
-
-    fn raw_frame(body: &[u8]) -> Vec<u8> {
-        let body_len = (FRAME_VERSION_SIZE + body.len()) as u32;
-        [
-            body_len.to_le_bytes().to_vec(),
-            FRAME_VERSION.to_le_bytes().to_vec(),
-            body.to_vec(),
-        ]
-        .concat()
-    }
+    use crate::{StreamProtocol, WireError};
 
     #[test]
     fn payload_too_large() {
-        let message = FetchFrame::ActivationTickets {
-            session_hash: SessionHashBytes([1; 32]),
-            tickets: vec![vec![0u8; 100]],
-        };
-        let result = Codec::new(10).encode(&message);
+        let result = Codec::new(10).encode(&vec![vec![0u8; 100]]);
         assert!(matches!(result, Err(WireError::PayloadTooLarge { .. })));
     }
 
@@ -283,70 +251,6 @@ mod tests {
         assert!(matches!(
             StreamProtocol::from_header_byte(0xFF),
             Err(WireError::UnknownProtocol(0xFF))
-        ));
-    }
-
-    #[test]
-    fn fetch_frames_preserve_borsh_layout_and_round_trip() {
-        let fetch_frames = [
-            (
-                FetchFrame::ActivationTickets {
-                    session_hash: SessionHashBytes([14; 32]),
-                    tickets: vec![],
-                },
-                DerivedFetchFrame::ActivationTickets {
-                    session_hash: SessionHashBytes([14; 32]),
-                    tickets: vec![],
-                },
-            ),
-            (
-                FetchFrame::FetchActivationTickets {
-                    session_hash: SessionHashBytes([13; 32]),
-                },
-                DerivedFetchFrame::FetchActivationTickets {
-                    session_hash: SessionHashBytes([13; 32]),
-                },
-            ),
-            (
-                FetchFrame::ActivationTickets {
-                    session_hash: SessionHashBytes([14; 32]),
-                    tickets: vec![vec![15, 16]],
-                },
-                DerivedFetchFrame::ActivationTickets {
-                    session_hash: SessionHashBytes([14; 32]),
-                    tickets: vec![vec![15, 16]],
-                },
-            ),
-        ];
-        for (manual, derived) in fetch_frames {
-            assert_eq!(
-                borsh::to_vec(&manual).unwrap(),
-                borsh::to_vec(&derived).unwrap()
-            );
-            let encoded = codec().encode(&manual).unwrap();
-            assert_eq!(codec().decode::<FetchFrame>(&encoded).unwrap(), manual);
-        }
-    }
-
-    #[test]
-    fn variable_lengths_are_checked_before_allocation() {
-        let mut fetch_body = vec![1];
-        fetch_body.extend_from_slice(&[0; 32]);
-        fetch_body.extend_from_slice(&1u32.to_le_bytes());
-        fetch_body.extend_from_slice(&u32::MAX.to_le_bytes());
-        let fetch_frame = raw_frame(&fetch_body);
-        assert!(matches!(
-            codec().decode::<FetchFrame>(&fetch_frame),
-            Err(WireError::ValueTooLarge {
-                field: "fetch.ticket",
-                ..
-            })
-        ));
-
-        let unknown_frame = raw_frame(&[0xff]);
-        assert!(matches!(
-            codec().decode::<FetchFrame>(&unknown_frame),
-            Err(WireError::Decode(_))
         ));
     }
 
@@ -409,7 +313,7 @@ mod tests {
     fn protocol_frame_body_caps_are_canonical() {
         assert_eq!(
             StreamProtocol::Fetch.max_frame_body(),
-            MAX_FETCH_RESPONSE_BYTES
+            crate::MAX_FETCH_RESPONSE_BYTES
         );
         assert_eq!(
             StreamProtocol::Exec.max_frame_body(),

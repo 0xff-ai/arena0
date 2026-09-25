@@ -46,9 +46,6 @@ pub enum TransportError {
     /// The remote peer speaks an incompatible protocol version.
     #[error("protocol mismatch: {0}")]
     ProtocolMismatch(String),
-    /// A decoded frame does not satisfy the protocol-domain contract.
-    #[error("invalid protocol frame: {0}")]
-    InvalidFrame(String),
     /// The message exceeds the maximum allowed size.
     #[error("payload too large: {size} bytes (max {max})")]
     PayloadTooLarge { size: usize, max: usize },
@@ -113,15 +110,6 @@ impl From<arena0_wire::WireError> for TransportError {
                 field: _,
             } => Self::PayloadTooLarge { size, max },
             other => Self::ProtocolMismatch(other.to_string()),
-        }
-    }
-}
-
-impl From<arena0_protocol::FetchFrameError> for TransportError {
-    fn from(error: arena0_protocol::FetchFrameError) -> Self {
-        match error {
-            arena0_protocol::FetchFrameError::Wire(error) => Self::from(error),
-            other => Self::InvalidFrame(other.to_string()),
         }
     }
 }

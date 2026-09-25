@@ -61,7 +61,7 @@ pub use execution::{
     ReceiptKind, ReceiptSummary, ReceiptWork, SharedProposal, StepCertificate, StepCursor,
     StopCause, StopReport, TerminalOutcome, TimerId, callout_id, validate_agreed_trace,
 };
-pub use fetch_frame::{FetchFrame, FetchFrameError};
+pub use fetch_frame::FetchFrame;
 pub use id::IdParseError;
 pub use negotiation::{
     ACTIVATION_DOMAIN, ACTIVATION_SIG_DOMAIN, ACTIVATION_SIG_VERSION, ACTIVATION_VERSION,

@@ -30,7 +30,7 @@ use arena0_protocol::{
     ExecFrame as DomainExecFrame, FetchFrame as DomainFetchFrame, NegotiationId, PeerId,
     SessionHash,
 };
-use arena0_wire::{Codec, FetchFrame as WireFetchFrame, StreamProtocol};
+use arena0_wire::{Codec, StreamProtocol};
 use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
@@ -352,8 +352,7 @@ impl SendHandle {
 
     /// Send an [`arena0_protocol::FetchFrame`] on a `Fetch` stream (the convergence fetch).
     pub async fn send_fetch(&self, msg: &DomainFetchFrame) -> Result<(), TransportError> {
-        let wire = WireFetchFrame::try_from(msg)?;
-        self.send_typed(StreamProtocol::Fetch, &wire).await
+        self.send_typed(StreamProtocol::Fetch, msg).await
     }
 
     async fn send_typed<T: borsh::BorshSerialize>(
@@ -496,9 +495,7 @@ impl RecvHandle {
                 "fetch packet unexpectedly carries an exec responsibility receipt".into(),
             ));
         }
-        let frame: WireFetchFrame =
-            Codec::new(StreamProtocol::Fetch.max_frame_body()).decode(&packet.bytes)?;
-        Ok(DomainFetchFrame::try_from(frame)?)
+        Ok(Codec::new(StreamProtocol::Fetch.max_frame_body()).decode(&packet.bytes)?)
     }
 
     async fn recv_packet(&self, expected: StreamProtocol) -> Result<StreamPacket, TransportError> {
