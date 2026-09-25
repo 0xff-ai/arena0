@@ -36,7 +36,6 @@ const RESERVED_PRIMITIVE_ACCESSORS: &[&str] = &[
     "peer",
     "peer_for",
     "primitive_output",
-    "primitive_outputs",
     "random",
     "random_bytes",
     "role",

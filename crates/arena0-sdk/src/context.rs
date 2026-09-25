@@ -66,13 +66,6 @@ pub trait EffectMode: Mode + Sized {
         effects: &mut Effects<'_, Shared, Self>,
         bytes: Vec<u8>,
     ) -> Self::Broadcast;
-
-    /// Emit every message in order.
-    #[doc(hidden)]
-    fn __broadcast_all<Shared>(
-        effects: &mut Effects<'_, Shared, Self>,
-        bytes: impl IntoIterator<Item = Vec<u8>>,
-    ) -> Self::Broadcast;
 }
 
 /// An agreed handler (`on_session_started`, `on_message`): it may change
@@ -103,15 +96,6 @@ impl EffectMode for AgreedMode {
         let queued = effects::host_broadcast(&bytes);
         debug_assert!(queued.is_ok(), "an agreed broadcast always queues");
     }
-
-    fn __broadcast_all<Shared>(
-        effects: &mut Effects<'_, Shared, Self>,
-        bytes: impl IntoIterator<Item = Vec<u8>>,
-    ) -> Self::Broadcast {
-        for b in bytes {
-            Self::__broadcast(effects, b);
-        }
-    }
 }
 
 impl EffectMode for LocalMode {
@@ -119,17 +103,6 @@ impl EffectMode for LocalMode {
 
     fn __broadcast<Shared>(_: &mut Effects<'_, Shared, Self>, bytes: Vec<u8>) -> Self::Broadcast {
         effects::host_broadcast(&bytes)
-    }
-
-    fn __broadcast_all<Shared>(
-        _: &mut Effects<'_, Shared, Self>,
-        bytes: impl IntoIterator<Item = Vec<u8>>,
-    ) -> Self::Broadcast {
-        let mut result = Ok(());
-        for b in bytes {
-            result = result.and(effects::host_broadcast(&b));
-        }
-        result
     }
 }
 
@@ -291,67 +264,41 @@ impl<Shared, Local, M: Mode> Ctx<Shared, Local, M> {
     }
 
     /// Convert a domain role back to its canonical session participant.
+    ///
+    /// # Panics
+    /// Panics if the participant is not in the committed ensemble.
     pub fn participant<Role>(&self, role: Role) -> Participant
     where
         Role: Into<Participant>,
     {
         let participant = role.into();
-        if let Some(ensemble) = self.committed_ensemble.as_ref() {
-            assert!(
-                ensemble.peer_at(participant).is_some(),
-                "participant {} is not in the committed ensemble",
-                participant.index()
-            );
-        } else {
-            assert!(
-                participant.index() < 2,
-                "role maps to participant {} outside this bilateral session",
-                participant.index()
-            );
-        }
+        assert!(
+            self.ensemble().peer_at(participant).is_some(),
+            "participant {} is not in the committed ensemble",
+            participant.index()
+        );
         participant
     }
 
-    /// Resolve a session participant to its transport identity.
+    /// Resolve a session participant to its transport identity through the
+    /// committed ensemble.
     ///
-    /// The committed ensemble is authoritative for N-party sessions. The
-    /// bilateral fallback applies only before a committed ensemble is
-    /// installed.
+    /// # Panics
+    /// Panics if the participant is not in the committed ensemble.
     pub fn peer_for(&self, participant: Participant) -> PeerId {
-        if let Some(ensemble) = self.committed_ensemble.as_ref() {
-            return ensemble
-                .peer_at(participant)
-                .expect("participant is not in the committed ensemble");
-        }
-        if participant == self.me() {
-            self.peer_id
-        } else if participant == self.other() {
-            self.peer()
-        } else {
-            panic!(
-                "participant {} is not in this bilateral session",
-                participant.index()
-            );
-        }
+        self.ensemble()
+            .peer_at(participant)
+            .expect("participant is not in the committed ensemble")
     }
 
     /// Resolve a transport peer in the active session to a participant.
     ///
     /// # Panics
-    /// Panics if `peer` is outside the active bilateral ensemble.
+    /// Panics if `peer` is not in the committed ensemble.
     pub fn participant_for_peer(&self, peer: PeerId) -> Participant {
-        if let Some(ensemble) = self.committed_ensemble.as_ref() {
-            return ensemble
-                .participant_of(&peer)
-                .expect("peer is not in the committed ensemble");
-        }
-        if peer == self.peer_id {
-            self.me()
-        } else if Some(peer) == self.remote_peer {
-            self.other()
-        } else {
-            panic!("peer {peer} is not in this session");
-        }
+        self.ensemble()
+            .participant_of(&peer)
+            .expect("peer is not in the committed ensemble")
     }
 
     /// Local participant index in the active session's canonical ensemble.
@@ -428,22 +375,6 @@ impl<Shared, Local, M: EffectMode> Ctx<Shared, Local, M> {
         PrimitiveOutput {
             message: msg,
             _marker: PhantomData,
-        }
-    }
-
-    /// Convert multiple primitive peer messages into a detached broadcast batch.
-    pub fn primitive_outputs<T>(
-        &mut self,
-        messages: impl IntoIterator<Item = T>,
-    ) -> PrimitiveOutputs<T> {
-        PrimitiveOutputs {
-            outputs: messages
-                .into_iter()
-                .map(|msg| PrimitiveOutput {
-                    message: msg,
-                    _marker: PhantomData,
-                })
-                .collect(),
         }
     }
 
@@ -660,20 +591,10 @@ impl<T: BorshSerialize> PrimitiveRoute<T> for RawPrimitiveRoute {
 /// broadcast-only: every output goes to all participants and enters the
 /// agreed trace at a canonical position.
 #[derive(Debug, Clone)]
-#[must_use = "primitive outputs must be broadcast, batched, or intentionally dropped"]
+#[must_use = "primitive outputs must be broadcast or intentionally dropped"]
 pub struct PrimitiveOutput<T, Route = RawPrimitiveRoute> {
     message: T,
     _marker: PhantomData<Route>,
-}
-
-/// Batch of detached primitive outputs that share a flush boundary.
-///
-/// [`Self::broadcast`] and [`Self::broadcast_via`] broadcast every output in
-/// the batch, in order, through the enclosing context's effect handle.
-#[derive(Debug, Clone, Default)]
-#[must_use = "primitive output batches must be sent or intentionally dropped"]
-pub struct PrimitiveOutputs<T, Route = RawPrimitiveRoute> {
-    outputs: Vec<PrimitiveOutput<T, Route>>,
 }
 
 /// Generated handle for a primitive field.
@@ -786,70 +707,6 @@ impl<T, Route> PrimitiveOutput<T, Route> {
     }
 }
 
-impl<T, Route> PrimitiveOutputs<T, Route> {
-    /// Create a batch from already detached outputs.
-    pub fn from_outputs(outputs: impl IntoIterator<Item = PrimitiveOutput<T, Route>>) -> Self {
-        Self {
-            outputs: outputs.into_iter().collect(),
-        }
-    }
-
-    /// Number of outputs in the batch.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.outputs.len()
-    }
-
-    /// Whether the batch contains no outputs.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.outputs.is_empty()
-    }
-
-    /// Wrap and broadcast every output in this batch through the enclosing
-    /// context's effect handle.
-    pub fn broadcast_via<W: BorshSerialize, Shared, M: EffectMode>(
-        self,
-        effects: &mut Effects<'_, Shared, M>,
-        mut wrap: impl FnMut(T) -> W,
-    ) -> M::Broadcast {
-        M::__broadcast_all(
-            effects,
-            self.outputs
-                .into_iter()
-                .map(|output| {
-                    borsh::to_vec(&wrap(output.message)).expect("primitive envelope serialization")
-                })
-                .collect::<Vec<_>>(),
-        )
-    }
-
-    /// Iterate over detached outputs for custom wrapping.
-    pub fn into_outputs(self) -> impl Iterator<Item = PrimitiveOutput<T, Route>> {
-        self.outputs.into_iter()
-    }
-}
-
-impl<T, Route: PrimitiveRoute<T>> PrimitiveOutputs<T, Route> {
-    /// Broadcast every output in this batch to every participant through the
-    /// enclosing context's effect handle.
-    pub fn broadcast<Shared, M: EffectMode>(
-        self,
-        effects: &mut Effects<'_, Shared, M>,
-    ) -> M::Broadcast {
-        M::__broadcast_all(
-            effects,
-            self.outputs
-                .into_iter()
-                .map(|output| {
-                    borsh::to_vec(&Route::wrap(output.message))
-                        .expect("primitive message serialization")
-                })
-                .collect::<Vec<_>>(),
-        )
-    }
-}
-
 impl<Shared, Local, P, Route, M: EffectMode> PrimitiveField<'_, Shared, Local, P, Route, M> {
     /// Return the participant identity associated with this dispatch.
     pub fn me(&self) -> Participant {
@@ -877,22 +734,6 @@ impl<Shared, Local, P, Route, M: EffectMode> PrimitiveField<'_, Shared, Local, P
         PrimitiveOutput {
             message: msg,
             _marker: PhantomData,
-        }
-    }
-
-    /// Convert multiple primitive messages into a detached output batch.
-    pub fn outputs<T>(
-        &mut self,
-        messages: impl IntoIterator<Item = T>,
-    ) -> PrimitiveOutputs<T, Route> {
-        PrimitiveOutputs {
-            outputs: messages
-                .into_iter()
-                .map(|msg| PrimitiveOutput {
-                    message: msg,
-                    _marker: PhantomData,
-                })
-                .collect(),
         }
     }
 }

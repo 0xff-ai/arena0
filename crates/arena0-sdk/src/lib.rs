@@ -98,8 +98,8 @@ pub use arena0_sdk_macros::{
 };
 pub use context::{
     AgreedMode, BroadcastError, CalloutContext, Context, Crypto, Ctx, EffectMode, Effects,
-    LocalContext, LocalMode, Mode, PrimitiveField, PrimitiveOutput, PrimitiveOutputs,
-    PrimitiveRoute, RawPrimitiveRoute, ReadMode, Signed,
+    LocalContext, LocalMode, Mode, PrimitiveField, PrimitiveOutput, PrimitiveRoute,
+    RawPrimitiveRoute, ReadMode, Signed,
 };
 #[doc(hidden)]
 pub use effects::{
