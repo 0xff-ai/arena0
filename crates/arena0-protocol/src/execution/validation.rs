@@ -8,8 +8,8 @@ use crate::{Effect, Ensemble, StateHash};
 
 use super::{
     AbortKind, ExecutionBinding, MAX_EFFECTS, MAX_RECEIPT_BYTES, MAX_TERMINAL_OUTCOME_BYTES,
-    MAX_TERMINAL_REASON_BYTES, MAX_TIMER_PAYLOAD_BYTES, MAX_TRACE_ENTRY_BYTES, ProtocolError,
-    ReceiptBody, SharedProposal, StepCursor, StopCause,
+    MAX_TERMINAL_REASON_BYTES, MAX_TIMER_PAYLOAD_BYTES, MAX_TRACE_ENTRY_BYTES,
+    ParticipantStepSignature, ProtocolError, ReceiptBody, SharedProposal, StepCursor, StopCause,
 };
 
 /// Validate an encoded value's total size without decoding it first.
@@ -103,26 +103,51 @@ pub(crate) fn validate_proposal(
     }
     for signature in &proposal.signatures {
         let key = binding.participant_key(&signature.participant())?;
-        if signature.signature().step != expected_commitment.step {
-            return Err(ProtocolError::InvalidStepSignature {
-                participant: signature.participant(),
-                step: expected_commitment.step,
-            });
-        }
-        let valid = key
-            .verify(
-                &expected_commitment.signing_bytes(),
-                &signature.signature().sig,
-            )
-            .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
-        if !valid {
-            return Err(ProtocolError::InvalidStepSignature {
-                participant: signature.participant(),
-                step: expected_commitment.step,
-            });
-        }
+        verify_step_signature(&key, &expected_commitment, signature)?;
     }
     validate_step_signature_order(&proposal.signatures)
+}
+
+/// Verify one participant's BLS signature over an exact step commitment.
+pub(crate) fn verify_step_signature(
+    key: &BlsPublicKey,
+    commitment: &StepCommitment,
+    signature: &ParticipantStepSignature,
+) -> Result<(), ProtocolError> {
+    let invalid = || ProtocolError::InvalidStepSignature {
+        participant: signature.participant(),
+        step: commitment.step,
+    };
+    if signature.signature().step != commitment.step {
+        return Err(invalid());
+    }
+    let valid = key
+        .verify(&commitment.signing_bytes(), &signature.signature().sig)
+        .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
+    if !valid {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// Verify an N-of-N aggregate agreement over an exact step commitment.
+///
+/// `keys` are the committed participants' execution keys in participant
+/// order, the order the signer bitmap indexes.
+pub(crate) fn verify_full_agreement(
+    agreement: &AggregateAttestation,
+    commitment: &StepCommitment,
+    keys: &[BlsPublicKey],
+) -> Result<(), ProtocolError> {
+    if agreement.signers.count() != keys.len() || !agreement.signers.is_full(keys.len()) {
+        return Err(ProtocolError::IncompleteProof {
+            actual: agreement.signers.count(),
+            expected: keys.len(),
+        });
+    }
+    agreement
+        .verify_signatures(commitment.step, &commitment.signing_bytes(), keys)
+        .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))
 }
 
 fn validate_proposal_status(
@@ -174,7 +199,7 @@ fn validate_proposal_status(
 }
 
 fn validate_step_signature_order(
-    signatures: &[super::ParticipantStepSignature],
+    signatures: &[ParticipantStepSignature],
 ) -> Result<(), ProtocolError> {
     for pair in signatures.windows(2) {
         if pair[0].participant() >= pair[1].participant() {
@@ -242,42 +267,23 @@ pub(crate) fn validate_receipt_body(
     {
         return Err(ProtocolError::ReceiptBodyMismatch);
     }
-    let participants = binding.participant_keys()?;
-    let participant_keys = participants.iter().map(|(_, key)| *key).collect::<Vec<_>>();
     match &header.terminal {
-        ReceiptTermination::Completed => {
-            validate_completed_receipt(binding, body, &participant_keys, participants.len())
-        }
-        ReceiptTermination::Stopped { cause } => {
-            validate_stopped_receipt(binding, body, cause, &participant_keys, participants.len())
-        }
+        ReceiptTermination::Completed => validate_receipt_trace(
+            binding,
+            body.trace(),
+            ReceiptTraceTerminal::Completed {
+                outcome: body.outcome(),
+            },
+        )
+        .map(|_| ()),
+        ReceiptTermination::Stopped { cause } => validate_stopped_receipt(binding, body, cause),
     }
-}
-
-fn validate_completed_receipt(
-    binding: &ExecutionBinding,
-    body: &ReceiptBody,
-    participant_keys: &[BlsPublicKey],
-    participant_count: usize,
-) -> Result<(), ProtocolError> {
-    validate_receipt_trace(
-        binding,
-        body.trace(),
-        participant_keys,
-        participant_count,
-        ReceiptTraceTerminal::Completed {
-            outcome: body.outcome(),
-        },
-    )
-    .map(|_| ())
 }
 
 fn validate_stopped_receipt(
     binding: &ExecutionBinding,
     body: &ReceiptBody,
     cause: &StopCause,
-    participant_keys: &[BlsPublicKey],
-    participant_count: usize,
 ) -> Result<(), ProtocolError> {
     cause.validate()?;
     match cause {
@@ -291,13 +297,8 @@ fn validate_stopped_receipt(
             {
                 return Err(ProtocolError::UnauthenticatedAbort);
             }
-            let cursor = validate_receipt_trace(
-                binding,
-                body.trace(),
-                participant_keys,
-                participant_count,
-                ReceiptTraceTerminal::Authenticated,
-            )?;
+            let cursor =
+                validate_receipt_trace(binding, body.trace(), ReceiptTraceTerminal::Authenticated)?;
             if *occurrence.coordinate() != cursor {
                 return Err(ProtocolError::InvalidAbortCoordinate);
             }
@@ -317,8 +318,6 @@ fn validate_stopped_receipt(
             let cursor = validate_receipt_trace(
                 binding,
                 body.trace(),
-                participant_keys,
-                participant_count,
                 ReceiptTraceTerminal::Stopped {
                     kind: *kind,
                     reason,
@@ -338,8 +337,6 @@ enum ReceiptTraceTerminal<'a> {
 fn validate_receipt_trace(
     binding: &ExecutionBinding,
     trace: &[TraceEntry],
-    participant_keys: &[BlsPublicKey],
-    participant_count: usize,
     terminal: ReceiptTraceTerminal<'_>,
 ) -> Result<StepCursor, ProtocolError> {
     if matches!(
@@ -349,33 +346,7 @@ fn validate_receipt_trace(
     {
         return Err(ProtocolError::ReceiptBodyMismatch);
     }
-    let mut previous_state = binding.activation.offer().data().initial_state;
-    let mut previous_link = crate::CHAIN_START;
-    for (index, entry) in trace.iter().enumerate() {
-        let step = u64::try_from(index).map_err(|_| ProtocolError::ReceiptBodyMismatch)?;
-        validate_shared_entry(binding, step, entry)?;
-        if entry.step != step || entry.pre_state != previous_state {
-            return Err(ProtocolError::ReceiptBodyMismatch);
-        }
-        if entry.agreement.signers.count() != participant_count
-            || !entry.agreement.signers.is_full(participant_count)
-        {
-            return Err(ProtocolError::IncompleteProof {
-                actual: entry.agreement.signers.count(),
-                expected: participant_count,
-            });
-        }
-        let commitment = StepCommitment::for_entry(binding.session_id(), entry, previous_link);
-        entry
-            .agreement
-            .verify_signatures(step, &commitment.signing_bytes(), participant_keys)
-            .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
-        if index + 1 < trace.len() && terminal_effect_count(entry) != 0 {
-            return Err(ProtocolError::TerminalTraceMismatch);
-        }
-        previous_state = entry.post_state;
-        previous_link = commitment.link_hash();
-    }
+    let cursor = validate_agreed_trace(binding, trace)?;
 
     let final_entry = trace.last();
     match terminal {
@@ -414,11 +385,40 @@ fn validate_receipt_trace(
             }
         }
     }
-    Ok(StepCursor::new(
-        u64::try_from(trace.len()).map_err(|_| ProtocolError::ReceiptBodyMismatch)?,
-        previous_state,
-        previous_link,
-    ))
+    Ok(cursor)
+}
+
+/// Validate a certified trace prefix from the activation's genesis state and
+/// return the agreed cursor after its last entry.
+///
+/// Every entry must be well formed at its position, extend the hash chain from
+/// the previous entry's post-state, and carry an N-of-N aggregate agreement
+/// over its derived [`StepCommitment`]. Only the final entry may carry a
+/// terminal. The receipt verifier and the store's reopen check share this path.
+pub fn validate_agreed_trace(
+    binding: &ExecutionBinding,
+    trace: &[TraceEntry],
+) -> Result<StepCursor, ProtocolError> {
+    let keys = binding.participant_bls_keys()?;
+    let mut cursor = StepCursor::new(
+        0,
+        binding.activation.offer().data().initial_state,
+        crate::CHAIN_START,
+    );
+    for (index, entry) in trace.iter().enumerate() {
+        validate_shared_entry(binding, cursor.next_step(), entry)?;
+        let commitment =
+            StepCommitment::for_entry(binding.session_id(), entry, cursor.chain_hash());
+        let next = cursor
+            .advance(&commitment)
+            .map_err(|_| ProtocolError::ReceiptBodyMismatch)?;
+        verify_full_agreement(&entry.agreement, &commitment, &keys)?;
+        if index + 1 < trace.len() && terminal_effect_count(entry) != 0 {
+            return Err(ProtocolError::TerminalTraceMismatch);
+        }
+        cursor = next;
+    }
+    Ok(cursor)
 }
 
 pub(crate) fn validate_trace_entry(entry: &TraceEntry) -> Result<(), ProtocolError> {

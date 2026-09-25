@@ -69,6 +69,16 @@ impl ExecutionBinding {
         Ok(keys)
     }
 
+    /// Participant execution keys in participant order, the order signer
+    /// bitmaps index.
+    pub(crate) fn participant_bls_keys(&self) -> Result<Vec<BlsPublicKey>, ProtocolError> {
+        Ok(self
+            .participant_keys()?
+            .into_iter()
+            .map(|(_, key)| key)
+            .collect())
+    }
+
     pub(crate) fn participant_key(
         &self,
         participant: &PeerId,

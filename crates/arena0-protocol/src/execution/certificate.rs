@@ -11,34 +11,24 @@ use arena0_program::bounded;
 
 use super::{
     ExecutionBinding, MAX_RECEIPT_BYTES, MAX_RECEIPT_TRACE_ENTRIES, MAX_TERMINAL_OUTCOME_BYTES,
-    ProtocolError, SharedProposal, StepCertificate, ensure_payload,
+    ProtocolError, SharedProposal, StepCertificate, ensure_payload, verify_full_agreement,
+    verify_step_signature,
 };
 
 impl StepCertificate {
     /// Verify N-of-N evidence against its session binding, independently of
     /// whether the receiving participant has restored the staged proposal yet.
     pub fn verify(&self, binding: &ExecutionBinding) -> Result<(), ProtocolError> {
-        if self.commitment.domain != crate::STEP_COMMIT_DOMAIN
-            || self.commitment.session_id != binding.session_id()
-        {
+        if !self.commitment.is_bound_to(binding.session_id()) {
             return Err(ProtocolError::InvalidCertificate(
                 "step certificate binding mismatch".into(),
             ));
         }
-        let participants = binding.participant_keys()?;
-        if !self.agreement.signers.is_full(participants.len()) {
-            return Err(ProtocolError::IncompleteProof {
-                actual: self.agreement.signers.count(),
-                expected: participants.len(),
-            });
-        }
-        self.agreement
-            .verify_signatures(
-                self.commitment.step,
-                &self.commitment.signing_bytes(),
-                &participants.iter().map(|(_, key)| *key).collect::<Vec<_>>(),
-            )
-            .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))
+        verify_full_agreement(
+            &self.agreement,
+            &self.commitment,
+            &binding.participant_bls_keys()?,
+        )
     }
 
     /// Build an activation-bound N-of-N certificate for a shared proposal.
@@ -71,28 +61,15 @@ impl StepCertificate {
                     expected: participants.len(),
                 });
             };
-            let valid = key
-                .verify(&commitment.signing_bytes(), &signature.signature.sig)
-                .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
-            if !valid {
-                return Err(ProtocolError::InvalidStepSignature {
-                    participant: *participant,
-                    step: commitment.step,
-                });
-            }
+            verify_step_signature(key, commitment, signature)?;
             signer_set.set(index);
             signatures.push(signature.signature.sig);
         }
 
         let agreement = AggregateAttestation::from_signatures(signer_set, &signatures)
             .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
-        agreement
-            .verify_signatures(
-                commitment.step,
-                &commitment.signing_bytes(),
-                &participants.iter().map(|(_, key)| *key).collect::<Vec<_>>(),
-            )
-            .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
+        let keys = participants.iter().map(|(_, key)| *key).collect::<Vec<_>>();
+        verify_full_agreement(&agreement, commitment, &keys)?;
 
         Ok(Self {
             commitment: commitment.clone(),

@@ -59,7 +59,7 @@ pub use execution::{
     MAX_TIMER_PAYLOAD_BYTES, MAX_TRACE_ENTRY_BYTES, OpenCallout, ParticipantStepSignature,
     PendingId, PendingIdParseError, ProtocolError, Receipt, ReceiptArtifact, ReceiptBody,
     ReceiptId, ReceiptKind, ReceiptSummary, ReceiptWork, SharedProposal, StepCertificate,
-    StepCursor, StopCause, StopReport, TerminalOutcome, TimerId, pending_id,
+    StepCursor, StopCause, StopReport, TerminalOutcome, TimerId, pending_id, validate_agreed_trace,
 };
 pub use fetch_frame::{FetchFrame, FetchFrameError};
 pub use id::IdParseError;

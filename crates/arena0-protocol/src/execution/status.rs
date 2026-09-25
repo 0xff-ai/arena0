@@ -100,7 +100,7 @@ impl StopCause {
             Self::Shared {
                 commitment, reason, ..
             } => {
-                if commitment.domain != crate::STEP_COMMIT_DOMAIN {
+                if !commitment.has_step_domain() {
                     return Err(ProtocolError::InvalidTerminalStatus);
                 }
                 ensure_reason(reason)
@@ -257,8 +257,7 @@ pub(crate) fn validate_cause_binding(
             }
         }
         StopCause::Shared { commitment, .. } => {
-            if commitment.domain != crate::STEP_COMMIT_DOMAIN
-                || commitment.session_id != binding.session_id()
+            if !commitment.is_bound_to(binding.session_id())
                 || commitment.step.checked_add(1) != Some(agreed.next_step())
                 || commitment.post_state != agreed.state_hash()
                 || commitment.link_hash() != agreed.chain_hash()

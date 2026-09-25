@@ -17,7 +17,7 @@ use super::{
     ExecutionBinding, ExecutionStatus, ExecutionVersion, MAX_EFFECTS, MAX_EXECUTION_STATE_BYTES,
     MAX_PROOF_SIGNATURES, ParticipantStepSignature, ProtocolError, ReceiptArtifact, ReceiptId,
     StepCursor, TerminalOutcome, check_effect_budget, ensure_encoded, ensure_payload,
-    validate_effects, validate_proposal, validate_receipt_body,
+    validate_effects, validate_proposal, validate_receipt_body, verify_step_signature,
 };
 
 /// A shared step waiting for N-of-N signatures.
@@ -172,22 +172,11 @@ impl SharedProposal {
             return Err(ProtocolError::ConflictingStepSignature { participant });
         }
 
-        let key = binding.participant_key(&participant)?;
-        if signature.signature().step != commitment.step {
-            return Err(ProtocolError::InvalidStepSignature {
-                participant,
-                step: commitment.step,
-            });
-        }
-        let valid = key
-            .verify(&commitment.signing_bytes(), &signature.signature().sig)
-            .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
-        if !valid {
-            return Err(ProtocolError::InvalidStepSignature {
-                participant,
-                step: commitment.step,
-            });
-        }
+        verify_step_signature(
+            &binding.participant_key(&participant)?,
+            commitment,
+            &signature,
+        )?;
         if self.signatures.len() >= MAX_PROOF_SIGNATURES {
             return Err(ProtocolError::CollectionTooLarge {
                 kind: "step signatures",

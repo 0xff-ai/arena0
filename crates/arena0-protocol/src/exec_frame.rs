@@ -143,7 +143,7 @@ impl BorshDeserialize for ExecFrame {
 impl WireDecode for ExecFrame {}
 
 fn write_commitment<W: io::Write>(commitment: &StepCommitment, writer: &mut W) -> io::Result<()> {
-    if commitment.domain != crate::STEP_COMMIT_DOMAIN {
+    if !commitment.has_step_domain() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "step commitment has an unknown domain",
@@ -154,7 +154,7 @@ fn write_commitment<W: io::Write>(commitment: &StepCommitment, writer: &mut W) -
 
 fn read_commitment<R: io::Read>(reader: &mut R) -> io::Result<StepCommitment> {
     let commitment = StepCommitment::deserialize_reader(reader)?;
-    if commitment.domain != crate::STEP_COMMIT_DOMAIN {
+    if !commitment.has_step_domain() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "step commitment has an unknown domain",

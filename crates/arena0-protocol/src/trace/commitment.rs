@@ -63,6 +63,18 @@ pub struct StepCommitment {
 }
 
 impl StepCommitment {
+    /// Whether this commitment carries the current [`STEP_COMMIT_DOMAIN`].
+    #[must_use]
+    pub fn has_step_domain(&self) -> bool {
+        self.domain == STEP_COMMIT_DOMAIN
+    }
+
+    /// Whether this commitment is a current-domain commitment for `session_id`.
+    #[must_use]
+    pub fn is_bound_to(&self, session_id: SessionHash) -> bool {
+        self.has_step_domain() && self.session_id == session_id
+    }
+
     /// Build the commitment for one public entry, given the previous
     /// position's chain link ([`CHAIN_START`] at position 0).
     #[must_use]
