@@ -41,6 +41,10 @@ pub enum ExecError {
     /// A valid writer message was rejected or did not reproduce its post-state.
     #[error("{0}")]
     Diverged(String),
+    /// An agreed step's broadcasts would overflow this Host's outgoing queue.
+    /// The Host fails the session instead of signing an unrepresentable step.
+    #[error("outgoing queue overflow")]
+    OutgoingQueueOverflow,
     /// The next agreed step would exceed the portable evidence budget.
     #[error("receipt budget exhausted at step {step}")]
     ReceiptBudgetExhausted { step: u64 },

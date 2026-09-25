@@ -1,16 +1,16 @@
 //! Inbound events dispatched to programs by the runtime.
 //!
 //! Each [`Event`] variant represents something that happened outside the
-//! program: a session boundary, a message arrival, or a local input, timer, or
-//! reaction. Every event uses the same dispatch path and may
-//! affect either state and emit any [`Effect`](crate::Effect).
+//! program: a session boundary, a message arrival, or a local input or timer.
+//! Every event uses the same dispatch path and may affect either state and
+//! emit any [`Effect`](crate::Effect).
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::io;
 
 use crate::bounded::{read_bytes as read_bounded_bytes, write_bytes as serialize_bounded_bytes};
-use crate::{Ensemble, MessageId, PeerId, StateHash, TimerPayload};
+use crate::{Ensemble, PeerId, TimerPayload};
 
 /// An event dispatched to a program during a single execution step.
 ///
@@ -26,19 +26,15 @@ pub enum Event<M = Vec<u8>> {
         ensemble: Ensemble,
     },
     /// A broadcast message applied at a canonical agreed position.
-    MessageReceived {
-        message_id: MessageId,
-        from: PeerId,
-        position: u64,
-        pre_state: StateHash,
-        msg: M,
-    },
+    ///
+    /// The event carries no trace coordinates: the author does not know its
+    /// post-state yet, and receivers reconstruct the same portable entry from
+    /// the frame. See [`crate::StepEvent`].
+    MessageReceived { from: PeerId, msg: M },
     /// The controlling agent submitted input in response to a callout.
     InputReceived { callout_index: u32, data: Vec<u8> },
     /// A previously set timer fired with its scheduled payload.
     TimerFired { timer: TimerPayload },
-    /// Run the program's reaction code after an agreed entry applied.
-    React,
 }
 
 impl Event<Vec<u8>> {
@@ -48,17 +44,8 @@ impl Event<Vec<u8>> {
     /// `MessageReceived` payload fails to deserialize.
     pub fn decode<M: BorshDeserialize>(self) -> Result<Event<M>, std::io::Error> {
         Ok(match self {
-            Self::MessageReceived {
-                message_id,
+            Self::MessageReceived { from, msg } => Event::MessageReceived {
                 from,
-                position,
-                pre_state,
-                msg,
-            } => Event::MessageReceived {
-                message_id,
-                from,
-                position,
-                pre_state,
                 msg: borsh::from_slice(&msg)?,
             },
             Self::SessionStarted { ensemble } => Event::SessionStarted { ensemble },
@@ -70,7 +57,6 @@ impl Event<Vec<u8>> {
                 data,
             },
             Self::TimerFired { timer } => Event::TimerFired { timer },
-            Self::React => Event::React,
         })
     }
 }
@@ -79,7 +65,6 @@ const EVENT_SESSION_STARTED: u8 = 0;
 const EVENT_MESSAGE_RECEIVED: u8 = 1;
 const EVENT_INPUT_RECEIVED: u8 = 2;
 const EVENT_TIMER_FIRED: u8 = 3;
-const EVENT_REACT: u8 = 4;
 
 impl<M: BorshSerialize> BorshSerialize for Event<M> {
     fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
@@ -88,18 +73,9 @@ impl<M: BorshSerialize> BorshSerialize for Event<M> {
                 BorshSerialize::serialize(&EVENT_SESSION_STARTED, writer)?;
                 BorshSerialize::serialize(ensemble, writer)
             }
-            Self::MessageReceived {
-                message_id,
-                from,
-                position,
-                pre_state,
-                msg,
-            } => {
+            Self::MessageReceived { from, msg } => {
                 BorshSerialize::serialize(&EVENT_MESSAGE_RECEIVED, writer)?;
-                BorshSerialize::serialize(message_id, writer)?;
                 BorshSerialize::serialize(from, writer)?;
-                BorshSerialize::serialize(position, writer)?;
-                BorshSerialize::serialize(pre_state, writer)?;
                 BorshSerialize::serialize(msg, writer)
             }
             Self::InputReceived {
@@ -120,7 +96,6 @@ impl<M: BorshSerialize> BorshSerialize for Event<M> {
                 BorshSerialize::serialize(&EVENT_TIMER_FIRED, writer)?;
                 timer.serialize_bounded(writer)
             }
-            Self::React => BorshSerialize::serialize(&EVENT_REACT, writer),
         }
     }
 }
@@ -132,10 +107,7 @@ impl<M: BorshDeserialize> BorshDeserialize for Event<M> {
                 ensemble: borsh::BorshDeserialize::deserialize_reader(reader)?,
             }),
             EVENT_MESSAGE_RECEIVED => Ok(Self::MessageReceived {
-                message_id: borsh::BorshDeserialize::deserialize_reader(reader)?,
                 from: borsh::BorshDeserialize::deserialize_reader(reader)?,
-                position: borsh::BorshDeserialize::deserialize_reader(reader)?,
-                pre_state: borsh::BorshDeserialize::deserialize_reader(reader)?,
                 msg: M::deserialize_reader(reader)?,
             }),
             EVENT_INPUT_RECEIVED => Ok(Self::InputReceived {
@@ -149,7 +121,6 @@ impl<M: BorshDeserialize> BorshDeserialize for Event<M> {
             EVENT_TIMER_FIRED => Ok(Self::TimerFired {
                 timer: TimerPayload::deserialize_bounded(reader)?,
             }),
-            EVENT_REACT => Ok(Self::React),
             tag => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown event tag {tag}"),
@@ -171,10 +142,7 @@ mod tests {
                 ensemble: Ensemble::from_peers(vec![peer, PeerId([0u8; 32])]).expect("ensemble"),
             },
             Event::MessageReceived {
-                message_id: MessageId([9u8; 32]),
                 from: peer,
-                position: 3,
-                pre_state: StateHash([8u8; 32]),
                 msg: vec![1, 2, 3],
             },
             Event::InputReceived {
@@ -187,7 +155,6 @@ mod tests {
                     data: vec![7],
                 },
             },
-            Event::React,
         ];
 
         for variant in &variants {
@@ -203,20 +170,15 @@ mod tests {
         let ensemble = Ensemble::from_peers(vec![peer, PeerId([2; 32])]).expect("ensemble");
         let start: Event<Vec<u8>> = Event::SessionStarted { ensemble };
         let message: Event<Vec<u8>> = Event::MessageReceived {
-            message_id: MessageId([2; 32]),
             from: peer,
-            position: 0,
-            pre_state: StateHash([3; 32]),
             msg: Vec::new(),
         };
         let timer: Event<Vec<u8>> = Event::TimerFired {
             timer: TimerPayload::unit(),
         };
-        let raw_react: Event<Vec<u8>> = Event::React;
         assert_eq!(borsh::to_vec(&start).unwrap()[0], 0);
         assert_eq!(borsh::to_vec(&message).unwrap()[0], 1);
         assert_eq!(borsh::to_vec(&timer).unwrap()[0], 3);
-        assert_eq!(borsh::to_vec(&raw_react).unwrap()[0], 4);
         assert!(borsh::from_slice::<Event<Vec<u8>>>(&[0xff]).is_err());
     }
 

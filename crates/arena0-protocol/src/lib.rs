@@ -79,7 +79,7 @@ pub use negotiation::{
     PREPARE_WINDOW_MS, PreparedActivation,
 };
 pub use outcome::SessionTermination;
-pub use session::{Committed, Ensemble, EnsembleError, Lifecycle, Nonce, Open, Participant};
+pub use session::{Committed, Ensemble, EnsembleError, Nonce, Open, Participant};
 pub use system_event::{
     EventSource, ExecCreationOrigin, ExecutionEvent, ExecutionFailureCode, NegotiationEvent,
     NegotiationStage, SystemEvent, TerminalKind,
@@ -88,7 +88,7 @@ pub use terminal::TerminalResult;
 pub use timer::{TimerPayload, TimerSpec};
 pub use trace::{
     AggregateAttestation, AttestationError, CHAIN_START, DivergenceDiagnostic, DivergenceKind,
-    ReceiptTermination, STEP_COMMIT_DOMAIN, SessionHeader, SignerSet, StepCommitment, StepSig,
-    TRACE_FORMAT_VERSION, TraceEntry,
+    ReceiptTermination, STEP_COMMIT_DOMAIN, SessionHeader, SignerSet, StepCommitment, StepEvent,
+    StepSig, StepTerminal, TRACE_FORMAT_VERSION, TraceEntry,
 };
 pub use view::{ColorDepth, Slot, View, Viewport};

@@ -276,14 +276,14 @@ from a peer that never confirmed wakes a retired execution. The daemon
 supervisor does not stop the actor merely because it observed the receipt.
 
 Portable/light verification is the only verification boundary. It checks the
-activation, identities, v2 trace chain, aggregate agreements, terminal
-evidence, and v4 receipt identity without loading Wasm. A completed result
+activation, identities, v3 trace chain, aggregate agreements, terminal
+evidence, and v5 receipt identity without loading Wasm. A completed result
 contains authenticated opaque outcome bytes; a stopped result contains its
 exact stop cause. Verification never executes a second program pass.
 
 The current compatibility boundary is ABI 22, execution profile 3, `TraceEntry`
-format 2, the v3 `StepCommitment` domain, receipt artifact/body 3, the v3
-`ReceiptId` domain, and store schema 4. Decoders reject unsupported versions;
+format 3, the v4 `StepCommitment` domain, receipt artifact/body 5, the v5
+`ReceiptId` domain, and store schema 5. Decoders reject unsupported versions;
 these formats do not silently accept evidence from the removed execution path.
 
 A receipt proves what the selected Hosts agreed under one program. It does not prove an external payment, task completion, legal identity, or asset transfer.

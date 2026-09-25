@@ -2,7 +2,8 @@ use std::fmt::Write;
 
 use arena0::prelude::*;
 use arena0_primitives::commit_reveal::{
-    self, CommitReveal, CommitRevealFieldExt, CommitRevealLocal, CommitRevealLocalState,
+    self, CommitReveal, CommitRevealAuthorExt, CommitRevealFieldExt, CommitRevealLocal,
+    CommitRevealLocalState,
 };
 
 #[arena0::data]
@@ -299,33 +300,7 @@ pub mod prisoner_dilemma {
         Ok(Transition::To(Phase::Playing))
     }
 
-    /// Local decision hook: broadcast the owed reveal once every commit is in,
-    /// The callout projection asks for any missing local move.
-    fn on_react(
-        ctx: &mut Context<Shared, Local>,
-    ) -> Result<ProgramTransition<PrisonerDilemma>, ProgramFault> {
-        // Unique-writer rule: react only when this node is the participant
-        // whose action is next (first missing commit, then first missing
-        // reveal); an idle node never broadcasts a sibling candidate.
-        if ctx.shared().commit_reveal.expected_writer() != Some(ctx.me()) {
-            return Ok(Transition::Stay);
-        }
-        if let Some(reveal) = ctx.commit_reveal().take_reveal() {
-            reveal.broadcast();
-            if ctx.shared().commit_reveal.is_complete() {
-                let finished = apply_completed_round(ctx.shared_mut());
-                return Ok(if finished {
-                    Transition::End
-                } else {
-                    Transition::Stay
-                });
-            }
-            return Ok(Transition::Stay);
-        }
-        Ok(Transition::Stay)
-    }
-
-    fn callout(ctx: &Context<Shared, Local>) -> Option<Callout> {
+    fn callout(ctx: &CalloutContext<'_, Shared, Local>) -> Option<Callout> {
         (ctx.shared().commit_reveal.expected_writer() == Some(ctx.me())
             && ctx
                 .shared()
@@ -349,6 +324,7 @@ pub mod prisoner_dilemma {
             return Ok(ApplyDecision::Reject);
         }
         if !ctx.shared().commit_reveal.is_complete() {
+            queue_setup_action(ctx).map_err(ProtocolFault::shared_violation)?;
             return Ok(ApplyDecision::Accept(Transition::Stay));
         }
 
@@ -361,19 +337,30 @@ pub mod prisoner_dilemma {
         Ok(ApplyDecision::Accept(Transition::Stay))
     }
 
-    fn on_input(
-        ctx: &mut Context<Shared, Local>,
-        input: Input,
-    ) -> arena0::anyhow::Result<ProgramTransition<PrisonerDilemma>> {
+    fn on_input(ctx: &mut LocalContext<Shared, Local>, input: Input) -> arena0::anyhow::Result<()> {
         if ctx.shared().commit_reveal.expected_writer() != Some(ctx.me()) {
             return Err(anyhow!("this participant does not own the next choice"));
         }
         let Input::Choose(choice) = input;
-        ctx.commit_reveal().commit(choice)?.broadcast();
-        Ok(Transition::Stay)
+        ctx.commit_reveal()
+            .commit(choice)?
+            .broadcast(&mut ctx.effects())?;
+        Ok(())
     }
 
     fn on_query(_shared: &Shared, _: ()) {}
+
+    /// Queue the owed reveal once every commit is in, when this node is the
+    /// expected writer.
+    fn queue_setup_action(ctx: &mut Context<Shared, Local>) -> arena0::anyhow::Result<()> {
+        if ctx.shared().commit_reveal.expected_writer() != Some(ctx.me()) {
+            return Ok(());
+        }
+        if let Some(reveal) = ctx.commit_reveal().take_reveal() {
+            reveal.broadcast(&mut ctx.effects());
+        }
+        Ok(())
+    }
 
     /// Score a completed reveal round and either reset the protocol for the
     /// next round or leave the final values visible for the terminal outcome.
@@ -481,14 +468,15 @@ mod tests {
     }
 
     /// Play one full round on a single native replica (the local node is
-    /// participant 0). The local input applies its own commit before broadcast;
-    /// only the opponent's commit and reveal are delivered back here.
+    /// participant 0). The local commit and reveal are queued and then authored
+    /// through `on_message`, exactly as the runtime authors them; only the
+    /// opponent's commit and reveal are delivered from outside.
     /// `mine` is the local choice, `theirs` the opponent's.
     fn play_round(h: &mut TestHarness<PrisonerDilemma>, mine: Choice, theirs: Choice) {
         let fx = h.resolve_callout::<callouts::Choose>(mine);
-        assert_eq!(fx.messages::<Message>().len(), 1);
+        h.author_queued(&fx.effects);
         let fx = h.message(local_b(), make_commit(theirs));
-        assert_eq!(fx.messages::<Message>().len(), 1);
+        h.author_queued(&fx.effects);
         h.message(local_b(), make_reveal(theirs));
     }
 

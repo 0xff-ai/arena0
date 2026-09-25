@@ -395,15 +395,8 @@ impl ExecutionActor {
         };
         if state.pending_shared().is_some() {
             self.ensure_step_signature().await?;
-        } else if state.status().lifecycle() == ExecLifecycle::Active
-            && state.agreed_step() > 0
-            && state.last_reacted_step() != Some(state.agreed_step() - 1)
-        {
-            self.dispatch_event(
-                arena0_protocol::Event::React,
-                super::guest::DispatchSource::default(),
-            )
-            .await?;
+        } else if self.may_author()? {
+            self.author_next_message().await?;
         }
         self.announce_callout().await?;
         self.deliver_frames()?;

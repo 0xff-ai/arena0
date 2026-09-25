@@ -8,14 +8,14 @@ use std::cell::RefCell;
 
 use arena0_protocol::trace::JsonDiffExt;
 use arena0_protocol::{
-    DivergenceDiagnostic, DivergenceKind, Effect, Ensemble, Event, MessageId, OpenCallout,
-    Participant, PeerId, StateHash, View, Viewport,
+    DivergenceDiagnostic, DivergenceKind, Effect, Ensemble, Event, OpenCallout, Participant,
+    PeerId, StateHash, View, Viewport,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::{
-    ApplyDecision, Arena0Callout, CalloutSpec, Context, MessageApply, Program, ProgramFault,
-    ProgramTransition, ProgramView,
+    ApplyDecision, Arena0Callout, CalloutSpec, Context, LocalContext, MessageApply, Program,
+    ProgramFault, ProgramTransition, ProgramView,
 };
 
 use super::diagnostics::event_name;
@@ -376,7 +376,11 @@ impl<P: Program> TestHarness<P> {
             }
         };
 
-        let callout_request = if failed { None } else { P::callout(&ctx) };
+        let callout_request = if failed {
+            None
+        } else {
+            P::callout(&ctx.__callout_context())
+        };
         let (mut shared, mut local, _) = ctx.__into_parts();
         let mut effects = drain_effects();
         let logs = if failed {
@@ -444,12 +448,154 @@ impl<P: Program> TestHarness<P> {
         }
     }
 
+    /// Run a local handler against a read-only shared context.
+    ///
+    /// A local handler returns no transition: it may update local state and
+    /// emit effects, but the agreed shared image must not change.
+    fn run_local<F, E>(
+        &mut self,
+        event: Event,
+        f: F,
+        map_err: impl FnOnce(E) -> FaultStatus,
+    ) -> HandlerResult
+    where
+        F: FnOnce(&mut LocalContext<P::Shared, P::Local>) -> Result<(), E>,
+    {
+        let previous_pending = self.pending.active().cloned();
+        let pending_close = match &event {
+            Event::InputReceived { .. } => Some(ClosedPendingReason::Resolved),
+            _ => None,
+        };
+        let pre_snapshot = shared_snapshot(&self.shared);
+        let local_snapshot = borsh::to_vec(&self.local).expect("local serialization failed");
+        let pre_state = shared_hash_snapshot(&pre_snapshot);
+        let shared = std::mem::take(&mut self.shared);
+        let local = std::mem::take(&mut self.local);
+        // SAFETY: the fixture is the native dispatch harness; the images are
+        // the committed shared image and the durable local image.
+        let mut ctx = unsafe { LocalContext::__new(shared, local, self.peer_id) };
+        if let Some(ref ensemble) = self.committed_ensemble {
+            let participant = ensemble
+                .participant_of(&self.peer_id)
+                .expect("local peer is not in the committed ensemble");
+            ctx.__set_participant(participant);
+            if let Some(peer) = self.peer() {
+                ctx.__set_remote_peer(*peer);
+            }
+            ctx.__set_committed_ensemble(ensemble.clone());
+        }
+        drain_effects();
+        drain_logs();
+        let mut failed = false;
+        let fault = match f(&mut ctx) {
+            Ok(()) => FaultStatus::None,
+            Err(e) => {
+                failed = true;
+                map_err(e)
+            }
+        };
+        // A local handler must leave the agreed shared image unchanged, the
+        // same byte-level boundary the Host enforces. Compare the serialized
+        // image so interior-mutable shared DTOs are caught too. Serialize only
+        // a successful handler, and treat a serialization error as a changed
+        // image, matching the generated guest glue.
+        let shared_changed = !failed
+            && borsh::to_vec(ctx.shared())
+                .map(|bytes| bytes != pre_snapshot)
+                .unwrap_or(true);
+        // A changed shared image rejects the dispatch before any callout is
+        // derived.
+        let callout_request = if failed || shared_changed {
+            None
+        } else {
+            P::callout(&ctx.__callout_context())
+        };
+        let mut local = ctx.__into_local();
+        let mut shared: P::Shared =
+            borsh::from_slice(&pre_snapshot).expect("shared state deserialization");
+        let mut effects = drain_effects();
+        let logs = if failed {
+            drain_logs();
+            Vec::new()
+        } else {
+            drain_logs()
+        };
+        if !failed && shared_changed {
+            // Restore both images; a rejected dispatch leaves no state change.
+            self.shared = shared;
+            self.local = borsh::from_slice(&local_snapshot).expect("local deserialization");
+            return HandlerResult {
+                effects: Vec::new(),
+                logs: Vec::new(),
+                fault: FaultStatus::Rejected(
+                    "a local handler changed the agreed shared state".into(),
+                ),
+                records: Vec::new(),
+                rejected: true,
+            };
+        }
+        if failed {
+            restore_shared(&mut shared, &pre_snapshot);
+            restore_local(&mut local, &local_snapshot);
+            if matches!(&fault, FaultStatus::Rejected(_)) {
+                self.shared = shared;
+                self.local = local;
+                return HandlerResult {
+                    effects: Vec::new(),
+                    logs: Vec::new(),
+                    fault,
+                    records: Vec::new(),
+                    rejected: true,
+                };
+            }
+            effects = fault_effects(&fault);
+        }
+        let post_state = shared_hash(&shared);
+        self.shared = shared;
+        self.local = local;
+
+        let terminal = effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. }
+            )
+        });
+        let pending = derive_open_callout(
+            previous_pending
+                .as_ref()
+                .filter(|_| !matches!(event, Event::InputReceived { .. })),
+            PendingId::new(self.event_position),
+            if terminal { None } else { callout_request },
+        );
+        let record = __dispatch_record(
+            self.event_position,
+            event,
+            effects.clone(),
+            pre_state,
+            post_state,
+            pending.clone(),
+        );
+        self.event_position += 1;
+        self.trace.push(record.clone());
+        let pending_close = pending_close.or_else(|| terminal_pending_close(&record));
+        self.pending
+            .update(previous_pending, pending_close, &fault, pending);
+
+        HandlerResult {
+            effects,
+            logs,
+            fault,
+            records: vec![record],
+            rejected: false,
+        }
+    }
+
     fn run_program(
         &mut self,
         event: Event,
-        f: impl FnOnce(&mut Context<P::Shared, P::Local>) -> Result<ProgramTransition<P>, ProgramFault>,
+        f: impl FnOnce(&mut LocalContext<P::Shared, P::Local>) -> Result<(), ProgramFault>,
     ) -> HandlerResult {
-        self.run(event, f, |ProgramFault(e)| {
+        self.run_local(event, f, |ProgramFault(e)| {
             FaultStatus::Abort(format!("{e:#}"))
         })
     }
@@ -457,9 +603,9 @@ impl<P: Program> TestHarness<P> {
     fn run_input(
         &mut self,
         event: Event,
-        f: impl FnOnce(&mut Context<P::Shared, P::Local>) -> anyhow::Result<ProgramTransition<P>>,
+        f: impl FnOnce(&mut LocalContext<P::Shared, P::Local>) -> anyhow::Result<()>,
     ) -> HandlerResult {
-        self.run(event, f, |e| FaultStatus::Rejected(format!("{e:#}")))
+        self.run_local(event, f, |e| FaultStatus::Rejected(format!("{e:#}")))
     }
     /// Run a message apply transactionally, mirroring the sandbox layer model:
     /// `Accept` commits both state values, while `Reject` restores both values
@@ -509,7 +655,7 @@ impl<P: Program> TestHarness<P> {
         let callout_request = if failed || rejected {
             None
         } else {
-            P::callout(&ctx)
+            P::callout(&ctx.__callout_context())
         };
         let (mut shared, mut local, _) = ctx.__into_parts();
         let mut effects = drain_effects();
@@ -584,39 +730,6 @@ impl<P: Program> TestHarness<P> {
         }
     }
 
-    /// Run the reaction hook after an accepted agreed event, matching the
-    /// runtime's explicit reaction step. This does not enqueue a producer
-    /// self-message; the originating dispatch already applied its own state
-    /// before this step begins.
-    fn react(&mut self) -> HandlerResult {
-        self.run(
-            Event::React,
-            |ctx| P::on_react(ctx),
-            |ProgramFault(e)| FaultStatus::Abort(format!("{e:#}")),
-        )
-    }
-
-    fn with_react(&mut self, result: HandlerResult) -> HandlerResult {
-        let terminal = result.records.iter().any(DispatchRecord::is_terminal);
-        if !matches!(result.fault, FaultStatus::None) || result.rejected || terminal {
-            return result;
-        }
-        let react = self.react();
-        let mut effects = result.effects;
-        effects.extend(react.effects);
-        let mut logs = result.logs;
-        logs.extend(react.logs);
-        let mut records = result.records;
-        records.extend(react.records);
-        HandlerResult {
-            effects,
-            logs,
-            fault: react.fault,
-            records,
-            rejected: result.rejected,
-        }
-    }
-
     fn dispatch_replay_event(
         &mut self,
         event: &Event,
@@ -638,13 +751,7 @@ impl<P: Program> TestHarness<P> {
                 }
                 (self.start_session_raw(ensemble), None)
             }
-            Event::MessageReceived {
-                message_id,
-                from,
-                position,
-                pre_state,
-                msg,
-            } => {
+            Event::MessageReceived { from, msg } => {
                 let participant = self
                     .committed_ensemble
                     .as_ref()
@@ -668,16 +775,9 @@ impl<P: Program> TestHarness<P> {
                         err.to_string(),
                     )
                 })?;
-                let result = self.run_apply(
-                    Event::MessageReceived {
-                        message_id,
-                        from,
-                        position,
-                        pre_state,
-                        msg,
-                    },
-                    |ctx| P::on_message(ctx, participant, decoded),
-                );
+                let result = self.run_apply(Event::MessageReceived { from, msg }, |ctx| {
+                    P::on_message(ctx, participant, decoded)
+                });
                 (result, Some(participant))
             }
             Event::InputReceived {
@@ -712,8 +812,41 @@ impl<P: Program> TestHarness<P> {
                 ),
                 None,
             ),
-            Event::React => (self.react(), None),
         })
+    }
+
+    /// Apply the broadcasts a dispatch queued back to this harness through
+    /// `on_message`, as the runtime authors its own queued messages.
+    ///
+    /// Queued messages are authored in order, including any broadcasts those
+    /// dispatches queue in turn, until the harness has no queued work.
+    pub fn author_queued(&mut self, effects: &[Effect]) -> Vec<HandlerResult>
+    where
+        P::Message: BorshSerialize + BorshDeserialize,
+    {
+        let mut queue: std::collections::VecDeque<Vec<u8>> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Broadcast { data } => Some(data.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut results = Vec::new();
+        let mut guard = 0usize;
+        while let Some(data) = queue.pop_front() {
+            guard += 1;
+            assert!(guard <= 1024, "queued authoring did not quiesce");
+            let msg: P::Message =
+                borsh::from_slice(&data).expect("queued message deserialization failed");
+            let result = self.message(self.peer_id, msg);
+            for effect in &result.effects {
+                if let Effect::Broadcast { data } = effect {
+                    queue.push_back(data.clone());
+                }
+            }
+            results.push(result);
+        }
+        results
     }
 
     /// Start a native harness with an explicit committed participant ensemble.
@@ -737,8 +870,7 @@ impl<P: Program> TestHarness<P> {
     }
 
     fn start_session(&mut self, ensemble: Ensemble) -> HandlerResult {
-        let result = self.start_session_raw(ensemble);
-        self.with_react(result)
+        self.start_session_raw(ensemble)
     }
 
     fn start_session_raw(&mut self, ensemble: Ensemble) -> HandlerResult {
@@ -785,20 +917,10 @@ where
 
     fn message(&mut self, from: PeerId, msg: P::Message) -> HandlerResult {
         let data = borsh::to_vec(&msg).expect("message serialization failed");
-        let result = self.run_apply(
-            Event::MessageReceived {
-                message_id: MessageId([0u8; 32]),
-                from,
-                position: 0,
-                pre_state: StateHash([0u8; 32]),
-                msg: data,
-            },
-            |ctx| {
-                let from = ctx.participant_for_peer(from);
-                P::on_message(ctx, from, msg)
-            },
-        );
-        self.with_react(result)
+        self.run_apply(Event::MessageReceived { from, msg: data }, |ctx| {
+            let from = ctx.participant_for_peer(from);
+            P::on_message(ctx, from, msg)
+        })
     }
 
     fn input(&mut self, input: P::Input) -> HandlerResult {
@@ -1023,12 +1145,12 @@ mod tests {
         }
 
         fn on_input(
-            ctx: &mut Context<Self::Shared, Self::Local>,
+            ctx: &mut LocalContext<Self::Shared, Self::Local>,
             _input: Self::Input,
-        ) -> anyhow::Result<ProgramTransition<Self>> {
+        ) -> anyhow::Result<()> {
             ctx.local_mut().value = 9;
             ctx.log("provisional rejection log");
-            ctx.effects().broadcast(&());
+            let _ = ctx.effects().broadcast(&());
             Err(anyhow!("try again"))
         }
     }
@@ -1148,10 +1270,9 @@ mod tests {
 
         let report =
             TestHarness::<FaultyProgram>::replay_trace(PeerId([0; 32]), (), h.trace()).unwrap();
-        // The flat transcript includes the boundary, its reaction, and the
-        // message dispatch. The faulting message does not schedule another
-        // reaction.
-        assert_eq!(report.event_count, 3);
+        // The flat transcript includes the session boundary and the message
+        // dispatch.
+        assert_eq!(report.event_count, 2);
         assert_eq!(
             report.final_state,
             h.trace().last().map(|record| record.post_state)

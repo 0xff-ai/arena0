@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use arena0_program::{CallStatus, JsonBytes};
-use arena0_protocol::{Committed, Ensemble, Event, MessageId, PeerId, StateHash};
+use arena0_protocol::{Committed, Ensemble, Event, PeerId, StateHash};
 use arena0_sandbox::{DispatchCall, InitializeCall, Program, ProgramInstance, WasmtimeEngine};
 use wasmparser::{ExternalKind, Parser, Payload};
 
@@ -38,6 +38,21 @@ fn exported_guest_shape(wasm: &[u8]) -> (BTreeSet<String>, bool) {
         }
     }
     (memories, dispatch)
+}
+
+/// Borsh-encoded `cumulative_sum::Message::Contribute { value }`.
+fn contribution(value: u64) -> Vec<u8> {
+    let mut message = vec![0];
+    message.extend_from_slice(&value.to_le_bytes());
+    message
+}
+
+/// One peer's contribution message as an agreed `MessageReceived` event.
+fn contribution_event(from: PeerId, value: u64) -> Event<Vec<u8>> {
+    Event::MessageReceived {
+        from,
+        msg: contribution(value),
+    }
 }
 
 fn resident_from_cumulative_guest(
@@ -100,49 +115,39 @@ fn sdk_guest_dispatch_has_exact_memories_and_rolls_back_rejected_state() {
     resident
         .commit_payloads()
         .expect("commit SessionStarted state");
-    let (before_react_shared, before_react_local) = resident.committed_payloads();
-    let before_react_shared = before_react_shared.clone();
-    let before_react_local = before_react_local.clone();
-    let before_react_hash = StateHash::of_shared(&before_react_shared).0;
+    let (before_shared, before_local) = resident.committed_payloads();
+    let before_shared = before_shared.clone();
+    let before_local = before_local.clone();
+    let before_hash = StateHash::of_shared(&before_shared).0;
 
+    // The author applies its own queued contribution through the same
+    // `on_message` dispatch every receiver runs.
     let accepted = resident
-        .dispatch(DispatchCall::new(peer0, session.clone(), Event::React))
-        .expect("React dispatch");
+        .dispatch(DispatchCall::new(
+            peer0,
+            session.clone(),
+            contribution_event(peer0, 111),
+        ))
+        .expect("own contribution dispatch");
     assert_eq!(accepted.status, CallStatus::Accepted);
-    assert_ne!(accepted.shared, before_react_shared);
-    assert_ne!(accepted.local, before_react_local);
-    assert_ne!(accepted.shared_hash, before_react_hash);
-    assert!(
-        accepted
-            .observations
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, arena0_protocol::Effect::Broadcast { .. })),
-        "React must emit the contribution broadcast"
-    );
+    assert_ne!(accepted.shared, before_shared);
+    assert_eq!(accepted.local, before_local);
+    assert_ne!(accepted.shared_hash, before_hash);
     let (accepted_shared, accepted_local) = resident
         .commit_payloads()
-        .expect("commit accepted React state");
+        .expect("commit accepted contribution state");
     assert_eq!(accepted_shared, accepted.shared);
     assert_eq!(accepted_local, accepted.local);
 
-    // The first React fills participant 0's slot, so a message from that same
-    // participant is a validly encoded but deterministic wrong-writer reject.
-    // Its payload is deliberately different from the committed state so the
-    // result proves the resident checkpoint, not input equality, is restored.
-    let mut message = vec![0];
-    message.extend_from_slice(&999u64.to_le_bytes());
+    // Participant 0's slot is filled, so a message from that same participant
+    // is a validly encoded but deterministic wrong-writer reject. Its payload
+    // is deliberately different from the committed state so the result proves
+    // the resident checkpoint, not input equality, is restored.
     let rejected = resident
         .dispatch(DispatchCall::new(
             peer0,
             session,
-            Event::MessageReceived {
-                message_id: MessageId([9; 32]),
-                from: peer0,
-                position: 1,
-                pre_state: StateHash([8; 32]),
-                msg: message,
-            },
+            contribution_event(peer0, 999),
         ))
         .expect("wrong-writer dispatch should return rejected status");
     assert_eq!(rejected.status, CallStatus::Rejected);
@@ -179,14 +184,19 @@ fn sdk_guest_repeated_allocations_preserve_commit_restore_and_rollback() {
         .commit_payloads()
         .expect("commit SessionStarted state");
 
-    for _ in 0..8 {
+    for index in 0..8u8 {
+        let peer = PeerId([index; 32]);
         let accepted = resident
-            .dispatch(DispatchCall::new(peer0, session.clone(), Event::React))
-            .expect("repeated React dispatch");
+            .dispatch(DispatchCall::new(
+                peer,
+                session.clone(),
+                contribution_event(peer, u64::from(index) + 1),
+            ))
+            .expect("repeated contribution dispatch");
         assert_eq!(accepted.status, CallStatus::Accepted);
         resident
             .commit_payloads()
-            .expect("commit repeated React state");
+            .expect("commit repeated contribution state");
     }
     let (committed_shared, committed_local) = resident.committed_payloads();
     let committed_shared = committed_shared.clone();
@@ -196,9 +206,14 @@ fn sdk_guest_repeated_allocations_preserve_commit_restore_and_rollback() {
     // An accepted candidate is discarded by explicit recovery before the
     // subsequent failure, proving that the durable checkpoint remains the
     // source of rollback state.
+    let candidate_peer = PeerId([8; 32]);
     let candidate = resident
-        .dispatch(DispatchCall::new(peer0, session.clone(), Event::React))
-        .expect("candidate React dispatch");
+        .dispatch(DispatchCall::new(
+            candidate_peer,
+            session.clone(),
+            contribution_event(candidate_peer, 8),
+        ))
+        .expect("candidate contribution dispatch");
     assert_eq!(candidate.status, CallStatus::Accepted);
     resident
         .restore_committed()
@@ -207,19 +222,12 @@ fn sdk_guest_repeated_allocations_preserve_commit_restore_and_rollback() {
     // Participant 0 has already contributed, so this valid message is a
     // deterministic wrong-writer rejection. Its payload differs from the
     // checkpoint and therefore proves restoration rather than input equality.
-    let mut message = vec![0];
-    message.extend_from_slice(&999u64.to_le_bytes());
+    let message = contribution(999);
     let rejected = resident
         .dispatch(DispatchCall::new(
             peer0,
             session.clone(),
-            Event::MessageReceived {
-                message_id: MessageId([9; 32]),
-                from: peer0,
-                position: 1,
-                pre_state: StateHash([8; 32]),
-                msg: message.clone(),
-            },
+            contribution_event(peer0, 999),
         ))
         .expect("wrong-writer dispatch should reject");
     assert_eq!(rejected.status, CallStatus::Rejected);
@@ -233,10 +241,7 @@ fn sdk_guest_repeated_allocations_preserve_commit_restore_and_rollback() {
         peer0,
         session.clone(),
         Event::MessageReceived {
-            message_id: MessageId([10; 32]),
             from: peer0,
-            position: 1,
-            pre_state: StateHash([8; 32]),
             msg: vec![255],
         },
     ));
@@ -250,10 +255,7 @@ fn sdk_guest_repeated_allocations_preserve_commit_restore_and_rollback() {
             peer0,
             session,
             Event::MessageReceived {
-                message_id: MessageId([11; 32]),
                 from: peer0,
-                position: 1,
-                pre_state: StateHash([8; 32]),
                 msg: message,
             },
         ))
@@ -262,4 +264,81 @@ fn sdk_guest_repeated_allocations_preserve_commit_restore_and_rollback() {
     assert_eq!(after_fault.shared, committed_shared);
     assert_eq!(after_fault.local, committed_local);
     assert_eq!(after_fault.shared_hash, committed_hash);
+}
+
+fn local_context_forge_wasm() -> Vec<u8> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../programs/target/wasm32-unknown-unknown/release/local_context_forge.wasm");
+    std::fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "cannot read required SDK guest {}: {error}; run `just build-programs`",
+            path.display()
+        )
+    })
+}
+
+/// A local handler that forges a replacement context must be rejected by the
+/// generated glue: the forged shared view never reaches `callout`, and neither
+/// image is stored.
+#[test]
+fn sdk_guest_rejects_a_local_handler_that_forges_its_shared_view() {
+    let engine = WasmtimeEngine::new().expect("sandbox engine");
+    let program = Program::try_from(local_context_forge_wasm()).expect("parse forge guest");
+    let loaded = engine.load(&program).expect("load forge guest");
+    let initialized = loaded
+        .initialize(InitializeCall::new(
+            JsonBytes::try_new(b"null".to_vec()).expect("valid params JSON"),
+        ))
+        .expect("initialize forge guest");
+    let session = Ensemble::from_peers(vec![PeerId([0; 32]), PeerId([1; 32])])
+        .expect("valid committed session");
+    let mut resident = loaded
+        .resident(initialized.shared, initialized.local)
+        .expect("create resident forge guest");
+    let peer0 = PeerId([0; 32]);
+
+    let started = resident
+        .dispatch(DispatchCall::new(
+            peer0,
+            session.clone(),
+            Event::SessionStarted {
+                ensemble: session.clone(),
+            },
+        ))
+        .expect("SessionStarted dispatch");
+    assert_eq!(started.status, CallStatus::Accepted);
+    // The committed marker is zero, so the fixture opens no callout.
+    assert!(started.callout.is_none());
+    resident
+        .commit_payloads()
+        .expect("commit SessionStarted state");
+    let (before_shared, before_local) = resident.committed_payloads();
+    let before_shared = before_shared.clone();
+    let before_local = before_local.clone();
+
+    let rejected = resident
+        .dispatch(DispatchCall::new(
+            peer0,
+            session,
+            Event::TimerFired {
+                timer: arena0_protocol::TimerPayload::unit(),
+            },
+        ))
+        .expect("timer dispatch");
+    assert_eq!(
+        rejected.status,
+        CallStatus::Rejected,
+        "the forged shared view must be rejected"
+    );
+    assert_eq!(rejected.shared, before_shared);
+    assert_eq!(rejected.local, before_local);
+    // The forged marker would open a callout; the glue must derive none.
+    assert!(
+        rejected.callout.is_none(),
+        "no callout may be derived from the forged shared image"
+    );
+    assert_eq!(
+        resident.committed_payloads(),
+        (&before_shared, &before_local)
+    );
 }

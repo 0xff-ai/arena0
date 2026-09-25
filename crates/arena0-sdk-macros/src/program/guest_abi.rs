@@ -125,6 +125,14 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
             ::arena0::borsh::from_slice(&bytes).expect("shared state deserialization failed")
         }
 
+        fn __arena0_load_shared_bytes() -> ::std::vec::Vec<u8> {
+            let len = ::arena0::__host_state_len(::arena0::__STATE_KIND_SHARED);
+            assert!(len <= __ARENA0_STATE_MAX, "shared state exceeds STATE_MAX");
+            let mut bytes = ::std::vec![0u8; len];
+            ::arena0::__host_state_read(::arena0::__STATE_KIND_SHARED, &mut bytes);
+            bytes
+        }
+
         fn __arena0_restore_shared(bytes: &::arena0::SharedStateBytes) -> #shared_ty {
             ::arena0::borsh::from_slice(bytes.as_bytes())
                 .expect("shared state deserialization failed")
@@ -141,14 +149,65 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
             ::arena0::borsh::from_slice(&bytes).expect("local state deserialization failed")
         }
 
-        fn __arena0_store_state(
-            ctx: ::arena0::Context<#shared_ty, #local_ty>,
-        ) {
-            let (shared, local, _peer_id) = ctx.__into_parts();
-            let shared = __arena0_serialize_shared(&shared);
-            let local = __arena0_serialize_local(&local);
+        fn __arena0_store_parts(shared: &#shared_ty, local: &#local_ty) {
+            let shared = __arena0_serialize_shared(shared);
+            let local = __arena0_serialize_local(local);
             ::arena0::__host_state_write(::arena0::__STATE_KIND_SHARED, &shared);
             ::arena0::__host_state_write(::arena0::__STATE_KIND_LOCAL, &local);
+        }
+
+        /// Whether a local handler left the typed shared image unchanged.
+        ///
+        /// Compares serialized bytes, so an interior-mutable shared DTO is
+        /// caught too.
+        fn __arena0_local_shared_changed(
+            ctx: &::arena0::LocalContext<#shared_ty, #local_ty>,
+            original: &[u8],
+        ) -> bool {
+            ::arena0::borsh::to_vec(ctx.shared())
+                .map(|bytes| bytes != original)
+                .unwrap_or(true)
+        }
+
+        /// The outcome of an accepted local handler: reject if it changed the
+        /// typed shared image, otherwise accept. A rejection derives no callout
+        /// and stores neither image.
+        fn __arena0_local_outcome(
+            ctx: &::arena0::LocalContext<#shared_ty, #local_ty>,
+            original: &[u8],
+        ) -> (::arena0::CallStatus, ::core::option::Option<::std::string::String>) {
+            if __arena0_local_shared_changed(ctx, original) {
+                (
+                    ::arena0::CallStatus::Rejected,
+                    Some(::std::string::String::from(
+                        "a local handler changed the agreed shared state",
+                    )),
+                )
+            } else {
+                (::arena0::CallStatus::Accepted, None)
+            }
+        }
+
+        /// Write back the original shared bytes a local dispatch received and
+        /// the accepted local image.
+        fn __arena0_store_local(shared: &[u8], local: &#local_ty) {
+            let local = __arena0_serialize_local(local);
+            ::arena0::__host_state_write(::arena0::__STATE_KIND_SHARED, shared);
+            ::arena0::__host_state_write(::arena0::__STATE_KIND_LOCAL, &local);
+        }
+
+        fn __arena0_store_state(ctx: ::arena0::Context<#shared_ty, #local_ty>) {
+            let (shared, local, _peer_id) = ctx.__into_parts();
+            __arena0_store_parts(&shared, &local);
+        }
+
+        /// The handler context for one accepted dispatch. A local handler owns
+        /// a read-only [`LocalContext`](::arena0::LocalContext); an agreed
+        /// handler owns a mutable [`Context`](::arena0::Context). A local arm
+        /// also carries the original shared bytes to write back unchanged.
+        enum __Arena0Dispatch {
+            Agreed(::arena0::Context<#shared_ty, #local_ty>),
+            Local(::arena0::LocalContext<#shared_ty, #local_ty>, ::std::vec::Vec<u8>),
         }
 
         fn __arena0_make_ctx(
@@ -166,6 +225,33 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                 __arena0_load_local(),
                 peer_id,
             );
+            ctx.__set_participant(participant);
+            if let Some(remote) = session.others(&peer_id).next() {
+                ctx.__set_remote_peer(remote);
+            }
+            ctx.__set_committed_ensemble(session);
+            ctx
+        }
+
+        fn __arena0_make_local_ctx(
+            input: &::arena0::DispatchInput,
+        ) -> ::arena0::LocalContext<#shared_ty, #local_ty> {
+            let peer_id = ::arena0::types::PeerId(input.peer_id);
+            let session: ::arena0::Ensemble<::arena0::Committed> =
+                ::arena0::borsh::from_slice(&input.session)
+                    .expect("session context deserialization failed");
+            let participant = session
+                .participant_of(&peer_id)
+                .expect("local peer is not in the committed ensemble");
+            // SAFETY: this is the generated dispatch glue; the images are the
+            // Host's committed shared image and the durable local image.
+            let mut ctx = unsafe {
+                ::arena0::LocalContext::__new(
+                    __arena0_load_shared(),
+                    __arena0_load_local(),
+                    peer_id,
+                )
+            };
             ctx.__set_participant(participant);
             if let Some(remote) = session.others(&peer_id).next() {
                 ctx.__set_remote_peer(remote);
@@ -232,11 +318,11 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
             let input: ::arena0::DispatchInput = __arena0_read_input(input_ptr, input_len);
             let raw_event: ::arena0::Event = ::arena0::borsh::from_slice(&input.event)
                 .expect("dispatch event deserialization failed");
-            let mut ctx = __arena0_make_ctx(&input);
-            let (status, reason) = match raw_event {
+            let (ctx, status, reason) = match raw_event {
                 ::arena0::Event::SessionStarted { ensemble } => {
+                    let mut ctx = __arena0_make_ctx(&input);
                     ctx.__set_committed_ensemble(ensemble.clone());
-                    match <#program_ty as ::arena0::Program>::on_session_started(
+                    let outcome = match <#program_ty as ::arena0::Program>::on_session_started(
                         &mut ctx,
                         &ensemble,
                     ) {
@@ -247,19 +333,15 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                         Err(::arena0::ProgramFault(error)) => {
                             panic!("session-start handler failed: {error:#}");
                         }
-                    }
+                    };
+                    (__Arena0Dispatch::Agreed(ctx), outcome.0, outcome.1)
                 }
-                ::arena0::Event::MessageReceived {
-                    message_id: _,
-                    from,
-                    position: _,
-                    pre_state: _,
-                    msg,
-                } => {
+                ::arena0::Event::MessageReceived { from, msg } => {
+                    let mut ctx = __arena0_make_ctx(&input);
                     let typed_msg: #message_ty = ::arena0::borsh::from_slice(&msg)
                         .expect("message deserialization failed");
                     let from = ctx.participant_for_peer(from);
-                    match <#program_ty as ::arena0::Program>::on_message(
+                    let outcome = match <#program_ty as ::arena0::Program>::on_message(
                         &mut ctx,
                         from,
                         typed_msg,
@@ -272,22 +354,25 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                             (::arena0::CallStatus::Rejected, None)
                         }
                         Err(error) => panic!("message handler failed: {error}"),
-                    }
+                    };
+                    (__Arena0Dispatch::Agreed(ctx), outcome.0, outcome.1)
                 }
                 ::arena0::Event::InputReceived {
                     callout_index,
                     data,
                 } => {
-                    match <#callout_ty as ::arena0::Arena0Callout>::from_raw(
+                    let mut local_ctx = __arena0_make_local_ctx(&input);
+                    let shared_bytes = __arena0_load_shared_bytes();
+                    let outcome = match <#callout_ty as ::arena0::Arena0Callout>::from_raw(
                         callout_index,
                         data,
                     ) {
                         Ok(input) => {
-                            match <#program_ty as ::arena0::Program>::on_input(&mut ctx, input) {
-                                Ok(transition) => {
-                                    ctx.__apply_transition::<#program_ty>(transition);
-                                    (::arena0::CallStatus::Accepted, None)
-                                }
+                            match <#program_ty as ::arena0::Program>::on_input(
+                                &mut local_ctx,
+                                input,
+                            ) {
+                                Ok(()) => __arena0_local_outcome(&local_ctx, &shared_bytes),
                                 Err(error) => (
                                     ::arena0::CallStatus::Rejected,
                                     Some(::arena0::__truncate_rejection_reason(&error)),
@@ -298,33 +383,42 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                             ::arena0::CallStatus::Rejected,
                             Some(::arena0::__truncate_rejection_reason(&error)),
                         ),
-                    }
+                    };
+                    (
+                        __Arena0Dispatch::Local(local_ctx, shared_bytes),
+                        outcome.0,
+                        outcome.1,
+                    )
                 }
                 ::arena0::Event::TimerFired { timer } => {
-                    match <#program_ty as ::arena0::Program>::on_timer(&mut ctx, timer) {
-                        Ok(transition) => {
-                            ctx.__apply_transition::<#program_ty>(transition);
-                            (::arena0::CallStatus::Accepted, None)
-                        }
+                    let mut local_ctx = __arena0_make_local_ctx(&input);
+                    let shared_bytes = __arena0_load_shared_bytes();
+                    let outcome = match <#program_ty as ::arena0::Program>::on_timer(
+                        &mut local_ctx,
+                        timer,
+                    ) {
+                        Ok(()) => __arena0_local_outcome(&local_ctx, &shared_bytes),
                         Err(::arena0::ProgramFault(error)) => {
                             panic!("timer handler failed: {error:#}");
                         }
-                    }
-                }
-                ::arena0::Event::React => {
-                    match <#program_ty as ::arena0::Program>::on_react(&mut ctx) {
-                        Ok(transition) => {
-                            ctx.__apply_transition::<#program_ty>(transition);
-                            (::arena0::CallStatus::Accepted, None)
-                        }
-                        Err(::arena0::ProgramFault(error)) => {
-                            panic!("react handler failed: {error:#}");
-                        }
-                    }
+                    };
+                    (
+                        __Arena0Dispatch::Local(local_ctx, shared_bytes),
+                        outcome.0,
+                        outcome.1,
+                    )
                 }
             };
             let callout = if status == ::arena0::CallStatus::Accepted {
-                <#program_ty as ::arena0::Program>::callout(&ctx).map(|callout| {
+                let request = match &ctx {
+                    __Arena0Dispatch::Agreed(ctx) => {
+                        <#program_ty as ::arena0::Program>::callout(&ctx.__callout_context())
+                    }
+                    __Arena0Dispatch::Local(ctx, _) => {
+                        <#program_ty as ::arena0::Program>::callout(&ctx.__callout_context())
+                    }
+                };
+                request.map(|callout| {
                     let context = ::arena0::serde_json::to_vec(&callout)
                         .expect("callout context serialization failed");
                     ::arena0::CalloutRequest {
@@ -336,7 +430,13 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                 None
             };
             if status == ::arena0::CallStatus::Accepted {
-                __arena0_store_state(ctx);
+                match ctx {
+                    __Arena0Dispatch::Agreed(ctx) => __arena0_store_state(ctx),
+                    __Arena0Dispatch::Local(ctx, shared_bytes) => {
+                        let local = ctx.__into_local();
+                        __arena0_store_local(&shared_bytes, &local);
+                    }
+                }
             }
             __arena0_write_result(&::arena0::DispatchOutput {
                 status,

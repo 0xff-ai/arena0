@@ -1,9 +1,10 @@
 use arena0_crypto::BlsPublicKey;
 
 use crate::trace::{
-    AggregateAttestation, ReceiptTermination, StepCommitment, TRACE_FORMAT_VERSION, TraceEntry,
+    AggregateAttestation, ReceiptTermination, StepCommitment, StepEvent, StepTerminal,
+    TRACE_FORMAT_VERSION, TraceEntry,
 };
-use crate::{Effect, Ensemble, Event, MessageId, StateHash};
+use crate::{Effect, Ensemble, StateHash};
 
 use super::{
     AbortKind, ExecutionBinding, MAX_EFFECTS, MAX_RECEIPT_BYTES, MAX_TERMINAL_OUTCOME_BYTES,
@@ -64,7 +65,6 @@ pub(crate) fn validate_proposal(
     }
     let advanced = agreed.advance(&proposal.commitment)?;
 
-    validate_effects(&proposal.effects)?;
     let lifecycle = proposal
         .effects
         .iter()
@@ -73,28 +73,10 @@ pub(crate) fn validate_proposal(
     if lifecycle.len() > 1 {
         return Err(ProtocolError::MultipleTerminalEffects);
     }
-    let portable_event = matches!(
-        &proposal.entry.event,
-        Event::SessionStarted { .. } | Event::MessageReceived { .. }
-    );
-    if portable_event
-        && !lifecycle.is_empty()
-        && proposal
-            .effects
-            .iter()
-            .any(|(_, effect)| matches!(effect, Effect::Broadcast { .. }))
-    {
-        // A portable entry is already an agreed session/message event. A
-        // broadcast emitted alongside its terminal effect would need a
-        // successor position after a terminal trace, so reject that shape at
-        // the point where the event's portable status is known. Local input,
-        // timer, signing, and reaction dispatches are validated by the actor
-        // with their originating event before they are normalized here.
-        return Err(ProtocolError::InvalidCertificate(
-            "terminal agreed event cannot defer a broadcast".into(),
-        ));
-    }
-    if lifecycle.first().copied() != proposal.entry.terminal.as_ref() {
+    let lifecycle_terminal = lifecycle
+        .first()
+        .and_then(|effect| StepTerminal::from_effect(effect));
+    if lifecycle_terminal != proposal.entry.terminal {
         return Err(ProtocolError::InvalidCertificate(
             "proposal effects and trace terminal do not match".into(),
         ));
@@ -143,7 +125,7 @@ fn validate_proposal_status(
         (None, super::ExecutionStatus::Active) => Ok(()),
         (None, _) => Err(ProtocolError::InvalidTerminalStatus),
         (
-            Some(Effect::SessionAbort { reason }),
+            Some(StepTerminal::Abort { reason }),
             super::ExecutionStatus::Stopped {
                 cause:
                     super::StopCause::Shared {
@@ -154,7 +136,7 @@ fn validate_proposal_status(
             },
         ) if actual_commitment == commitment && actual_reason == reason => Ok(()),
         (
-            Some(Effect::Fail { reason }),
+            Some(StepTerminal::Fail { reason }),
             super::ExecutionStatus::Stopped {
                 cause:
                     super::StopCause::Shared {
@@ -165,7 +147,7 @@ fn validate_proposal_status(
             },
         ) if actual_commitment == commitment && actual_reason == reason => Ok(()),
         (
-            Some(Effect::SessionEnd { outcome }),
+            Some(StepTerminal::End { outcome }),
             super::ExecutionStatus::Certified { outcome: actual },
         ) => {
             actual.validate()?;
@@ -175,8 +157,8 @@ fn validate_proposal_status(
                 Err(ProtocolError::TerminalOutcomeMismatch)
             }
         }
-        (Some(Effect::SessionEnd { .. }), _) => Err(ProtocolError::TerminalOutcomeRequired),
-        (Some(Effect::SessionAbort { .. } | Effect::Fail { .. }), _) | (Some(_), _) => {
+        (Some(StepTerminal::End { .. }), _) => Err(ProtocolError::TerminalOutcomeRequired),
+        (Some(StepTerminal::Abort { .. } | StepTerminal::Fail { .. }), _) => {
             Err(ProtocolError::InvalidTerminalStatus)
         }
     }
@@ -392,8 +374,12 @@ fn validate_receipt_trace(
             let Some(entry) = final_entry else {
                 return Err(ProtocolError::ReceiptBodyMismatch);
             };
-            if !matches!(entry.terminal, Some(Effect::SessionEnd { .. }))
-                || entry.completed_outcome() != Some(outcome)
+            let completed = entry
+                .terminal
+                .as_ref()
+                .and_then(StepTerminal::completed_outcome);
+            if !matches!(entry.terminal, Some(StepTerminal::End { .. }))
+                || completed != Some(outcome)
             {
                 return Err(ProtocolError::TerminalTraceMismatch);
             }
@@ -408,8 +394,10 @@ fn validate_receipt_trace(
                 return Err(ProtocolError::ReceiptBodyMismatch);
             };
             let valid = match (kind, entry.terminal.as_ref()) {
-                (AbortKind::Abort, Some(Effect::SessionAbort { reason: actual }))
-                | (AbortKind::Fail, Some(Effect::Fail { reason: actual })) => actual == reason,
+                (AbortKind::Abort, Some(StepTerminal::Abort { reason: actual }))
+                | (AbortKind::Fail, Some(StepTerminal::Fail { reason: actual })) => {
+                    actual == reason
+                }
                 _ => false,
             };
             if !valid {
@@ -431,9 +419,6 @@ pub(crate) fn validate_trace_entry(entry: &TraceEntry) -> Result<(), ProtocolErr
             expected: TRACE_FORMAT_VERSION,
         });
     }
-    entry
-        .validate_shape()
-        .map_err(|error| ProtocolError::Deserialization(error.to_string()))?;
     let encoded =
         borsh::to_vec(entry).map_err(|error| ProtocolError::Serialization(error.to_string()))?;
     ensure_encoded("trace entry", encoded.len(), MAX_TRACE_ENTRY_BYTES).map_err(
@@ -445,26 +430,32 @@ pub(crate) fn validate_trace_entry(entry: &TraceEntry) -> Result<(), ProtocolErr
         },
     )?;
     match &entry.event {
-        Event::SessionStarted { .. } => {}
-        Event::MessageReceived { pre_state, msg, .. } => {
-            if *pre_state != entry.pre_state {
-                return Err(ProtocolError::AgreedPreStateMismatch {
-                    expected: entry.pre_state,
-                    actual: *pre_state,
-                });
-            }
+        StepEvent::SessionStarted { .. } => {}
+        StepEvent::Message { data, .. } => {
             ensure_payload(
                 "message payload",
-                msg.len(),
+                data.len(),
                 super::MAX_EFFECT_PAYLOAD_BYTES,
             )?;
         }
-        _ => return Err(ProtocolError::InvalidCertificate("non-agreed event".into())),
     }
-    if let Some(effect) = &entry.terminal {
-        validate_effect(effect)?;
+    if let Some(terminal) = &entry.terminal {
+        validate_terminal(terminal)?;
     }
     Ok(())
+}
+
+fn validate_terminal(terminal: &StepTerminal) -> Result<(), ProtocolError> {
+    match terminal {
+        StepTerminal::End { outcome } => ensure_payload(
+            "terminal outcome",
+            outcome.len(),
+            MAX_TERMINAL_OUTCOME_BYTES,
+        ),
+        StepTerminal::Abort { reason } | StepTerminal::Fail { reason } => {
+            ensure_payload("terminal reason", reason.len(), MAX_TERMINAL_REASON_BYTES)
+        }
+    }
 }
 
 pub(crate) fn validate_shared_entry(
@@ -480,7 +471,7 @@ pub(crate) fn validate_shared_entry(
         });
     }
     match &entry.event {
-        Event::SessionStarted { ensemble } => {
+        StepEvent::SessionStarted { ensemble } => {
             if expected_step != 0 {
                 return Err(ProtocolError::SessionStartPosition);
             }
@@ -496,83 +487,68 @@ pub(crate) fn validate_shared_entry(
                 return Err(ProtocolError::SessionStartMismatch);
             }
         }
-        Event::MessageReceived {
-            message_id,
-            from,
-            position,
-            pre_state,
-            msg,
-        } => {
+        StepEvent::Message { from, .. } => {
             if expected_step == 0 {
                 return Err(ProtocolError::MissingSessionStart);
             }
             binding.participant_key(from)?;
-            if *position != expected_step {
-                return Err(ProtocolError::StepCoordinateMismatch {
-                    expected: expected_step,
-                    actual: *position,
-                });
-            }
-            if *message_id
-                != MessageId::derive(
-                    binding.session_id(),
-                    *from,
-                    *position,
-                    *pre_state,
-                    entry.post_state,
-                    msg,
-                )
-            {
-                return Err(ProtocolError::InvalidCertificate(
-                    "message id does not match its authenticated envelope".into(),
-                ));
-            }
         }
-        _ => return Err(ProtocolError::InvalidCertificate("non-agreed event".into())),
     }
     Ok(())
 }
 
-pub(crate) fn validate_effects(effects: &[(u32, Effect)]) -> Result<(), ProtocolError> {
-    if effects.len() > MAX_EFFECTS {
-        return Err(ProtocolError::CollectionTooLarge {
-            kind: "effects",
-            actual: effects.len(),
-            max: MAX_EFFECTS,
-        });
+/// Check every protocol limit one dispatch's effects must satisfy: the count
+/// bound, each effect's payload bounds, and the exact canonical `Vec<Effect>`
+/// encoding bound, including the vector's length prefix.
+///
+/// The sandbox calls this at emission and recovery validation calls it on
+/// stored proposals, so the two boundaries cannot drift.
+pub fn check_effect_budget<'a>(
+    effects: impl IntoIterator<Item = &'a Effect>,
+) -> Result<(), ProtocolError> {
+    let mut total = std::mem::size_of::<u32>();
+    let mut count = 0usize;
+    for effect in effects {
+        count += 1;
+        if count > MAX_EFFECTS {
+            return Err(ProtocolError::CollectionTooLarge {
+                kind: "effects",
+                actual: count,
+                max: MAX_EFFECTS,
+            });
+        }
+        validate_effect_payload(effect)?;
+        let len = borsh::object_length(effect)
+            .map_err(|error| ProtocolError::Serialization(error.to_string()))?;
+        total = total
+            .checked_add(len)
+            .ok_or(ProtocolError::EncodedTooLarge {
+                kind: "effects",
+                actual: usize::MAX,
+                max: arena0_program::MAX_EFFECT_BYTES as usize,
+            })?;
     }
-    let mut broadcasts = 0;
-    for (ordinal, effect) in effects {
+    ensure_encoded("effects", total, arena0_program::MAX_EFFECT_BYTES as usize)
+}
+
+pub(crate) fn validate_effects(effects: &[(u32, Effect)]) -> Result<(), ProtocolError> {
+    for (ordinal, _) in effects {
         if *ordinal as usize >= MAX_EFFECTS {
             return Err(ProtocolError::InvalidCertificate(
                 "effect ordinal is outside the dispatch range".into(),
             ));
         }
-        validate_effect(effect)?;
-        if matches!(effect, Effect::Broadcast { .. }) {
-            broadcasts += 1;
-        }
-    }
-    if broadcasts > 1 {
-        return Err(ProtocolError::MultipleBroadcasts);
     }
     if effects.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
         return Err(ProtocolError::InvalidCertificate(
             "effect ordinals are not strictly increasing".into(),
         ));
     }
-    let values = effects.iter().map(|(_, effect)| effect).collect::<Vec<_>>();
-    let encoded =
-        borsh::to_vec(&values).map_err(|error| ProtocolError::Serialization(error.to_string()))?;
-    ensure_encoded(
-        "effects",
-        encoded.len(),
-        arena0_program::MAX_EFFECT_BYTES as usize,
-    )?;
-    Ok(())
+    check_effect_budget(effects.iter().map(|(_, effect)| effect))
 }
 
-fn validate_effect(effect: &Effect) -> Result<(), ProtocolError> {
+/// Check one effect's payload against its protocol bound.
+pub fn validate_effect_payload(effect: &Effect) -> Result<(), ProtocolError> {
     match effect {
         Effect::SessionEnd { outcome } => ensure_payload(
             "terminal outcome",

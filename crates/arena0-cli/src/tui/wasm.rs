@@ -369,7 +369,7 @@ fn public_detail(state: &ScreenState, step: u64, representative: &TraceEntry) ->
                 hosts.len()
             )
         }
-        TraceEvent::MessageReceived { from, msg, .. } => {
+        TraceEvent::Message { from, data } => {
             if status == "different" {
                 format!(
                     "public observations differ  observed {observed}/{}",
@@ -379,12 +379,11 @@ fn public_detail(state: &ScreenState, step: u64, representative: &TraceEntry) ->
                 format!(
                     "message from {}  {} B  observed {observed}/{}  {status}",
                     from.fmt_short(),
-                    msg.len(),
+                    data.len(),
                     hosts.len()
                 )
             }
         }
-        _ => "non-public event".to_owned(),
     }
 }
 
@@ -422,7 +421,6 @@ pub(super) fn event_name(kind: EventKind) -> &'static str {
         EventKind::MessageReceived => "message received",
         EventKind::InputReceived => "input received",
         EventKind::TimerFired => "timer fired",
-        EventKind::React => "react",
     }
 }
 

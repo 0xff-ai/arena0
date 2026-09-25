@@ -123,8 +123,8 @@ impl<'de> Deserialize<'de> for ReceiptBody {
     }
 }
 
-const RECEIPT_BODY_VERSION: u8 = 4;
-const RECEIPT_VERSION: u8 = 4;
+const RECEIPT_BODY_VERSION: u8 = 5;
+const RECEIPT_VERSION: u8 = 5;
 
 impl ReceiptBody {
     /// Assemble a receipt body from its portable proof fields.
@@ -279,7 +279,7 @@ impl ReceiptId {
             borsh::to_vec(body).map_err(|error| ProtocolError::Serialization(error.to_string()))?;
         ensure_payload("receipt body", bytes.len(), MAX_RECEIPT_BYTES)?;
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"arena0/receipt/v4");
+        hasher.update(b"arena0/receipt/v5");
         hasher.update(&[RECEIPT_VERSION]);
         hasher.update(&bytes);
         Ok(Self(*hasher.finalize().as_bytes()))

@@ -89,12 +89,24 @@ impl InitializeCall {
     }
 }
 
+/// Whether a dispatch event is an agreed event or a local event.
+///
+/// The distinction drives the sandbox's emission rules: only agreed events may
+/// emit a lifecycle effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DispatchKind {
+    Agreed,
+    Local,
+}
+
 /// Decoded inputs for one resident dispatch: the ABI envelope, optional replay
-/// evidence, the lifecycle the guest sees, and the per-dispatch signer.
+/// evidence, the dispatch kind the guest sees, the committed outgoing length,
+/// and the per-dispatch signer.
 type DispatchParts = (
     DispatchInput,
     Option<RandomReplay>,
-    arena0_protocol::Lifecycle,
+    DispatchKind,
+    usize,
     Option<Arc<dyn GuestSigner>>,
 );
 
@@ -105,6 +117,7 @@ pub struct DispatchCall {
     pub(crate) session: Ensemble<Committed>,
     pub(crate) event: Event<Vec<u8>>,
     pub(crate) random_replay: Option<RandomReplay>,
+    pub(crate) outgoing_len: usize,
     pub(crate) signer: Option<Arc<dyn GuestSigner>>,
 }
 
@@ -131,8 +144,19 @@ impl DispatchCall {
             session,
             event,
             random_replay: None,
+            outgoing_len: 0,
             signer: None,
         }
+    }
+
+    /// Supply the number of messages already committed to the outgoing queue.
+    ///
+    /// The broadcast import adds the broadcasts queued in this dispatch and
+    /// rejects the call once the total reaches the queue bound.
+    #[must_use]
+    pub fn with_outgoing_len(mut self, outgoing_len: usize) -> Self {
+        self.outgoing_len = outgoing_len;
+        self
     }
 
     /// Install the signer exposed to this dispatch's synchronous `sign` calls.
@@ -158,18 +182,18 @@ impl DispatchCall {
             session,
             event,
             random_replay,
+            outgoing_len,
             signer,
         } = self;
         let session_bytes = serialize(&session)?;
         let event_bytes = serialize(&event)?;
         let input = DispatchInput::try_new(peer_id.0, session_bytes, event_bytes)
             .map_err(|error| crate::SandboxError::input_limit(error.to_string()))?;
-        let lifecycle = if matches!(event, Event::SessionStarted { .. }) {
-            arena0_protocol::Lifecycle::PreSession
-        } else {
-            arena0_protocol::Lifecycle::Active
+        let dispatch = match event {
+            Event::SessionStarted { .. } | Event::MessageReceived { .. } => DispatchKind::Agreed,
+            Event::InputReceived { .. } | Event::TimerFired { .. } => DispatchKind::Local,
         };
-        Ok((input, random_replay, lifecycle, signer))
+        Ok((input, random_replay, dispatch, outgoing_len, signer))
     }
 }
 

@@ -35,11 +35,13 @@ the values. The shared state records accepted choices. `writer` selects the
 participant allowed to act next; `on_message` rejects a choice from anyone else.
 
 The SDK uses an actor-oriented model. Every session source produces one flat
-`Event`, and every mutating callback receives one `Context` over the
-participant's shared and local state. A callback may mutate either state or both
-and may emit any existing `Effect`. If a dispatch changes shared state or emits
-a lifecycle effect, the Host applies the agreement rules for that result.
-Queries and views project information without changing state.
+`Event`. Agreed handlers (`on_session_started`, `on_message`) receive a mutable
+`Context` over the participant's shared and local state and return a transition;
+they may emit any `Effect`, including a lifecycle effect. Local handlers
+(`on_input`, `on_timer`) receive a `LocalContext` whose shared state is
+read-only and return nothing; they may update local state and queue messages.
+The Host applies the agreement rules for an agreed dispatch. Queries and views
+project information without changing state.
 
 ## State, messages, and inputs
 
@@ -60,14 +62,15 @@ and an open callout does not prevent other events from dispatching.
 
 An answer names the exact open `PendingId` and enters the program as an
 `InputReceived` event. The Host validates the answer against the callout's
-output schema, then the guest decodes it fallibly. `on_input` returns a plain
-`anyhow::Result<ProgramTransition<Self>>`; an error rejects the answer without
-persisting state, keeps the same callout open, and returns the bounded reason as
-`InputRejected`. A valid handler can update local or shared state and emit the
-effects for that dispatch. If the result changes shared state for the other
-participants, emit a program message that they apply as `MessageReceived`; the
-receiver validates the message against its own state before signing the
-advertised shared result.
+output schema, then the guest decodes it fallibly. `on_input` receives a
+`LocalContext` and returns a plain `anyhow::Result<()>`; an error rejects the
+answer without persisting state, keeps the same callout open, and returns the
+bounded reason as `InputRejected`. A local handler may update local state and
+emit effects, but it cannot change agreed shared state. When it owes the next
+shared action, it queues a program message; the author then applies its own
+message through the same `on_message` dispatch every receiver runs, and the
+receiver validates it against its own state before signing the advertised
+shared result.
 
 ## Handler lifecycle
 
@@ -77,10 +80,9 @@ The minimal program demonstrates the full path:
 | --- | --- |
 | `writer` | Select who may author the next shared action. |
 | `on_session_started` | Initialize the active session through the same dispatch context. |
-| `on_react` | Handle a `React` event and perform program work; any resulting callout is derived from state. |
-| `on_input` | Validate the answer, mutate either state, and emit any effects; return an error to reject it. |
+| `on_input` | Validate the answer in a read-only-shared local context, update local state, and queue any message; return an error to reject it. |
 | `on_message` | Accept or reject the message and mutate either state. |
-| `on_timer` | Handle one typed `TimerFired` event using the same context and effect rules. |
+| `on_timer` | Handle one typed `TimerFired` event in a read-only-shared local context. |
 | `callout` | Derive the current open callout from a read-only state image. |
 | `outcome` | Derive the terminal result from shared state. |
 | `view` | Render the current program state without changing it. |
@@ -90,11 +92,11 @@ transition. `SessionStarted` and `MessageReceived` provide the portable public
 agreement path; the protocol certifies the shared execution and terminal
 evidence. The program defines the outcome; it does not assemble its own receipt.
 
-Guest signing is synchronous. In `InputReceived`, `TimerFired`, and `React`
-handlers, `ctx.sign(scheme, payload)` returns a `Signed` value containing the
-exact signed bytes and signature. The call is unavailable during
-`SessionStarted`, `MessageReceived`, and read-only projections. Declaring the
-`Sign` capability is still required before a handler can use it.
+Guest signing is synchronous. In `InputReceived` and `TimerFired` handlers,
+`ctx.sign(scheme, payload)` returns a `Signed` value containing the exact signed
+bytes and signature. The call is unavailable during `SessionStarted`,
+`MessageReceived`, and read-only projections. Declaring the `Sign` capability is
+still required before a handler can use it.
 
 ## Interfaces and encoding
 

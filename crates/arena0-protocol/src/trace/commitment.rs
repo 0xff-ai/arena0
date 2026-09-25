@@ -12,7 +12,7 @@ use crate::{SessionHash, StateHash};
 use super::entry::TraceEntry;
 
 /// Domain separation tag for the shared per-entry commitment participants sign.
-pub const STEP_COMMIT_DOMAIN: [u8; 24] = *b"arena0/step-commit/v3\0\0\0";
+pub const STEP_COMMIT_DOMAIN: [u8; 24] = *b"arena0/step-commit/v4\0\0\0";
 
 /// The chain link at the start of the public section: position 0 links to
 /// zeros. The activation boundary attestation is decoupled from trace positions,
@@ -349,12 +349,9 @@ mod tests {
         TraceEntry {
             trace_version: crate::TRACE_FORMAT_VERSION,
             step,
-            event: crate::Event::MessageReceived {
-                message_id: crate::MessageId([step as u8; 32]),
+            event: crate::StepEvent::Message {
                 from: crate::PeerId([1; 32]),
-                position: step,
-                pre_state: pre,
-                msg: Vec::new(),
+                data: Vec::new(),
             },
             pre_state: pre,
             post_state: post,

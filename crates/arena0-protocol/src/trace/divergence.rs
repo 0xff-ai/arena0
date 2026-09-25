@@ -317,7 +317,7 @@ impl JsonDiffExt for Value {
 mod tests {
     use super::*;
     use crate::trace::AggregateAttestation;
-    use crate::{Effect, Event, StateHash};
+    use crate::{StateHash, StepEvent, StepTerminal};
 
     fn hash(byte: u8) -> StateHash {
         StateHash([byte; 32])
@@ -327,12 +327,9 @@ mod tests {
         TraceEntry {
             trace_version: TRACE_FORMAT_VERSION,
             step,
-            event: Event::MessageReceived {
-                message_id: crate::MessageId([step as u8; 32]),
+            event: StepEvent::Message {
                 from: crate::PeerId([1; 32]),
-                position: step,
-                pre_state: pre,
-                msg: Vec::new(),
+                data: Vec::new(),
             },
             pre_state: pre,
             post_state: post,
@@ -360,7 +357,7 @@ mod tests {
     fn compare_traces_reports_effect_mismatch() {
         let left = vec![entry(0, hash(0), hash(1))];
         let mut right = left.clone();
-        right[0].terminal = Some(Effect::SessionEnd { outcome: vec![] });
+        right[0].terminal = Some(StepTerminal::End { outcome: vec![] });
         let err = TraceEntry::compare_traces(&left, &right).unwrap_err();
         assert_eq!(err.kind, DivergenceKind::EffectMismatch);
     }
@@ -368,16 +365,16 @@ mod tests {
     #[test]
     fn compare_step_reports_terminal_mismatch() {
         let mut left = entry(0, hash(0), hash(1));
-        left.terminal = Some(Effect::Fail {
+        left.terminal = Some(StepTerminal::Fail {
             reason: "boom".into(),
         });
         let mut right = left.clone();
-        right.terminal = Some(Effect::SessionAbort {
+        right.terminal = Some(StepTerminal::Abort {
             reason: "retry".into(),
         });
         let err = TraceEntry::compare_step(&left, &right).unwrap_err();
         assert_eq!(err.kind, DivergenceKind::EffectMismatch);
-        assert_eq!(err.field_path, "terminal.Fail");
+        assert_eq!(err.field_path, "terminal.Abort");
     }
     #[test]
     fn json_difference_paths_are_deterministic() {

@@ -154,9 +154,20 @@ pub enum ProtocolError {
     /// The execution already has terminal lifecycle.
     #[error("execution is terminal")]
     AlreadyTerminal,
-    /// One dispatch attempted to emit more than one broadcast.
-    #[error("one event dispatch contains multiple broadcasts")]
-    MultipleBroadcasts,
+    /// A local event's dispatch changed the agreed shared state.
+    #[error("a local event may not change the agreed shared state")]
+    LocalSharedChange,
+    /// The durable outgoing queue has reached its bound.
+    #[error("outgoing message queue has {actual} entries; maximum is {max}")]
+    OutgoingQueueFull {
+        /// Actual queued message count.
+        actual: usize,
+        /// Maximum queued message count.
+        max: usize,
+    },
+    /// An authored message is not the head of the durable outgoing queue.
+    #[error("authored message is not the head of the outgoing queue")]
+    NotQueuedMessage,
     /// A timer firing did not match an active timer identity.
     #[error("timer firing does not match an active timer")]
     StaleTimerFiring,

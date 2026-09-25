@@ -60,7 +60,11 @@ pub struct Shared {
 
 #[arena0::local]
 #[derive(Default)]
-pub struct Local {}
+pub struct Local {
+    /// Set while this participant's choice is queued but not yet applied, so
+    /// the callout does not re-ask the answered question.
+    choice_pending: bool,
+}
 
 #[arena0::program(
     name = "minimal-choice",
@@ -136,8 +140,8 @@ pub mod minimal_choice {
         Ok(Transition::To(Phase::Choosing))
     }
 
-    fn callout(ctx: &Context<Shared, Local>) -> Option<Callout> {
-        (writer(ctx.shared()) == Some(ctx.me())).then(|| {
+    fn callout(ctx: &CalloutContext<'_, Shared, Local>) -> Option<Callout> {
+        (!ctx.local().choice_pending && writer(ctx.shared()) == Some(ctx.me())).then(|| {
             let previous = ctx.shared().choices.iter().flatten().next().copied();
             callouts::Choose { previous }.into()
         })
@@ -153,21 +157,18 @@ pub mod minimal_choice {
         }
         let Message::Choice(choice) = message;
         let transition = apply_choice(ctx.shared_mut(), from, choice);
+        ctx.mutate_local(|local| local.choice_pending = false);
         Ok(ApplyDecision::Accept(transition))
     }
 
-    fn on_input(
-        ctx: &mut Context<Shared, Local>,
-        input: Input,
-    ) -> arena0::anyhow::Result<ProgramTransition<MinimalChoice>> {
-        let from = ctx.me();
-        if writer(ctx.shared()) != Some(from) {
+    fn on_input(ctx: &mut LocalContext<Shared, Local>, input: Input) -> arena0::anyhow::Result<()> {
+        if writer(ctx.shared()) != Some(ctx.me()) {
             return Err(anyhow!("this participant does not own the next choice"));
         }
         let Input::Choose(choice) = input;
-        let transition = apply_choice(ctx.shared_mut(), from, choice);
-        ctx.effects().broadcast(&Message::Choice(choice));
-        Ok(transition)
+        ctx.mutate_local(|local| local.choice_pending = true);
+        ctx.effects().broadcast(&Message::Choice(choice))?;
+        Ok(())
     }
 
     fn on_query(_shared: &Shared, _: ()) {}

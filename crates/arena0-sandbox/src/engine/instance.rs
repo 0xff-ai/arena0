@@ -4,8 +4,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::call::DispatchKind;
 use arena0_program::ExecutionProfile;
-use arena0_protocol::Lifecycle;
 use wasmtime::{Linker, Module, Store};
 
 use super::imports::{register_always_available, register_metadata_imports};
@@ -131,7 +131,7 @@ impl super::WasmtimeEngine {
                 schema: &program.definition().schema,
                 profile: &self.profile,
                 call_kind: CallKind::Metadata,
-                lifecycle: Lifecycle::PreSession,
+                dispatch: DispatchKind::Local,
                 random_replay: None,
             },
         )?;
@@ -182,7 +182,7 @@ impl super::WasmtimeEngine {
             HostState::new(
                 self.profile.clone(),
                 CallKind::Metadata,
-                Lifecycle::PreSession,
+                DispatchKind::Local,
                 None,
                 Vec::new(),
             ),

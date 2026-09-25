@@ -103,7 +103,7 @@ fn render_records(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, focuse
                 )
             } else {
                 (
-                    trace_event_label(&entry.entry),
+                    trace_event_label(&entry.entry, state.session_id()),
                     format!(
                         "{} -> {}",
                         entry.entry.pre_state.fmt_short(),
@@ -221,7 +221,7 @@ fn render_inspector(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, focu
             lines.push(Line::styled(
                 format!(
                     "{host}  {}  state {} -> {}",
-                    trace_event_label(&entry.entry),
+                    trace_event_label(&entry.entry, state.session_id()),
                     entry.entry.pre_state.fmt_short(),
                     entry.entry.post_state.fmt_short()
                 ),
@@ -261,32 +261,31 @@ fn render_inspector(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, focu
     );
 }
 
-fn trace_event_label(entry: &TraceEntry) -> String {
+pub(super) fn trace_event_label(entry: &TraceEntry, session_id: Option<SessionHash>) -> String {
     match &entry.event {
         TraceEvent::SessionStarted { ensemble } => {
             format!("session started  {} participants", ensemble.len())
         }
-        TraceEvent::MessageReceived {
-            message_id,
-            from,
-            msg,
-            ..
-        } => format!(
-            "message {} from {}  {} B",
-            message_id.fmt_short(),
-            from.fmt_short(),
-            msg.len()
-        ),
-        _ => "non-public event".to_owned(),
+        TraceEvent::Message { from, data } => {
+            // The message identity is derived from the entry, never stored.
+            match session_id.and_then(|session| entry.message_id(session)) {
+                Some(id) => format!(
+                    "message {} from {}  {} B",
+                    id.fmt_short(),
+                    from.fmt_short(),
+                    data.len()
+                ),
+                None => format!("message from {}  {} B", from.fmt_short(), data.len()),
+            }
+        }
     }
 }
 
 fn trace_effect_labels(entry: &TraceEntry) -> String {
     match entry.terminal.as_ref() {
         None => "none".to_owned(),
-        Some(TraceEffect::SessionEnd { .. }) => "session end".to_owned(),
-        Some(TraceEffect::SessionAbort { .. }) => "session abort".to_owned(),
+        Some(TraceEffect::End { .. }) => "session end".to_owned(),
+        Some(TraceEffect::Abort { .. }) => "session abort".to_owned(),
         Some(TraceEffect::Fail { .. }) => "fail".to_owned(),
-        Some(_) => "terminal".to_owned(),
     }
 }

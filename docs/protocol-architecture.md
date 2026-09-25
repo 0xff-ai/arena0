@@ -438,8 +438,12 @@ and applies them when the step is certified. A rejection or trap discards the
 queue with the candidate state.
 
 - `Broadcast` is available to every event. It appends the message to this
-  participant's durable outgoing queue, which is bounded. When the queue is
-  full, the host call returns an error to the program and queues nothing.
+  participant's durable outgoing queue, which is bounded. The queue is local,
+  so an agreed handler never observes it: in `SessionStarted` and
+  `MessageReceived` the call always succeeds, and if the agreed step would
+  overflow the queue the Host fails the session with a Host-signed `Fail`
+  instead of signing. In a local handler a full queue returns an error to the
+  program and queues nothing.
 - `SetTimer` is available to every event, but not in the same dispatch as a
   lifecycle effect.
 - `SessionEnd`, `SessionAbort`, and `Fail` are available only to agreed
@@ -451,7 +455,7 @@ When no proposal is staged and the `writer` projection over the agreed shared
 state selects this participant, the actor takes the oldest queued message and
 applies it through its own `MessageReceived` dispatch, exactly as every other
 participant will. If the result is accepted, the actor stages the proposal and
-sends the message with its pre-state and post-state hashes. If its own program
+sends the message frame carrying its complete `StepCommitment`. If its own program
 rejects the message, the actor removes it from the queue and records a local
 error; the message never reaches a peer. A local handler that wants to end the
 session queues a message whose agreed handler ends it.
@@ -493,18 +497,21 @@ failures restore both state memories and persist no effects.
 Shared-state steps exchange `arena0_protocol::ExecFrame` values;
 `arena0-transport` converts them to the bounded raw values owned by
 `arena0-wire` for canonical framing and delivery. A message frame carries the
-message position and the author's pre/post shared hashes. The author applies
+message data and the author's complete `StepCommitment` for it. The author applies
 its own message through the same dispatch as every receiver. A step is accepted
 only when all selected participants sign the same `StepCommitment`.
 
-`TraceEntry` format v2 is the portable public trace. Each entry records its
-step, the agreed `SessionStarted` or `MessageReceived` event, pre/post shared
-state hashes, an optional terminal effect, and one aggregate agreement with a
-signer bitmap. Participant-specific events, local state, ordinary effects,
-fuel, and entropy observations remain in the Host's local store. The entry hash
-normalizes the aggregate out of its signed content; `StepCommitment` uses the
-v3 step-commit domain and binds that entry hash, both shared hashes, and the
-chain link.
+`TraceEntry` format v3 is the portable public trace. Each entry records its
+step, the agreed `StepEvent` (`SessionStarted` or a message from one
+authenticated author), pre/post shared state hashes, an optional `StepTerminal`
+(`End`, `Abort`, or `Fail`), and one aggregate agreement with a signer bitmap.
+The guest-facing dispatch event carries no trace coordinates, so the author and
+every receiver build the same entry from the agreed cursor and the message
+payload; a message's content identity is derived from the entry on demand.
+Participant-specific events, local state, ordinary effects, fuel, and entropy
+observations remain in the Host's local store. The entry hash normalizes the
+aggregate out of its signed content; `StepCommitment` uses the v4 step-commit
+domain and binds that entry hash, both shared hashes, and the chain link.
 
 A guest dispatch returns its state images, effects, and derived callout
 atomically to the actor; these values cannot be queried later as mutable "last
@@ -515,11 +522,12 @@ proposed result uncommitted, and the actor restores the resident instance from
 the last committed images.
 
 An authenticated writer message that the receiving program rejects, traps, or
-cannot reproduce at its advertised post-state is a divergence. The participant
+cannot reproduce as the author's exact `StepCommitment` is a divergence; the
+receiver compares commitments before it signs. The participant
 that detects it records a Host-signed `Fail` occurrence at the agreed cursor;
 its peers receive that occurrence as an `Abort` frame. Invalid frames—wrong
-writer, wrong pre-state, stale position, or mismatched message identity—are
-dropped rather than treated as divergence. The guest ends or aborts a session
+writer, wrong pre-state, or stale position—are dropped rather than treated as
+divergence. The guest ends or aborts a session
 with `Effect::SessionEnd`/`SessionAbort`; a unilateral occurrence travels as
 `ExecFrame::Abort`.
 
@@ -651,9 +659,9 @@ only after the durable delivery fact is present.
 
 ## 11. Receipts and verification
 
-`ReceiptId` is BLAKE3 over the domain `arena0/receipt/v4`, the receipt version
-4, and the exact versioned Borsh artifact bytes. It is independent of which
-Host exports those bytes. The Borsh artifact and body versions are 4. JSON uses
+`ReceiptId` is BLAKE3 over the domain `arena0/receipt/v5`, the receipt version
+5, and the exact versioned Borsh artifact bytes. It is independent of which
+Host exports those bytes. The Borsh artifact and body versions are 5. JSON uses
 the tagged shape
 `{"kind":"receipt"|"stop_report","body":...}`; decoding rejects a kind that
 disagrees with the authenticated terminal evidence. `ProofId` and producer-bound
@@ -672,16 +680,16 @@ never picks an arbitrary imported report. Each Host keeps its own database and
 proof evidence even when the canonical artifact is identical across Hosts.
 
 Portable/light verification is the only receipt verification boundary. It
-checks the activation binding, ordered v2 trace chain, full participant
-agreements, terminal evidence, and derived v4 receipt identity without loading
+checks the activation binding, ordered v3 trace chain, full participant
+agreements, terminal evidence, and derived v5 receipt identity without loading
 the program. Completion evidence is a final trace entry whose certified
-terminal effect is `SessionEnd` and whose outcome bytes equal the receipt's
-outcome. A completed result includes authenticated opaque `outcome_borsh`
+terminal value is `StepTerminal::End` and whose outcome bytes equal the
+receipt's outcome. A completed result includes authenticated opaque `outcome_borsh`
 bytes. A stopped result includes the exact `StopCause`, preserving the
 distinction between an authenticated unilateral report and a shared N-of-N
 stop. Verification does not execute Wasm and stops at these checks.
 
-This release uses store schema version 4 and rejects earlier databases with an
+This release uses store schema version 5 and rejects earlier databases with an
 unsupported-schema error. It does not rewrite or delete old evidence. Version-1
 producer-sealed receipts are also rejected; they must be inspected with the
 matching older release. Automatic migration is not provided.

@@ -8,9 +8,9 @@
 use arena0_crypto::{BlsSignature, NodeKeys, SecretKey};
 use arena0_program::ProgramHash;
 use arena0_protocol::{
-    AbortKind, AbortOccurrence, Activation, AggregateAttestation, Effect, Ensemble, Event,
-    MessageId, NegotiationId, PeerIdSource, ReceiptArtifact, ReceiptBody, ReceiptTermination,
-    SessionHash, SessionHeader, SignerSet, StateHash, StepCommitment, StepCursor, TraceEntry,
+    AbortKind, AbortOccurrence, Activation, AggregateAttestation, Ensemble, NegotiationId,
+    PeerIdSource, ReceiptArtifact, ReceiptBody, ReceiptTermination, SessionHash, SessionHeader,
+    SignerSet, StateHash, StepCommitment, StepCursor, StepEvent, StepTerminal, TraceEntry,
 };
 
 use crate::fixtures::activation_for;
@@ -104,8 +104,8 @@ impl Synthetic {
     pub fn signed_entry(
         &self,
         step: u64,
-        event: Event<Vec<u8>>,
-        terminal: Option<Effect>,
+        event: StepEvent,
+        terminal: Option<StepTerminal>,
         link: [u8; 32],
         signers: &[usize],
     ) -> (TraceEntry, StepCommitment) {
@@ -126,7 +126,7 @@ impl Synthetic {
     pub fn started_entry(&self, signers: &[usize]) -> (TraceEntry, StepCommitment) {
         self.signed_entry(
             0,
-            Event::SessionStarted {
+            StepEvent::SessionStarted {
                 ensemble: self.ensemble(),
             },
             None,
@@ -135,23 +135,11 @@ impl Synthetic {
         )
     }
 
-    /// A `MessageReceived` event with a self-consistent content address.
-    pub fn message_event(&self, step: u64, from_idx: usize, data: Vec<u8>) -> Event<Vec<u8>> {
-        let from = self.peer(from_idx);
-        let message_id = MessageId::derive(
-            self.session_hash,
-            from,
-            step,
-            self.initial,
-            self.initial,
-            &data,
-        );
-        Event::MessageReceived {
-            message_id,
-            position: step,
-            pre_state: self.initial,
-            from,
-            msg: data,
+    /// A message step event for one author and payload.
+    pub fn message_event(&self, _step: u64, from_idx: usize, data: Vec<u8>) -> StepEvent {
+        StepEvent::Message {
+            from: self.peer(from_idx),
+            data,
         }
     }
 

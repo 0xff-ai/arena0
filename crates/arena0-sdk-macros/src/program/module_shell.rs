@@ -282,15 +282,6 @@ fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
             }
         });
     }
-    if module_has_fn(items, "on_react") {
-        methods.push(quote! {
-            fn on_react(
-                ctx: &mut ::arena0::Context<Self::Shared, Self::Local>,
-            ) -> Result<::arena0::ProgramTransition<Self>, ::arena0::ProgramFault> {
-                self::on_react(ctx)
-            }
-        });
-    }
     if module_has_fn(items, "writer") {
         methods.push(quote! {
             fn writer(shared: &Self::Shared) -> ::core::option::Option<::arena0::Participant> {
@@ -318,9 +309,9 @@ fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
     if module_has_fn(items, "on_input") {
         methods.push(quote! {
             fn on_input(
-                ctx: &mut ::arena0::Context<Self::Shared, Self::Local>,
+                ctx: &mut ::arena0::LocalContext<Self::Shared, Self::Local>,
                 input: Self::Input,
-            ) -> ::arena0::anyhow::Result<::arena0::ProgramTransition<Self>> {
+            ) -> ::arena0::anyhow::Result<()> {
                 self::on_input(ctx, input)
             }
         });
@@ -328,7 +319,7 @@ fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
     if module_has_fn(items, "callout") {
         methods.push(quote! {
             fn callout(
-                ctx: &::arena0::Context<Self::Shared, Self::Local>,
+                ctx: &::arena0::CalloutContext<'_, Self::Shared, Self::Local>,
             ) -> ::core::option::Option<Self::Callout> {
                 self::callout(ctx)
             }
@@ -337,9 +328,9 @@ fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
     if let Some(timer_ty) = module_typed_timer_arg(items) {
         methods.push(quote! {
             fn on_timer(
-                ctx: &mut ::arena0::Context<Self::Shared, Self::Local>,
+                ctx: &mut ::arena0::LocalContext<Self::Shared, Self::Local>,
                 timer: ::arena0::TimerPayload,
-            ) -> Result<::arena0::ProgramTransition<Self>, ::arena0::ProgramFault> {
+            ) -> Result<(), ::arena0::ProgramFault> {
                 let timer: #timer_ty = ::arena0::decode_timer_payload(timer)?;
                 self::on_timer(ctx, timer)
             }
@@ -347,9 +338,9 @@ fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
     } else if module_has_fn(items, "on_timer") {
         methods.push(quote! {
             fn on_timer(
-                ctx: &mut ::arena0::Context<Self::Shared, Self::Local>,
+                ctx: &mut ::arena0::LocalContext<Self::Shared, Self::Local>,
                 _timer: ::arena0::TimerPayload,
-            ) -> Result<::arena0::ProgramTransition<Self>, ::arena0::ProgramFault> {
+            ) -> Result<(), ::arena0::ProgramFault> {
                 self::on_timer(ctx)
             }
         });

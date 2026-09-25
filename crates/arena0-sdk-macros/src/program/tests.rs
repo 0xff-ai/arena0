@@ -284,7 +284,7 @@ fn infers_the_sign_scheme_of_a_literal_context_call() {
                 #[arena0::state(max = 256)]
                 pub struct Shared {{ round: u64 }}
 
-                fn on_react(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {{
+                fn on_input(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {{
                     let _ = ctx.sign(SignScheme::{scheme}, b"payload");
                     Ok(Transition::Stay)
                 }}
@@ -309,7 +309,7 @@ fn infers_both_sign_schemes_for_a_dynamic_scheme() {
             #[arena0::state(max = 256)]
             pub struct Shared { round: u64 }
 
-            fn on_react(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
+            fn on_input(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
                 let scheme = SignScheme::Bls;
                 let _ = ctx.sign(scheme, b"payload");
                 Ok(Transition::Stay)
@@ -337,7 +337,7 @@ fn ignores_sign_calls_on_non_context_receivers() {
                 fn sign(&self, _payload: &[u8]) {}
             }
 
-            fn on_react(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
+            fn on_input(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
                 let helper = Helper;
                 helper.sign(b"payload");
                 let _ = ctx;
@@ -359,7 +359,7 @@ fn infers_sign_through_a_context_alias() {
             #[arena0::state(max = 256)]
             pub struct Shared { round: u64 }
 
-            fn on_react(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
+            fn on_input(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
                 let signer = &*ctx;
                 let _ = signer.sign(SignScheme::Bls, b"payload");
                 Ok(Transition::Stay)
@@ -387,7 +387,7 @@ fn scopes_context_bindings_to_the_declaring_function() {
                 fn sign(&self, _scheme: SignScheme, _payload: &[u8]) {}
             }
 
-            fn on_react(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
+            fn on_input(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
                 let _ = ctx;
                 Ok(Transition::Stay)
             }
@@ -417,7 +417,7 @@ fn ignores_sign_calls_through_a_shadowing_local() {
                 fn sign(&self, _scheme: SignScheme, _payload: &[u8]) {}
             }
 
-            fn on_react(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
+            fn on_input(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
                 let ctx = Helper;
                 ctx.sign(SignScheme::Ed25519, b"payload");
                 Ok(Transition::Stay)
@@ -440,7 +440,7 @@ fn scopes_effect_bindings_to_the_declaring_function() {
 
             pub enum Message { Pong }
 
-            fn on_react(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
+            fn on_input(ctx: &mut Context) -> Result<Transition<Phase>, ProgramFault> {
                 let effects = ctx.effects();
                 let _ = effects;
                 Ok(Transition::Stay)

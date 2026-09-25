@@ -2,7 +2,8 @@ use std::fmt::Write;
 
 use arena0::prelude::*;
 use arena0_primitives::commit_reveal::{
-    self, CommitReveal, CommitRevealFieldExt, CommitRevealLocal, CommitRevealLocalState,
+    self, CommitReveal, CommitRevealAuthorExt, CommitRevealFieldExt, CommitRevealLocal,
+    CommitRevealLocalState,
 };
 
 #[arena0::data]
@@ -284,34 +285,7 @@ pub mod rock_paper_scissors {
         Ok(Transition::To(Phase::Playing))
     }
 
-    /// Local decision hook. Broadcasts the owed reveal once every commit is in,
-    /// The callout projection asks for any missing local move.
-    fn on_react(
-        ctx: &mut Context<Shared, Local>,
-    ) -> Result<ProgramTransition<RockPaperScissors>, ProgramFault> {
-        // Unique-writer rule: react only when this node is the participant
-        // whose action is next (first missing commit, then first missing
-        // reveal). An idle node never broadcasts into a position it cannot
-        // win, so no sibling candidates converge on one position.
-        if ctx.shared().commit_reveal.expected_writer() != Some(ctx.me()) {
-            return Ok(Transition::Stay);
-        }
-        if let Some(reveal) = ctx.commit_reveal().take_reveal() {
-            reveal.broadcast();
-            if ctx.shared().commit_reveal.is_complete() {
-                let finished = apply_completed_round(ctx.shared_mut());
-                return Ok(if finished {
-                    Transition::End
-                } else {
-                    Transition::Stay
-                });
-            }
-            return Ok(Transition::Stay);
-        }
-        Ok(Transition::Stay)
-    }
-
-    fn callout(ctx: &Context<Shared, Local>) -> Option<Callout> {
+    fn callout(ctx: &CalloutContext<'_, Shared, Local>) -> Option<Callout> {
         (ctx.shared().commit_reveal.expected_writer() == Some(ctx.me())
             && ctx
                 .shared()
@@ -320,16 +294,15 @@ pub mod rock_paper_scissors {
         .then(|| ctx.shared().choice_request(ctx.me().index()).into())
     }
 
-    fn on_input(
-        ctx: &mut Context<Shared, Local>,
-        input: Input,
-    ) -> arena0::anyhow::Result<ProgramTransition<RockPaperScissors>> {
+    fn on_input(ctx: &mut LocalContext<Shared, Local>, input: Input) -> arena0::anyhow::Result<()> {
         if ctx.shared().commit_reveal.expected_writer() != Some(ctx.me()) {
             return Err(anyhow!("this participant does not own the next choice"));
         }
         let Input::ChooseMove(choice) = input;
-        ctx.commit_reveal().commit(choice)?.broadcast();
-        Ok(Transition::Stay)
+        ctx.commit_reveal()
+            .commit(choice)?
+            .broadcast(&mut ctx.effects())?;
+        Ok(())
     }
 
     fn on_message(
@@ -348,6 +321,7 @@ pub mod rock_paper_scissors {
             return Ok(ApplyDecision::Reject);
         }
         if !ctx.shared().commit_reveal.is_complete() {
+            queue_reveal_if_due(ctx).map_err(ProtocolFault::shared_violation)?;
             return Ok(ApplyDecision::Accept(Transition::Stay));
         }
 
@@ -360,6 +334,18 @@ pub mod rock_paper_scissors {
         }
         // The reset state determines the next round's callout.
         Ok(ApplyDecision::Accept(Transition::Stay))
+    }
+
+    /// Queue the owed reveal once every commit is in, when this node owns the
+    /// next writer position.
+    fn queue_reveal_if_due(ctx: &mut Context<Shared, Local>) -> arena0::anyhow::Result<()> {
+        if ctx.shared().commit_reveal.expected_writer() != Some(ctx.me()) {
+            return Ok(());
+        }
+        if let Some(reveal) = ctx.commit_reveal().take_reveal() {
+            reveal.broadcast(&mut ctx.effects());
+        }
+        Ok(())
     }
 
     fn on_query(_shared: &Shared, _: ()) {}
@@ -396,7 +382,9 @@ pub mod rock_paper_scissors {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arena0::testing::{ALICE, BOB, DeliverySchedule, FaultStatus, Harness, Scenario};
+    use arena0::testing::{
+        ALICE, BOB, DeliverySchedule, FaultStatus, Harness, Scenario, TestHarness,
+    };
     use arena0::types::{ColorDepth, Slot};
     use arena0_primitives::commit_reveal;
 
@@ -421,24 +409,25 @@ mod tests {
         })
     }
 
-    /// Play one full round on a single native replica. The local input applies
-    /// its own commit before broadcasting; only the opponent's commit and reveal
-    /// are delivered back to this replica. `me` chooses `mine`; the opponent
-    /// chose `theirs`.
+    /// Play one full round on a single native replica. The local commit and
+    /// reveal are queued and then authored through `on_message`, exactly as the
+    /// runtime authors them; only the opponent's commit and reveal are delivered
+    /// from outside. `mine` is the local choice, `theirs` the opponent's.
     /// Returns the result of the reveal that completes the round.
-    fn play_round<H>(h: &mut H, mine: Choice, theirs: Choice) -> arena0::testing::HandlerResult
-    where
-        H: Harness<RockPaperScissors>,
-    {
-        // Local commit (answers the pending ChooseMove callout), broadcast.
+    fn play_round(
+        h: &mut TestHarness<RockPaperScissors>,
+        mine: Choice,
+        theirs: Choice,
+    ) -> arena0::testing::HandlerResult {
+        // Local commit (answers the pending ChooseMove callout), then authored.
         let fx = h.resolve_callout::<callouts::ChooseMove>(mine);
         assert_eq!(fx.messages::<Message>().len(), 1);
-        // The local commit is already applied; the opponent's commit makes the
-        // reveal due, which `on_react` applies locally and broadcasts.
+        h.author_queued(&fx.effects);
+        // The opponent's commit makes the local reveal due; author it.
         let fx = h.message(peer_a(), make_commit(theirs));
         assert_eq!(fx.messages::<Message>().len(), 1);
-        // The local reveal is already applied; the opponent's reveal completes
-        // the round.
+        h.author_queued(&fx.effects);
+        // The opponent's reveal completes the round.
         h.message(peer_a(), make_reveal(theirs))
     }
 
@@ -492,12 +481,12 @@ mod tests {
     }
 
     #[arena0::test(RockPaperScissors, ())]
-    fn reveal_is_broadcast_by_react_once_every_commit_is_applied(h: ()) {
+    fn reveal_is_broadcast_once_every_commit_is_applied(h: ()) {
         h.session_started(peer_a());
         // The local peer (slot 0) is the expected writer in the commit phase:
         // its callout is pending from session start. Answer it (stashes the
         // private value and broadcasts the local commit), then apply both
-        // commits in writer order; the final react broadcasts the reveal.
+        // commits in writer order; the expected writer then queues the reveal.
         let fx = h.resolve_callout::<callouts::ChooseMove>(Choice::Rock);
         let msgs = fx.messages::<Message>();
         assert_eq!(msgs.len(), 1);
@@ -505,9 +494,11 @@ mod tests {
             msgs[0],
             Message::CommitReveal(commit_reveal::Message::Commit(_))
         ));
+        // The author applies its own commit through `on_message`.
+        h.author_queued(&fx.effects);
 
-        // The local commit is applied by the input handler; peer_a's commit
-        // completes the commit phase and react broadcasts the owed reveal.
+        // peer_a's commit completes the commit phase and the owed reveal is
+        // queued for the author.
         let fx = h.message(peer_a(), make_commit(Choice::Scissors));
         let reveals = fx.messages::<Message>();
         assert_eq!(reveals.len(), 1, "reveals: {reveals:?}");
@@ -578,6 +569,7 @@ mod tests {
         // the view renders sealed hands.
         let fx = h.resolve_callout::<callouts::ChooseMove>(Choice::Rock);
         assert_eq!(fx.messages::<Message>().len(), 1);
+        h.author_queued(&fx.effects);
         h.message(peer_a(), make_commit(Choice::Scissors));
 
         let view = h.view(Viewport {

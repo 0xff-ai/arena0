@@ -63,11 +63,12 @@ does not make a message a valid action.
 
 An agreed public transition applies one `Event` through the program's `Context`.
 Participants certify the resulting shared state before advancing. The portable
-`TraceEntry` records only the agreed `SessionStarted` or `MessageReceived`
-event, the pre/post shared-state hashes, an optional terminal effect, and the
-aggregate agreement. `StepCommitment` binds that entry and the preceding chain
-link; participant-specific events, local state, ordinary effects, fuel, and
-entropy observations remain Host-local.
+`TraceEntry` records only the agreed `StepEvent` (`SessionStarted` or a message
+from one authenticated author), the pre/post shared-state hashes, an optional
+`StepTerminal` (`End`, `Abort`, or `Fail`), and the aggregate agreement.
+`StepCommitment` binds that entry and the preceding chain link;
+participant-specific events, local state, ordinary effects, fuel, and entropy
+observations remain Host-local.
 
 A program can group actions into rounds or phases. The auction's commitment and
 revelation phases each contain multiple shared steps. Application rounds do not
@@ -185,8 +186,8 @@ participant retains its own evidence for later inspection or verification.
 ## Verification
 
 Portable/light verification is the only verification boundary. It checks
-activation binding, signatures, the v2 trace chain, shared pre/post hashes,
-terminal evidence, and the v4 receipt identity without loading the program. A
+activation binding, signatures, the v3 trace chain, shared pre/post hashes,
+terminal evidence, and the v5 receipt identity without loading the program. A
 completed result includes authenticated opaque outcome bytes; a stopped result
 includes the exact stop cause. It authenticates certified facts and does not
 execute Wasm or claim to reproduce participant-specific state.

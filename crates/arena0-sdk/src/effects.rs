@@ -20,7 +20,7 @@ unsafe extern "C" {
     fn fail(reason_ptr: u32, reason_len: u32);
     fn log(level: u32, msg_ptr: u32, msg_len: u32);
     fn random(buf_ptr: u32, buf_len: u32);
-    fn broadcast(data_ptr: u32, data_len: u32);
+    fn broadcast(data_ptr: u32, data_len: u32) -> u32;
     fn set_timer(delay_ms: u64, type_ptr: u32, type_len: u32, data_ptr: u32, data_len: u32);
     fn sign(scheme: u32, data_ptr: u32, data_len: u32, out_ptr: u32, out_cap: u32) -> u32;
     fn end_session(result_ptr: u32, result_len: u32);
@@ -110,15 +110,24 @@ pub(crate) fn host_random(buf: &mut [u8]) {
 }
 
 /// Broadcast a message to every participant.
-pub(crate) fn host_broadcast(msg_bytes: &[u8]) {
+///
+/// Returns [`BroadcastError::QueueFull`] when the durable outgoing queue is
+/// full; the host then queues nothing.
+pub(crate) fn host_broadcast(msg_bytes: &[u8]) -> Result<(), crate::context::BroadcastError> {
     #[cfg(target_arch = "wasm32")]
     unsafe {
-        broadcast(msg_bytes.as_ptr() as u32, msg_bytes.len() as u32);
+        if broadcast(msg_bytes.as_ptr() as u32, msg_bytes.len() as u32) != 0 {
+            return Err(crate::context::BroadcastError::QueueFull);
+        }
+        Ok(())
     }
     #[cfg(not(target_arch = "wasm32"))]
-    crate::testing::push_effect(arena0_protocol::Effect::Broadcast {
-        data: msg_bytes.to_vec(),
-    });
+    {
+        crate::testing::push_effect(arena0_protocol::Effect::Broadcast {
+            data: msg_bytes.to_vec(),
+        });
+        Ok(())
+    }
 }
 
 pub(crate) fn host_set_timer_spec(spec: &TimerSpec) {

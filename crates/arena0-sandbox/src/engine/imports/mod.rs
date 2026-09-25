@@ -5,10 +5,11 @@ mod core;
 
 use arena0_crypto::SignScheme;
 use arena0_program::{Capability, StateMemoryKind};
-use arena0_protocol::Lifecycle;
+use arena0_protocol::Effect;
 use wasmtime::{Caller, Extern, Memory};
 
 use super::HostState;
+use crate::call::DispatchKind;
 
 pub(super) use capabilities::register_capability_imports;
 pub(super) use core::register_always_available;
@@ -41,12 +42,7 @@ pub(super) trait CallerExt {
     ) -> Result<Vec<u8>, wasmtime::Error>;
     fn begin_import(&mut self, _name: &str) -> Result<(), wasmtime::Error>;
     fn reject_read_only(&self, name: &str) -> Result<(), wasmtime::Error>;
-    fn reject_if_lifecycle_disallowed(
-        &self,
-        function_name: &str,
-        allowed: &[Lifecycle],
-    ) -> Result<(), wasmtime::Error>;
-    fn record_effect(&mut self, effect: arena0_protocol::Effect) -> Result<(), wasmtime::Error>;
+    fn record_effect(&mut self, effect: Effect) -> Result<(), wasmtime::Error>;
 }
 
 impl CallerExt for Caller<'_, HostState> {
@@ -119,21 +115,7 @@ impl CallerExt for Caller<'_, HostState> {
         Ok(())
     }
 
-    fn reject_if_lifecycle_disallowed(
-        &self,
-        function_name: &str,
-        allowed: &[Lifecycle],
-    ) -> Result<(), wasmtime::Error> {
-        let lifecycle = self.data().lifecycle;
-        if !allowed.contains(&lifecycle) {
-            return Err(wasmtime::Error::msg(format!(
-                "{function_name}: not allowed in {lifecycle:?} lifecycle"
-            )));
-        }
-        Ok(())
-    }
-
-    fn record_effect(&mut self, effect: arena0_protocol::Effect) -> Result<(), wasmtime::Error> {
+    fn record_effect(&mut self, effect: Effect) -> Result<(), wasmtime::Error> {
         if !self.data().call_kind.allows_effects() {
             return Err(wasmtime::Error::msg(format!(
                 "effect {:?} is unavailable to {:?} calls",
@@ -141,6 +123,50 @@ impl CallerExt for Caller<'_, HostState> {
                 self.data().call_kind
             )));
         }
+        let dispatch = self.data().dispatch;
+        match &effect {
+            Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. } => {
+                if dispatch != DispatchKind::Agreed {
+                    return Err(wasmtime::Error::msg(format!(
+                        "{}: a lifecycle effect is only available to agreed events",
+                        effect_name(&effect)
+                    )));
+                }
+                if self.data().effect_queue.iter().any(is_lifecycle_effect) {
+                    return Err(wasmtime::Error::msg(
+                        "at most one lifecycle effect is allowed per dispatch",
+                    ));
+                }
+                if self
+                    .data()
+                    .effect_queue
+                    .iter()
+                    .any(|queued| matches!(queued, Effect::SetTimer { .. }))
+                {
+                    return Err(wasmtime::Error::msg(
+                        "a lifecycle effect cannot be combined with SetTimer",
+                    ));
+                }
+            }
+            Effect::SetTimer { .. } => {
+                if self.data().effect_queue.iter().any(is_lifecycle_effect) {
+                    return Err(wasmtime::Error::msg(
+                        "SetTimer cannot be combined with a lifecycle effect",
+                    ));
+                }
+            }
+            Effect::Broadcast { .. } => {}
+        }
+        // Enforce every protocol effect limit at emission, including the exact
+        // canonical `Vec<Effect>` aggregate, so the dispatch path never has to
+        // reject an effect the guest already emitted.
+        arena0_protocol::execution::check_effect_budget(
+            self.data()
+                .effect_queue
+                .iter()
+                .chain(std::iter::once(&effect)),
+        )
+        .map_err(|error| wasmtime::Error::msg(format!("effect rejected: {error}")))?;
         let bytes = borsh::to_vec(&effect)
             .map_err(|error| wasmtime::Error::msg(format!("effect encoding failed: {error}")))?;
         let profile = self.data().profile.clone();
@@ -154,6 +180,23 @@ impl CallerExt for Caller<'_, HostState> {
             .map_err(wasmtime::Error::new)?;
         self.data_mut().effect_queue.push(effect);
         Ok(())
+    }
+}
+
+fn is_lifecycle_effect(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. }
+    )
+}
+
+fn effect_name(effect: &Effect) -> &'static str {
+    match effect {
+        Effect::SessionEnd { .. } => "end_session",
+        Effect::SessionAbort { .. } => "abort_session",
+        Effect::Fail { .. } => "fail",
+        Effect::SetTimer { .. } => "set_timer",
+        Effect::Broadcast { .. } => "broadcast",
     }
 }
 

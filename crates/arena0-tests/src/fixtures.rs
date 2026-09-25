@@ -505,7 +505,7 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
     let wat = format!(
         r#"
         (module
-          (import "arena0" "broadcast" (func $broadcast (param i32 i32)))
+          (import "arena0" "broadcast" (func $broadcast (param i32 i32) (result i32)))
           {stop_import}
           (memory (export "memory") 1)
           (global (export "arena0_abi_version") i32 (i32.const 22))
@@ -584,7 +584,7 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
               i32.add
               local.get $session_len
               i32.add
-              i32.const 109
+              i32.const 37
               i32.add
               i32.load8_u
               i32.const 1

@@ -41,7 +41,7 @@ use lock::{
     OwnerLock, acquire_process_lock, configure_connection, initialize_schema, prepare_database_file,
 };
 
-const SCHEMA_VERSION: u64 = 4;
+const SCHEMA_VERSION: u64 = 5;
 const ENVELOPE_VERSION: u16 = 2;
 const ENVELOPE_MAGIC: [u8; 8] = *b"AR0STOR1";
 const ENVELOPE_DOMAIN: &[u8] = b"arena0/store-envelope/v2";
@@ -504,7 +504,6 @@ pub enum EventKind {
     MessageReceived,
     InputReceived,
     TimerFired,
-    React,
 }
 
 /// One effect's kind and bounded payload size. The store never returns
@@ -527,9 +526,10 @@ pub enum EffectKind {
 
 /// A safe projection of one durable event record for local diagnostics.
 /// Event position is an authoritative local coordinate. An event may produce
-/// more than one agreed step (for example, a deferred broadcast successor), so
-/// the relation is represented as a list rather than a misleading scalar.
-/// Payloads contain only kinds and sizes, never raw private values.
+/// more than one agreed step (an authored message stages a proposal after its
+/// local dispatch), so the relation is represented as a list rather than a
+/// misleading scalar. Payloads contain only kinds and sizes, never raw private
+/// values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventRecordSummary {
     pub event_position: u64,
@@ -606,7 +606,6 @@ impl EventRecordSummary {
             Event::MessageReceived { msg, .. } => (EventKind::MessageReceived, Some(msg.len())),
             Event::InputReceived { data, .. } => (EventKind::InputReceived, Some(data.len())),
             Event::TimerFired { timer } => (EventKind::TimerFired, Some(timer.data.len())),
-            Event::React => (EventKind::React, None),
         };
         let effects = effects
             .iter()
@@ -753,6 +752,8 @@ pub struct TransitionRecord {
 pub enum Change {
     /// Update the local end confirmation phase without changing evidence.
     End,
+    /// Drop the head of the outgoing queue after the program rejected it.
+    DropOutgoing,
     /// Enter active execution.
     Activate,
     /// Record an accepted guest dispatch and consume its durable source.

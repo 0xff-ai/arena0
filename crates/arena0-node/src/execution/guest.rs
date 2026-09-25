@@ -13,7 +13,7 @@ use arena0_program::{CallStatus, JsonBytes, ProgramHash};
 use arena0_protocol::execution::GuestSignData;
 use arena0_protocol::{
     Committed, Effect, Ensemble, Event, ExecFrame, ExecLifecycle, ExecutionState, ExecutionStatus,
-    MessageId, ParticipantStepSignature, PeerIdSource, PendingId, SessionHash, StateHash,
+    ParticipantStepSignature, PeerIdSource, PendingId, SessionHash, StateHash, StepEvent,
     TerminalOutcome,
 };
 use arena0_sandbox::{DispatchCall, GuestSigner, OutcomeCall, QueryCall, ViewCall, WriterCall};
@@ -22,12 +22,21 @@ use std::sync::Arc;
 
 use super::{ExecutionActor, MAX_TIMER_BATCH, now_ms};
 
-/// Durable identities supplied by the actor's validated event source.
-#[derive(Debug, Clone, Copy, Default)]
-pub(super) struct DispatchSource {
-    pub(super) timer_id: Option<arena0_protocol::TimerId>,
-    pub(super) pending_id: Option<PendingId>,
-    pub(super) advertised_post_state: Option<StateHash>,
+/// The validated durable source of one dispatched event.
+#[derive(Debug, Clone)]
+pub(super) enum DispatchSource {
+    /// A local event with no durable identity beyond its event record.
+    Local,
+    /// A callout answer that must name the exact open callout.
+    Answer(PendingId),
+    /// A timer firing that consumes its durable timer identity.
+    Timer(arena0_protocol::TimerId),
+    /// An authenticated peer message with the author's complete commitment.
+    PeerMessage {
+        commitment: arena0_protocol::StepCommitment,
+    },
+    /// This participant's own queued message.
+    OwnMessage,
 }
 
 /// Classification for the agent-facing input command.
@@ -127,10 +136,7 @@ impl ExecutionActor {
                     callout_index,
                     data: data.into_bytes(),
                 },
-                DispatchSource {
-                    pending_id: Some(pending_id),
-                    ..DispatchSource::default()
-                },
+                DispatchSource::Answer(pending_id),
             )
             .await
             .map_err(|error| match error {
@@ -140,10 +146,9 @@ impl ExecutionActor {
         match accepted {
             DispatchOutcome::Committed => self.progress().await?,
             DispatchOutcome::Frozen => {
-                // A deferred broadcast may have left a successor proposal in
-                // flight while this continuation is still pending. The
-                // answer was not consumed; surface that boundary to the
-                // caller so it can retry with the same pending id.
+                // A staged proposal froze the guest. The answer was not
+                // consumed; surface that boundary to the caller so it can
+                // retry with the same pending id.
                 return Err(SubmitInputError::Expected(ExecError::AgreementPending));
             }
             DispatchOutcome::Rejected { reason } => {
@@ -198,7 +203,7 @@ impl ExecutionActor {
                 Event::SessionStarted {
                     ensemble: self.ensemble(),
                 },
-                DispatchSource::default(),
+                DispatchSource::Local,
             )
             .await?;
         if !matches!(accepted, DispatchOutcome::Committed) {
@@ -213,7 +218,7 @@ impl ExecutionActor {
         state.agreed_step() > 0
             || state.pending_shared().is_some_and(|proposal| {
                 proposal.commitment().step == 0
-                    && matches!(proposal.entry().event, Event::SessionStarted { .. })
+                    && matches!(proposal.entry().event, StepEvent::SessionStarted { .. })
             })
     }
 
@@ -241,14 +246,7 @@ impl ExecutionActor {
         source: arena0_protocol::PeerId,
         frame: ExecFrame,
     ) -> Result<bool, ExecError> {
-        let ExecFrame::Message {
-            message_id,
-            seq,
-            prestate,
-            data,
-            poststate,
-        } = frame
-        else {
+        let ExecFrame::Message { commitment, data } = frame else {
             return Err(ExecError::InvalidState(
                 "execution frame is not a message".into(),
             ));
@@ -262,19 +260,14 @@ impl ExecutionActor {
                 "cannot apply a local message while a shared proposal is pending".into(),
             ));
         }
+        let seq = commitment.step;
         if seq > state.agreed_step() {
             return Ok(false);
         }
         if seq < state.agreed_step()
-            || prestate != state.agreed_state()
-            || MessageId::derive(
-                state.binding().session_id(),
-                source,
-                seq,
-                prestate,
-                poststate,
-                &data,
-            ) != message_id
+            || commitment.session_id != state.binding().session_id()
+            || commitment.pre_state != state.agreed_state()
+            || commitment.link != state.agreed_link()
         {
             return Ok(false);
         }
@@ -284,16 +277,10 @@ impl ExecutionActor {
         let outcome = self
             .dispatch_event(
                 Event::MessageReceived {
-                    message_id,
                     from: source,
-                    position: seq,
-                    pre_state: prestate,
                     msg: data,
                 },
-                DispatchSource {
-                    advertised_post_state: Some(poststate),
-                    ..DispatchSource::default()
-                },
+                DispatchSource::PeerMessage { commitment },
             )
             .await?;
         match outcome {
@@ -336,6 +323,54 @@ impl ExecutionActor {
         Ok(writer.and_then(|participant| ensemble.peer_at(participant)))
     }
 
+    /// Whether this participant currently owns the next agreed message.
+    ///
+    /// True only while active, with no staged proposal, a non-empty outgoing
+    /// queue, and the `writer` projection selecting this participant.
+    pub(super) fn may_author(&self) -> Result<bool, ExecError> {
+        let state = &self.state;
+        if !matches!(state.status(), ExecutionStatus::Active)
+            || state.pending_shared().is_some()
+            || state.outgoing().is_empty()
+        {
+            return Ok(false);
+        }
+        Ok(
+            self.writer_for_shared(state.shared_state(), &self.ensemble())?
+                == Some(self.context.identity.peer_id()),
+        )
+    }
+
+    /// Author the oldest queued message through the same dispatch every
+    /// receiver runs, staging a proposal on acceptance.
+    ///
+    /// A message the program rejects is dropped from the durable queue and the
+    /// loop continues with the next one; it never reaches a peer.
+    pub(super) async fn author_next_message(&mut self) -> Result<(), ExecError> {
+        while self.may_author()? {
+            let event = Event::MessageReceived {
+                from: self.context.identity.peer_id(),
+                msg: self.state.outgoing()[0].clone(),
+            };
+            match self
+                .dispatch_event(event, DispatchSource::OwnMessage)
+                .await?
+            {
+                DispatchOutcome::Committed | DispatchOutcome::Frozen => return Ok(()),
+                DispatchOutcome::Rejected { .. } => {
+                    let mut next = self.state.clone();
+                    next.drop_outgoing_head()?;
+                    self.persist(next, Change::DropOutgoing).await?;
+                    tracing::error!(
+                        exec_id = %self.context.exec_id,
+                        "own queued message rejected by the program"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Apply an accepted dispatch to actor-owned state and persist it atomically.
     /// Rejection restores the guest candidate; persistence failure reloads the
     /// last durable state before any further transition.
@@ -347,13 +382,17 @@ impl ExecutionActor {
         let mut next = self.state.clone();
         {
             let state = &next;
-            if let Event::InputReceived { callout_index, .. } = &event
-                && !state.callout().is_some_and(|open| {
-                    source.pending_id == Some(open.id) && *callout_index == open.callout_index
-                })
-            {
-                self.discard_candidate()?;
-                return Err(ExecError::CalloutNotPending);
+            if let Event::InputReceived { callout_index, .. } = &event {
+                let DispatchSource::Answer(pending_id) = source else {
+                    self.discard_candidate()?;
+                    return Err(ExecError::CalloutNotPending);
+                };
+                if !state.callout().is_some_and(|open| {
+                    pending_id == open.id && *callout_index == open.callout_index
+                }) {
+                    self.discard_candidate()?;
+                    return Err(ExecError::CalloutNotPending);
+                }
             }
             if state.status().is_terminal() {
                 return Ok(DispatchOutcome::Frozen);
@@ -368,18 +407,29 @@ impl ExecutionActor {
             }
             self.reconcile_resident()?;
 
+            // The sandbox bounds broadcasts against the committed queue. An
+            // own message authors the head it is about to pop, so it is not
+            // counted as already committed.
+            let outgoing_len = match source {
+                DispatchSource::OwnMessage => state.outgoing().len().saturating_sub(1),
+                DispatchSource::Local
+                | DispatchSource::Answer(_)
+                | DispatchSource::Timer(_)
+                | DispatchSource::PeerMessage { .. } => state.outgoing().len(),
+            };
             let call = {
                 let mut call = DispatchCall::new(
                     self.context.identity.peer_id(),
                     self.ensemble(),
                     event.clone(),
-                );
+                )
+                .with_outgoing_len(outgoing_len);
                 // Only local handlers may sign. `SessionStarted` is a
                 // pre-session dispatch and `MessageReceived` reproduces a
                 // peer's agreed result, so neither is offered a signer.
                 if matches!(
                     &event,
-                    Event::InputReceived { .. } | Event::TimerFired { .. } | Event::React
+                    Event::InputReceived { .. } | Event::TimerFired { .. }
                 ) {
                     call = call.with_signer(Arc::new(DispatchSigner {
                         session_id: self.context.activation.session_hash(),
@@ -430,89 +480,9 @@ impl ExecutionActor {
                     "sandbox shared-state hash does not match its payload".into(),
                 ));
             }
-            if source
-                .advertised_post_state
-                .is_some_and(|post_state| post_state != candidate_hash)
-            {
-                self.discard_candidate()?;
-                return Err(ExecError::Diverged(super::truncate_reason(
-                    format!(
-                        "diverged at step {}: post-state mismatch",
-                        state.agreed_step()
-                    ),
-                    arena0_protocol::MAX_TERMINAL_REASON_BYTES,
-                )));
-            }
-
-            let agreed_event = matches!(
-                &event,
-                Event::SessionStarted { .. } | Event::MessageReceived { .. }
-            );
             let candidate_shared = result.shared.clone();
+            let candidate_local = result.local.clone();
             let effects = result.observations.effects;
-            let broadcast_count = effects
-                .iter()
-                .filter(|effect| matches!(effect, Effect::Broadcast { .. }))
-                .count();
-            let lifecycle_count = effects
-                .iter()
-                .filter(|effect| {
-                    matches!(
-                        effect,
-                        Effect::SessionEnd { .. }
-                            | Effect::SessionAbort { .. }
-                            | Effect::Fail { .. }
-                    )
-                })
-                .count();
-            let shared_changed = candidate_hash != state.agreed_state();
-            if broadcast_count > 1 || lifecycle_count > 1 {
-                self.discard_candidate()?;
-                return Err(ExecError::InvalidState(
-                    "dispatch emitted too many agreement or lifecycle effects".into(),
-                ));
-            }
-            if agreed_event && broadcast_count != 0 && lifecycle_count != 0 {
-                // The broadcast would begin a second position after this
-                // terminal step, which has no successor to host it.
-                self.discard_candidate()?;
-                return Err(ExecError::InvalidState(
-                    "terminal agreed event cannot defer a broadcast".into(),
-                ));
-            }
-            if (shared_changed || lifecycle_count != 0) && !agreed_event && broadcast_count == 0 {
-                self.discard_candidate()?;
-                return Err(ExecError::InvalidState(
-                    "local shared or lifecycle mutation requires a broadcast".into(),
-                ));
-            }
-            if broadcast_count != 0 {
-                // A broadcast is an agreement boundary, not an arbitrary
-                // local effect. For a local event, the current committed
-                // state selects its author. A broadcast observed while
-                // applying an already-agreed event is deferred to the next
-                // position, so the post-dispatch state selects that successor
-                // author. This check runs before the store can stage anything.
-                let writer_state = if agreed_event {
-                    &candidate_shared
-                } else {
-                    state.shared_state()
-                };
-                let writer = match self.writer_for_shared(writer_state, &self.ensemble()) {
-                    Ok(writer) => writer,
-                    Err(error) => {
-                        self.discard_candidate()?;
-                        return Err(error);
-                    }
-                };
-                if writer != Some(self.context.identity.peer_id()) {
-                    self.discard_candidate()?;
-                    return Err(ExecError::InvalidState(
-                        "broadcast was emitted by a participant that is not the selected writer"
-                            .into(),
-                    ));
-                }
-            }
             let terminal_outcome = match self.terminal_outcome(&result.shared, &effects) {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -520,18 +490,82 @@ impl ExecutionActor {
                     return Err(error);
                 }
             };
-            let candidate_local = result.local.clone();
             if let Err(error) = next.apply_dispatch(
                 &event,
                 result.shared,
                 result.local,
                 &effects,
                 terminal_outcome,
-                source.pending_id,
+                match source {
+                    DispatchSource::Answer(pending_id) => Some(pending_id),
+                    DispatchSource::Local
+                    | DispatchSource::Timer(_)
+                    | DispatchSource::PeerMessage { .. }
+                    | DispatchSource::OwnMessage => None,
+                },
                 result.callout,
             ) {
                 self.discard_candidate()?;
-                return Err(error.into());
+                return match (&source, error) {
+                    // An agreed step whose broadcasts would overflow the local
+                    // outgoing queue fails the session; the Host does not sign
+                    // it. The failure boundary records the Host-signed `Fail`.
+                    (_, arena0_protocol::ProtocolError::OutgoingQueueFull { .. }) => {
+                        Err(ExecError::OutgoingQueueOverflow)
+                    }
+                    // A local receipt-budget limit is a session-level stop, not
+                    // a program divergence.
+                    (_, arena0_protocol::ProtocolError::ReceiptBudgetExhausted { step }) => {
+                        Err(ExecError::ReceiptBudgetExhausted { step })
+                    }
+                    // A peer message the local program cannot apply is a
+                    // divergence, not an agent rejection.
+                    (DispatchSource::PeerMessage { .. }, other) => {
+                        Err(ExecError::Diverged(super::truncate_reason(
+                            format!("diverged at step {}: {other}", self.state.agreed_step()),
+                            arena0_protocol::MAX_TERMINAL_REASON_BYTES,
+                        )))
+                    }
+                    // A local event or an authored own message is a plain
+                    // rejection; the caller keeps the session live.
+                    (
+                        DispatchSource::Local
+                        | DispatchSource::Answer(_)
+                        | DispatchSource::Timer(_)
+                        | DispatchSource::OwnMessage,
+                        other,
+                    ) => Ok(DispatchOutcome::Rejected {
+                        reason: Some(super::truncate_reason(
+                            other.to_string(),
+                            arena0_program::MAX_REJECTION_REASON_BYTES,
+                        )),
+                    }),
+                };
+            }
+            // The receiver rebuilds the entry itself; its commitment must equal
+            // the author's in every field. Compare before anything is persisted
+            // so recovery can never sign an incompatible proposal.
+            if let DispatchSource::PeerMessage { commitment } = &source {
+                let local = next
+                    .pending_shared()
+                    .expect("a peer dispatch stages a proposal")
+                    .commitment();
+                if local != commitment {
+                    self.discard_candidate()?;
+                    let cause = if local.post_state != commitment.post_state {
+                        "post-state mismatch"
+                    } else if local.entry_hash != commitment.entry_hash {
+                        "entry mismatch"
+                    } else if local.link != commitment.link {
+                        "link mismatch"
+                    } else {
+                        "commitment mismatch"
+                    };
+                    return Err(ExecError::Diverged(super::truncate_reason(
+                        format!("diverged at step {}: {cause}", self.state.agreed_step()),
+                        arena0_protocol::MAX_TERMINAL_REASON_BYTES,
+                    )));
+                }
             }
             let proposal_staged = next.pending_shared().is_some();
             self.persist(
@@ -539,7 +573,13 @@ impl ExecutionActor {
                 Change::Dispatch {
                     event,
                     effects,
-                    timer_id: source.timer_id,
+                    timer_id: match &source {
+                        DispatchSource::Timer(timer_id) => Some(*timer_id),
+                        DispatchSource::Local
+                        | DispatchSource::Answer(_)
+                        | DispatchSource::PeerMessage { .. }
+                        | DispatchSource::OwnMessage => None,
+                    },
                 },
             )
             .await?;
@@ -635,13 +675,7 @@ impl ExecutionActor {
         for timer in timers {
             let event = Event::TimerFired { timer: timer.timer };
             let accepted = self
-                .dispatch_event(
-                    event,
-                    DispatchSource {
-                        timer_id: Some(timer.timer_id),
-                        ..DispatchSource::default()
-                    },
-                )
+                .dispatch_event(event, DispatchSource::Timer(timer.timer_id))
                 .await?;
             if matches!(accepted, DispatchOutcome::Frozen) {
                 // A staged proposal or terminal boundary freezes the guest; leave

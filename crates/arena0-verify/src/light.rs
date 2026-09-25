@@ -94,9 +94,9 @@ pub(crate) mod tests {
     use arena0_crypto::{BlsSignature, ExecutionKey, ExecutionSalt, NodeKeys, SecretKey};
     use arena0_program::ExecutionProfile;
     use arena0_protocol::{
-        Activation, AggregateAttestation, CHAIN_START, Committed, Effect, Ensemble, Event,
-        MessageId, Offer, OfferData, PreparedActivation, ReceiptBody, SessionHeader, SignerSet,
-        StateHash, StepCommitment, TRACE_FORMAT_VERSION, Ticket, TicketAction, TicketData,
+        Activation, AggregateAttestation, CHAIN_START, Committed, Ensemble, Offer, OfferData,
+        PreparedActivation, ReceiptBody, SessionHeader, SignerSet, StateHash, StepCommitment,
+        StepEvent, StepTerminal, TRACE_FORMAT_VERSION, Ticket, TicketAction, TicketData,
         TraceEntry,
     };
 
@@ -203,12 +203,12 @@ pub(crate) mod tests {
         let mut first = TraceEntry {
             trace_version: TRACE_FORMAT_VERSION,
             step: 0,
-            event: Event::SessionStarted {
+            event: StepEvent::SessionStarted {
                 ensemble: ensemble.clone(),
             },
             pre_state: initial_state,
             post_state: first_post_state,
-            terminal: (!two_steps).then(|| Effect::SessionEnd {
+            terminal: (!two_steps).then(|| StepTerminal::End {
                 outcome: outcome.clone(),
             }),
             agreement: AggregateAttestation::empty(),
@@ -230,23 +230,13 @@ pub(crate) mod tests {
             let mut second = TraceEntry {
                 trace_version: TRACE_FORMAT_VERSION,
                 step: 1,
-                event: Event::MessageReceived {
-                    message_id: MessageId::derive(
-                        session,
-                        sender,
-                        1,
-                        first_post_state,
-                        final_state,
-                        &msg,
-                    ),
+                event: StepEvent::Message {
                     from: sender,
-                    position: 1,
-                    pre_state: first_post_state,
-                    msg,
+                    data: msg,
                 },
                 pre_state: first_post_state,
                 post_state: final_state,
-                terminal: Some(Effect::SessionEnd {
+                terminal: Some(StepTerminal::End {
                     outcome: outcome.clone(),
                 }),
                 agreement: AggregateAttestation::empty(),

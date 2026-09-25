@@ -334,7 +334,6 @@ pub enum EventKind {
     MessageReceived,
     InputReceived,
     TimerFired,
-    React,
 }
 
 /// Kind and bounded payload size of one effect. The payload itself is

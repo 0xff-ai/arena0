@@ -166,7 +166,9 @@ impl ResourceLedger {
 pub(crate) struct HostState {
     pub limits: StoreLimits,
     pub call_kind: CallKind,
-    pub lifecycle: arena0_protocol::Lifecycle,
+    pub dispatch: crate::call::DispatchKind,
+    /// Committed outgoing messages before this dispatch began.
+    pub outgoing_len: usize,
     pub logs: Vec<(String, String)>,
     pub effect_queue: Vec<Effect>,
     pub entropy: Entropy,
@@ -180,7 +182,7 @@ impl HostState {
     pub(crate) fn new(
         profile: ExecutionProfile,
         call_kind: CallKind,
-        lifecycle: arena0_protocol::Lifecycle,
+        dispatch: crate::call::DispatchKind,
         random_replay: Option<&[Vec<u8>]>,
         callout_inputs: Vec<arena0_program::JsonSchemaDocument>,
     ) -> Self {
@@ -197,7 +199,8 @@ impl HostState {
                 .memories(profile.limits.max_memories as usize)
                 .build(),
             call_kind,
-            lifecycle,
+            dispatch,
+            outgoing_len: 0,
             logs: Vec::new(),
             effect_queue: Vec::new(),
             entropy,
@@ -227,11 +230,13 @@ impl HostState {
     /// accounting before a resident instance is re-entered.
     pub(crate) fn reset_for_dispatch(
         &mut self,
-        lifecycle: arena0_protocol::Lifecycle,
+        dispatch: crate::call::DispatchKind,
+        outgoing_len: usize,
         random_replay: Option<&[Vec<u8>]>,
     ) {
         self.call_kind = CallKind::Dispatch;
-        self.lifecycle = lifecycle;
+        self.dispatch = dispatch;
+        self.outgoing_len = outgoing_len;
         self.logs.clear();
         self.effect_queue.clear();
         self.ledger = ResourceLedger::new();
@@ -338,7 +343,7 @@ pub(crate) struct InstanceConfig<'a> {
     pub schema: &'a arena0_program::ProgramSchema,
     pub profile: &'a ExecutionProfile,
     pub call_kind: CallKind,
-    pub lifecycle: arena0_protocol::Lifecycle,
+    pub dispatch: crate::call::DispatchKind,
     pub random_replay: Option<&'a [Vec<u8>]>,
 }
 
@@ -352,7 +357,7 @@ pub(crate) fn instantiate_module(
         schema,
         profile,
         call_kind,
-        lifecycle,
+        dispatch,
         random_replay,
     } = config;
     let mut store = Store::new(
@@ -360,7 +365,7 @@ pub(crate) fn instantiate_module(
         HostState::new(
             profile.clone(),
             CallKind::Prepare,
-            lifecycle,
+            dispatch,
             random_replay,
             schema.callouts.iter().map(|c| c.input.clone()).collect(),
         ),

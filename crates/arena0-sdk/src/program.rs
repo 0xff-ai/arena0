@@ -6,8 +6,9 @@ use borsh::BorshDeserialize;
 use core::convert::Infallible;
 
 use crate::{
-    Arena0Callout, Arena0Phase, Arena0Query, Context, LocalState, PhaseDecl, PhasedSharedState,
-    PrimitiveRouteSchema, ProgramFault, ProtocolFault, SharedState, Transition,
+    Arena0Callout, Arena0Phase, Arena0Query, CalloutContext, Context, LocalContext, LocalState,
+    PhaseDecl, PhasedSharedState, PrimitiveRouteSchema, ProgramFault, ProtocolFault, SharedState,
+    Transition,
 };
 
 pub type ProgramTransition<P> = Transition<<P as Program>::Phase>;
@@ -113,14 +114,6 @@ pub trait Program: Sized {
         Ok(Transition::Stay)
     }
 
-    /// Decision hook run by the node's runtime after an applied entry unless a
-    /// callout is already pending.
-    fn on_react(
-        _ctx: &mut Context<Self::Shared, Self::Local>,
-    ) -> Result<ProgramTransition<Self>, ProgramFault> {
-        Ok(Transition::Stay)
-    }
-
     /// Message handler applied at the message's canonical agreed position.
     /// Returns [`ApplyDecision::Accept`] to commit the dispatch result and transition
     /// or [`ApplyDecision::Reject`] to decline it without a trace entry.
@@ -132,19 +125,23 @@ pub trait Program: Sized {
         Ok(ApplyDecision::Accept(Transition::Stay))
     }
     /// Handler for a callout answer. An error rejects the answer and restores
-    /// both state memories without ending the session.
+    /// both state memories without ending the session. A local handler cannot
+    /// change agreed shared state or end the session; it queues a message
+    /// whose agreed handler does that.
     fn on_input(
-        _ctx: &mut Context<Self::Shared, Self::Local>,
+        _ctx: &mut LocalContext<Self::Shared, Self::Local>,
         _input: Self::Input,
-    ) -> anyhow::Result<ProgramTransition<Self>> {
-        Ok(Transition::Stay)
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 
+    /// Handler for one fired timer. Like [`Self::on_input`], a local handler
+    /// cannot change agreed shared state or end the session.
     fn on_timer(
-        _ctx: &mut Context<Self::Shared, Self::Local>,
+        _ctx: &mut LocalContext<Self::Shared, Self::Local>,
         _timer: TimerPayload,
-    ) -> Result<ProgramTransition<Self>, ProgramFault> {
-        Ok(Transition::Stay)
+    ) -> Result<(), ProgramFault> {
+        Ok(())
     }
 
     /// Derive the single open callout implied by the current state.
@@ -158,7 +155,7 @@ pub trait Program: Sized {
     /// withdraws it. A terminal transition has no callout regardless of this
     /// result. The callout is computed from state only; it must not depend on
     /// the dispatch that produced the state.
-    fn callout(_ctx: &Context<Self::Shared, Self::Local>) -> Option<Self::Callout> {
+    fn callout(_ctx: &CalloutContext<'_, Self::Shared, Self::Local>) -> Option<Self::Callout> {
         None
     }
 

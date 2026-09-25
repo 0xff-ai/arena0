@@ -7,29 +7,27 @@ use std::time::Instant;
 
 use crate::exec::ExecLifecycle;
 use crate::negotiation::Activation;
-use crate::trace::{AggregateAttestation, StepCommitment, TRACE_FORMAT_VERSION, TraceEntry};
+use crate::trace::{
+    AggregateAttestation, StepCommitment, StepEvent, StepTerminal, TRACE_FORMAT_VERSION, TraceEntry,
+};
 use crate::{
-    Effect, Event, ExecFrame, ExecId, MessageId, OpenCallout, PeerId, PendingId, StateHash,
-    pending_id,
+    Effect, Event, ExecFrame, ExecId, OpenCallout, PeerId, PendingId, StateHash, pending_id,
 };
 
 use super::{
     ExecutionBinding, ExecutionStatus, ExecutionVersion, MAX_EFFECTS, MAX_EXECUTION_STATE_BYTES,
     MAX_PROOF_SIGNATURES, ParticipantStepSignature, ProtocolError, ReceiptArtifact, ReceiptId,
-    StepCursor, TerminalOutcome, ensure_encoded, validate_effects, validate_proposal,
-    validate_receipt_body,
+    StepCursor, TerminalOutcome, ensure_encoded, ensure_payload, validate_effects,
+    validate_proposal, validate_receipt_body,
 };
 
 /// A shared step waiting for N-of-N signatures.
 ///
 /// The proposal is the only durable place where a dispatch result can be
-/// staged before agreement. It keeps both state memories and the complete
-/// post-agreement effect list because agreement commits the dispatch
-/// atomically: a failed or incomplete agreement must not expose either memory
-/// or any deferred effect. An establishing broadcast from a non-agreed event
-/// is consumed into its normalized trace entry instead
-/// of being retained here; a broadcast emitted by an already-agreed event is
-/// retained as deferred next-step work. `event_position` identifies the event
+/// staged before agreement. It keeps both state memories, the outgoing queue,
+/// and the post-agreement timer effects because agreement commits the
+/// dispatch atomically: a failed or incomplete agreement must not expose
+/// either memory or any deferred effect. `event_position` identifies the event
 /// that produced the result; it is independent of the agreed trace step.
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct SharedProposal {
@@ -37,9 +35,11 @@ pub struct SharedProposal {
     pub(crate) entry: TraceEntry,
     pub(crate) shared_state: SharedStateBytes,
     pub(crate) local_state: LocalStateBytes,
-    /// Effects paired with their original dispatch ordinals. Establishing
-    /// broadcasts may be omitted before staging; every retained effect keeps
-    /// its original ordinal for durable timer identity.
+    /// The outgoing queue this proposal installs when it is certified.
+    pub(crate) outgoing: Vec<Vec<u8>>,
+    /// Effects paired with their original dispatch ordinals. Broadcasts are
+    /// never retained here; every retained timer keeps its original ordinal
+    /// for durable timer identity.
     pub(crate) effects: Vec<(u32, Effect)>,
     pub(crate) event_position: u64,
     pub(crate) status: ExecutionStatus,
@@ -56,6 +56,7 @@ impl SharedProposal {
         entry: TraceEntry,
         shared_state: SharedStateBytes,
         local_state: LocalStateBytes,
+        outgoing: Vec<Vec<u8>>,
         effects: Vec<(u32, Effect)>,
         event_position: u64,
         status: ExecutionStatus,
@@ -69,12 +70,13 @@ impl SharedProposal {
                 max: MAX_EFFECTS,
             });
         }
-        validate_effects(&effects)?;
+        validate_outgoing(&outgoing)?;
         let proposal = Self {
             commitment,
             entry,
             shared_state,
             local_state,
+            outgoing,
             effects,
             event_position,
             status,
@@ -100,6 +102,12 @@ impl SharedProposal {
     #[must_use]
     pub const fn local_state(&self) -> &LocalStateBytes {
         &self.local_state
+    }
+
+    /// Borrow the outgoing queue this proposal installs when certified.
+    #[must_use]
+    pub fn outgoing(&self) -> &[Vec<u8>] {
+        &self.outgoing
     }
 
     /// Borrow effects emitted by the dispatch.
@@ -243,7 +251,9 @@ pub struct ExecutionState {
     pub(crate) agreed_link: [u8; 32],
     pub(crate) last_certificate: Option<StepCertificate>,
     pub(crate) end_phase: super::EndPhase,
-    pub(crate) last_reacted_step: Option<u64>,
+    /// Local FIFO queue of authored messages. Never part of a commitment,
+    /// `StateHash`, or receipt.
+    pub(crate) outgoing: Vec<Vec<u8>>,
     pub(crate) shared_state: SharedStateBytes,
     pub(crate) local_state: LocalStateBytes,
     pub(crate) proposal: Option<SharedProposal>,
@@ -264,7 +274,7 @@ struct ExecutionStateBody {
     agreed_link: [u8; 32],
     last_certificate: Option<StepCertificate>,
     end_phase: super::EndPhase,
-    last_reacted_step: Option<u64>,
+    outgoing: Vec<Vec<u8>>,
     shared_state: SharedStateBytes,
     local_state: LocalStateBytes,
     proposal: Option<SharedProposal>,
@@ -308,7 +318,7 @@ impl ExecutionState {
             agreed_link: self.agreed_link,
             last_certificate: self.last_certificate.clone(),
             end_phase: self.end_phase.clone(),
-            last_reacted_step: self.last_reacted_step,
+            outgoing: self.outgoing.clone(),
             shared_state: self.shared_state.clone(),
             local_state: self.local_state.clone(),
             proposal: self.proposal.clone(),
@@ -332,7 +342,7 @@ impl ExecutionState {
             agreed_link: body.agreed_link,
             last_certificate: body.last_certificate,
             end_phase: body.end_phase,
-            last_reacted_step: body.last_reacted_step,
+            outgoing: body.outgoing,
             shared_state: body.shared_state,
             local_state: body.local_state,
             proposal: body.proposal,
@@ -392,7 +402,7 @@ impl ExecutionState {
             agreed_link: cursor.chain_hash(),
             last_certificate: None,
             end_phase: super::EndPhase::Open,
-            last_reacted_step: None,
+            outgoing: Vec::new(),
             shared_state,
             local_state,
             proposal: None,
@@ -480,19 +490,14 @@ impl ExecutionState {
         self.check_receipt_entries(&[entry])
     }
 
-    /// Reserve every entry this proposal will stage, including a deferred
-    /// broadcast and both full agreements. Recovery and signature acceptance
-    /// enforce the same rule as dispatch so no signer becomes bound to a
-    /// proposal whose successor cannot fit in a publishable receipt.
+    /// Reserve the entry this proposal will stage. Recovery and signature
+    /// acceptance enforce the same rule as dispatch so no signer becomes
+    /// bound to a proposal that cannot fit in a publishable receipt.
     fn check_proposal_receipt_budget(
         &self,
         proposal: &SharedProposal,
     ) -> Result<(), ProtocolError> {
-        if let Some(successor) = self.deferred_broadcast_successor(proposal)? {
-            self.check_receipt_entries(&[&proposal.entry, &successor.entry])?;
-        } else {
-            self.check_receipt_budget(&proposal.entry)?;
-        }
+        self.check_receipt_budget(&proposal.entry)?;
         Ok(())
     }
 
@@ -536,10 +541,10 @@ impl ExecutionState {
         self.agreed_link
     }
 
-    /// Return the last agreed step for which React was durably run.
+    /// Borrow the durable outgoing message queue in FIFO order.
     #[must_use]
-    pub const fn last_reacted_step(&self) -> Option<u64> {
-        self.last_reacted_step
+    pub fn outgoing(&self) -> &[Vec<u8>] {
+        &self.outgoing
     }
 
     /// Return the agreed-step cursor view.
@@ -617,14 +622,12 @@ impl ExecutionState {
 
     /// Apply the pure protocol part of one accepted guest dispatch.
     ///
-    /// The state decides whether the result installs immediately or stages a
-    /// shared proposal, derives the next status and open callout, normalizes
-    /// an establishing broadcast, and advances the version. The caller remains
-    /// responsible for validating its durable source and atomically persisting
-    /// this state, the returned establishing frame, and the original effects.
-    ///
-    /// The optional frame establishes a normalized broadcast. `callout` is the
-    /// one request the program derived from the accepted post-state.
+    /// A local event installs immediately and may not change the agreed shared
+    /// state. An agreed event always stages a proposal. Broadcasts are
+    /// appended to the outgoing queue, never staged as effects. The returned
+    /// frame is the establishing message an own-message dispatch delivers.
+    /// `callout` is the one request the program derived from the accepted
+    /// post-state.
     #[allow(clippy::too_many_arguments)]
     pub fn apply_dispatch(
         &mut self,
@@ -635,14 +638,13 @@ impl ExecutionState {
         terminal_outcome: Option<TerminalOutcome>,
         pending_id: Option<PendingId>,
         callout: Option<CalloutRequest>,
-    ) -> Result<Option<(u32, ExecFrame)>, ProtocolError> {
+    ) -> Result<Option<ExecFrame>, ProtocolError> {
         if self.proposal.is_some() {
             return Err(ProtocolError::SharedProposalExists);
         }
         let event_position = self.event_position;
         let post_state = StateHash::of_shared(&shared_state);
         let indexed_effects = indexed_dispatch_effects(effects)?;
-        validate_effects(&indexed_effects)?;
         let lifecycle = dispatch_lifecycle_effect(effects)?;
         if lifecycle.is_some()
             && effects
@@ -651,57 +653,98 @@ impl ExecutionState {
         {
             return Err(ProtocolError::InvalidTerminalStatus);
         }
-        let broadcast_index = effects
-            .iter()
-            .position(|effect| matches!(effect, Effect::Broadcast { .. }));
-        let portable_event = matches!(
+        validate_callout_dispatch(self, event, pending_id)?;
+        let agreed_event = matches!(
             event,
             Event::SessionStarted { .. } | Event::MessageReceived { .. }
         );
-        let requires_agreement = portable_event
-            || post_state != self.agreed_state
-            || broadcast_index.is_some()
-            || lifecycle.is_some();
-        let reacted_step = reacted_step(self, event)?;
-        validate_callout_dispatch(self, event, pending_id)?;
 
-        if !requires_agreement {
+        if !agreed_event {
+            // The sandbox rejects a lifecycle effect from a local event at
+            // emission; keep the durable boundary defensive here.
+            if lifecycle.is_some() {
+                return Err(ProtocolError::InvalidTerminalStatus);
+            }
+            if post_state != self.agreed_state {
+                return Err(ProtocolError::LocalSharedChange);
+            }
             if terminal_outcome.is_some() {
                 return Err(ProtocolError::TerminalOutcomeMismatch);
             }
+            let mut outgoing = self.outgoing.clone();
+            append_broadcasts(&mut outgoing, effects)?;
             let status = ExecutionStatus::active();
             let next_callout = next_open_callout(self, event, event_position, &status, callout);
             self.install_dispatch(
                 event_position,
                 shared_state,
                 local_state,
+                outgoing,
                 status,
                 next_callout,
-                reacted_step,
             )?;
             return Ok(None);
         }
 
-        let (trace_event, proposal_effects, establishing_frame) =
-            normalize_proposal_event(self, event, &shared_state, indexed_effects, broadcast_index)?;
-        if lifecycle.is_some()
-            && proposal_effects
-                .iter()
-                .any(|(_, effect)| matches!(effect, Effect::Broadcast { .. }))
-        {
-            return Err(ProtocolError::InvalidTerminalStatus);
+        let mut outgoing = self.outgoing.clone();
+        // The author dispatches the same two-field event a receiver builds from
+        // the frame; the entry is built from the shared coordinates here, so
+        // author and receivers produce byte-identical entries by construction.
+        let is_own_message =
+            matches!(event, Event::MessageReceived { from, .. } if *from == self.producer);
+        if is_own_message {
+            let Event::MessageReceived { msg, .. } = event else {
+                return Err(ProtocolError::InvalidTerminalStatus);
+            };
+            let Some(head) = outgoing.first() else {
+                return Err(ProtocolError::NotQueuedMessage);
+            };
+            if head.as_slice() != msg.as_slice() {
+                return Err(ProtocolError::NotQueuedMessage);
+            }
+            outgoing.remove(0);
         }
+        let trace_event = match event {
+            Event::SessionStarted { ensemble } => StepEvent::SessionStarted {
+                ensemble: ensemble.clone(),
+            },
+            Event::MessageReceived { from, msg } => StepEvent::Message {
+                from: *from,
+                data: msg.clone(),
+            },
+            Event::InputReceived { .. } | Event::TimerFired { .. } => {
+                return Err(ProtocolError::InvalidCertificate(
+                    "shared dispatch requires a portable event".into(),
+                ));
+            }
+        };
+        append_broadcasts(&mut outgoing, effects)?;
+        let proposal_effects = indexed_effects
+            .into_iter()
+            .filter(|(_, effect)| !matches!(effect, Effect::Broadcast { .. }))
+            .collect::<Vec<_>>();
         let entry = TraceEntry {
             trace_version: TRACE_FORMAT_VERSION,
             step: self.agreed_step,
             event: trace_event,
             pre_state: self.agreed_state,
             post_state,
-            terminal: lifecycle,
+            terminal: lifecycle.as_ref().and_then(StepTerminal::from_effect),
             agreement: AggregateAttestation::empty(),
         };
         let commitment =
             StepCommitment::for_entry(self.binding.session_id(), &entry, self.agreed_link);
+        let establishing_frame = if is_own_message {
+            let Event::MessageReceived { msg, .. } = event else {
+                return Err(ProtocolError::InvalidTerminalStatus);
+            };
+            Some(ExecFrame::Message {
+                commitment: commitment.clone(),
+                data: msg.clone(),
+            })
+        } else {
+            None
+        };
         let status = proposal_status(&entry, &commitment, terminal_outcome)?;
         let next_callout = next_open_callout(self, event, event_position, &status, callout);
         let proposal = SharedProposal::new(
@@ -709,31 +752,30 @@ impl ExecutionState {
             entry,
             shared_state,
             local_state,
+            outgoing,
             proposal_effects,
             event_position,
             status,
             next_callout,
             Vec::new(),
         )?;
-        self.stage_proposal(proposal, reacted_step)?;
+        self.stage_proposal(proposal)?;
         Ok(establishing_frame)
     }
 
     /// Install one accepted dispatch that does not require shared agreement.
     ///
-    /// Such a dispatch may replace either memory and may leave a callout open,
+    /// Such a dispatch may replace local memory and may leave a callout open,
     /// but its shared payload must hash to the current agreed shared state. A
-    /// dispatch that changes that hash belongs in [`Self::stage_proposal`].
-    /// `reacted_step` records a `React` dispatch in the same durable mutation;
-    /// ordinary events pass `None`.
+    /// dispatch that changes that hash is rejected by [`Self::apply_dispatch`].
     fn install_dispatch(
         &mut self,
         event_position: u64,
         shared_state: SharedStateBytes,
         local_state: LocalStateBytes,
+        outgoing: Vec<Vec<u8>>,
         status: ExecutionStatus,
         callout: Option<OpenCallout>,
-        reacted_step: Option<u64>,
     ) -> Result<(), ProtocolError> {
         if self.proposal.is_some() {
             return Err(ProtocolError::SharedProposalExists);
@@ -755,14 +797,6 @@ impl ExecutionState {
         if StateHash::of_shared(&shared_state) != self.agreed_state {
             return Err(ProtocolError::StateHashMismatch);
         }
-        if let Some(step) = reacted_step
-            && (step >= self.agreed_step
-                || self
-                    .last_reacted_step
-                    .is_some_and(|previous| step <= previous))
-        {
-            return Err(ProtocolError::InvalidTerminalStatus);
-        }
         let next_event_position = event_position
             .checked_add(1)
             .ok_or(ProtocolError::VersionExhausted)?;
@@ -771,11 +805,9 @@ impl ExecutionState {
         next.event_position = next_event_position;
         next.shared_state = shared_state;
         next.local_state = local_state;
+        next.outgoing = outgoing;
         next.status = status;
         next.callout = callout;
-        if let Some(step) = reacted_step {
-            next.last_reacted_step = Some(step);
-        }
         next.bump_version()?;
         next.validate_recovered()?;
         *self = next;
@@ -784,15 +816,9 @@ impl ExecutionState {
 
     /// Stage one dispatch result for signature collection.
     ///
-    /// `reacted_step` records a `React` dispatch that produced this result. It
-    /// is consumed atomically with proposal staging so recovery cannot rerun
-    /// that reaction; the proposed memories and status remain uncommitted
+    /// The proposed memories, outgoing queue, and status remain uncommitted
     /// until the step receives agreement.
-    fn stage_proposal(
-        &mut self,
-        proposal: SharedProposal,
-        reacted_step: Option<u64>,
-    ) -> Result<(), ProtocolError> {
+    fn stage_proposal(&mut self, proposal: SharedProposal) -> Result<(), ProtocolError> {
         if self.proposal.is_some() {
             return Err(ProtocolError::SharedProposalExists);
         }
@@ -807,14 +833,6 @@ impl ExecutionState {
                 "proposal event position is not the next event position".into(),
             ));
         }
-        if let Some(step) = reacted_step
-            && (step >= self.agreed_step
-                || self
-                    .last_reacted_step
-                    .is_some_and(|previous| step <= previous))
-        {
-            return Err(ProtocolError::InvalidTerminalStatus);
-        }
         let next_event_position = self
             .event_position
             .checked_add(1)
@@ -828,10 +846,24 @@ impl ExecutionState {
         self.check_proposal_receipt_budget(&proposal)?;
         let mut next = self.clone();
         next.event_position = next_event_position;
-        if let Some(step) = reacted_step {
-            next.last_reacted_step = Some(step);
-        }
         next.proposal = Some(proposal);
+        next.bump_version()?;
+        next.validate_recovered()?;
+        *self = next;
+        Ok(())
+    }
+
+    /// Remove the head of the outgoing queue after its message was rejected by
+    /// the program. Errors when the queue is empty or a proposal is staged.
+    pub fn drop_outgoing_head(&mut self) -> Result<(), ProtocolError> {
+        if self.proposal.is_some() {
+            return Err(ProtocolError::SharedProposalExists);
+        }
+        if self.outgoing.is_empty() {
+            return Err(ProtocolError::NotQueuedMessage);
+        }
+        let mut next = self.clone();
+        next.outgoing.remove(0);
         next.bump_version()?;
         next.validate_recovered()?;
         *self = next;
@@ -896,21 +928,12 @@ impl ExecutionState {
             });
         }
         if let Some(proposal) = &self.proposal {
-            if let Event::MessageReceived {
-                message_id,
-                from,
-                position,
-                pre_state,
-                msg,
-            } = &proposal.entry.event
+            if let StepEvent::Message { from, data } = &proposal.entry.event
                 && *from == me
             {
                 frames.push(ExecFrame::Message {
-                    message_id: *message_id,
-                    seq: *position,
-                    prestate: *pre_state,
-                    data: msg.clone(),
-                    poststate: proposal.commitment.post_state,
+                    commitment: proposal.commitment.clone(),
+                    data: data.clone(),
                 });
             }
             if let Some(signature) = proposal
@@ -968,8 +991,7 @@ impl ExecutionState {
         certificate.verify(&self.binding)?;
         let next = self.step_cursor().advance(&certificate.commitment)?;
         let trace_bytes = self.check_receipt_budget(&proposal.entry)?;
-        let expected_successor = self.deferred_broadcast_successor(proposal)?;
-        // Tripwire for the reservation made when the origin was staged.
+        // Tripwire for the reservation made when the proposal was staged.
         self.check_proposal_receipt_budget(proposal)?;
         let mut committed = self
             .proposal
@@ -983,79 +1005,12 @@ impl ExecutionState {
         self.last_certificate = Some(certificate);
         self.shared_state = committed.shared_state.clone();
         self.local_state = committed.local_state.clone();
+        self.outgoing = committed.outgoing.clone();
         self.status = committed.status.clone();
         self.begin_end();
         self.callout = committed.callout.clone();
-        self.proposal = expected_successor;
+        self.proposal = None;
         Ok(committed)
-    }
-
-    /// Build the deterministic successor proposal for a retained broadcast.
-    ///
-    /// A broadcast emitted by an agreed event is the next agreed event, not a
-    /// second dispatch. The successor therefore reuses the originating event
-    /// position, carries the just-committed memories and status, and has no
-    /// effects of its own. The state machine installs this successor itself
-    /// when the originating proposal reaches N-of-N agreement.
-    fn deferred_broadcast_successor(
-        &self,
-        proposal: &SharedProposal,
-    ) -> Result<Option<SharedProposal>, ProtocolError> {
-        let Some(data) = proposal
-            .effects
-            .iter()
-            .find_map(|(_, effect)| match effect {
-                Effect::Broadcast { data } => Some(data.as_slice()),
-                _ => None,
-            })
-        else {
-            return Ok(None);
-        };
-        let step = proposal
-            .commitment
-            .step
-            .checked_add(1)
-            .ok_or(ProtocolError::AgreedStepExhausted)?;
-        let pre_state = proposal.commitment.post_state;
-        let event = Event::MessageReceived {
-            message_id: MessageId::derive(
-                self.binding.session_id(),
-                self.producer,
-                step,
-                pre_state,
-                pre_state,
-                data,
-            ),
-            from: self.producer,
-            position: step,
-            pre_state,
-            msg: data.to_vec(),
-        };
-        let entry = TraceEntry {
-            trace_version: TRACE_FORMAT_VERSION,
-            step,
-            event,
-            pre_state,
-            post_state: pre_state,
-            terminal: None,
-            agreement: AggregateAttestation::empty(),
-        };
-        let commitment = StepCommitment::for_entry(
-            self.binding.session_id(),
-            &entry,
-            proposal.commitment.link_hash(),
-        );
-        Ok(Some(SharedProposal::new(
-            commitment,
-            entry,
-            proposal.shared_state.clone(),
-            proposal.local_state.clone(),
-            Vec::new(),
-            proposal.event_position,
-            proposal.status.clone(),
-            proposal.callout.clone(),
-            Vec::new(),
-        )?))
     }
 
     /// Accept an authenticated stop at the current agreed cursor.
@@ -1237,12 +1192,7 @@ impl ExecutionState {
                 step: self.agreed_step,
             });
         }
-        if self
-            .last_reacted_step
-            .is_some_and(|step| step >= self.agreed_step)
-        {
-            return Err(ProtocolError::InvalidTerminalStatus);
-        }
+        validate_outgoing(&self.outgoing)?;
         self.validate_end()?;
         match &self.last_certificate {
             Some(certificate)
@@ -1279,12 +1229,14 @@ impl ExecutionState {
                     "pending proposal is not paired with the next event position".into(),
                 ));
             }
+            validate_effects(proposal.effects())?;
             validate_proposal(
                 &self.binding,
                 self.step_cursor(),
                 proposal.event_position,
                 proposal,
             )?;
+            validate_outgoing(proposal.outgoing())?;
             self.check_proposal_receipt_budget(proposal)?;
             if !matches!(proposal.status(), ExecutionStatus::Active) && proposal.callout().is_some()
             {
@@ -1296,13 +1248,6 @@ impl ExecutionState {
 }
 
 fn indexed_dispatch_effects(effects: &[Effect]) -> Result<Vec<(u32, Effect)>, ProtocolError> {
-    if effects.len() > MAX_EFFECTS {
-        return Err(ProtocolError::CollectionTooLarge {
-            kind: "effects",
-            actual: effects.len(),
-            max: MAX_EFFECTS,
-        });
-    }
     effects
         .iter()
         .enumerate()
@@ -1394,79 +1339,40 @@ fn next_open_callout(
     })
 }
 
-fn reacted_step(
-    state: &ExecutionState,
-    event: &Event<Vec<u8>>,
-) -> Result<Option<u64>, ProtocolError> {
-    if !matches!(event, Event::React) {
-        return Ok(None);
+/// Append every broadcast effect to the durable outgoing queue.
+///
+/// The sandbox already enforces the queue bound against the committed length;
+/// this is the durable boundary check.
+fn append_broadcasts(outgoing: &mut Vec<Vec<u8>>, effects: &[Effect]) -> Result<(), ProtocolError> {
+    for effect in effects {
+        if let Effect::Broadcast { data } = effect {
+            if outgoing.len() >= super::MAX_OUTGOING_MESSAGES {
+                return Err(ProtocolError::OutgoingQueueFull {
+                    actual: outgoing.len(),
+                    max: super::MAX_OUTGOING_MESSAGES,
+                });
+            }
+            outgoing.push(data.clone());
+        }
     }
-    state
-        .agreed_step
-        .checked_sub(1)
-        .map(Some)
-        .ok_or(ProtocolError::InvalidTerminalStatus)
+    Ok(())
 }
 
-type NormalizedProposalEvent = (Event<Vec<u8>>, Vec<(u32, Effect)>, Option<(u32, ExecFrame)>);
-
-fn normalize_proposal_event(
-    state: &ExecutionState,
-    event: &Event<Vec<u8>>,
-    shared: &SharedStateBytes,
-    mut proposal_effects: Vec<(u32, Effect)>,
-    broadcast_index: Option<usize>,
-) -> Result<NormalizedProposalEvent, ProtocolError> {
-    if let Some(index) = broadcast_index
-        && matches!(
-            event,
-            Event::InputReceived { .. } | Event::TimerFired { .. } | Event::React
-        )
-    {
-        let Effect::Broadcast { data } = &proposal_effects[index].1 else {
-            return Err(ProtocolError::InvalidCertificate(
-                "broadcast ordinal does not identify a broadcast".into(),
-            ));
-        };
-        let data = data.clone();
-        let ordinal = proposal_effects[index].0;
-        proposal_effects.remove(index);
-        let post_state = StateHash::of_shared(shared);
-        let message_id = MessageId::derive(
-            state.binding.session_id(),
-            state.producer,
-            state.agreed_step,
-            state.agreed_state,
-            post_state,
-            &data,
-        );
-        let frame = ExecFrame::Message {
-            message_id,
-            seq: state.agreed_step,
-            prestate: state.agreed_state,
-            poststate: post_state,
-            data: data.clone(),
-        };
-        return Ok((
-            Event::MessageReceived {
-                message_id,
-                from: state.producer,
-                position: state.agreed_step,
-                pre_state: state.agreed_state,
-                msg: data,
-            },
-            proposal_effects,
-            Some((ordinal, frame)),
-        ));
+fn validate_outgoing(outgoing: &[Vec<u8>]) -> Result<(), ProtocolError> {
+    if outgoing.len() > super::MAX_OUTGOING_MESSAGES {
+        return Err(ProtocolError::OutgoingQueueFull {
+            actual: outgoing.len(),
+            max: super::MAX_OUTGOING_MESSAGES,
+        });
     }
-    match event {
-        Event::SessionStarted { .. } | Event::MessageReceived { .. } => {
-            Ok((event.clone(), proposal_effects, None))
-        }
-        _ => Err(ProtocolError::InvalidCertificate(
-            "shared dispatch requires a portable event or a broadcast".into(),
-        )),
+    for message in outgoing {
+        ensure_payload(
+            "outgoing message",
+            message.len(),
+            super::MAX_EFFECT_PAYLOAD_BYTES,
+        )?;
     }
+    Ok(())
 }
 
 fn proposal_status(
@@ -1476,7 +1382,7 @@ fn proposal_status(
 ) -> Result<ExecutionStatus, ProtocolError> {
     if let Some(terminal) = &entry.terminal {
         match terminal {
-            Effect::SessionEnd {
+            StepTerminal::End {
                 outcome: effect_outcome,
             } => {
                 let outcome = terminal_outcome.ok_or(ProtocolError::TerminalOutcomeRequired)?;
@@ -1485,14 +1391,13 @@ fn proposal_status(
                 }
                 return Ok(ExecutionStatus::Certified { outcome });
             }
-            Effect::SessionAbort { .. } | Effect::Fail { .. } => {
+            StepTerminal::Abort { .. } | StepTerminal::Fail { .. } => {
                 if terminal_outcome.is_some() {
                     return Err(ProtocolError::TerminalOutcomeMismatch);
                 }
                 return ExecutionStatus::from_shared_entry(entry, commitment.clone())?
                     .ok_or(ProtocolError::InvalidTerminalStatus);
             }
-            _ => return Err(ProtocolError::InvalidTerminalStatus),
         }
     }
     if terminal_outcome.is_some() {
@@ -1514,8 +1419,9 @@ mod tests {
     };
     use crate::trace::{AggregateAttestation, CHAIN_START, TRACE_FORMAT_VERSION};
     use crate::{
-        AbortKind, AbortOccurrence, Ensemble, Event, LocalStateBytes, MessageId, NegotiationId,
-        OpenCallout, SharedStateBytes, StateHash, StopCause, TicketAction, TraceEntry, pending_id,
+        AbortKind, AbortOccurrence, Ensemble, Event, LocalStateBytes, NegotiationId, OpenCallout,
+        SharedStateBytes, StateHash, StepEvent, StepTerminal, StopCause, TicketAction, TraceEntry,
+        pending_id,
     };
 
     struct Fixture {
@@ -1708,6 +1614,28 @@ mod tests {
         );
     }
 
+    /// Add every participant signature to the staged proposal and push the
+    /// certified entry into `trace`.
+    fn certify_pending(state: &mut ExecutionState, fixture: &Fixture, trace: &mut Vec<TraceEntry>) {
+        let commitment = state.pending_shared().unwrap().commitment().clone();
+        for (index, (peer, key)) in fixture.participants.iter().enumerate() {
+            let committed = state
+                .add_step_signature(ParticipantStepSignature::new(
+                    *peer,
+                    commitment.step,
+                    key.sign(&commitment.signing_bytes()),
+                ))
+                .unwrap();
+            if index + 1 < fixture.participants.len() {
+                assert!(committed.is_none());
+                assert_eq!(state.status(), &ExecutionStatus::Active);
+            }
+            if let Some(committed) = committed {
+                trace.push(committed.entry().clone());
+            }
+        }
+    }
+
     fn terminal_state(fixture: &Fixture, terminal: Effect) -> ExecutionState {
         let mut state = active_state(fixture);
         let ensemble =
@@ -1761,26 +1689,23 @@ mod tests {
             Ensemble::from_peers(fixture.participants.iter().map(|(peer, _)| *peer).collect())
                 .expect("complete ensemble");
         let post_state = StateHash::of_shared(&shared_state);
+        // A remote sender keeps the built entry a peer message rather than an
+        // authored own message, which `apply_dispatch` requires to be queued.
+        let sender = fixture
+            .participants
+            .iter()
+            .map(|(peer, _)| *peer)
+            .find(|peer| *peer != fixture.producer())
+            .unwrap_or_else(|| fixture.producer());
         let entry = TraceEntry {
             trace_version: TRACE_FORMAT_VERSION,
             step: state.agreed_step(),
             event: if state.agreed_step() == 0 {
-                Event::SessionStarted { ensemble }
+                StepEvent::SessionStarted { ensemble }
             } else {
-                let msg = vec![0x01];
-                Event::MessageReceived {
-                    message_id: MessageId::derive(
-                        fixture.activation.session_hash(),
-                        fixture.producer(),
-                        state.agreed_step(),
-                        state.agreed_state(),
-                        post_state,
-                        &msg,
-                    ),
-                    from: fixture.producer(),
-                    position: state.agreed_step(),
-                    pre_state: state.agreed_state(),
-                    msg,
+                StepEvent::Message {
+                    from: sender,
+                    data: vec![0x01],
                 }
             },
             pre_state: state.agreed_state(),
@@ -1798,6 +1723,7 @@ mod tests {
             entry,
             shared_state,
             local_state,
+            Vec::new(),
             Vec::new(),
             state.event_position(),
             ExecutionStatus::active(),
@@ -2005,6 +1931,346 @@ mod tests {
         assert!(state.callout().is_none());
     }
 
+    fn local_timer_event() -> Event<Vec<u8>> {
+        Event::TimerFired {
+            timer: crate::TimerPayload::unit(),
+        }
+    }
+
+    /// An active execution whose step-0 `SessionStarted` entry is certified.
+    fn started_state(fixture: &Fixture) -> ExecutionState {
+        started_state_as(fixture, fixture.producer())
+    }
+
+    /// An active execution for `producer` whose step-0 `SessionStarted` entry
+    /// is certified.
+    fn started_state_as(fixture: &Fixture, producer: PeerId) -> ExecutionState {
+        let mut state = ExecutionState::new(
+            ExecId([0x44; 32]),
+            fixture.activation.clone(),
+            producer,
+            fixture.initial.clone(),
+            LocalStateBytes::try_new(vec![0x90]).expect("bounded local state"),
+        )
+        .expect("valid execution state");
+        state.activate().expect("activation transition");
+        let ensemble =
+            Ensemble::from_peers(fixture.participants.iter().map(|(peer, _)| *peer).collect())
+                .expect("complete ensemble");
+        state
+            .apply_dispatch(
+                &Event::SessionStarted { ensemble },
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let commitment = state.pending_shared().unwrap().commitment().clone();
+        for (peer, key) in &fixture.participants {
+            state
+                .add_step_signature(ParticipantStepSignature::new(
+                    *peer,
+                    commitment.step,
+                    key.sign(&commitment.signing_bytes()),
+                ))
+                .unwrap();
+        }
+        state
+    }
+
+    #[test]
+    fn local_dispatch_changing_shared_state_is_rejected() {
+        let fixture = fixture();
+        let mut state = active_state(&fixture);
+        let before = state.clone();
+        let changed = SharedStateBytes::try_new(vec![0x7f]).expect("state");
+        let error = state
+            .apply_dispatch(
+                &local_timer_event(),
+                changed,
+                state.local_state().clone(),
+                &[],
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error, ProtocolError::LocalSharedChange);
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn local_broadcast_is_queued_and_installs_without_a_proposal() {
+        let fixture = fixture();
+        let mut state = active_state(&fixture);
+        let before_step = state.agreed_step();
+        let before_position = state.event_position();
+        state
+            .apply_dispatch(
+                &local_timer_event(),
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[Effect::Broadcast { data: vec![0xaa] }],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(state.pending_shared().is_none());
+        assert_eq!(state.outgoing(), &[vec![0xaa]]);
+        assert_eq!(state.agreed_step(), before_step);
+        assert_eq!(state.event_position(), before_position + 1);
+    }
+
+    #[test]
+    fn own_message_must_match_the_outgoing_head() {
+        let fixture = fixture();
+        let mut state = started_state(&fixture);
+        state
+            .apply_dispatch(
+                &local_timer_event(),
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[Effect::Broadcast { data: vec![0xaa] }],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let before = state.clone();
+        let mismatched = Event::MessageReceived {
+            from: fixture.producer(),
+            msg: vec![0xbb],
+        };
+        assert_eq!(
+            state.apply_dispatch(
+                &mismatched,
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[],
+                None,
+                None,
+                None,
+            ),
+            Err(ProtocolError::NotQueuedMessage)
+        );
+        assert_eq!(state, before);
+
+        let matching = Event::MessageReceived {
+            from: fixture.producer(),
+            msg: vec![0xaa],
+        };
+        let frame = state
+            .apply_dispatch(
+                &matching,
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[],
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .expect("establishing frame");
+        assert!(matches!(frame, ExecFrame::Message { data, .. } if data == vec![0xaa]));
+        assert!(
+            state
+                .pending_shared()
+                .expect("proposal")
+                .outgoing()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn own_message_stages_outgoing_and_installs_it_at_certification() {
+        let fixture = fixture();
+        let mut state = started_state(&fixture);
+        state
+            .apply_dispatch(
+                &local_timer_event(),
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[Effect::Broadcast { data: vec![0xaa] }],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let matching = Event::MessageReceived {
+            from: fixture.producer(),
+            msg: vec![0xaa],
+        };
+        state
+            .apply_dispatch(
+                &matching,
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[Effect::Broadcast { data: vec![0xbb] }],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        // The committed queue still holds the authored head until the step is
+        // certified; the proposal carries the post-dispatch queue.
+        assert_eq!(state.outgoing(), &[vec![0xaa]]);
+        assert_eq!(
+            state.pending_shared().expect("proposal").outgoing(),
+            &[vec![0xbb]]
+        );
+        let commitment = state.pending_shared().unwrap().commitment().clone();
+        for (peer, key) in &fixture.participants {
+            state
+                .add_step_signature(ParticipantStepSignature::new(
+                    *peer,
+                    commitment.step,
+                    key.sign(&commitment.signing_bytes()),
+                ))
+                .unwrap();
+        }
+        assert!(state.pending_shared().is_none());
+        assert_eq!(state.outgoing(), &[vec![0xbb]]);
+    }
+
+    #[test]
+    fn author_and_receiver_build_identical_entries_for_the_same_message() {
+        let fixture = fixture();
+        let author_peer = fixture.producer();
+        let receiver_peer = fixture
+            .participants
+            .iter()
+            .map(|(peer, _)| *peer)
+            .find(|peer| *peer != author_peer)
+            .expect("a remote participant");
+
+        // The author queues the message, then applies its own message.
+        let mut author = started_state(&fixture);
+        author
+            .apply_dispatch(
+                &local_timer_event(),
+                author.shared_state().clone(),
+                author.local_state().clone(),
+                &[Effect::Broadcast { data: vec![0xaa] }],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        author
+            .apply_dispatch(
+                &Event::MessageReceived {
+                    from: author_peer,
+                    msg: vec![0xaa],
+                },
+                author.shared_state().clone(),
+                author.local_state().clone(),
+                &[],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // A different participant applies the same message from a different
+        // local queue length. The entry must be byte-identical.
+        let mut receiver = started_state_as(&fixture, receiver_peer);
+        receiver
+            .apply_dispatch(
+                &local_timer_event(),
+                receiver.shared_state().clone(),
+                receiver.local_state().clone(),
+                &[Effect::Broadcast { data: vec![0xcc] }],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        receiver
+            .apply_dispatch(
+                &Event::MessageReceived {
+                    from: author_peer,
+                    msg: vec![0xaa],
+                },
+                receiver.shared_state().clone(),
+                receiver.local_state().clone(),
+                &[],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let authored = author.pending_shared().expect("author proposal");
+        let received = receiver.pending_shared().expect("receiver proposal");
+        assert_eq!(authored.commitment(), received.commitment());
+        assert_eq!(
+            borsh::to_vec(authored.entry()).expect("encode author entry"),
+            borsh::to_vec(received.entry()).expect("encode receiver entry"),
+        );
+    }
+
+    #[test]
+    fn drop_outgoing_head_removes_only_the_oldest_message() {
+        let fixture = fixture();
+        let mut state = active_state(&fixture);
+        state
+            .apply_dispatch(
+                &local_timer_event(),
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[
+                    Effect::Broadcast { data: vec![1] },
+                    Effect::Broadcast { data: vec![2] },
+                ],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(state.outgoing(), &[vec![1], vec![2]]);
+        state.drop_outgoing_head().unwrap();
+        assert_eq!(state.outgoing(), &[vec![2]]);
+        state.drop_outgoing_head().unwrap();
+        assert_eq!(
+            state.drop_outgoing_head(),
+            Err(ProtocolError::NotQueuedMessage)
+        );
+    }
+
+    #[test]
+    fn effect_budget_is_exact_at_the_aggregate_bound() {
+        let broadcast = |bytes: usize| Effect::Broadcast {
+            data: vec![0u8; bytes],
+        };
+        // The aggregate counts the canonical `Vec<Effect>` length prefix, so 63
+        // maximal broadcasts fit and 64 do not.
+        let fits: Vec<Effect> = (0..63).map(|_| broadcast(64 * 1024)).collect();
+        assert!(crate::execution::check_effect_budget(fits.iter()).is_ok());
+        let over: Vec<Effect> = (0..64).map(|_| broadcast(64 * 1024)).collect();
+        assert!(matches!(
+            crate::execution::check_effect_budget(over.iter()),
+            Err(ProtocolError::EncodedTooLarge { .. })
+        ));
+        // One byte over the per-effect payload bound is rejected at emission.
+        assert!(matches!(
+            crate::execution::check_effect_budget([&broadcast(64 * 1024 + 1)]),
+            Err(ProtocolError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn outgoing_queue_bound_is_enforced_on_decode() {
+        let fixture = fixture();
+        let mut state = active_state(&fixture);
+        state.outgoing = vec![Vec::new(); super::super::MAX_OUTGOING_MESSAGES + 1];
+        let bytes = borsh::to_vec(&state).expect("encode");
+        assert!(ExecutionState::decode(&bytes).is_err());
+    }
+
     #[test]
     fn receipt_budget_refuses_the_next_step_without_changing_the_certified_prefix() {
         let fixture = fixture();
@@ -2019,24 +2285,9 @@ mod tests {
             )
             .entry()
             .event
-            .clone();
-            if let Event::MessageReceived {
-                message_id,
-                from,
-                position,
-                pre_state,
-                msg,
-            } = &mut event
-            {
+            .dispatch_event();
+            if let Event::MessageReceived { msg, .. } = &mut event {
                 *msg = vec![1; super::super::MAX_EFFECT_PAYLOAD_BYTES];
-                *message_id = MessageId::derive(
-                    fixture.activation.session_hash(),
-                    *from,
-                    *position,
-                    *pre_state,
-                    state.agreed_state(),
-                    msg,
-                );
             }
             let before = state.clone();
             let result = state.apply_dispatch(
@@ -2052,47 +2303,6 @@ mod tests {
                 assert_eq!(step, before.agreed_step());
                 assert_eq!(state, before);
                 assert!(state.agreed_step() > 1);
-                // The small originating event fits on its own, but its
-                // deferred broadcast would not. Refuse the entire dispatch
-                // before either entry can be staged or signed.
-                let small_event = proposal_for(
-                    &fixture,
-                    &state,
-                    state.shared_state().clone(),
-                    state.local_state().clone(),
-                )
-                .entry()
-                .event
-                .clone();
-                let mut without_broadcast = state.clone();
-                without_broadcast
-                    .apply_dispatch(
-                        &small_event,
-                        state.shared_state().clone(),
-                        state.local_state().clone(),
-                        &[],
-                        None,
-                        None,
-                        None,
-                    )
-                    .expect("originating entry still fits");
-                assert!(matches!(
-                    state.apply_dispatch(
-                        &small_event,
-                        state.shared_state().clone(),
-                        state.local_state().clone(),
-                        &[Effect::Broadcast {
-                            data: vec![1; super::super::MAX_EFFECT_PAYLOAD_BYTES],
-                        }],
-                        None,
-                        None,
-                        None,
-                    ),
-                    Err(ProtocolError::ReceiptBudgetExhausted { step })
-                        if step == before.agreed_step()
-                ));
-                assert_eq!(state, before);
-                assert_recovery_rejects_over_budget_broadcast(&fixture, &state, &small_event);
                 // A terminal step is subject to the same check; it cannot
                 // certify an outcome that leaves local assembly impossible.
                 assert!(matches!(
@@ -2133,64 +2343,6 @@ mod tests {
         }
     }
 
-    fn assert_recovery_rejects_over_budget_broadcast(
-        fixture: &Fixture,
-        prefix: &ExecutionState,
-        event: &Event<Vec<u8>>,
-    ) {
-        let mut state = prefix.clone();
-        state
-            .apply_dispatch(
-                event,
-                state.shared_state().clone(),
-                state.local_state().clone(),
-                &[Effect::Broadcast { data: vec![1] }],
-                None,
-                None,
-                None,
-            )
-            .expect("small deferred broadcast fits");
-        assert_eq!(
-            ExecutionState::decode(&state.encode().unwrap()).unwrap(),
-            state
-        );
-        assert_eq!(
-            serde_json::from_slice::<ExecutionState>(&serde_json::to_vec(&state).unwrap()).unwrap(),
-            state
-        );
-
-        // Corrupt only the retained payload. The certified prefix and its
-        // byte counter remain authentic; the missing reservation is the
-        // sole reason both aggregate decode boundaries must reject it.
-        state.proposal.as_mut().unwrap().effects[0].1 = Effect::Broadcast {
-            data: vec![1; super::super::MAX_EFFECT_PAYLOAD_BYTES],
-        };
-        let expected_error = format!("receipt budget exhausted at step {}", state.agreed_step());
-        let borsh_error = ExecutionState::decode(&state.encode().unwrap()).unwrap_err();
-        assert!(borsh_error.to_string().contains(&expected_error));
-        let serde_error =
-            serde_json::from_slice::<ExecutionState>(&serde_json::to_vec(&state).unwrap())
-                .unwrap_err();
-        assert!(serde_error.to_string().contains(&expected_error));
-
-        // Even an invalid in-memory aggregate must fail before retaining
-        // the first signature, leaving its signer free to authenticate Fail.
-        let before = state.clone();
-        let commitment = state.pending_shared().unwrap().commitment();
-        let (peer, key) = &fixture.participants[0];
-        let signature = ParticipantStepSignature::new(
-            *peer,
-            commitment.step,
-            key.sign(&commitment.signing_bytes()),
-        );
-        assert!(matches!(
-            state.add_step_signature(signature),
-            Err(ProtocolError::ReceiptBudgetExhausted { step }) if step == prefix.agreed_step()
-        ));
-        assert_eq!(state, before);
-        assert!(state.pending_shared().unwrap().signatures().is_empty());
-    }
-
     #[test]
     fn certified_session_end_is_complete_receipt_evidence() {
         let fixture = fixture();
@@ -2200,48 +2352,45 @@ mod tests {
                 .unwrap();
         let outcome = TerminalOutcome::new(vec![7], b"7".to_vec()).unwrap();
         let mut trace = Vec::new();
-        for (event, effects, projection) in [
-            (Event::SessionStarted { ensemble }, vec![], None),
-            (
-                Event::React,
-                vec![
-                    Effect::Broadcast { data: vec![1] },
-                    Effect::SessionEnd { outcome: vec![7] },
-                ],
+
+        // Step 0: the session boundary, with no effects.
+        state
+            .apply_dispatch(
+                &Event::SessionStarted { ensemble },
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        certify_pending(&mut state, &fixture, &mut trace);
+
+        // Step 1: an agreed message that ends the session. The broadcast it
+        // emits is queued, not staged as an effect.
+        let remote = fixture
+            .participants
+            .iter()
+            .map(|(peer, _)| *peer)
+            .find(|peer| *peer != fixture.producer())
+            .unwrap();
+        let msg = vec![1u8];
+        let event = Event::MessageReceived { from: remote, msg };
+        state
+            .apply_dispatch(
+                &event,
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[Effect::SessionEnd { outcome: vec![7] }],
                 Some(outcome.clone()),
-            ),
-        ] {
-            state
-                .apply_dispatch(
-                    &event,
-                    state.shared_state().clone(),
-                    state.local_state().clone(),
-                    &effects,
-                    projection,
-                    None,
-                    None,
-                )
-                .unwrap();
-            // Even an unchanged shared image requires agreement for SessionEnd.
-            assert_eq!(state.status(), &ExecutionStatus::Active);
-            let commitment = state.pending_shared().unwrap().commitment().clone();
-            for (index, (peer, key)) in fixture.participants.iter().enumerate() {
-                let committed = state
-                    .add_step_signature(ParticipantStepSignature::new(
-                        *peer,
-                        commitment.step,
-                        key.sign(&commitment.signing_bytes()),
-                    ))
-                    .unwrap();
-                if index + 1 < fixture.participants.len() {
-                    assert!(committed.is_none());
-                    assert_eq!(state.status(), &ExecutionStatus::Active);
-                }
-                if let Some(committed) = committed {
-                    trace.push(committed.entry().clone());
-                }
-            }
-        }
+                None,
+                None,
+            )
+            .unwrap();
+        // Even an unchanged shared image requires agreement for SessionEnd.
+        assert_eq!(state.status(), &ExecutionStatus::Active);
+        certify_pending(&mut state, &fixture, &mut trace);
         assert_eq!(
             state.status(),
             &ExecutionStatus::Certified {
@@ -2280,7 +2429,7 @@ mod tests {
 
         // A validly signed different terminal kind cannot claim completion.
         let mut stopped = trace.clone();
-        stopped.last_mut().unwrap().terminal = Some(Effect::SessionAbort {
+        stopped.last_mut().unwrap().terminal = Some(StepTerminal::Abort {
             reason: "stop".into(),
         });
         let previous = StepCommitment::for_entry(
@@ -2361,7 +2510,7 @@ mod tests {
         )
         .entry()
         .event
-        .clone();
+        .dispatch_event();
         state
             .apply_dispatch(
                 &event,
@@ -2439,7 +2588,7 @@ mod tests {
                 .expect("maximal proposed local state"),
         );
         state
-            .stage_proposal(proposal, None)
+            .stage_proposal(proposal)
             .expect("maximal proposal staging");
         let encoded = state.encode().expect("maximal aggregate encoding");
         assert!(encoded.len() > 16 * 1024 * 1024);
@@ -2478,9 +2627,9 @@ mod tests {
                 state.event_position(),
                 fixture.initial.clone(),
                 local.clone(),
+                Vec::new(),
                 ExecutionStatus::active(),
                 Some(pending),
-                None,
             )
             .expect("dispatch installation");
         assert_eq!(state.event_position(), 1);
@@ -2495,8 +2644,8 @@ mod tests {
                 state.event_position() + 1,
                 fixture.initial.clone(),
                 local,
+                Vec::new(),
                 ExecutionStatus::active(),
-                None,
                 None,
             )
             .expect_err("wrong event coordinate must be rejected");
@@ -2532,9 +2681,7 @@ mod tests {
             SharedStateBytes::try_new(vec![0x51]).expect("state"),
             LocalStateBytes::try_new(vec![0x52]).expect("state"),
         );
-        state
-            .stage_proposal(proposal, None)
-            .expect("stage proposal");
+        state.stage_proposal(proposal).expect("stage proposal");
         let staged = state.pending_shared().expect("pending proposal").clone();
         let (signer, signer_key) = fixture
             .participants
@@ -2611,19 +2758,19 @@ mod tests {
         );
         malformed.commitment.post_state = StateHash([0xee; 32]);
         let before = state.clone();
-        assert!(state.stage_proposal(malformed, None).is_err());
+        assert!(state.stage_proposal(malformed).is_err());
         assert_eq!(state, before);
 
         let proposal = proposal_for(&fixture, &state, proposed_shared, proposed_local);
         state
-            .stage_proposal(proposal.clone(), None)
+            .stage_proposal(proposal.clone())
             .expect("valid proposal");
         assert_eq!(state.event_position(), 1);
         assert_eq!(state.pending_shared(), Some(&proposal));
 
         let after_stage = state.clone();
         assert_eq!(
-            state.stage_proposal(proposal, None).unwrap_err(),
+            state.stage_proposal(proposal).unwrap_err(),
             ProtocolError::SharedProposalExists
         );
         assert_eq!(state, after_stage);
@@ -2636,15 +2783,12 @@ mod tests {
         let proposed_shared = SharedStateBytes::try_new(vec![0x61, 0x62]).expect("state");
         let proposed_local = LocalStateBytes::try_new(vec![0x71]).expect("state");
         state
-            .stage_proposal(
-                proposal_for(
-                    &fixture,
-                    &state,
-                    proposed_shared.clone(),
-                    proposed_local.clone(),
-                ),
-                None,
-            )
+            .stage_proposal(proposal_for(
+                &fixture,
+                &state,
+                proposed_shared.clone(),
+                proposed_local.clone(),
+            ))
             .expect("valid proposal");
         let staged = state.pending_shared().expect("staged proposal").clone();
 
@@ -2693,17 +2837,13 @@ mod tests {
         let second_shared = SharedStateBytes::try_new(vec![0x63]).expect("state");
         let second_local = LocalStateBytes::try_new(vec![0x73]).expect("state");
         state
-            .stage_proposal(
-                proposal_for(
-                    &fixture,
-                    &state,
-                    second_shared.clone(),
-                    second_local.clone(),
-                ),
-                Some(0),
-            )
-            .expect("reaction proposal");
-        assert_eq!(state.last_reacted_step(), Some(0));
+            .stage_proposal(proposal_for(
+                &fixture,
+                &state,
+                second_shared.clone(),
+                second_local.clone(),
+            ))
+            .expect("second proposal");
         let second_staged = state.pending_shared().expect("second proposal").clone();
         for (peer, key) in &fixture.participants {
             let signature = ParticipantStepSignature::new(
@@ -2716,166 +2856,45 @@ mod tests {
                 .expect("reaction signature");
         }
         assert_eq!(state.agreed_step(), 2);
-        assert_eq!(state.last_reacted_step(), Some(0));
         assert_eq!(state.shared_state(), &second_shared);
         assert_eq!(state.local_state(), &second_local);
     }
 
     #[test]
-    fn completing_a_deferred_broadcast_installs_one_successor_for_the_same_event() {
-        let fixture = fixture();
-        let mut state = active_state(&fixture);
-        let proposed_shared = SharedStateBytes::try_new(vec![0xb1, 0xb2]).expect("state");
-        let proposed_local = LocalStateBytes::try_new(vec![0xb3]).expect("state");
-        let broadcast = vec![0xb4, 0xb5];
-        let mut proposal = proposal_for(
-            &fixture,
-            &state,
-            proposed_shared.clone(),
-            proposed_local.clone(),
-        );
-        proposal.effects = vec![(
-            4,
-            Effect::Broadcast {
-                data: broadcast.clone(),
-            },
-        )];
-        state
-            .stage_proposal(proposal, None)
-            .expect("proposal with deferred broadcast");
-        let successor = state
-            .deferred_broadcast_successor(state.pending_shared().unwrap())
-            .expect("successor construction")
-            .expect("retained broadcast");
-        assert_eq!(successor.event_position(), 0);
-        assert!(successor.effects().is_empty());
-        assert_eq!(successor.shared_state(), &proposed_shared);
-        assert_eq!(successor.local_state(), &proposed_local);
-        let Event::MessageReceived {
-            message_id,
-            from,
-            position,
-            pre_state,
-            msg,
-        } = &successor.entry().event
-        else {
-            panic!("deferred broadcast must become a message event");
-        };
-        assert_eq!(*from, fixture.producer());
-        assert_eq!(*position, 1);
-        assert_eq!(*pre_state, StateHash::of_shared(&proposed_shared));
-        assert_eq!(msg, &broadcast);
-        assert_eq!(
-            *message_id,
-            MessageId::derive(
-                fixture.activation.session_hash(),
-                fixture.producer(),
-                1,
-                *pre_state,
-                *pre_state,
-                &broadcast,
-            )
-        );
-
-        let staged = state.pending_shared().expect("staged proposal").clone();
-        let first = &fixture.participants[0];
-        let first_signature = ParticipantStepSignature::new(
-            first.0,
-            staged.commitment().step,
-            first.1.sign(&staged.commitment().signing_bytes()),
-        );
-        assert!(
-            state
-                .add_step_signature(first_signature)
-                .expect("first signature")
-                .is_none()
-        );
-        let second = &fixture.participants[1];
-        let second_signature = ParticipantStepSignature::new(
-            second.0,
-            staged.commitment().step,
-            second.1.sign(&staged.commitment().signing_bytes()),
-        );
-        let committed = state
-            .add_step_signature(second_signature)
-            .expect("current agreement")
-            .expect("committed current proposal");
-        assert_eq!(
-            committed.effects(),
-            &[(4, Effect::Broadcast { data: broadcast })]
-        );
-        assert_eq!(state.event_position(), 1);
-        assert_eq!(state.agreed_step(), 1);
-        assert_eq!(state.pending_shared(), Some(&successor));
-
-        let recovered = ExecutionState::decode(&state.encode().expect("encode successor state"))
-            .expect("decode successor state");
-        assert_eq!(recovered, state);
-
-        let successor = state.pending_shared().expect("successor proposal").clone();
-        for (peer, key) in &fixture.participants {
-            let signature = ParticipantStepSignature::new(
-                *peer,
-                successor.commitment().step,
-                key.sign(&successor.commitment().signing_bytes()),
-            );
-            state
-                .add_step_signature(signature)
-                .expect("successor signature");
-        }
-        assert!(state.pending_shared().is_none());
-        assert_eq!(state.agreed_step(), 2);
-        assert_eq!(state.event_position(), 1);
-    }
-
-    #[test]
-    fn terminal_proposals_consume_establishing_broadcasts_but_reject_deferred_ones() {
+    fn terminal_proposal_validates_with_a_queued_broadcast() {
         let fixture = fixture();
         let state = active_state(&fixture);
         let terminal = Effect::SessionAbort {
             reason: "guest stopped".into(),
         };
 
-        let mut terminal_only = proposal_for(
+        let mut proposal = proposal_for(
             &fixture,
             &state,
             SharedStateBytes::try_new(vec![0xa1]).expect("state"),
             LocalStateBytes::try_new(vec![0xa2]).expect("state"),
         );
-        terminal_only.entry.terminal = Some(terminal.clone());
-        terminal_only.effects = vec![(0, terminal.clone())];
-        terminal_only.commitment = StepCommitment::for_entry(
+        proposal.entry.terminal = Some(
+            StepTerminal::from_effect(&terminal).expect("lifecycle effect is a terminal value"),
+        );
+        proposal.effects = vec![(0, terminal)];
+        proposal.outgoing = vec![vec![0xa3]];
+        proposal.commitment = StepCommitment::for_entry(
             fixture.activation.session_hash(),
-            &terminal_only.entry,
+            &proposal.entry,
             state.agreed_link(),
         );
-        terminal_only.status = ExecutionStatus::from_shared_entry(
-            &terminal_only.entry,
-            terminal_only.commitment.clone(),
-        )
-        .expect("terminal status construction")
-        .expect("abort status");
+        proposal.status =
+            ExecutionStatus::from_shared_entry(&proposal.entry, proposal.commitment.clone())
+                .expect("terminal status construction")
+                .expect("abort status");
         validate_proposal(
             state.binding(),
             state.step_cursor(),
             state.event_position(),
-            &terminal_only,
+            &proposal,
         )
-        .expect("terminal effect is valid when the establishing broadcast was consumed");
-
-        let mut terminal_with_broadcast = terminal_only.clone();
-        terminal_with_broadcast.effects =
-            vec![(0, terminal), (1, Effect::Broadcast { data: vec![0xa3] })];
-        assert!(matches!(
-            validate_proposal(
-                state.binding(),
-                state.step_cursor(),
-                state.event_position(),
-                &terminal_with_broadcast,
-            ),
-            Err(ProtocolError::InvalidCertificate(message))
-                if message == "terminal agreed event cannot defer a broadcast"
-        ));
+        .expect("a terminal proposal may retain a queued broadcast");
     }
 
     #[test]
@@ -2884,15 +2903,12 @@ mod tests {
         let mut state = active_state(&fixture);
         let staged_shared = SharedStateBytes::try_new(vec![0x81]).expect("state");
         state
-            .stage_proposal(
-                proposal_for(
-                    &fixture,
-                    &state,
-                    staged_shared,
-                    LocalStateBytes::try_new(vec![0x82]).expect("state"),
-                ),
-                None,
-            )
+            .stage_proposal(proposal_for(
+                &fixture,
+                &state,
+                staged_shared,
+                LocalStateBytes::try_new(vec![0x82]).expect("state"),
+            ))
             .expect("valid proposal");
         let staged = state.pending_shared().expect("proposal").clone();
         let (peer, key) = &fixture.participants[0];
@@ -2992,15 +3008,15 @@ mod tests {
             SharedStateBytes::try_new(vec![0x25]).expect("state"),
             LocalStateBytes::try_new(vec![0x26]).expect("state"),
         );
-        terminal.entry.terminal = Some(Effect::SessionAbort {
+        terminal.entry.terminal = Some(StepTerminal::Abort {
             reason: "invalid status".into(),
         });
         terminal.effects = terminal
             .entry
             .terminal
             .clone()
+            .map(|terminal| (0, terminal.to_effect()))
             .into_iter()
-            .map(|effect| (0, effect))
             .collect();
         terminal.commitment = StepCommitment::for_entry(
             fixture.activation.session_hash(),

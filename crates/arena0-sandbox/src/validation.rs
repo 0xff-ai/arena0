@@ -475,7 +475,7 @@ mod tests {
             crate::engine::HostState::new(
                 arena0_program::ExecutionProfile::current(),
                 crate::engine::CallKind::Metadata,
-                arena0_protocol::Lifecycle::PreSession,
+                crate::call::DispatchKind::Local,
                 None,
                 Vec::new(),
             ),

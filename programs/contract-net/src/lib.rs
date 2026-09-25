@@ -212,51 +212,7 @@ pub mod contract_net {
         Ok(Transition::Stay)
     }
 
-    fn on_react(
-        ctx: &mut Context<Shared, Local>,
-    ) -> Result<ProgramTransition<ContractNet>, ProgramFault> {
-        if ctx.shared().expected_writer() != Some(ctx.me()) {
-            return Ok(Transition::Stay);
-        }
-
-        match ctx.shared().phase() {
-            Phase::CollectingOffers if ctx.me() == COORDINATOR => {
-                if !ctx.local().proposal_sent {
-                    let plan = ctx.shared().plan();
-                    let participant_count = ctx.ensemble().len();
-                    apply_proposal(ctx.shared_mut(), plan.clone(), participant_count)?;
-                    ctx.effects().broadcast(&Message::Proposal { plan });
-                    ctx.mutate_local(|local| local.proposal_sent = true);
-                    return Ok(Transition::To(Phase::ReviewingProposal));
-                }
-            }
-            Phase::CollectingOffers => {}
-            Phase::ReviewingProposal => {
-                let expected_plan = ctx.shared().plan();
-                let Some(proposal) = ctx.shared().agreement.proposal() else {
-                    return Err(anyhow!("reviewing phase has no proposal").into());
-                };
-                if proposal.value != &expected_plan {
-                    return Err(
-                        anyhow!("stored proposal differs from deterministic allocation").into(),
-                    );
-                }
-                let proposal_id = proposal.id;
-                if ctx.local().accepted_proposal != Some(proposal_id) {
-                    let me = ctx.me();
-                    let tally = apply_accept(ctx.shared_mut(), me, proposal_id)?;
-                    ctx.effects().broadcast(&Message::Accept {
-                        proposal: proposal_id,
-                    });
-                    ctx.mutate_local(|local| local.accepted_proposal = Some(proposal_id));
-                    return transition_for_tally(tally);
-                }
-            }
-        }
-        Ok(Transition::Stay)
-    }
-
-    fn callout(ctx: &Context<Shared, Local>) -> Option<Callout> {
+    fn callout(ctx: &CalloutContext<'_, Shared, Local>) -> Option<Callout> {
         (ctx.shared().phase() == Phase::CollectingOffers
             && ctx.me() != COORDINATOR
             && ctx.shared().expected_writer() == Some(ctx.me())
@@ -273,10 +229,7 @@ pub mod contract_net {
             })
     }
 
-    fn on_input(
-        ctx: &mut Context<Shared, Local>,
-        input: Input,
-    ) -> arena0::anyhow::Result<ProgramTransition<ContractNet>> {
+    fn on_input(ctx: &mut LocalContext<Shared, Local>, input: Input) -> arena0::anyhow::Result<()> {
         let Input::SubmitOffer(offer) = input;
         if ctx.shared().phase() != Phase::CollectingOffers
             || ctx.shared().expected_offer_writer() != Some(ctx.me())
@@ -286,11 +239,49 @@ pub mod contract_net {
         offer
             .validate(&ctx.shared().tasks)
             .map_err(|error| anyhow!(error))?;
-        let from = ctx.me();
-        apply_offer(ctx.shared_mut(), from, offer.clone());
-        ctx.effects().broadcast(&Message::Offer(offer));
         ctx.mutate_local(|local| local.offer_sent = true);
-        Ok(Transition::Stay)
+        ctx.effects().broadcast(&Message::Offer(offer))?;
+        Ok(())
+    }
+
+    /// Queue the coordinator's deterministic proposal once every offer is in.
+    fn queue_proposal_if_due(ctx: &mut Context<Shared, Local>) -> arena0::anyhow::Result<()> {
+        if ctx.me() != COORDINATOR
+            || !ctx.shared().all_offers_received()
+            || ctx.local().proposal_sent
+        {
+            return Ok(());
+        }
+        let plan = ctx.shared().plan();
+        ctx.mutate_local(|local| local.proposal_sent = true);
+        ctx.effects().broadcast(&Message::Proposal { plan });
+        Ok(())
+    }
+
+    /// Queue this node's acceptance when the ballot selects it next.
+    fn queue_accept_if_due(ctx: &mut Context<Shared, Local>) -> arena0::anyhow::Result<()> {
+        let Some(proposal) = ctx.shared().agreement.proposal() else {
+            return Ok(());
+        };
+        let expected_plan = ctx.shared().plan();
+        if proposal.value != &expected_plan {
+            return Err(anyhow!(
+                "stored proposal differs from deterministic allocation"
+            ));
+        }
+        let proposal_id = proposal.id;
+        let next_voter = ctx
+            .shared()
+            .agreement
+            .ballot()
+            .and_then(|ballot| ballot.next_voter());
+        if next_voter == Some(ctx.me()) && ctx.local().accepted_proposal != Some(proposal_id) {
+            ctx.mutate_local(|local| local.accepted_proposal = Some(proposal_id));
+            ctx.effects().broadcast(&Message::Accept {
+                proposal: proposal_id,
+            });
+        }
+        Ok(())
     }
 
     fn on_message(
@@ -311,6 +302,7 @@ pub mod contract_net {
                     return Ok(ApplyDecision::Reject);
                 }
                 apply_offer(ctx.shared_mut(), from, offer);
+                queue_proposal_if_due(ctx).map_err(ProtocolFault::shared_violation)?;
                 Ok(ApplyDecision::Accept(Transition::Stay))
             }
             Message::Proposal { plan } => {
@@ -326,6 +318,7 @@ pub mod contract_net {
                 if apply_proposal(ctx.shared_mut(), plan, participant_count).is_err() {
                     return Ok(ApplyDecision::Reject);
                 }
+                queue_accept_if_due(ctx).map_err(ProtocolFault::shared_violation)?;
                 Ok(ApplyDecision::Accept(Transition::To(
                     Phase::ReviewingProposal,
                 )))
@@ -337,7 +330,11 @@ pub mod contract_net {
                 let Ok(tally) = apply_accept(ctx.shared_mut(), from, proposal) else {
                     return Ok(ApplyDecision::Reject);
                 };
-                Ok(ApplyDecision::Accept(transition_for_tally(tally)?))
+                let transition = transition_for_tally(tally)?;
+                if matches!(transition, Transition::Stay) {
+                    queue_accept_if_due(ctx).map_err(ProtocolFault::shared_violation)?;
+                }
+                Ok(ApplyDecision::Accept(transition))
             }
         }
     }
@@ -729,6 +726,16 @@ mod tests {
             .into_iter()
             .find(|message| matches!(message, Message::Offer(_)))
             .expect("worker emits the offer");
+        // The author applies its own offer through `on_message`.
+        assert!(
+            worker_harness
+                .author_queued(&offered.effects)
+                .iter()
+                .all(|fx| matches!(fx.fault, FaultStatus::None))
+        );
+
+        // The coordinator applies the offer, then authors its proposal and its
+        // own acceptance.
         let offered = coordinator_harness.message(worker, offer_message);
         assert!(matches!(offered.fault, FaultStatus::None));
         assert!(
@@ -736,19 +743,23 @@ mod tests {
                 .messages::<Message>()
                 .iter()
                 .any(|message| matches!(message, Message::Proposal { .. })),
-            "coordinator emits the deterministic proposal"
+            "coordinator queues the deterministic proposal"
         );
         let proposal = offered
             .messages::<Message>()
             .into_iter()
             .find(|message| matches!(message, Message::Proposal { .. }))
-            .expect("coordinator emits the deterministic proposal");
-        let id = coordinator_harness
-            .shared()
-            .agreement
-            .proposal()
-            .expect("proposal is active")
-            .id;
+            .expect("coordinator queues the deterministic proposal");
+        let coordinator_authored = coordinator_harness.author_queued(&offered.effects);
+        let coordinator_accept = coordinator_authored
+            .iter()
+            .flat_map(|fx| fx.messages::<Message>())
+            .find(|message| matches!(message, Message::Accept { .. }))
+            .expect("coordinator queues its acceptance");
+        assert!(
+            coordinator_harness.shared().agreement.proposal().is_some(),
+            "proposal is active"
+        );
 
         // The worker rejects a proposal whose plan is not the deterministic
         // allocation, before the real proposal is delivered.
@@ -762,10 +773,9 @@ mod tests {
             worker_harness.message(coordinator, Message::Proposal { plan: wrong_plan });
         assert!(wrong_proposal.rejected);
 
-        // Deliver the producer's proposal to the worker. The coordinator's
-        // ballot puts its own vote first, so inject that distinct vote event on
-        // the coordinator replica before delivering it to the worker. This is
-        // not a re-delivery of a producer broadcast.
+        // Deliver the real proposal to the worker. The coordinator votes first,
+        // so the worker queues its acceptance only after the coordinator's vote
+        // reaches it.
         let proposed = worker_harness.message(coordinator, proposal);
         assert!(matches!(proposed.fault, FaultStatus::None));
         let wrong = ProposalId {
@@ -774,16 +784,14 @@ mod tests {
         };
         let wrong_accept = worker_harness.message(coordinator, Message::Accept { proposal: wrong });
         assert!(wrong_accept.rejected);
-
-        let coordinator_vote =
-            coordinator_harness.message(coordinator, Message::Accept { proposal: id });
+        let coordinator_vote = worker_harness.message(coordinator, coordinator_accept);
         assert!(matches!(coordinator_vote.fault, FaultStatus::None));
-        let worker_vote = worker_harness.message(coordinator, Message::Accept { proposal: id });
-        let worker_accept = worker_vote
+        let worker_accept = coordinator_vote
             .messages::<Message>()
             .into_iter()
             .find(|message| matches!(message, Message::Accept { .. }))
-            .expect("worker accepts the exact proposal");
+            .expect("worker queues its acceptance");
+        worker_harness.author_queued(&coordinator_vote.effects);
         let finished = coordinator_harness.message(worker, worker_accept);
         assert!(matches!(finished.fault, FaultStatus::None));
         assert!(finished.has_session_end());

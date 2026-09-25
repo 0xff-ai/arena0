@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use arena0_protocol::{ExecFrame, MessageId, ParticipantStepSignature, PeerId, ProtocolError};
+use arena0_protocol::{ExecFrame, ParticipantStepSignature, PeerId, ProtocolError};
 use arena0_store::Change;
 use arena0_transport::{ExecDelivery, ExecDeliveryRejection, SendHandle, TransportError};
 use tokio::time::Instant;
@@ -102,23 +102,6 @@ impl ExecutionActor {
             {
                 return Ok(Some(Rejected));
             }
-            ExecFrame::Message {
-                message_id,
-                seq,
-                prestate,
-                poststate,
-                data,
-            } if MessageId::derive(
-                self.state.binding().session_id(),
-                source,
-                *seq,
-                *prestate,
-                *poststate,
-                data,
-            ) != *message_id =>
-            {
-                return Ok(Some(Rejected));
-            }
             _ => {}
         }
         if self.state.status().is_terminal() {
@@ -137,31 +120,31 @@ impl ExecutionActor {
         match frame {
             frame @ ExecFrame::Message { .. } => {
                 let ExecFrame::Message {
-                    message_id,
-                    seq,
-                    prestate,
-                    poststate,
-                    ..
+                    ref commitment,
+                    ref data,
                 } = frame
                 else {
                     unreachable!()
                 };
-                if seq < step {
+                if commitment.step < step {
                     return Ok(None);
                 }
-                if seq > step {
+                if commitment.step > step {
                     return Ok(Some(NotYet));
                 }
-                if prestate != self.state.agreed_state()
+                if commitment.session_id != self.state.binding().session_id()
+                    || commitment.pre_state != self.state.agreed_state()
+                    || commitment.link != self.state.agreed_link()
                     || !self.writer_is(source, &self.state, &self.ensemble())?
                 {
                     return Ok(Some(Rejected));
                 }
                 if let Some(proposal) = self.state.pending_shared() {
                     return Ok(
-                        if matches!(&proposal.entry().event,
-                        arena0_protocol::Event::MessageReceived { message_id: staged, .. } if *staged == message_id)
-                            && proposal.commitment().post_state == poststate
+                        if proposal.commitment() == commitment
+                            && matches!(&proposal.entry().event,
+                                arena0_protocol::StepEvent::Message { from, data: staged }
+                                    if *from == source && staged == data)
                         {
                             None
                         } else {

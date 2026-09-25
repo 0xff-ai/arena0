@@ -147,19 +147,18 @@ impl<T> CommitRevealLocalState<T> for CommitRevealLocal<T> {
     }
 }
 
-/// Unified context-field operations for `CommitReveal` primitives.
+/// Author-side operations for `CommitReveal` primitives.
 ///
 /// `#[arena0::state]` generates field-named accessors such as
-/// `ctx.commit_reveal()`. Outgoing commit and reveal operations consume the
-/// participant-local opening and apply its corresponding shared value during
-/// the same event before returning a detached output. Incoming messages use
-/// the same handle, so every accepted event can update both state values.
-pub trait CommitRevealFieldExt<T, Route = RawPrimitiveRoute> {
+/// `ctx.commit_reveal()`. These operations read shared state, update the
+/// participant-local opening, and return a detached output; they never mutate
+/// shared state, so they are available from both agreed and local handlers.
+pub trait CommitRevealAuthorExt<T, Route = RawPrimitiveRoute> {
     /// Whether this node still owes its commit for the current round.
     fn needs_commit(self) -> bool;
 
-    /// Commit a local value with a host-generated salt, apply its shared
-    /// commitment, and return the commit message to broadcast.
+    /// Commit a local value with a host-generated salt and return the commit
+    /// message to broadcast.
     fn commit(self, value: T) -> Result<PrimitiveOutput<Message<T>, Route>, Error>;
 
     /// Commit a local value with an explicit salt.
@@ -172,18 +171,25 @@ pub trait CommitRevealFieldExt<T, Route = RawPrimitiveRoute> {
         salt: [u8; 32],
     ) -> Result<PrimitiveOutput<Message<T>, Route>, Error>;
 
-    /// Take and apply the reveal message owed this round, once every
-    /// commitment is in. Returns `None` until the reveal is due and at most
-    /// once per round.
+    /// Take the reveal message owed this round, once every commitment is in.
+    /// Returns `None` until the reveal is due and at most once per round.
     fn take_reveal(self) -> Option<PrimitiveOutput<Message<T>, Route>>;
+}
 
+/// Handle-side operations for `CommitReveal` primitives.
+///
+/// [`handle`](Self::handle) mutates shared state and is available only from an
+/// agreed handler's mutable primitive field.
+pub trait CommitRevealFieldExt<T, Route = RawPrimitiveRoute>:
+    CommitRevealAuthorExt<T, Route>
+{
     /// Apply a commit-reveal message from the authenticated sender. Every node
     /// runs this operation at the same agreed position.
     fn handle(self, from: Participant, msg: Message<T>) -> Result<(), Error>;
 }
 
-impl<Shared, Local, T, Route> CommitRevealFieldExt<T, Route>
-    for PrimitiveField<'_, Shared, Local, CommitReveal<T>, Route>
+impl<Shared, Local, T, Route, Mode> CommitRevealAuthorExt<T, Route>
+    for PrimitiveField<'_, Shared, Local, CommitReveal<T>, Route, Mode>
 where
     Shared: Primitive,
     Local: CommitRevealLocalState<T>,
@@ -195,7 +201,7 @@ where
 
     fn commit(mut self, value: T) -> Result<PrimitiveOutput<Message<T>, Route>, Error> {
         let salt = self.random_bytes();
-        <Self as CommitRevealFieldExt<T, Route>>::commit_with_salt(self, value, salt)
+        <Self as CommitRevealAuthorExt<T, Route>>::commit_with_salt(self, value, salt)
     }
 
     fn commit_with_salt(
@@ -203,25 +209,31 @@ where
         value: T,
         salt: [u8; 32],
     ) -> Result<PrimitiveOutput<Message<T>, Route>, Error> {
-        let participant = self.me();
+        // The author stashes its opening locally and queues the commit. Shared
+        // state changes only when the author's own message is applied through
+        // `handle`, exactly as every receiver applies it.
         let commit = self.with_shared_local(|cr, local| {
             cr.commit_with_salt(local.commit_reveal_local_mut(), value, salt)
         })?;
-        self.mutate(|cr| cr.handle(participant, commit.clone()))?;
         Ok(self.output(commit))
     }
 
     fn take_reveal(mut self) -> Option<PrimitiveOutput<Message<T>, Route>> {
-        let participant = self.me();
+        // The reveal is taken from local state and queued; shared state changes
+        // when the author's own message is applied through `handle`.
         let reveal =
             self.with_shared_local(|cr, local| cr.take_reveal(local.commit_reveal_local_mut()))?;
-        self.mutate(|cr| {
-            cr.handle(participant, reveal.clone())
-                .expect("local commit-reveal reveal must be valid")
-        });
         Some(self.output(reveal))
     }
+}
 
+impl<Shared, Local, T, Route> CommitRevealFieldExt<T, Route>
+    for PrimitiveField<'_, Shared, Local, CommitReveal<T>, Route, arena0::MutablePrimitive>
+where
+    Shared: Primitive,
+    Local: CommitRevealLocalState<T>,
+    T: BorshSerialize + Clone,
+{
     fn handle(mut self, from: Participant, msg: Message<T>) -> Result<(), Error> {
         self.mutate(|cr| cr.handle(from, msg))
     }
@@ -321,8 +333,8 @@ impl<T> CommitReveal<T> {
     }
 
     /// Stash a value and salt in the supplied local DTO and return the Commit
-    /// message to broadcast. The caller may apply the corresponding shared
-    /// transition in the same event before emitting that message.
+    /// message to broadcast. The author's shared state changes only when its
+    /// own Commit message is applied through [`Self::handle`].
     pub fn commit_with_salt(
         &self,
         local: &mut CommitRevealLocal<T>,

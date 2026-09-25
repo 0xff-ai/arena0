@@ -60,12 +60,13 @@ impl Database {
                     timer,
                     now_ms,
                 )?,
-                Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. } => {}
-                Effect::Broadcast { .. } => {
-                    return Err(StoreError::Corruption(
-                        "committed broadcast was not converted to a protocol frame".into(),
-                    ));
-                }
+                // Lifecycle effects and broadcasts have no side rows: the
+                // lifecycle effect is in the trace entry and the broadcast is
+                // in the durable outgoing queue carried by the state blob.
+                Effect::SessionEnd { .. }
+                | Effect::SessionAbort { .. }
+                | Effect::Fail { .. }
+                | Effect::Broadcast { .. } => {}
             }
         }
         Ok(())

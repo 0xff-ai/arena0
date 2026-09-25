@@ -14,8 +14,8 @@ pub use commitment::{
     StepCommitment, StepSig,
 };
 pub use divergence::{DivergenceDiagnostic, DivergenceKind, JsonDiffExt};
-pub use entry::TraceEntry;
+pub use entry::{StepEvent, StepTerminal, TraceEntry};
 pub use header::{ReceiptTermination, SessionHeader};
 
 /// Trace schema version for state-machine step records.
-pub const TRACE_FORMAT_VERSION: u32 = 2;
+pub const TRACE_FORMAT_VERSION: u32 = 3;

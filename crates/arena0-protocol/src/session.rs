@@ -25,50 +25,6 @@ id_type!(
     Default
 );
 
-/// Sandbox/session lifecycle.
-///
-/// The runtime advances this through `PreSession -> Active -> Completed|Failed`.
-/// The sandbox uses the current value to gate which host functions a program may
-/// call (e.g. messaging is only valid during `Active`). Distinct from the
-/// program-domain phase (`#[arena0::phases]`).
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    Default,
-    PartialEq,
-    Eq,
-    Hash,
-    Serialize,
-    Deserialize,
-    BorshSerialize,
-    BorshDeserialize,
-    borsh::BorshSchema,
-)]
-pub enum Lifecycle {
-    /// Initialization and state setup before a session is active.
-    #[default]
-    PreSession,
-    /// Main execution: full read/write, traced events, peer messaging.
-    Active,
-    /// Terminal: session completed successfully.
-    Completed,
-    /// Terminal: session ended due to an error or explicit abort.
-    Failed,
-}
-
-impl Lifecycle {
-    /// Returns `true` for `Completed` and `Failed`. No further events are
-    /// dispatched once a session reaches a terminal lifecycle value.
-    #[must_use]
-    pub fn is_terminal(&self) -> bool {
-        match self {
-            Self::PreSession | Self::Active => false,
-            Self::Completed | Self::Failed => true,
-        }
-    }
-}
-
 /// A participant's deterministic identity inside one session.
 ///
 /// Participant 0 is assigned to the peer with the lexicographically lower
@@ -417,13 +373,5 @@ mod tests {
         let encoded = borsh::to_vec(&committed).unwrap();
         let decoded = borsh::from_slice::<Ensemble>(&encoded).unwrap();
         assert_eq!(decoded.peers(), &[peer(1), peer(2)]);
-    }
-
-    #[test]
-    fn lifecycle_terminal() {
-        assert!(!Lifecycle::PreSession.is_terminal());
-        assert!(!Lifecycle::Active.is_terminal());
-        assert!(Lifecycle::Completed.is_terminal());
-        assert!(Lifecycle::Failed.is_terminal());
     }
 }

@@ -14,9 +14,8 @@ use arena0_program::{
 use arena0_protocol::execution::GuestSignData;
 use arena0_protocol::{
     AbortKind, AbortOccurrence, Activation, ActivationData, Ensemble, Event, ExecFrame, ExecId,
-    ExecutionAdmission, ExecutionStatus, MessageId, NegotiationId, Offer, OfferData, PeerId,
-    PeerIdSource, PendingId, PreparedActivation, StateHash, Ticket, TicketAction, TicketData,
-    TicketHash,
+    ExecutionAdmission, ExecutionStatus, NegotiationId, Offer, OfferData, PeerId, PeerIdSource,
+    PendingId, PreparedActivation, StateHash, Ticket, TicketAction, TicketData, TicketHash,
 };
 use arena0_sandbox::{InitializeCall, LoadedProgram, Program, WasmtimeEngine};
 use arena0_store::{Change, Store, StoreConfig};
@@ -61,11 +60,18 @@ enum GuestMode {
     Callout,
     CalloutFault,
     CalloutReject,
+    InputSharedChange,
+    /// A local input handler that broadcasts a fixed payload size.
+    InputBroadcast(u32),
+    /// An agreed message handler that broadcasts, used to exercise agreed
+    /// outgoing-queue overflow.
+    MessageBroadcast,
     LocalSign,
     SignOnMessage,
     Broadcast,
     RejectMessage,
     EndOnMessage,
+    EndOnSessionStarted,
 }
 
 struct Fixture {
@@ -298,7 +304,7 @@ impl Fixture {
                 Event::SessionStarted {
                     ensemble: actor.ensemble(),
                 },
-                DispatchSource::default(),
+                DispatchSource::Local,
             )
             .await
             .expect("session start dispatch");
@@ -340,7 +346,7 @@ async fn ended_actor() -> (
     let (messages, mut observations) = mpsc::channel(16);
     let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
     fixture.commit_session_started(&mut actor).await;
-    let frame = message_frame(
+    let frame = terminal_message_frame(
         &actor.state,
         fixture.remote_keys.peer_id(),
         actor.state.agreed_step(),
@@ -443,7 +449,7 @@ async fn verified_final_certificate_waits_for_proposal_then_commits_without_reje
         Some(arena0_transport::ExecDeliveryRejection::NotYet)
     );
     assert_eq!(actor.state, before);
-    let message = message_frame(
+    let message = terminal_message_frame(
         &actor.state,
         fixture.remote_keys.peer_id(),
         actor.state.agreed_step(),
@@ -813,7 +819,7 @@ async fn certificate_authentication_rejects_bad_evidence_but_local_contradiction
             .unwrap(),
         Some(arena0_transport::ExecDeliveryRejection::Rejected)
     );
-    let different = message_frame(
+    let different = terminal_message_frame(
         &actor.state,
         fixture.remote_keys.peer_id(),
         actor.state.agreed_step(),
@@ -831,6 +837,46 @@ async fn certificate_authentication_rejects_bad_evidence_but_local_contradiction
     ));
 }
 
+fn message_commitment(
+    state: &arena0_protocol::ExecutionState,
+    source: PeerId,
+    step: u64,
+    pre_state: StateHash,
+    post_state: StateHash,
+    data: &[u8],
+) -> arena0_protocol::StepCommitment {
+    message_commitment_with_terminal(state, source, step, pre_state, post_state, None, data)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn message_commitment_with_terminal(
+    state: &arena0_protocol::ExecutionState,
+    source: PeerId,
+    step: u64,
+    pre_state: StateHash,
+    post_state: StateHash,
+    terminal: Option<arena0_protocol::StepTerminal>,
+    data: &[u8],
+) -> arena0_protocol::StepCommitment {
+    let entry = arena0_protocol::TraceEntry {
+        trace_version: arena0_protocol::TRACE_FORMAT_VERSION,
+        step,
+        event: arena0_protocol::StepEvent::Message {
+            from: source,
+            data: data.to_vec(),
+        },
+        pre_state,
+        post_state,
+        terminal,
+        agreement: arena0_protocol::AggregateAttestation::empty(),
+    };
+    arena0_protocol::StepCommitment::for_entry(
+        state.binding().session_id(),
+        &entry,
+        state.agreed_link(),
+    )
+}
+
 fn message_frame(
     state: &arena0_protocol::ExecutionState,
     source: PeerId,
@@ -838,21 +884,36 @@ fn message_frame(
     data: Vec<u8>,
 ) -> ExecFrame {
     let poststate = StateHash::of_shared(&message_state());
-    let message_id = MessageId::derive(
-        state.binding().session_id(),
+    let commitment = message_commitment(
+        state,
         source,
         sequence,
         state.agreed_state(),
         poststate,
         &data,
     );
-    ExecFrame::Message {
-        message_id,
-        seq: sequence,
-        prestate: state.agreed_state(),
-        data,
+    ExecFrame::Message { commitment, data }
+}
+
+/// A message frame whose step ends the session with an empty outcome, matching
+/// the `EndOnMessage` fixture.
+fn terminal_message_frame(
+    state: &arena0_protocol::ExecutionState,
+    source: PeerId,
+    sequence: u64,
+    data: Vec<u8>,
+) -> ExecFrame {
+    let poststate = StateHash::of_shared(&message_state());
+    let commitment = message_commitment_with_terminal(
+        state,
+        source,
+        sequence,
+        state.agreed_state(),
         poststate,
-    }
+        Some(arena0_protocol::StepTerminal::End { outcome: vec![] }),
+        &data,
+    );
+    ExecFrame::Message { commitment, data }
 }
 
 #[tokio::test]
@@ -939,22 +1000,16 @@ async fn valid_writer_message_divergence_preserves_state_until_failure_is_persis
         let before = actor.state.clone();
         let source = fixture.remote_keys.peer_id();
         // The identity is valid even when the advertised result is wrong.
-        let poststate = before.agreed_state();
         let data = b"writer message".to_vec();
-        let frame = ExecFrame::Message {
-            message_id: MessageId::derive(
-                before.binding().session_id(),
-                source,
-                before.agreed_step(),
-                before.agreed_state(),
-                poststate,
-                &data,
-            ),
-            seq: before.agreed_step(),
-            prestate: before.agreed_state(),
-            data,
-            poststate,
-        };
+        let commitment = message_commitment(
+            &before,
+            source,
+            before.agreed_step(),
+            before.agreed_state(),
+            before.agreed_state(),
+            &data,
+        );
+        let frame = ExecFrame::Message { commitment, data };
         let error = actor
             .accept_frame(source, frame)
             .await
@@ -965,7 +1020,9 @@ async fn valid_writer_message_divergence_preserves_state_until_failure_is_persis
         assert!(reason.starts_with("diverged at step 1:"), "{reason}");
         assert!(reason.contains(cause), "{reason}");
         assert!(reason.len() <= arena0_protocol::MAX_TERMINAL_REASON_BYTES);
-        assert_eq!(actor.state.clone(), before);
+        // A rejection, trap, or commitment mismatch persists nothing, so no
+        // proposal can be signed after a restart.
+        assert_eq!(actor.state, before);
         assert!(
             actor.fail_terminal(error).await,
             "failure must permit final delivery"
@@ -977,8 +1034,84 @@ async fn valid_writer_message_divergence_preserves_state_until_failure_is_persis
 }
 
 #[tokio::test]
+async fn terminal_only_commitment_mismatch_diverges_before_signing() {
+    let fixture = Fixture::with_mode(true, GuestMode::Plain).await;
+    let (messages, _observations) = mpsc::channel(8);
+    let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
+    fixture.commit_session_started(&mut actor).await;
+    let before = actor.state.clone();
+    let source = fixture.remote_keys.peer_id();
+    let data = b"terminal only".to_vec();
+    let poststate = StateHash::of_shared(&message_state());
+    // The guest's post-state matches; only the terminal differs.
+    let commitment = message_commitment_with_terminal(
+        &before,
+        source,
+        before.agreed_step(),
+        before.agreed_state(),
+        poststate,
+        Some(arena0_protocol::StepTerminal::End { outcome: vec![] }),
+        &data,
+    );
+    let frame = ExecFrame::Message { commitment, data };
+    let error = actor
+        .accept_frame(source, frame)
+        .await
+        .expect_err("divergence");
+    let crate::ExecError::Diverged(reason) = &error else {
+        panic!("expected divergence, got {error:?}");
+    };
+    assert!(reason.contains("entry mismatch"), "{reason}");
+    // Nothing is persisted, so the receiver has no proposal to sign.
+    assert_eq!(actor.state, before);
+    assert!(actor.state.pending_shared().is_none());
+    assert!(actor.fail_terminal(error).await);
+    assert!(actor.state.status().is_terminal());
+    assert_eq!(actor.state.agreed_step(), before.agreed_step());
+}
+
+#[tokio::test]
+async fn a_commitment_mismatch_leaves_no_proposal_for_recovery_to_sign() {
+    let fixture = Fixture::with_mode(true, GuestMode::Plain).await;
+    let (messages, _observations) = mpsc::channel(8);
+    let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
+    fixture.commit_session_started(&mut actor).await;
+    let before = actor.state.clone();
+    let source = fixture.remote_keys.peer_id();
+    let data = b"terminal only".to_vec();
+    let poststate = StateHash::of_shared(&message_state());
+    let commitment = message_commitment_with_terminal(
+        &before,
+        source,
+        before.agreed_step(),
+        before.agreed_state(),
+        poststate,
+        Some(arena0_protocol::StepTerminal::End { outcome: vec![] }),
+        &data,
+    );
+    let frame = ExecFrame::Message { commitment, data };
+    assert!(matches!(
+        actor.accept_frame(source, frame).await,
+        Err(crate::ExecError::Diverged(_))
+    ));
+    // No terminal stop is persisted yet; recover the actor from the store.
+    drop(actor);
+    let (messages, _observations) = mpsc::channel(8);
+    let mut recovered = fixture.actor_with_messages(messages).await;
+    recovered.recover().await.expect("recover");
+    assert!(recovered.state.pending_shared().is_none());
+    assert_eq!(recovered.state.agreed_step(), before.agreed_step());
+    // Recovery has nothing to sign.
+    recovered
+        .ensure_step_signature()
+        .await
+        .expect("no proposal to sign");
+    assert!(recovered.state.pending_shared().is_none());
+}
+
+#[tokio::test]
 async fn invalid_messages_are_dropped_before_the_guest_can_diverge() {
-    for invalid in ["stale", "prestate", "message_id", "writer"] {
+    for invalid in ["stale", "prestate", "writer"] {
         let fixture = Fixture::with_mode(invalid != "writer", GuestMode::RejectMessage).await;
         let (messages, _observations) = mpsc::channel(8);
         let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
@@ -997,25 +1130,8 @@ async fn invalid_messages_are_dropped_before_the_guest_can_diverge() {
         };
         let poststate = StateHash::of_shared(&message_state());
         let data = b"invalid frame".to_vec();
-        let message_id = MessageId::derive(
-            before.binding().session_id(),
-            source,
-            seq,
-            prestate,
-            poststate,
-            &data,
-        );
-        let frame = ExecFrame::Message {
-            message_id,
-            seq,
-            prestate,
-            data: if invalid == "message_id" {
-                b"different payload".to_vec()
-            } else {
-                data
-            },
-            poststate,
-        };
+        let commitment = message_commitment(&before, source, seq, prestate, poststate, &data);
+        let frame = ExecFrame::Message { commitment, data };
         let decision = actor
             .accept_frame(source, frame)
             .await
@@ -1030,106 +1146,6 @@ async fn invalid_messages_are_dropped_before_the_guest_can_diverge() {
         );
         assert_eq!(actor.state.clone(), before, "{invalid}");
     }
-}
-
-#[tokio::test]
-async fn peer_divergence_ends_the_writer_after_it_signed_its_proposal() {
-    let writer = Fixture::with_mode(false, GuestMode::RejectMessage).await;
-    let receiver = Fixture::from_wasm_with_peer(writer.wasm.clone(), Some(&writer)).await;
-    for fixture in [&writer, &receiver] {
-        let (messages, _observations) = mpsc::channel(16);
-        let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
-        fixture.commit_session_started(&mut actor).await;
-        if fixture.local_keys.peer_id() == writer.local_keys.peer_id() {
-            assert_eq!(
-                actor
-                    .dispatch_event(Event::React, DispatchSource::default())
-                    .await
-                    .expect("writer proposal"),
-                DispatchOutcome::Committed
-            );
-            actor
-                .ensure_step_signature()
-                .await
-                .expect("sign writer proposal");
-            let state = actor.state.clone();
-            let signatures = state
-                .pending_shared()
-                .expect("staged proposal")
-                .signatures();
-            assert_eq!(signatures.len(), 1);
-            assert_eq!(signatures[0].participant(), writer.local_keys.peer_id());
-        }
-    }
-    let writer_host = crate::Host::start(
-        Arc::clone(&writer.local_keys),
-        writer.local_transport.clone() as Arc<dyn Transport + Sync>,
-        writer.store.handle().clone(),
-    );
-    let receiver_host = crate::Host::start(
-        Arc::clone(&receiver.local_keys),
-        receiver.local_transport.clone() as Arc<dyn Transport + Sync>,
-        receiver.store.handle().clone(),
-    );
-    let mut writer_exec = writer_host
-        .spawn(
-            writer.context(),
-            writer_host.claim_execution(EXEC_ID).expect("writer claim"),
-        )
-        .expect("writer actor");
-    let mut receiver_exec = receiver_host
-        .spawn(
-            receiver.context(),
-            receiver_host
-                .claim_execution(EXEC_ID)
-                .expect("receiver claim"),
-        )
-        .expect("receiver actor");
-    tokio::time::timeout(Duration::from_secs(10), async {
-        for execution in [&mut receiver_exec, &mut writer_exec] {
-            loop {
-                match execution
-                    .message_rx
-                    .recv()
-                    .await
-                    .expect("terminal observation")
-                {
-                    crate::SessionMessage::Failed { reason } => {
-                        assert!(
-                            reason.contains(
-                                "diverged at step 1: program rejected the writer message"
-                            ),
-                            "{reason}"
-                        );
-                        break;
-                    }
-                    crate::SessionMessage::Completed { .. }
-                    | crate::SessionMessage::Aborted { .. } => {
-                        panic!("expected authenticated failure")
-                    }
-                    _ => {}
-                }
-            }
-        }
-    })
-    .await
-    .expect("both peers must finish without wedging");
-    for fixture in [&writer, &receiver] {
-        let state = fixture
-            .store
-            .handle()
-            .load_execution(EXEC_ID)
-            .await
-            .expect("load terminal")
-            .expect("execution");
-        assert!(state.status().is_terminal());
-        assert!(state.pending_shared().is_none());
-        assert_eq!(state.agreed_step(), 1);
-    }
-    writer_exec.shutdown().await;
-    receiver_exec.shutdown().await;
-    writer_host.stop().await;
-    receiver_host.stop().await;
 }
 
 #[tokio::test]
@@ -1232,9 +1248,14 @@ async fn flat_dispatch_commits_local_state_in_the_resident() {
     fixture.commit_session_started(&mut actor).await;
 
     let accepted = actor
-        .dispatch_event(Event::React, DispatchSource::default())
+        .dispatch_event(
+            Event::TimerFired {
+                timer: arena0_protocol::TimerPayload::unit(),
+            },
+            DispatchSource::Local,
+        )
         .await
-        .expect("dispatch local reaction");
+        .expect("dispatch local event");
     assert_eq!(accepted, DispatchOutcome::Committed);
     let state = actor.state.clone();
     assert_eq!(state.local_state().as_bytes(), &[9]);
@@ -1246,14 +1267,8 @@ async fn flat_dispatch_commits_local_state_in_the_resident() {
 async fn restart_resumes_a_durable_timer_and_accepts_a_message() {
     let fixture = Fixture::with_mode(true, GuestMode::Timer).await;
     let mut actor = fixture.prepare_active_actor().await;
+    // The fixture arms its timer from the agreed session boundary.
     fixture.commit_session_started(&mut actor).await;
-    assert_eq!(
-        actor
-            .dispatch_event(Event::React, DispatchSource::default())
-            .await
-            .expect("arm timer"),
-        DispatchOutcome::Committed
-    );
     drop(actor);
 
     let (messages, _observations) = mpsc::channel(32);
@@ -1296,15 +1311,8 @@ async fn recovered_sdk_timers_dispatch_typed_and_unit_payloads() {
     for stem in ["timer_dispatch_typed", "timer_dispatch_unit"] {
         let fixture = Fixture::with_guest(stem).await;
         let mut actor = fixture.prepare_active_actor().await;
+        // The fixture arms its timer from the agreed session boundary.
         fixture.commit_session_started(&mut actor).await;
-        assert_eq!(
-            actor
-                .dispatch_event(Event::React, DispatchSource::default())
-                .await
-                .expect("schedule timer"),
-            DispatchOutcome::Committed,
-            "{stem} React dispatch"
-        );
         drop(actor);
 
         let (messages, _observations) = mpsc::channel(8);
@@ -1340,7 +1348,12 @@ async fn restart_reannounces_committed_callout_once() {
     let pending_id = {
         assert_eq!(
             actor
-                .dispatch_event(Event::React, DispatchSource::default())
+                .dispatch_event(
+                    Event::TimerFired {
+                        timer: arena0_protocol::TimerPayload::unit()
+                    },
+                    DispatchSource::Local
+                )
                 .await
                 .expect("dispatch callout"),
             DispatchOutcome::Committed
@@ -1394,43 +1407,6 @@ async fn restart_reannounces_committed_callout_once() {
 }
 
 #[tokio::test]
-async fn react_runs_with_an_open_callout_and_replaces_the_question() {
-    let fixture = Fixture::with_mode(false, GuestMode::Callout).await;
-    let (messages, _observations) = mpsc::channel(32);
-    let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
-    fixture.commit_session_started(&mut actor).await;
-    assert_eq!(
-        actor
-            .dispatch_event(
-                Event::TimerFired {
-                    timer: arena0_protocol::TimerPayload::unit()
-                },
-                DispatchSource::default(),
-            )
-            .await
-            .unwrap(),
-        DispatchOutcome::Committed
-    );
-    let before = actor.state.clone();
-    let first = before.callout().unwrap().clone();
-    assert_eq!(first.context, b"true");
-    actor.progress().await.unwrap();
-    let after = actor.state.clone();
-    assert_eq!(after.last_reacted_step(), Some(after.agreed_step() - 1));
-    assert_eq!(after.callout().unwrap().context, b"null");
-    assert_ne!(after.callout().unwrap().id, first.id);
-    assert!(!after.status().is_terminal());
-    assert!(matches!(
-        actor
-            .submit_input(first.id, JsonBytes::try_new(b"null".to_vec()).unwrap())
-            .await,
-        Err(SubmitInputError::Expected(
-            crate::ExecError::CalloutNotPending
-        ))
-    ));
-}
-
-#[tokio::test]
 async fn staged_result_preserves_callout_and_reports_agreement_pending() {
     let fixture = Fixture::with_mode(true, GuestMode::Callout).await;
     let mut actor = fixture.prepare_active_actor().await;
@@ -1443,7 +1419,12 @@ async fn staged_result_preserves_callout_and_reports_agreement_pending() {
         ))
     ));
     actor
-        .dispatch_event(Event::React, DispatchSource::default())
+        .dispatch_event(
+            Event::TimerFired {
+                timer: arena0_protocol::TimerPayload::unit(),
+            },
+            DispatchSource::Local,
+        )
         .await
         .unwrap();
     let before = actor.state.clone();
@@ -1480,7 +1461,12 @@ async fn rejected_callout_answer_preserves_pending_continuation_until_valid_inpu
     fixture.commit_session_started(&mut actor).await;
     assert_eq!(
         actor
-            .dispatch_event(Event::React, DispatchSource::default())
+            .dispatch_event(
+                Event::TimerFired {
+                    timer: arena0_protocol::TimerPayload::unit()
+                },
+                DispatchSource::Local
+            )
             .await
             .expect("dispatch callout"),
         DispatchOutcome::Committed
@@ -1534,7 +1520,12 @@ async fn input_handler_trap_rejects_without_ending_session() {
     fixture.commit_session_started(&mut actor).await;
     assert_eq!(
         actor
-            .dispatch_event(Event::React, DispatchSource::default())
+            .dispatch_event(
+                Event::TimerFired {
+                    timer: arena0_protocol::TimerPayload::unit()
+                },
+                DispatchSource::Local
+            )
             .await
             .expect("dispatch callout"),
         DispatchOutcome::Committed
@@ -1763,11 +1754,20 @@ async fn stale_abort_is_acked_across_restart_and_signed_proposal_still_commits()
     fixture.commit_session_started(&mut actor).await;
     assert_eq!(
         actor
-            .dispatch_event(Event::React, DispatchSource::default())
+            .dispatch_event(
+                Event::TimerFired {
+                    timer: arena0_protocol::TimerPayload::unit()
+                },
+                DispatchSource::Local
+            )
             .await
-            .expect("stage broadcast proposal"),
+            .expect("queue broadcast"),
         DispatchOutcome::Committed
     );
+    actor
+        .author_next_message()
+        .await
+        .expect("author queued message");
     actor
         .ensure_step_signature()
         .await
@@ -1837,7 +1837,7 @@ async fn stale_abort_is_acked_across_restart_and_signed_proposal_still_commits()
 }
 
 #[tokio::test]
-async fn react_handler_signs_with_the_participant_identity_key() {
+async fn local_handler_signs_with_the_participant_identity_key() {
     let fixture = Fixture::with_mode(false, GuestMode::LocalSign).await;
     let (messages, _observations) = mpsc::channel(8);
     let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
@@ -1845,7 +1845,12 @@ async fn react_handler_signs_with_the_participant_identity_key() {
     let position = actor.state.clone().event_position();
     assert_eq!(
         actor
-            .dispatch_event(Event::React, DispatchSource::default())
+            .dispatch_event(
+                Event::TimerFired {
+                    timer: arena0_protocol::TimerPayload::unit()
+                },
+                DispatchSource::Local
+            )
             .await
             .expect("dispatch local sign"),
         DispatchOutcome::Committed
@@ -2057,38 +2062,51 @@ async fn trace_observation_waits_for_the_certified_step() {
 }
 
 #[tokio::test]
-async fn broadcast_delivery_has_only_remote_destinations_and_no_self_apply() {
+async fn local_broadcast_is_queued_then_authored() {
     let fixture = Fixture::with_mode(false, GuestMode::Broadcast).await;
     let mut actor = fixture.prepare_active_actor().await;
     fixture.commit_session_started(&mut actor).await;
     let before = actor.state.clone();
     assert_eq!(
         actor
-            .dispatch_event(Event::React, DispatchSource::default())
+            .dispatch_event(
+                Event::TimerFired {
+                    timer: arena0_protocol::TimerPayload::unit()
+                },
+                DispatchSource::Local
+            )
             .await
             .expect("dispatch broadcast"),
         DispatchOutcome::Committed
     );
 
+    // The local event queues the broadcast and installs immediately.
+    let queued = actor.state.clone();
+    assert!(queued.pending_shared().is_none());
+    assert_eq!(queued.outgoing().len(), 1);
+    assert_eq!(queued.agreed_step(), before.agreed_step());
+
+    // The author dispatches its own queued message and stages the proposal.
+    actor
+        .author_next_message()
+        .await
+        .expect("author queued message");
     let state = actor.state.clone();
     assert!(state.pending_shared().is_some());
-    assert_eq!(state.agreed_step(), before.agreed_step());
     let frame = state
         .current_frames(fixture.local_keys.peer_id())
         .into_iter()
         .find(|frame| matches!(frame, ExecFrame::Message { .. }))
-        .expect("broadcast frame");
+        .expect("authored message frame");
     assert!(matches!(
         frame,
-        ExecFrame::Message {
-            seq,
-            poststate,
-            ..
-        } if seq == before.agreed_step() && poststate == before.agreed_state()
+        ExecFrame::Message { commitment, .. }
+            if commitment.step == before.agreed_step()
+                && commitment == *state.pending_shared().unwrap().commitment()
     ));
     assert_eq!(
         state.event_position(),
-        before.event_position().saturating_add(1)
+        before.event_position().saturating_add(2)
     );
     actor.deliver_frames().unwrap();
     assert_eq!(actor.send_lanes.len(), 1);
@@ -2098,6 +2116,220 @@ async fn broadcast_delivery_has_only_remote_destinations_and_no_self_apply() {
             .contains_key(&fixture.remote_keys.peer_id())
     );
     assert_eq!(actor.state, state);
+}
+
+#[tokio::test]
+async fn author_waits_until_the_local_node_is_the_writer() {
+    let fixture = Fixture::with_mode(true, GuestMode::Broadcast).await;
+    let mut actor = fixture.prepare_active_actor().await;
+    fixture.commit_session_started(&mut actor).await;
+    assert_eq!(
+        actor
+            .dispatch_event(
+                Event::TimerFired {
+                    timer: arena0_protocol::TimerPayload::unit()
+                },
+                DispatchSource::Local
+            )
+            .await
+            .expect("queue broadcast"),
+        DispatchOutcome::Committed
+    );
+    assert_eq!(actor.state.outgoing().len(), 1);
+    assert!(!actor.may_author().expect("writer projection"));
+    actor
+        .author_next_message()
+        .await
+        .expect("a non-writer authors nothing");
+    assert!(actor.state.pending_shared().is_none());
+    assert_eq!(actor.state.outgoing().len(), 1);
+}
+
+#[tokio::test]
+async fn restart_authors_a_non_empty_outgoing_queue() {
+    let fixture = Fixture::with_mode(false, GuestMode::Broadcast).await;
+    let mut actor = fixture.prepare_active_actor().await;
+    fixture.commit_session_started(&mut actor).await;
+    assert_eq!(
+        actor
+            .dispatch_event(
+                Event::TimerFired {
+                    timer: arena0_protocol::TimerPayload::unit()
+                },
+                DispatchSource::Local
+            )
+            .await
+            .expect("queue broadcast"),
+        DispatchOutcome::Committed
+    );
+    assert_eq!(actor.state.outgoing().len(), 1);
+    drop(actor);
+
+    let (messages, _observations) = mpsc::channel(32);
+    let mut restarted = fixture.actor_with_messages(messages).await;
+    assert_eq!(restarted.state.outgoing().len(), 1);
+    restarted
+        .author_next_message()
+        .await
+        .expect("author the recovered queue");
+    assert!(restarted.state.pending_shared().is_some());
+}
+
+#[tokio::test]
+async fn own_rejected_message_is_dropped_from_the_queue() {
+    let fixture = Fixture::with_mode(false, GuestMode::RejectMessage).await;
+    let mut actor = fixture.prepare_active_actor().await;
+    fixture.commit_session_started(&mut actor).await;
+    assert_eq!(
+        actor
+            .dispatch_event(
+                Event::TimerFired {
+                    timer: arena0_protocol::TimerPayload::unit()
+                },
+                DispatchSource::Local
+            )
+            .await
+            .expect("queue broadcast"),
+        DispatchOutcome::Committed
+    );
+    assert_eq!(actor.state.outgoing().len(), 1);
+    actor
+        .author_next_message()
+        .await
+        .expect("a rejected own message is dropped");
+    assert!(actor.state.pending_shared().is_none());
+    assert!(actor.state.outgoing().is_empty());
+
+    // The drop is durable, not only an in-memory edit.
+    let reloaded = fixture
+        .store
+        .handle()
+        .load_execution(EXEC_ID)
+        .await
+        .expect("load execution")
+        .expect("execution");
+    assert!(reloaded.outgoing().is_empty());
+    assert!(reloaded.pending_shared().is_none());
+}
+
+#[tokio::test]
+async fn local_input_that_mutates_shared_state_is_rejected_and_changes_nothing() {
+    let fixture = Fixture::with_mode(false, GuestMode::InputSharedChange).await;
+    let mut actor = fixture.prepare_active_actor().await;
+    fixture.commit_session_started(&mut actor).await;
+    let before = actor.state.clone();
+    let pending_id = before.callout().expect("open callout").id;
+
+    assert!(matches!(
+        actor
+            .submit_input(pending_id, JsonBytes::try_new(b"null".to_vec()).unwrap())
+            .await,
+        Err(SubmitInputError::Expected(crate::ExecError::InputRejected(
+            _
+        )))
+    ));
+    assert_eq!(actor.state, before);
+    assert_eq!(actor.state.callout().map(|open| open.id), Some(pending_id));
+}
+
+#[tokio::test]
+async fn session_started_may_end_the_session() {
+    let fixture = Fixture::with_mode(false, GuestMode::EndOnSessionStarted).await;
+    let mut actor = fixture.prepare_active_actor().await;
+    let ensemble = actor.ensemble();
+    assert_eq!(
+        actor
+            .dispatch_event(Event::SessionStarted { ensemble }, DispatchSource::Local)
+            .await
+            .expect("session start"),
+        DispatchOutcome::Committed
+    );
+    let proposal = actor.state.pending_shared().expect("terminal proposal");
+    assert!(proposal.entry().is_terminal());
+}
+
+#[tokio::test]
+async fn input_broadcast_at_the_payload_bound_is_accepted() {
+    let at_limit = arena0_protocol::execution::MAX_EFFECT_PAYLOAD_BYTES as u32;
+    let fixture = Fixture::with_mode(false, GuestMode::InputBroadcast(at_limit)).await;
+    let (messages, observations) = mpsc::channel(32);
+    let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
+    fixture.commit_session_started(&mut actor).await;
+    let pending_id = actor.state.callout().expect("open callout").id;
+    actor
+        .submit_input(pending_id, JsonBytes::try_new(b"null".to_vec()).unwrap())
+        .await
+        .expect("at-limit broadcast is accepted");
+    assert_eq!(actor.state.outgoing().len(), 1);
+    assert!(!actor.state.status().is_terminal());
+    drop(observations);
+}
+
+#[tokio::test]
+async fn input_broadcast_over_the_payload_bound_is_rejected_and_changes_nothing() {
+    let over = arena0_protocol::execution::MAX_EFFECT_PAYLOAD_BYTES as u32 + 1;
+    let fixture = Fixture::with_mode(false, GuestMode::InputBroadcast(over)).await;
+    let mut actor = fixture.prepare_active_actor().await;
+    fixture.commit_session_started(&mut actor).await;
+    let before = actor.state.clone();
+    let pending_id = before.callout().expect("open callout").id;
+    assert!(matches!(
+        actor
+            .submit_input(pending_id, JsonBytes::try_new(b"null".to_vec()).unwrap())
+            .await,
+        Err(SubmitInputError::Expected(crate::ExecError::InputRejected(
+            _
+        )))
+    ));
+    assert_eq!(actor.state, before);
+    assert_eq!(actor.state.callout().map(|open| open.id), Some(pending_id));
+    assert!(!actor.state.status().is_terminal());
+}
+
+#[tokio::test]
+async fn agreed_broadcast_overflow_fails_the_session() {
+    let fixture = Fixture::with_mode(true, GuestMode::MessageBroadcast).await;
+    let (messages, _observations) = mpsc::channel(16);
+    let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
+    fixture.commit_session_started(&mut actor).await;
+    // Fill the local outgoing queue to the bound with local broadcasts.
+    for _ in 0..arena0_protocol::execution::MAX_OUTGOING_MESSAGES {
+        assert_eq!(
+            actor
+                .dispatch_event(
+                    Event::TimerFired {
+                        timer: arena0_protocol::TimerPayload::unit()
+                    },
+                    DispatchSource::Local,
+                )
+                .await
+                .expect("queue local broadcast"),
+            DispatchOutcome::Committed
+        );
+    }
+    assert_eq!(
+        actor.state.outgoing().len(),
+        arena0_protocol::execution::MAX_OUTGOING_MESSAGES
+    );
+
+    // A peer message whose agreed handler broadcasts would overflow.
+    let source = fixture.remote_keys.peer_id();
+    let data = b"overflow".to_vec();
+    let frame = message_frame(&actor.state, source, actor.state.agreed_step(), data);
+    let error = actor
+        .accept_frame(source, frame)
+        .await
+        .expect_err("agreed overflow");
+    assert!(matches!(error, crate::ExecError::OutgoingQueueOverflow));
+    assert!(actor.fail_terminal(error).await);
+    assert!(actor.state.status().is_terminal());
+    let reason = actor
+        .state
+        .status()
+        .terminal_cause()
+        .map(arena0_protocol::StopCause::reason)
+        .unwrap_or_default();
+    assert!(reason.contains("outgoing queue overflow"), "{reason}");
 }
 
 fn activation(
@@ -2191,7 +2423,11 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
     let writer_peer = writer.map(|index| peers.peers()[usize::from(index)]);
     let unit = unit_schema();
     let capabilities = match mode {
-        GuestMode::Plain | GuestMode::EndOnMessage => Vec::new(),
+        GuestMode::Plain
+        | GuestMode::EndOnMessage
+        | GuestMode::InputSharedChange
+        | GuestMode::EndOnSessionStarted => Vec::new(),
+        GuestMode::InputBroadcast(_) | GuestMode::MessageBroadcast => vec![Capability::Messaging],
         GuestMode::Timer => vec![Capability::Timers],
         GuestMode::Callout | GuestMode::CalloutFault | GuestMode::CalloutReject => Vec::new(),
         GuestMode::LocalSign | GuestMode::SignOnMessage => vec![Capability::Sign {
@@ -2200,7 +2436,11 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
         GuestMode::Broadcast | GuestMode::RejectMessage => vec![Capability::Messaging],
     };
     let callouts = match mode {
-        GuestMode::Callout | GuestMode::CalloutFault | GuestMode::CalloutReject => {
+        GuestMode::Callout
+        | GuestMode::CalloutFault
+        | GuestMode::CalloutReject
+        | GuestMode::InputSharedChange
+        | GuestMode::InputBroadcast(_) => {
             vec![CalloutSchema {
                 name: "request".into(),
                 prompt: "request".into(),
@@ -2244,14 +2484,17 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
             (func $sign (param i32 i32 i32 i32 i32) (result i32)))"#
         }
         GuestMode::Broadcast | GuestMode::RejectMessage => {
-            r#"(import "arena0" "broadcast" (func $broadcast (param i32 i32)))"#
+            r#"(import "arena0" "broadcast" (func $broadcast (param i32 i32) (result i32)))"#
         }
-        GuestMode::EndOnMessage => {
+        GuestMode::EndOnMessage | GuestMode::EndOnSessionStarted => {
             r#"(import "arena0" "end_session" (func $end_session (param i32 i32)))"#
         }
-        GuestMode::Plain => "",
+        GuestMode::Plain | GuestMode::InputSharedChange => "",
+        GuestMode::InputBroadcast(_) | GuestMode::MessageBroadcast => {
+            r#"(import "arena0" "broadcast" (func $broadcast (param i32 i32) (result i32)))"#
+        }
     };
-    let react_body = match mode {
+    let local_body = match mode {
         GuestMode::Plain => {
             r#"
               i32.const 1
@@ -2274,7 +2517,12 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
               call $set_timer
             "#
         }
-        GuestMode::Callout | GuestMode::CalloutFault | GuestMode::CalloutReject => {
+        GuestMode::Callout
+        | GuestMode::CalloutFault
+        | GuestMode::CalloutReject
+        | GuestMode::InputSharedChange
+        | GuestMode::InputBroadcast(_)
+        | GuestMode::MessageBroadcast => {
             r#"
               i32.const 1
               i32.const 1040
@@ -2312,13 +2560,59 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
               i32.const 1110
               i32.const 9
               call $broadcast
+              drop
             "#
         }
-        GuestMode::EndOnMessage | GuestMode::SignOnMessage => "",
+        GuestMode::EndOnMessage | GuestMode::SignOnMessage | GuestMode::EndOnSessionStarted => "",
     };
-    let session_started_body = "";
-    let react_body = if matches!(mode, GuestMode::RejectMessage) {
-        // Both participants run React; only the designated writer broadcasts.
+    // The timer fixture arms its timer from the session boundary, which is an
+    // agreed event, so no local dispatch is needed to schedule it.
+    let session_started_body = if matches!(mode, GuestMode::Timer) {
+        r#"
+          i32.const 1
+          i32.const 1040
+          i32.const 1
+          call $state_write
+          i64.const 0
+          i32.const 1090
+          i32.const 4
+          i32.const 1070
+          i32.const 5
+          call $set_timer
+        "#
+    } else if matches!(
+        mode,
+        GuestMode::InputSharedChange | GuestMode::InputBroadcast(_)
+    ) {
+        r#"
+          i32.const 1
+          i32.const 1040
+          i32.const 1
+          call $state_write
+          i32.const 33000
+          i32.const 15
+          call $pack
+          return
+        "#
+    } else if matches!(mode, GuestMode::EndOnSessionStarted) {
+        r#"
+          i32.const 0
+          i32.const 1024
+          i32.const 1
+          call $state_write
+          i32.const 1
+          i32.const 1030
+          i32.const 1
+          call $state_write
+          i32.const 1080
+          i32.const 0
+          call $end_session
+        "#
+    } else {
+        ""
+    };
+    let local_body = if matches!(mode, GuestMode::RejectMessage) {
+        // Both participants run the local handler; only the designated writer broadcasts.
         format!(
             r#"
           local.get $input
@@ -2331,12 +2625,12 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
             call $pack
             return
           end
-          {react_body}
+          {local_body}
         "#,
             i64::from_le_bytes(writer_peer.expect("writer").0[..8].try_into().unwrap())
         )
     } else {
-        react_body.to_owned()
+        local_body.to_owned()
     };
     let input_fault_body = match mode {
         GuestMode::CalloutFault => {
@@ -2352,6 +2646,23 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
               unreachable
             "#
         }
+        GuestMode::InputSharedChange => {
+            // A local input handler that changes agreed shared state.
+            r#"
+              i32.const 0
+              i32.const 1024
+              i32.const 1
+              call $state_write
+            "#
+        }
+        GuestMode::InputBroadcast(len) => &format!(
+            r#"
+              i32.const 0
+              i32.const {len}
+              call $broadcast
+              drop
+            "#
+        ),
         GuestMode::CalloutReject => {
             r#"
               local.get $event_ptr
@@ -2379,7 +2690,7 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
               i32.store8
             "#
         }
-        GuestMode::EndOnMessage => {
+        GuestMode::EndOnMessage | GuestMode::EndOnSessionStarted => {
             r#"
               i32.const 0
               i32.const 1024
@@ -2392,6 +2703,22 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
               i32.const 1080
               i32.const 0
               call $end_session
+            "#
+        }
+        GuestMode::MessageBroadcast => {
+            r#"
+              i32.const 0
+              i32.const 1024
+              i32.const 1
+              call $state_write
+              i32.const 1
+              i32.const 1030
+              i32.const 1
+              call $state_write
+              i32.const 1110
+              i32.const 9
+              call $broadcast
+              drop
             "#
         }
         GuestMode::SignOnMessage => {
@@ -2422,24 +2749,24 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
             "#
         }
     };
+    // The fired-timer arm runs the timer handler for the timer fixture and the
+    // former local handler body for every other mode.
     let timer_body = match mode {
-        GuestMode::Callout => {
-            r#"
-              i32.const 33100
-              i32.const 15
-              call $pack
-              return
-            "#
-        }
-        GuestMode::Timer => {
-            r#"
+        GuestMode::Timer => r#"
               i32.const 1
               i32.const 1140
               i32.const 1
               call $state_write
             "#
-        }
-        _ => "",
+        .to_owned(),
+        GuestMode::MessageBroadcast => r#"
+              i32.const 1110
+              i32.const 9
+              call $broadcast
+              drop
+            "#
+        .to_owned(),
+        _ => local_body.clone(),
     };
     let wat = format!(
         r#"
@@ -2529,14 +2856,6 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
                 i32.eq
                 if
                   {input_fault_body}
-                else
-                  local.get $event_ptr
-                  i32.load8_u
-                  i32.const 4
-                  i32.eq
-                  if
-                    {react_body}
-                  end
                 end
               end
             end
@@ -2564,7 +2883,6 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
         writer_len = writer.len(),
         metadata = wat_data(&metadata),
         metadata_len = metadata.len(),
-        react_body = react_body,
         session_started_body = session_started_body,
         input_fault_body = input_fault_body,
         message_body = message_body,
@@ -2635,7 +2953,12 @@ async fn failed_persist_reloads_state_and_restores_resident_before_next_dispatch
         .await
         .unwrap();
     let result = actor
-        .dispatch_event(Event::React, DispatchSource::default())
+        .dispatch_event(
+            Event::TimerFired {
+                timer: arena0_protocol::TimerPayload::unit(),
+            },
+            DispatchSource::Local,
+        )
         .await;
     assert!(
         result.is_err(),
@@ -2647,7 +2970,12 @@ async fn failed_persist_reloads_state_and_restores_resident_before_next_dispatch
     assert_eq!(resident.1, durable.local_state());
     assert_eq!(
         actor
-            .dispatch_event(Event::React, DispatchSource::default())
+            .dispatch_event(
+                Event::TimerFired {
+                    timer: arena0_protocol::TimerPayload::unit()
+                },
+                DispatchSource::Local
+            )
             .await
             .unwrap(),
         DispatchOutcome::Committed
@@ -2657,4 +2985,250 @@ async fn failed_persist_reloads_state_and_restores_resident_before_next_dispatch
         actor.context.store.load_execution().await.unwrap().unwrap(),
         actor.state
     );
+}
+
+/// Two live peers reach the same agreed cursor, but one has a full outgoing
+/// queue. The author's establishing message makes the receiver overflow, and
+/// the receiver's signed failure ends both peers through normal delivery.
+#[tokio::test]
+async fn agreed_overflow_converges_both_peers_on_failure() {
+    let writer = Fixture::with_mode(false, GuestMode::MessageBroadcast).await;
+    let receiver = Fixture::from_wasm_with_peer(writer.wasm.clone(), Some(&writer)).await;
+    let writer_peer = writer.local_keys.peer_id();
+    for fixture in [&writer, &receiver] {
+        let (messages, _observations) = mpsc::channel(16);
+        let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
+        fixture.commit_session_started(&mut actor).await;
+        if fixture.local_keys.peer_id() == writer_peer {
+            assert_eq!(
+                actor
+                    .dispatch_event(
+                        Event::TimerFired {
+                            timer: arena0_protocol::TimerPayload::unit()
+                        },
+                        DispatchSource::Local
+                    )
+                    .await
+                    .expect("queue writer broadcast"),
+                DispatchOutcome::Committed
+            );
+            actor
+                .author_next_message()
+                .await
+                .expect("author writer message");
+            actor
+                .ensure_step_signature()
+                .await
+                .expect("sign writer proposal");
+            assert_eq!(
+                actor
+                    .state
+                    .pending_shared()
+                    .expect("staged writer proposal")
+                    .signature_count(),
+                1
+            );
+        } else {
+            for _ in 0..arena0_protocol::execution::MAX_OUTGOING_MESSAGES {
+                assert_eq!(
+                    actor
+                        .dispatch_event(
+                            Event::TimerFired {
+                                timer: arena0_protocol::TimerPayload::unit()
+                            },
+                            DispatchSource::Local
+                        )
+                        .await
+                        .expect("queue receiver broadcast"),
+                    DispatchOutcome::Committed
+                );
+            }
+            assert_eq!(
+                actor.state.outgoing().len(),
+                arena0_protocol::execution::MAX_OUTGOING_MESSAGES
+            );
+            // The overflowing peer has signed no step beyond session start.
+            assert!(actor.state.pending_shared().is_none());
+        }
+    }
+    let writer_host = crate::Host::start(
+        Arc::clone(&writer.local_keys),
+        writer.local_transport.clone() as Arc<dyn Transport + Sync>,
+        writer.store.handle().clone(),
+    );
+    let receiver_host = crate::Host::start(
+        Arc::clone(&receiver.local_keys),
+        receiver.local_transport.clone() as Arc<dyn Transport + Sync>,
+        receiver.store.handle().clone(),
+    );
+    let mut writer_exec = writer_host
+        .spawn(
+            writer.context(),
+            writer_host.claim_execution(EXEC_ID).expect("writer claim"),
+        )
+        .expect("writer actor");
+    let mut receiver_exec = receiver_host
+        .spawn(
+            receiver.context(),
+            receiver_host
+                .claim_execution(EXEC_ID)
+                .expect("receiver claim"),
+        )
+        .expect("receiver actor");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for execution in [&mut receiver_exec, &mut writer_exec] {
+            loop {
+                match execution
+                    .message_rx
+                    .recv()
+                    .await
+                    .expect("terminal observation")
+                {
+                    crate::SessionMessage::Failed { reason } => {
+                        assert!(reason.contains("outgoing queue overflow"), "{reason}");
+                        break;
+                    }
+                    crate::SessionMessage::Completed { .. }
+                    | crate::SessionMessage::Aborted { .. } => {
+                        panic!("expected an authenticated failure")
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })
+    .await
+    .expect("both peers must finish without wedging");
+    for fixture in [&writer, &receiver] {
+        let state = fixture
+            .store
+            .handle()
+            .load_execution(EXEC_ID)
+            .await
+            .expect("load terminal")
+            .expect("execution");
+        assert!(state.status().is_terminal());
+        assert!(state.pending_shared().is_none());
+    }
+    let receiver_state = receiver
+        .store
+        .handle()
+        .load_execution(EXEC_ID)
+        .await
+        .expect("load receiver")
+        .expect("receiver execution");
+    // The overflowing peer only ever signed session start.
+    assert_eq!(receiver_state.agreed_step(), 1);
+    writer_exec.shutdown().await;
+    receiver_exec.shutdown().await;
+    writer_host.stop().await;
+    receiver_host.stop().await;
+}
+
+/// Two live peers receive a message frame whose only divergence is its
+/// terminal. The receiver fails before signing, and its signed failure ends the
+/// author through normal delivery.
+#[tokio::test]
+async fn terminal_commitment_mismatch_converges_both_peers_on_failure() {
+    let writer = Fixture::with_mode(false, GuestMode::Plain).await;
+    let receiver = Fixture::from_wasm_with_peer(writer.wasm.clone(), Some(&writer)).await;
+    let writer_peer = writer.local_keys.peer_id();
+    let receiver_peer = receiver.local_keys.peer_id();
+    for fixture in [&writer, &receiver] {
+        let (messages, _observations) = mpsc::channel(16);
+        let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
+        fixture.commit_session_started(&mut actor).await;
+    }
+    let writer_host = crate::Host::start(
+        Arc::clone(&writer.local_keys),
+        writer.local_transport.clone() as Arc<dyn Transport + Sync>,
+        writer.store.handle().clone(),
+    );
+    let receiver_host = crate::Host::start(
+        Arc::clone(&receiver.local_keys),
+        receiver.local_transport.clone() as Arc<dyn Transport + Sync>,
+        receiver.store.handle().clone(),
+    );
+    let mut writer_exec = writer_host
+        .spawn(
+            writer.context(),
+            writer_host.claim_execution(EXEC_ID).expect("writer claim"),
+        )
+        .expect("writer actor");
+    let mut receiver_exec = receiver_host
+        .spawn(
+            receiver.context(),
+            receiver_host
+                .claim_execution(EXEC_ID)
+                .expect("receiver claim"),
+        )
+        .expect("receiver actor");
+    let receiver_state = receiver
+        .store
+        .handle()
+        .load_execution(EXEC_ID)
+        .await
+        .expect("load receiver")
+        .expect("receiver execution");
+    let data = b"terminal only".to_vec();
+    let poststate = StateHash::of_shared(&message_state());
+    let commitment = message_commitment_with_terminal(
+        &receiver_state,
+        writer_peer,
+        receiver_state.agreed_step(),
+        receiver_state.agreed_state(),
+        poststate,
+        Some(arena0_protocol::StepTerminal::End { outcome: vec![] }),
+        &data,
+    );
+    let frame = ExecFrame::Message { commitment, data };
+    let stream = writer
+        .local_transport
+        .open_exec(&receiver_peer, writer.activation.session_hash())
+        .await
+        .expect("open writer stream");
+    stream
+        .send_exec(&frame)
+        .await
+        .expect("send mismatched frame");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for execution in [&mut receiver_exec, &mut writer_exec] {
+            loop {
+                match execution
+                    .message_rx
+                    .recv()
+                    .await
+                    .expect("terminal observation")
+                {
+                    crate::SessionMessage::Failed { reason } => {
+                        assert!(reason.contains("entry mismatch"), "{reason}");
+                        break;
+                    }
+                    crate::SessionMessage::Completed { .. }
+                    | crate::SessionMessage::Aborted { .. } => {
+                        panic!("expected an authenticated failure")
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })
+    .await
+    .expect("both peers must finish without wedging");
+    for fixture in [&writer, &receiver] {
+        let state = fixture
+            .store
+            .handle()
+            .load_execution(EXEC_ID)
+            .await
+            .expect("load terminal")
+            .expect("execution");
+        assert!(state.status().is_terminal());
+        assert!(state.pending_shared().is_none());
+        assert_eq!(state.agreed_step(), 1);
+    }
+    writer_exec.shutdown().await;
+    receiver_exec.shutdown().await;
+    writer_host.stop().await;
+    receiver_host.stop().await;
 }

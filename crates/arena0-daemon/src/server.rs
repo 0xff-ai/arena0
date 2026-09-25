@@ -3761,7 +3761,6 @@ fn project_event_record_summary(
             arena0_store::EventKind::MessageReceived => ApiEventKind::MessageReceived,
             arena0_store::EventKind::InputReceived => ApiEventKind::InputReceived,
             arena0_store::EventKind::TimerFired => ApiEventKind::TimerFired,
-            arena0_store::EventKind::React => ApiEventKind::React,
         },
         input_payload_bytes,
         effects,

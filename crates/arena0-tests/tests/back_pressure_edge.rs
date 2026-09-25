@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use arena0_crypto::NodeKeys;
-use arena0_protocol::{Event, ExecFrame, ExecId, MessageId, NegotiationId, PeerId, StateHash};
+use arena0_protocol::{ExecFrame, ExecId, NegotiationId, PeerId, StateHash};
 use arena0_tests::assert::wait_for_entry;
 use arena0_tests::fixtures::{
     complete_pending_shared, establish_live_session, ordering_program_wasm, provider,
@@ -20,21 +20,39 @@ fn cryptos() -> Vec<NodeKeys> {
     vec![provider(7), provider(8), provider(9)]
 }
 
+async fn current_link(execution: &arena0_tests::fixtures::LiveExecution) -> [u8; 32] {
+    execution
+        .store_handle
+        .load_execution(execution.exec_id)
+        .await
+        .expect("load execution")
+        .expect("execution")
+        .agreed_link()
+}
+
 fn message(
     session: arena0_protocol::SessionHash,
     source: PeerId,
     seq: u64,
     prestate: StateHash,
+    link: [u8; 32],
     payload: u8,
 ) -> ExecFrame {
     let data = vec![payload];
-    ExecFrame::Message {
-        message_id: MessageId::derive(session, source, seq, prestate, prestate, &data),
-        seq,
-        prestate,
-        data,
-        poststate: prestate,
-    }
+    let entry = arena0_protocol::TraceEntry {
+        trace_version: arena0_protocol::TRACE_FORMAT_VERSION,
+        step: seq,
+        event: arena0_protocol::StepEvent::Message {
+            from: source,
+            data: data.clone(),
+        },
+        pre_state: prestate,
+        post_state: prestate,
+        terminal: None,
+        agreement: arena0_protocol::AggregateAttestation::empty(),
+    };
+    let commitment = arena0_protocol::StepCommitment::for_entry(session, &entry, link);
+    ExecFrame::Message { commitment, data }
 }
 
 async fn send(
@@ -68,6 +86,7 @@ async fn message_claiming_unflushed_agreement_stays_behind_the_edge() {
         source,
         2,
         execution.initial_state,
+        current_link(&execution).await,
         7,
     );
     assert!(matches!(
@@ -108,6 +127,7 @@ async fn ordered_message_passes_the_public_edge() {
             source,
             1,
             execution.initial_state,
+            current_link(&execution).await,
             7,
         ),
     )
@@ -115,7 +135,7 @@ async fn ordered_message_passes_the_public_edge() {
     complete_pending_shared(&execution, &participants).await;
     let trace = wait_for_entry(&execution.store_handle, execution.exec_id, 1).await;
     let message = trace.iter().find_map(|entry| match &entry.event {
-        Event::MessageReceived { msg, .. } => msg.first().copied(),
+        arena0_protocol::StepEvent::Message { data, .. } => data.first().copied(),
         _ => None,
     });
     assert_eq!(message, Some(7));
@@ -144,6 +164,7 @@ async fn malformed_sender_frame_is_rejected_before_back_pressure_state() {
             outsider,
             1,
             execution.initial_state,
+            current_link(&execution).await,
             7,
         ))
         .await;

@@ -229,14 +229,17 @@ impl ExecutionStatus {
         entry: &TraceEntry,
         commitment: StepCommitment,
     ) -> Result<Option<Self>, ProtocolError> {
-        let Some(reason) = entry.abort_reason() else {
+        let Some(terminal) = entry.terminal.as_ref() else {
+            return Ok(None);
+        };
+        let Some(reason) = terminal.abort_reason() else {
             return Ok(None);
         };
         ensure_reason(reason)?;
-        let kind = match entry.terminal.as_ref() {
-            Some(crate::Effect::SessionAbort { .. }) => AbortKind::Abort,
-            Some(crate::Effect::Fail { .. }) => AbortKind::Fail,
-            _ => return Ok(None),
+        let kind = match terminal {
+            crate::StepTerminal::Abort { .. } => AbortKind::Abort,
+            crate::StepTerminal::Fail { .. } => AbortKind::Fail,
+            crate::StepTerminal::End { .. } => return Ok(None),
         };
         Ok(Some(Self::Stopped {
             cause: StopCause::Shared {

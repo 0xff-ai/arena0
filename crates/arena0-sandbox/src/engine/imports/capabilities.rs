@@ -3,7 +3,8 @@
 use arena0_crypto::SignScheme;
 use arena0_program::Capability;
 use arena0_program::abi::{self, imports};
-use arena0_protocol::{Effect, Lifecycle, TimerPayload};
+use arena0_protocol::execution::MAX_OUTGOING_MESSAGES;
+use arena0_protocol::{Effect, TimerPayload};
 use wasmtime::{Caller, Linker};
 
 use super::{CallerExt as _, u32_to_sign_scheme};
@@ -46,20 +47,30 @@ fn register_messaging(linker: &mut Linker<HostState>) -> Result<(), SandboxError
         .func_wrap(
             abi::HOST_MODULE,
             imports::BROADCAST,
-            |mut caller: Caller<'_, HostState>, data_ptr: u32, data_len: u32| {
+            |mut caller: Caller<'_, HostState>,
+             data_ptr: u32,
+             data_len: u32|
+             -> Result<u32, wasmtime::Error> {
                 caller.begin_import("broadcast")?;
-                caller.reject_if_lifecycle_disallowed(
-                    "broadcast",
-                    &[
-                        Lifecycle::PreSession,
-                        Lifecycle::Active,
-                        Lifecycle::Completed,
-                        Lifecycle::Failed,
-                    ],
-                )?;
                 caller.reject_read_only("broadcast")?;
+                // The queue is local, so an agreed handler never observes it:
+                // in an agreed dispatch the call always queues and reports
+                // success. Only a local handler sees the bound.
+                if caller.data().dispatch == crate::call::DispatchKind::Local {
+                    let queued_before = caller.data().outgoing_len;
+                    let queued_here = caller
+                        .data()
+                        .effect_queue
+                        .iter()
+                        .filter(|effect| matches!(effect, Effect::Broadcast { .. }))
+                        .count();
+                    if queued_before + queued_here >= MAX_OUTGOING_MESSAGES {
+                        return Ok(1);
+                    }
+                }
                 let data = caller.read_guest_bytes(data_ptr, data_len, "broadcast:data")?;
-                caller.record_effect(Effect::Broadcast { data })
+                caller.record_effect(Effect::Broadcast { data })?;
+                Ok(0)
             },
         )
         .map_err(map_err)?;
@@ -78,10 +89,6 @@ fn register_timers(linker: &mut Linker<HostState>) -> Result<(), SandboxError> {
              data_ptr: u32,
              data_len: u32| {
                 caller.begin_import("set_timer")?;
-                caller.reject_if_lifecycle_disallowed(
-                    "set_timer",
-                    &[Lifecycle::PreSession, Lifecycle::Active],
-                )?;
                 caller.reject_read_only("set_timer")?;
                 let type_bytes = caller.read_guest_bytes(type_ptr, type_len, "set_timer:type")?;
                 let type_name = String::from_utf8(type_bytes).map_err(|e| {
@@ -114,7 +121,6 @@ fn register_sign(
                   out_cap: u32|
                   -> Result<u32, wasmtime::Error> {
                 caller.begin_import("sign")?;
-                caller.reject_if_lifecycle_disallowed("sign", &[Lifecycle::Active])?;
                 caller.reject_read_only("sign")?;
                 let scheme = u32_to_sign_scheme(scheme)?;
                 reject_if_sign_scheme_disallowed("sign", scheme, &allowed_schemes)?;
@@ -174,7 +180,7 @@ mod tests {
     use wasmtime::{Engine, Linker, Module, Store};
 
     fn instantiate_timer_test_module(
-        stage: Lifecycle,
+        dispatch: crate::call::DispatchKind,
     ) -> (Store<HostState>, wasmtime::TypedFunc<(), ()>) {
         let engine = Engine::default();
         let module = Module::new(
@@ -204,11 +210,11 @@ mod tests {
             let mut hs = HostState::new(
                 arena0_program::ExecutionProfile::current(),
                 CallKind::Dispatch,
-                Lifecycle::PreSession,
+                crate::call::DispatchKind::Local,
                 None,
                 Vec::new(),
             );
-            hs.lifecycle = stage;
+            hs.dispatch = dispatch;
             hs
         });
         let instance = linker.instantiate(&mut store, &module).unwrap();
@@ -219,7 +225,7 @@ mod tests {
     }
 
     fn instantiate_sign_test_module(
-        stage: Lifecycle,
+        dispatch: crate::call::DispatchKind,
         scheme: u32,
         declared_schemes: Vec<SignScheme>,
         with_signer: bool,
@@ -259,11 +265,11 @@ mod tests {
             let mut hs = HostState::new(
                 arena0_program::ExecutionProfile::current(),
                 CallKind::Dispatch,
-                Lifecycle::PreSession,
+                crate::call::DispatchKind::Local,
                 None,
                 Vec::new(),
             );
-            hs.lifecycle = stage;
+            hs.dispatch = dispatch;
             if with_signer {
                 hs.signer.install(Some(std::sync::Arc::new(TestSigner)));
             }
@@ -296,8 +302,9 @@ mod tests {
     }
 
     #[test]
-    fn set_timer_allowed_during_pre_session() {
-        let (mut store, set_timer) = instantiate_timer_test_module(Lifecycle::PreSession);
+    fn set_timer_allowed_during_a_local_dispatch() {
+        let (mut store, set_timer) =
+            instantiate_timer_test_module(crate::call::DispatchKind::Local);
         set_timer.call(&mut store, ()).unwrap();
         assert_eq!(
             store.data().effect_queue,
@@ -312,26 +319,24 @@ mod tests {
     }
 
     #[test]
-    fn set_timer_rejected_after_finish() {
-        let (mut store, set_timer) = instantiate_timer_test_module(Lifecycle::Completed);
+    fn set_timer_rejected_during_a_read_only_call() {
+        let (mut store, set_timer) =
+            instantiate_timer_test_module(crate::call::DispatchKind::Agreed);
+        store.data_mut().call_kind = CallKind::Query;
         assert!(set_timer.call(&mut store, ()).is_err());
         assert!(store.data().effect_queue.is_empty());
     }
 
     #[test]
     fn sign_without_a_signer_traps_in_a_local_handler() {
-        let (mut store, sign, _) =
-            instantiate_sign_test_module(Lifecycle::Active, 0, vec![SignScheme::Ed25519], false);
+        let (mut store, sign, _) = instantiate_sign_test_module(
+            crate::call::DispatchKind::Local,
+            0,
+            vec![SignScheme::Ed25519],
+            false,
+        );
         let error = sign.call(&mut store, ()).unwrap_err();
         assert!(format!("{error:?}").contains("local handlers"), "{error:?}");
-        assert!(store.data().effect_queue.is_empty());
-    }
-
-    #[test]
-    fn sign_rejected_during_pre_session() {
-        let (mut store, sign, _) =
-            instantiate_sign_test_module(Lifecycle::PreSession, 0, vec![SignScheme::Ed25519], true);
-        assert!(sign.call(&mut store, ()).is_err());
         assert!(store.data().effect_queue.is_empty());
     }
 
@@ -342,7 +347,7 @@ mod tests {
             vec![SignScheme::Ed25519, SignScheme::Ed25519],
         ] {
             let (mut store, sign, memory) =
-                instantiate_sign_test_module(Lifecycle::Active, 0, declared, true);
+                instantiate_sign_test_module(crate::call::DispatchKind::Local, 0, declared, true);
             let written = sign.call(&mut store, ()).unwrap();
             let mut encoded = vec![0u8; written as usize];
             memory.read(&store, 0, &mut encoded).unwrap();
@@ -356,17 +361,216 @@ mod tests {
 
     #[test]
     fn sign_rejects_undeclared_scheme() {
-        let (mut store, sign, _) =
-            instantiate_sign_test_module(Lifecycle::Active, 1, vec![SignScheme::Ed25519], true);
+        let (mut store, sign, _) = instantiate_sign_test_module(
+            crate::call::DispatchKind::Local,
+            1,
+            vec![SignScheme::Ed25519],
+            true,
+        );
         assert!(sign.call(&mut store, ()).is_err());
         assert!(store.data().effect_queue.is_empty());
     }
 
     #[test]
     fn sign_rejects_unknown_scheme_discriminant() {
-        let (mut store, sign, _) =
-            instantiate_sign_test_module(Lifecycle::Active, 7, vec![SignScheme::Ed25519], true);
+        let (mut store, sign, _) = instantiate_sign_test_module(
+            crate::call::DispatchKind::Local,
+            7,
+            vec![SignScheme::Ed25519],
+            true,
+        );
         assert!(sign.call(&mut store, ()).is_err());
         assert!(store.data().effect_queue.is_empty());
+    }
+
+    fn instantiate_effect_test_module(
+        dispatch: crate::call::DispatchKind,
+        body: &str,
+        imports: &str,
+    ) -> (Store<HostState>, wasmtime::TypedFunc<(), i32>) {
+        instantiate_effect_test_module_with_pages(dispatch, body, imports, 1)
+    }
+
+    fn instantiate_effect_test_module_with_pages(
+        dispatch: crate::call::DispatchKind,
+        body: &str,
+        imports: &str,
+        pages: u32,
+    ) -> (Store<HostState>, wasmtime::TypedFunc<(), i32>) {
+        let engine = Engine::default();
+        let wat = format!(
+            r#"
+                (module
+                  {imports}
+                  (memory (export "memory") {pages})
+                  (data (i32.const 0) "x")
+                  (func (export "call") (result i32) {body}))
+            "#
+        );
+        let module = Module::new(&engine, wat).unwrap();
+        let mut linker = Linker::new(&engine);
+        crate::engine::imports::register_always_available(&mut linker).unwrap();
+        register_capability_imports(&mut linker, &[Capability::Messaging, Capability::Timers])
+            .unwrap();
+        let mut store = Store::new(&engine, {
+            let mut hs = HostState::new(
+                arena0_program::ExecutionProfile::current(),
+                CallKind::Dispatch,
+                crate::call::DispatchKind::Local,
+                None,
+                Vec::new(),
+            );
+            hs.dispatch = dispatch;
+            hs
+        });
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        let call = instance
+            .get_typed_func::<(), i32>(&mut store, "call")
+            .unwrap();
+        (store, call)
+    }
+
+    #[test]
+    fn lifecycle_effect_traps_in_a_local_dispatch() {
+        let (mut store, call) = instantiate_effect_test_module(
+            crate::call::DispatchKind::Local,
+            "i32.const 0 i32.const 1 call $end_session i32.const 0",
+            r#"(import "arena0" "end_session" (func $end_session (param i32 i32)))"#,
+        );
+        let error = call.call(&mut store, ()).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("only available to agreed events"),
+            "{error:?}"
+        );
+        assert!(store.data().effect_queue.is_empty());
+    }
+
+    #[test]
+    fn a_second_lifecycle_effect_traps() {
+        let (mut store, call) = instantiate_effect_test_module(
+            crate::call::DispatchKind::Agreed,
+            "i32.const 0 i32.const 1 call $end_session i32.const 0 i32.const 1 call $abort_session i32.const 0",
+            r#"(import "arena0" "end_session" (func $end_session (param i32 i32)))
+               (import "arena0" "abort_session" (func $abort_session (param i32 i32)))"#,
+        );
+        let error = call.call(&mut store, ()).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("at most one lifecycle effect"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn set_timer_combined_with_a_lifecycle_effect_traps() {
+        let imports = r#"(import "arena0" "end_session" (func $end_session (param i32 i32)))
+               (import "arena0" "set_timer" (func $set_timer (param i64 i32 i32 i32 i32)))"#;
+        let (mut store, call) = instantiate_effect_test_module(
+            crate::call::DispatchKind::Agreed,
+            "i32.const 0 i32.const 1 call $end_session i64.const 0 i32.const 0 i32.const 1 i32.const 0 i32.const 1 call $set_timer i32.const 0",
+            imports,
+        );
+        let error = call.call(&mut store, ()).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("SetTimer cannot be combined"),
+            "{error:?}"
+        );
+
+        let (mut store, call) = instantiate_effect_test_module(
+            crate::call::DispatchKind::Agreed,
+            "i64.const 0 i32.const 0 i32.const 1 i32.const 0 i32.const 1 call $set_timer i32.const 0 i32.const 1 call $end_session i32.const 0",
+            imports,
+        );
+        let error = call.call(&mut store, ()).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("cannot be combined with SetTimer"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn local_broadcast_returns_queue_full_after_an_earlier_broadcast() {
+        let (mut store, call) = instantiate_effect_test_module(
+            crate::call::DispatchKind::Local,
+            "i32.const 0 i32.const 1 call $broadcast drop \
+             i32.const 0 i32.const 1 call $broadcast",
+            r#"(import "arena0" "broadcast" (func $broadcast (param i32 i32) (result i32)))"#,
+        );
+        store.data_mut().outgoing_len = arena0_protocol::execution::MAX_OUTGOING_MESSAGES - 1;
+        // The first broadcast fills the queue; the second observes the bound.
+        assert_eq!(call.call(&mut store, ()).unwrap(), 1);
+        assert_eq!(store.data().effect_queue.len(), 1);
+    }
+
+    #[test]
+    fn local_broadcast_returns_queue_full_when_the_queue_is_already_full() {
+        let (mut store, call) = instantiate_effect_test_module(
+            crate::call::DispatchKind::Local,
+            "i32.const 0 i32.const 1 call $broadcast",
+            r#"(import "arena0" "broadcast" (func $broadcast (param i32 i32) (result i32)))"#,
+        );
+        store.data_mut().outgoing_len = arena0_protocol::execution::MAX_OUTGOING_MESSAGES;
+        assert_eq!(call.call(&mut store, ()).unwrap(), 1);
+        assert!(store.data().effect_queue.is_empty());
+    }
+
+    #[test]
+    fn broadcast_payload_bound_is_enforced_at_emission() {
+        let at_limit = arena0_protocol::execution::MAX_EFFECT_PAYLOAD_BYTES;
+        let (mut store, call) = instantiate_effect_test_module_with_pages(
+            crate::call::DispatchKind::Local,
+            &format!("i32.const 0 i32.const {at_limit} call $broadcast"),
+            r#"(import "arena0" "broadcast" (func $broadcast (param i32 i32) (result i32)))"#,
+            2,
+        );
+        assert_eq!(call.call(&mut store, ()).unwrap(), 0);
+        assert_eq!(store.data().effect_queue.len(), 1);
+
+        let (mut store, call) = instantiate_effect_test_module_with_pages(
+            crate::call::DispatchKind::Local,
+            &format!("i32.const 0 i32.const {} call $broadcast", at_limit + 1),
+            r#"(import "arena0" "broadcast" (func $broadcast (param i32 i32) (result i32)))"#,
+            2,
+        );
+        assert!(call.call(&mut store, ()).is_err());
+        assert!(store.data().effect_queue.is_empty());
+    }
+
+    #[test]
+    fn effect_count_bound_is_enforced_at_emission() {
+        let count = arena0_program::MAX_EFFECTS_PER_DISPATCH as usize;
+        let imports =
+            r#"(import "arena0" "broadcast" (func $broadcast (param i32 i32) (result i32)))"#;
+        let emit = |n: usize| {
+            format!(
+                "{}i32.const 0",
+                "i32.const 0 i32.const 1 call $broadcast drop ".repeat(n)
+            )
+        };
+        let (mut store, call) = instantiate_effect_test_module(
+            crate::call::DispatchKind::Agreed,
+            &emit(count),
+            imports,
+        );
+        assert_eq!(call.call(&mut store, ()).unwrap(), 0);
+        assert_eq!(store.data().effect_queue.len(), count);
+
+        let (mut store, call) = instantiate_effect_test_module(
+            crate::call::DispatchKind::Agreed,
+            &emit(count + 1),
+            imports,
+        );
+        assert!(call.call(&mut store, ()).is_err());
+        assert_eq!(store.data().effect_queue.len(), count);
+    }
+
+    #[test]
+    fn broadcast_is_available_to_agreed_events() {
+        let (mut store, call) = instantiate_effect_test_module(
+            crate::call::DispatchKind::Agreed,
+            "i32.const 0 i32.const 1 call $broadcast",
+            r#"(import "arena0" "broadcast" (func $broadcast (param i32 i32) (result i32)))"#,
+        );
+        assert_eq!(call.call(&mut store, ()).unwrap(), 0);
+        assert_eq!(store.data().effect_queue.len(), 1);
     }
 }

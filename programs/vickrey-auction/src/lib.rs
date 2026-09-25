@@ -11,7 +11,8 @@ use std::fmt::Write;
 
 use arena0::prelude::*;
 use arena0_primitives::commit_reveal::{
-    self, CommitReveal, CommitRevealFieldExt, CommitRevealLocal, CommitRevealLocalState,
+    self, CommitReveal, CommitRevealAuthorExt, CommitRevealFieldExt, CommitRevealLocal,
+    CommitRevealLocalState,
 };
 use arena0_primitives::joint_randomness;
 
@@ -331,53 +332,11 @@ pub mod vickrey_auction {
             .set_participant_count(count)
             .and_then(|_| ctx.shared_mut().entropy.set_participant_count(count))
             .map_err(|error| anyhow!(error))?;
+        queue_bid_action_if_due(ctx)?;
         Ok(Transition::To(Phase::Bidding))
     }
 
-    fn on_react(
-        ctx: &mut Context<Shared, Local>,
-    ) -> Result<ProgramTransition<VickreyAuction>, ProgramFault> {
-        match ctx.shared().phase() {
-            Phase::Setup => {}
-            Phase::Bidding => {
-                if ctx.shared().bids.expected_writer() != Some(ctx.me()) {
-                    return Ok(Transition::Stay);
-                }
-                if let Some(reveal) = ctx.bids().take_reveal() {
-                    reveal.broadcast();
-                    if ctx.shared().bids.is_complete() {
-                        return Ok(settle_bids(ctx.shared_mut())?);
-                    }
-                } else if ctx.bids().needs_commit() && ctx.me().index() == 0 {
-                    ctx.bids().commit_with_salt(0, [0; 32])?.broadcast();
-                }
-            }
-            Phase::TieBreak => {
-                if ctx.shared().entropy.expected_writer() != Some(ctx.me()) {
-                    return Ok(Transition::Stay);
-                }
-                if let Some(reveal) = ctx.entropy().take_reveal() {
-                    reveal.broadcast();
-                    if ctx.shared().entropy.is_complete() {
-                        ctx.shared_mut().settle_tie()?;
-                        return Ok(Transition::End);
-                    }
-                } else if ctx.entropy().needs_commit() {
-                    if ctx.me().index() == 0 {
-                        ctx.entropy()
-                            .commit_with_salt([0; 32], [0; 32])?
-                            .broadcast();
-                    } else {
-                        let nonce = ctx.random_bytes::<32>();
-                        ctx.entropy().commit(nonce)?.broadcast();
-                    }
-                }
-            }
-        }
-        Ok(Transition::Stay)
-    }
-
-    fn callout(ctx: &Context<Shared, Local>) -> Option<Callout> {
+    fn callout(ctx: &CalloutContext<'_, Shared, Local>) -> Option<Callout> {
         (ctx.shared().phase() == Phase::Bidding
             && ctx.me().index() != 0
             && ctx.shared().bids.expected_writer() == Some(ctx.me())
@@ -407,10 +366,15 @@ pub mod vickrey_auction {
                     return Ok(ApplyDecision::Reject);
                 }
                 if !ctx.shared().bids.is_complete() {
+                    queue_bid_action_if_due(ctx).map_err(ProtocolFault::shared_violation)?;
                     return Ok(ApplyDecision::Accept(Transition::Stay));
                 }
 
-                Ok(ApplyDecision::Accept(settle_bids(ctx.shared_mut())?))
+                let transition = settle_bids(ctx.shared_mut())?;
+                if matches!(transition, Transition::To(Phase::TieBreak)) {
+                    queue_entropy_action_if_due(ctx).map_err(ProtocolFault::shared_violation)?;
+                }
+                Ok(ApplyDecision::Accept(transition))
             }
             Message::Entropy(message) => {
                 if ctx.shared().phase() != Phase::TieBreak
@@ -422,6 +386,7 @@ pub mod vickrey_auction {
                     return Ok(ApplyDecision::Reject);
                 }
                 if !ctx.shared().entropy.is_complete() {
+                    queue_entropy_action_if_due(ctx).map_err(ProtocolFault::shared_violation)?;
                     return Ok(ApplyDecision::Accept(Transition::Stay));
                 }
                 ctx.shared_mut()
@@ -432,10 +397,43 @@ pub mod vickrey_auction {
         }
     }
 
-    fn on_input(
-        ctx: &mut Context<Shared, Local>,
-        input: Input,
-    ) -> arena0::anyhow::Result<ProgramTransition<VickreyAuction>> {
+    /// Queue the next owed bid commit or reveal when this node owns the writer.
+    fn queue_bid_action_if_due(ctx: &mut Context<Shared, Local>) -> arena0::anyhow::Result<()> {
+        if ctx.shared().bids.expected_writer() != Some(ctx.me()) {
+            return Ok(());
+        }
+        if let Some(reveal) = ctx.bids().take_reveal() {
+            reveal.broadcast(&mut ctx.effects());
+        } else if ctx.bids().needs_commit() && ctx.me().index() == 0 {
+            ctx.bids()
+                .commit_with_salt(0, [0; 32])?
+                .broadcast(&mut ctx.effects());
+        }
+        Ok(())
+    }
+
+    /// Queue the next owed entropy commit or reveal when this node owns the
+    /// writer.
+    fn queue_entropy_action_if_due(ctx: &mut Context<Shared, Local>) -> arena0::anyhow::Result<()> {
+        if ctx.shared().entropy.expected_writer() != Some(ctx.me()) {
+            return Ok(());
+        }
+        if let Some(reveal) = ctx.entropy().take_reveal() {
+            reveal.broadcast(&mut ctx.effects());
+        } else if ctx.entropy().needs_commit() {
+            if ctx.me().index() == 0 {
+                ctx.entropy()
+                    .commit_with_salt([0; 32], [0; 32])?
+                    .broadcast(&mut ctx.effects());
+            } else {
+                let nonce = ctx.random_bytes::<32>();
+                ctx.entropy().commit(nonce)?.broadcast(&mut ctx.effects());
+            }
+        }
+        Ok(())
+    }
+
+    fn on_input(ctx: &mut LocalContext<Shared, Local>, input: Input) -> arena0::anyhow::Result<()> {
         let Input::SubmitBid(amount) = input;
         if ctx.me().index() == 0 {
             return Err(anyhow!("seller/coordinator cannot submit a bid"));
@@ -446,8 +444,8 @@ pub mod vickrey_auction {
         if ctx.shared().bids.expected_writer() != Some(ctx.me()) {
             return Err(anyhow!("this participant does not own the next bid"));
         }
-        ctx.bids().commit(amount)?.broadcast();
-        Ok(Transition::Stay)
+        ctx.bids().commit(amount)?.broadcast(&mut ctx.effects())?;
+        Ok(())
     }
 
     fn on_query(_shared: &Shared, _: ()) {}
@@ -716,21 +714,23 @@ mod tests {
 
         let started = h.session_started_with_ensemble(ensemble);
         assert!(matches!(started.fault, FaultStatus::None));
-        // Session-start reaction already applies the seller's commit; the
-        // broadcast is evidence for peers, not a self-message to redeliver.
+        // Session start queues the seller's commit; the author applies its own
+        // message through `on_message`.
         let _seller_commit = started
             .messages::<Message>()
             .into_iter()
             .find(|message| matches!(message, Message::Bid(commit_reveal::Message::Commit(_))))
-            .expect("seller commits through the actual reaction handler");
+            .expect("seller queues its commit");
+        h.author_queued(&started.effects);
         h.message(first_bidder, bid_commit(120, 1));
         let committed = h.message(missing_bidder, bid_commit(80, 2));
         let _seller_reveal = committed
             .messages::<Message>()
             .into_iter()
             .find(|message| matches!(message, Message::Bid(commit_reveal::Message::Reveal { .. })))
-            .expect("seller reveal is emitted by the actual reaction handler");
-        // The reaction that emitted this reveal also applied it locally.
+            .expect("seller reveal is queued once every commit is applied");
+        // The author applies its own reveal through `on_message`.
+        h.author_queued(&committed.effects);
         let pending = h.message(
             first_bidder,
             Message::Bid(commit_reveal::Message::Reveal {

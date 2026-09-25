@@ -975,9 +975,7 @@ impl Transport for LocalTransport {
 mod tests {
     use super::*;
     use arena0_crypto::{NodeKeys, SecretKey};
-    use arena0_protocol::{
-        AbortKind, AbortOccurrence, ExecFrame, MessageId, StateHash, StepCursor,
-    };
+    use arena0_protocol::{AbortKind, AbortOccurrence, ExecFrame, StateHash, StepCursor};
     use tokio::time::{Duration, timeout};
 
     fn peer(byte: u8) -> PeerId {
@@ -994,11 +992,16 @@ mod tests {
 
     fn message_frame(byte: u8) -> ExecFrame {
         ExecFrame::Message {
-            message_id: MessageId([byte; 32]),
-            seq: u64::from(byte),
-            prestate: StateHash([byte.wrapping_add(1); 32]),
+            commitment: arena0_protocol::StepCommitment {
+                domain: arena0_protocol::STEP_COMMIT_DOMAIN,
+                session_id: arena0_protocol::SessionHash([byte; 32]),
+                step: u64::from(byte),
+                entry_hash: [byte; 32],
+                pre_state: StateHash([byte.wrapping_add(1); 32]),
+                post_state: StateHash([byte.wrapping_add(3); 32]),
+                link: [byte.wrapping_add(4); 32],
+            },
             data: vec![byte.wrapping_add(2)],
-            poststate: StateHash([byte.wrapping_add(3); 32]),
         }
     }
 

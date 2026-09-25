@@ -186,6 +186,15 @@ pub mod chess {
         moves
     }
 
+    /// Participant-local chess state.
+    #[arena0::local]
+    #[derive(Default)]
+    pub struct Local {
+        /// Set while this participant's move is queued but not yet applied, so
+        /// the callout does not re-ask the answered question.
+        move_pending: bool,
+    }
+
     #[arena0::state(max = 32768)]
     pub struct Shared {
         #[phase]
@@ -195,8 +204,6 @@ pub mod chess {
         status: Status,
         move_history: Vec<String>,
     }
-
-    pub type Local = ();
 
     /// Pure projection from final shared state; no context, effects, or entropy.
     ///
@@ -440,9 +447,14 @@ pub mod chess {
     }
 
     /// Ask the participant whose turn it is for a legal move.
-    fn callout(ctx: &Context<Shared, Local>) -> Option<Callout> {
+    fn callout(ctx: &CalloutContext<'_, Shared, Local>) -> Option<Callout> {
         let state = ctx.shared();
         if state.phase() != Phase::Playing || state.status != Status::InProgress {
+            return None;
+        }
+        // An answer already queued this participant's move; do not re-ask the
+        // same question until the author's own message is applied.
+        if ctx.local().move_pending {
             return None;
         }
         let is_my_turn = state
@@ -457,26 +469,21 @@ pub mod chess {
         Some(callouts::MakeMove { fen, legal_moves }.into())
     }
 
-    fn on_input(
-        ctx: &mut Context<Shared, Local>,
-        input: Input,
-    ) -> arena0::anyhow::Result<ProgramTransition<Chess>> {
+    fn on_input(ctx: &mut LocalContext<Shared, Local>, input: Input) -> arena0::anyhow::Result<()> {
         let Input::MakeMove(text) = input;
         let move_str = text.trim();
-        let from = ctx.me();
-        if writer(ctx.shared()) != Some(from) {
+        if writer(ctx.shared()) != Some(ctx.me()) {
             return Err(anyhow!("this participant does not own the next move"));
         }
-        // A bad move is rejected. The originating event applies the move before
-        // its broadcast; receivers apply the same helper at the message boundary.
-        let finished = apply_move(ctx.shared_mut(), move_str).map_err(|e| anyhow!(e))?;
+        // Validate the move against the committed board without mutating
+        // shared state; the author applies it when its own message is applied.
+        ctx.shared()
+            .validate_move(move_str)
+            .map_err(|e| anyhow!(e))?;
+        ctx.mutate_local(|local| local.move_pending = true);
         ctx.effects()
-            .broadcast(&Message::Move(move_str.to_string()));
-        Ok(if finished {
-            Transition::End
-        } else {
-            Transition::Stay
-        })
+            .broadcast(&Message::Move(move_str.to_string()))?;
+        Ok(())
     }
 
     fn on_message(
@@ -492,6 +499,7 @@ pub mod chess {
         let Ok(finished) = apply_move(ctx.shared_mut(), move_str) else {
             return Ok(ApplyDecision::Reject);
         };
+        ctx.mutate_local(|local| local.move_pending = false);
         if finished {
             return Ok(ApplyDecision::Accept(Transition::End));
         }
@@ -502,8 +510,8 @@ pub mod chess {
     fn on_query(_shared: &Shared, _: ()) {}
 
     /// Apply one validated move to the shared board and advance the canonical
-    /// turn. Both the originating input and every receiving message use this
-    /// helper so the producer never needs to self-apply its broadcast.
+    /// turn. Every participant, including the author applying its own message,
+    /// uses this helper.
     fn apply_move(state: &mut Shared, move_str: &str) -> Result<bool, Error> {
         let (board, algebraic) = state.validate_move(move_str)?;
         state.apply_validated_move(&board, algebraic);
@@ -765,14 +773,16 @@ mod tests {
         }
 
         /// Make the local side's move on a single native replica: answer the
-        /// pending `MakeMove` callout. The input handler applies the move before
-        /// emitting its broadcast, so this helper does not self-deliver it.
-        /// The local node is White (participant 0). Returns the apply result.
-        fn play_move<H>(h: &mut H, uci: &str) -> arena0::testing::HandlerResult
-        where
-            H: Harness<Chess>,
-        {
-            h.resolve_callout::<callouts::MakeMove>(uci.to_string())
+        /// pending `MakeMove` callout, then author the queued move through
+        /// `on_message` as the runtime does. The local node is White
+        /// (participant 0). Returns the authored apply result.
+        fn play_move(h: &mut TestHarness<Chess>, uci: &str) -> HandlerResult {
+            let input = h.resolve_callout::<callouts::MakeMove>(uci.to_string());
+            assert!(matches!(input.fault, FaultStatus::None));
+            h.author_queued(&input.effects)
+                .into_iter()
+                .last()
+                .expect("queued move is authored")
         }
 
         fn session_end_outcome(result: &HandlerResult) -> Outcome {
@@ -790,7 +800,12 @@ mod tests {
         fn terminal_move(h: &mut TestHarness<Chess>, fen: &str, uci: &str) -> (Status, Outcome) {
             h.session_started(peer_a());
             h.shared_mut().fen = fen.to_owned();
-            let result = h.resolve_callout::<callouts::MakeMove>(uci.to_owned());
+            let input = h.resolve_callout::<callouts::MakeMove>(uci.to_owned());
+            let result = h
+                .author_queued(&input.effects)
+                .into_iter()
+                .last()
+                .expect("queued move is authored");
             assert!(
                 result.has_session_end(),
                 "terminal move should end the session"
@@ -806,10 +821,17 @@ mod tests {
         fn valid_move_updates_board(h: ()) {
             h.session_started(peer_a());
 
-            // The input handler applies the move before broadcasting it.
-            let fx = h.resolve_callout::<callouts::MakeMove>("e2e4".to_string());
-            assert!(matches!(fx.fault, FaultStatus::None));
-            assert!(fx.has_broadcast());
+            // The input queues the move; the author applies it when its own
+            // message is dispatched through `on_message`.
+            let input = h.resolve_callout::<callouts::MakeMove>("e2e4".to_string());
+            assert!(matches!(input.fault, FaultStatus::None));
+            assert!(input.has_broadcast());
+            let authored = h.author_queued(&input.effects);
+            assert!(
+                authored
+                    .iter()
+                    .all(|fx| matches!(fx.fault, FaultStatus::None))
+            );
 
             let state = h.shared();
             assert!(!state.fen.is_empty());
@@ -910,16 +932,21 @@ mod tests {
             play_move(&mut h, "d1h5");
             h.message(peer_a(), Message::Move("g8f6".to_string()));
 
-            // 4. Qxf7# (checkmate). The input handler applies the winning move
-            // before emitting its broadcast and terminal effect.
-            let broadcast = h.resolve_callout::<callouts::MakeMove>("h5f7".to_string());
+            // 4. Qxf7# (checkmate). The input queues the winning move; the
+            // authored message applies it and emits the terminal effect.
+            let input = h.resolve_callout::<callouts::MakeMove>("h5f7".to_string());
             assert!(
-                broadcast.has_broadcast(),
-                "winning move is broadcast with the local apply"
+                input.has_broadcast(),
+                "winning move is queued as a broadcast"
             );
+            let broadcast = h
+                .author_queued(&input.effects)
+                .into_iter()
+                .last()
+                .expect("queued mate is authored");
             assert!(
                 broadcast.has_session_end(),
-                "the local mate input ends the session"
+                "the authored mate ends the session"
             );
 
             let state = h.shared();
@@ -980,7 +1007,7 @@ mod tests {
             h.message(peer_a(), Message::Move("b8c6".to_string()));
             play_move(&mut h, "d1h5");
             h.message(peer_a(), Message::Move("g8f6".to_string()));
-            let broadcast = h.resolve_callout::<callouts::MakeMove>("h5f7".to_string());
+            let broadcast = play_move(&mut h, "h5f7");
             assert!(broadcast.has_session_end());
             assert_eq!(
                 h.shared().status,

@@ -3,8 +3,8 @@
 use arena0_crypto::BlsSignature;
 use arena0_wire::{
     ABORT_KIND_ABORT, ABORT_KIND_FAIL, ExecFrame as WireExecFrame, MAX_EXEC_MESSAGE_BYTES,
-    MAX_EXEC_REASON_BYTES, MessageIdBytes, PeerIdBytes, SessionHashBytes, StateHashBytes,
-    WireAbortCoordinate, WireAbortOccurrence, WireError, WireStepCommitment,
+    MAX_EXEC_REASON_BYTES, PeerIdBytes, SessionHashBytes, StateHashBytes, WireAbortCoordinate,
+    WireAbortOccurrence, WireError, WireStepCommitment,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 use std::io;
@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::trace::StepCommitment;
 use crate::{
-    AbortKind, AbortOccurrence, AggregateAttestation, MessageId, SessionHash, SignerSet, StateHash,
+    AbortKind, AbortOccurrence, AggregateAttestation, SessionHash, SignerSet, StateHash,
     StepCertificate,
 };
 
@@ -24,17 +24,15 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecFrame {
     /// Broadcast one program payload at an agreed trace position.
+    ///
+    /// The commitment carries the author's step, pre/post shared hashes, entry
+    /// hash, and chain link. A receiver rebuilds the entry itself and compares
+    /// its own commitment before signing.
     Message {
-        /// Content identity of the message envelope.
-        message_id: MessageId,
-        /// Agreed trace position.
-        seq: u64,
-        /// Shared state hash before applying the message.
-        prestate: StateHash,
+        /// The author's complete commitment for this message step.
+        commitment: StepCommitment,
         /// Opaque guest payload.
         data: Vec<u8>,
-        /// Shared state hash after applying the message.
-        poststate: StateHash,
     },
     /// One participant's signature over one exact shared-state commitment.
     StepSignature {
@@ -74,19 +72,10 @@ impl TryFrom<WireExecFrame> for ExecFrame {
 
     fn try_from(frame: WireExecFrame) -> Result<Self, Self::Error> {
         Ok(match frame {
-            WireExecFrame::Message {
-                message_id,
-                seq,
-                prestate,
-                poststate,
-                data,
-            } => {
+            WireExecFrame::Message { commitment, data } => {
                 check_data_len(data.len())?;
                 Self::Message {
-                    message_id: MessageId(message_id.0),
-                    seq,
-                    prestate: StateHash(prestate.0),
-                    poststate: StateHash(poststate.0),
+                    commitment: step_commitment_from_wire(commitment)?,
                     data,
                 }
             }
@@ -133,19 +122,10 @@ impl TryFrom<&ExecFrame> for WireExecFrame {
 
     fn try_from(frame: &ExecFrame) -> Result<Self, Self::Error> {
         Ok(match frame {
-            ExecFrame::Message {
-                message_id,
-                seq,
-                prestate,
-                poststate,
-                data,
-            } => {
+            ExecFrame::Message { commitment, data } => {
                 check_data_len(data.len())?;
                 Self::Message {
-                    message_id: MessageIdBytes(message_id.0),
-                    seq: *seq,
-                    prestate: StateHashBytes(prestate.0),
-                    poststate: StateHashBytes(poststate.0),
+                    commitment: step_commitment_to_wire(commitment)?,
                     data: data.clone(),
                 }
             }
@@ -313,11 +293,16 @@ mod tests {
 
     fn message_frame() -> ExecFrame {
         ExecFrame::Message {
-            message_id: MessageId([1; 32]),
-            seq: 7,
-            prestate: StateHash([2; 32]),
+            commitment: StepCommitment {
+                domain: crate::STEP_COMMIT_DOMAIN,
+                session_id: SessionHash([1; 32]),
+                step: 7,
+                entry_hash: [2; 32],
+                pre_state: StateHash([3; 32]),
+                post_state: StateHash([6; 32]),
+                link: [5; 32],
+            },
             data: vec![3, 4, 5],
-            poststate: StateHash([6; 32]),
         }
     }
 

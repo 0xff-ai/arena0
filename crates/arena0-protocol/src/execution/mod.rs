@@ -21,6 +21,8 @@ mod validation;
 
 /// Maximum number of effects retained for one event dispatch.
 pub const MAX_EFFECTS: usize = 128;
+/// Maximum number of messages one execution may hold in its outgoing queue.
+pub const MAX_OUTGOING_MESSAGES: usize = 16;
 /// Maximum number of active one-shot timers in one execution.
 pub const MAX_ACTIVE_TIMERS: usize = 64;
 /// Maximum number of signatures retained for one pending proof.
@@ -62,6 +64,7 @@ pub use status::{ExecutionStatus, ReceiptWork, StopCause};
 pub use timer::TimerId;
 pub use timer_firing::TimerFiring;
 
+pub use validation::{check_effect_budget, validate_effect_payload};
 pub(crate) use validation::{
     ensure_encoded, ensure_payload, validate_effects, validate_proposal, validate_receipt_body,
     validate_receipt_body_shape,

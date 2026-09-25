@@ -1539,12 +1539,9 @@ fn monitor_trace_detail_decodes_messages_and_scrolls_inspector() {
         .map(|step| TraceEntry {
             trace_version: arena0_client::protocol::TRACE_FORMAT_VERSION,
             step,
-            event: TraceEvent::MessageReceived {
-                message_id: arena0_client::protocol::MessageId([step as u8; 32]),
+            event: TraceEvent::Message {
                 from: PeerId([1; 32]),
-                position: step,
-                pre_state: arena0_client::protocol::StateHash([step as u8; 32]),
-                msg: (step as u32).to_le_bytes().to_vec(),
+                data: (step as u32).to_le_bytes().to_vec(),
             },
             pre_state: arena0_client::protocol::StateHash([step as u8; 32]),
             post_state: arena0_client::protocol::StateHash([(step + 1) as u8; 32]),
@@ -1793,4 +1790,24 @@ fn monitor_tab_reaches_the_answer_pane_and_returns_in_order() {
     state.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
     assert_eq!(state.focus, Focus::Workspace);
     assert_eq!(state.page.pane(), OverviewPane::SystemEvents);
+}
+
+#[test]
+fn trace_label_shows_the_derived_message_id() {
+    let session = SessionHash([0x44; 32]);
+    let entry = TraceEntry {
+        trace_version: arena0_client::protocol::TRACE_FORMAT_VERSION,
+        step: 1,
+        event: TraceEvent::Message {
+            from: PeerId([1; 32]),
+            data: vec![2],
+        },
+        pre_state: arena0_client::protocol::StateHash([0x11; 32]),
+        post_state: arena0_client::protocol::StateHash([0x22; 32]),
+        terminal: None,
+        agreement: arena0_client::protocol::AggregateAttestation::empty(),
+    };
+    let label = super::trace::trace_event_label(&entry, Some(session));
+    let id = entry.message_id(session).expect("message identity");
+    assert!(label.contains(&id.fmt_short().to_string()), "{label}");
 }

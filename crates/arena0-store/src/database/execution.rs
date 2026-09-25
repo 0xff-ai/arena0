@@ -438,7 +438,7 @@ impl Database {
                     )?;
                 }
             }
-            Change::Stop | Change::End => {}
+            Change::Stop | Change::End | Change::DropOutgoing => {}
             Change::Publish { artifact } => {
                 self.persist_terminal_publication(execution_id, next.version(), &artifact, now_ms)?;
             }
@@ -750,12 +750,7 @@ impl Database {
         now_ms: u64,
         state: &ExecutionState,
     ) -> Result<(), StoreError> {
-        let release_effects = proposal
-            .effects()
-            .iter()
-            .filter(|(_, effect)| !matches!(effect, Effect::Broadcast { .. }))
-            .cloned()
-            .collect::<Vec<_>>();
+        let release_effects = proposal.effects().to_vec();
         let event_exists = self
             .connection
             .query_row(

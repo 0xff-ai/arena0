@@ -14,6 +14,13 @@
 //! use [`arena0_program::JsonBytes`], active calls carry a committed ensemble,
 //! and projections return bounded typed values.
 
+/// The sandbox effect-count limit is a resource limit; it must never exceed
+/// the protocol maximum, which the emission check also enforces.
+const _: () = assert!(
+    arena0_program::MAX_EFFECTS_PER_DISPATCH as usize <= arena0_protocol::execution::MAX_EFFECTS,
+    "the sandbox effect count must not exceed the protocol maximum"
+);
+
 mod call;
 mod engine;
 mod error;

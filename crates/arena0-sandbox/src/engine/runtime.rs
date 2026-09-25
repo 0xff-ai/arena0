@@ -1,11 +1,11 @@
 //! Resident dispatch and fresh projection operations for loaded programs.
 
+use crate::call::DispatchKind;
 use arena0_program::{
     CallStatus, DispatchInput, DispatchOutput, InitInput, LocalStateBytes, OutcomeInput,
     OutcomeOutput, QueryInput, QueryOutput, SharedStateBytes, ViewInput, ViewOutput, WriterInput,
     WriterOutput, abi,
 };
-use arena0_protocol::Lifecycle;
 use borsh::{BorshDeserialize, BorshSerialize};
 use wasmtime::{Global, Instance, Memory, Store, StoreLimitsBuilder, Val};
 
@@ -24,7 +24,7 @@ impl super::LoadedProgram {
         let input = call.into_input()?;
         let (output, observations) = self.invoke::<InitInput, arena0_program::InitializedState>(
             CallKind::Initialize,
-            Lifecycle::PreSession,
+            DispatchKind::Local,
             None,
             abi::exports::INITIALIZE,
             input,
@@ -47,7 +47,7 @@ impl super::LoadedProgram {
                 schema: &self.program.definition().schema,
                 profile: &self.profile,
                 call_kind: CallKind::Dispatch,
-                lifecycle: Lifecycle::Active,
+                dispatch: DispatchKind::Local,
                 random_replay: None,
             },
         )?;
@@ -130,7 +130,7 @@ impl super::LoadedProgram {
         self.validate_shared_state(&input.shared)?;
         let (output, observations) = self.invoke::<WriterInput, WriterOutput>(
             CallKind::Writer,
-            Lifecycle::Active,
+            DispatchKind::Local,
             None,
             abi::exports::WRITER,
             input,
@@ -165,7 +165,7 @@ impl super::LoadedProgram {
         let query_index = input.query_index;
         let (output, observations) = self.invoke::<QueryInput, QueryOutput>(
             CallKind::Query,
-            Lifecycle::Active,
+            DispatchKind::Local,
             None,
             abi::exports::QUERY,
             input,
@@ -191,7 +191,7 @@ impl super::LoadedProgram {
         self.validate_shared_state(&input.shared)?;
         let (output, observations) = self.invoke::<ViewInput, ViewOutput>(
             CallKind::View,
-            Lifecycle::Active,
+            DispatchKind::Local,
             None,
             abi::exports::VIEW,
             input,
@@ -207,7 +207,7 @@ impl super::LoadedProgram {
         self.validate_shared_state(&input.shared)?;
         let (output, observations) = self.invoke::<OutcomeInput, OutcomeOutput>(
             CallKind::Outcome,
-            Lifecycle::Completed,
+            DispatchKind::Local,
             None,
             abi::exports::OUTCOME,
             input,
@@ -225,7 +225,7 @@ impl super::LoadedProgram {
     fn invoke<I, O>(
         &self,
         kind: CallKind,
-        lifecycle: Lifecycle,
+        dispatch: DispatchKind,
         random_replay: Option<&[Vec<u8>]>,
         export: &str,
         input: I,
@@ -254,7 +254,7 @@ impl super::LoadedProgram {
                 schema: &self.program.definition().schema,
                 profile: &self.profile,
                 call_kind: kind,
-                lifecycle,
+                dispatch,
                 random_replay,
             },
         )?;
@@ -392,8 +392,14 @@ impl std::fmt::Debug for ProgramInstance {
 impl ProgramInstance {
     /// Dispatch one event through the sole mutating guest export.
     pub fn dispatch(&mut self, call: DispatchCall) -> Result<DispatchCallResult, SandboxError> {
-        let (input, random_replay, lifecycle, signer) = call.into_input()?;
-        self.dispatch_input(input, random_replay.as_ref(), lifecycle, signer)
+        let (input, random_replay, dispatch, outgoing_len, signer) = call.into_input()?;
+        self.dispatch_input(
+            input,
+            random_replay.as_ref(),
+            dispatch,
+            outgoing_len,
+            signer,
+        )
     }
 
     /// Replace the resident state with durable committed payloads during actor
@@ -477,7 +483,8 @@ impl ProgramInstance {
         &mut self,
         input: DispatchInput,
         random_replay: Option<&crate::call::RandomReplay>,
-        lifecycle: Lifecycle,
+        dispatch: DispatchKind,
+        outgoing_len: usize,
         signer: Option<std::sync::Arc<dyn crate::GuestSigner>>,
     ) -> Result<DispatchCallResult, SandboxError> {
         let bytes = borsh::to_vec(&input)
@@ -492,7 +499,7 @@ impl ProgramInstance {
         let bytes_len = u32::try_from(bytes.len()).map_err(|_| {
             SandboxError::InputLimitExceeded("dispatch input length overflows u32".into())
         })?;
-        if let Err(error) = self.reset_for_dispatch(lifecycle, random_replay) {
+        if let Err(error) = self.reset_for_dispatch(dispatch, outgoing_len, random_replay) {
             return self.rollback_error(error);
         }
         // A signer is installed only for this dispatch; any rollback path
@@ -623,7 +630,8 @@ impl ProgramInstance {
 
     fn reset_for_dispatch(
         &mut self,
-        lifecycle: Lifecycle,
+        dispatch: DispatchKind,
+        outgoing_len: usize,
         random_replay: Option<&crate::call::RandomReplay>,
     ) -> Result<(), SandboxError> {
         // Reset at entry so every guest call sees the same temporary-memory and
@@ -631,7 +639,8 @@ impl ProgramInstance {
         // not yet committed by the owning store transaction.
         let reset_result = self.reset_work_and_globals();
         self.store.data_mut().reset_for_dispatch(
-            lifecycle,
+            dispatch,
+            outgoing_len,
             random_replay.map(crate::call::RandomReplay::as_slice),
         );
         reset_result?;
@@ -661,7 +670,7 @@ impl ProgramInstance {
         let restore_result = self.restore_committed();
         self.store
             .data_mut()
-            .reset_for_dispatch(Lifecycle::Active, None);
+            .reset_for_dispatch(DispatchKind::Local, 0, None);
         restore_result
     }
 
@@ -934,6 +943,7 @@ mod resident_runtime_tests {
           i32.const 1100
           i32.const 6
           call $broadcast
+          drop
           i32.const 32768
           i32.const 3
           call $pack
@@ -1003,6 +1013,7 @@ mod resident_runtime_tests {
           i32.const 1100
           i32.const 6
           call $broadcast
+          drop
           i32.const 1
           i32.const 1100
           i32.const 6
@@ -1028,7 +1039,13 @@ mod resident_runtime_tests {
     fn call() -> DispatchCall {
         let peer = PeerId([1; 32]);
         let session = Ensemble::<Committed>::from_peers(vec![peer, PeerId([2; 32])]).unwrap();
-        DispatchCall::new(peer, session, Event::React)
+        DispatchCall::new(
+            peer,
+            session,
+            Event::TimerFired {
+                timer: arena0_protocol::TimerPayload::unit(),
+            },
+        )
     }
 
     fn resident(body: &str, capabilities: Vec<Capability>, imports: &str) -> ProgramInstance {
@@ -1136,7 +1153,7 @@ mod resident_runtime_tests {
         let raw = dispatch_module(
             accepted_body(),
             vec![Capability::Messaging],
-            r#"(import "arena0" "broadcast" (func $broadcast (param i32 i32)))"#,
+            r#"(import "arena0" "broadcast" (func $broadcast (param i32 i32) (result i32)))"#,
         );
         let program = engine.build_program(&raw).unwrap();
         let shape = crate::finalize::inspect(program.bytes()).unwrap();
@@ -1207,7 +1224,7 @@ mod resident_runtime_tests {
         let mut instance = resident(
             accepted_body(),
             vec![Capability::Messaging],
-            r#"(import "arena0" "broadcast" (func $broadcast (param i32 i32)))"#,
+            r#"(import "arena0" "broadcast" (func $broadcast (param i32 i32) (result i32)))"#,
         );
         let first = instance.dispatch(call()).unwrap();
         assert_eq!(first.status, arena0_program::CallStatus::Accepted);
@@ -1295,7 +1312,7 @@ mod resident_runtime_tests {
             rejected_with_observations_body(),
             vec![Capability::Messaging],
             r#"
-              (import "arena0" "broadcast" (func $broadcast (param i32 i32)))
+              (import "arena0" "broadcast" (func $broadcast (param i32 i32) (result i32)))
               (import "arena0" "log" (func $log (param i32 i32 i32)))
               (import "arena0" "random" (func $random (param i32 i32)))
             "#,

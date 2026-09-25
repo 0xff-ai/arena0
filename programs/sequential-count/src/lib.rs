@@ -9,7 +9,8 @@ use std::fmt::Write;
 
 use arena0::prelude::*;
 use arena0_primitives::commit_reveal::{
-    self, CommitReveal, CommitRevealFieldExt, CommitRevealLocal, CommitRevealLocalState,
+    self, CommitReveal, CommitRevealAuthorExt, CommitRevealFieldExt, CommitRevealLocal,
+    CommitRevealLocalState,
 };
 use arena0_primitives::turn_manager::TurnManager;
 
@@ -208,56 +209,7 @@ pub mod sequential_count {
             .commit_reveal
             .set_participant_count(ensemble.len());
         configured.map_err(|error| anyhow!(error))?;
-        Ok(Transition::Stay)
-    }
-
-    fn on_react(
-        ctx: &mut Context<Shared, Local>,
-    ) -> Result<ProgramTransition<SequentialCount>, ProgramFault> {
-        match ctx.shared().phase() {
-            Phase::Setup => {
-                // Unique-writer rule: react only when this node is the
-                // participant whose commit or reveal is next.
-                if ctx.shared().commit_reveal.expected_writer() != Some(ctx.me()) {
-                    return Ok(Transition::Stay);
-                }
-                if let Some(reveal) = ctx.commit_reveal().take_reveal() {
-                    reveal.broadcast();
-                    if ctx.shared().commit_reveal.is_complete() {
-                        apply_order(ctx.shared_mut())?;
-                        return Ok(Transition::To(Phase::Counting));
-                    }
-                    return Ok(Transition::Stay);
-                }
-                if ctx.commit_reveal().needs_commit() {
-                    let mut nonce = [0u8; 32];
-                    ctx.random(&mut nonce);
-                    ctx.commit_reveal().commit(nonce)?.broadcast();
-                }
-            }
-            Phase::Counting => {
-                let (next, is_my_turn) = {
-                    let state = ctx.shared();
-                    let next = state.count + 1;
-                    let is_my_turn = state
-                        .turns
-                        .as_ref()
-                        .is_some_and(|turns| turns.current() == ctx.me());
-                    (next, is_my_turn)
-                };
-                if is_my_turn && ctx.local().last_sent != Some(next) {
-                    let me = ctx.me();
-                    let finished = apply_count(ctx.shared_mut(), me, next);
-                    ctx.effects().broadcast(&Message::Count { value: next });
-                    ctx.mutate_local(|state| state.last_sent = Some(next));
-                    return Ok(if finished {
-                        Transition::End
-                    } else {
-                        Transition::Stay
-                    });
-                }
-            }
-        }
+        queue_setup_action(ctx)?;
         Ok(Transition::Stay)
     }
 
@@ -281,10 +233,12 @@ pub mod sequential_count {
                     return Ok(ApplyDecision::Reject);
                 }
                 if !ctx.shared().commit_reveal.is_complete() {
+                    queue_setup_action(ctx).map_err(ProtocolFault::shared_violation)?;
                     return Ok(ApplyDecision::Accept(Transition::Stay));
                 }
 
                 apply_order(ctx.shared_mut())?;
+                queue_count_if_due(ctx).map_err(ProtocolFault::shared_violation)?;
                 Ok(ApplyDecision::Accept(Transition::To(Phase::Counting)))
             }
             Message::Count { value } => {
@@ -306,6 +260,9 @@ pub mod sequential_count {
                 }
 
                 let finished = apply_count(ctx.shared_mut(), from, value);
+                if !finished {
+                    queue_count_if_due(ctx).map_err(ProtocolFault::shared_violation)?;
+                }
                 if finished {
                     Ok(ApplyDecision::Accept(Transition::End))
                 } else {
@@ -316,6 +273,40 @@ pub mod sequential_count {
     }
 
     fn on_query(_shared: &Shared, _: ()) {}
+
+    /// Queue this node's next commit or reveal when it owns the setup writer.
+    fn queue_setup_action(ctx: &mut Context<Shared, Local>) -> arena0::anyhow::Result<()> {
+        if ctx.shared().commit_reveal.expected_writer() != Some(ctx.me()) {
+            return Ok(());
+        }
+        if let Some(reveal) = ctx.commit_reveal().take_reveal() {
+            reveal.broadcast(&mut ctx.effects());
+            return Ok(());
+        }
+        if ctx.commit_reveal().needs_commit() {
+            let mut nonce = [0u8; 32];
+            ctx.random(&mut nonce);
+            ctx.commit_reveal()
+                .commit(nonce)?
+                .broadcast(&mut ctx.effects());
+        }
+        Ok(())
+    }
+
+    /// Queue this node's next count when the turn order selects it.
+    fn queue_count_if_due(ctx: &mut Context<Shared, Local>) -> arena0::anyhow::Result<()> {
+        let next = ctx.shared().count + 1;
+        let is_my_turn = ctx
+            .shared()
+            .turns
+            .as_ref()
+            .is_some_and(|turns| turns.current() == ctx.me());
+        if is_my_turn && ctx.local().last_sent != Some(next) {
+            ctx.mutate_local(|state| state.last_sent = Some(next));
+            ctx.effects().broadcast(&Message::Count { value: next });
+        }
+        Ok(())
+    }
 
     /// Install the deterministic round-robin order selected by the completed
     /// nonce exchange. Both the producer's reveal reaction and receivers call

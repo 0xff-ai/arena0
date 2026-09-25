@@ -661,12 +661,12 @@ impl Run {
                             })
                             .unwrap_or_default();
                         format!(
-                            "lifecycle={:?} version={} step={} event_position={} reacted={:?} proposal_step={:?} shared_signatures={signatures:?}",
+                            "lifecycle={:?} version={} step={} event_position={} outgoing={} proposal_step={:?} shared_signatures={signatures:?}",
                             state.lifecycle(),
                             state.version(),
                             state.agreed_step(),
                             state.event_position(),
-                            state.last_reacted_step(),
+                            state.outgoing().len(),
                             state.pending_shared().map(|proposal| proposal.commitment().step),
                         )
                     });

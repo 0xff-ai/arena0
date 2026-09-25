@@ -301,10 +301,6 @@ pub(crate) fn register_always_available(
             |mut caller: Caller<'_, HostState>, outcome_ptr: u32, outcome_len: u32| {
                 caller.begin_import("end_session")?;
                 caller.reject_read_only("end_session")?;
-                caller.reject_if_lifecycle_disallowed(
-                    "end_session",
-                    &[arena0_protocol::Lifecycle::Active],
-                )?;
                 let outcome = caller.read_guest_bytes(outcome_ptr, outcome_len, "end_session")?;
                 caller.record_effect(Effect::SessionEnd { outcome })
             },
@@ -318,10 +314,6 @@ pub(crate) fn register_always_available(
             |mut caller: Caller<'_, HostState>, reason_ptr: u32, reason_len: u32| {
                 caller.begin_import("abort_session")?;
                 caller.reject_read_only("abort_session")?;
-                caller.reject_if_lifecycle_disallowed(
-                    "abort_session",
-                    &[arena0_protocol::Lifecycle::Active],
-                )?;
                 let reason = caller.read_guest_bytes(reason_ptr, reason_len, "abort_session")?;
                 caller.record_effect(Effect::SessionAbort {
                     reason: String::from_utf8_lossy(&reason).into_owned(),

@@ -6,10 +6,9 @@ use arena0_program::{
 };
 use arena0_protocol::{
     AbortKind, AbortOccurrence, ActivationData, Effect, Ensemble, Event, ExecFrame, ExecutionState,
-    ExecutionVersion, MessageId, NegotiationId, NegotiationTarget, Offer, OfferData,
-    ParticipantStepSignature, PreparedActivation, ReceiptArtifact, ReceiptTermination,
-    SessionHeader, StateHash, StepCursor, TerminalOutcome, Ticket, TicketAction, TicketData,
-    TimerPayload,
+    ExecutionVersion, NegotiationId, NegotiationTarget, Offer, OfferData, ParticipantStepSignature,
+    PreparedActivation, ReceiptArtifact, ReceiptTermination, SessionHeader, StateHash, StepCursor,
+    StepEvent, TerminalOutcome, Ticket, TicketAction, TicketData, TimerPayload,
 };
 use std::path::Path;
 
@@ -326,7 +325,7 @@ async fn publish_current(
 fn receipt_with_different_content(receipt: &ReceiptArtifact) -> ReceiptArtifact {
     let changed_outcome = vec![9, 8, 8];
     let mut trace = receipt.body().trace().to_vec();
-    trace[0].terminal = Some(Effect::SessionEnd {
+    trace[0].terminal = Some(arena0_protocol::StepTerminal::End {
         outcome: changed_outcome.clone(),
     });
     let commitment = arena0_protocol::StepCommitment::for_entry(
@@ -1541,83 +1540,55 @@ async fn activation_prepare_commit_is_idempotent_and_recoverable() {
     reopened.shutdown().await.expect("shutdown");
 }
 
-#[tokio::test]
-async fn deferred_broadcast_commits_two_steps_at_one_event_position() {
-    let fixture = activation_fixture();
-    let directory = tempfile::tempdir().expect("tempdir");
-    let path = directory.path().join("store.sqlite");
-    let execution_id = ExecId([0xef; 32]);
-    let store = create_execution(&path, &fixture, execution_id).await;
-    let mut writer = store
-        .handle()
-        .claim_execution(execution_id)
-        .expect("execution writer");
-    let state = store
-        .handle()
-        .load_execution(execution_id)
-        .await
-        .expect("load active")
-        .expect("active state");
-    assert!(matches!(
-        dispatch_record(&mut writer,
-                state.version(),
-                session_started_event(&fixture),
-                SharedStateBytes::try_new(vec![0]).expect("shared state"),
-                LocalStateBytes::try_new(Vec::new()).expect("local state"),
-                vec![Effect::Broadcast { data: vec![7, 8] },],
-                None,
-                None,
-                None,
-                Some(arena0_program::CalloutRequest {
-                    callout_index: 0,
-                    context: vec![3],
-                }),
-                7,
-            )
-            .await
-            .expect("stage dispatch"),
-        state if state.pending_shared().is_some()
-    ));
-    let proposed = store
-        .handle()
-        .load_execution(execution_id)
-        .await
-        .expect("load proposal")
-        .expect("proposal state");
-    assert_eq!(proposed.event_position(), 1);
-    assert_eq!(proposed.agreed_step(), 0);
-    assert_eq!(
-        proposed
-            .pending_shared()
-            .expect("proposal")
-            .event_position(),
-        0
-    );
-
-    let after_first = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
-    let successor = after_first.pending_shared().expect("deferred successor");
-    assert_eq!(after_first.event_position(), 1);
-    assert_eq!(after_first.agreed_step(), 1);
-    assert_eq!(successor.event_position(), 0);
-    assert_eq!(successor.entry().step, 1);
-    assert!(successor.effects().is_empty());
-    assert!(matches!(
-        &successor.entry().event,
+/// Stage one authored-message proposal: a local event queues the broadcast and
+/// installs immediately, then the author dispatches its queued message and the
+/// store stages the proposal.
+#[allow(clippy::too_many_arguments)]
+async fn stage_own_message_proposal(
+    writer: &mut ExecutionStore,
+    fixture: &ActivationFixture,
+    broadcast: Vec<u8>,
+    callout: Option<arena0_program::CalloutRequest>,
+    now_ms: u64,
+) -> ExecutionState {
+    let state = writer.load_execution().await.unwrap().unwrap();
+    let after_local = dispatch_record(
+        writer,
+        state.version(),
+        Event::TimerFired {
+            timer: TimerPayload::unit(),
+        },
+        state.shared_state().clone(),
+        state.local_state().clone(),
+        vec![Effect::Broadcast {
+            data: broadcast.clone(),
+        }],
+        None,
+        None,
+        None,
+        None,
+        now_ms,
+    )
+    .await
+    .expect("install local broadcast");
+    dispatch_record(
+        writer,
+        after_local.version(),
         Event::MessageReceived {
-            position: 1,
-            from,
-            msg,
-            ..
-        } if *from == fixture.producer && msg == &[7, 8]
-    ));
-
-    let after_successor = sign_step(&store, &fixture, execution_id, &mut writer, 10, 11).await;
-    assert_eq!(after_successor.event_position(), 1);
-    assert_eq!(after_successor.agreed_step(), 2);
-    assert!(after_successor.pending_shared().is_none());
-
-    drop(writer);
-    store.shutdown().await.expect("shutdown");
+            from: fixture.producer,
+            msg: broadcast,
+        },
+        after_local.shared_state().clone(),
+        after_local.local_state().clone(),
+        Vec::new(),
+        None,
+        None,
+        None,
+        callout,
+        now_ms + 1,
+    )
+    .await
+    .expect("stage own-message proposal")
 }
 
 #[tokio::test]
@@ -1653,32 +1624,17 @@ async fn pending_proposal_exposes_frames_but_withholds_callout() {
     )
     .await
     .expect("stage initial event");
-    let after_start = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
+    let _after_start = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
     let callout = arena0_program::CalloutRequest {
         callout_index: 0,
         context: vec![0x51],
     };
     let broadcast = vec![0x61, 0x62];
-    dispatch_record(
-        &mut writer,
-        after_start.version(),
-        Event::React,
-        SharedStateBytes::try_new(vec![0]).expect("shared state"),
-        LocalStateBytes::try_new(Vec::new()).expect("local state"),
-        vec![Effect::Broadcast {
-            data: broadcast.clone(),
-        }],
-        None,
-        None,
-        None,
-        Some(callout),
-        10,
-    )
-    .await
-    .expect("stage broadcast proposal");
-
-    let proposed = writer.load_execution().await.unwrap().unwrap();
+    let proposed =
+        stage_own_message_proposal(&mut writer, &fixture, broadcast.clone(), Some(callout), 10)
+            .await;
     assert!(proposed.callout().is_none());
+    assert!(proposed.pending_shared().is_some());
     assert!(
         proposed
             .current_frames(fixture.producer)
@@ -1690,7 +1646,7 @@ async fn pending_proposal_exposes_frames_but_withholds_callout() {
     assert!(committed.pending_shared().is_none());
     assert_eq!(
         committed.callout().expect("callout pending").id,
-        arena0_protocol::pending_id(execution_id, after_start.event_position())
+        arena0_protocol::pending_id(execution_id, proposed.event_position() - 1)
     );
 
     assert_eq!(committed.callout().unwrap().context, vec![0x51]);
@@ -1731,31 +1687,10 @@ async fn stopping_an_unsigned_proposal_recovers_only_current_evidence() {
     )
     .await
     .expect("stage session start");
-    let after_start = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
+    let _after_start = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
     let data = vec![0xa1, 0xa2];
-    assert!(matches!(
-        dispatch_record(&mut writer,
-                after_start.version(),
-                Event::React,
-                SharedStateBytes::try_new(vec![0]).expect("shared state"),
-                LocalStateBytes::try_new(Vec::new()).expect("local state"),
-                vec![Effect::Broadcast { data: data.clone() }],
-                None,
-                None,
-                None,
-                None,
-                11,
-            )
-            .await
-            .expect("stage broadcast proposal"),
-        state if state.pending_shared().is_some()
-    ));
-    let proposed = store
-        .handle()
-        .load_execution(execution_id)
-        .await
-        .expect("load proposal")
-        .expect("proposal state");
+    let proposed = stage_own_message_proposal(&mut writer, &fixture, data, None, 11).await;
+    assert!(proposed.pending_shared().is_some());
     let proposal = proposed
         .pending_shared()
         .expect("unsigned proposal")
@@ -1850,25 +1785,12 @@ async fn portable_events_stage_agreement_without_shared_state_delta() {
     assert_eq!(state.event_position(), 1);
 
     let source = other_peer(&fixture);
-    let position = state.agreed_step();
-    let pre_state = state.agreed_state();
     let data = vec![0x42, 0x43];
-    let message_id = MessageId::derive(
-        state.binding().session_id(),
-        source,
-        position,
-        pre_state,
-        pre_state,
-        &data,
-    );
     assert!(matches!(
         dispatch_record(&mut writer,
                 state.version(),
                 Event::MessageReceived {
-                    message_id,
                     from: source,
-                    position,
-                    pre_state,
                     msg: data,
                 },
                 SharedStateBytes::try_new(vec![0]).expect("shared state"),
@@ -1893,15 +1815,10 @@ async fn portable_events_stage_agreement_without_shared_state_delta() {
         .await
         .expect("read portable trace");
     assert_eq!(trace.len(), 2);
-    assert!(matches!(trace[0].event, Event::SessionStarted { .. }));
+    assert!(matches!(trace[0].event, StepEvent::SessionStarted { .. }));
     assert!(matches!(
         &trace[1].event,
-        Event::MessageReceived {
-            from,
-            position: 1,
-            msg,
-            ..
-        } if *from == source && msg == &[0x42, 0x43]
+        StepEvent::Message { from, data } if *from == source && data == &[0x42, 0x43]
     ));
     drop(writer);
     store.shutdown().await.expect("shutdown");
@@ -1949,25 +1866,21 @@ async fn terminal_agreement_clears_open_callout() {
     let after_waiting = waiting;
 
     let data = vec![0x51, 0x52];
-    let position = after_waiting.agreed_step();
-    let pre_state = after_waiting.agreed_state();
-    let message_id = MessageId::derive(
-        after_waiting.binding().session_id(),
-        fixture.producer,
-        position,
-        pre_state,
-        pre_state,
-        &data,
-    );
+    // A remote sender keeps this an agreed peer message rather than an
+    // authored own message, which must be queued first.
+    let source = fixture
+        .prepared
+        .tickets()
+        .iter()
+        .map(|ticket| ticket.data.signer)
+        .find(|peer| *peer != fixture.producer)
+        .expect("a remote participant");
     let outcome = vec![0x61, 0x62];
     dispatch_record(
         &mut writer,
         after_waiting.version(),
         Event::MessageReceived {
-            message_id,
-            from: fixture.producer,
-            position,
-            pre_state,
+            from: source,
             msg: data,
         },
         SharedStateBytes::try_new(vec![0]).expect("terminal shared state"),
@@ -2073,84 +1986,6 @@ async fn authenticated_stop_clears_open_callout() {
         .unwrap()
         .unwrap();
     assert!(state.callout().is_none());
-    drop(writer);
-    store.shutdown().await.expect("shutdown");
-}
-
-#[tokio::test]
-async fn answered_callout_stays_open_while_dispatch_proposal_is_staged() {
-    let fixture = activation_fixture();
-    let directory = tempfile::tempdir().expect("tempdir");
-    let path = directory.path().join("store.sqlite");
-    let execution_id = ExecId([0xf5; 32]);
-    let store = create_execution(&path, &fixture, execution_id).await;
-    let mut writer = store
-        .handle()
-        .claim_execution(execution_id)
-        .expect("execution writer");
-
-    let callout = arena0_program::CalloutRequest {
-        callout_index: 0,
-        context: vec![0x91],
-    };
-    let state = store
-        .handle()
-        .load_execution(execution_id)
-        .await
-        .expect("load active")
-        .expect("active state");
-    dispatch_record(
-        &mut writer,
-        state.version(),
-        session_started_event(&fixture),
-        SharedStateBytes::try_new(vec![0]).expect("shared state"),
-        LocalStateBytes::try_new(Vec::new()).expect("local state"),
-        vec![],
-        None,
-        None,
-        None,
-        Some(callout),
-        7,
-    )
-    .await
-    .expect("stage callout");
-    let waiting = sign_step(&store, &fixture, execution_id, &mut writer, 8, 9).await;
-    let pending_id = waiting.callout().expect("pending callout").id;
-
-    dispatch_record(
-        &mut writer,
-        waiting.version(),
-        Event::InputReceived {
-            callout_index: 0,
-            data: vec![0x92],
-        },
-        SharedStateBytes::try_new(vec![1]).expect("updated shared state"),
-        LocalStateBytes::try_new(Vec::new()).expect("local state"),
-        vec![Effect::Broadcast { data: vec![0xa0] }],
-        None,
-        None,
-        Some(pending_id),
-        None,
-        10,
-    )
-    .await
-    .expect("stage input proposal");
-    let proposed = store
-        .handle()
-        .load_execution(execution_id)
-        .await
-        .expect("load staged input")
-        .expect("staged input state");
-    assert!(proposed.pending_shared().is_some());
-    assert!(
-        proposed
-            .pending_shared()
-            .expect("proposal")
-            .callout()
-            .is_none()
-    );
-    assert_eq!(proposed.callout(), waiting.callout());
-
     drop(writer);
     store.shutdown().await.expect("shutdown");
 }

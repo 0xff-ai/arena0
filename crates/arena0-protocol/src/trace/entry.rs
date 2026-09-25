@@ -1,35 +1,264 @@
 //! Portable trace entries.
 
-use crate::{Effect, Event, StateHash};
+use crate::bounded::{
+    read_bytes as read_bounded_bytes, read_string as read_bounded_string,
+    write_bytes as serialize_bounded_bytes, write_string as serialize_bounded_string,
+};
+use crate::{Effect, Ensemble, Event, MessageId, PeerId, SessionHash, StateHash};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::io;
 
 use super::commitment::AggregateAttestation;
 
+/// The portable, agreed event of one step.
+///
+/// Only the two events every participant observes at the same position are
+/// representable here. The type makes a non-agreed event in a portable entry
+/// unrepresentable, so no runtime shape check is needed.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum StepEvent {
+    /// The session boundary at step 0.
+    SessionStarted {
+        /// Committed participant set in canonical order.
+        ensemble: Ensemble,
+    },
+    /// One participant's broadcast applied at this step.
+    Message {
+        /// Authenticated author.
+        from: PeerId,
+        /// Opaque program payload.
+        data: Vec<u8>,
+    },
+}
+
+/// The terminal value of one step, if that step ended the session.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum StepTerminal {
+    /// Successful completion with opaque outcome bytes.
+    End {
+        /// Opaque outcome bytes.
+        outcome: Vec<u8>,
+    },
+    /// A shared program abort.
+    Abort {
+        /// Human-readable reason.
+        reason: String,
+    },
+    /// A shared program failure.
+    Fail {
+        /// Human-readable reason.
+        reason: String,
+    },
+}
+
+impl StepEvent {
+    /// The dispatch event every participant runs for this step.
+    ///
+    /// The guest event carries no trace coordinates; [`TraceEntry`] owns them.
+    #[must_use]
+    pub fn dispatch_event(&self) -> Event<Vec<u8>> {
+        match self {
+            Self::SessionStarted { ensemble } => Event::SessionStarted {
+                ensemble: ensemble.clone(),
+            },
+            Self::Message { from, data } => Event::MessageReceived {
+                from: *from,
+                msg: data.clone(),
+            },
+        }
+    }
+}
+
+impl StepTerminal {
+    /// The terminal value for a lifecycle effect, or `None` for any other
+    /// effect.
+    #[must_use]
+    pub fn from_effect(effect: &Effect) -> Option<Self> {
+        match effect {
+            Effect::SessionEnd { outcome } => Some(Self::End {
+                outcome: outcome.clone(),
+            }),
+            Effect::SessionAbort { reason } => Some(Self::Abort {
+                reason: reason.clone(),
+            }),
+            Effect::Fail { reason } => Some(Self::Fail {
+                reason: reason.clone(),
+            }),
+            Effect::Broadcast { .. } | Effect::SetTimer { .. } => None,
+        }
+    }
+
+    /// The lifecycle effect this terminal value represents.
+    #[must_use]
+    pub fn to_effect(&self) -> Effect {
+        match self {
+            Self::End { outcome } => Effect::SessionEnd {
+                outcome: outcome.clone(),
+            },
+            Self::Abort { reason } => Effect::SessionAbort {
+                reason: reason.clone(),
+            },
+            Self::Fail { reason } => Effect::Fail {
+                reason: reason.clone(),
+            },
+        }
+    }
+
+    /// The successful outcome bytes, if this terminal completed the session.
+    #[must_use]
+    pub fn completed_outcome(&self) -> Option<&[u8]> {
+        match self {
+            Self::End { outcome } => Some(outcome.as_slice()),
+            Self::Abort { .. } | Self::Fail { .. } => None,
+        }
+    }
+
+    /// The abort or failure reason, if this terminal stopped the session.
+    #[must_use]
+    pub fn abort_reason(&self) -> Option<&str> {
+        match self {
+            Self::Abort { reason } | Self::Fail { reason } => Some(reason.as_str()),
+            Self::End { .. } => None,
+        }
+    }
+}
+
 /// One portable entry in the agreed session trace.
 ///
-/// Only the two events that all participants can observe are portable:
-/// `SessionStarted` and `MessageReceived`. Participant-specific events and
-/// effects remain in the participant's store. A lifecycle effect is retained as the
-/// optional terminal value because terminal agreement must bind its kind and
-/// payload even when shared state is unchanged. The aggregate agreement is a
-/// log join and is intentionally excluded from [`Self::entry_hash`].
+/// The entry owns the trace coordinates and the terminal value. The aggregate
+/// agreement is a log join and is intentionally excluded from
+/// [`Self::entry_hash`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct TraceEntry {
+    /// Trace schema version.
     pub trace_version: u32,
+    /// Canonical agreed position.
     pub step: u64,
-    pub event: Event<Vec<u8>>,
+    /// The agreed event.
+    pub event: StepEvent,
+    /// Shared state hash before the entry.
     pub pre_state: StateHash,
+    /// Shared state hash after the entry.
     pub post_state: StateHash,
-    pub terminal: Option<Effect>,
+    /// The terminal value when this step ended the session.
+    pub terminal: Option<StepTerminal>,
+    /// N-of-N agreement over the commitment.
     pub agreement: AggregateAttestation,
+}
+
+impl BorshSerialize for StepEvent {
+    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
+        match self {
+            Self::SessionStarted { ensemble } => {
+                BorshSerialize::serialize(&0u8, writer)?;
+                BorshSerialize::serialize(ensemble, writer)
+            }
+            Self::Message { from, data } => {
+                BorshSerialize::serialize(&1u8, writer)?;
+                BorshSerialize::serialize(from, writer)?;
+                serialize_bounded_bytes(
+                    writer,
+                    data,
+                    crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
+                    "step message payload",
+                )
+            }
+        }
+    }
+}
+
+impl BorshDeserialize for StepEvent {
+    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> io::Result<Self> {
+        match u8::deserialize_reader(reader)? {
+            0 => Ok(Self::SessionStarted {
+                ensemble: BorshDeserialize::deserialize_reader(reader)?,
+            }),
+            1 => Ok(Self::Message {
+                from: BorshDeserialize::deserialize_reader(reader)?,
+                data: read_bounded_bytes(
+                    reader,
+                    crate::execution::MAX_EFFECT_PAYLOAD_BYTES,
+                    "step message payload",
+                )?,
+            }),
+            tag => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown step event tag {tag}"),
+            )),
+        }
+    }
+}
+
+impl BorshSerialize for StepTerminal {
+    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
+        match self {
+            Self::End { outcome } => {
+                BorshSerialize::serialize(&0u8, writer)?;
+                serialize_bounded_bytes(
+                    writer,
+                    outcome,
+                    crate::execution::MAX_TERMINAL_OUTCOME_BYTES,
+                    "terminal outcome",
+                )
+            }
+            Self::Abort { reason } => {
+                BorshSerialize::serialize(&1u8, writer)?;
+                serialize_bounded_string(
+                    writer,
+                    reason,
+                    crate::execution::MAX_TERMINAL_REASON_BYTES,
+                    "terminal reason",
+                )
+            }
+            Self::Fail { reason } => {
+                BorshSerialize::serialize(&2u8, writer)?;
+                serialize_bounded_string(
+                    writer,
+                    reason,
+                    crate::execution::MAX_TERMINAL_REASON_BYTES,
+                    "failure reason",
+                )
+            }
+        }
+    }
+}
+
+impl BorshDeserialize for StepTerminal {
+    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> io::Result<Self> {
+        match u8::deserialize_reader(reader)? {
+            0 => Ok(Self::End {
+                outcome: read_bounded_bytes(
+                    reader,
+                    crate::execution::MAX_TERMINAL_OUTCOME_BYTES,
+                    "terminal outcome",
+                )?,
+            }),
+            1 => Ok(Self::Abort {
+                reason: read_bounded_string(
+                    reader,
+                    crate::execution::MAX_TERMINAL_REASON_BYTES,
+                    "terminal reason",
+                )?,
+            }),
+            2 => Ok(Self::Fail {
+                reason: read_bounded_string(
+                    reader,
+                    crate::execution::MAX_TERMINAL_REASON_BYTES,
+                    "failure reason",
+                )?,
+            }),
+            tag => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown step terminal tag {tag}"),
+            )),
+        }
+    }
 }
 
 impl BorshSerialize for TraceEntry {
     fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
         validate_version(self.trace_version)?;
-        self.validate_shape()?;
         BorshSerialize::serialize(&self.trace_version, writer)?;
         BorshSerialize::serialize(&self.step, writer)?;
         BorshSerialize::serialize(&self.event, writer)?;
@@ -45,14 +274,13 @@ impl BorshDeserialize for TraceEntry {
         let entry = Self {
             trace_version: u32::deserialize_reader(reader)?,
             step: u64::deserialize_reader(reader)?,
-            event: Event::<Vec<u8>>::deserialize_reader(reader)?,
+            event: StepEvent::deserialize_reader(reader)?,
             pre_state: StateHash::deserialize_reader(reader)?,
             post_state: StateHash::deserialize_reader(reader)?,
-            terminal: Option::<Effect>::deserialize_reader(reader)?,
+            terminal: Option::<StepTerminal>::deserialize_reader(reader)?,
             agreement: AggregateAttestation::deserialize_reader(reader)?,
         };
         validate_version(entry.trace_version)?;
-        entry.validate_shape()?;
         Ok(entry)
     }
 }
@@ -71,58 +299,30 @@ fn validate_version(version: u32) -> io::Result<()> {
 }
 
 impl TraceEntry {
-    /// Reject an event or terminal value that cannot be included in portable
-    /// agreement evidence. This is deliberately a shape check; binding to an
-    /// activation and checking the expected step belongs to protocol
-    /// validation.
-    pub(crate) fn validate_shape(&self) -> io::Result<()> {
+    /// The content identity of a message step, derived from the entry itself.
+    ///
+    /// `None` for the session boundary. Callers that need a message identity
+    /// (logs, API projections, dedupe) derive it here instead of storing or
+    /// transmitting it.
+    #[must_use]
+    pub fn message_id(&self, session: SessionHash) -> Option<MessageId> {
         match &self.event {
-            Event::SessionStarted { .. } | Event::MessageReceived { .. } => {}
-            Event::InputReceived { .. } | Event::TimerFired { .. } | Event::React => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "portable trace entry contains a non-agreed event",
-                ));
-            }
+            StepEvent::SessionStarted { .. } => None,
+            StepEvent::Message { from, data } => Some(MessageId::derive(
+                session,
+                *from,
+                self.step,
+                self.pre_state,
+                self.post_state,
+                data,
+            )),
         }
-        if let Some(effect) = &self.terminal
-            && !matches!(
-                effect,
-                Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. }
-            )
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "portable trace entry contains a non-lifecycle terminal effect",
-            ));
-        }
-        Ok(())
     }
 
-    /// Whether this entry carries a lifecycle effect.
+    /// Whether this entry carries a terminal value.
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         self.terminal.is_some()
-    }
-
-    /// The successful outcome carried by this entry, if any.
-    #[must_use]
-    pub fn completed_outcome(&self) -> Option<&[u8]> {
-        match self.terminal.as_ref() {
-            Some(Effect::SessionEnd { outcome }) => Some(outcome.as_slice()),
-            _ => None,
-        }
-    }
-
-    /// The abort or guest-failure reason carried by this entry, if any.
-    #[must_use]
-    pub fn abort_reason(&self) -> Option<&str> {
-        match self.terminal.as_ref() {
-            Some(Effect::SessionAbort { reason }) | Some(Effect::Fail { reason }) => {
-                Some(reason.as_str())
-            }
-            _ => None,
-        }
     }
 
     /// Hash the canonical entry content, excluding the agreement join.
@@ -138,10 +338,10 @@ impl TraceEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Ensemble, MessageId, PeerId, SignerSet};
+    use crate::{PeerId, SignerSet};
     use arena0_crypto::BlsSignature;
 
-    fn entry(event: Event<Vec<u8>>) -> TraceEntry {
+    fn entry(event: StepEvent) -> TraceEntry {
         TraceEntry {
             trace_version: crate::TRACE_FORMAT_VERSION,
             step: 0,
@@ -154,26 +354,8 @@ mod tests {
     }
 
     #[test]
-    fn non_agreed_events_are_rejected_from_portable_entries() {
-        let value = entry(Event::InputReceived {
-            callout_index: 0,
-            data: Vec::new(),
-        });
-        assert!(borsh::to_vec(&value).is_err());
-    }
-
-    #[test]
-    fn non_lifecycle_terminal_effects_are_rejected() {
-        let mut value = entry(Event::SessionStarted {
-            ensemble: Ensemble::from_peers(vec![PeerId([1; 32]), PeerId([2; 32])]).unwrap(),
-        });
-        value.terminal = Some(Effect::Broadcast { data: Vec::new() });
-        assert!(borsh::to_vec(&value).is_err());
-    }
-
-    #[test]
     fn incompatible_trace_versions_are_rejected_at_the_codec_boundary() {
-        let mut value = entry(Event::SessionStarted {
+        let mut value = entry(StepEvent::SessionStarted {
             ensemble: Ensemble::from_peers(vec![PeerId([1; 32]), PeerId([2; 32])]).unwrap(),
         });
         value.trace_version = 1;
@@ -186,13 +368,47 @@ mod tests {
     }
 
     #[test]
-    fn agreement_is_excluded_from_entry_hash() {
-        let value = entry(Event::MessageReceived {
-            message_id: MessageId([3; 32]),
+    fn message_id_is_derived_from_the_entry_coordinates() {
+        let value = entry(StepEvent::Message {
             from: PeerId([4; 32]),
-            position: 0,
-            pre_state: StateHash([1; 32]),
-            msg: vec![5],
+            data: vec![5],
+        });
+        let session = SessionHash([9; 32]);
+        assert_eq!(
+            value.message_id(session),
+            Some(MessageId::derive(
+                session,
+                PeerId([4; 32]),
+                0,
+                StateHash([1; 32]),
+                StateHash([2; 32]),
+                &[5],
+            ))
+        );
+    }
+
+    #[test]
+    fn terminal_round_trips_through_its_lifecycle_effect() {
+        for effect in [
+            Effect::SessionEnd { outcome: vec![7] },
+            Effect::SessionAbort {
+                reason: "stop".into(),
+            },
+            Effect::Fail {
+                reason: "fail".into(),
+            },
+        ] {
+            let terminal = StepTerminal::from_effect(&effect).expect("lifecycle effect");
+            assert_eq!(terminal.to_effect(), effect);
+        }
+        assert!(StepTerminal::from_effect(&Effect::Broadcast { data: vec![] }).is_none());
+    }
+
+    #[test]
+    fn agreement_is_excluded_from_entry_hash() {
+        let value = entry(StepEvent::Message {
+            from: PeerId([4; 32]),
+            data: vec![5],
         });
         let hash = value.entry_hash();
         let mut agreed = value.clone();

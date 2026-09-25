@@ -177,6 +177,5 @@ pub(super) fn event_name(event: &Event) -> &'static str {
         Event::MessageReceived { .. } => "MessageReceived",
         Event::InputReceived { .. } => "InputReceived",
         Event::TimerFired { .. } => "TimerFired",
-        Event::React => "React",
     }
 }

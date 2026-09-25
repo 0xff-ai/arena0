@@ -3,8 +3,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use arena0::testing::{Harness, TestHarness};
 use arena0::{
-    ApplyDecision, Context, Ensemble, MessageApply, Participant, PeerId, Primitive, Program,
-    ProgramFault, ProgramTransition, ProgramValue, SharedState, Transition,
+    ApplyDecision, CalloutContext, Context, Ensemble, LocalContext, MessageApply, Participant,
+    PeerId, Primitive, Program, ProgramFault, ProgramTransition, ProgramValue, SharedState,
+    TimerPayload, Transition,
 };
 
 #[derive(
@@ -55,17 +56,11 @@ impl Program for EnsembleProgram {
     }
 
     fn on_session_started(
-        _ctx: &mut Context<Self::Shared, Self::Local>,
-        _ensemble: &Ensemble,
-    ) -> Result<ProgramTransition<Self>, ProgramFault> {
-        Ok(Transition::Stay)
-    }
-
-    fn on_react(
         ctx: &mut Context<Self::Shared, Self::Local>,
+        ensemble: &Ensemble,
     ) -> Result<ProgramTransition<Self>, ProgramFault> {
         let me = ctx.me();
-        let ensemble_len = u8::try_from(ctx.ensemble().len()).expect("test ensemble fits in u8");
+        let ensemble_len = u8::try_from(ensemble.len()).expect("test ensemble fits in u8");
         ctx.mutate_local(|local| {
             local.me = Some(me);
             local.ensemble_len = ensemble_len;
@@ -131,7 +126,7 @@ fn n_party_replay_uses_canonical_diagnostics_and_rejects_bad_membership() {
 
     let report = TestHarness::<EnsembleProgram>::replay_trace(local, (), &trace)
         .expect("N-party trace replays");
-    assert_eq!(report.event_count, 4);
+    assert_eq!(report.event_count, 2);
 
     let mut start_mismatch = trace[..1].to_vec();
     start_mismatch[0].post_state = arena0::StateHash([9; 32]);
@@ -141,8 +136,7 @@ fn n_party_replay_uses_canonical_diagnostics_and_rejects_bad_membership() {
     assert_eq!(error.participant, None, "session start has no author");
 
     let mut post_state_mismatch = trace.clone();
-    post_state_mismatch[2].post_state = arena0::StateHash([9; 32]);
-    post_state_mismatch[3].pre_state = arena0::StateHash([9; 32]);
+    post_state_mismatch[1].post_state = arena0::StateHash([9; 32]);
     let error = TestHarness::<EnsembleProgram>::replay_trace(local, (), &post_state_mismatch)
         .expect_err("changed message state must diverge");
     assert_eq!(error.kind, arena0::DivergenceKind::PostStateMismatch);
@@ -160,7 +154,7 @@ fn n_party_replay_uses_canonical_diagnostics_and_rejects_bad_membership() {
     );
 
     let mut missing_sender = trace.clone();
-    match &mut missing_sender[2].event {
+    match &mut missing_sender[1].event {
         arena0::types::Event::MessageReceived { from, .. } => *from = peer(9),
         event => panic!("expected message event, got {event:?}"),
     }
@@ -190,5 +184,220 @@ fn public_data_macro_compiles_explicit_generic_contract_bounds() {
         ExplicitBounds::<String>::json_schema()
             .as_value()
             .is_object()
+    );
+}
+
+/// A hostile local handler that forges a replacement context. The native
+/// harness must reject the dispatch before the forged shared view reaches the
+/// callout, and must restore both images.
+struct ReplacingLocalProgram;
+
+impl Program for ReplacingLocalProgram {
+    type Shared = Shared;
+    type Local = Local;
+    type Phase = Infallible;
+    type Message = ();
+    type Callout = ();
+    type Input = ();
+    type Params = ();
+    type Outcome = ();
+
+    fn outcome(_shared: &Self::Shared) -> Self::Outcome {}
+
+    fn writer(_shared: &Self::Shared) -> Option<Participant> {
+        None
+    }
+
+    fn on_session_started(
+        ctx: &mut Context<Self::Shared, Self::Local>,
+        ensemble: &Ensemble,
+    ) -> Result<ProgramTransition<Self>, ProgramFault> {
+        let me = ctx.me();
+        let ensemble_len = u8::try_from(ensemble.len()).expect("test ensemble fits in u8");
+        ctx.mutate_local(|local| {
+            local.me = Some(me);
+            local.ensemble_len = ensemble_len;
+        });
+        Ok(Transition::Stay)
+    }
+
+    fn on_timer(
+        ctx: &mut LocalContext<Self::Shared, Self::Local>,
+        _timer: TimerPayload,
+    ) -> Result<(), ProgramFault> {
+        let forged_shared = Shared {
+            sender: Some(Participant::new(3)),
+        };
+        let forged_local = Local {
+            me: Some(Participant::new(3)),
+            ensemble_len: 99,
+        };
+        // SAFETY: hostile-handler test. A local handler must not be able to
+        // replace its context; the harness rejects the dispatch.
+        *ctx = unsafe { LocalContext::__new(forged_shared, forged_local, ctx.identity()) };
+        Ok(())
+    }
+
+    fn callout(ctx: &CalloutContext<'_, Self::Shared, Self::Local>) -> Option<Self::Callout> {
+        ctx.shared().sender.is_none().then_some(())
+    }
+}
+
+#[test]
+fn native_local_handler_cannot_forge_a_shared_view_for_the_callout() {
+    let mut harness = TestHarness::<ReplacingLocalProgram>::with_peer_id(peer(2), ());
+    harness.session_started(peer(1));
+    let pending_before = harness.active_pending().map(|callout| callout.id);
+    assert!(pending_before.is_some(), "session start opens a callout");
+    let sender_before = harness.shared().sender;
+    let me_before = harness.local().me;
+    let len_before = harness.local().ensemble_len;
+
+    let result = harness.timer();
+
+    assert!(result.rejected, "the forged shared view must be rejected");
+    assert_eq!(harness.shared().sender, sender_before);
+    assert_eq!(harness.local().me, me_before);
+    assert_eq!(harness.local().ensemble_len, len_before);
+    assert_eq!(
+        harness.active_pending().map(|callout| callout.id),
+        pending_before,
+        "the open callout is unchanged"
+    );
+}
+
+/// A shared DTO whose custom Borsh serializer fails for the value a local
+/// handler installs. The native harness must treat that as a changed image and
+/// return a plain rejection instead of panicking.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    arena0::serde::Serialize,
+    arena0::serde::Deserialize,
+    arena0::borsh::BorshDeserialize,
+    arena0::schemars::JsonSchema,
+)]
+#[schemars(crate = "arena0::schemars")]
+struct FallibleShared {
+    poison: bool,
+}
+
+impl Default for FallibleShared {
+    fn default() -> Self {
+        Self { poison: false }
+    }
+}
+
+impl arena0::borsh::BorshSerialize for FallibleShared {
+    fn serialize<W: arena0::borsh::io::Write>(
+        &self,
+        writer: &mut W,
+    ) -> arena0::borsh::io::Result<()> {
+        if self.poison {
+            return Err(arena0::borsh::io::Error::new(
+                arena0::borsh::io::ErrorKind::Other,
+                "poisoned shared image",
+            ));
+        }
+        arena0::borsh::BorshSerialize::serialize(&self.poison, writer)
+    }
+}
+
+impl Primitive for FallibleShared {}
+impl ProgramValue for FallibleShared {}
+
+impl SharedState for FallibleShared {
+    const STATE_MAX: usize = 64;
+}
+
+struct PoisoningLocalProgram;
+
+impl Program for PoisoningLocalProgram {
+    type Shared = FallibleShared;
+    type Local = Local;
+    type Phase = Infallible;
+    type Message = ();
+    type Callout = ();
+    type Input = ();
+    type Params = ();
+    type Outcome = ();
+
+    fn outcome(_shared: &Self::Shared) -> Self::Outcome {}
+
+    fn writer(_shared: &Self::Shared) -> Option<Participant> {
+        None
+    }
+
+    fn on_session_started(
+        ctx: &mut Context<Self::Shared, Self::Local>,
+        ensemble: &Ensemble,
+    ) -> Result<ProgramTransition<Self>, ProgramFault> {
+        let me = ctx.me();
+        let ensemble_len = u8::try_from(ensemble.len()).expect("test ensemble fits in u8");
+        ctx.mutate_local(|local| {
+            local.me = Some(me);
+            local.ensemble_len = ensemble_len;
+        });
+        Ok(Transition::Stay)
+    }
+
+    fn on_timer(
+        ctx: &mut LocalContext<Self::Shared, Self::Local>,
+        _timer: TimerPayload,
+    ) -> Result<(), ProgramFault> {
+        // Emit provisional effects and logs that a rejected dispatch discards.
+        ctx.log("before forging");
+        ctx.effects().set_timer(0, ());
+        let poison = FallibleShared { poison: true };
+        let forged_local = Local {
+            me: Some(Participant::new(3)),
+            ensemble_len: 99,
+        };
+        // SAFETY: hostile-handler test. The harness must reject the dispatch
+        // because the installed image cannot serialize.
+        *ctx = unsafe { LocalContext::__new(poison, forged_local, ctx.identity()) };
+        Ok(())
+    }
+
+    fn callout(ctx: &CalloutContext<'_, Self::Shared, Self::Local>) -> Option<Self::Callout> {
+        (!ctx.shared().poison).then_some(())
+    }
+}
+
+#[test]
+fn native_local_handler_that_breaks_shared_serialization_is_rejected_without_panicking() {
+    let mut harness = TestHarness::<PoisoningLocalProgram>::with_peer_id(peer(2), ());
+    harness.session_started(peer(1));
+    let pending_before = harness.active_pending().map(|callout| callout.id);
+    assert!(pending_before.is_some(), "session start opens a callout");
+    let me_before = harness.local().me;
+    let len_before = harness.local().ensemble_len;
+
+    let result = harness.timer();
+
+    assert!(
+        result.rejected,
+        "an unserializable shared image must be rejected"
+    );
+    assert!(
+        result.effects.is_empty(),
+        "no effects survive a rejected dispatch"
+    );
+    assert!(
+        result.logs.is_empty(),
+        "no logs survive a rejected dispatch"
+    );
+    assert!(
+        !harness.shared().poison,
+        "the committed shared image is unchanged"
+    );
+    assert_eq!(harness.local().me, me_before);
+    assert_eq!(harness.local().ensemble_len, len_before);
+    assert_eq!(
+        harness.active_pending().map(|callout| callout.id),
+        pending_before,
+        "the open callout is unchanged"
     );
 }

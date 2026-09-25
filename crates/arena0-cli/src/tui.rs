@@ -171,8 +171,8 @@ use arena0_client::program::{BorshSchemaDocument, ProgramHash};
 #[cfg(test)]
 use arena0_client::protocol::TicketHash;
 use arena0_client::protocol::{
-    Effect as TraceEffect, Event as TraceEvent, ExecId, ExecLifecycle, PeerId, PendingId,
-    SessionHash, Slot, TraceEntry, View,
+    ExecId, ExecLifecycle, PeerId, PendingId, SessionHash, Slot, StepEvent as TraceEvent,
+    StepTerminal as TraceEffect, TraceEntry, View,
 };
 use arena0_client::sanitize;
 use arena0_home::HostName;
@@ -843,12 +843,11 @@ impl TraceViewEntry {
     fn new(entry: TraceEntry, schema: Result<&BorshSchemaDocument, &str>) -> Self {
         let message = match &entry.event {
             TraceEvent::SessionStarted { .. } => None,
-            TraceEvent::MessageReceived { msg, .. } => Some(
+            TraceEvent::Message { data, .. } => Some(
                 schema
                     .map_err(str::to_owned)
-                    .and_then(|schema| schema.decode_json(msg).map_err(|error| error.to_string())),
+                    .and_then(|schema| schema.decode_json(data).map_err(|error| error.to_string())),
             ),
-            _ => None,
         };
         Self { entry, message }
     }

@@ -213,14 +213,8 @@ impl BorshDeserialize for WireAbortOccurrence {
 pub enum ExecFrame {
     /// Broadcast one program payload at an agreed trace position.
     Message {
-        /// Content identity of the message envelope.
-        message_id: MessageIdBytes,
-        /// Agreed trace position.
-        seq: u64,
-        /// Shared state hash before applying the message.
-        prestate: StateHashBytes,
-        /// Shared state hash after applying the message.
-        poststate: StateHashBytes,
+        /// The author's complete commitment for this message step.
+        commitment: WireStepCommitment,
         /// Opaque guest payload.
         data: Vec<u8>,
     },
@@ -250,18 +244,9 @@ pub enum ExecFrame {
 impl BorshSerialize for ExecFrame {
     fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
         match self {
-            Self::Message {
-                message_id,
-                seq,
-                prestate,
-                poststate,
-                data,
-            } => {
+            Self::Message { commitment, data } => {
                 BorshSerialize::serialize(&EXEC_KIND_MESSAGE, writer)?;
-                BorshSerialize::serialize(message_id, writer)?;
-                BorshSerialize::serialize(seq, writer)?;
-                BorshSerialize::serialize(prestate, writer)?;
-                BorshSerialize::serialize(poststate, writer)?;
+                BorshSerialize::serialize(commitment, writer)?;
                 serialize_bounded_bytes(writer, data, MAX_EXEC_MESSAGE_BYTES, "exec.data")?;
                 Ok(())
             }
@@ -295,10 +280,7 @@ impl BorshDeserialize for ExecFrame {
     fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
         match u8::deserialize_reader(reader)? {
             EXEC_KIND_MESSAGE => Ok(Self::Message {
-                message_id: MessageIdBytes::deserialize_reader(reader)?,
-                seq: u64::deserialize_reader(reader)?,
-                prestate: StateHashBytes::deserialize_reader(reader)?,
-                poststate: StateHashBytes::deserialize_reader(reader)?,
+                commitment: WireStepCommitment::deserialize_reader(reader)?,
                 data: read_bounded_bytes(reader, MAX_EXEC_MESSAGE_BYTES, "exec.data")?,
             }),
             EXEC_KIND_STEP_SIGNATURE => Ok(Self::StepSignature {

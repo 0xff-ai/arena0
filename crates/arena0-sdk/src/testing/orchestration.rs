@@ -145,7 +145,9 @@ where
     pub fn message(&mut self, from: Participant, msg: P::Message) -> HandlerResult {
         let data = borsh::to_vec(&msg).expect("message serialization failed");
         let (from_peer, to_peer) = self.peer_route(from);
-        self.deliver_raw(from_peer, to_peer, data)
+        let result = self.deliver_raw(from_peer, to_peer, data);
+        self.queue_effects(to_peer, &result.effects);
+        result
     }
 
     /// Drop the next queued peer message, if any.
@@ -229,21 +231,18 @@ where
     }
 
     fn queue_effects(&mut self, from: PeerId, effects: &[Effect]) {
-        // Broadcast effects are delivered to the other participant. The
-        // originating dispatch has already applied its own dispatch result;
-        // queuing a producer self-message would apply that event twice.
+        // A broadcast is delivered to every participant, including its author:
+        // the author applies its own message through `on_message` exactly as
+        // every receiver does, in writer order, one at a time.
         for effect in effects {
             if let Effect::Broadcast { data } = effect {
-                let other = if from == self.alice.peer_id() {
-                    self.bob.peer_id()
-                } else {
-                    self.alice.peer_id()
-                };
-                self.outbox.push_back(QueuedMessage {
-                    from,
-                    to: other,
-                    data: data.clone(),
-                });
+                for to in [self.alice.peer_id(), self.bob.peer_id()] {
+                    self.outbox.push_back(QueuedMessage {
+                        from,
+                        to,
+                        data: data.clone(),
+                    });
+                }
             }
         }
     }

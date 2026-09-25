@@ -10,8 +10,8 @@ use std::time::Duration;
 use arena0_crypto::NodeKeys;
 use arena0_node::{SessionMessage, SpawnedExec};
 use arena0_protocol::{
-    Event, ExecFrame, ExecId, FetchActivationTickets, FetchFrame, MessageId, NegotiationId, PeerId,
-    PeerIdSource, SessionHash, StateHash, StepCommitment,
+    ExecFrame, ExecId, FetchActivationTickets, FetchFrame, NegotiationId, PeerId, PeerIdSource,
+    SessionHash, StateHash, StepCommitment,
 };
 use arena0_tests::assert::wait_for_entry;
 use arena0_tests::fixtures::{
@@ -43,21 +43,39 @@ async fn establish_session(execution: &LiveExecution) {
     establish_live_session(execution, &participants).await;
 }
 
+async fn current_link(execution: &LiveExecution) -> [u8; 32] {
+    execution
+        .store_handle
+        .load_execution(execution.exec_id)
+        .await
+        .expect("load execution")
+        .expect("execution")
+        .agreed_link()
+}
+
 fn message_frame(
     session_hash: SessionHash,
     source: PeerId,
     sequence: u64,
     prestate: StateHash,
+    link: [u8; 32],
     payload: u8,
 ) -> ExecFrame {
     let data = vec![payload];
-    ExecFrame::Message {
-        message_id: MessageId::derive(session_hash, source, sequence, prestate, prestate, &data),
-        seq: sequence,
-        prestate,
-        data,
-        poststate: prestate,
-    }
+    let entry = arena0_protocol::TraceEntry {
+        trace_version: arena0_protocol::TRACE_FORMAT_VERSION,
+        step: sequence,
+        event: arena0_protocol::StepEvent::Message {
+            from: source,
+            data: data.clone(),
+        },
+        pre_state: prestate,
+        post_state: prestate,
+        terminal: None,
+        agreement: arena0_protocol::AggregateAttestation::empty(),
+    };
+    let commitment = arena0_protocol::StepCommitment::for_entry(session_hash, &entry, link);
+    ExecFrame::Message { commitment, data }
 }
 
 async fn send_message(execution: &LiveExecution, participant: usize, frame: ExecFrame) {
@@ -181,6 +199,7 @@ async fn future_message_is_retried_after_public_head_catches_up() {
         source,
         2,
         execution.initial_state,
+        current_link(&execution).await,
         0xA2,
     );
     assert!(matches!(
@@ -207,19 +226,29 @@ async fn future_message_is_retried_after_public_head_catches_up() {
             source,
             1,
             execution.initial_state,
+            current_link(&execution).await,
             0xA1,
         ),
     )
     .await;
     complete_pending_shared(&execution, &cryptos()).await;
     let _ = wait_for_entry(&execution.store_handle, execution.exec_id, 1).await;
+    // The retried frame binds the link after step 1.
+    let future = message_frame(
+        execution.session_hash,
+        source,
+        2,
+        execution.initial_state,
+        current_link(&execution).await,
+        0xA2,
+    );
     send_message(&execution, 1, future).await;
     complete_pending_shared(&execution, &cryptos()).await;
     let trace = wait_for_entry(&execution.store_handle, execution.exec_id, 2).await;
     let payloads = trace
         .iter()
         .filter_map(|entry| match &entry.event {
-            Event::MessageReceived { msg, .. } => msg.first().copied(),
+            arena0_protocol::StepEvent::Message { data, .. } => data.first().copied(),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -239,6 +268,7 @@ async fn rejected_shared_message_fails_without_advancing_the_public_trace() {
             source,
             1,
             execution.initial_state,
+            current_link(&execution).await,
             0x01,
         ),
     )
@@ -282,6 +312,7 @@ async fn duplicate_position_does_not_replace_the_first_public_entry() {
             source,
             1,
             execution.initial_state,
+            current_link(&execution).await,
             0x10,
         ),
     )
@@ -296,6 +327,7 @@ async fn duplicate_position_does_not_replace_the_first_public_entry() {
             source,
             1,
             execution.initial_state,
+            current_link(&execution).await,
             0x20,
         ),
     )
@@ -309,7 +341,7 @@ async fn duplicate_position_does_not_replace_the_first_public_entry() {
     let payloads = trace
         .iter()
         .filter_map(|entry| match &entry.event {
-            Event::MessageReceived { msg, .. } => msg.first().copied(),
+            arena0_protocol::StepEvent::Message { data, .. } => data.first().copied(),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -331,6 +363,7 @@ async fn non_participant_frame_is_rejected_without_mutating_execution() {
             outsider,
             1,
             execution.initial_state,
+            current_link(&execution).await,
             0xEE,
         ))
         .await;
@@ -404,12 +437,15 @@ async fn participant_stream_closure_allows_reconnection_and_progress() {
         execution.peer_ids[1],
         1,
         execution.initial_state,
+        current_link(&execution).await,
         0x42,
     );
     send.send_exec(&frame).await.expect("apply after reconnect");
     complete_pending_shared(&execution, &cryptos()).await;
     let trace = wait_for_entry(&execution.store_handle, execution.exec_id, 1).await;
-    assert!(matches!(&trace[1].event, Event::MessageReceived { msg, .. } if msg == &[0x42]));
+    assert!(
+        matches!(&trace[1].event, arena0_protocol::StepEvent::Message { data, .. } if data == &[0x42])
+    );
 }
 
 #[tokio::test]
@@ -525,6 +561,7 @@ async fn nonterminal_conflict_receipt_does_not_stop_progress_on_other_lane() {
             execution.peer_ids[1],
             1,
             execution.initial_state,
+            current_link(&execution).await,
             0xA1,
         ),
     )

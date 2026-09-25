@@ -17,9 +17,10 @@
 //! Contributions live in shared state now: canonical (collect) ordering applies
 //! each participant's broadcast at the same public position on every node, so the
 //! shared hash moves on every contribution and each is a genuinely co-signed
-//! transition. The random draw and the broadcast are local decision code in
-//! `on_react`, fired exactly once per node (guarded by a local `sent` flag); the
-//! shared `on_message` handler applies the authenticated sender's value.
+//! transition. The participant whose slot is next draws its contribution and
+//! queues it; the author applies its own message through the same `on_message`
+//! handler every receiver runs, so the draw stays deterministic per node
+//! (guarded by a local `sent` flag).
 
 use std::fmt::Write;
 
@@ -229,41 +230,15 @@ pub mod cumulative_sum {
     }
 
     /// Position-0 boundary: size the contributions buffer to the committed
-    /// ensemble. The session-start handler draws no entropy and broadcasts nothing;
-    /// that is `on_react`'s job.
+    /// ensemble, then queue the first contribution when this node owes it.
     fn on_session_started(
         ctx: &mut Context<Shared, Local>,
         ensemble: &arena0::Ensemble,
     ) -> Result<ProgramTransition<CumulativeSum>, ProgramFault> {
         let n = ensemble.len();
         ctx.shared_mut().contributions = vec![None; n];
+        queue_contribution_if_due(ctx)?;
         Ok(Transition::Stay)
-    }
-
-    /// Local decision hook: draw this node's contribution, apply it to shared
-    /// state, and broadcast it in the same dispatch.
-    /// Unique-writer rule: only the first participant with an empty slot may
-    /// broadcast, so concurrent Reacts never produce sibling candidates at
-    /// one position.
-    fn on_react(
-        ctx: &mut Context<Shared, Local>,
-    ) -> Result<ProgramTransition<CumulativeSum>, ProgramFault> {
-        let from = ctx.me();
-        if ctx.shared().expected_writer() != Some(from.index()) {
-            return Ok(Transition::Stay);
-        }
-        if ctx.local().sent {
-            return Ok(Transition::Stay);
-        }
-        let mut buf = [0u8; 8];
-        ctx.random(&mut buf);
-        let value = u64::from_le_bytes(buf) % 1000;
-        let n = ctx.ensemble().len();
-        apply_contribution(ctx.shared_mut(), from, value);
-        let transition = finalize_if_ready(ctx.shared_mut(), n);
-        ctx.effects().broadcast(&Message::Contribute { value });
-        ctx.mutate_local(|s| s.sent = true);
-        Ok(transition)
     }
 
     fn on_message(
@@ -281,10 +256,28 @@ pub mod cumulative_sum {
         // Key the contribution by the AUTHENTICATED sender, never a value the
         // message could spoof: `from` is resolved from the signed transport peer.
         apply_contribution(ctx.shared_mut(), from, value);
-        Ok(ApplyDecision::Accept(finalize_if_ready(
-            ctx.shared_mut(),
-            n,
-        )))
+        let transition = finalize_if_ready(ctx.shared_mut(), n);
+        if matches!(transition, Transition::Stay) {
+            queue_contribution_if_due(ctx).map_err(ProtocolFault::shared_violation)?;
+        }
+        Ok(ApplyDecision::Accept(transition))
+    }
+
+    /// Draw and queue this node's contribution when it owns the next slot.
+    ///
+    /// The shared slot is filled only when the author's own message is applied
+    /// through [`on_message`], so the draw is deterministic per node and the
+    /// unique-writer rule holds at every position.
+    fn queue_contribution_if_due(ctx: &mut Context<Shared, Local>) -> arena0::anyhow::Result<()> {
+        if ctx.shared().expected_writer() != Some(ctx.me().index()) || ctx.local().sent {
+            return Ok(());
+        }
+        let mut buf = [0u8; 8];
+        ctx.random(&mut buf);
+        let value = u64::from_le_bytes(buf) % 1000;
+        ctx.mutate_local(|s| s.sent = true);
+        ctx.effects().broadcast(&Message::Contribute { value });
+        Ok(())
     }
 
     fn on_query(_shared: &Shared, _: ()) {}
@@ -312,7 +305,7 @@ pub mod cumulative_sum {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arena0::testing::{FaultStatus, Harness};
+    use arena0::testing::{FaultStatus, Harness, TestHarness};
     use arena0::types::{ColorDepth, Slot};
 
     fn peer_a() -> PeerId {
@@ -329,6 +322,21 @@ mod tests {
         }
     }
 
+    /// Apply this harness's own queued broadcast through `on_message`, as the
+    /// runtime authors its own queued messages.
+    fn author_queued(h: &mut TestHarness<CumulativeSum>, effects: &[Effect]) {
+        let data = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Broadcast { data } => Some(data.clone()),
+                _ => None,
+            })
+            .expect("session start queued a contribution");
+        let msg: Message = borsh::from_slice(&data).expect("contribution decodes");
+        let authored = h.message(h.peer_id(), msg);
+        assert!(matches!(authored.fault, FaultStatus::None));
+    }
+
     #[arena0::test(
         CumulativeSum,
         Params {
@@ -338,8 +346,10 @@ mod tests {
     fn view_renders_contributions_table_and_bar(h: ()) {
         let started = h.session_started(peer_a());
         assert!(matches!(started.fault, FaultStatus::None));
-        // Session start's reaction fills the local P0 slot. The remote P1
-        // contribution is then applied at the message boundary.
+        // The session-start handler queued P0's contribution; the author
+        // applies its own message through `on_message`.
+        author_queued(&mut h, &started.effects);
+        // The remote P1 contribution is then applied at the message boundary.
         let remote = peer_a();
         let contributed = h.message(remote, Message::Contribute { value: 250 });
         assert!(matches!(contributed.fault, FaultStatus::None));
@@ -365,7 +375,8 @@ mod tests {
         }
     )]
     fn view_mono_contains_no_sgr(h: ()) {
-        h.session_started(peer_a());
+        let started = h.session_started(peer_a());
+        author_queued(&mut h, &started.effects);
         h.message(peer_a(), Message::Contribute { value: 250 });
 
         let view = h.view(Viewport {

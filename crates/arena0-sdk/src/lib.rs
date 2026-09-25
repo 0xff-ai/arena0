@@ -11,6 +11,64 @@
 //! let _ = arena0::io_alloc::io_alloc(8);
 //! ```
 //!
+//! A local handler's [`LocalContext`] exposes shared state read-only, so a
+//! generated primitive accessor there has no shared-mutation method. The sample
+//! state derives every trait the state macro requires, so the mutation is the
+//! only compilation error:
+//!
+//! ```compile_fail
+//! use arena0::prelude::*;
+//!
+//! #[derive(Default)]
+//! #[arena0::primitive]
+//! struct Counter {
+//!     value: u64,
+//! }
+//!
+//! #[arena0::state(max = 64)]
+//! struct Shared {
+//!     #[primitive]
+//!     counter: Counter,
+//! }
+//!
+//! #[arena0::local]
+//! #[derive(Default)]
+//! struct Local {}
+//!
+//! fn local(ctx: &mut LocalContext<Shared, Local>) {
+//!     // `LocalContext` has no `mutate`, so this does not compile.
+//!     ctx.counter().mutate(|counter| counter.value = 1);
+//! }
+//! ```
+//!
+//! Reading that primitive from a local handler is allowed:
+//!
+//! ```rust
+//! use arena0::prelude::*;
+//!
+//! #[derive(Default)]
+//! #[arena0::primitive]
+//! struct Counter {
+//!     value: u64,
+//! }
+//!
+//! #[arena0::state(max = 64)]
+//! struct Shared {
+//!     #[primitive]
+//!     counter: Counter,
+//! }
+//!
+//! #[arena0::local]
+//! #[derive(Default)]
+//! struct Local {}
+//!
+//! fn local(ctx: &mut LocalContext<Shared, Local>) {
+//!     let _ = ctx
+//!         .counter()
+//!         .with_shared_local(|counter, _local| counter.value);
+//! }
+//! ```
+//!
 //! Programs are pure state machines. The runtime handles transport,
 //! callout/input collection, and state verification.
 
@@ -43,8 +101,9 @@ pub use arena0_sdk_macros::{
     test,
 };
 pub use context::{
-    Context, Crypto, Effects, PrimitiveField, PrimitiveOutput, PrimitiveOutputs, PrimitiveRoute,
-    RawPrimitiveRoute, Signed,
+    AgreedEffects, BroadcastError, BroadcastSink, CalloutContext, Context, Crypto, Effects,
+    LocalContext, LocalEffects, LocalPrimitive, MutablePrimitive, PrimitiveField, PrimitiveOutput,
+    PrimitiveOutputs, PrimitiveRoute, RawPrimitiveRoute, Signed,
 };
 #[doc(hidden)]
 pub use effects::{

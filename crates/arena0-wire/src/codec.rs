@@ -224,8 +224,8 @@ mod tests {
     use super::*;
     use crate::{
         EXEC_KIND_ABORT, EXEC_KIND_MESSAGE, ExecFrame, FetchFrame, MAX_EXEC_REASON_BYTES,
-        MAX_FETCH_RESPONSE_BYTES, MessageIdBytes, PeerIdBytes, SessionHashBytes, StateHashBytes,
-        StreamProtocol, WireAbortCoordinate, WireAbortOccurrence, WireError, WireStepCommitment,
+        MAX_FETCH_RESPONSE_BYTES, PeerIdBytes, SessionHashBytes, StateHashBytes, StreamProtocol,
+        WireAbortCoordinate, WireAbortOccurrence, WireError, WireStepCommitment,
     };
     use arena0_crypto::BlsSignature;
     use borsh::BorshSerialize;
@@ -233,10 +233,7 @@ mod tests {
     #[derive(BorshSerialize)]
     enum DerivedExecFrame {
         Message {
-            message_id: MessageIdBytes,
-            seq: u64,
-            prestate: StateHashBytes,
-            poststate: StateHashBytes,
+            commitment: WireStepCommitment,
             data: Vec<u8>,
         },
         StepSignature {
@@ -293,7 +290,7 @@ mod tests {
 
     fn step_commitment() -> WireStepCommitment {
         WireStepCommitment {
-            domain: *b"arena0/step-commit/v3\0\0\0",
+            domain: *b"arena0/step-commit/v4\0\0\0",
             session_id: SessionHashBytes([0x11; 32]),
             step: 3,
             entry_hash: [0x22; 32],
@@ -306,10 +303,7 @@ mod tests {
     #[test]
     fn payload_too_large() {
         let message = ExecFrame::Message {
-            message_id: MessageIdBytes([0; 32]),
-            seq: 0,
-            prestate: StateHashBytes([0; 32]),
-            poststate: StateHashBytes([0; 32]),
+            commitment: step_commitment(),
             data: vec![0u8; 100],
         };
         let result = Codec::new(10).encode(&message);
@@ -347,17 +341,11 @@ mod tests {
         let frames = [
             (
                 ExecFrame::Message {
-                    message_id: MessageIdBytes([3; 32]),
-                    seq: 4,
-                    prestate: StateHashBytes([5; 32]),
-                    poststate: StateHashBytes([8; 32]),
+                    commitment: step_commitment.clone(),
                     data: vec![6, 7],
                 },
                 DerivedExecFrame::Message {
-                    message_id: MessageIdBytes([3; 32]),
-                    seq: 4,
-                    prestate: StateHashBytes([5; 32]),
-                    poststate: StateHashBytes([8; 32]),
+                    commitment: step_commitment.clone(),
                     data: vec![6, 7],
                 },
             ),
@@ -459,10 +447,7 @@ mod tests {
     #[test]
     fn variable_lengths_are_checked_before_allocation() {
         let mut message_body = vec![EXEC_KIND_MESSAGE];
-        message_body.extend_from_slice(&[0; 32]);
-        message_body.extend_from_slice(&0u64.to_le_bytes());
-        message_body.extend_from_slice(&[0; 32]);
-        message_body.extend_from_slice(&[0; 32]);
+        message_body.extend_from_slice(&borsh::to_vec(&step_commitment()).unwrap());
         message_body.extend_from_slice(&u32::MAX.to_le_bytes());
         let message_frame = raw_frame(&message_body);
         assert!(matches!(

@@ -41,22 +41,20 @@ pub mod timer_dispatch_typed {
     type Shared = super::Shared;
     type Local = super::Local;
 
-    fn on_react(
+    fn on_session_started(
         ctx: &mut Context<Shared, Local>,
+        _ensemble: &arena0::Ensemble,
     ) -> Result<ProgramTransition<TimerDispatchTyped>, ProgramFault> {
         ctx.effects()
             .set_timer(Timer::Fired, TimerSchedule::after(Duration::ZERO));
         Ok(Transition::Stay)
     }
 
-    fn on_timer(
-        ctx: &mut Context<Shared, Local>,
-        timer: Timer,
-    ) -> Result<ProgramTransition<TimerDispatchTyped>, ProgramFault> {
+    fn on_timer(ctx: &mut LocalContext<Shared, Local>, timer: Timer) -> Result<(), ProgramFault> {
         match timer {
             Timer::Fired => {}
         }
         ctx.mutate_local(|local| local.fired = local.fired.saturating_add(1));
-        Ok(Transition::Stay)
+        Ok(())
     }
 }

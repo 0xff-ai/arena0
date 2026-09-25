@@ -176,20 +176,24 @@ mod tests {
         .expect("unknown sessions must close before receiving any frame");
         let state = arena0_protocol::StateHash([1; 32]);
         let data = vec![1];
-        let frame = arena0_protocol::ExecFrame::Message {
-            message_id: arena0_protocol::MessageId::derive(
-                session,
-                peer(1),
-                0,
-                state,
-                state,
-                &data,
-            ),
-            seq: 0,
-            prestate: state,
-            poststate: state,
-            data,
+        let entry = arena0_protocol::TraceEntry {
+            trace_version: arena0_protocol::TRACE_FORMAT_VERSION,
+            step: 0,
+            event: arena0_protocol::StepEvent::Message {
+                from: peer(1),
+                data: data.clone(),
+            },
+            pre_state: state,
+            post_state: state,
+            terminal: None,
+            agreement: arena0_protocol::AggregateAttestation::empty(),
         };
+        let commitment = arena0_protocol::StepCommitment::for_entry(
+            arena0_protocol::SessionHash([0; 32]),
+            &entry,
+            arena0_protocol::CHAIN_START,
+        );
+        let frame = arena0_protocol::ExecFrame::Message { commitment, data };
         assert!(matches!(
             send.send_exec(&frame).await,
             Err(arena0_transport::TransportError::ConnectionClosed)
