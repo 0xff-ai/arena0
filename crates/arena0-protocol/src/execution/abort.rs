@@ -77,7 +77,12 @@ impl<'de> Deserialize<'de> for AbortKind {
 ///
 /// The signature covers every field except itself, including the session,
 /// sender, terminal kind/code/reason, and exact agreed chain coordinate.
+///
+/// Both decoders validate the shape: Borsh through its reader below, serde
+/// through the derived field layout (`remote = "Self"`) wrapped in the same
+/// check.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, BorshSerialize)]
+#[serde(remote = "Self")]
 pub struct AbortOccurrence {
     domain: [u8; 24],
     version: u16,
@@ -108,6 +113,22 @@ impl BorshDeserialize for AbortOccurrence {
         occurrence.validate_shape().map_err(|error| {
             borsh::io::Error::new(borsh::io::ErrorKind::InvalidData, error.to_string())
         })?;
+        Ok(occurrence)
+    }
+}
+
+impl Serialize for AbortOccurrence {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AbortOccurrence {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let occurrence = Self::deserialize(deserializer)?;
+        occurrence
+            .validate_shape()
+            .map_err(serde::de::Error::custom)?;
         Ok(occurrence)
     }
 }
@@ -306,5 +327,27 @@ mod tests {
             borsh::from_slice::<AbortOccurrence>(&borsh::to_vec(&value).unwrap()).unwrap(),
             value
         );
+    }
+
+    #[test]
+    fn serde_decode_validates_the_shape_like_borsh() {
+        let value = occurrence();
+        let json = serde_json::to_value(&value).unwrap();
+        assert_eq!(
+            serde_json::from_value::<AbortOccurrence>(json.clone()).unwrap(),
+            value
+        );
+        for (field, invalid) in [
+            ("version", serde_json::json!(0)),
+            ("sender", serde_json::to_value(PeerId([0; 32])).unwrap()),
+            ("reason", serde_json::json!("x".repeat(MAX_TERMINAL_REASON_BYTES + 1))),
+        ] {
+            let mut tampered = json.clone();
+            tampered[field] = invalid;
+            assert!(
+                serde_json::from_value::<AbortOccurrence>(tampered).is_err(),
+                "serde accepted an invalid {field}"
+            );
+        }
     }
 }
