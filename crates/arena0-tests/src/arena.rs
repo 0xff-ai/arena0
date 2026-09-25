@@ -22,7 +22,7 @@ use arena0_protocol::{
     Viewport,
 };
 use arena0_sandbox::Program;
-use arena0_store::{Store, StoreConfig, StoreHandle};
+use arena0_store::{Store, StoreHandle};
 use arena0_test_engine::shared_test_engine;
 use arena0_transport::Transport;
 use arena0_transport::local::LocalTransport;
@@ -233,17 +233,7 @@ impl Arena {
         let mut stores: Vec<(TempDir, Store)> = Vec::with_capacity(n);
         let mut host_specs = Vec::with_capacity(n);
         for node in &identities {
-            let directory = tempfile::tempdir().expect("store directory");
-            let store = Store::open(StoreConfig::new(
-                directory.path().join("arena0.sqlite"),
-                node.peer_id,
-            ))
-            .expect("open store");
-            store
-                .handle()
-                .register_program(wasm.clone(), unix_time_ms())
-                .await
-                .expect("register program");
+            let (directory, store) = crate::fixtures::seeded_store(node.peer_id, &wasm).await;
             host_specs.push((Arc::clone(&node.identity), store.handle().clone()));
             stores.push((directory, store));
         }

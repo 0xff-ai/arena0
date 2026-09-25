@@ -107,6 +107,23 @@ pub fn activation_for(
     Activation::new(prepared, aggregate).expect("valid activation")
 }
 
+/// The SQLite file name inside a [`seeded_store`] directory, for reopening.
+pub const STORE_FILE: &str = "arena0.sqlite";
+
+/// Open a fresh Host store owned by `owner` in a new temporary directory,
+/// with `wasm` registered in its program catalog.
+pub async fn seeded_store(owner: PeerId, wasm: &[u8]) -> (TempDir, Store) {
+    let directory = tempfile::tempdir().expect("temporary store directory");
+    let store = Store::open(StoreConfig::new(directory.path().join(STORE_FILE), owner))
+        .expect("open sqlite store");
+    store
+        .handle()
+        .register_program(wasm.to_vec(), 1)
+        .await
+        .expect("register program");
+    (directory, store)
+}
+
 /// Agent JSON for `Params { target_size }`.
 pub fn encode_params(target_size: u32) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({ "target_size": target_size }))
@@ -200,17 +217,8 @@ pub async fn spawn_live_execution_with_delivery(
         .filter(|_| automatic_acknowledgements)
         .map(|transport| tokio::spawn(acknowledge_exec_streams(Arc::clone(transport))))
         .collect::<Vec<_>>();
-    let directory = tempfile::tempdir().expect("temporary store directory");
-    let store = Store::open(StoreConfig::new(
-        directory.path().join("arena0.sqlite"),
-        identity.peer_id(),
-    ))
-    .expect("open sqlite store");
+    let (directory, store) = seeded_store(identity.peer_id(), &wasm).await;
     let store_handle = store.handle().clone();
-    store_handle
-        .register_program(wasm.clone(), 1)
-        .await
-        .expect("register program");
     let host = Host::start(
         Arc::clone(&identity),
         Arc::clone(&transports[0]) as Arc<dyn arena0_transport::Transport + Sync>,

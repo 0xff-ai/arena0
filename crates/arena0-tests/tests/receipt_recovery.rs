@@ -12,7 +12,9 @@ use arena0_protocol::{
 use arena0_sandbox::Program;
 use arena0_store::{RecoveryCursor, Store, StoreConfig};
 use arena0_test_engine::shared_test_engine;
-use arena0_tests::fixtures::{activation_for, execution_key, ordering_program_wasm, provider};
+use arena0_tests::fixtures::{
+    STORE_FILE, activation_for, execution_key, ordering_program_wasm, provider, seeded_store,
+};
 use arena0_transport::Transport;
 use arena0_transport::local::{LocalNetwork, LocalTransport};
 
@@ -37,8 +39,6 @@ async fn recover_after(cut: CrashAfter) {
     let started = Instant::now();
     let mut progress = vec![(Milestone::Started, started.elapsed())];
     tokio::time::timeout(Duration::from_secs(15), async {
-        let directory = tempfile::tempdir().expect("temporary home");
-        let path = directory.path().join("arena0.sqlite");
         let keys = [provider(7), provider(8)];
         let peers = keys.iter().map(PeerIdSource::peer_id).collect::<Vec<_>>();
         let wasm = ordering_program_wasm(false);
@@ -55,12 +55,8 @@ async fn recover_after(cut: CrashAfter) {
             params.as_bytes().to_vec(),
             StateHash::of_shared(&initialized.shared),
         );
-        let store = Store::open(StoreConfig::new(&path, peers[0])).unwrap();
-        store
-            .handle()
-            .register_program(wasm.clone(), 1)
-            .await
-            .unwrap();
+        let (directory, store) = seeded_store(peers[0], &wasm).await;
+        let path = directory.path().join(STORE_FILE);
         let mut writer = store.handle().claim_execution(exec_id).unwrap();
         writer
             .create_execution_request(

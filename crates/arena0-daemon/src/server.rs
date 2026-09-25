@@ -4692,6 +4692,49 @@ mod tests {
         activation: Activation,
     }
 
+    /// Claim `execution_id` and durably record the creator's explicit
+    /// request and `prepared`, as negotiation does before signing.
+    async fn record_prepared(
+        daemon: &HostService,
+        execution_id: ExecId,
+        prepared: PreparedActivation,
+    ) -> HostExecutionStore {
+        let offer = prepared.offer().data();
+        let (program_hash, params) = (offer.program_hash, offer.params.clone());
+        let admission =
+            ExecutionAdmission::explicit(offer.negotiation_id, prepared.signers().collect())
+                .expect("admission");
+        let mut writer = daemon.runtime.claim_execution(execution_id).unwrap();
+        writer
+            .create_execution_request(program_hash, Some(params), admission, 1)
+            .await
+            .expect("request");
+        writer
+            .prepare_activation(prepared, 2)
+            .await
+            .expect("prepare");
+        writer
+    }
+
+    /// Commit `activation` and create its execution aggregate from the
+    /// initial state images.
+    async fn commit_execution(
+        writer: &mut HostExecutionStore,
+        activation: Activation,
+        producer: PeerId,
+        shared: SharedStateBytes,
+        local: LocalStateBytes,
+    ) {
+        writer
+            .commit_activation(activation.clone(), 3)
+            .await
+            .expect("commit");
+        writer
+            .create_execution(activation, producer, shared, local, 4)
+            .await
+            .expect("execution");
+    }
+
     fn two_party_activation(
         daemon: &HostService,
         peer: PeerId,
@@ -4790,34 +4833,15 @@ mod tests {
             prepared,
             activation,
         } = two_party_activation(&daemon, peer, program_hash, negotiation_id, &initial_shared);
-        let mut writer = daemon.runtime.claim_execution(execution_id).unwrap();
-        writer
-            .create_execution_request(
-                program_hash,
-                Some(JsonBytes::try_new(b"null".to_vec()).expect("params")),
-                ExecutionAdmission::explicit(negotiation_id, vec![peer, other]).expect("admission"),
-                1,
-            )
-            .await
-            .expect("request");
-        writer
-            .prepare_activation(prepared, 2)
-            .await
-            .expect("prepare");
-        writer
-            .commit_activation(activation.clone(), 3)
-            .await
-            .expect("commit");
-        writer
-            .create_execution(
-                activation,
-                peer,
-                initial_shared,
-                LocalStateBytes::try_new(Vec::new()).expect("local state"),
-                4,
-            )
-            .await
-            .expect("execution");
+        let mut writer = record_prepared(&daemon, execution_id, prepared).await;
+        commit_execution(
+            &mut writer,
+            activation,
+            peer,
+            initial_shared,
+            LocalStateBytes::try_new(Vec::new()).expect("local state"),
+        )
+        .await;
         drop(writer);
 
         // Certify a session-start step that ends the session, leaving the
@@ -4955,28 +4979,15 @@ mod tests {
             negotiation_id,
             &initialized.shared,
         );
-        let mut writer = daemon.runtime.claim_execution(execution_id).unwrap();
-        writer
-            .create_execution_request(
-                program_hash,
-                Some(params),
-                ExecutionAdmission::explicit(negotiation_id, vec![peer, other]).expect("admission"),
-                1,
-            )
-            .await
-            .expect("request");
-        writer
-            .prepare_activation(prepared, 2)
-            .await
-            .expect("prepare");
-        writer
-            .commit_activation(activation.clone(), 3)
-            .await
-            .expect("commit");
-        writer
-            .create_execution(activation, peer, initialized.shared, initialized.local, 4)
-            .await
-            .expect("execution");
+        let mut writer = record_prepared(&daemon, execution_id, prepared).await;
+        commit_execution(
+            &mut writer,
+            activation,
+            peer,
+            initialized.shared,
+            initialized.local,
+        )
+        .await;
         drop(writer);
 
         // Stop, publish, and close the confirmation window with the other
@@ -5113,20 +5124,7 @@ mod tests {
             activation,
             ..
         } = two_party_activation(&daemon, peer, program_hash, negotiation_id, &initial_shared);
-        let mut writer = daemon.runtime.claim_execution(execution_id).unwrap();
-        writer
-            .create_execution_request(
-                program_hash,
-                Some(JsonBytes::try_new(b"null".to_vec()).expect("params")),
-                ExecutionAdmission::explicit(negotiation_id, vec![peer, other]).expect("admission"),
-                1,
-            )
-            .await
-            .expect("request");
-        writer
-            .prepare_activation(prepared, 2)
-            .await
-            .expect("prepare");
+        let mut writer = record_prepared(&daemon, execution_id, prepared).await;
         let request = store
             .handle()
             .load_execution_request(execution_id)
