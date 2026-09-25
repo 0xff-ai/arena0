@@ -118,14 +118,7 @@ impl ExecutionActor {
         }
         let step = self.state.agreed_step();
         match frame {
-            frame @ ExecFrame::Message { .. } => {
-                let ExecFrame::Message {
-                    ref commitment,
-                    ref data,
-                } = frame
-                else {
-                    unreachable!()
-                };
+            ExecFrame::Message { commitment, data } => {
                 if commitment.step < step {
                     return Ok(None);
                 }
@@ -145,10 +138,10 @@ impl ExecutionActor {
                     // function of the staged entry and the agreed link.
                     let staged = self.state.proposal_commitment();
                     return Ok(
-                        if staged.as_ref() == Some(commitment)
+                        if staged.as_ref() == Some(&commitment)
                             && matches!(&proposal.entry().event,
                                 arena0_protocol::StepEvent::Message { from, data: staged }
-                                    if *from == source && staged == data)
+                                    if *from == source && *staged == data)
                         {
                             None
                         } else {
@@ -156,7 +149,7 @@ impl ExecutionActor {
                         },
                     );
                 }
-                self.apply_message(source, frame).await?;
+                self.apply_message(source, commitment, data).await?;
             }
             ExecFrame::StepSignature {
                 commitment,
@@ -182,14 +175,7 @@ impl ExecutionActor {
                 let Ok(certified) = next.add_step_signature(signature) else {
                     return Ok(Some(Rejected));
                 };
-                let agreed = certified.as_ref().map(|proposal| proposal.entry().step);
-                self.persist(next, Change::StepSignature { certified })
-                    .await?;
-                if agreed.is_some() {
-                    // Certification replaced the committed images.
-                    self.reload_resident()?;
-                }
-                self.emit_trace_appended(agreed).await;
+                self.persist_step_signature(next, certified).await?;
             }
             ExecFrame::StepCertificate { certificate } => {
                 if certificate.commitment().step < step {
@@ -207,17 +193,7 @@ impl ExecutionActor {
                 let certified = next.certify_step(certificate).map_err(|_| {
                     ExecError::DeliveryInvariant("verified certificate could not be committed")
                 })?;
-                let agreed = certified.entry().step;
-                self.persist(
-                    next,
-                    Change::StepSignature {
-                        certified: Some(certified),
-                    },
-                )
-                .await?;
-                // Certification replaced the committed images.
-                self.reload_resident()?;
-                self.emit_trace_appended(Some(agreed)).await;
+                self.persist_step_signature(next, Some(certified)).await?;
             }
             ExecFrame::Abort { occurrence } => {
                 if occurrence.coordinate().next_step() < step {

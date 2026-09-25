@@ -925,11 +925,14 @@ async fn rejected_writer_leaves_durable_state_unchanged() {
         Vec::new(),
     );
 
-    let applied = actor
-        .apply_message(fixture.remote_keys.peer_id(), frame)
+    let rejection = actor
+        .accept_frame(fixture.remote_keys.peer_id(), frame)
         .await
         .expect("drop wrong writer");
-    assert!(!applied);
+    assert_eq!(
+        rejection,
+        Some(arena0_transport::ExecDeliveryRejection::Rejected)
+    );
 
     let after = fixture
         .store
@@ -1586,7 +1589,7 @@ async fn receipt_budget_failure_publishes_a_stop_report_that_survives_restart() 
             vec![1; arena0_protocol::MAX_EFFECT_PAYLOAD_BYTES],
         );
         let result = actor
-            .apply_message(fixture.remote_keys.peer_id(), frame)
+            .accept_frame(fixture.remote_keys.peer_id(), frame)
             .await;
         if let Err(error @ crate::ExecError::ReceiptBudgetExhausted { .. }) = result {
             assert_eq!(actor.state.clone(), before);
@@ -1594,7 +1597,7 @@ async fn receipt_budget_failure_publishes_a_stop_report_that_survives_restart() 
             assert!(actor.fail_terminal(error).await);
             break;
         }
-        assert!(result.expect("dispatch within budget"));
+        assert_eq!(result.expect("dispatch within budget"), None);
         actor
             .ensure_step_signature()
             .await
@@ -1887,7 +1890,7 @@ async fn message_handler_cannot_sign() {
     let sequence = state.agreed_step();
     let frame = message_frame(&state, source, sequence, vec![4, 5, 6]);
     let error = actor
-        .apply_message(source, frame)
+        .accept_frame(source, frame)
         .await
         .expect_err("a message handler must not reach the signer");
     assert!(
@@ -1954,14 +1957,15 @@ async fn future_step_signature_waits_behind_the_current_proposal() {
     let state = actor.state.clone();
     let source = fixture.remote_keys.peer_id();
     let sequence = state.agreed_step();
-    assert!(
+    assert_eq!(
         actor
-            .apply_message(
+            .accept_frame(
                 source,
                 message_frame(&state, source, sequence, vec![1, 2, 3]),
             )
             .await
-            .expect("stage current proposal")
+            .expect("stage current proposal"),
+        None
     );
 
     let state = actor.state.clone();
@@ -1994,14 +1998,15 @@ async fn trace_observation_waits_for_the_certified_step() {
     let state = actor.state.clone();
     let source = fixture.remote_keys.peer_id();
     let sequence = state.agreed_step();
-    assert!(
+    assert_eq!(
         actor
-            .apply_message(
+            .accept_frame(
                 source,
                 message_frame(&state, source, sequence, vec![1, 2, 3]),
             )
             .await
-            .expect("stage shared proposal")
+            .expect("stage shared proposal"),
+        None
     );
     assert!(
         observations.try_recv().is_err(),

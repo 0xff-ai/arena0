@@ -12,8 +12,9 @@ use arena0_crypto::{ExecutionKey, NodeKeys, SignScheme};
 use arena0_program::{CallStatus, JsonBytes, ProgramHash};
 use arena0_protocol::execution::GuestSignData;
 use arena0_protocol::{
-    Committed, Effect, Ensemble, Event, ExecFrame, ExecLifecycle, ExecutionState, ExecutionStatus,
-    ParticipantStepSignature, PeerIdSource, PendingId, SessionHash, StepEvent, TerminalOutcome,
+    Committed, Effect, Ensemble, Event, ExecLifecycle, ExecutionState, ExecutionStatus,
+    ParticipantStepSignature, PeerIdSource, PendingId, SessionHash, SharedProposal, StepEvent,
+    TerminalOutcome,
 };
 use arena0_sandbox::{DispatchCall, GuestSigner};
 use arena0_store::Change;
@@ -237,42 +238,18 @@ impl ExecutionActor {
         Ok(())
     }
 
-    /// Apply one authenticated peer message frame. The receiver checks both
-    /// advertised frame hashes before it can sign the resulting proposal. The
-    /// Host's own messages go through `author_next_message` instead.
+    /// Dispatch one peer message that `accept_frame` has already classified:
+    /// current step, bound to the agreed cursor, and authored by the current
+    /// writer, with no staged proposal. The receiver checks both advertised
+    /// frame hashes before it can sign the resulting proposal. The Host's own
+    /// messages go through `author_next_message` instead.
     pub(super) async fn apply_message(
         &mut self,
         source: arena0_protocol::PeerId,
-        frame: ExecFrame,
-    ) -> Result<bool, ExecError> {
-        let ExecFrame::Message { commitment, data } = frame else {
-            return Err(ExecError::InvalidState(
-                "execution frame is not a message".into(),
-            ));
-        };
-        let state = &self.state;
-        if state.status().is_terminal() {
-            return Ok(false);
-        }
-        if state.pending_shared().is_some() {
-            return Err(ExecError::InvalidState(
-                "cannot apply a local message while a shared proposal is pending".into(),
-            ));
-        }
+        commitment: arena0_protocol::StepCommitment,
+        data: Vec<u8>,
+    ) -> Result<(), ExecError> {
         let seq = commitment.step;
-        if seq > state.agreed_step() {
-            return Ok(false);
-        }
-        if seq < state.agreed_step()
-            || commitment.session_id != state.binding().session_id()
-            || commitment.pre_state != state.agreed_state()
-            || commitment.link != state.agreed_link()
-        {
-            return Ok(false);
-        }
-        if self.writer_for_shared(state.shared_state(), &self.ensemble())? != Some(source) {
-            return Ok(false);
-        }
         let outcome = self
             .dispatch_event(
                 Event::MessageReceived {
@@ -283,8 +260,7 @@ impl ExecutionActor {
             )
             .await?;
         match outcome {
-            DispatchOutcome::Committed => Ok(true),
-            DispatchOutcome::Frozen => Ok(false),
+            DispatchOutcome::Committed | DispatchOutcome::Frozen => Ok(()),
             DispatchOutcome::Rejected { reason } => {
                 let mut message =
                     format!("diverged at step {seq}: program rejected the writer message");
@@ -688,24 +664,28 @@ impl ExecutionActor {
         );
         let mut next = self.state.clone();
         let certified = next.add_step_signature(signature)?;
-        let agreed_step = certified.as_ref().map(|proposal| proposal.entry().step);
-        self.persist(next, Change::StepSignature { certified })
-            .await?;
-        if agreed_step.is_some() {
-            // Certification replaced the committed images.
-            self.reload_resident()?;
-        }
-        self.emit_trace_appended(agreed_step).await;
-        Ok(())
+        self.persist_step_signature(next, certified).await
     }
 
-    pub(super) async fn emit_trace_appended(&mut self, step: Option<u64>) {
-        let Some(step) = step else {
-            return;
+    /// Persist a state that recorded one more step signature. When it
+    /// certified the proposal, reload the resident from the replaced committed
+    /// images and report the newly agreed step.
+    pub(super) async fn persist_step_signature(
+        &mut self,
+        next: ExecutionState,
+        certified: Option<SharedProposal>,
+    ) -> Result<(), ExecError> {
+        let agreed = certified.as_ref().map(|proposal| proposal.entry().step);
+        self.persist(next, Change::StepSignature { certified })
+            .await?;
+        let Some(step) = agreed else {
+            return Ok(());
         };
+        self.reload_resident()?;
         let _ = self
             .messages
             .send(SessionMessage::TraceAppended { step })
             .await;
+        Ok(())
     }
 }
