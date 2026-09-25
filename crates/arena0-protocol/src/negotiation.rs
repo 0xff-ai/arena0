@@ -237,6 +237,16 @@ impl PreparedActivation {
         &self.tickets
     }
 
+    /// Each ticket's signer, in canonical ticket order (creator first).
+    pub fn signers(&self) -> impl Iterator<Item = PeerId> + '_ {
+        self.tickets.iter().map(|ticket| ticket.data.signer)
+    }
+
+    /// The activated participant set, in sorted ensemble order.
+    pub fn ensemble(&self) -> Result<crate::Ensemble, crate::EnsembleError> {
+        crate::Ensemble::from_peers(self.signers().collect())
+    }
+
     /// Borrow the activation preimage fixed during preparation.
     #[must_use]
     pub const fn activation_data(&self) -> &ActivationData {

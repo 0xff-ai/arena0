@@ -500,11 +500,7 @@ impl ReceiptArtifact {
     pub fn summary(&self) -> ReceiptSummary {
         let body = self.body();
         let activation = &body.header().activation;
-        let mut ensemble = activation
-            .tickets()
-            .iter()
-            .map(|ticket| ticket.data.signer)
-            .collect::<Vec<_>>();
+        let mut ensemble = activation.prepared().signers().collect::<Vec<_>>();
         ensemble.sort_unstable();
         let terminal = body.termination().clone();
         let outcome_borsh = matches!(terminal, crate::ReceiptTermination::Completed)

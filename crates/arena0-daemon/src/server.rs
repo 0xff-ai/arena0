@@ -2729,9 +2729,7 @@ impl HostService {
                 ApiError::new(ApiErrorCode::Storage, format!("load program: {error}"))
             })?;
         let peers = prepared
-            .tickets()
-            .iter()
-            .map(|ticket| ticket.data.signer)
+            .signers()
             .filter(|peer| *peer != self.peer_id)
             .collect::<Vec<_>>();
         let bootstrap = negotiation_bootstrap(self.peer_id, None, peers.iter().copied());
@@ -3765,9 +3763,8 @@ impl HostService {
         let mut fetch_rx = self.runtime.register_fetch_handler(session_hash);
         let bootstrap = committed
             .activation()
-            .tickets()
-            .iter()
-            .map(|ticket| ticket.data.signer)
+            .prepared()
+            .signers()
             .collect::<Vec<_>>();
         let topic = match self
             .subscribe_negotiation(program_id, bootstrap.clone())

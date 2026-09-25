@@ -101,10 +101,7 @@ impl ExecutionBinding {
 
     /// Participant identities in canonical activation order.
     pub fn participants(&self) -> impl Iterator<Item = PeerId> + '_ {
-        self.activation
-            .tickets()
-            .iter()
-            .map(|ticket| ticket.data.signer)
+        self.activation.prepared().signers()
     }
 
     /// Whether `peer` holds a ticket in the activated ensemble.

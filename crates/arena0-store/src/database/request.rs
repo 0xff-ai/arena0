@@ -449,14 +449,9 @@ fn ensure_admission_authority(
             }
         }
         ExecutionAdmission::Explicit { peers, .. } => {
-            let admitted = arena0_protocol::Ensemble::from_peers(
-                prepared
-                    .tickets()
-                    .iter()
-                    .map(|ticket| ticket.data.signer)
-                    .collect(),
-            )
-            .map_err(|error| StoreError::InvalidAdmission(error.to_string()))?;
+            let admitted = prepared
+                .ensemble()
+                .map_err(|error| StoreError::InvalidAdmission(error.to_string()))?;
             if offer.creator != host_id || &admitted != peers {
                 return Err(StoreError::InvalidAdmission(
                     "prepared activation changes the explicit participant set".into(),

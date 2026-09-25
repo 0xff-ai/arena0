@@ -6,7 +6,7 @@
 //! committed participant ordering that execution and receipts use. Pure state;
 //! no network, persistence, or time.
 
-use arena0_protocol::{Activation, Committed, Ensemble, PeerId, SessionHash};
+use arena0_protocol::{Activation, Committed, Ensemble, SessionHash};
 use thiserror::Error;
 
 /// Why a confirmed activation could not form a session.
@@ -37,12 +37,9 @@ impl ActivatedSession {
         activation
             .validate()
             .map_err(|error| ActivatedSessionError::AggregateVerification(error.to_string()))?;
-        let peers = activation
-            .tickets()
-            .iter()
-            .map(|ticket| ticket.data.signer)
-            .collect::<Vec<PeerId>>();
-        let ensemble = Ensemble::from_peers(peers)
+        let ensemble = activation
+            .prepared()
+            .ensemble()
             .map_err(|error| ActivatedSessionError::InvalidEnsemble(error.to_string()))?;
         Ok(Self {
             ensemble,
