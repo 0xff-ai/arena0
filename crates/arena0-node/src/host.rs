@@ -22,12 +22,6 @@ use crate::machines::negotiation::{
 };
 use crate::router::{ExecStreamRouter, FetchRegistry};
 
-#[derive(Debug)]
-struct ExecRoute {
-    tx: mpsc::Sender<InboundStreamPayload>,
-    rx: Option<mpsc::Receiver<InboundStreamPayload>>,
-}
-
 /// Errors at the host/actor construction boundary.
 #[derive(Debug, Error)]
 pub enum HostError {
@@ -54,7 +48,10 @@ pub struct Host {
     identity: Arc<NodeKeys>,
     transport: Arc<dyn Transport + Sync>,
     store: StoreHandle,
-    routes: Arc<StdMutex<HashMap<SessionHash, ExecRoute>>>,
+    /// One entry per session with a live actor handle. The entry is the
+    /// session's routing claim; the weak sender leaves the actor's handle as
+    /// the only owner of its stream queue.
+    routes: Arc<StdMutex<HashMap<SessionHash, mpsc::WeakSender<InboundStreamPayload>>>>,
     fetch_registry: FetchRegistry,
     end_wakes: StdMutex<Option<mpsc::Receiver<ExecId>>>,
     owner_token: Arc<()>,
@@ -248,11 +245,10 @@ impl Host {
         }
         let execution_store = execution_store.into_store();
         let session_hash = context.activation.session_hash();
-        let mut inbound = self.try_claim_route(session_hash)?;
-        let routes = Arc::clone(&self.routes);
-        let session_claim = SessionStreamClaim::new(move || {
-            routes.lock().unwrap().remove(&session_hash);
-        });
+        let mut routes = self.routes.lock().unwrap();
+        if routes.contains_key(&session_hash) {
+            return Err(HostError::DuplicateSession(session_hash));
+        }
         let spawned = spawn_execution(
             context.bind(
                 Arc::clone(&self.identity),
@@ -261,46 +257,23 @@ impl Host {
             ),
             Arc::clone(self),
         );
-        let stream_tx = spawned.stream_tx.clone();
-        let forwarder = tokio::spawn(async move {
-            loop {
-                let payload = tokio::select! {
-                    _ = stream_tx.closed() => break,
-                    payload = inbound.recv() => match payload {
-                        Some(payload) => payload,
-                        None => break,
-                    },
-                };
-                if stream_tx.send(payload).await.is_err() {
-                    break;
-                }
-            }
+        routes.insert(session_hash, spawned.stream_tx.downgrade());
+        drop(routes);
+        let routes = Arc::clone(&self.routes);
+        let session_claim = SessionStreamClaim::new(move || {
+            routes.lock().unwrap().remove(&session_hash);
         });
-        Ok(spawned
-            .with_session_claim(session_claim)
-            .with_forwarder(forwarder))
-    }
-
-    fn try_claim_route(
-        &self,
-        key: SessionHash,
-    ) -> Result<mpsc::Receiver<InboundStreamPayload>, HostError> {
-        let mut routes = self.routes.lock().unwrap();
-        let route = routes.entry(key).or_insert_with(|| {
-            let (tx, rx) = mpsc::channel(64);
-            ExecRoute { tx, rx: Some(rx) }
-        });
-        route.rx.take().ok_or(HostError::DuplicateSession(key))
+        Ok(spawned.with_session_claim(session_claim))
     }
 }
 
 fn route_sender(
-    routes: &StdMutex<HashMap<SessionHash, ExecRoute>>,
+    routes: &StdMutex<HashMap<SessionHash, mpsc::WeakSender<InboundStreamPayload>>>,
     key: SessionHash,
 ) -> Option<mpsc::Sender<InboundStreamPayload>> {
     routes
         .lock()
         .unwrap()
         .get(&key)
-        .map(|route| route.tx.clone())
+        .and_then(mpsc::WeakSender::upgrade)
 }

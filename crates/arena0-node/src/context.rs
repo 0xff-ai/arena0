@@ -398,10 +398,10 @@ pub struct SpawnedExec {
     pub cmd_tx: mpsc::Sender<ExecCommand>,
     /// Durable observations emitted by the actor.
     pub message_rx: mpsc::Receiver<SessionMessage>,
-    /// Stream handoff queue used by [`crate::Host`].
+    /// Stream handoff queue. The Host route holds only a weak sender, so this
+    /// handle decides when the queue closes.
     pub(crate) stream_tx: mpsc::Sender<InboundStreamPayload>,
     task: Option<ExecutionTask>,
-    forwarder: Option<JoinHandle<()>>,
     session_claim: Option<SessionStreamClaim>,
 }
 
@@ -457,18 +457,12 @@ impl SpawnedExec {
             message_rx,
             stream_tx,
             task: Some(task),
-            forwarder: None,
             session_claim: None,
         }
     }
 
     pub(crate) fn with_session_claim(mut self, claim: SessionStreamClaim) -> Self {
         self.session_claim = Some(claim);
-        self
-    }
-
-    pub(crate) fn with_forwarder(mut self, forwarder: JoinHandle<()>) -> Self {
-        self.forwarder = Some(forwarder);
         self
     }
 
@@ -487,11 +481,6 @@ impl SpawnedExec {
             let (replacement_streams, _) = mpsc::channel(1);
             let streams = std::mem::replace(&mut self.stream_tx, replacement_streams);
             drop(streams);
-
-            if let Some(forwarder) = self.forwarder.take() {
-                forwarder.abort();
-                let _ = forwarder.await;
-            }
 
             let ExecutionTask {
                 actor,
@@ -540,9 +529,6 @@ impl Drop for SpawnedExec {
         if let Some(task) = self.task.take() {
             task.actor.abort();
             task.streams.abort();
-        }
-        if let Some(forwarder) = self.forwarder.take() {
-            forwarder.abort();
         }
         drop(self.session_claim.take());
     }
