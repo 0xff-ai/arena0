@@ -1442,16 +1442,13 @@ impl HostService {
             return Ok(());
         }
         if cause == ResumeCause::Startup {
-            self.events.emit(HostEvent::Created {
-                source: EventSource::Execution {
-                    peer_id: self.peer_id,
-                    exec_id,
-                    program_id: request.program_hash(),
-                },
-                negotiation_id: request.negotiation_id(),
-                queue_position: None,
-                origin: ExecCreationOrigin::Recovery,
-            });
+            self.emit_created(
+                exec_id,
+                request.program_hash(),
+                request.negotiation_id(),
+                None,
+                ExecCreationOrigin::Recovery,
+            );
         }
 
         // The recovery page intentionally contains only bounded metadata.
@@ -1751,6 +1748,29 @@ impl HostService {
                 Ok(())
             }
         }
+    }
+
+    /// Announce an execution this Host created, from a request or recovery.
+    /// Creation precedes any negotiation or session, so the event names the
+    /// bare execution source.
+    fn emit_created(
+        &self,
+        exec_id: ExecId,
+        program_id: ProgramHash,
+        negotiation_id: Option<NegotiationId>,
+        queue_position: Option<usize>,
+        origin: ExecCreationOrigin,
+    ) {
+        self.events.emit(HostEvent::Created {
+            source: EventSource::Execution {
+                peer_id: self.peer_id,
+                exec_id,
+                program_id,
+            },
+            negotiation_id,
+            queue_position,
+            origin,
+        });
     }
 
     /// Persist a recovery failure at the authoritative lifecycle boundary.
@@ -2449,16 +2469,13 @@ impl HostService {
         let queue_position = (queue_slot > 0).then_some(queue_slot);
         let negotiation_id = plan.negotiation_id();
         let entry = self.execs.register_live(exec_id);
-        self.events.emit(HostEvent::Created {
-            source: EventSource::Execution {
-                peer_id: self.peer_id,
-                exec_id,
-                program_id,
-            },
+        self.emit_created(
+            exec_id,
+            program_id,
             negotiation_id,
             queue_position,
-            origin: ExecCreationOrigin::Request,
-        });
+            ExecCreationOrigin::Request,
+        );
 
         let daemon = Arc::clone(self);
         let entry_task = Arc::clone(&entry);
@@ -4187,16 +4204,13 @@ mod tests {
             reason: Some("filtered".into()),
             uptime_secs: 1,
         });
-        daemon.events.emit(HostEvent::Created {
-            source: EventSource::Execution {
-                peer_id: daemon.peer_id,
-                exec_id,
-                program_id: ProgramHash([0xA2; 32]),
-            },
-            negotiation_id: None,
-            queue_position: None,
-            origin: ExecCreationOrigin::Request,
-        });
+        daemon.emit_created(
+            exec_id,
+            ProgramHash([0xA2; 32]),
+            None,
+            None,
+            ExecCreationOrigin::Request,
+        );
 
         let received: EventFrame =
             tokio::time::timeout(Duration::from_secs(1), frame::read_frame(&mut client_read))
