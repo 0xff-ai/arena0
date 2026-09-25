@@ -5,11 +5,11 @@
 use std::time::Duration;
 
 use arena0_crypto::NodeKeys;
-use arena0_protocol::{ExecFrame, ExecId, NegotiationId, PeerId, StateHash};
+use arena0_protocol::{ExecId, NegotiationId};
 use arena0_tests::assert::wait_for_entry;
 use arena0_tests::fixtures::{
-    complete_pending_shared, establish_live_session, ordering_program_wasm, provider,
-    spawn_live_execution,
+    complete_pending_shared, establish_live_session, message_frame, ordering_program_wasm,
+    provider, spawn_live_execution,
 };
 use arena0_transport::Transport;
 
@@ -18,53 +18,6 @@ const NEGOTIATION_ID: NegotiationId = NegotiationId([0xC0; 32]);
 
 fn cryptos() -> Vec<NodeKeys> {
     vec![provider(7), provider(8), provider(9)]
-}
-
-async fn current_link(execution: &arena0_tests::fixtures::LiveExecution) -> [u8; 32] {
-    execution
-        .store_handle
-        .load_execution(execution.exec_id)
-        .await
-        .expect("load execution")
-        .expect("execution")
-        .agreed_link()
-}
-
-fn message(
-    session: arena0_protocol::SessionHash,
-    source: PeerId,
-    seq: u64,
-    prestate: StateHash,
-    link: [u8; 32],
-    payload: u8,
-) -> ExecFrame {
-    let data = vec![payload];
-    let entry = arena0_protocol::TraceEntry {
-        trace_version: arena0_protocol::TRACE_FORMAT_VERSION,
-        step: seq,
-        event: arena0_protocol::StepEvent::Message {
-            from: source,
-            data: data.clone(),
-        },
-        pre_state: prestate,
-        post_state: prestate,
-        terminal: None,
-        agreement: arena0_protocol::AggregateAttestation::empty(),
-    };
-    let commitment = arena0_protocol::StepCommitment::for_entry(session, &entry, link);
-    ExecFrame::Message { commitment, data }
-}
-
-async fn send(
-    execution: &arena0_tests::fixtures::LiveExecution,
-    participant: usize,
-    frame: ExecFrame,
-) {
-    let stream = execution.participant_stream(participant);
-    stream
-        .send_exec(&frame)
-        .await
-        .expect("send execution frame");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -81,12 +34,12 @@ async fn message_claiming_unflushed_agreement_stays_behind_the_edge() {
     establish_live_session(&execution, &participants).await;
     let source = execution.peer_ids[1];
 
-    let frame = message(
+    let frame = message_frame(
         execution.session_hash,
         source,
         2,
         execution.initial_state,
-        current_link(&execution).await,
+        execution.agreed_link().await,
         7,
     );
     assert!(matches!(
@@ -119,19 +72,19 @@ async fn ordered_message_passes_the_public_edge() {
     establish_live_session(&execution, &participants).await;
     let source = execution.peer_ids[1];
 
-    send(
-        &execution,
-        1,
-        message(
-            execution.session_hash,
-            source,
+    execution
+        .send_from(
             1,
-            execution.initial_state,
-            current_link(&execution).await,
-            7,
-        ),
-    )
-    .await;
+            &message_frame(
+                execution.session_hash,
+                source,
+                1,
+                execution.initial_state,
+                execution.agreed_link().await,
+                7,
+            ),
+        )
+        .await;
     complete_pending_shared(&execution, &participants).await;
     let trace = wait_for_entry(&execution.store_handle, execution.exec_id, 1).await;
     let message = trace.iter().find_map(|entry| match &entry.event {
@@ -159,12 +112,12 @@ async fn malformed_sender_frame_is_rejected_before_back_pressure_state() {
         .await
         .expect("open outsider stream");
     let result = stream
-        .send_exec(&message(
+        .send_exec(&message_frame(
             execution.session_hash,
             outsider,
             1,
             execution.initial_state,
-            current_link(&execution).await,
+            execution.agreed_link().await,
             7,
         ))
         .await;

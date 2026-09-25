@@ -10,13 +10,13 @@ use std::time::Duration;
 use arena0_crypto::NodeKeys;
 use arena0_node::{SessionMessage, SpawnedExec};
 use arena0_protocol::{
-    ExecFrame, ExecId, FetchActivationTickets, FetchFrame, NegotiationId, PeerId, PeerIdSource,
-    SessionHash, StateHash, StepCommitment,
+    ExecFrame, ExecId, FetchActivationTickets, FetchFrame, NegotiationId, PeerIdSource,
+    StepCommitment,
 };
 use arena0_tests::assert::wait_for_entry;
 use arena0_tests::fixtures::{
     LIVE_EXECUTION_TIMEOUT, LiveExecution, complete_pending_shared, establish_live_session,
-    ordering_program_wasm, provider, spawn_live_execution,
+    message_frame, ordering_program_wasm, provider, spawn_live_execution,
 };
 use arena0_transport::Transport;
 
@@ -41,49 +41,6 @@ async fn harness(reject_shared: bool) -> LiveExecution {
 async fn establish_session(execution: &LiveExecution) {
     let participants = cryptos();
     establish_live_session(execution, &participants).await;
-}
-
-async fn current_link(execution: &LiveExecution) -> [u8; 32] {
-    execution
-        .store_handle
-        .load_execution(execution.exec_id)
-        .await
-        .expect("load execution")
-        .expect("execution")
-        .agreed_link()
-}
-
-fn message_frame(
-    session_hash: SessionHash,
-    source: PeerId,
-    sequence: u64,
-    prestate: StateHash,
-    link: [u8; 32],
-    payload: u8,
-) -> ExecFrame {
-    let data = vec![payload];
-    let entry = arena0_protocol::TraceEntry {
-        trace_version: arena0_protocol::TRACE_FORMAT_VERSION,
-        step: sequence,
-        event: arena0_protocol::StepEvent::Message {
-            from: source,
-            data: data.clone(),
-        },
-        pre_state: prestate,
-        post_state: prestate,
-        terminal: None,
-        agreement: arena0_protocol::AggregateAttestation::empty(),
-    };
-    let commitment = arena0_protocol::StepCommitment::for_entry(session_hash, &entry, link);
-    ExecFrame::Message { commitment, data }
-}
-
-async fn send_message(execution: &LiveExecution, participant: usize, frame: ExecFrame) {
-    execution
-        .participant_stream(participant)
-        .send_exec(&frame)
-        .await
-        .expect("send message frame");
 }
 
 async fn terminal_reason(spawned: &mut SpawnedExec) -> String {
@@ -199,7 +156,7 @@ async fn future_message_is_retried_after_public_head_catches_up() {
         source,
         2,
         execution.initial_state,
-        current_link(&execution).await,
+        execution.agreed_link().await,
         0xA2,
     );
     assert!(matches!(
@@ -218,19 +175,19 @@ async fn future_message_is_retried_after_public_head_catches_up() {
         "future frame cannot advance the public head"
     );
 
-    send_message(
-        &execution,
-        1,
-        message_frame(
-            execution.session_hash,
-            source,
+    execution
+        .send_from(
             1,
-            execution.initial_state,
-            current_link(&execution).await,
-            0xA1,
-        ),
-    )
-    .await;
+            &message_frame(
+                execution.session_hash,
+                source,
+                1,
+                execution.initial_state,
+                execution.agreed_link().await,
+                0xA1,
+            ),
+        )
+        .await;
     complete_pending_shared(&execution, &cryptos()).await;
     let _ = wait_for_entry(&execution.store_handle, execution.exec_id, 1).await;
     // The retried frame binds the link after step 1.
@@ -239,10 +196,10 @@ async fn future_message_is_retried_after_public_head_catches_up() {
         source,
         2,
         execution.initial_state,
-        current_link(&execution).await,
+        execution.agreed_link().await,
         0xA2,
     );
-    send_message(&execution, 1, future).await;
+    execution.send_from(1, &future).await;
     complete_pending_shared(&execution, &cryptos()).await;
     let trace = wait_for_entry(&execution.store_handle, execution.exec_id, 2).await;
     let payloads = trace
@@ -260,19 +217,19 @@ async fn rejected_shared_message_fails_without_advancing_the_public_trace() {
     let mut execution = harness(true).await;
     establish_session(&execution).await;
     let source = execution.peer_ids[1];
-    send_message(
-        &execution,
-        1,
-        message_frame(
-            execution.session_hash,
-            source,
+    execution
+        .send_from(
             1,
-            execution.initial_state,
-            current_link(&execution).await,
-            0x01,
-        ),
-    )
-    .await;
+            &message_frame(
+                execution.session_hash,
+                source,
+                1,
+                execution.initial_state,
+                execution.agreed_link().await,
+                0x01,
+            ),
+        )
+        .await;
     let reason = terminal_reason(&mut execution.spawned).await;
     assert!(
         reason.starts_with("diverged at step 1: program rejected the writer message"),
@@ -304,34 +261,34 @@ async fn duplicate_position_does_not_replace_the_first_public_entry() {
     let execution = harness(false).await;
     establish_session(&execution).await;
     let source = execution.peer_ids[1];
-    send_message(
-        &execution,
-        1,
-        message_frame(
-            execution.session_hash,
-            source,
+    execution
+        .send_from(
             1,
-            execution.initial_state,
-            current_link(&execution).await,
-            0x10,
-        ),
-    )
-    .await;
+            &message_frame(
+                execution.session_hash,
+                source,
+                1,
+                execution.initial_state,
+                execution.agreed_link().await,
+                0x10,
+            ),
+        )
+        .await;
     complete_pending_shared(&execution, &cryptos()).await;
     let _ = wait_for_entry(&execution.store_handle, execution.exec_id, 1).await;
-    send_message(
-        &execution,
-        1,
-        message_frame(
-            execution.session_hash,
-            source,
+    execution
+        .send_from(
             1,
-            execution.initial_state,
-            current_link(&execution).await,
-            0x20,
-        ),
-    )
-    .await;
+            &message_frame(
+                execution.session_hash,
+                source,
+                1,
+                execution.initial_state,
+                execution.agreed_link().await,
+                0x20,
+            ),
+        )
+        .await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     let trace = execution
         .store_handle
@@ -363,7 +320,7 @@ async fn non_participant_frame_is_rejected_without_mutating_execution() {
             outsider,
             1,
             execution.initial_state,
-            current_link(&execution).await,
+            execution.agreed_link().await,
             0xEE,
         ))
         .await;
@@ -437,7 +394,7 @@ async fn participant_stream_closure_allows_reconnection_and_progress() {
         execution.peer_ids[1],
         1,
         execution.initial_state,
-        current_link(&execution).await,
+        execution.agreed_link().await,
         0x42,
     );
     send.send_exec(&frame).await.expect("apply after reconnect");
@@ -553,19 +510,19 @@ async fn nonterminal_conflict_receipt_does_not_stop_progress_on_other_lane() {
         }
     });
     establish_session(&execution).await;
-    send_message(
-        &execution,
-        1,
-        message_frame(
-            execution.session_hash,
-            execution.peer_ids[1],
+    execution
+        .send_from(
             1,
-            execution.initial_state,
-            current_link(&execution).await,
-            0xA1,
-        ),
-    )
-    .await;
+            &message_frame(
+                execution.session_hash,
+                execution.peer_ids[1],
+                1,
+                execution.initial_state,
+                execution.agreed_link().await,
+                0xA1,
+            ),
+        )
+        .await;
     complete_pending_shared(&execution, &cryptos()).await;
     let _ = wait_for_entry(&execution.store_handle, EXEC_ID, 1).await;
     let _responsive = tokio::time::timeout(Duration::from_secs(2), reader)

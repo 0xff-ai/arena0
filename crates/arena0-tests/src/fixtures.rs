@@ -10,9 +10,9 @@ use arena0_program::{
     StateSchema,
 };
 use arena0_protocol::{
-    Activation, ActivationData, ExecId, ExecutionAdmission, MAX_TICKET_LIFETIME_MS, NegotiationId,
-    Offer, OfferData, OfferHash, PeerId, PeerIdSource, PreparedActivation, StateHash, Ticket,
-    TicketAction, TicketData, TicketHash,
+    Activation, ActivationData, ExecFrame, ExecId, ExecutionAdmission, MAX_TICKET_LIFETIME_MS,
+    NegotiationId, Offer, OfferData, OfferHash, PeerId, PeerIdSource, PreparedActivation,
+    StateHash, Ticket, TicketAction, TicketData, TicketHash,
 };
 use arena0_sandbox::Program;
 use arena0_store::{Store, StoreConfig, StoreHandle};
@@ -291,6 +291,53 @@ impl LiveExecution {
             .cloned()
             .expect("remote participant stream")
     }
+
+    /// The durable chain link after the agreed prefix, which the next
+    /// message's commitment must extend.
+    pub async fn agreed_link(&self) -> [u8; 32] {
+        self.store_handle
+            .load_execution(self.exec_id)
+            .await
+            .expect("load execution")
+            .expect("execution")
+            .agreed_link()
+    }
+
+    /// Send `frame` on remote participant `index`'s authenticated stream and
+    /// require the receiver to accept it.
+    pub async fn send_from(&self, index: usize, frame: &ExecFrame) {
+        self.participant_stream(index)
+            .send_exec(frame)
+            .await
+            .expect("send execution frame");
+    }
+}
+
+/// A one-byte message from `source` at `step` that leaves shared state
+/// `prestate` unchanged, carrying its complete `StepCommitment`.
+pub fn message_frame(
+    session_hash: arena0_protocol::SessionHash,
+    source: PeerId,
+    step: u64,
+    prestate: StateHash,
+    link: [u8; 32],
+    payload: u8,
+) -> ExecFrame {
+    let data = vec![payload];
+    let entry = arena0_protocol::TraceEntry {
+        trace_version: arena0_protocol::TRACE_FORMAT_VERSION,
+        step,
+        event: arena0_protocol::StepEvent::Message {
+            from: source,
+            data: data.clone(),
+        },
+        pre_state: prestate,
+        post_state: prestate,
+        terminal: None,
+        agreement: arena0_protocol::AggregateAttestation::empty(),
+    };
+    let commitment = arena0_protocol::StepCommitment::for_entry(session_hash, &entry, link);
+    ExecFrame::Message { commitment, data }
 }
 
 /// Complete the initial shared SessionStarted proposal with all remote
