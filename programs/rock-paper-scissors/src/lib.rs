@@ -382,6 +382,102 @@ pub mod rock_paper_scissors {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arena0::types::{ColorDepth, Slot};
+
+    #[test]
+    fn terminal_view_renders_revealed_hands_and_scores() {
+        // Finished best-of-3 clinched 2-0: drive a completed Rock-vs-Scissors
+        // commit/reveal through the real primitive with fixed public salts, so
+        // the final reveal stays visible exactly as it does at session end.
+        let mut commit_reveal = CommitReveal::default();
+        let mut locals = [CommitRevealLocal::default(), CommitRevealLocal::default()];
+        let choices = [Choice::Rock, Choice::Scissors];
+        let salts = [[0x11u8; 32], [0x22u8; 32]];
+        let commits: Vec<_> = choices
+            .iter()
+            .zip(locals.iter_mut())
+            .zip(salts.iter())
+            .map(|((choice, local), salt)| {
+                commit_reveal
+                    .commit_with_salt(local, *choice, *salt)
+                    .expect("fresh commit")
+            })
+            .collect();
+        for (index, commit) in commits.into_iter().enumerate() {
+            commit_reveal
+                .handle(
+                    Participant::try_from(index).expect("test participant fits"),
+                    commit,
+                )
+                .expect("commit applies");
+        }
+        let reveals: Vec<_> = locals
+            .iter_mut()
+            .map(|local| commit_reveal.take_reveal(local).expect("reveal is due"))
+            .collect();
+        for (index, reveal) in reveals.into_iter().enumerate() {
+            commit_reveal
+                .handle(
+                    Participant::try_from(index).expect("test participant fits"),
+                    reveal,
+                )
+                .expect("reveal applies");
+        }
+        assert!(commit_reveal.is_complete());
+
+        let state = Shared {
+            round: 2,
+            total_rounds: 3,
+            scores: [2, 0],
+            commit_reveal,
+            ..Shared::default()
+        };
+        let ensemble = Ensemble::from_peers(vec![PeerId([0; 32]), PeerId([1; 32])])
+            .expect("valid view ensemble");
+        for color in [ColorDepth::Mono, ColorDepth::Ansi16] {
+            let view = <rock_paper_scissors::RockPaperScissors as ProgramView>::view(
+                &state,
+                &ensemble,
+                &Viewport { width: 120, color },
+            );
+            assert_eq!(view.slots.len(), 4, "{color:?} fills every slot");
+            for slot in [Slot::Header, Slot::Agents, Slot::State, Slot::StatusBar] {
+                assert!(
+                    view.slots.contains_key(&slot),
+                    "{color:?} is missing {slot:?}"
+                );
+            }
+            let agents = &view.slots[&Slot::Agents];
+            let state_slot = &view.slots[&Slot::State];
+            for (participant, score, hand) in [(0, 2, "Rock"), (1, 0, "Scissors")] {
+                assert!(
+                    state_slot.lines().any(|line| {
+                        line.starts_with(&format!("P{participant} throws ")) && line.contains(hand)
+                    }),
+                    "state associates P{participant} with {hand}: {state_slot:?}"
+                );
+                assert!(
+                    agents.lines().any(|line| {
+                        line.starts_with(&format!("P{participant}: {score} points "))
+                            && line.contains(hand)
+                    }),
+                    "agents associate P{participant} with score {score} and {hand}: {agents:?}"
+                );
+            }
+            if color == ColorDepth::Mono {
+                assert!(
+                    view.slots.values().all(|text| !text.contains("\x1b[")),
+                    "mono view must not contain escapes"
+                );
+            }
+        }
+
+        let outcome = <rock_paper_scissors::RockPaperScissors as Program>::outcome(&state);
+        assert!(
+            matches!(outcome, Outcome::Win { winner, scores: [2, 0] } if winner == Participant::new(0)),
+            "P0 wins 2-0"
+        );
+    }
 
     #[test]
     fn choice_helpers() {

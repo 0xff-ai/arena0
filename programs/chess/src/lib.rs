@@ -675,6 +675,162 @@ pub mod chess {
             }
         }
     }
+
+    /// Terminal projection coverage: every ruled terminal board renders all
+    /// four slots and projects its exact receipt. Expectations below are
+    /// specified literals; the boards reach them through real legal moves.
+    #[cfg(test)]
+    mod projection_tests {
+        use super::super::{DrawReason, WinReason};
+        use super::*;
+        use arena0::types::{ColorDepth, Slot};
+
+        #[test]
+        fn terminal_view_and_outcome_preserve_chess_results() {
+            // Play UCI moves legally, recording SAN history as `validate_move` does.
+            let play = |mut board: CozyBoard, moves: &[&str]| -> (CozyBoard, Vec<String>) {
+                let mut history = Vec::new();
+                for uci in moves {
+                    let mv = parse_uci_move(&board, uci).expect("fixture move parses");
+                    assert!(board.is_legal(mv), "{uci} is legal");
+                    history.push(format!("{}", display_san_move(&board, mv)));
+                    board.play(mv);
+                }
+                (board, history)
+            };
+            let (scholar, scholar_history) = play(
+                CozyBoard::default(),
+                &["e2e4", "e7e5", "d1h5", "b8c6", "f1c4", "g8f6", "h5f7"],
+            );
+            let (stalemate, stalemate_history) = play(
+                "7k/8/4Q3/6K1/8/8/8/8 w - - 0 1".parse().expect("valid FEN"),
+                &["e6f7"],
+            );
+            let (fifty, fifty_history) = play(
+                "4k3/8/8/8/8/8/4K2R/8 w - - 99 1"
+                    .parse()
+                    .expect("valid FEN"),
+                &["h2h3"],
+            );
+            let (material, material_history) = play(
+                "4k3/7b/8/8/8/8/2B1K3/8 w - - 0 1"
+                    .parse()
+                    .expect("valid FEN"),
+                &["c2h7"],
+            );
+            let cases: Vec<(&str, CozyBoard, Vec<String>, Status, &str)> = vec![
+                (
+                    "scholar's mate",
+                    scholar,
+                    scholar_history,
+                    Status::Checkmate {
+                        winner: Color::White,
+                    },
+                    "Checkmate! white wins.",
+                ),
+                (
+                    "stalemate",
+                    stalemate,
+                    stalemate_history,
+                    Status::Stalemate,
+                    "Draw by stalemate.",
+                ),
+                (
+                    "fifty-move rule",
+                    fifty,
+                    fifty_history,
+                    Status::DrawBy50MoveRule,
+                    "Draw by fifty-move rule.",
+                ),
+                (
+                    "insufficient material",
+                    material,
+                    material_history,
+                    Status::DrawByInsufficientMaterial,
+                    "Draw by insufficient material.",
+                ),
+            ];
+            let ensemble = Ensemble::from_peers(vec![PeerId([0; 32]), PeerId([1; 32])])
+                .expect("valid view ensemble");
+            for (label, board, history, expected_status, expected_text) in cases {
+                // The real rule engine must agree with the specified literal.
+                assert_eq!(Status::compute(&board), expected_status, "{label}");
+                let state = Shared {
+                    fen: board.to_string(),
+                    status: expected_status,
+                    move_history: history,
+                    ..Shared::default()
+                };
+                let viewport = Viewport {
+                    width: 120,
+                    color: ColorDepth::Mono,
+                };
+                let view = <Chess as ProgramView>::view(&state, &ensemble, &viewport);
+                assert_eq!(view.slots.len(), 4, "{label} fills every slot");
+                for slot in [Slot::Header, Slot::Agents, Slot::State, Slot::StatusBar] {
+                    assert!(
+                        view.slots.contains_key(&slot),
+                        "{label} is missing {slot:?}"
+                    );
+                }
+                assert!(
+                    view.slots[&Slot::State].contains('\u{2654}'),
+                    "{label} shows the white king"
+                );
+                assert!(
+                    view.slots[&Slot::State].contains('\u{265A}'),
+                    "{label} shows the black king"
+                );
+                assert!(
+                    view.slots[&Slot::StatusBar].contains(expected_text),
+                    "{label} reports its terminal status"
+                );
+                assert!(
+                    view.slots.values().all(|text| !text.contains("\x1b[")),
+                    "{label} mono view must not contain escapes"
+                );
+                let outcome = <Chess as Program>::outcome(&state);
+                match expected_status {
+                    Status::Checkmate {
+                        winner: Color::White,
+                    } => assert!(
+                        matches!(outcome, Outcome::Win { winner, reason: WinReason::Checkmate } if winner == Participant::new(0)),
+                        "{label} is a white checkmate win"
+                    ),
+                    Status::Stalemate => assert!(
+                        matches!(
+                            outcome,
+                            Outcome::Draw {
+                                reason: DrawReason::Stalemate
+                            }
+                        ),
+                        "{label} is a stalemate draw"
+                    ),
+                    Status::DrawBy50MoveRule => assert!(
+                        matches!(
+                            outcome,
+                            Outcome::Draw {
+                                reason: DrawReason::FiftyMoveRule
+                            }
+                        ),
+                        "{label} is a fifty-move draw"
+                    ),
+                    Status::DrawByInsufficientMaterial => assert!(
+                        matches!(
+                            outcome,
+                            Outcome::Draw {
+                                reason: DrawReason::InsufficientMaterial
+                            }
+                        ),
+                        "{label} is an insufficient-material draw"
+                    ),
+                    Status::InProgress | Status::Checkmate { .. } => {
+                        panic!("{label} is not a specified terminal status")
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

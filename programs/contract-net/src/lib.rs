@@ -583,6 +583,7 @@ fn allocate(tasks: &[Task], offers: &[Option<WorkerOffer>]) -> AssignmentPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arena0::types::{ColorDepth, Slot};
 
     fn tasks() -> Vec<Task> {
         vec![
@@ -616,6 +617,101 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn terminal_view_renders_accepted_assignment() {
+        // One task awarded to P1 at cost 7: propose the exact plan to both
+        // participants with a unanimous threshold, then accept from each. The
+        // view and outcome below read only this agreed agreement state.
+        let plan = AssignmentPlan {
+            assignments: vec![Assignment {
+                task: 0,
+                award: Award::Assigned {
+                    worker: Participant::new(1),
+                    cost: 7,
+                },
+            }],
+        };
+        let mut agreement = Agreement::default();
+        let proposal = agreement
+            .propose(
+                PROPOSAL_VERSION,
+                plan.clone(),
+                vec![Participant::new(0), Participant::new(1)],
+                2,
+            )
+            .expect("proposal applies");
+        for index in [0, 1] {
+            agreement
+                .vote(Participant::new(index), proposal, Vote::Accept)
+                .expect("accept applies");
+        }
+        assert_eq!(agreement.status(), AgreementStatus::Accepted);
+
+        let state = Shared {
+            target_size: 2,
+            tasks: vec![Task {
+                name: "compile".to_string(),
+                capability: "rust".to_string(),
+            }],
+            offers: vec![
+                None,
+                Some(WorkerOffer {
+                    capabilities: vec!["rust".to_string()],
+                    capacity: 1,
+                    bids: vec![Bid { task: 0, cost: 7 }],
+                }),
+            ],
+            agreement,
+            ..Shared::default()
+        };
+        let ensemble = Ensemble::from_peers(vec![PeerId([0; 32]), PeerId([1; 32])])
+            .expect("valid view ensemble");
+        for color in [ColorDepth::Mono, ColorDepth::Ansi16] {
+            let view = <contract_net::ContractNet as ProgramView>::view(
+                &state,
+                &ensemble,
+                &Viewport { width: 120, color },
+            );
+            assert_eq!(view.slots.len(), 4, "{color:?} fills every slot");
+            for slot in [Slot::Header, Slot::Agents, Slot::State, Slot::StatusBar] {
+                assert!(
+                    view.slots.contains_key(&slot),
+                    "{color:?} is missing {slot:?}"
+                );
+            }
+            assert!(
+                view.slots[&Slot::State].contains("compile"),
+                "state names the task: {:?}",
+                view.slots[&Slot::State]
+            );
+            assert!(
+                view.slots[&Slot::State].contains("P1 @ 7"),
+                "state shows the assignment: {:?}",
+                view.slots[&Slot::State]
+            );
+            assert!(
+                view.slots[&Slot::Agents].contains("P1"),
+                "agents list the worker: {:?}",
+                view.slots[&Slot::Agents]
+            );
+            assert_eq!(view.slots[&Slot::StatusBar], "assignment plan accepted");
+            if color == ColorDepth::Mono {
+                assert!(
+                    view.slots.values().all(|text| !text.contains("\x1b[")),
+                    "mono view must not contain escapes"
+                );
+            }
+        }
+
+        let outcome = <contract_net::ContractNet as Program>::outcome(&state);
+        assert_eq!(outcome.proposal, proposal);
+        assert_eq!(outcome.plan.assignments.len(), 1);
+        assert!(matches!(
+            outcome.plan.assignments[0].award,
+            Award::Assigned { worker, cost: 7 } if worker == Participant::new(1)
+        ));
     }
 
     #[test]
