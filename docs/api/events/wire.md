@@ -115,7 +115,7 @@ An empty or absent `include` selects all catalog tags. An empty or absent
   "data": {
     "version": "0.6.0",
     "transport_key": "a2f28686c4b4328ae4ce1c3a924d7522e2c08da862e3c2e7af5c912505eaea9a",
-    "abi_version": 20
+    "abi_version": 22
   }
 }
 ```

@@ -254,9 +254,9 @@ local production and import facts independently yield `Produced`, `Imported`, or
 `Both`. Each `Verified` response includes the exact verified `receipt_id`.
 
 The earlier `{key:{session_id,producer}}` API and producer-sealed JSON format are
-replaced by these references and artifacts. Receipt artifact and body format,
-their `ReceiptId` domain, and the store schema are version 5; older evidence and
-databases require their matching older release.
+replaced by these references and artifacts. Receipt artifact and body format
+and their `ReceiptId` domain are version 5, and the store schema is version 6;
+older evidence and databases require their matching older release.
 
 `receipt.verify` performs portable/light verification only. It checks the
 activation binding, ordered v3 trace chain, N-of-N aggregate agreements,
