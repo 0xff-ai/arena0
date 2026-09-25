@@ -8,9 +8,7 @@ members = [
     "sequential-count",
     "vickrey-auction",
     "contract-net",
-    "timer-dispatch-typed",
-    "timer-dispatch-unit",
-    "local-context-forge",
+    "timer-dispatch",
 ]
 
 [workspace.package]

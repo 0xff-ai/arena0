@@ -1322,34 +1322,32 @@ async fn restart_resumes_a_durable_timer_and_accepts_a_message() {
 }
 
 #[tokio::test]
-async fn recovered_sdk_timers_dispatch_typed_and_unit_payloads() {
-    for stem in ["timer_dispatch_typed", "timer_dispatch_unit"] {
-        let fixture = Fixture::with_guest(stem).await;
-        let mut actor = fixture.prepare_active_actor().await;
-        // The fixture arms its timer from the agreed session boundary.
-        fixture.commit_session_started(&mut actor).await;
-        drop(actor);
+async fn recovered_sdk_timer_dispatches_its_typed_payload() {
+    let fixture = Fixture::with_guest("timer_dispatch").await;
+    let mut actor = fixture.prepare_active_actor().await;
+    // The fixture arms its timer from the agreed session boundary.
+    fixture.commit_session_started(&mut actor).await;
+    drop(actor);
 
-        let (messages, _observations) = mpsc::channel(8);
-        let mut restarted = fixture.actor_with_messages(messages).await;
+    let (messages, _observations) = mpsc::channel(8);
+    let mut restarted = fixture.actor_with_messages(messages).await;
+    restarted
+        .fire_due_timers()
+        .await
+        .expect("fire recovered timer");
+
+    let state = restarted.state.clone();
+    assert_eq!(state.local_state().as_bytes(), &[1], "timer handler");
+    assert!(
         restarted
-            .fire_due_timers()
+            .context
+            .store
+            .due_timers(super::now_ms(), 16)
             .await
-            .expect("fire recovered timer");
-
-        let state = restarted.state.clone();
-        assert_eq!(state.local_state().as_bytes(), &[1], "{stem} timer handler");
-        assert!(
-            restarted
-                .context
-                .store
-                .due_timers(super::now_ms(), 16)
-                .await
-                .expect("load timers")
-                .is_empty(),
-            "{stem} timer row"
-        );
-    }
+            .expect("load timers")
+            .is_empty(),
+        "timer row"
+    );
 }
 
 #[tokio::test]

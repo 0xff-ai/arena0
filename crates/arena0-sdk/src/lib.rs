@@ -122,7 +122,7 @@ pub use state::{
     Arena0Callout, Arena0CalloutRequest, Arena0Phase, Arena0Query, LocalDebug, LocalState,
     ManagedPhase, PhaseDecl, PhasedSharedState, ProgramValue, SharedState,
 };
-pub use timer::{IntoTimerEffect, TimerSchedule, decode_timer_payload, timer_payload};
+pub use timer::{decode_timer_payload, timer_payload};
 pub use transition::{AbortReason, Transition};
 
 pub use anyhow;
@@ -142,7 +142,7 @@ pub use arena0_program::{
 pub use arena0_protocol as types;
 pub use arena0_protocol::{
     Committed, Effect, Ensemble, EnsembleError, Event, LogLevel, Open, Participant, PeerId,
-    SessionHash, StateHash, TimerPayload, TimerSpec, TraceEntry, View, Viewport,
+    SessionHash, StateHash, TimerPayload, TraceEntry, View, Viewport,
 };
 pub use blake3;
 pub use borsh;

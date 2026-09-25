@@ -94,7 +94,7 @@ pub(super) fn expand_arena0_program_module(
         &params_ty,
         &outcome_ty,
     );
-    let methods = module_handler_methods(items);
+    let methods = module_handler_methods(items)?;
     let program_impl = quote! {
         impl ::arena0::Program for #program_ident {
             #(#assoc_types)*
@@ -218,7 +218,7 @@ fn module_assoc_types(
     ]
 }
 
-fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
+fn module_handler_methods(items: &[Item]) -> Result<Vec<TokenStream2>> {
     let mut methods = vec![
         quote! {
             #[doc(hidden)]
@@ -325,7 +325,7 @@ fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
             }
         });
     }
-    if let Some(timer_ty) = module_typed_timer_arg(items) {
+    if let Some(timer_ty) = module_timer_arg(items)? {
         methods.push(quote! {
             fn on_timer(
                 ctx: &mut ::arena0::LocalContext<Self::Shared, Self::Local>,
@@ -335,17 +335,8 @@ fn module_handler_methods(items: &[Item]) -> Vec<TokenStream2> {
                 self::on_timer(ctx, timer)
             }
         });
-    } else if module_has_fn(items, "on_timer") {
-        methods.push(quote! {
-            fn on_timer(
-                ctx: &mut ::arena0::LocalContext<Self::Shared, Self::Local>,
-                _timer: ::arena0::TimerPayload,
-            ) -> Result<(), ::arena0::ProgramFault> {
-                self::on_timer(ctx)
-            }
-        });
     }
-    methods
+    Ok(methods)
 }
 
 fn module_view_impl(items: &[Item], program_ident: &Ident, shared_ty: &Type) -> TokenStream2 {
@@ -369,21 +360,30 @@ fn module_view_impl(items: &[Item], program_ident: &Ident, shared_ty: &Type) -> 
     }
 }
 
-fn module_typed_timer_arg(items: &[Item]) -> Option<Type> {
-    let function = items.iter().find_map(|item| match item {
+/// The timer type of a module's `on_timer(ctx, timer: T)`, if it has one.
+fn module_timer_arg(items: &[Item]) -> Result<Option<Type>> {
+    let Some(function) = items.iter().find_map(|item| match item {
         Item::Fn(function) if function.sig.ident == "on_timer" => Some(function),
         _ => None,
-    })?;
-    let mut typed_inputs = function.sig.inputs.iter().filter_map(|input| match input {
-        syn::FnArg::Typed(input) => Some(input),
-        syn::FnArg::Receiver(_) => None,
-    });
-    let _ctx = typed_inputs.next()?;
-    let timer = typed_inputs.next()?;
-    if typed_inputs.next().is_some() {
-        return None;
+    }) else {
+        return Ok(None);
+    };
+    let typed_inputs: Vec<_> = function
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|input| match input {
+            syn::FnArg::Typed(input) => Some(input),
+            syn::FnArg::Receiver(_) => None,
+        })
+        .collect();
+    match typed_inputs.as_slice() {
+        [_ctx, timer] => Ok(Some((*timer.ty).clone())),
+        _ => Err(Error::new(
+            function.sig.span(),
+            "on_timer must take (ctx: &mut LocalContext, timer: T) for the timer type T passed to set_timer",
+        )),
     }
-    Some((*timer.ty).clone())
 }
 
 fn module_has_item_type(items: &[Item], name: &str) -> bool {

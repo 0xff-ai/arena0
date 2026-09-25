@@ -15,11 +15,10 @@
 
 use arena0_crypto::{CryptoError, HashAlgorithm, SignScheme};
 use arena0_protocol::{Committed, Ensemble, LogLevel, Participant, PeerId};
-use borsh::BorshSerialize;
+use borsh::{BorshDeserialize, BorshSerialize};
 use std::marker::PhantomData;
 
 use crate::effects;
-use crate::timer::IntoTimerEffect;
 use crate::{Program, Transition};
 
 mod sealed {
@@ -741,19 +740,18 @@ impl<Shared, M: EffectMode> Effects<'_, Shared, M> {
     pub fn broadcast<T: BorshSerialize>(&mut self, msg: &T) -> M::Broadcast {
         M::__broadcast(self, borsh::to_vec(msg).expect("message serialization"))
     }
-    /// Schedule a timer.
-    ///
-    /// Untyped timers use a delay and the unit marker:
-    /// `ctx.effects().set_timer(1000, ())`.
-    ///
-    /// Typed timers use a program enum plus a duration:
+    /// Schedule a one-shot typed timer that fires `timer` after `delay`:
     /// `ctx.effects().set_timer(Timer::TurnDeadline, Duration::from_secs(60))`.
-    pub fn set_timer<A, B>(&mut self, timer: A, schedule: B)
+    ///
+    /// `on_timer(ctx, timer: Timer)` receives the value back.
+    pub fn set_timer<T>(&mut self, timer: T, delay: std::time::Duration)
     where
-        (A, B): IntoTimerEffect,
+        T: BorshSerialize + BorshDeserialize + Clone + 'static,
     {
-        let spec = (timer, schedule).into_timer_spec();
-        effects::host_set_timer_spec(&spec);
+        effects::host_set_timer(
+            crate::timer::duration_millis(delay),
+            &crate::timer::timer_payload(timer),
+        );
     }
 }
 

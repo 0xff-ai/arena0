@@ -271,9 +271,9 @@ fn sdk_guest_repeated_allocations_preserve_commit_restore_and_rollback() {
     assert_no_images(&after_fault);
 }
 
-fn local_context_forge_wasm() -> Vec<u8> {
+fn timer_dispatch_wasm() -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../programs/target/wasm32-unknown-unknown/release/local_context_forge.wasm");
+        .join("../../programs/target/wasm32-unknown-unknown/release/timer_dispatch.wasm");
     std::fs::read(&path).unwrap_or_else(|error| {
         panic!(
             "cannot read required SDK guest {}: {error}; run `just build-programs`",
@@ -284,11 +284,11 @@ fn local_context_forge_wasm() -> Vec<u8> {
 
 /// A local handler that forges a replacement context must be rejected by the
 /// generated glue: the forged shared view never reaches `callout`, and neither
-/// image is stored.
+/// image is stored. The `timer-dispatch` fixture forges on `Timer::Forge`.
 #[test]
 fn sdk_guest_rejects_a_local_handler_that_forges_its_shared_view() {
     let engine = shared_test_engine();
-    let program = Program::try_from(local_context_forge_wasm()).expect("parse forge guest");
+    let program = Program::try_from(timer_dispatch_wasm()).expect("parse forge guest");
     let loaded = engine.load(&program).expect("load forge guest");
     let initialized = loaded
         .initialize(JsonBytes::try_new(b"null".to_vec()).expect("valid params JSON"))
@@ -322,7 +322,12 @@ fn sdk_guest_rejects_a_local_handler_that_forges_its_shared_view() {
             peer0,
             session,
             Event::TimerFired {
-                timer: arena0_protocol::TimerPayload::unit(),
+                // The fixture's `Timer::Forge`: the SDK names the timer type
+                // and Borsh-encodes the variant index.
+                timer: arena0_protocol::TimerPayload {
+                    type_name: "timer_dispatch::Timer".to_owned(),
+                    data: vec![1],
+                },
             },
         ))
         .expect("timer dispatch");

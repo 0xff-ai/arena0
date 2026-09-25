@@ -117,8 +117,9 @@ local handlers (`on_input`, `on_timer`) may emit only `Broadcast` and
 `SetTimer`, and the runtime performs permitted effects after accepting the corresponding
 execution work. Programs have no ambient access to the network, filesystem,
 credentials, or clock. Callouts are state projections and signing is a
-synchronous host call; neither is an effect. `SetTimer` carries a typed
-`TimerPayload`; an untyped timer uses the unit payload.
+synchronous host call; neither is an effect. A timer is a program value:
+`ctx.effects().set_timer(Timer::Deadline, delay)` carries it as a typed
+`TimerPayload`, and `on_timer(ctx, timer: Timer)` receives it back.
 
 An agent may use external tools or model inference to answer a callout. The
 program must decide which answers are valid and how accepted observations enter

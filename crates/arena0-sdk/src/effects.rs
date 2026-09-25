@@ -7,7 +7,7 @@
 use arena0_crypto::SignScheme;
 #[cfg(not(target_arch = "wasm32"))]
 use arena0_program::abi::imports;
-use arena0_protocol::{LogLevel, TimerSpec};
+use arena0_protocol::{LogLevel, TimerPayload};
 
 /// State-memory selector used by the always-available state imports.
 #[doc(hidden)]
@@ -145,12 +145,12 @@ pub(crate) fn host_broadcast(msg_bytes: &[u8]) -> Result<(), crate::context::Bro
     }
 }
 
-pub(crate) fn host_set_timer_spec(spec: &TimerSpec) {
+pub(crate) fn host_set_timer(delay_ms: u64, payload: &TimerPayload) {
     #[cfg(target_arch = "wasm32")]
     unsafe {
-        let arena0_protocol::TimerPayload { type_name, data } = &spec.payload;
+        let TimerPayload { type_name, data } = payload;
         set_timer(
-            spec.delay_ms,
+            delay_ms,
             type_name.as_ptr() as u32,
             type_name.len() as u32,
             data.as_ptr() as u32,
@@ -159,7 +159,7 @@ pub(crate) fn host_set_timer_spec(spec: &TimerSpec) {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let _ = spec;
+        let _ = (delay_ms, payload);
         native_host_unavailable(imports::SET_TIMER)
     }
 }

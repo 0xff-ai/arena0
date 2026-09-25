@@ -238,6 +238,27 @@ fn module_shell_wires_typed_timer_handler() {
 }
 
 #[test]
+fn module_shell_rejects_an_on_timer_without_a_timer_argument() {
+    let item: Item = syn::parse_quote! {
+        pub mod ping {
+            use arena0::prelude::*;
+
+            #[arena0::state(max = 256)]
+            pub struct Shared {
+                round: u64,
+            }
+
+            fn on_timer(ctx: &mut LocalContext) -> Result<(), ProgramFault> {
+                Ok(())
+            }
+        }
+    };
+
+    let error = expand_arena0_program_item(args(), item).unwrap_err();
+    assert!(error.to_string().contains("on_timer must take"), "{error}");
+}
+
+#[test]
 fn module_shell_rejects_external_modules() {
     let item: Item = syn::parse_quote! {
         mod ping;
@@ -312,7 +333,7 @@ fn infers_sign_through_a_bare_local_context() {
             #[arena0::state(max = 256)]
             pub struct Shared { round: u64 }
 
-            fn on_timer(ctx: &mut LocalContext) -> Result<(), ProgramFault> {
+            fn on_timer(ctx: &mut LocalContext, _timer: Timer) -> Result<(), ProgramFault> {
                 let _ = ctx.sign(SignScheme::Ed25519, b"payload");
                 Ok(())
             }

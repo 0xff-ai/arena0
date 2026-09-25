@@ -26,40 +26,12 @@ pub struct TimerPayload {
 }
 
 impl TimerPayload {
-    /// Construct the payload used by an untyped timer.
+    /// The payload of a `()` timer value.
     #[must_use]
     pub fn unit() -> Self {
         Self {
             type_name: std::any::type_name::<()>().to_owned(),
             data: Vec::new(),
         }
-    }
-}
-
-/// Complete timer request emitted by a program.
-#[derive(
-    Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq, Hash,
-)]
-pub struct TimerSpec {
-    /// Delay before first firing, in milliseconds.
-    pub delay_ms: u64,
-    /// Timer payload, including the unit payload for an untyped timer.
-    pub payload: TimerPayload,
-}
-
-impl TimerSpec {
-    /// Build an untyped timer request.
-    #[must_use]
-    pub fn untyped(delay_ms: u64) -> Self {
-        Self {
-            delay_ms,
-            payload: TimerPayload::unit(),
-        }
-    }
-
-    /// Build a typed timer request.
-    #[must_use]
-    pub fn typed(delay_ms: u64, payload: TimerPayload) -> Self {
-        Self { delay_ms, payload }
     }
 }

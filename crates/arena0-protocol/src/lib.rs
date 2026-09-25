@@ -82,7 +82,7 @@ pub use system_event::{
     EventSource, ExecCreationOrigin, ExecutionEvent, ExecutionFailureCode, NegotiationEvent,
     NegotiationStage, SystemEvent, TerminalKind,
 };
-pub use timer::{TimerPayload, TimerSpec};
+pub use timer::TimerPayload;
 pub use trace::{
     AggregateAttestation, AttestationError, CHAIN_START, ReceiptTermination, STEP_COMMIT_DOMAIN,
     SessionHeader, SignerSet, StepCommitment, StepEvent, StepSig, StepTerminal,

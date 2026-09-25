@@ -1,76 +1,14 @@
 //! Typed timer helpers for program authoring.
 
-use std::time::Duration;
-
 use anyhow::anyhow;
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::ProgramFault;
-use crate::types::{TimerPayload, TimerSpec};
+use crate::types::TimerPayload;
 
-/// Delay policy for a typed, one-shot timer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TimerSchedule {
-    delay: Duration,
-}
-
-impl TimerSchedule {
-    /// One-shot timer after `delay`.
-    #[must_use]
-    pub fn after(delay: Duration) -> Self {
-        Self { delay }
-    }
-
-    #[must_use]
-    pub(crate) fn delay_ms(self) -> u64 {
-        duration_millis(self.delay)
-    }
-}
-
-/// Converts `ctx.effects().set_timer(...)` arguments into a timer effect.
-pub trait IntoTimerEffect {
-    fn into_timer_spec(self) -> TimerSpec;
-}
-
-impl IntoTimerEffect for (u64, ()) {
-    fn into_timer_spec(self) -> TimerSpec {
-        TimerSpec::untyped(self.0)
-    }
-}
-
-impl<T> IntoTimerEffect for (T, Duration)
-where
-    T: BorshSerialize + BorshDeserialize + Clone + 'static,
-{
-    fn into_timer_spec(self) -> TimerSpec {
-        typed_timer_spec(self.0, TimerSchedule::after(self.1))
-    }
-}
-
-impl<T> IntoTimerEffect for (T, TimerSchedule)
-where
-    T: BorshSerialize + BorshDeserialize + Clone + 'static,
-{
-    fn into_timer_spec(self) -> TimerSpec {
-        typed_timer_spec(self.0, self.1)
-    }
-}
-
-fn typed_timer_spec<T>(timer: T, schedule: TimerSchedule) -> TimerSpec
-where
-    T: BorshSerialize + BorshDeserialize + Clone + 'static,
-{
-    let payload = timer_payload(timer);
-    TimerSpec::typed(schedule.delay_ms(), payload)
-}
-
-fn duration_millis(delay: Duration) -> u64 {
-    let millis = delay.as_millis();
-    if millis > u128::from(u64::MAX) {
-        u64::MAX
-    } else {
-        millis as u64
-    }
+/// A timer delay in whole milliseconds, saturating at `u64::MAX`.
+pub(crate) fn duration_millis(delay: std::time::Duration) -> u64 {
+    u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Encode a typed timer value into the payload carried by traces and tests.
@@ -111,15 +49,19 @@ mod tests {
     }
 
     #[test]
-    fn duration_schedules_typed_timer_payload() {
-        let spec = (Timer::TurnDeadline, Duration::from_secs(2)).into_timer_spec();
+    fn typed_timer_payload_round_trips() {
+        let payload = timer_payload(Timer::TurnDeadline);
 
-        assert_eq!(spec.delay_ms, 2000);
-        let payload = spec.payload;
         assert_eq!(payload.type_name, std::any::type_name::<Timer>());
         assert_eq!(
             decode_timer_payload::<Timer>(payload).unwrap(),
             Timer::TurnDeadline
         );
+    }
+
+    #[test]
+    fn delay_saturates_at_u64_millis() {
+        assert_eq!(duration_millis(std::time::Duration::from_secs(2)), 2000);
+        assert_eq!(duration_millis(std::time::Duration::MAX), u64::MAX);
     }
 }
