@@ -224,8 +224,9 @@ continue.
 
 Startup resumes `ending` executions. An authenticated frame from an unconfirmed
 peer wakes a dormant `ended` execution and receives `NotYet` until the actor
-can compare conclusions again. Traffic from confirmed peers is acknowledged
-as stale. Completion and certified shared stops match the same final step
+can compare conclusions again; the wake emits no further events for the
+execution. Authenticated traffic from confirmed peers is acknowledged as
+stale. Completion and certified shared stops match the same final step
 certificate; unilateral stops match an authenticated occurrence at the same
 agreed cursor, even when another participant forwards it.
 

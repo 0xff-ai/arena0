@@ -632,9 +632,12 @@ acknowledged as already applied.
 The actor retires at `Ended`. Startup resumes executions that are still
 `Ending`. An `Ended` execution with unconfirmed peers is dormant, not
 abandoned: an authenticated frame for it from one of those peers resumes the
-actor, which sends its terminal evidence again. A frame from a confirmed peer
-for a retired execution is acknowledged as stale. The daemon supervisor does
-not stop the actor because it observed the finished receipt.
+actor, which sends its terminal evidence again; the wake reports no new
+observations. A retired execution authenticates every frame with the actor's
+policy: an authentic frame from a confirmed peer is acknowledged as stale, a
+contradicting conclusion is answered with a conflict, and anything else is
+rejected. The daemon supervisor does not stop the actor because it observed
+the finished receipt.
 
 `ReceiptArtifact` distinguishes two guarantees:
 
