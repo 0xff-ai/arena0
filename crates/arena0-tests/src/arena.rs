@@ -1000,10 +1000,14 @@ impl Expect<'_> {
         loop {
             self.run.drain_events();
             let participant = &mut self.run.participants[self.participant];
-            let pending = participant.events.iter().find_map(|event| match event {
-                SessionMessage::CalloutRequested { pending_id, .. } => Some(*pending_id),
-                _ => None,
-            });
+            let pending = participant
+                .events
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    SessionMessage::CalloutRequested { pending_id, .. } => Some(*pending_id),
+                    _ => None,
+                });
             if let Some(pending_id) = pending {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 participant
