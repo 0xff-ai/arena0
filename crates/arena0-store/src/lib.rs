@@ -41,7 +41,7 @@ use lock::{
     OwnerLock, acquire_process_lock, configure_connection, initialize_schema, prepare_database_file,
 };
 
-const SCHEMA_VERSION: u64 = 5;
+const SCHEMA_VERSION: u64 = 6;
 const ENVELOPE_VERSION: u16 = 2;
 const ENVELOPE_MAGIC: [u8; 8] = *b"AR0STOR1";
 const ENVELOPE_DOMAIN: &[u8] = b"arena0/store-envelope/v2";

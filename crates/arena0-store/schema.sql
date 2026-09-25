@@ -66,7 +66,6 @@ CREATE TABLE executions (
     producer BLOB NOT NULL CHECK (length(producer) = 32),
     session_id BLOB NOT NULL CHECK (length(session_id) = 32),
     state BLOB NOT NULL,
-    local_state_checksum BLOB NOT NULL CHECK (length(local_state_checksum) = 32),
     end_phase INTEGER NOT NULL CHECK (end_phase IN (0, 1, 2)),
     end_unconfirmed BLOB NOT NULL,
     version INTEGER NOT NULL CHECK (version >= 0),
@@ -107,9 +106,9 @@ CREATE TABLE terminal_proofs (
     execution_id BLOB NOT NULL CHECK (length(execution_id) = 32),
     version INTEGER NOT NULL CHECK (version >= 0),
     receipt_id BLOB NOT NULL CHECK (length(receipt_id) = 32),
-    publication BLOB NOT NULL,
     PRIMARY KEY (execution_id, version),
-    FOREIGN KEY (execution_id) REFERENCES executions(execution_id)
+    FOREIGN KEY (execution_id) REFERENCES executions(execution_id),
+    FOREIGN KEY (receipt_id) REFERENCES receipts(receipt_id)
 ) STRICT;
 
 CREATE TABLE receipts (

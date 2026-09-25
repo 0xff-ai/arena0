@@ -20,7 +20,6 @@ pub(super) struct Database {
 struct ExecutionIndexRow {
     execution_id: ExecId,
     state_bytes: Vec<u8>,
-    local_checksum: Vec<u8>,
     version: i64,
     lifecycle: i64,
     agreed_step: i64,

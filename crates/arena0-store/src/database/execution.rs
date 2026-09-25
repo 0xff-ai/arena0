@@ -85,16 +85,15 @@ impl Database {
         self.connection.execute(
             "INSERT INTO executions
              (execution_id, host_id, producer, session_id, state,
-              local_state_checksum, version, lifecycle, agreed_step, event_position,
+              version, lifecycle, agreed_step, event_position,
               created_at_ms, updated_at_ms, end_phase, end_unconfirmed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12, ?13)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12)",
             params![
                 state.execution_id().0.to_vec(),
                 self.host_id.0.to_vec(),
                 state.producer().0.to_vec(),
                 state.binding().session_id().0.to_vec(),
                 envelope(EnvelopeKind::ExecutionState, &bytes)?,
-                checksum(state.local_state().as_bytes()).to_vec(),
                 sqlite_u64(state.version().get())?,
                 lifecycle_tag(state.lifecycle()),
                 sqlite_u64(state.agreed_step())?,
@@ -227,7 +226,7 @@ impl Database {
             .connection
             .query_row(
                 "SELECT host_id, producer, session_id, state,
-                        local_state_checksum, version, lifecycle, agreed_step,
+                        version, lifecycle, agreed_step,
                         event_position
                  FROM executions WHERE execution_id = ?1",
                 params![execution_id.0.to_vec()],
@@ -237,11 +236,10 @@ impl Database {
                         row.get::<_, Vec<u8>>(1)?,
                         row.get::<_, Vec<u8>>(2)?,
                         row.get::<_, Vec<u8>>(3)?,
-                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, i64>(4)?,
                         row.get::<_, i64>(5)?,
                         row.get::<_, i64>(6)?,
                         row.get::<_, i64>(7)?,
-                        row.get::<_, i64>(8)?,
                     ))
                 },
             )
@@ -251,7 +249,6 @@ impl Database {
             producer_bytes,
             session_bytes,
             state_bytes,
-            local_checksum,
             version,
             lifecycle,
             agreed_step,
@@ -270,7 +267,6 @@ impl Database {
         self.decode_state_row(ExecutionIndexRow {
             execution_id,
             state_bytes,
-            local_checksum,
             version,
             lifecycle,
             agreed_step,
@@ -288,7 +284,6 @@ impl Database {
         let ExecutionIndexRow {
             execution_id,
             state_bytes,
-            local_checksum,
             version,
             lifecycle,
             agreed_step,
@@ -308,11 +303,6 @@ impl Database {
         {
             return Err(StoreError::Corruption(
                 "execution index does not match decoded state".into(),
-            ));
-        }
-        if local_checksum != checksum(state.local_state().as_bytes()).as_slice() {
-            return Err(StoreError::Corruption(
-                "local state checksum does not match execution state".into(),
             ));
         }
         self.validate_state_indexes(&state, version, lifecycle, agreed_step, event_position)?;
@@ -840,13 +830,12 @@ impl Database {
     ) -> Result<(), StoreError> {
         let bytes = state_bytes(next)?;
         let changed = self.connection.execute(
-            "UPDATE executions SET state = ?1, local_state_checksum = ?2,
-                    version = ?3, lifecycle = ?4, agreed_step = ?5,
-                    event_position = ?6, updated_at_ms = ?7, end_phase = ?10, end_unconfirmed = ?11
-             WHERE execution_id = ?8 AND version = ?9",
+            "UPDATE executions SET state = ?1,
+                    version = ?2, lifecycle = ?3, agreed_step = ?4,
+                    event_position = ?5, updated_at_ms = ?6, end_phase = ?9, end_unconfirmed = ?10
+             WHERE execution_id = ?7 AND version = ?8",
             params![
                 envelope(EnvelopeKind::ExecutionState, &bytes)?,
-                checksum(next.local_state().as_bytes()).to_vec(),
                 sqlite_u64(next.version().get())?,
                 lifecycle_tag(next.lifecycle()),
                 sqlite_u64(next.agreed_step())?,

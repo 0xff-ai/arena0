@@ -2406,12 +2406,16 @@ async fn unpublished_execution_rejects_terminal_projection_rows_on_restart() {
     store.shutdown().await.expect("shutdown");
 
     let connection = Connection::open(&path).expect("inspect");
+    // Simulate corruption that bypasses the schema's relations.
+    connection
+        .pragma_update(None, "foreign_keys", "OFF")
+        .expect("disable foreign keys");
     connection
         .execute(
             "INSERT INTO terminal_proofs
-             (execution_id, version, receipt_id, publication)
-             VALUES (?1, 1, ?2, ?3)",
-            rusqlite::params![execution_id.0.to_vec(), [2u8; 32].to_vec(), [3u8],],
+             (execution_id, version, receipt_id)
+             VALUES (?1, 1, ?2)",
+            rusqlite::params![execution_id.0.to_vec(), [2u8; 32].to_vec(),],
         )
         .expect("insert unexpected terminal row");
     drop(connection);
@@ -2436,6 +2440,11 @@ async fn published_receipts_require_terminal_proof_and_production_rows_on_restar
             "terminal-proof",
             "DELETE FROM terminal_proofs WHERE execution_id = ?1",
         ),
+        (
+            0x36,
+            "receipt",
+            "DELETE FROM receipts WHERE receipt_id IN (SELECT receipt_id FROM terminal_proofs WHERE execution_id = ?1)",
+        ),
     ] {
         let path = directory.path().join(format!("missing-{row}.sqlite"));
         let execution_id = ExecId([byte; 32]);
@@ -2453,6 +2462,10 @@ async fn published_receipts_require_terminal_proof_and_production_rows_on_restar
         store.shutdown().await.expect("shutdown");
 
         let connection = Connection::open(&path).expect("inspect");
+        // Simulate corruption that bypasses the schema's relations.
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .expect("disable foreign keys");
         connection
             .execute(delete, rusqlite::params![execution_id.0.to_vec()])
             .expect("remove required publication row");

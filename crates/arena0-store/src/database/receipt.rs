@@ -258,31 +258,18 @@ impl Database {
         now_ms: u64,
     ) -> Result<(), StoreError> {
         self.insert_artifact(receipt, now_ms)?;
-        let publication_bytes = receipt.encode()?;
         let existing = self
             .connection
             .query_row(
-                "SELECT version, receipt_id, publication FROM terminal_proofs
+                "SELECT version, receipt_id FROM terminal_proofs
              WHERE execution_id = ?1",
                 params![execution_id.0.to_vec()],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                    ))
-                },
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
             )
             .optional()?;
-        if let Some((old_version, old_id, old_publication)) = existing {
-            let old_payload = open_envelope(
-                EnvelopeKind::TerminalPublication,
-                &old_publication,
-                arena0_protocol::MAX_RECEIPT_BYTES,
-            )?;
+        if let Some((old_version, old_id)) = existing {
             if sqlite_i64(old_version)? != version.get()
                 || old_id != receipt.receipt_id().as_bytes().to_vec()
-                || old_payload != publication_bytes
             {
                 return Err(StoreError::Corruption(
                     "terminal publication identity was reused with different evidence".into(),
@@ -312,13 +299,12 @@ impl Database {
         }
         self.connection.execute(
             "INSERT INTO terminal_proofs
-             (execution_id, version, receipt_id, publication)
-             VALUES (?1, ?2, ?3, ?4)",
+             (execution_id, version, receipt_id)
+             VALUES (?1, ?2, ?3)",
             params![
                 execution_id.0.to_vec(),
                 sqlite_u64(version.get())?,
                 receipt.receipt_id().as_bytes().to_vec(),
-                envelope(EnvelopeKind::TerminalPublication, &publication_bytes)?,
             ],
         )?;
         Ok(())
@@ -348,18 +334,20 @@ impl Database {
         let Some(receipt_id) = state.published_receipt_id() else {
             return Ok(());
         };
-        let (version, row_id, publication): (i64, Vec<u8>, Vec<u8>) = self.connection.query_row(
-            "SELECT version, receipt_id, publication FROM terminal_proofs WHERE execution_id = ?1",
+        let (version, row_id): (i64, Vec<u8>) = self.connection.query_row(
+            "SELECT version, receipt_id FROM terminal_proofs WHERE execution_id = ?1",
             params![execution_id.0.to_vec()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let payload = open_envelope(
-            EnvelopeKind::TerminalPublication,
-            &publication,
+        let row = self
+            .receipt_row_by_id(receipt_id)?
+            .ok_or_else(|| StoreError::Corruption("published receipt row is missing".into()))?;
+        let bytes = open_envelope(
+            EnvelopeKind::Receipt,
+            &row.artifact,
             arena0_protocol::MAX_RECEIPT_BYTES,
         )?;
-        let receipt: ReceiptArtifact = ReceiptArtifact::decode(&payload)
-            .map_err(|error| StoreError::Corruption(format!("terminal publication: {error}")))?;
+        let receipt = ReceiptArtifact::decode(&bytes)?;
         // End confirmations advance local state after publication without
         // changing any portable evidence or the publication's original version.
         if sqlite_i64(version)? > state.version().get()
@@ -397,16 +385,7 @@ impl Database {
                 }
             }
         }
-        let row = self
-            .receipt_row_by_id(receipt_id)?
-            .ok_or_else(|| StoreError::Corruption("published receipt row is missing".into()))?;
-        let bytes = open_envelope(
-            EnvelopeKind::Receipt,
-            &row.artifact,
-            arena0_protocol::MAX_RECEIPT_BYTES,
-        )?;
-        if ReceiptArtifact::decode(&bytes)? != receipt
-            || row.session_id != state.binding().session_id().0.to_vec()
+        if row.session_id != state.binding().session_id().0.to_vec()
             || row.kind != artifact_kind(&receipt)
         {
             return Err(StoreError::Corruption(

@@ -10,7 +10,6 @@ pub(crate) enum EnvelopeKind {
     EventRecord = 4,
     AgreedStep = 5,
     Effects = 6,
-    TerminalPublication = 7,
     Receipt = 8,
     Timer = 10,
     ExecutionSalt = 11,
@@ -89,10 +88,6 @@ pub(crate) fn envelope_checksum(kind: EnvelopeKind, payload: &[u8]) -> [u8; 32] 
     hasher.update(&ENVELOPE_VERSION.to_le_bytes());
     hasher.update(payload);
     *hasher.finalize().as_bytes()
-}
-
-pub(crate) fn checksum(bytes: &[u8]) -> [u8; 32] {
-    *blake3::hash(bytes).as_bytes()
 }
 
 pub(crate) fn decode_borsh<T: BorshDeserialize>(
