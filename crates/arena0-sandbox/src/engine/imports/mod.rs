@@ -124,39 +124,33 @@ impl CallerExt for Caller<'_, HostState> {
                 self.data().call_kind
             )));
         }
-        let dispatch = self.data().dispatch;
-        match &effect {
-            Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. } => {
-                if dispatch != DispatchKind::Agreed {
-                    return Err(wasmtime::Error::msg(format!(
-                        "{}: a lifecycle effect is only available to agreed events",
-                        effect_name(&effect)
-                    )));
-                }
-                if self.data().effect_queue.iter().any(Effect::is_lifecycle) {
-                    return Err(wasmtime::Error::msg(
-                        "at most one lifecycle effect is allowed per dispatch",
-                    ));
-                }
-                if self
-                    .data()
-                    .effect_queue
-                    .iter()
-                    .any(|queued| matches!(queued, Effect::SetTimer { .. }))
-                {
-                    return Err(wasmtime::Error::msg(
-                        "a lifecycle effect cannot be combined with SetTimer",
-                    ));
-                }
+        let queue = &self.data().effect_queue;
+        if effect.is_lifecycle() {
+            if self.data().dispatch != DispatchKind::Agreed {
+                return Err(wasmtime::Error::msg(format!(
+                    "{}: a lifecycle effect is only available to agreed events",
+                    effect_name(&effect)
+                )));
             }
-            Effect::SetTimer { .. } => {
-                if self.data().effect_queue.iter().any(Effect::is_lifecycle) {
-                    return Err(wasmtime::Error::msg(
-                        "SetTimer cannot be combined with a lifecycle effect",
-                    ));
-                }
+            if queue.iter().any(Effect::is_lifecycle) {
+                return Err(wasmtime::Error::msg(
+                    "at most one lifecycle effect is allowed per dispatch",
+                ));
             }
-            Effect::Broadcast { .. } => {}
+            if queue
+                .iter()
+                .any(|queued| matches!(queued, Effect::SetTimer { .. }))
+            {
+                return Err(wasmtime::Error::msg(
+                    "a lifecycle effect cannot be combined with SetTimer",
+                ));
+            }
+        } else if matches!(effect, Effect::SetTimer { .. })
+            && queue.iter().any(Effect::is_lifecycle)
+        {
+            return Err(wasmtime::Error::msg(
+                "SetTimer cannot be combined with a lifecycle effect",
+            ));
         }
         // Enforce every protocol effect limit at emission, including the exact
         // canonical `Vec<Effect>` aggregate, so the dispatch path never has to
