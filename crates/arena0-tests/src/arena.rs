@@ -302,7 +302,7 @@ impl Arena {
             let bootstrap = peer_ids
                 .iter()
                 .copied()
-                .filter(|peer| *peer != host.peer_id)
+                .filter(|peer| *peer != host.peer_id())
                 .collect::<Vec<_>>();
             let exec_id = exec_id_for(i);
             let transport = Arc::clone(&transports[i]);

@@ -136,7 +136,7 @@ impl std::fmt::Debug for ExecutionActor {
             .debug_struct("ExecutionActor")
             .field("exec_id", &self.context.exec_id)
             .field("session", &self.context.activation.session_hash())
-            .field("producer", &self.context.producer)
+            .field("producer", &self.context.identity.peer_id())
             .finish_non_exhaustive()
     }
 }
@@ -280,11 +280,7 @@ impl ExecutionActor {
     pub(super) async fn ensure_execution(
         context: &mut ActorContext,
     ) -> Result<ExecutionState, ExecError> {
-        if context.identity.peer_id() != context.producer {
-            return Err(ExecError::InvalidState(
-                "actor identity and producer identity differ".into(),
-            ));
-        }
+        let producer = context.identity.peer_id();
         let request = context
             .store
             .load_execution_request()
@@ -329,7 +325,7 @@ impl ExecutionActor {
         let Some(local_ticket) = durable_activation
             .tickets()
             .iter()
-            .find(|ticket| ticket.data.signer == context.producer)
+            .find(|ticket| ticket.data.signer == producer)
         else {
             return Err(ExecError::InvalidState(
                 "durable activation has no ticket for the local producer".into(),
@@ -346,9 +342,7 @@ impl ExecutionActor {
             ));
         }
         if let Some(state) = context.store.load_execution().await? {
-            if state.producer() != context.producer
-                || state.binding().activation() != &context.activation
-            {
+            if state.producer() != producer || state.binding().activation() != &context.activation {
                 return Err(ExecError::InvalidState(
                     "durable execution binding differs from actor context".into(),
                 ));
@@ -360,7 +354,7 @@ impl ExecutionActor {
             .store
             .create_execution(
                 context.activation.clone(),
-                context.producer,
+                producer,
                 initialized.shared,
                 initialized.local,
                 now_ms(),

@@ -52,8 +52,6 @@ pub enum HostError {
 #[allow(missing_debug_implementations)]
 pub struct Host {
     identity: Arc<NodeKeys>,
-    /// Persistent peer identity exposed for local ensemble construction.
-    pub peer_id: PeerId,
     transport: Arc<dyn Transport + Sync>,
     store: StoreHandle,
     routes: Arc<StdMutex<HashMap<SessionHash, ExecRoute>>>,
@@ -71,7 +69,6 @@ impl Host {
         transport: Arc<dyn Transport + Sync>,
         store: StoreHandle,
     ) -> Arc<Self> {
-        let peer_id = identity.peer_id();
         let routes = Arc::new(StdMutex::new(HashMap::new()));
         let exec_router: ExecStreamRouter = {
             let routes = Arc::clone(&routes);
@@ -92,7 +89,6 @@ impl Host {
         ));
         Arc::new(Self {
             identity,
-            peer_id,
             transport,
             store,
             routes,
@@ -109,6 +105,12 @@ impl Host {
     /// Requests are advisory: peers receive NotYet and retry until it is live.
     pub fn take_end_wakes(&self) -> Option<mpsc::Receiver<ExecId>> {
         self.end_wakes.lock().unwrap().take()
+    }
+
+    /// Persistent peer identity of this Host's signer.
+    #[must_use]
+    pub fn peer_id(&self) -> PeerId {
+        self.identity.peer_id()
     }
 
     /// Share the durable node identity signer.

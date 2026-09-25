@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use arena0_protocol::{ExecFrame, ParticipantStepSignature, PeerId, ProtocolError};
+use arena0_protocol::{ExecFrame, ParticipantStepSignature, PeerId, PeerIdSource, ProtocolError};
 use arena0_store::Change;
 use arena0_transport::{ExecDelivery, ExecDeliveryRejection, SendHandle, TransportError};
 use tokio::time::Instant;
@@ -222,11 +222,12 @@ impl ExecutionActor {
     /// acknowledgement share a deadline. JoinSet owns cancellation when the
     /// actor exits, and each task owns its stream until settlement.
     pub(super) fn deliver_frames(&mut self) -> Result<(), ExecError> {
+        let producer = self.context.identity.peer_id();
         let ending = self.state.status().is_terminal();
         let frames = if ending {
             self.state.terminal_evidence().into_iter().collect()
         } else {
-            self.state.current_frames(self.context.producer)
+            self.state.current_frames(producer)
         };
         let frames = frames
             .into_iter()
@@ -234,7 +235,7 @@ impl ExecutionActor {
             .collect::<Result<Vec<_>, ExecError>>()?;
         for ticket in self.context.activation.tickets() {
             let peer = ticket.data.signer;
-            if peer == self.context.producer {
+            if peer == producer {
                 continue;
             }
             if ending

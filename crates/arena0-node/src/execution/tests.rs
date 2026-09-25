@@ -424,7 +424,7 @@ async fn verified_final_certificate_waits_for_proposal_then_commits_without_reje
     let (_source_fixture, source, _source_observations) = ended_actor().await;
     let certificate = source
         .state
-        .current_frames(source.context.producer)
+        .current_frames(source.context.identity.peer_id())
         .into_iter()
         .next()
         .unwrap();
@@ -481,7 +481,7 @@ async fn retired_session_router_acknowledges_final_frames() {
     actor.finalize_receipt().await.unwrap();
     let frame = actor
         .state
-        .current_frames(actor.context.producer)
+        .current_frames(actor.context.identity.peer_id())
         .into_iter()
         .next()
         .unwrap();
@@ -790,7 +790,7 @@ async fn certificate_authentication_rejects_bad_evidence_but_local_contradiction
     let (_source_fixture, source, _observations) = ended_actor().await;
     let certificate = source
         .state
-        .current_frames(source.context.producer)
+        .current_frames(source.context.identity.peer_id())
         .into_iter()
         .next()
         .unwrap();

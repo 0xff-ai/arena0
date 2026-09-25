@@ -11,7 +11,7 @@ use arena0_crypto::{ExecutionKey, ExecutionSalt, NodeKeys};
 use arena0_program::{JsonBytes, ProgramHash};
 use arena0_protocol::{
     Activation, Ensemble, ExecId, ExecutionAdmission, LocalStateBytes, NegotiationTarget,
-    PeerIdSource, PreparedActivation, ReceiptArtifact, SessionHash, SharedStateBytes, View,
+    PreparedActivation, ReceiptArtifact, SessionHash, SharedStateBytes, View,
 };
 use arena0_sandbox::LoadedProgram;
 use arena0_store::{
@@ -354,7 +354,6 @@ pub(crate) struct ActorContext {
     pub(crate) program: Arc<LoadedProgram>,
     pub(crate) params: JsonBytes,
     pub(crate) activation: Activation,
-    pub(crate) producer: arena0_protocol::PeerId,
     /// Execution-scoped BLS signer shared by handle with per-dispatch guest
     /// signers.
     pub(crate) execution_key: Arc<ExecutionKey>,
@@ -370,14 +369,12 @@ impl ExecContext {
         store: ExecutionStore,
         transport: Arc<dyn Transport + Sync>,
     ) -> ActorContext {
-        let producer = identity.peer_id();
         ActorContext {
             end_confirmation_window: self.end_confirmation_window,
             exec_id: self.exec_id,
             program: self.program,
             params: self.params,
             activation: self.activation,
-            producer,
             execution_key: Arc::new(self.execution_key),
             identity,
             store,

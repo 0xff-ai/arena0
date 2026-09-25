@@ -38,9 +38,9 @@ use arena0_protocol::{
     ActivationAnnouncement, EventSource, ExecCreationOrigin, ExecId, ExecutionAdmission,
     ExecutionEvent, ExecutionFailureCode, ExecutionStatus, FetchFrame, MAX_CLOCK_SKEW_MS,
     MAX_TICKET_LIFETIME_MS, NegotiationEvent, NegotiationFact, NegotiationGossip, NegotiationId,
-    NegotiationTarget, Offer, OfferData, OfferHash, PREPARE_WINDOW_MS, PeerId, PeerIdSource,
-    PendingId, ReceiptArtifact, SessionHash, StateHash, TerminalKind, Ticket, TicketAction,
-    TicketData, TicketHash, Viewport, system_event::SystemEvent,
+    NegotiationTarget, Offer, OfferData, OfferHash, PREPARE_WINDOW_MS, PeerId, PendingId,
+    ReceiptArtifact, SessionHash, StateHash, TerminalKind, Ticket, TicketAction, TicketData,
+    TicketHash, Viewport, system_event::SystemEvent,
 };
 use arena0_sandbox::{LoadedProgram, Program, WasmtimeEngine};
 use arena0_transport::{NegotiationTopic, ProgramTopicEvent, Transport};
@@ -1177,12 +1177,7 @@ impl HostService {
         } = init;
 
         let identity = runtime.identity_keys();
-        let peer_id = identity.peer_id();
-        anyhow::ensure!(
-            runtime.peer_id == peer_id,
-            "runtime host peer {runtime_peer} does not match the peer derived from the runtime identity keys {peer_id}",
-            runtime_peer = runtime.peer_id,
-        );
+        let peer_id = runtime.peer_id();
         let execs = Arc::new(ExecutionHandles::new(store.clone()));
         let events = Events::new(HostInfo {
             id: name.clone(),

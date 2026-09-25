@@ -1414,7 +1414,7 @@ mod construction_tests {
         let runtime = runtime_ensemble
             .host(&expected)
             .expect("runtime should start with the opened identity");
-        assert_eq!(runtime.peer_id, expected);
+        assert_eq!(runtime.peer_id(), expected);
         let transport = runtime_ensemble
             .transport(&expected)
             .expect("transport should start with the opened identity");
