@@ -166,7 +166,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arena0-api",
- "arena0-crypto",
  "arena0-home",
  "arena0-program",
  "arena0-protocol",
@@ -248,16 +247,13 @@ dependencies = [
  "arena0-test-engine",
  "arena0-transport",
  "arena0-wire",
- "async-trait",
  "blake3",
  "borsh",
- "bytes",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "wat",
 ]
 
@@ -303,7 +299,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
- "tracing-subscriber",
  "valuable",
 ]
 
@@ -404,7 +399,6 @@ dependencies = [
  "arena0-store",
  "arena0-test-engine",
  "arena0-transport",
- "borsh",
  "hex",
  "serde_json",
  "tempfile",

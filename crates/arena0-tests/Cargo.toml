@@ -17,7 +17,6 @@ arena0-sandbox = { path = "../arena0-sandbox" }
 arena0-test-engine = { path = "../arena0-test-engine" }
 arena0-store = { path = "../arena0-store" }
 arena0-protocol = { path = "../arena0-protocol" }
-borsh.workspace = true
 hex.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
