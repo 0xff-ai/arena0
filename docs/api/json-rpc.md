@@ -63,8 +63,8 @@ public metadata before it stores the exact Wasm bytes in the Host's SQLite
 catalog. The local transport does not fetch programs; every selected Host must
 have the same exact Wasm locally. `ProgramSummary.participants` declares
 supported counts. Fixed programs use `{"kind":"exact","count":2}`,
-while variable-size programs use `{"kind":"range","min":2,"max":64}`. The explicit
-ensemble size must fall within it.
+while variable-size programs use `{"kind":"range","min":2,"max":64}`. The
+requested participant count must fall within it.
 
 ## Execution
 
@@ -137,8 +137,7 @@ admission forms:
 
 `Create` chooses the total participant count, including the local Host. The
 daemon creates the negotiation ID and checks that the selected program accepts
-the count. The older `Explicit` form, `{"Explicit":{"peers":[...]}}`, remains
-available for launcher compatibility.
+the count.
 
 `Join` with `target: null` discovers the first usable offer on the program
 topic. A supplied target restricts discovery to that creator and negotiation.
@@ -151,8 +150,8 @@ durable binding.
 The request's `params` value is optional for a join. Without it, the Host
 accepts the creator's authenticated offer parameters. With it, the Host treats
 the value as a local preference, signs only a matching offer, and emits a
-signed counteroffer when the current offer differs. Create and Explicit
-requests validate and store offer parameters before negotiation.
+signed counteroffer when the current offer differs. Create requests validate
+and store offer parameters before negotiation.
 
 ### Agent values
 

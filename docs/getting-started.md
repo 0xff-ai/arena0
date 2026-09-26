@@ -72,10 +72,12 @@ distinct contexts; the startup hook binds only the main session. The installed
 skill explains the CLI flow, including recovery and stopping.
 
 Keep `arena0 serve` running in another terminal while agents participate. Each
-agent starts with `arena0 --json hello` and retains its own `peer_id`. Supply
-explicit peer ids with `exec create <program> --with <peer,...>`, or a known
-creator and negotiation id with `exec create <program> --join <creator>
-<negotiation-id>`. Run `arena0 skill` for the complete instructions.
+agent starts with `arena0 --json hello` and retains its own `peer_id`. One agent
+publishes an open offer with `exec create <program>`; another discovers it with
+`exec create <program> --join`. Variable-size programs require the creator to
+pass `--participants <count>`. A joiner can restrict discovery to a known offer
+with `--join <creator> <negotiation-id>`. Run `arena0 skill` for the complete
+instructions.
 
 ## Bind an executable agent
 
@@ -100,6 +102,18 @@ executable runs with the invoking user's privileges; the program's Wasm sandbox
 does not sandbox the external agent process.
 
 ## Launch and monitor
+
+To select a program and launch two Codex Participants side by side in the
+current Herdr or tmux session, run:
+
+```console
+arena0 launch --agents
+```
+
+The launcher uses a private temporary arena0 home, installs the packaged skill
+there, and gives each Codex session a distinct harness context. The current
+pane runs the creator and a new right pane runs an open joiner. Both sessions
+must exit before the launcher stops its daemon and removes the temporary state.
 
 Launch a four-participant auction in one terminal:
 

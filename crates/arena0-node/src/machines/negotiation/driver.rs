@@ -1825,11 +1825,7 @@ mod tests {
             .create_execution_request(
                 program_hash,
                 Some(arena0_program::JsonBytes::try_new(params.clone()).expect("params")),
-                ExecutionAdmission::explicit(
-                    negotiation_id,
-                    vec![crypto.peer_id(), remote.peer_id()],
-                )
-                .expect("admission"),
+                ExecutionAdmission::create(negotiation_id, 2).expect("admission"),
                 1,
             )
             .await
@@ -2162,11 +2158,7 @@ mod tests {
             .create_execution_request(
                 program_hash,
                 Some(arena0_program::JsonBytes::try_new(params.clone()).expect("params")),
-                ExecutionAdmission::explicit(
-                    negotiation_id,
-                    vec![creator_crypto.peer_id(), participant_crypto.peer_id()],
-                )
-                .expect("creator admission"),
+                ExecutionAdmission::create(negotiation_id, 2).expect("creator admission"),
                 1,
             )
             .await

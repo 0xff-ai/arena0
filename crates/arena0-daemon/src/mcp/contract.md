@@ -89,13 +89,14 @@ wait elapsed without a callout or terminal event; it does not withdraw or
 finish the execution. Call the tool again with the retained execution reference
 to renew the wait, including while an open Join is still discovering an offer.
 
-MCP admission uses public Participant peer IDs:
+MCP admission either publishes an offer or discovers one:
 
 ```json
-{"mode":"explicit","peers":["<peer-id>"]}
+{"mode":"create","participant_count":2}
+{"mode":"join","target":null}
 {"mode":"join","target":{"creator":"<creator-peer-id>","negotiation_id":"<negotiation-id>"}}
 ```
 
 Mode-specific unknown or conflicting fields are rejected before dispatch.
-Peer IDs identify protocol Participants; they do not grant access to another
-Host's tools, catalog, executions, or receipts.
+The optional join target restricts discovery; its peer ID does not grant access
+to another Host's tools, catalog, executions, or receipts.

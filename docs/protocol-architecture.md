@@ -198,9 +198,7 @@ enum EnsembleSpec {
 `participant_count` Participants, including that Host. The daemon creates the
 `NegotiationId`, enforces the 2-to-64 participant bound, and checks that the
 program supports the requested count. Fixed-size programs declare one exact
-count; variable-size programs declare an inclusive range. The older
-`Explicit { peers }` form remains accepted for launcher compatibility and
-selects the listed peers plus the creator.
+count; variable-size programs declare an inclusive range.
 
 `Join` carries an optional `target`. With `target: Some`, it subscribes to the
 program topic and considers only the offer authored by that creator with that
@@ -220,8 +218,8 @@ For an open Join, `ExecCreated.negotiation_id` is `null` until the authenticated
 offer is selected; status carries the same optional value, and the creation
 event omits it while it is unknown.
 
-The socket request has an optional local `params` value for both forms. An
-explicit request validates and stores its parameters before it publishes the
+The socket request has an optional local `params` value for both forms. A
+creator request validates and stores its parameters before it publishes the
 offer. A join request may omit `params`; it then accepts the creator's
 authenticated offer parameters. If a join request supplies `params`, the Host
 uses them as a preference: it signs only an offer with matching parameters and
@@ -770,18 +768,28 @@ machine-readable response. `arena0 serve` replaces the CLI process
 with the installed `arena0d` executable and provides a persistent service for
 CLI and API clients. Bare `arena0` on a human terminal opens a local workspace;
 `arena0 run` provides the explicit scriptable grammar. These paths may start an
-installed `arena0d` child for the exact selected Host set and stop only that
+installed `arena0d` child for the selected local Hosts and stop only that
 owned child when the command ends. The child still owns every Host, store,
 transport, sandbox, and runtime resource. The CLI owns only child-process
 supervision and typed socket clients. It reuses the shared endpoint and opens
 missing selected Hosts through the daemon's existing provisioning operation.
 It never stops a borrowed service.
 
+`arena0 run` creates an offer for the selected Host count and targets that offer
+from its other selected Hosts. Admission does not reserve places for named
+peers: another Host may join the shared program topic first. The runner checks
+the verified receipt ensemble against its selected Hosts and reports a
+mismatch rather than presenting that run as their shared result.
+
 `arena0 launch <program>` uses the same coordinated admission and receipt
 verification without opening the terminal interface. Omitting the program in
 a terminal opens the existing launcher; ambiguous references offer a choice
-there. Selections carry exact program hashes into coordinated admission. It supervises explicitly configured
-local drivers; unbound Hosts wait for independent clients. `arena0 monitor`
+there. Selections carry exact program hashes into coordinated admission. It
+supervises configured local drivers; unbound Hosts wait for independent
+clients. `arena0 launch --agents` opens a two-Participant program and harness
+selector, creates a private temporary home, and runs distinct Codex contexts in
+the current pane and a new right pane. The creator and open joiner use the same
+program-topic discovery as other agent clients. `arena0 monitor`
 attaches through the shared daemon socket and observes the complete daemon
 Ensemble. It owns subscriptions and presentation only, and detaching never
 stops the daemon or its executions. Executions are keyed by Host and local

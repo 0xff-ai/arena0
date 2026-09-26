@@ -53,6 +53,41 @@ fn invoke(home: &Path, args: &[&str], environment: &[(&str, &str)]) -> Output {
         .unwrap_or_else(|error| panic!("run arena0 {args:?}: {error}"))
 }
 
+fn invoke_with_timeout(
+    home: &Path,
+    args: &[&str],
+    environment: &[(&str, &str)],
+    timeout: Duration,
+) -> Output {
+    let mut command = base_command(env!("CARGO_BIN_EXE_arena0"), home);
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let mut child = command.spawn().expect("spawn arena0 CLI");
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().expect("poll arena0 CLI").is_some() {
+            return child.wait_with_output().expect("collect arena0 CLI output");
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .expect("collect timed out CLI output");
+            panic!(
+                "arena0 {args:?} did not finish within {timeout:?}; stdout: {}; stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn json_output(output: Output, invocation: &str) -> serde_json::Value {
     assert!(
         output.status.success(),
@@ -430,5 +465,60 @@ fn codex_context_fallback_and_explicit_host_override_are_observable() {
     assert_eq!(fallback_identity["peer_id"], fallback_peer.to_string());
     assert_eq!(host_count(home.path()), 2);
 
+    daemon.stop();
+}
+
+#[test]
+fn cli_create_and_open_join_activate_two_context_hosts() {
+    let home = tempfile::tempdir().expect("temporary arena0 home");
+    let mut daemon = DaemonGuard::start(home.path());
+    let creator_context = [("ARENA0_CONTEXT", "harness:creator")];
+    let joiner_context = [("ARENA0_CONTEXT", "harness:joiner")];
+    hello(home.path(), Some("harness:creator"), USER_AGENT);
+    hello(home.path(), Some("harness:joiner"), USER_AGENT);
+
+    let creator = json_output(
+        invoke(
+            home.path(),
+            &[
+                "--json",
+                "exec",
+                "create",
+                "rock-paper-scissors",
+                "--participants",
+                "2",
+            ],
+            &creator_context,
+        ),
+        "arena0 exec create --participants 2",
+    );
+    let joiner = json_output(
+        invoke(
+            home.path(),
+            &["--json", "exec", "create", "rock-paper-scissors", "--join"],
+            &joiner_context,
+        ),
+        "arena0 exec create --join",
+    );
+    let creator_exec = creator["exec_id"].as_str().expect("creator exec id");
+    let joiner_exec = joiner["exec_id"].as_str().expect("joiner exec id");
+    assert!(creator["negotiation_id"].is_string());
+
+    for (context, exec_id) in [
+        (&creator_context[..], creator_exec),
+        (&joiner_context[..], joiner_exec),
+    ] {
+        let active = json_output(
+            invoke_with_timeout(
+                home.path(),
+                &["--json", "exec", "await", exec_id],
+                context,
+                Duration::from_secs(30),
+            ),
+            "arena0 exec await",
+        );
+        assert_eq!(active["exec_id"], exec_id);
+        assert_eq!(active["exec_state"], "Active");
+    }
     daemon.stop();
 }

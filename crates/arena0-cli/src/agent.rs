@@ -303,6 +303,14 @@ impl ExecutableAgent {
         let cleanup = self.terminate().await.err();
         let stderr = self.stderr_tail();
         let mut message = error.to_string();
+        // A child can close stdin between the stdout probe and the write.
+        // Keep its final status in that diagnostic too, after cleanup has
+        // reaped it, rather than reporting only the failed pipe operation.
+        match self.child.try_wait() {
+            Ok(Some(status)) => message.push_str(&format!("; final process status {status}")),
+            Ok(None) => {}
+            Err(error) => message.push_str(&format!("; read final process status: {error}")),
+        }
         if let Some(cleanup) = cleanup {
             message.push_str(&format!("; cleanup failed: {cleanup}"));
         }
@@ -485,7 +493,7 @@ mod tests {
             )
             .await
             .expect_err("false cannot answer");
-        assert!(error.to_string().contains("status"));
+        assert!(error.to_string().contains("status"), "{error:#}");
         assert!(agent.is_closed());
     }
 

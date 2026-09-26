@@ -172,10 +172,7 @@ impl Fixture {
                 program.hash(),
                 Some(params.clone()),
                 peer.map_or_else(
-                    || {
-                        ExecutionAdmission::explicit(NEGOTIATION_ID, vec![local_peer, remote_peer])
-                            .expect("admission")
-                    },
+                    || ExecutionAdmission::create(NEGOTIATION_ID, 2).expect("admission"),
                     |peer| ExecutionAdmission::join(peer.local_keys.peer_id(), NEGOTIATION_ID),
                 ),
                 2,
@@ -1333,6 +1330,7 @@ async fn spawned_execution_keeps_host_router_alive_after_host_arc_drop() {
         .unwrap()
         .unwrap();
     assert_eq!(committed.agreed_step(), 1);
+    drop(send);
     spawned.shutdown().await;
 }
 

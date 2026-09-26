@@ -282,7 +282,6 @@ enum NegotiationPlan {
     Create {
         negotiation_id: arena0_protocol::NegotiationId,
         target_size: u16,
-        peers: Vec<PeerId>,
     },
     Join {
         target: Option<NegotiationTarget>,
@@ -292,21 +291,12 @@ enum NegotiationPlan {
 impl NegotiationPlan {
     fn from_admission(admission: &ExecutionAdmission) -> Self {
         match admission {
-            ExecutionAdmission::Explicit {
-                negotiation_id,
-                peers,
-            } => Self::Create {
-                negotiation_id: *negotiation_id,
-                target_size: u16::try_from(peers.peers().len()).unwrap_or(u16::MAX),
-                peers: peers.peers().to_vec(),
-            },
             ExecutionAdmission::Create {
                 negotiation_id,
                 participant_count,
             } => Self::Create {
                 negotiation_id: *negotiation_id,
                 target_size: *participant_count,
-                peers: Vec::new(),
             },
             ExecutionAdmission::Join { target } => Self::Join { target: *target },
         }
@@ -2359,42 +2349,8 @@ impl HostService {
                     NegotiationPlan::Create {
                         negotiation_id,
                         target_size: participant_count,
-                        peers: Vec::new(),
                     },
                     ExecutionAdmission::create(negotiation_id, participant_count).map_err(
-                        |error| ApiError::new(ApiErrorCode::BadRequest, error.to_string()),
-                    )?,
-                )
-            }
-            EnsembleSpec::Explicit { peers } => {
-                if peers.contains(&self.peer_id)
-                    || peers.iter().collect::<std::collections::HashSet<_>>().len() != peers.len()
-                {
-                    return Err(ApiError::new(
-                        ApiErrorCode::BadRequest,
-                        "explicit peers must be unique and exclude this Host",
-                    ));
-                }
-                let target_size = u16::try_from(peers.len() + 1).map_err(|_| {
-                    ApiError::new(ApiErrorCode::BadRequest, "too many explicit peers")
-                })?;
-                if !(2..=arena0_protocol::MAX_PARTICIPANTS as u16).contains(&target_size) {
-                    return Err(ApiError::new(
-                        ApiErrorCode::BadRequest,
-                        "explicit negotiation needs 2 to 64 participants",
-                    ));
-                }
-                let negotiation_id = arena0_protocol::NegotiationId(rand::random());
-                let mut admission_peers = peers.clone();
-                admission_peers.push(self.peer_id);
-                (
-                    self.resolve_program(&program).await?,
-                    NegotiationPlan::Create {
-                        negotiation_id,
-                        target_size,
-                        peers,
-                    },
-                    ExecutionAdmission::explicit(negotiation_id, admission_peers).map_err(
                         |error| ApiError::new(ApiErrorCode::BadRequest, error.to_string()),
                     )?,
                 )
@@ -2962,9 +2918,8 @@ impl HostService {
             guard = self.runtime.negotiation_guard() => guard,
         };
         let deadline = match &plan {
-            NegotiationPlan::Create { peers, .. } if peers.is_empty() => None,
-            NegotiationPlan::Join { target: None } => None,
-            _ => Some(Instant::now() + NEGOTIATION_TIMEOUT),
+            NegotiationPlan::Create { .. } | NegotiationPlan::Join { target: None } => None,
+            NegotiationPlan::Join { target: Some(_) } => Some(Instant::now() + NEGOTIATION_TIMEOUT),
         };
 
         let program = self
@@ -2978,7 +2933,6 @@ impl HostService {
             NegotiationPlan::Create {
                 negotiation_id,
                 target_size,
-                peers,
             } => {
                 let params = preferred_params.clone().ok_or_else(|| {
                     ApiError::new(ApiErrorCode::BadRequest, "create requires params")
@@ -3028,9 +2982,9 @@ impl HostService {
                 let (offer, creator_ticket) = creator_book
                     .create_creator_offer(offer_data, issued_at)
                     .map_err(|error| ApiError::new(ApiErrorCode::Negotiation, error.to_string()))?;
-                let bootstrap = negotiation_bootstrap(self.peer_id, None, peers.iter().copied());
+                let bootstrap = negotiation_bootstrap(self.peer_id, None, std::iter::empty());
                 let topic = self.subscribe_negotiation(program_id, bootstrap).await?;
-                (offer, Some(creator_ticket), topic, peers)
+                (offer, Some(creator_ticket), topic, Vec::new())
             }
             NegotiationPlan::Join { target } => {
                 let bootstrap = negotiation_bootstrap(
@@ -4420,7 +4374,7 @@ mod tests {
 
     #[tokio::test]
     async fn withdrawal_intercepts_a_caller_owned_id_before_creation() {
-        let (_dir, _store, daemon, peer) = test_daemon();
+        let (_dir, _store, daemon, _peer) = test_daemon();
         let exec_id = ExecId([0x3a; 32]);
         let cancelling_daemon = Arc::clone(&daemon);
         let cancellation = tokio::spawn(async move {
@@ -4453,8 +4407,8 @@ mod tests {
                 exec_id,
                 program: "missing".to_owned(),
                 params: None,
-                ensemble: EnsembleSpec::Explicit {
-                    peers: vec![PeerId([peer.0[0].wrapping_add(1); 32])],
+                ensemble: EnsembleSpec::Create {
+                    participant_count: 2,
                 },
             })
             .await;
@@ -4624,13 +4578,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn recovery_visits_unfinished_requests_after_terminal_history() {
-        let (_dir, store, daemon, peer) = test_daemon();
+        let (_dir, store, daemon, _peer) = test_daemon();
         let (program_hash, _) = store
             .handle()
             .register_program(vec![1, 2, 3], 1)
             .await
             .expect("program");
-        let other = PeerId([peer.0[0].wrapping_add(1); 32]);
         let tail = 17_u64;
         let tail_id = ExecId({
             let mut bytes = [0; 32];
@@ -4648,13 +4601,13 @@ mod tests {
                 .create_execution_request(
                     program_hash,
                     Some(JsonBytes::try_new(b"null".to_vec()).expect("params")),
-                    ExecutionAdmission::explicit(
+                    ExecutionAdmission::create(
                         NegotiationId({
                             let mut bytes = [0; 32];
                             bytes[..8].copy_from_slice(&index.to_le_bytes());
                             bytes
                         }),
-                        vec![peer, other],
+                        2,
                     )
                     .expect("admission"),
                     index,
@@ -4692,7 +4645,7 @@ mod tests {
         activation: Activation,
     }
 
-    /// Claim `execution_id` and durably record the creator's explicit
+    /// Claim `execution_id` and durably record the creator's
     /// request and `prepared`, as negotiation does before signing.
     async fn record_prepared(
         daemon: &HostService,
@@ -4702,8 +4655,7 @@ mod tests {
         let offer = prepared.offer().data();
         let (program_hash, params) = (offer.program_hash, offer.params.clone());
         let admission =
-            ExecutionAdmission::explicit(offer.negotiation_id, prepared.signers().collect())
-                .expect("admission");
+            ExecutionAdmission::create(offer.negotiation_id, offer.target_size).expect("admission");
         let mut writer = daemon.runtime.claim_execution(execution_id).unwrap();
         writer
             .create_execution_request(program_hash, Some(params), admission, 1)
@@ -5197,7 +5149,7 @@ mod tests {
             .create_execution_request(
                 program_hash,
                 Some(JsonBytes::try_new(b"null".to_vec()).expect("params")),
-                ExecutionAdmission::explicit(negotiation_id, vec![peer, other]).expect("admission"),
+                ExecutionAdmission::create(negotiation_id, 2).expect("admission"),
                 4,
             )
             .await

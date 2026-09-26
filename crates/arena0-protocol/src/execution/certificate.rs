@@ -787,6 +787,9 @@ mod tests {
                 "invalid prefix at {end}"
             );
         }
+        let mut trailing = original.clone();
+        trailing.push(0);
+        assert!(ReceiptArtifact::decode(&trailing).is_err());
         let mut unknown = original;
         unknown[0] = 0xff;
         assert!(ReceiptArtifact::decode(&unknown).is_err());

@@ -20,6 +20,12 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  artifacts:
+    name: verified release artifacts
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: check
+    uses: ./.github/workflows/build-artifacts.yml
+
   # One job, not three. Wasmtime dominates compile time, so the win is
   # building the dependency graph once and reusing the warm target dir across
   # fmt -> clippy -> build -> test. Splitting into parallel jobs would recompile
@@ -27,11 +33,7 @@ jobs:
   # Steps are ordered fast-fail: formatting and clippy run before the test phase.
   check:
     name: fmt + clippy + test
-    # Main pushes and PRs from repository-trusted authors use the persistent runner.
-    runs-on: >-
-      ${{ (github.event_name == 'push' ||
-          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association))
-          && 'arena0-ficus' || 'ubuntu-26.04' }}
+    runs-on: arena0-ficus
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -88,6 +90,13 @@ jobs:
           HEAD_SHA: ${{ steps.scope.outputs.head }}
         run: git diff --check "$BASE_SHA" "$HEAD_SHA"
 
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Test release safety contracts
+        run: node --test npm/release.test.mjs scripts/resolve-release-run.test.mjs
+
       # rust-toolchain.toml is the source of truth: it pins the channel, clippy,
       # rustfmt, and the wasm32 target. `rustup show` installs exactly that set.
       - name: Install toolchain
@@ -113,7 +122,9 @@ jobs:
         run: echo "identity=$(rustc -vV | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
 
       - name: Restore Rust cache
-        if: ${{ steps.scope.outputs.scope != 'docs' }}
+        # Ficus keeps compiler outputs in its machine-local Kache store. Only
+        # ephemeral GitHub-hosted runners need the archive-backed Cargo cache.
+        if: ${{ steps.scope.outputs.scope != 'docs' && runner.environment == 'github-hosted' }}
         id: rust-cache
         continue-on-error: true
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -191,7 +202,7 @@ jobs:
         run: cargo nextest run --locked --manifest-path programs/Cargo.toml --profile ci
 
       - name: Save Rust cache
-        if: ${{ !cancelled() && steps.scope.outputs.scope != 'docs' && steps.rust-cache.outputs.cache-primary-key != '' }}
+        if: ${{ !cancelled() && runner.environment == 'github-hosted' && steps.scope.outputs.scope != 'docs' && steps.rust-cache.outputs.cache-primary-key != '' }}
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:

@@ -229,6 +229,7 @@ mod tests {
         );
         assert!(second_catalog.list().await.unwrap().is_empty());
         assert!(second_catalog.detail(hash).await.unwrap().is_none());
+        assert!(second_catalog.load_program(hash).await.is_err());
         assert!(matches!(
             second_catalog.resolve("rock-paper-scissors").await.unwrap(),
             Err(ProgramRefError::NotFound { .. })

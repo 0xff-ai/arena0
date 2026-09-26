@@ -44,8 +44,8 @@ async fn exec_new_returns_immediately_and_await_blocks() {
             exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
-            ensemble: EnsembleSpec::Explicit {
-                peers: vec![d.peer_b],
+            ensemble: EnsembleSpec::Create {
+                participant_count: 2,
             },
         },
     )
@@ -147,8 +147,8 @@ async fn competing_callout_submissions_return_typed_conflict_and_execution_conti
             exec_id: ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
-            ensemble: EnsembleSpec::Explicit {
-                peers: vec![d.peer_b],
+            ensemble: EnsembleSpec::Create {
+                participant_count: 2,
             },
         },
     )
@@ -240,8 +240,8 @@ async fn rejected_input_is_typed_and_emits_no_answered_event() {
             exec_id: ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
-            ensemble: EnsembleSpec::Explicit {
-                peers: vec![d.peer_b],
+            ensemble: EnsembleSpec::Create {
+                participant_count: 2,
             },
         },
     )
@@ -358,8 +358,8 @@ async fn stale_callout_after_terminal_is_typed_conflict_and_missing_exec_is_not_
             exec_id: ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
-            ensemble: EnsembleSpec::Explicit {
-                peers: vec![d.peer_b],
+            ensemble: EnsembleSpec::Create {
+                participant_count: 2,
             },
         },
     )
@@ -535,8 +535,8 @@ async fn negotiating_ticket_can_be_withdrawn() {
                 exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
-                ensemble: EnsembleSpec::Explicit {
-                    peers: vec![d.peer_b],
+                ensemble: EnsembleSpec::Create {
+                    participant_count: 2,
                 },
             },
         )
@@ -576,8 +576,8 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
             exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
-            ensemble: EnsembleSpec::Explicit {
-                peers: vec![d.peer_b],
+            ensemble: EnsembleSpec::Create {
+                participant_count: 2,
             },
         },
     )
@@ -734,8 +734,8 @@ async fn events_subscribe_streams_negotiation_step_terminal() {
             exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
-            ensemble: EnsembleSpec::Explicit {
-                peers: vec![d.peer_b],
+            ensemble: EnsembleSpec::Create {
+                participant_count: 2,
             },
         },
     )
@@ -886,8 +886,8 @@ async fn receipt_id_import_idempotence_and_list() {
             exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
-            ensemble: EnsembleSpec::Explicit {
-                peers: vec![d.peer_b],
+            ensemble: EnsembleSpec::Create {
+                participant_count: 2,
             },
         },
     )
@@ -1057,8 +1057,8 @@ async fn one_endpoint_routes_multiple_hosts_and_rejects_invalid_host_calls() {
                 exec_id: ExecId([line!() as u8; 32]),
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
-                ensemble: EnsembleSpec::Explicit {
-                    peers: vec![d.peer_b],
+                ensemble: EnsembleSpec::Create {
+                    participant_count: 2,
                 },
             },
         )

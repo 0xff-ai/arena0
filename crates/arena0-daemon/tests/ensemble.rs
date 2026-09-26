@@ -159,18 +159,9 @@ async fn shared_unix_api_classifies_program_input_errors() {
 }
 
 #[tokio::test]
-async fn variable_size_program_accepts_supported_explicit_ensemble() {
+async fn variable_size_program_accepts_supported_creator_count() {
     let (home, daemon, serving) = start(&["host-01", "host-02", "host-03"]).await;
     let socket = home.path().join("arena0.sock");
-    let mut peers = Vec::new();
-    for name in ["host-01", "host-02", "host-03"] {
-        let response = call(&socket, &host(name, HostRequest::IdShow)).await;
-        let id = match response {
-            Ok(ResponseOk::Id(id)) => id,
-            response => panic!("unexpected identity response: {response:?}"),
-        };
-        peers.push(id.peer_id);
-    }
     let response = call(&socket, &host("host-01", HostRequest::ProgramList)).await;
     let programs = match response {
         Ok(ResponseOk::ProgramList(programs)) => programs,
@@ -194,8 +185,8 @@ async fn variable_size_program_accepts_supported_explicit_ensemble() {
                 exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                 program: "rock-paper-scissors".into(),
                 params: None,
-                ensemble: EnsembleSpec::Explicit {
-                    peers: peers[1..].to_vec(),
+                ensemble: EnsembleSpec::Create {
+                    participant_count: 3,
                 },
             },
         ),
@@ -212,8 +203,8 @@ async fn variable_size_program_accepts_supported_explicit_ensemble() {
                 exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                 program: "cumulative-sum".into(),
                 params: Some(serde_json::json!({ "target_size": 3 })),
-                ensemble: EnsembleSpec::Explicit {
-                    peers: peers[1..].to_vec(),
+                ensemble: EnsembleSpec::Create {
+                    participant_count: 3,
                 },
             },
         ),
