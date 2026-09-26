@@ -482,8 +482,10 @@ signed bytes together with the signature. The supported schemes are
 deterministic, so a crash rerun produces the same signature.
 
 An answer must name the exact open `CalloutId`. A mismatch returns
-`CalloutNotPending`. While a proposal is staged, an answer returns
-`AgreementPending` and the callout stays open. The Host
+`CalloutNotPending`. While a proposal is staged, the execution actor reports
+`AgreementPending` internally and the callout stays open. The public
+`exec.submit` operation waits for agreement before responding, as described
+below. The Host
 checks the answer against the callout's output schema before dispatch. If the
 guest cannot decode it, rejects it, traps, or hits an input-handler resource
 limit, the actor restores both memories, persists nothing, keeps the same open
@@ -612,8 +614,12 @@ explicit phase of each participant's execution state, much like a TCP close
 handshake. The phase is `Open` while the session runs. The transition that
 makes the execution terminal moves it to `Ending`, which holds the peers that
 have not yet confirmed the conclusion. It becomes `Ended` once that set is
-empty or the end-confirmation window (ten minutes from actor start or wake by
-default) elapses, and `Ended` keeps any peers that never confirmed. The phase is local: it never enters a commitment or receipt.
+empty or the end-confirmation window (ten minutes after the last persisted
+terminal activity by default) elapses, and `Ended` keeps any peers that never
+confirmed. Entering `Ending` starts the window; each newly confirmed peer
+restarts it. Ticks, retries, and duplicate evidence do not. Recovery uses the
+last durable activity time rather than starting a new window. The phase is
+local: it never enters a commitment or receipt.
 
 While `Ending`, the actor sends its terminal evidence, the final step
 certificate or the stop occurrence it adopted, to each unconfirmed peer. One

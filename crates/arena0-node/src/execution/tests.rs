@@ -267,7 +267,7 @@ impl Fixture {
             messages,
             send_lanes: HashMap::new(),
             send_tasks: tokio::task::JoinSet::new(),
-            end_deadline: tokio::time::Instant::now() + Duration::from_secs(600),
+            end_timer: None,
             session_started_emitted: false,
             terminal_emitted: false,
             announced_callout: None,
@@ -335,10 +335,23 @@ async fn ended_actor() -> (
     ExecutionActor,
     mpsc::Receiver<crate::SessionMessage>,
 ) {
+    ended_actor_after_idle(Duration::ZERO).await
+}
+
+async fn ended_actor_after_idle(
+    idle: Duration,
+) -> (
+    Fixture,
+    ExecutionActor,
+    mpsc::Receiver<crate::SessionMessage>,
+) {
     let fixture = Fixture::with_mode(true, GuestMode::EndOnMessage).await;
     let (messages, mut observations) = mpsc::channel(16);
     let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
     fixture.commit_session_started(&mut actor).await;
+    if !idle.is_zero() {
+        tokio::time::advance(idle).await;
+    }
     let frame = terminal_message_frame(
         &actor.state,
         fixture.remote_keys.peer_id(),
@@ -373,6 +386,73 @@ async fn ended_actor() -> (
     ));
     while observations.try_recv().is_ok() {}
     (fixture, actor, observations)
+}
+
+#[tokio::test(start_paused = true)]
+async fn terminal_after_a_long_execution_still_delivers_evidence() {
+    let (fixture, mut actor, _observations) =
+        ended_actor_after_idle(Duration::from_secs(601)).await;
+    actor
+        .progress()
+        .await
+        .expect("publish and deliver terminal");
+    assert!(matches!(
+        actor.state.end_phase(),
+        arena0_protocol::EndPhase::Ending { .. }
+    ));
+
+    let recv = fixture
+        .remote_transport
+        .accept_exec()
+        .await
+        .expect("terminal stream")
+        .into_parts()
+        .1;
+    let delivery = recv.recv_exec().await.expect("terminal evidence");
+    assert_eq!(delivery.frame(), &actor.state.terminal_evidence().unwrap());
+    delivery.acknowledge().expect("remote acknowledgement");
+}
+
+#[tokio::test(start_paused = true)]
+async fn persisted_terminal_activity_restarts_the_confirmation_window() {
+    let (_fixture, mut actor, _observations) = ended_actor().await;
+    let first_deadline = actor.end_timer.expect("terminal timer").deadline;
+    tokio::time::advance(Duration::from_secs(599)).await;
+    actor.finalize_receipt().await.expect("publish receipt");
+    assert!(actor.end_timer.expect("refreshed timer").deadline > first_deadline);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    actor
+        .progress_terminal_boundary()
+        .await
+        .expect("continue ending");
+    assert!(matches!(
+        actor.state.end_phase(),
+        arena0_protocol::EndPhase::Ending { .. }
+    ));
+}
+
+#[tokio::test]
+async fn recovered_ending_uses_the_last_durable_activity_time() {
+    let (fixture, mut actor, _observations) = ended_actor().await;
+    actor.finalize_receipt().await.expect("publish receipt");
+    drop(actor);
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let (messages, _observations) = mpsc::channel(16);
+    let mut recovered = fixture.actor_with_messages(messages).await;
+    recovered.context.end_confirmation_window = Duration::from_millis(50);
+    recovered
+        .resync_on_error(Ok(()))
+        .await
+        .expect("restore timer");
+    recovered
+        .progress_terminal_boundary()
+        .await
+        .expect("expire idle end");
+    assert!(matches!(
+        recovered.state.end_phase(),
+        arena0_protocol::EndPhase::Ended { unconfirmed } if !unconfirmed.is_empty()
+    ));
 }
 
 #[tokio::test]

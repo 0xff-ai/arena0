@@ -132,6 +132,21 @@ impl Database {
         self.load_execution_in_transaction(execution_id)
     }
 
+    pub(crate) fn execution_updated_at_ms(
+        &self,
+        execution_id: ExecId,
+    ) -> Result<Option<u64>, StoreError> {
+        let updated: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT updated_at_ms FROM executions WHERE execution_id = ?1",
+                params![execution_id.0.to_vec()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        updated.map(sqlite_i64).transpose()
+    }
+
     pub(crate) fn list_executions(
         &mut self,
         limit: usize,

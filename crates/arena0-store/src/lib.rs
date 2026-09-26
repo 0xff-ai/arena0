@@ -1292,6 +1292,16 @@ impl ExecutionStore {
         self.handle.load_execution(self.execution_id).await
     }
 
+    /// Timestamp of the last durable execution transition. The end handshake
+    /// uses it to preserve its inactivity window across actor recovery.
+    pub async fn execution_updated_at_ms(&self) -> Result<u64, StoreError> {
+        let execution_id = self.execution_id;
+        self.handle
+            .run(move |db| db.execution_updated_at_ms(execution_id))
+            .await?
+            .ok_or(StoreError::ExecutionNotFound(execution_id))
+    }
+
     /// Load one receipt by the content identity stored on this execution's
     /// published terminal status. The caller supplies the identity so it can
     /// check that the aggregate and immutable artifact remain bound together.

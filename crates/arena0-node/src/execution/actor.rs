@@ -6,9 +6,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arena0_protocol::{
-    Committed, Ensemble, ExecLifecycle, ExecutionState, PeerIdSource, ReceiptWork, TicketAction,
+    Committed, EndPhase, Ensemble, ExecLifecycle, ExecutionState, PeerIdSource, ReceiptWork,
+    TicketAction,
 };
 use arena0_sandbox::ProgramInstance;
 use arena0_store::{Change, TransitionRecord};
@@ -21,7 +23,10 @@ use crate::Host;
 use crate::context::{ActorContext, ExecCommand, ExecError, InboundStreamPayload, SpawnedExec};
 
 use super::guest::SubmitInputError;
-use super::{COMMAND_CAPACITY, ExecutionActor, PROGRESS_INTERVAL, STREAM_CAPACITY, now_ms};
+use super::{
+    COMMAND_CAPACITY, EndTimer, EndTimerPhase, ExecutionActor, PROGRESS_INTERVAL, STREAM_CAPACITY,
+    now_ms,
+};
 
 /// Spawn one actor and one concurrent reader supervisor.
 #[must_use]
@@ -64,7 +69,6 @@ pub(crate) fn spawn_execution(context: ActorContext, host: Arc<Host>) -> Spawned
                 }
             }
         };
-        let end_deadline = tokio::time::Instant::now() + context.end_confirmation_window;
         let actor = ExecutionActor {
             context,
             state,
@@ -72,7 +76,7 @@ pub(crate) fn spawn_execution(context: ActorContext, host: Arc<Host>) -> Spawned
             messages: message_tx,
             send_lanes: HashMap::new(),
             send_tasks: JoinSet::new(),
-            end_deadline,
+            end_timer: None,
             session_started_emitted: false,
             terminal_emitted: false,
             announced_callout: None,
@@ -147,6 +151,10 @@ impl ExecutionActor {
         mut commands: mpsc::Receiver<ExecCommand>,
         startup_error: Option<ExecError>,
     ) {
+        let timer = self.sync_end_timer().await;
+        if !self.continue_after(timer).await {
+            return;
+        }
         let recovered = match startup_error {
             Some(error) => Err(error),
             None => self.recover().await,
@@ -425,10 +433,10 @@ impl ExecutionActor {
     pub(super) async fn progress_terminal_boundary(&mut self) -> Result<(), ExecError> {
         self.finalize_receipt().await?;
         self.emit_published_terminal().await?;
-        if matches!(
-            self.state.end_phase(),
-            arena0_protocol::EndPhase::Ending { .. }
-        ) && tokio::time::Instant::now() >= self.end_deadline
+        if matches!(self.state.end_phase(), EndPhase::Ending { .. })
+            && self
+                .end_timer
+                .is_some_and(|timer| tokio::time::Instant::now() >= timer.deadline)
         {
             let mut next = self.state.clone();
             next.expire_end()?;
@@ -442,7 +450,65 @@ impl ExecutionActor {
 
     pub(super) fn end_run_finished(&self) -> bool {
         matches!(self.state.status().receipt_work(), ReceiptWork::Published)
-            && matches!(self.state.end_phase(), arena0_protocol::EndPhase::Ended { unconfirmed } if unconfirmed.is_empty() || tokio::time::Instant::now() >= self.end_deadline)
+            && matches!(self.state.end_phase(), EndPhase::Ended { unconfirmed } if unconfirmed.is_empty() || self.end_timer.is_some_and(|timer| tokio::time::Instant::now() >= timer.deadline))
+    }
+
+    /// Recompute after a durable transition or recovery. Ordinary progress
+    /// ticks and repeated sends cannot prolong a silent peer's window.
+    async fn sync_end_timer(&mut self) -> Result<(), ExecError> {
+        let version = self.state.version();
+        let window = self.context.end_confirmation_window;
+        match self.state.end_phase() {
+            EndPhase::Open => {
+                self.end_timer = None;
+            }
+            EndPhase::Ended { unconfirmed } if unconfirmed.is_empty() => {
+                self.end_timer = None;
+            }
+            EndPhase::Ending { .. } => {
+                if self.end_timer.is_some_and(|timer| {
+                    timer.version == version && timer.phase == EndTimerPhase::Ending
+                }) {
+                    return Ok(());
+                }
+                let deadline = if self
+                    .end_timer
+                    .is_some_and(|timer| timer.phase == EndTimerPhase::Ending)
+                {
+                    tokio::time::Instant::now() + window
+                } else {
+                    // A recovered actor must not receive a fresh full window.
+                    // Within this actor, Tokio's monotonic clock owns elapsed
+                    // time; the durable wall timestamp bridges restarts.
+                    let updated = self.context.store.execution_updated_at_ms().await?;
+                    let elapsed = Duration::from_millis(now_ms().saturating_sub(updated));
+                    tokio::time::Instant::now() + window.saturating_sub(elapsed)
+                };
+                self.end_timer = Some(EndTimer {
+                    version,
+                    phase: EndTimerPhase::Ending,
+                    deadline,
+                });
+            }
+            EndPhase::Ended { .. } => {
+                let deadline = match self.end_timer {
+                    Some(timer)
+                        if timer.version == version || timer.phase == EndTimerPhase::Ending =>
+                    {
+                        // `Ending -> Ended` expires the existing window. A
+                        // later wake starts a new one when no timer exists.
+                        timer.deadline
+                    }
+                    _ => tokio::time::Instant::now() + window,
+                };
+                self.end_timer = Some(EndTimer {
+                    version,
+                    phase: EndTimerPhase::Ended,
+                    deadline,
+                });
+            }
+        }
+        Ok(())
     }
 
     pub(super) async fn persist(
@@ -463,7 +529,7 @@ impl ExecutionActor {
         result: Result<(), ExecError>,
     ) -> Result<(), ExecError> {
         let Err(error) = result else {
-            return Ok(());
+            return self.sync_end_timer().await;
         };
         self.instance = None;
         self.state = self

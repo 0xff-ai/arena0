@@ -8,9 +8,11 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use arena0_protocol::ExecutionVersion;
 use arena0_sandbox::ProgramInstance;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 
 use crate::context::{ActorContext, SessionMessage};
 use crate::unix_time_ms as now_ms;
@@ -29,6 +31,19 @@ const STREAM_CAPACITY: usize = 64;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_TIMER_BATCH: usize = 16;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EndTimerPhase {
+    Ending,
+    Ended,
+}
+
+#[derive(Clone, Copy)]
+struct EndTimer {
+    version: ExecutionVersion,
+    phase: EndTimerPhase,
+    deadline: Instant,
+}
+
 /// Sole live owner of one loaded guest and its external capabilities.
 ///
 /// The actor is intentionally private: callers interact through the
@@ -46,7 +61,10 @@ struct ExecutionActor {
     messages: mpsc::Sender<SessionMessage>,
     send_lanes: HashMap<arena0_protocol::PeerId, delivery::SendLane>,
     send_tasks: JoinSet<delivery::SendResult>,
-    end_deadline: tokio::time::Instant,
+    /// Local clock for the current end-confirmation activity. The store's
+    /// `updated_at_ms` anchors an `Ending` timer after restart; an `Ended`
+    /// actor woken by peer traffic gets a fresh window to receive that peer.
+    end_timer: Option<EndTimer>,
     /// Whether this actor lifetime has delivered the durable session-start
     /// handoff to its observer. A restart may intentionally deliver it again;
     /// the durable public boundary remains the source of truth.
