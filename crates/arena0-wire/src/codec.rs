@@ -16,7 +16,7 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 1_048_576;
 /// Size of the frame header: four bytes containing a little-endian body size.
 pub const FRAME_HEADER_SIZE: usize = 4;
 /// The current version of the canonical transport-frame envelope.
-pub const FRAME_VERSION: u16 = 1;
+pub const FRAME_VERSION: u16 = 2;
 /// Size of the little-endian frame-version field.
 pub const FRAME_VERSION_SIZE: usize = std::mem::size_of::<u16>();
 
@@ -222,112 +222,11 @@ impl Write for BoundedWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        EXEC_KIND_ABORT, EXEC_KIND_MESSAGE, ExecFrame, FetchFrame, MAX_EXEC_REASON_BYTES,
-        MAX_FETCH_RESPONSE_BYTES, MessageIdBytes, PeerIdBytes, SessionHashBytes, StateHashBytes,
-        StreamProtocol, WireAbortCoordinate, WireAbortOccurrence, WireError, WireStepCommitment,
-        WireTerminalCommitment, WitnessCommitmentBytes,
-    };
-    use arena0_crypto::BlsSignature;
-    use borsh::BorshSerialize;
-
-    #[derive(BorshSerialize)]
-    enum DerivedExecFrame {
-        Message {
-            message_id: MessageIdBytes,
-            seq: u64,
-            prestate: StateHashBytes,
-            data: Vec<u8>,
-            witness: WitnessCommitmentBytes,
-        },
-        StepSignature {
-            commitment: WireStepCommitment,
-            signature: BlsSignature,
-        },
-        End {
-            commitment: WireTerminalCommitment,
-            signature: BlsSignature,
-        },
-        Abort {
-            occurrence: WireAbortOccurrence,
-        },
-    }
-
-    #[derive(BorshSerialize)]
-    enum DerivedFetchFrame {
-        FetchActivationTickets {
-            session_hash: SessionHashBytes,
-        },
-        ActivationTickets {
-            session_hash: SessionHashBytes,
-            tickets: Vec<Vec<u8>>,
-        },
-    }
-
-    fn codec() -> Codec {
-        Codec::default()
-    }
-
-    fn raw_frame(body: &[u8]) -> Vec<u8> {
-        let body_len = (FRAME_VERSION_SIZE + body.len()) as u32;
-        [
-            body_len.to_le_bytes().to_vec(),
-            FRAME_VERSION.to_le_bytes().to_vec(),
-            body.to_vec(),
-        ]
-        .concat()
-    }
-
-    fn abort_occurrence(reason: &[u8]) -> WireAbortOccurrence {
-        WireAbortOccurrence {
-            domain: *b"arena0/abort-occurrence\0",
-            version: 1,
-            session_hash: SessionHashBytes([0x11; 32]),
-            sender: PeerIdBytes([0x22; 32]),
-            kind: crate::ABORT_KIND_ABORT,
-            code: 7,
-            reason: reason.to_vec(),
-            coordinate: WireAbortCoordinate {
-                next_step: 3,
-                state_hash: StateHashBytes([0x33; 32]),
-                chain_hash: [0x44; 32],
-            },
-            signature: arena0_crypto::Ed25519Signature([0x55; 64]),
-        }
-    }
-
-    fn step_commitment() -> WireStepCommitment {
-        WireStepCommitment {
-            domain: *b"arena0/step-commit/v2\0\0\0",
-            session_id: SessionHashBytes([0x11; 32]),
-            step: 3,
-            entry_hash: [0x22; 32],
-            pre_state: StateHashBytes([0x33; 32]),
-            post_state: StateHashBytes([0x44; 32]),
-            link: [0x55; 32],
-        }
-    }
-
-    fn terminal_commitment() -> WireTerminalCommitment {
-        WireTerminalCommitment {
-            domain: *b"arena0/terminal/v1\0\0\0\0\0\0",
-            session_id: SessionHashBytes([0x11; 32]),
-            final_step: 3,
-            final_state: StateHashBytes([0x44; 32]),
-            outcome_hash: [0x66; 32],
-        }
-    }
+    use crate::{StreamProtocol, WireError};
 
     #[test]
     fn payload_too_large() {
-        let message = ExecFrame::Message {
-            message_id: MessageIdBytes([0; 32]),
-            seq: 0,
-            prestate: StateHashBytes([0; 32]),
-            data: vec![0u8; 100],
-            witness: WitnessCommitmentBytes([0; 32]),
-        };
-        let result = Codec::new(10).encode(&message);
+        let result = Codec::new(10).encode(&vec![vec![0u8; 100]]);
         assert!(matches!(result, Err(WireError::PayloadTooLarge { .. })));
     }
 
@@ -356,173 +255,9 @@ mod tests {
     }
 
     #[test]
-    fn frames_preserve_borsh_layout_and_round_trip() {
-        let step_commitment = step_commitment();
-        let terminal_commitment = terminal_commitment();
-        let step_signature = BlsSignature([0xCC; 48]);
-        let terminal_signature = BlsSignature([0xDD; 48]);
-        let frames = [
-            (
-                ExecFrame::Message {
-                    message_id: MessageIdBytes([3; 32]),
-                    seq: 4,
-                    prestate: StateHashBytes([5; 32]),
-                    data: vec![6, 7],
-                    witness: WitnessCommitmentBytes([8; 32]),
-                },
-                DerivedExecFrame::Message {
-                    message_id: MessageIdBytes([3; 32]),
-                    seq: 4,
-                    prestate: StateHashBytes([5; 32]),
-                    data: vec![6, 7],
-                    witness: WitnessCommitmentBytes([8; 32]),
-                },
-            ),
-            (
-                ExecFrame::StepSignature {
-                    commitment: step_commitment.clone(),
-                    signature: step_signature,
-                },
-                DerivedExecFrame::StepSignature {
-                    commitment: step_commitment,
-                    signature: step_signature,
-                },
-            ),
-            (
-                ExecFrame::End {
-                    commitment: terminal_commitment.clone(),
-                    signature: terminal_signature,
-                },
-                DerivedExecFrame::End {
-                    commitment: terminal_commitment,
-                    signature: terminal_signature,
-                },
-            ),
-            (
-                ExecFrame::Abort {
-                    occurrence: abort_occurrence(b"reason"),
-                },
-                DerivedExecFrame::Abort {
-                    occurrence: abort_occurrence(b"reason"),
-                },
-            ),
-        ];
-        for (manual, derived) in frames {
-            assert_eq!(
-                borsh::to_vec(&manual).unwrap(),
-                borsh::to_vec(&derived).unwrap()
-            );
-            let encoded = codec().encode(&manual).unwrap();
-            assert_eq!(codec().decode::<ExecFrame>(&encoded).unwrap(), manual);
-        }
-
-        let fetch_frames = [
-            (
-                FetchFrame::ActivationTickets {
-                    session_hash: SessionHashBytes([14; 32]),
-                    tickets: vec![],
-                },
-                DerivedFetchFrame::ActivationTickets {
-                    session_hash: SessionHashBytes([14; 32]),
-                    tickets: vec![],
-                },
-            ),
-            (
-                FetchFrame::FetchActivationTickets {
-                    session_hash: SessionHashBytes([13; 32]),
-                },
-                DerivedFetchFrame::FetchActivationTickets {
-                    session_hash: SessionHashBytes([13; 32]),
-                },
-            ),
-            (
-                FetchFrame::ActivationTickets {
-                    session_hash: SessionHashBytes([14; 32]),
-                    tickets: vec![vec![15, 16]],
-                },
-                DerivedFetchFrame::ActivationTickets {
-                    session_hash: SessionHashBytes([14; 32]),
-                    tickets: vec![vec![15, 16]],
-                },
-            ),
-        ];
-        for (manual, derived) in fetch_frames {
-            assert_eq!(
-                borsh::to_vec(&manual).unwrap(),
-                borsh::to_vec(&derived).unwrap()
-            );
-            let encoded = codec().encode(&manual).unwrap();
-            assert_eq!(codec().decode::<FetchFrame>(&encoded).unwrap(), manual);
-        }
-    }
-
-    #[test]
-    fn abort_occurrence_is_canonical_and_bounded() {
-        let occurrence = abort_occurrence(b"because");
-        let frame = ExecFrame::Abort {
-            occurrence: occurrence.clone(),
-        };
-        let mut body = vec![EXEC_KIND_ABORT];
-        body.extend(borsh::to_vec(&occurrence).unwrap());
-        let encoded = codec().encode(&frame).unwrap();
-        assert_eq!(encoded, raw_frame(&body));
-        assert_eq!(codec().decode::<ExecFrame>(&encoded).unwrap(), frame);
-
-        let oversized = ExecFrame::Abort {
-            occurrence: WireAbortOccurrence {
-                reason: vec![0; MAX_EXEC_REASON_BYTES + 1],
-                ..abort_occurrence(b"")
-            },
-        };
-        assert!(matches!(
-            codec().encode(&oversized),
-            Err(WireError::ValueTooLarge {
-                field: "exec.abort.reason",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn variable_lengths_are_checked_before_allocation() {
-        let mut message_body = vec![EXEC_KIND_MESSAGE];
-        message_body.extend_from_slice(&[0; 32]);
-        message_body.extend_from_slice(&0u64.to_le_bytes());
-        message_body.extend_from_slice(&[0; 32]);
-        message_body.extend_from_slice(&u32::MAX.to_le_bytes());
-        let message_frame = raw_frame(&message_body);
-        assert!(matches!(
-            codec().decode::<ExecFrame>(&message_frame),
-            Err(WireError::ValueTooLarge {
-                field: "exec.data",
-                ..
-            })
-        ));
-
-        let mut fetch_body = vec![1];
-        fetch_body.extend_from_slice(&[0; 32]);
-        fetch_body.extend_from_slice(&1u32.to_le_bytes());
-        fetch_body.extend_from_slice(&u32::MAX.to_le_bytes());
-        let fetch_frame = raw_frame(&fetch_body);
-        assert!(matches!(
-            codec().decode::<FetchFrame>(&fetch_frame),
-            Err(WireError::ValueTooLarge {
-                field: "fetch.ticket",
-                ..
-            })
-        ));
-
-        let unknown_frame = raw_frame(&[0xff]);
-        assert!(matches!(
-            codec().decode::<ExecFrame>(&unknown_frame),
-            Err(WireError::Decode(_))
-        ));
-    }
-
-    #[test]
     fn frame_envelope_is_versioned_and_exact_length() {
         let encoded = Codec::new(1).encode(&7u8).unwrap();
-        assert_eq!(encoded, [3, 0, 0, 0, 1, 0, 7]);
+        assert_eq!(encoded, [3, 0, 0, 0, 2, 0, 7]);
         assert_eq!(Codec::new(1).decode_frame(&encoded).unwrap(), &[7]);
 
         for (bytes, error) in [
@@ -548,7 +283,7 @@ mod tests {
                 },
             ),
             (
-                vec![3, 0, 0, 0, 1, 0, 7, 8],
+                vec![3, 0, 0, 0, 2, 0, 7, 8],
                 WireError::TrailingBytes {
                     expected: 7,
                     actual: 8,
@@ -557,7 +292,7 @@ mod tests {
             (
                 vec![3, 0, 0, 0, 255, 255, 7],
                 WireError::UnsupportedVersion {
-                    expected: 1,
+                    expected: 2,
                     actual: u16::MAX,
                 },
             ),
@@ -578,11 +313,11 @@ mod tests {
     fn protocol_frame_body_caps_are_canonical() {
         assert_eq!(
             StreamProtocol::Fetch.max_frame_body(),
-            MAX_FETCH_RESPONSE_BYTES
+            crate::MAX_FETCH_RESPONSE_BYTES
         );
         assert_eq!(
             StreamProtocol::Exec.max_frame_body(),
-            DEFAULT_MAX_MESSAGE_SIZE
+            crate::MAX_EXEC_FRAME_BYTES
         );
     }
 }

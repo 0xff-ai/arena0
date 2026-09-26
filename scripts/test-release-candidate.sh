@@ -76,7 +76,7 @@ if [[ ! -S "$socket" ]]; then
 fi
 
 ARENA0_HOME="$home" "$bin_dir/arena0" --json run "$wasm" \
-  --builtin host-01=first-allowed --builtin host-02=sample --replay \
+  --builtin host-01=first-allowed --builtin host-02=sample \
   >"$smoke_root/result.json"
 python3 - "$smoke_root/result.json" <<'PY'
 import json
@@ -87,7 +87,6 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 verified = result["verified"]
 receipts = verified["receipts"]
 assert result["exec"] == "completed", result
-assert verified["tier"] == "full", verified
 assert verified["all_verified"] is True, verified
 assert verified["shared_evidence_agrees"] is True, verified
 assert len(receipts) == 2, receipts
@@ -99,17 +98,18 @@ PY
 session_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["session_id"])' \
   "$smoke_root/result.json")
 ARENA0_HOME="$home" "$bin_dir/arena0" --json verify "$session_id" \
-  --hosts host-01,host-02 --replay >"$smoke_root/verified.json"
+  --hosts host-01,host-02 >"$smoke_root/verified.json"
 python3 - "$smoke_root/verified.json" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as handle:
     result = json.load(handle)
-assert result["tier"] == "full", result
 assert result["all_verified"] is True, result
 assert result["shared_evidence_agrees"] is True, result
 assert len(result["ensemble"]) == 2, result
+assert result["terminal"] == "Completed", result
+assert isinstance(result["outcome_borsh"], list), result
 assert len(result["producers"]) == 2, result
 assert {entry["host"] for entry in result["producers"]} == {"host-01", "host-02"}, result
 assert all(entry["result"] == "valid" for entry in result["producers"]), result
@@ -152,4 +152,4 @@ if [[ $(grep -c 'arena0d Host stopped' "$log") -ne 2 ]]; then
   exit 1
 fi
 
-echo "release candidate built and replayed the external example, then shut down cleanly"
+echo "release candidate built and verified the external example, then shut down cleanly"

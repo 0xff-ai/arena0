@@ -14,15 +14,12 @@ arena0-home = { path = "../arena0-home" }
 arena0-transport = { path = "../arena0-transport" }
 arena0-node = { path = "../arena0-node" }
 arena0-sandbox = { path = "../arena0-sandbox" }
+arena0-test-engine = { path = "../arena0-test-engine" }
 arena0-store = { path = "../arena0-store" }
 arena0-protocol = { path = "../arena0-protocol" }
-arena0-verify = { path = "../arena0-verify", features = ["replay"] }
-blake3.workspace = true
-borsh.workspace = true
 hex.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 tracing-subscriber.workspace = true
 wat.workspace = true

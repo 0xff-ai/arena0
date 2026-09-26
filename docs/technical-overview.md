@@ -30,10 +30,11 @@ human or agent
     |
     +-- arena0 CLI -------------> arena0d
                                   |
+                                  +-- Unix API (one socket, explicit Host routing)
+                                  |
                                   +-- Ensemble
                                       |
                                       +-- Host A
-                                      |   +-- Unix API
                                       |   +-- SQLite store
                                       |   +-- execution actors
                                       |   +-- Wasm sandbox
@@ -55,7 +56,7 @@ The workspace manifests own dependency selection and exact versions. The table b
 | Guest target | `wasm32-unknown-unknown` | Portable deterministic program artifact |
 | Wasm runtime | Wasmtime with Cranelift | Validation, compilation, caching, fuel accounting, memory limits, and guest execution |
 | Async runtime | Tokio | Service tasks, Unix APIs, transport channels, cancellation, and shutdown |
-| Durable storage | SQLite through `rusqlite` | Per-Host identities, programs, activation, execution state, inbox, outbox, timers, and receipts |
+| Durable storage | SQLite through `rusqlite` | Per-Host identities, programs, activation, execution state, timers, and receipts |
 | Deterministic encoding | Borsh | Canonical protocol, wire, stored, and guest-owned program bytes |
 | Agent encoding | Serde JSON | Host API requests, responses, callouts, queries, views, and outcomes |
 | Agent schemas | JSON Schema Draft 2020-12 | Input validation and program introspection |
@@ -78,7 +79,7 @@ protocol foundations
     arena0-crypto -> arena0-wire -> arena0-program -> arena0-protocol
 
 host capabilities
-    arena0-store + arena0-transport + arena0-sandbox + arena0-verify
+    arena0-store + arena0-transport + arena0-sandbox
 
 guest authoring and Host runtime
     arena0-sdk-macros + arena0-sdk + arena0-primitives + programs
@@ -96,7 +97,7 @@ Protocol crates do not depend on Tokio, SQLite, Wasmtime, a transport implementa
 The three executables retain narrow dependency closures:
 
 ```text
-arena0       -> arena0-home + arena0-client + arena0-verify
+arena0       -> arena0-home + arena0-client
 arena0d      -> arena0-home + arena0-daemon
 cargo-arena0 -> arena0-sandbox
 ```
@@ -113,13 +114,13 @@ Each important fact has one owner:
 | Fact or capability | Owner |
 | --- | --- |
 | Canonical protocol state and transitions | `arena0-protocol` |
-| Receipt evidence | `arena0-protocol::Receipt` |
+| Receipt evidence | `arena0-protocol::ReceiptArtifact` |
 | One Host's durable data | `arena0-store::Store` |
-| One execution's durable mutation capability | non-cloneable `arena0-store::ExecutionStore` |
+| One execution's committed state and transition application | private `arena0-node::ExecutionActor` |
 | One execution's live guest, signer, and transport handles | private `arena0-node::ExecutionActor` |
 | One participant | `arena0-node::Host` |
 | Local Host set and coordinated shutdown | `arena0-node::Ensemble` |
-| Program delivery | `arena0-transport::Transport` |
+| Protocol frame delivery seam | `arena0-transport::Transport` |
 | Local delivery implementation | `arena0-transport::LocalTransport` |
 | Wasm validation and execution | `arena0-sandbox` |
 | Identity custody, catalogs, APIs, and process lifecycle | `arena0-daemon` |
@@ -153,8 +154,7 @@ local admission
     -> N-of-N activation
     -> local activation commit
     -> deterministic execution
-    -> N-of-N agreement on each public step
-    -> terminal proof
+    -> N-of-N agreement on each public step, including the terminal step
     -> atomic artifact publication
     -> canonical receipt or unilateral stop report
 ```
@@ -163,7 +163,13 @@ Admission selects an exact program, participant set, parameter set, execution pr
 
 Each Host prepares its activation record before it signs. A Host starts execution only after it validates and commits the complete activation. Hosts may commit at different wall-clock times. The process has no global start barrier.
 
-Every public transition binds the session, position, prior state, next state, event, effects, fuel, and replayable randomness. It commits only after every activated participant signs the same commitment.
+Every agreed public transition binds the session, position, event, prior and
+next shared-state hashes, and the chain link. `SessionStarted` and
+`MessageReceived` are the portable trace events and the only events that change
+shared state or end the session; `InputReceived` and `TimerFired` are
+participant-specific events that change local state. Local state, effects, fuel, and
+entropy observations remain Host-local. The transition commits only after every
+activated participant signs the same `StepCommitment`.
 
 The [execution walkthrough](architecture.md#complete-execution-walkthrough) traces this lifecycle through an auction.
 
@@ -171,27 +177,57 @@ The [execution walkthrough](architecture.md#complete-execution-walkthrough) trac
 
 The guest program owns protocol-specific meaning. It defines roles, parameters, shared and local state, messages, callouts, transitions, views, and outcomes.
 
-The Host owns deterministic execution conditions. It validates the module and required exports, enforces fuel and memory limits, supplies replayable randomness, persists results, and performs explicit effects.
+The Host owns bounded execution conditions. It validates the module and required
+exports, enforces fuel and memory limits, supplies bounded host entropy,
+persists results, and performs explicit effects.
 
-Every semantic guest call uses a fresh bounded Wasm instance. Shared calls may replace only shared state. Local calls may replace only local state. Read-only calls must not change guest state or emit effects.
+Each active execution owns one resident `ProgramInstance` with fixed,
+independent `arena0_shared` and `arena0_local` memories. Every session
+`Event` enters the same `arena0_dispatch`. Agreed events may mutate both
+memories; local events may mutate only local memory. Each effect host call
+validates its effect when the guest emits it and queues it; the Host applies the
+queue only when the handler's result is accepted. A broadcast enters a bounded
+outgoing queue, and its author later applies it through its own
+`MessageReceived` dispatch like every other participant. Work memory, mutable globals, fuel, and per-dispatch observations
+reset to the resident baseline. After an accepted dispatch, the read-only
+`callout` function derives at most one open callout from the resulting state
+image; that callout is stored with the image or staged proposal.
+Read-only initialization, writer, query, view, and outcome projections use
+fresh bounded instances and must not change guest state or emit effects.
+
+The synchronous `ctx.sign(...)` host call is available only to local
+`InputReceived` and `TimerFired` handlers. It is unavailable to
+`SessionStarted`, `MessageReceived`, and read-only projections, and returns the
+exact signed bytes with the signature. The sign capability still gates access.
 
 Content addressing binds an execution to exact Wasm bytes. The execution profile binds proof-relevant runtime configuration. Wasmtime compilation is cached within a process and in a persistent cache below the arena0 home.
 
 ## Persistence and recovery
 
-Each Host owns one SQLite database and one blocking database-owner thread. The daemon reserves the store before opening or creating signing keys. The same store owns the latest agent software label (`user_agent`), separate from protocol state. Cloneable handles submit bounded operations to that owner. A non-cloneable `ExecutionStore` grants exclusive mutation authority for one execution.
+Each Host owns one SQLite database. The daemon reserves the store before
+opening or creating signing keys. The same store owns the latest agent software
+label (`user_agent`), separate from protocol state. The execution actor is the
+only writer for its execution: it owns committed state, applies protocol
+transitions, and hands a complete transition record to the store. One SQLite
+transaction persists that record, including state images, effects, timers,
+callout, and receipt facts. The store keeps a version check as a corruption
+tripwire; it has no owner thread, command queue, write-through working set, or
+delivery lease.
 
-The pure protocol reducer returns a commit plan rather than performing I/O. The store applies the plan with a version compare-and-set. One SQLite transaction writes the execution aggregate, trace or private records, timers, outbox effects, and the applied inbox status.
-
-Inbound execution frames enter the durable inbox before the transport receives an acknowledgement. Reducer application happens later. This split lets a restarted Host recover accepted work without claiming that the work already changed protocol state.
-
-Outbound effects use durable rows and leases. A send failure leaves recoverable work. Lease expiry allows a later actor to retry without deleting causal history.
+Delivery needs no inbox or outbox: the frames a peer can still lack are part
+of execution state, so the actor resends them from that state through one
+bounded lane per peer, including after a restart. The acknowledgement and
+retry rules are specified in
+[Durable delivery](protocol-architecture.md#durable-delivery).
 
 Recovery validates stored state and every nested projection before it exposes the execution. Corruption produces an error. Recovery does not invent missing state or choose between conflicting histories.
 
 ## Concurrency and shutdown
 
-Long-lived state uses one clear task or resource owner. Execution actors own live execution capabilities. The store thread owns its SQLite connection. The Ensemble owns coordinated local shutdown. The daemon owns its services and child task lifecycles.
+Long-lived state uses one clear task or resource owner. Execution actors own
+live execution capabilities and complete transition records. The store persists
+those records through its SQLite connection. The Ensemble owns coordinated
+local shutdown, and the daemon owns its services and child task lifecycles.
 
 The CLI binds each harness context to a durable Host through serialized, supervised provisioning. Repeated `arena0 hello` reopens that same Host; the daemon checks its identity before publishing the service. Persisted Hosts outside the startup set reopen on demand. Shutdown settles pending provisioning before releasing stores.
 
@@ -209,7 +245,7 @@ against other processes controlled by the same machine operator.
 
 Within that boundary, each Host still validates protocol facts independently. N-of-N agreement prevents the system from hiding one selected Host's disagreement inside a majority result. The same rule allows any selected Host to stop progress.
 
-Guest code has no ambient access to the network, filesystem, credentials, clock, or process. It can request only the effects exposed by the ABI. The Host applies policy and bounds before it performs an effect.
+Guest code has no ambient access to the network, filesystem, credentials, clock, or process. It can request only the effects exposed by the ABI. The Host applies capability checks and bounds before it performs an effect.
 
 System events and API projections exclude parameters, outcomes, callout context, signatures, private state, program bytes, and keys. Receipt evidence contains public protocol facts, but receipt publication is a separate action.
 
@@ -223,9 +259,17 @@ execution. Unilateral stops produce distinct authenticated reports. Both are
 exported through `ReceiptArtifact` and addressed by a content-derived `ReceiptId`.
 The store owns local production and import provenance separately from the bytes.
 
-Light verification checks the activation, identities, trace chain, aggregate agreements, terminal evidence, and receipt identity without loading Wasm.
+Receipt publication is a local fact. Afterwards each participant keeps
+sending its terminal evidence until its peers confirm the same conclusion; the
+`Open`/`Ending`/`Ended` end phase is specified in
+[Terminal evidence and publication](protocol-architecture.md#terminal-evidence-and-publication).
 
-Full verification first performs light verification. It then loads the exact program and execution profile, repeats initialization and every public call, and compares state hashes, effects, fuel, randomness, and the terminal result.
+Portable verification is the only verification boundary. It authenticates the
+certified facts without loading or executing Wasm; the checks it performs are
+listed in [Receipts and verification](protocol-architecture.md#11-receipts-and-verification).
+Every format carries an explicit version, and decoders reject unsupported ones;
+the current versions are listed with the
+[preserved invariants](protocol-architecture.md#14-preserved-invariants).
 
 A receipt proves what the selected Hosts agreed under one program. It does not prove an external payment, task completion, legal identity, or asset transfer.
 
@@ -245,9 +289,10 @@ The CLI, execution observatory, and JSON output project typed Host state. Presen
 local drivers. `arena0 monitor` attaches independently to the existing daemon
 and uses the same terminal observatory for multiparty execution tables,
 guest-owned textual views, activity, and public agreement. The monitor can
-answer one pending callout through the existing Host submission boundary;
-competing stale answers receive `CalloutNotPending`. Adapter activity has its own
-bounded operational stream, separate from semantic Host events.
+answer the current open callout through the ordinary Host submission boundary,
+under the same [callout identity rules](protocol-architecture.md#10-execution-and-agreement)
+as any other client. Adapter activity has its own bounded operational stream,
+separate from semantic Host events.
 
 ## Fixed Phase 1 constraints
 
@@ -258,7 +303,8 @@ The [protocol architecture](protocol-architecture.md) defines the complete invar
 - Every Host owns independent durable state and its own copy of the receipt or stop report.
 - Admission is exact and local. It has no discovery fallback or implicit program acquisition.
 - Activation uses prepare-before-sign and commit-before-`SessionStarted` ordering.
-- The inbox and outbox preserve work across restart and duplicate delivery.
+- Current protocol frames in execution state preserve delivery across restart
+  and duplicate delivery; an unapplicable frame is retried without being stored.
 - Guest execution and every ABI crossing are bounded.
 - Program Borsh values remain opaque to the Host.
 - Agent-facing values remain JSON.

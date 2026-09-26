@@ -8,6 +8,7 @@ members = [
     "sequential-count",
     "vickrey-auction",
     "contract-net",
+    "timer-dispatch",
 ]
 
 [workspace.package]

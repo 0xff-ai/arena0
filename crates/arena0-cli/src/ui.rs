@@ -4,7 +4,7 @@
 
 use std::io::IsTerminal;
 
-use arena0_client::protocol::{ColorDepth, Slot, View};
+use arena0_client::protocol::{ColorDepth, ExecLifecycle, Slot, View};
 use arena0_client::sanitize;
 use owo_colors::{OwoColorize, Style as OwoStyle};
 use ratatui::layout::Rect;
@@ -251,6 +251,20 @@ impl Palette {
 /// The current terminal width for program views. Falls back to 80 columns when
 /// stdout is not a terminal or the platform cannot report a width.
 #[must_use]
+/// Human-readable lifecycle name. An abort-kind stop reads as the protocol's
+/// "Stopped"; a fail-kind stop stays "Failed".
+pub(crate) const fn lifecycle_label(lifecycle: ExecLifecycle) -> &'static str {
+    match lifecycle {
+        ExecLifecycle::Negotiating => "Negotiating",
+        ExecLifecycle::Activating => "Activating",
+        ExecLifecycle::Waiting => "Waiting",
+        ExecLifecycle::Active => "Active",
+        ExecLifecycle::Completed => "Completed",
+        ExecLifecycle::Aborted => "Stopped",
+        ExecLifecycle::Failed => "Failed",
+    }
+}
+
 pub(crate) fn terminal_width() -> u16 {
     std::env::var("COLUMNS")
         .ok()
@@ -537,6 +551,13 @@ pub(crate) fn compact_json(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_labels_name_an_abort_kind_stop_stopped() {
+        assert_eq!(lifecycle_label(ExecLifecycle::Aborted), "Stopped");
+        assert_eq!(lifecycle_label(ExecLifecycle::Failed), "Failed");
+        assert_eq!(lifecycle_label(ExecLifecycle::Completed), "Completed");
+    }
 
     #[test]
     fn terminal_capabilities_enable_color_only_for_human_ttys() {

@@ -143,10 +143,7 @@ fn severity(event: &SystemEvent) -> Severity {
         } => Severity::Error,
         SystemEvent::Negotiation { .. }
         | SystemEvent::Execution {
-            event:
-                ExecutionEvent::StepCommitted { .. }
-                | ExecutionEvent::CalloutRequested { .. }
-                | ExecutionEvent::CalloutAnswered { .. },
+            event: ExecutionEvent::CalloutRequested { .. } | ExecutionEvent::CalloutAnswered { .. },
             ..
         } => Severity::Debug,
     }

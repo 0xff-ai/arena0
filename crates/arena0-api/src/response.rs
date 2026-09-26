@@ -5,8 +5,8 @@
 use arena0_crypto::AgentPubKey;
 use arena0_program::{JsonSchemaDocument, ParticipantCount, ProgramHash, ProgramSchema};
 use arena0_protocol::{
-    ExecId, ExecLifecycle, NegotiationId, OfferHash, PeerId, PendingId, ReceiptArtifact,
-    SessionHash, StateHash, StopCause, TicketHash, TraceEntry, View,
+    CalloutId, EffectSummary, EventKind, ExecId, ExecLifecycle, NegotiationId, OfferHash, PeerId,
+    ReceiptArtifact, ReceiptSummary, SessionHash, StateHash, TicketHash, TraceEntry, View,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,7 +21,6 @@ pub enum ResponseOk {
     /// A method with no payload succeeded (e.g. `daemon.stop`, `program.remove`).
     Ack,
     Id(IdInfo),
-    IdList(Vec<IdInfo>),
     Program(Box<ProgramDetail>),
     ProgramList(Vec<ProgramSummary>),
     /// `exec.new` returns immediately; negotiation runs in the background. The state
@@ -61,17 +60,9 @@ pub enum ResponseOk {
     Trace(Vec<TraceEntry>),
     Receipt(Box<ReceiptArtifact>),
     ReceiptList(Vec<ReceiptListEntry>),
-    /// `receipt.verify`: the recovered evidence, not a bool. The result variant
-    /// records whether structural light verification or Wasm replay ran, so a
-    /// completed result cannot claim an unavailable JSON projection.
-    Verified {
-        receipt_id: arena0_protocol::ReceiptId,
-        program_id: ProgramHash,
-        session_id: SessionHash,
-        ensemble: Vec<PeerId>,
-        steps: u64,
-        result: VerifiedResult,
-    },
+    /// `receipt.verify`: the recovered structural and cryptographic evidence,
+    /// not a bool.
+    Verified(ReceiptSummary),
     DaemonInfo(DaemonInfo),
     /// The ack for `events.subscribe`; `EventFrame`s follow on the same connection.
     Subscribed,
@@ -141,6 +132,9 @@ pub enum ApiErrorCode {
     /// A callout answer raced with another answer and the pending callout is
     /// no longer available.
     CalloutNotPending,
+    /// The program rejected the submitted callout answer; execution remains
+    /// live and the same callout can be answered again.
+    InputRejected,
     /// A program handle resolved to more than one program.
     Ambiguous,
     /// A JSON value failed validation against the program's public schema.
@@ -159,17 +153,14 @@ pub enum ApiErrorCode {
     Internal,
 }
 
-/// Public material for one keystore identity. Seeds never appear here.
+/// Public material for the Host identity. Seeds never appear here.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IdInfo {
     pub peer_id: PeerId,
-    pub label: Option<String>,
     /// The persistent Ed25519 identity key used by the Host.
     /// `peer_id` is derived from this key. The execution BLS key is minted per exec,
     /// so it is not identity material and does not appear here.
     pub transport_key: AgentPubKey,
-    /// Whether this is the daemon's active identity.
-    pub active: bool,
 }
 
 /// A registry listing entry (no wasm bytes, no schema).
@@ -194,10 +185,47 @@ pub struct ProgramDetail {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecStatus {
+    /// Local end handshake; independent of receipt publication.
+    pub end: ExecEndStatus,
     pub exec_id: ExecId,
     pub negotiation_id: Option<NegotiationId>,
     pub program_id: ProgramHash,
     pub state: ExecStatusState,
+}
+
+/// Public local end-confirmation progress.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecEndStatus {
+    pub phase: ExecEndPhase,
+    pub unconfirmed: Vec<PeerId>,
+}
+
+/// Phase of the local end handshake.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecEndPhase {
+    #[default]
+    Open,
+    Ending,
+    Ended,
+}
+
+impl From<&arena0_protocol::EndPhase> for ExecEndStatus {
+    fn from(end: &arena0_protocol::EndPhase) -> Self {
+        use arena0_protocol::EndPhase;
+        Self {
+            phase: match end {
+                EndPhase::Open => ExecEndPhase::Open,
+                EndPhase::Ending { .. } => ExecEndPhase::Ending,
+                EndPhase::Ended { .. } => ExecEndPhase::Ended,
+            },
+            unconfirmed: end
+                .unconfirmed()
+                .map(|peers| peers.iter().copied().collect())
+                .unwrap_or_default(),
+        }
+    }
 }
 
 /// The facts valid at each public execution lifecycle.
@@ -230,7 +258,7 @@ pub struct SessionStatus {
 
 /// A bounded, host-local projection of durable execution facts for inspection
 /// UIs. It contains no signatures, keys, parameters, outcomes, callout
-/// contexts, or private payload bytes.
+/// contexts, or participant-specific payload bytes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionInspection {
@@ -238,14 +266,14 @@ pub struct ExecutionInspection {
     pub status: ExecStatus,
     /// The durable activation evidence, when preparation has started.
     pub activation: Option<ActivationInspection>,
-    /// The returned private-record window's first sequence.
-    pub private_from: u64,
-    /// The bounded private-record projection.
-    pub private: Vec<PrivateCommitSummary>,
-    /// Total private records currently durable for this execution.
-    pub private_total: u64,
-    /// Next sequence available after this page, if more records exist.
-    pub private_next: Option<u64>,
+    /// The returned event-record window's first event position.
+    pub events_from: u64,
+    /// The bounded event-record projection.
+    pub events: Vec<EventRecordSummary>,
+    /// Total event records currently durable for this execution.
+    pub events_total: u64,
+    /// Next event position available after this page, if more records exist.
+    pub events_next: Option<u64>,
 }
 
 /// Durable activation facts safe to display in a local diagnostic view.
@@ -287,51 +315,19 @@ pub struct ActivationParticipant {
     pub ticket_hash: TicketHash,
 }
 
-/// Kind of local event that caused one private handler run.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PrivateEventKind {
-    InputReceived,
-    TimerFired,
-    TypedTimerFired,
-    Signed,
-    React,
-}
-
-/// Kind and bounded payload size of one private effect. The payload itself is
-/// deliberately never returned.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct PrivateEffectSummary {
-    pub kind: PrivateEffectKind,
-    pub payload_bytes: Option<u64>,
-}
-
-/// Kind of effect emitted by one private handler run.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PrivateEffectKind {
-    Broadcast,
-    Callout,
-    SetTimer,
-    Sign,
-    RetryInput,
-}
-
-/// A bounded summary of one durable private handler commit.
+/// A bounded summary of one durable Host-local event record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct PrivateCommitSummary {
-    /// Gapless local private-record sequence.
-    pub sequence: u64,
-    /// Public cursor observed by the local run.
-    pub public_position: u64,
-    pub event: PrivateEventKind,
+pub struct EventRecordSummary {
+    /// Authoritative local event position.
+    pub event_position: u64,
+    /// Public steps produced by this event, when any.
+    pub agreed_steps: Vec<u64>,
+    pub event: EventKind,
     /// Size of the input payload, when the event has one. The payload is not
     /// exposed.
     pub input_payload_bytes: Option<u64>,
-    pub effects: Vec<PrivateEffectSummary>,
-    pub fuel_used: u64,
+    pub effects: Vec<EffectSummary>,
 }
 
 /// How far a failed execution got before it stopped.
@@ -342,13 +338,12 @@ pub enum SessionProgress {
     Started { session: SessionStatus },
 }
 
-/// The public identity of an agent-visible pending callout.
+/// The public identity of an agent-visible open callout.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PendingCalloutStatus {
-    pub pending_id: PendingId,
+    pub pending_id: CalloutId,
     pub callout_index: u32,
-    pub expected_type: Option<String>,
 }
 
 impl ExecStatus {
@@ -439,7 +434,7 @@ impl ExecStatusState {
     }
 }
 
-/// The blocking return of `exec.next`. Signing continuations stay inside the
+/// The blocking return of `exec.next`. Guest signing stays inside the
 /// execution actor, which owns the custodied key.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum NextEvent {
@@ -447,7 +442,7 @@ pub enum NextEvent {
     /// program schema, `schema` is the answer type inline (so a cold agent needs no
     /// `get_program`), and `context` is guest-produced JSON.
     Callout {
-        pending_id: PendingId,
+        pending_id: CalloutId,
         callout_index: u32,
         name: String,
         prompt: String,
@@ -463,18 +458,6 @@ pub enum NextEvent {
     Failed { reason: String },
 }
 
-/// The local facts known about a stored receipt artifact.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ReceiptProvenance {
-    /// The daemon produced the artifact.
-    Produced,
-    /// The daemon imported the artifact from another Host.
-    Imported,
-    /// The daemon imported the artifact and later produced the same artifact.
-    Both,
-}
-
 /// A `receipt.list` entry: the content address, its session and producer, program,
 /// completion, and the complete local provenance projection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -484,57 +467,5 @@ pub struct ReceiptListEntry {
     pub kind: arena0_protocol::ReceiptKind,
     pub program_id: ProgramHash,
     pub completed: bool,
-    pub provenance: ReceiptProvenance,
-}
-
-/// The result of one verification tier.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub enum VerifiedResult {
-    /// Structural and cryptographic verification without Wasm.
-    Light {
-        /// Terminal evidence available without executing the guest.
-        terminal: LightVerifiedTerminal,
-    },
-    /// Structural verification followed by deterministic Wasm replay.
-    Full {
-        /// Terminal evidence including the replayed JSON projection when the
-        /// receipt completed.
-        terminal: FullVerifiedTerminal,
-    },
-}
-
-/// Terminal evidence returned by light verification.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub enum LightVerifiedTerminal {
-    /// The receipt records a signed completion. Light verification leaves the
-    /// JSON projection unavailable because it does not load the guest.
-    Completed {
-        /// Opaque stock-Borsh outcome bytes committed by the receipt.
-        outcome_borsh: Vec<u8>,
-    },
-    /// The receipt records an authenticated unilateral stop or a shared
-    /// N-of-N stop. The protocol evidence remains intact for callers.
-    Stopped { cause: StopCause },
-}
-
-/// Terminal evidence returned by full verification.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub enum FullVerifiedTerminal {
-    /// The receipt records a signed completion and replay produced the JSON
-    /// projection from the guest's concrete outcome DTO.
-    Completed {
-        /// Opaque stock-Borsh outcome bytes committed by the receipt.
-        outcome_borsh: Vec<u8>,
-        /// Guest-produced agent-facing JSON. Full completion always has this
-        /// value; stopped proofs have no outcome field at all.
-        outcome_json: Value,
-    },
-    /// The receipt records an authenticated unilateral stop or a shared
-    /// N-of-N stop. The protocol evidence remains intact for callers.
-    Stopped { cause: StopCause },
+    pub provenance: arena0_protocol::ReceiptProvenance,
 }

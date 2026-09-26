@@ -11,16 +11,13 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use arena0_api::{ApiError, ApiErrorCode, AwaitState, ExecLifecycle, NextEvent, PendingId};
+use arena0_api::{ApiError, ApiErrorCode, AwaitState, CalloutId, ExecLifecycle, NextEvent};
 use arena0_node::{ExecCommand, LocalTicketWithdrawal, SessionMessage, SpawnedExec};
 use arena0_program::{ProgramHash, ProgramSchema};
 use arena0_protocol::execution::ExecutionState;
-use arena0_protocol::{
-    AbortKind, EventSource, ExecId, ExecutionStatus, NegotiationId, SessionHash, StopCause, Ticket,
-    View,
-};
+use arena0_protocol::{AbortKind, EventSource, ExecId, NegotiationId, SessionHash, Ticket, View};
 use arena0_sandbox::Program;
-use arena0_store::{PendingRequest, StoreHandle};
+use arena0_store::StoreHandle;
 use arena0_transport::Transport;
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot, watch};
 use tokio::time::Instant;
@@ -111,50 +108,30 @@ impl ExecutionHandle {
     /// Derive the public lifecycle from durable state, including phases before
     /// an execution aggregate exists.
     pub(crate) async fn lifecycle(&self) -> anyhow::Result<ExecLifecycle> {
-        if let Some(state) = self.execution().await? {
-            return Ok(state.lifecycle());
-        }
-        if self
-            .request()
-            .await?
-            .is_some_and(|request| request.failure().is_some())
-        {
-            return Ok(ExecLifecycle::Failed);
-        }
-        if self.activation().await?.is_some() {
-            return Ok(ExecLifecycle::Activating);
-        }
-        Ok(ExecLifecycle::Negotiating)
+        let state = self.execution().await?;
+        let request = self.request().await?;
+        let activation = self.activation().await?;
+        Ok(project_lifecycle(
+            request.is_some_and(|request| request.failure().is_some()),
+            activation.as_ref(),
+            state.as_ref(),
+        ))
     }
 
     /// Build the source for a safe daemon event from durable request and
     /// activation facts.
     pub(crate) async fn event_source(&self) -> anyhow::Result<EventSource> {
-        let peer_id = self.store.host_id();
-        let program_id = self.program_id().await?;
-        if let Some(state) = self.execution().await? {
-            return Ok(EventSource::Session {
-                peer_id,
-                exec_id: self.exec_id,
-                program_id,
-                session_hash: state.binding().session_id(),
-            });
-        }
-        match self.negotiation_id().await? {
-            Some(negotiation_id) => Ok(EventSource::Negotiation {
-                peer_id,
-                exec_id: self.exec_id,
-                program_id,
-                negotiation_id,
-            }),
-            // An open Join can fail before it accepts an offer, so there is
-            // no negotiation identity to attach to its terminal event.
-            None => Ok(EventSource::Execution {
-                peer_id,
-                exec_id: self.exec_id,
-                program_id,
-            }),
-        }
+        let session_hash = self
+            .execution()
+            .await?
+            .map(|state| state.binding().session_id());
+        Ok(EventSource::most_specific(
+            self.store.host_id(),
+            self.exec_id,
+            self.program_id().await?,
+            self.negotiation_id().await?,
+            session_hash,
+        ))
     }
 
     pub(crate) async fn await_state(
@@ -187,8 +164,7 @@ impl ExecutionHandle {
         }
     }
 
-    /// Wait for and project the next durable agent-facing event. Signing
-    /// continuations remain internal to the actor and are never projected.
+    /// Wait for and project the next durable agent-facing event.
     pub(crate) async fn next(&self, schema: &ProgramSchema) -> Result<NextEvent, ApiError> {
         loop {
             let notified = self.changed.notified();
@@ -203,19 +179,14 @@ impl ExecutionHandle {
         &self,
         schema: &ProgramSchema,
     ) -> Result<Option<NextEvent>, ApiError> {
-        let state = self
+        let Some(state) = self
             .execution()
             .await
-            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
-        let Some(state) = state else {
+            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
+        else {
             return Ok(None);
         };
-        let pending = self
-            .store
-            .list_pending_requests(self.exec_id)
-            .await
-            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
-        project_durable_next(state, pending, schema)
+        project_durable_next(state, schema)
     }
 
     pub(crate) async fn wait_for_change(&self) {
@@ -244,52 +215,55 @@ impl ExecutionHandle {
         })
     }
 
+    /// Submit an answer the caller has matched to the committed callout and
+    /// validated against its schema. The actor owns the authoritative check
+    /// that the callout is still open when the answer is dispatched.
     pub(crate) async fn submit(
         &self,
-        pending_id: PendingId,
+        pending_id: CalloutId,
         data: arena0_program::JsonBytes,
     ) -> Result<(), ApiError> {
-        let callout_index = self
-            .store
-            .list_pending_requests(self.exec_id)
-            .await
-            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
-            .into_iter()
-            .find_map(|request| match request {
-                PendingRequest::Callout {
-                    pending_id: id,
-                    callout_index,
-                    ..
-                } if id == pending_id => Some(callout_index),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                ApiError::new(
-                    ApiErrorCode::CalloutNotPending,
-                    format!("no pending {pending_id}"),
-                )
-            })?;
-        let (reply, rx) = oneshot::channel();
-        self.running()?
-            .send(ExecCommand::SubmitInput {
-                pending_id,
-                callout_index,
-                data,
-                reply,
-            })
-            .await
-            .map_err(|_| ApiError::new(ApiErrorCode::Execution, "execution task gone"))?;
-        rx.await
-            .map_err(|_| ApiError::new(ApiErrorCode::Execution, "input reply dropped"))?
-            .map_err(|error| match error {
-                arena0_node::ExecError::CalloutNotPending => ApiError::new(
-                    ApiErrorCode::CalloutNotPending,
-                    format!("no pending {pending_id}"),
-                ),
-                error => ApiError::new(ApiErrorCode::Execution, format!("input rejected: {error}")),
-            })?;
-        self.changed.notify_waiters();
-        Ok(())
+        loop {
+            let (reply, rx) = oneshot::channel();
+            self.running()?
+                .send(ExecCommand::SubmitInput {
+                    pending_id,
+                    data: data.clone(),
+                    reply,
+                })
+                .await
+                .map_err(|_| ApiError::new(ApiErrorCode::Execution, "execution task gone"))?;
+            let result = rx
+                .await
+                .map_err(|_| ApiError::new(ApiErrorCode::Execution, "input reply dropped"))?;
+            match result {
+                Ok(()) => {
+                    self.changed.notify_waiters();
+                    return Ok(());
+                }
+                Err(arena0_node::ExecError::CalloutNotPending) => {
+                    return Err(ApiError::new(
+                        ApiErrorCode::CalloutNotPending,
+                        format!("no pending {pending_id}"),
+                    ));
+                }
+                Err(arena0_node::ExecError::InputRejected(reason)) => {
+                    return Err(ApiError::new(ApiErrorCode::InputRejected, reason));
+                }
+                Err(arena0_node::ExecError::AgreementPending) => {
+                    // Agreement freezes guest dispatch but does not consume the
+                    // callout. Keep the request at the daemon boundary while
+                    // the actor remains free to process inbound signatures.
+                    tokio::select! {
+                        () = self.changed.notified() => {}
+                        () = tokio::time::sleep(Duration::from_millis(25)) => {}
+                    }
+                }
+                Err(error) => {
+                    return Err(ApiError::new(ApiErrorCode::Execution, error.to_string()));
+                }
+            }
+        }
     }
 
     pub(crate) async fn install_negotiation(
@@ -422,6 +396,23 @@ impl ExecutionHandle {
     }
 }
 
+/// The one public lifecycle projection. An execution aggregate owns its
+/// lifecycle (a certified step stays `Active` until its receipt is published);
+/// before one exists, a recorded request failure, then a durable activation,
+/// decide the phase.
+pub(crate) fn project_lifecycle(
+    request_failed: bool,
+    activation: Option<&arena0_store::ActivationRecord>,
+    state: Option<&ExecutionState>,
+) -> ExecLifecycle {
+    match state {
+        Some(state) => state.lifecycle(),
+        None if request_failed => ExecLifecycle::Failed,
+        None if activation.is_some() => ExecLifecycle::Activating,
+        None => ExecLifecycle::Negotiating,
+    }
+}
+
 pub(crate) fn satisfies(lifecycle: ExecLifecycle, until: AwaitState) -> bool {
     match until {
         AwaitState::Active => {
@@ -433,11 +424,11 @@ pub(crate) fn satisfies(lifecycle: ExecLifecycle, until: AwaitState) -> bool {
 }
 
 /// The host-owned facts needed to project a durable callout at either output
-/// boundary. Keeping this private payload separate from [`NextEvent`] prevents
+/// boundary. Keeping this host-local payload separate from [`NextEvent`] prevents
 /// the supervisor from matching a public API enum just to emit a host event.
 #[derive(Debug)]
 struct CalloutProjection {
-    pending_id: PendingId,
+    pending_id: CalloutId,
     callout_index: u32,
     name: String,
     prompt: String,
@@ -446,18 +437,11 @@ struct CalloutProjection {
 }
 
 fn project_callout(
-    request: PendingRequest,
+    pending_id: CalloutId,
+    callout_index: u32,
+    context: &[u8],
     schema: &ProgramSchema,
 ) -> anyhow::Result<CalloutProjection> {
-    let PendingRequest::Callout {
-        pending_id,
-        callout_index,
-        context,
-        ..
-    } = request
-    else {
-        anyhow::bail!("signing request is daemon-internal")
-    };
     let callout = schema
         .callouts
         .get(usize::try_from(callout_index).context("callout index overflow")?)
@@ -468,24 +452,22 @@ fn project_callout(
         name: callout.name.clone(),
         prompt: callout.prompt.clone(),
         schema: callout.output.clone(),
-        context: serde_json::from_slice(&context).context("decode callout context")?,
+        context: serde_json::from_slice(context).context("decode callout context")?,
     })
 }
 
 /// Project one durable execution event without requiring a live actor. This
-/// keeps terminal rows and acknowledged callouts observable across a restart.
+/// keeps terminal rows and the committed open callout observable across a
+/// restart.
 pub(crate) fn project_durable_next(
     state: ExecutionState,
-    pending: Vec<PendingRequest>,
     schema: &ProgramSchema,
 ) -> Result<Option<NextEvent>, ApiError> {
-    if let Some(request) = pending
-        .into_iter()
-        .find(|request| matches!(request, PendingRequest::Callout { .. }))
-    {
-        let projection = project_callout(request, schema).map_err(|error| {
-            ApiError::new(ApiErrorCode::Storage, format!("project callout: {error}"))
-        })?;
+    if let Some(open) = state.callout() {
+        let projection = project_callout(open.id, open.callout_index, &open.context, schema)
+            .map_err(|error| {
+                ApiError::new(ApiErrorCode::Storage, format!("project callout: {error}"))
+            })?;
         return Ok(Some(NextEvent::Callout {
             pending_id: projection.pending_id,
             callout_index: projection.callout_index,
@@ -495,8 +477,8 @@ pub(crate) fn project_durable_next(
             context: projection.context,
         }));
     }
-    match state.status() {
-        ExecutionStatus::Completed { .. } => Ok(Some(NextEvent::Completed {
+    match state.lifecycle() {
+        ExecLifecycle::Completed => Ok(Some(NextEvent::Completed {
             session_id: state.binding().session_id(),
             outcome: state
                 .terminal_outcome_json()
@@ -506,14 +488,16 @@ pub(crate) fn project_durable_next(
                     ApiError::new(ApiErrorCode::Storage, format!("decode outcome: {error}"))
                 })?,
         })),
-        ExecutionStatus::Stopped { cause } | ExecutionStatus::StoppedPublished { cause, .. } => {
-            Ok(Some(NextEvent::Failed {
-                reason: cause.reason().to_owned(),
-            }))
+        // The agent-facing stream reports every stop, abort or failure, as
+        // `Failed` with its cause.
+        ExecLifecycle::Aborted | ExecLifecycle::Failed => {
+            Ok(state
+                .status()
+                .terminal_cause()
+                .map(|cause| NextEvent::Failed {
+                    reason: cause.reason().to_owned(),
+                }))
         }
-        ExecutionStatus::Incomplete { reason, .. } => Ok(Some(NextEvent::Failed {
-            reason: reason.clone(),
-        })),
         _ => Ok(None),
     }
 }
@@ -528,13 +512,26 @@ pub(crate) struct ExecutionHandles {
 }
 
 /// Owns the live actor and its bounded supervisor loop. Durable execution
-/// state is always loaded through `entry.store`; no protocol state is copied.
+/// state is always loaded through `entry.store`; only the immutable session
+/// binding facts are cached.
 #[allow(missing_debug_implementations)]
 pub(crate) struct Supervisor {
     pub entry: Arc<ExecutionHandle>,
     pub spawned: SpawnedExec,
     pub events: Events,
     pub transport: Arc<dyn Transport + Sync>,
+    pub session: Option<SessionFacts>,
+    /// The actor was woken only to finish end confirmation. Its restart
+    /// replays observations this Host already reported, so none are projected.
+    pub replay: bool,
+}
+
+/// Session facts fixed by the committed activation.
+#[derive(Debug)]
+pub(crate) struct SessionFacts {
+    source: EventSource,
+    /// Participants in canonical activation order.
+    ensemble: Vec<arena0_protocol::PeerId>,
 }
 
 impl ExecutionHandles {
@@ -633,16 +630,14 @@ impl Supervisor {
         let initial_session = self.entry.session_id().await.ok().flatten();
         let exec_id = self.entry.exec_id;
         let mut resume = tokio::time::Instant::now() + stall;
-        let mut terminal = false;
         loop {
             tokio::select! {
                 _ = &mut stop => break,
                 event = self.spawned.message_rx.recv() => {
                     let Some(event) = event else { break };
                     resume = tokio::time::Instant::now() + stall;
-                    terminal = self.handle_message(event).await || terminal;
+                    self.handle_message(event).await;
                     self.entry.notify();
-                    if terminal { break; }
                 }
                 _ = tokio::time::sleep_until(resume) => {
                     if self.entry.lifecycle().await.is_ok_and(|state| state == ExecLifecycle::Active) {
@@ -660,28 +655,42 @@ impl Supervisor {
         }
     }
 
-    async fn handle_message(&mut self, message: SessionMessage) -> bool {
+    /// Immutable session facts, loaded once the execution aggregate exists.
+    async fn session(&mut self) -> Option<&SessionFacts> {
+        if self.session.is_none() {
+            let state = self.entry.execution().await.ok().flatten()?;
+            let binding = state.binding();
+            self.session = Some(SessionFacts {
+                source: EventSource::most_specific(
+                    self.entry.store.host_id(),
+                    self.entry.exec_id,
+                    binding.program_hash(),
+                    None,
+                    Some(binding.session_id()),
+                ),
+                ensemble: binding.participants().collect(),
+            });
+        }
+        self.session.as_ref()
+    }
+
+    /// Project one actor observation. Payloads carry the observed facts; the
+    /// store is read only for the trace entry, the callout's current state,
+    /// and a failure's lifecycle.
+    async fn handle_message(&mut self, message: SessionMessage) {
+        if self.replay {
+            return;
+        }
         match message {
             SessionMessage::SessionStarted { .. } => {
-                let Ok(Some(state)) = self.entry.execution().await else {
-                    return false;
+                let Some(session) = self.session().await else {
+                    return;
                 };
-                let source = EventSource::Session {
-                    peer_id: self.entry.store.host_id(),
-                    exec_id: self.entry.exec_id,
-                    program_id: state.binding().program_hash(),
-                    session_hash: state.binding().session_id(),
+                let event = HostEvent::SessionStarted {
+                    source: session.source.clone(),
+                    ensemble: session.ensemble.clone(),
                 };
-                self.events.emit(HostEvent::SessionStarted {
-                    source,
-                    ensemble: state
-                        .binding()
-                        .activation()
-                        .tickets()
-                        .iter()
-                        .map(|ticket| ticket.data.signer)
-                        .collect(),
-                });
+                self.events.emit(event);
             }
             SessionMessage::TraceAppended { step } => {
                 let Ok(entries) = self
@@ -690,49 +699,28 @@ impl Supervisor {
                     .read_trace(self.entry.exec_id, step, step.saturating_add(1))
                     .await
                 else {
-                    return false;
+                    return;
                 };
                 let Some(entry) = entries.into_iter().next() else {
-                    return false;
+                    return;
                 };
-                let Ok(Some(state)) = self.entry.execution().await else {
-                    return false;
-                };
-                let source = EventSource::Session {
-                    peer_id: self.entry.store.host_id(),
-                    exec_id: self.entry.exec_id,
-                    program_id: state.binding().program_hash(),
-                    session_hash: state.binding().session_id(),
+                let Some(session) = self.session().await else {
+                    return;
                 };
                 let signers = u16::try_from(entry.agreement.signers.count()).unwrap_or(u16::MAX);
-                let participants =
-                    u16::try_from(state.binding().activation().tickets().len()).unwrap_or(u16::MAX);
-                self.events.emit(HostEvent::SessionStep {
-                    source,
+                let participants = u16::try_from(session.ensemble.len()).unwrap_or(u16::MAX);
+                let event = HostEvent::SessionStep {
+                    source: session.source.clone(),
                     step: entry.step,
                     pre_state: entry.pre_state,
                     post_state: entry.post_state,
-                    fuel_used: entry.fuel_used,
                     signers,
                     participants,
-                });
+                };
+                self.events.emit(event);
             }
             SessionMessage::CalloutRequested { pending_id, .. } => {
-                let request = self
-                    .entry
-                    .store
-                    .list_pending_requests(self.entry.exec_id)
-                    .await
-                    .ok()
-                    .and_then(|requests| {
-                        requests.into_iter().find(|request| {
-                            request.pending_id() == pending_id
-                                && matches!(request, PendingRequest::Callout { .. })
-                        })
-                    });
-                if let Some(request) = request
-                    && let Ok(Some((source, projection))) = self.project_callout(request).await
-                {
+                if let Ok(Some((source, projection))) = self.project_callout(pending_id).await {
                     let CalloutProjection {
                         pending_id,
                         callout_index,
@@ -752,92 +740,87 @@ impl Supervisor {
                     });
                 }
             }
-            SessionMessage::Completed { .. } => {
-                if let Ok(Some(state)) = self.entry.execution().await
-                    && matches!(state.status(), ExecutionStatus::Completed { .. })
-                {
-                    let source = EventSource::Session {
-                        peer_id: self.entry.store.host_id(),
-                        exec_id: self.entry.exec_id,
-                        program_id: state.binding().program_hash(),
-                        session_hash: state.binding().session_id(),
-                    };
-                    let outcome = state
-                        .terminal_outcome_json()
-                        .and_then(|json| serde_json::from_slice(json).ok());
-                    self.events
-                        .emit(HostEvent::SessionCompleted { source, outcome });
-                    return true;
-                }
+            SessionMessage::Completed { result_json, .. } => {
+                let Some(session) = self.session().await else {
+                    return;
+                };
+                let event = HostEvent::SessionCompleted {
+                    source: session.source.clone(),
+                    outcome: result_json.and_then(|json| serde_json::from_slice(&json).ok()),
+                };
+                self.events.emit(event);
             }
-            SessionMessage::Aborted { .. } => {
-                if let Ok(Some(state)) = self.entry.execution().await {
-                    let source = EventSource::Session {
-                        peer_id: self.entry.store.host_id(),
-                        exec_id: self.entry.exec_id,
-                        program_id: state.binding().program_hash(),
-                        session_hash: state.binding().session_id(),
-                    };
-                    if let Some(cause) = state.status().terminal_cause() {
-                        let step = match cause {
-                            StopCause::Authenticated(occurrence) => {
-                                occurrence.coordinate().next_step()
-                            }
-                            StopCause::Shared { commitment, .. } => commitment.step,
-                        };
-                        self.events.emit(HostEvent::SessionAborted {
-                            source,
-                            step,
-                            reason: cause.reason().to_owned(),
-                            failure: if cause.kind() == AbortKind::Abort {
-                                arena0_protocol::ExecutionFailureCode::ProgramAborted
-                            } else {
-                                arena0_protocol::ExecutionFailureCode::Runtime
-                            },
-                        });
-                        return true;
-                    }
-                }
+            SessionMessage::Aborted { step, reason } => {
+                let Some(session) = self.session().await else {
+                    return;
+                };
+                let event = HostEvent::SessionAborted {
+                    source: session.source.clone(),
+                    step,
+                    reason,
+                    failure: arena0_protocol::ExecutionFailureCode::ProgramAborted,
+                };
+                self.events.emit(event);
             }
             SessionMessage::Failed { reason } => {
-                if let Ok(Some(state)) = self.entry.execution().await {
-                    let source = self.entry.event_source().await.ok();
-                    if state.lifecycle() == ExecLifecycle::Aborted {
-                        if let Some(source) = source {
-                            self.events.emit(HostEvent::SessionAborted {
-                                source,
-                                step: state.public().next_step().saturating_sub(1),
-                                reason,
-                                failure: arena0_protocol::ExecutionFailureCode::ProgramAborted,
-                            });
-                        }
-                    } else if let Some(source) = source {
-                        self.events.emit(HostEvent::Failed {
-                            source,
-                            reason,
-                            failure: arena0_protocol::ExecutionFailureCode::Runtime,
-                        });
-                    }
-                    return state.lifecycle().is_terminal();
-                }
+                // A supervisor failure can report over an execution that
+                // already stopped with an abort; the durable cause wins.
+                let Ok(Some(state)) = self.entry.execution().await else {
+                    return;
+                };
+                let Ok(source) = self.entry.event_source().await else {
+                    return;
+                };
+                let aborted = state
+                    .status()
+                    .terminal_cause()
+                    .filter(|cause| cause.kind() == AbortKind::Abort);
+                self.events.emit(match aborted {
+                    Some(cause) => HostEvent::SessionAborted {
+                        source,
+                        step: cause.step(),
+                        reason,
+                        failure: arena0_protocol::ExecutionFailureCode::ProgramAborted,
+                    },
+                    None => HostEvent::Failed {
+                        source,
+                        reason,
+                        failure: arena0_protocol::ExecutionFailureCode::Runtime,
+                    },
+                });
             }
-            SessionMessage::ReceiptPublished { .. } | SessionMessage::Notification { .. } => {}
+            SessionMessage::ReceiptPublished { .. } => {}
         }
-        false
     }
 
     async fn project_callout(
         &mut self,
-        request: PendingRequest,
+        pending_id: CalloutId,
     ) -> anyhow::Result<Option<(EventSource, CalloutProjection)>> {
+        let Some(state) = self.entry.execution().await? else {
+            return Ok(None);
+        };
+        let Some(open) = state.callout().filter(|open| open.id == pending_id) else {
+            return Ok(None);
+        };
         let program_id = self.entry.program_id().await?;
         let Some(stored) = self.entry.store.load_program(program_id).await? else {
             return Ok(None);
         };
         let program =
             Program::try_from(stored.wasm().to_vec()).context("parse execution program")?;
-        let event = project_callout(request, &program.definition().schema)?;
-        let source = self.entry.event_source().await?;
+        let event = project_callout(
+            pending_id,
+            open.callout_index,
+            &open.context,
+            &program.definition().schema,
+        )?;
+        let source = self
+            .session()
+            .await
+            .context("session facts are unavailable")?
+            .source
+            .clone();
         Ok(Some((source, event)))
     }
 }

@@ -23,18 +23,14 @@ const REQUIRED_FUNC_EXPORTS: &[(&str, &[AbiType], Returns)] = &[
         &[AbiType::I32, AbiType::I32],
         Returns::None,
     ),
+    (abi::exports::PREPARE, &[], Returns::One(AbiType::I32)),
     (
         abi::exports::INITIALIZE,
         &[AbiType::I32, AbiType::I32],
         Returns::Packed,
     ),
     (
-        abi::exports::SHARED,
-        &[AbiType::I32, AbiType::I32],
-        Returns::Packed,
-    ),
-    (
-        abi::exports::LOCAL,
+        abi::exports::DISPATCH,
         &[AbiType::I32, AbiType::I32],
         Returns::Packed,
     ),
@@ -61,7 +57,7 @@ const REQUIRED_FUNC_EXPORTS: &[(&str, &[AbiType], Returns)] = &[
     (abi::exports::METADATA, &[], Returns::Packed),
 ];
 
-const REQUIRED_GLOBAL_EXPORTS: &[&str] = &["arena0_abi_version"];
+const REQUIRED_GLOBAL_EXPORTS: &[&str] = &[abi::exports::ABI_VERSION];
 
 /// Globals at or above this value are assumed to be pointers into linear
 /// memory (the Rust wasm32 pattern for `#[no_mangle] static` items) and
@@ -139,8 +135,7 @@ fn validate_json_schema(label: &str, document: &JsonSchemaDocument) -> Result<()
     })
 }
 
-/// Verify the module exports all required arena0 function and global symbols.
-pub(crate) fn validate_exports(module: &Module) -> Result<(), SandboxError> {
+pub(crate) fn validate_required_exports(module: &Module) -> Result<(), SandboxError> {
     for &(name, params, returns) in REQUIRED_FUNC_EXPORTS {
         let export = module
             .exports()
@@ -161,6 +156,24 @@ pub(crate) fn validate_exports(module: &Module) -> Result<(), SandboxError> {
         }
     }
 
+    Ok(())
+}
+
+/// Verify the raw ABI-22 module exports all required functions and work memory
+/// before the artifact finalizer adds the state memories.
+pub(crate) fn validate_raw_exports(module: &Module) -> Result<(), SandboxError> {
+    validate_required_exports(module)?;
+    let memory = module
+        .exports()
+        .find(|export| export.name() == abi::exports::WORK_MEMORY)
+        .ok_or_else(|| SandboxError::MissingExport(abi::exports::WORK_MEMORY.into()))?;
+    if memory.ty().memory().is_none() {
+        return Err(SandboxError::InvalidExportSignature {
+            name: abi::exports::WORK_MEMORY.into(),
+            expected: "memory export",
+            actual: format!("{:?}", memory.ty()),
+        });
+    }
     Ok(())
 }
 
@@ -271,7 +284,7 @@ fn read_global_i32(
 
     // Rust wasm32 pattern: the global holds a pointer into linear memory.
     let memory = instance
-        .get_memory(&mut *store, "memory")
+        .get_memory(&mut *store, abi::exports::WORK_MEMORY)
         .ok_or_else(|| SandboxError::dispatch_failed("no 'memory' export"))?;
     let data = memory.data(&*store);
     let addr = raw as usize;
@@ -291,7 +304,7 @@ pub(crate) fn check_abi_version(
     store: &mut wasmtime::Store<super::engine::HostState>,
     instance: &wasmtime::Instance,
 ) -> Result<(), SandboxError> {
-    let version = read_global_i32(store, instance, "arena0_abi_version")?;
+    let version = read_global_i32(store, instance, abi::exports::ABI_VERSION)?;
 
     if version != EXPECTED_ABI_VERSION {
         return Err(SandboxError::InvalidAbiVersion {
@@ -325,7 +338,7 @@ mod tests {
         let abi_version = if omitted == Some("arena0_abi_version") {
             ""
         } else {
-            r#"(global (export "arena0_abi_version") i32 (i32.const 20))"#
+            r#"(global (export "arena0_abi_version") i32 (i32.const 22))"#
         };
         let alloc = export(
             "arena0_alloc",
@@ -337,20 +350,20 @@ mod tests {
             r#"(func (export "arena0_dealloc") (param i32 i32))"#,
             r#"(func (export "arena0_dealloc") (param i32))"#,
         );
+        let prepare = export(
+            "arena0_prepare",
+            r#"(func (export "arena0_prepare") (result i32) i32.const 1)"#,
+            r#"(func (export "arena0_prepare") (result i64) i64.const 1)"#,
+        );
         let initialize = export(
             "arena0_initialize",
             r#"(func (export "arena0_initialize") (param i32 i32) (result i64) i64.const 0)"#,
             r#"(func (export "arena0_initialize") (param i32) (result i64) i64.const 0)"#,
         );
-        let shared = export(
-            "arena0_shared",
-            r#"(func (export "arena0_shared") (param i32 i32) (result i64) i64.const 0)"#,
-            r#"(func (export "arena0_shared") (param i32) (result i64) i64.const 0)"#,
-        );
-        let local = export(
-            "arena0_local",
-            r#"(func (export "arena0_local") (param i32 i32) (result i64) i64.const 0)"#,
-            r#"(func (export "arena0_local") (param i32) (result i64) i64.const 0)"#,
+        let dispatch = export(
+            "arena0_dispatch",
+            r#"(func (export "arena0_dispatch") (param i32 i32) (result i64) i64.const 0)"#,
+            r#"(func (export "arena0_dispatch") (param i32) (result i64) i64.const 0)"#,
         );
         let writer = export(
             "arena0_writer",
@@ -380,13 +393,15 @@ mod tests {
         let wat = format!(
             r#"
             (module
-              (memory (export "memory") 1)
+              (memory (export "memory") 1 1024)
+              (memory (export "arena0_shared") 65 65)
+              (memory (export "arena0_local") 65 65)
               {abi_version}
               {alloc}
               {dealloc}
+              {prepare}
               {initialize}
-              {shared}
-              {local}
+              {dispatch}
               {writer}
               {outcome}
               {query}
@@ -398,18 +413,18 @@ mod tests {
     }
 
     #[test]
-    fn validate_exports_accepts_full_required_set() {
-        assert!(validate_exports(&stub_module(None, None)).is_ok());
+    fn validate_required_exports_accepts_full_set() {
+        assert!(validate_required_exports(&stub_module(None, None)).is_ok());
     }
 
     #[test]
-    fn validate_exports_requires_each_independent_required_export() {
+    fn validate_required_exports_checks_each_independent_export() {
         for name in [
             "arena0_alloc",
             "arena0_dealloc",
+            "arena0_prepare",
             "arena0_initialize",
-            "arena0_shared",
-            "arena0_local",
+            "arena0_dispatch",
             "arena0_writer",
             "arena0_outcome",
             "arena0_query",
@@ -417,7 +432,7 @@ mod tests {
             "arena0_metadata",
             "arena0_abi_version",
         ] {
-            let err = validate_exports(&stub_module(Some(name), None)).unwrap_err();
+            let err = validate_required_exports(&stub_module(Some(name), None)).unwrap_err();
             assert!(
                 matches!(&err, SandboxError::MissingExport(actual) if actual == name),
                 "unexpected omission error for {name}: {err}"
@@ -426,20 +441,20 @@ mod tests {
     }
 
     #[test]
-    fn validate_exports_rejects_each_independent_required_function_signature() {
+    fn validate_required_exports_checks_each_function_signature() {
         for name in [
             "arena0_alloc",
             "arena0_dealloc",
+            "arena0_prepare",
             "arena0_initialize",
-            "arena0_shared",
-            "arena0_local",
+            "arena0_dispatch",
             "arena0_writer",
             "arena0_outcome",
             "arena0_query",
             "arena0_view",
             "arena0_metadata",
         ] {
-            let err = validate_exports(&stub_module(None, Some(name))).unwrap_err();
+            let err = validate_required_exports(&stub_module(None, Some(name))).unwrap_err();
             assert!(
                 matches!(&err, SandboxError::InvalidExportSignature { name: actual, .. } if actual == name),
                 "unexpected signature error for {name}: {err}"
@@ -460,8 +475,7 @@ mod tests {
             crate::engine::HostState::new(
                 arena0_program::ExecutionProfile::current(),
                 crate::engine::CallKind::Metadata,
-                arena0_protocol::Lifecycle::PreSession,
-                None,
+                crate::call::DispatchKind::Local,
                 Vec::new(),
             ),
         );

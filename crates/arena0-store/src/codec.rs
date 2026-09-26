@@ -7,17 +7,14 @@ pub(crate) enum EnvelopeKind {
     Activation = 1,
     PreparedActivation = 2,
     ExecutionState = 3,
-    ExecutionInput = 4,
-    SharedCommit = 5,
-    PrivateCommit = 6,
-    TerminalPublication = 7,
+    EventRecord = 4,
+    AgreedStep = 5,
+    Effects = 6,
     Receipt = 8,
-    InboundFrame = 9,
-    Effect = 10,
-    Timer = 11,
-    ExecutionSalt = 12,
-    Program = 13,
-    ExecutionAdmission = 14,
+    Timer = 10,
+    ExecutionSalt = 11,
+    Program = 12,
+    ExecutionAdmission = 13,
 }
 
 impl EnvelopeKind {
@@ -33,19 +30,6 @@ pub(crate) struct DurableEnvelope {
     version: u16,
     payload: Vec<u8>,
     checksum: [u8; 32],
-}
-
-#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StoredFrame {
-    tag: u8,
-    payload: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InboxStatus {
-    Accepted,
-    Applied,
-    Consumed,
 }
 
 pub(crate) fn envelope(kind: EnvelopeKind, payload: &[u8]) -> Result<Vec<u8>, StoreError> {
@@ -106,28 +90,12 @@ pub(crate) fn envelope_checksum(kind: EnvelopeKind, payload: &[u8]) -> [u8; 32] 
     *hasher.finalize().as_bytes()
 }
 
-pub(crate) fn checksum(bytes: &[u8]) -> [u8; 32] {
-    *blake3::hash(bytes).as_bytes()
-}
-
 pub(crate) fn decode_borsh<T: BorshDeserialize>(
     bytes: &[u8],
     field: &str,
 ) -> Result<T, StoreError> {
     borsh::from_slice(bytes)
         .map_err(|error| StoreError::Corruption(format!("{field} decode: {error}")))
-}
-
-pub(crate) fn encoded_len<T: BorshSerialize>(value: &T, max: usize) -> Result<usize, StoreError> {
-    let bytes = borsh::to_vec(value)
-        .map_err(|error| StoreError::Corruption(format!("value encode: {error}")))?;
-    if bytes.len() > max {
-        return Err(StoreError::CommandTooLarge {
-            required: bytes.len(),
-            capacity: max,
-        });
-    }
-    Ok(bytes.len())
 }
 
 pub(crate) fn activation_bytes(activation: &Activation) -> Result<Vec<u8>, StoreError> {
@@ -146,8 +114,13 @@ pub(crate) fn state_bytes(state: &ExecutionState) -> Result<Vec<u8>, StoreError>
     state.encode().map_err(StoreError::Protocol)
 }
 
-pub(crate) fn input_bytes(input: &ExecutionInput) -> Result<Vec<u8>, StoreError> {
-    input.encode().map_err(StoreError::Protocol)
+pub(crate) fn event_bytes(event: &Event<Vec<u8>>) -> Result<Vec<u8>, StoreError> {
+    borsh::to_vec(event).map_err(|error| StoreError::Corruption(format!("event encode: {error}")))
+}
+
+pub(crate) fn effects_bytes(effects: &[Effect]) -> Result<Vec<u8>, StoreError> {
+    borsh::to_vec(effects)
+        .map_err(|error| StoreError::Corruption(format!("effects encode: {error}")))
 }
 
 pub(crate) fn decode_execution_salt(encoded: &[u8]) -> Result<ExecutionSalt, StoreError> {
@@ -163,207 +136,6 @@ pub(crate) fn decode_execution_salt(encoded: &[u8]) -> Result<ExecutionSalt, Sto
 pub(crate) fn max_program_bytes() -> Result<usize, StoreError> {
     usize::try_from(arena0_program::PROGRAM_MAX_LEN)
         .map_err(|_| StoreError::InvalidConfiguration("program size bound does not fit usize"))
-}
-
-pub(crate) fn frame_bytes(frame: &AuthenticatedFrame) -> Result<Vec<u8>, StoreError> {
-    let stored = canonical_frame_shape(&frame.frame)?;
-    borsh::to_vec(&stored)
-        .map_err(|error| StoreError::Corruption(format!("inbox frame encode: {error}")))
-}
-
-pub(crate) fn inbox_identity_bytes(
-    source: PeerId,
-    stored: &StoredFrame,
-) -> Result<Vec<u8>, StoreError> {
-    let canonical = borsh::to_vec(stored)
-        .map_err(|error| StoreError::Corruption(format!("inbox frame encode: {error}")))?;
-    let mut bytes = Vec::with_capacity(16 + 32 + canonical.len());
-    bytes.extend_from_slice(b"arena0/inbox/v1");
-    bytes.extend_from_slice(&source.0);
-    bytes.extend_from_slice(&canonical);
-    Ok(bytes)
-}
-
-pub(crate) fn inbox_identity_digest(
-    source: PeerId,
-    stored: &StoredFrame,
-) -> Result<[u8; 32], StoreError> {
-    let identity = inbox_identity_bytes(source, stored)?;
-    Ok(*blake3::hash(&identity).as_bytes())
-}
-
-pub(crate) fn occurrence_key_bytes(key: OccurrenceKey) -> Result<Vec<u8>, StoreError> {
-    borsh::to_vec(&key)
-        .map_err(|error| StoreError::Corruption(format!("occurrence key encode: {error}")))
-}
-
-pub(crate) fn decode_effect(encoded: &[u8]) -> Result<DurableEffect, StoreError> {
-    let payload = open_envelope(
-        EnvelopeKind::Effect,
-        encoded,
-        arena0_protocol::MAX_RECEIPT_BYTES,
-    )?;
-    decode_borsh(&payload, "outbox effect")
-}
-
-pub(crate) fn canonical_frame_shape(frame: &ExecFrame) -> Result<StoredFrame, StoreError> {
-    let (tag, payload) = match frame {
-        ExecFrame::Message {
-            message_id,
-            seq,
-            prestate,
-            data,
-            witness,
-        } => (
-            0,
-            borsh::to_vec(&(*message_id, *seq, *prestate, data, *witness)),
-        ),
-        ExecFrame::StepSignature {
-            commitment,
-            signature,
-        } => (1, borsh::to_vec(&(commitment, signature))),
-        ExecFrame::End {
-            commitment,
-            signature,
-        } => (2, borsh::to_vec(&(commitment, signature))),
-        ExecFrame::Abort { occurrence } => (3, borsh::to_vec(occurrence)),
-    };
-    let payload =
-        payload.map_err(|error| StoreError::Corruption(format!("inbox frame encode: {error}")))?;
-    let required = payload
-        .len()
-        .checked_add(5)
-        .ok_or_else(|| StoreError::CommandTooLarge {
-            required: usize::MAX,
-            capacity: MAX_FRAME_BYTES,
-        })?;
-    if required > MAX_FRAME_BYTES {
-        return Err(StoreError::CommandTooLarge {
-            required,
-            capacity: MAX_FRAME_BYTES,
-        });
-    }
-    Ok(StoredFrame { tag, payload })
-}
-
-pub(crate) fn decode_stored_frame(stored: &StoredFrame) -> Result<ExecFrame, StoreError> {
-    let frame = match stored.tag {
-        0 => {
-            let (message_id, seq, prestate, data, witness): (
-                MessageId,
-                u64,
-                StateHash,
-                Vec<u8>,
-                WitnessCommitment,
-            ) = decode_borsh(&stored.payload, "inbox message frame")?;
-            ExecFrame::Message {
-                message_id,
-                seq,
-                prestate,
-                data,
-                witness,
-            }
-        }
-        1 => {
-            let (commitment, signature): (StepCommitment, BlsSignature) =
-                decode_borsh(&stored.payload, "inbox step signature")?;
-            ExecFrame::StepSignature {
-                commitment,
-                signature,
-            }
-        }
-        2 => {
-            let (commitment, signature): (TerminalCommitment, BlsSignature) =
-                decode_borsh(&stored.payload, "inbox terminal signature")?;
-            ExecFrame::End {
-                commitment,
-                signature,
-            }
-        }
-        3 => ExecFrame::Abort {
-            occurrence: decode_borsh(&stored.payload, "inbox abort frame")?,
-        },
-        tag => {
-            return Err(StoreError::Corruption(format!(
-                "unknown stored inbox frame tag {tag}"
-            )));
-        }
-    };
-    if canonical_frame_shape(&frame)? != *stored {
-        return Err(StoreError::Corruption(
-            "stored inbox frame is not canonical".into(),
-        ));
-    }
-    Ok(frame)
-}
-
-pub(crate) fn canonical_frame(
-    frame: &AuthenticatedFrame,
-    state: &ExecutionState,
-) -> Result<StoredFrame, StoreError> {
-    if !is_participant(state, frame.source) {
-        return Err(StoreError::UnauthenticatedSource(format!(
-            "{} is not an activation participant",
-            frame.source
-        )));
-    }
-    match &frame.frame {
-        ExecFrame::Message {
-            message_id,
-            seq,
-            prestate,
-            data,
-            witness,
-        } => {
-            let expected = MessageId::derive(
-                state.binding().session_id(),
-                frame.source,
-                *seq,
-                *prestate,
-                data,
-                *witness,
-            );
-            if expected != *message_id {
-                return Err(StoreError::UnauthenticatedSource(
-                    "message id does not authenticate its source".into(),
-                ));
-            }
-        }
-        ExecFrame::StepSignature { commitment, .. } => {
-            if commitment.session_id != state.binding().session_id() {
-                return Err(StoreError::UnauthenticatedSource(
-                    "step signature names another session".into(),
-                ));
-            }
-        }
-        ExecFrame::End { commitment, .. } => {
-            if commitment.session_id != state.binding().session_id() {
-                return Err(StoreError::UnauthenticatedSource(
-                    "terminal signature names another session".into(),
-                ));
-            }
-        }
-        ExecFrame::Abort { occurrence } => {
-            if occurrence.sender() != frame.source
-                || occurrence.session_id() != state.binding().session_id()
-                || !occurrence.verify_signature()?
-            {
-                return Err(StoreError::UnauthenticatedSource(
-                    "abort occurrence is not authenticated by its source".into(),
-                ));
-            }
-        }
-    }
-    canonical_frame_shape(&frame.frame)
-}
-
-pub(crate) fn is_participant(state: &ExecutionState, peer: PeerId) -> bool {
-    state
-        .binding()
-        .activation()
-        .tickets()
-        .iter()
-        .any(|ticket| ticket.data.signer == peer)
 }
 
 pub(crate) fn prepared_activation_record(
@@ -400,28 +172,6 @@ pub(crate) fn parse_activation_status(value: &str) -> Result<ActivationRecordSta
     }
 }
 
-pub(crate) fn parse_inbox_status(value: &str) -> Result<InboxStatus, StoreError> {
-    match value {
-        "accepted" => Ok(InboxStatus::Accepted),
-        "applied" => Ok(InboxStatus::Applied),
-        "consumed" => Ok(InboxStatus::Consumed),
-        other => Err(StoreError::Corruption(format!(
-            "unknown inbox status {other}"
-        ))),
-    }
-}
-
-pub(crate) fn parse_outbox_status(value: &str) -> Result<OutboxStatus, StoreError> {
-    match value {
-        "pending" => Ok(OutboxStatus::Pending),
-        "leased" => Ok(OutboxStatus::Leased),
-        "acknowledged" => Ok(OutboxStatus::Acknowledged),
-        other => Err(StoreError::Corruption(format!(
-            "unknown outbox status {other}"
-        ))),
-    }
-}
-
 pub(crate) fn lifecycle_tag(lifecycle: ExecLifecycle) -> i64 {
     match lifecycle {
         ExecLifecycle::Negotiating => 0,
@@ -430,14 +180,13 @@ pub(crate) fn lifecycle_tag(lifecycle: ExecLifecycle) -> i64 {
         ExecLifecycle::Active => 3,
         ExecLifecycle::Completed => 4,
         ExecLifecycle::Aborted => 5,
-        ExecLifecycle::Incomplete => 6,
         ExecLifecycle::Failed => 7,
     }
 }
 
 pub(crate) fn bounded_reason(reason: String) -> Result<String, StoreError> {
     if reason.len() > MAX_ERROR_BYTES {
-        return Err(StoreError::CommandTooLarge {
+        return Err(StoreError::PayloadTooLarge {
             required: reason.len(),
             capacity: MAX_ERROR_BYTES,
         });
@@ -448,12 +197,12 @@ pub(crate) fn bounded_reason(reason: String) -> Result<String, StoreError> {
 pub(crate) fn account_response(current: &mut usize, additional: usize) -> Result<(), StoreError> {
     let next = current
         .checked_add(additional)
-        .ok_or(StoreError::CommandTooLarge {
+        .ok_or(StoreError::PayloadTooLarge {
             required: usize::MAX,
             capacity: MAX_RESPONSE_BYTES,
         })?;
     if next > MAX_RESPONSE_BYTES {
-        return Err(StoreError::CommandTooLarge {
+        return Err(StoreError::PayloadTooLarge {
             required: next,
             capacity: MAX_RESPONSE_BYTES,
         });
@@ -483,24 +232,36 @@ pub(crate) fn array32(bytes: &[u8], field: &str) -> Result<[u8; 32], StoreError>
 pub(crate) fn peer_id_from_blob(bytes: &[u8], field: &str) -> Result<PeerId, StoreError> {
     Ok(PeerId(array32(bytes, field)?))
 }
-
-pub(crate) fn derive_lease_id(outbox_id: OutboxId, attempts: u32, now_ms: u64) -> LeaseId {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"arena0/store/outbox-lease/v1");
-    hasher.update(outbox_id.as_bytes());
-    hasher.update(&attempts.to_le_bytes());
-    hasher.update(&now_ms.to_le_bytes());
-    LeaseId::from_bytes(*hasher.finalize().as_bytes())
+/// Narrow end-phase projection used for routing without loading state images.
+pub(crate) fn end_columns(end: &arena0_protocol::EndPhase) -> Result<(i64, Vec<u8>), StoreError> {
+    use arena0_protocol::EndPhase;
+    let empty = std::collections::BTreeSet::<PeerId>::new();
+    let (tag, peers) = match end {
+        EndPhase::Open => (0, &empty),
+        EndPhase::Ending { unconfirmed } => (1, unconfirmed),
+        EndPhase::Ended { unconfirmed } => (2, unconfirmed),
+    };
+    Ok((
+        tag,
+        borsh::to_vec(peers).map_err(|e| StoreError::Corruption(e.to_string()))?,
+    ))
 }
 
-pub(crate) fn unix_time_ms() -> Result<u64, StoreError> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| {
-            StoreError::Io(std::io::Error::other(format!(
-                "system clock before Unix epoch: {error}"
-            )))
-        })?;
-    u64::try_from(duration.as_millis())
-        .map_err(|_| StoreError::Corruption("system clock millisecond value exceeds u64".into()))
+pub(crate) fn decode_end(tag: i64, bytes: &[u8]) -> Result<arena0_protocol::EndPhase, StoreError> {
+    use arena0_protocol::EndPhase;
+    if bytes.len() > 4 + arena0_protocol::MAX_PARTICIPANTS * 32 {
+        return Err(StoreError::Corruption(
+            "end peer set exceeds participant bound".into(),
+        ));
+    }
+    let unconfirmed: std::collections::BTreeSet<PeerId> =
+        borsh::from_slice(bytes).map_err(|e| StoreError::Corruption(e.to_string()))?;
+    match tag {
+        0 if unconfirmed.is_empty() => Ok(EndPhase::Open),
+        1 if !unconfirmed.is_empty() => Ok(EndPhase::Ending { unconfirmed }),
+        2 => Ok(EndPhase::Ended { unconfirmed }),
+        _ => Err(StoreError::Corruption(
+            "invalid end phase projection".into(),
+        )),
+    }
 }

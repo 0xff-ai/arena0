@@ -4,12 +4,12 @@
 //! Host-explicit MCP endpoint serve every Host.
 //!
 //! The trust boundary is custody: the daemon holds the seeds and performs all
-//! signing (step attestations, BLS activation ratification, program `Sign` effects);
-//! a client supplies only callout *answers* and never holds a key. The execution
-//! actor completes guest signing continuations without crossing the socket.
+//! signing (step attestations, BLS activation ratification, synchronous guest
+//! signing calls); a client supplies only callout *answers* and never holds a
+//! key. The execution actor performs guest signing without crossing the socket.
 //!
 //! Daemon state changes record one redacted system event and publish one
-//! matching local API frame through a private Host event feed.
+//! matching local API frame through a Host-local event feed.
 
 mod assets;
 mod catalog;
@@ -31,4 +31,4 @@ mod open_host_tests;
 pub use ensemble::{Daemon, McpConfig};
 pub use paths::Paths;
 pub use run::run;
-pub use store::{Keystore, KeystoreError};
+pub use store::Keystore;

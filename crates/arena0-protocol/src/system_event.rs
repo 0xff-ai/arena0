@@ -3,10 +3,10 @@
 //! These types describe host and protocol facts. They are not guest ABI,
 //! guest wire, receipt, or durable trace types.
 
-use crate::PendingId;
+use crate::CalloutId;
 use valuable::Valuable;
 
-use crate::{ExecId, ExecLifecycle, NegotiationId, PeerId, SessionHash, StateHash, TicketHash};
+use crate::{ExecId, ExecLifecycle, NegotiationId, PeerId, SessionHash, TicketHash};
 use arena0_program::ProgramHash;
 
 /// One safe host or protocol occurrence for structured tracing.
@@ -52,6 +52,41 @@ pub enum EventSource {
         program_id: ProgramHash,
         session_hash: SessionHash,
     },
+}
+
+impl EventSource {
+    /// The most specific source for an execution: its session once the
+    /// execution aggregate exists, else its negotiation, else the bare
+    /// execution (an open Join can fail before it accepts an offer, so no
+    /// negotiation identity exists yet).
+    #[must_use]
+    pub const fn most_specific(
+        peer_id: PeerId,
+        exec_id: ExecId,
+        program_id: ProgramHash,
+        negotiation_id: Option<NegotiationId>,
+        session_hash: Option<SessionHash>,
+    ) -> Self {
+        match (session_hash, negotiation_id) {
+            (Some(session_hash), _) => Self::Session {
+                peer_id,
+                exec_id,
+                program_id,
+                session_hash,
+            },
+            (None, Some(negotiation_id)) => Self::Negotiation {
+                peer_id,
+                exec_id,
+                program_id,
+                negotiation_id,
+            },
+            (None, None) => Self::Execution {
+                peer_id,
+                exec_id,
+                program_id,
+            },
+        }
+    }
 }
 
 /// Safe negotiation progress and decisions.
@@ -125,20 +160,12 @@ pub enum ExecutionEvent {
     SessionStarted {
         ensemble: Vec<PeerId>,
     },
-    StepCommitted {
-        step: u64,
-        pre_state: StateHash,
-        post_state: StateHash,
-        fuel_used: u64,
-        signer_count: u16,
-        participant_count: u16,
-    },
     CalloutRequested {
-        pending_id: PendingId,
+        pending_id: CalloutId,
         callout_index: u32,
     },
     CalloutAnswered {
-        pending_id: PendingId,
+        pending_id: CalloutId,
     },
     Terminal {
         kind: TerminalKind,

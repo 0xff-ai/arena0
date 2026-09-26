@@ -237,6 +237,16 @@ impl PreparedActivation {
         &self.tickets
     }
 
+    /// Each ticket's signer, in canonical ticket order (creator first).
+    pub fn signers(&self) -> impl Iterator<Item = PeerId> + '_ {
+        self.tickets.iter().map(|ticket| ticket.data.signer)
+    }
+
+    /// The activated participant set, in sorted ensemble order.
+    pub fn ensemble(&self) -> Result<crate::Ensemble, crate::EnsembleError> {
+        crate::Ensemble::from_peers(self.signers().collect())
+    }
+
     /// Borrow the activation preimage fixed during preparation.
     #[must_use]
     pub const fn activation_data(&self) -> &ActivationData {
@@ -583,10 +593,16 @@ pub(crate) fn verify_identity_signature(
 /// plus the matching full tickets. The committed collective signature is
 /// validated only on [`Activation`]; [`ActivationAnnouncement`] carries that
 /// signature for bounded gossip without the full ticket bodies.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize)]
 pub struct Offer {
     data: OfferData,
     /// Creator ticket first, rest ascending `PeerId`; freezes at `target_size`.
+    tickets: Vec<TicketHash>,
+}
+
+#[derive(BorshDeserialize)]
+struct OfferRaw {
+    data: OfferData,
     tickets: Vec<TicketHash>,
 }
 
@@ -762,18 +778,10 @@ impl<'de> Deserialize<'de> for Offer {
     }
 }
 
-impl BorshSerialize for Offer {
-    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        BorshSerialize::serialize(&self.data, writer)?;
-        BorshSerialize::serialize(&self.tickets, writer)
-    }
-}
-
 impl BorshDeserialize for Offer {
     fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> io::Result<Self> {
-        let data = OfferData::deserialize_reader(reader)?;
-        let tickets = Vec::<TicketHash>::deserialize_reader(reader)?;
-        Self::new(data, tickets).map_err(invalid_data)
+        let raw = OfferRaw::deserialize_reader(reader)?;
+        Self::new(raw.data, raw.tickets).map_err(invalid_data)
     }
 }
 
@@ -1068,7 +1076,7 @@ pub struct TicketData {
 
 /// The ticket action. Validity lives only on `Active`: a withdrawal is a
 /// revision tombstone, not temporary consent.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub enum TicketAction {
     Active {
         /// The per-execution BLS public key the activation aggregate verifies
@@ -1085,44 +1093,6 @@ pub enum TicketAction {
         valid_for_ms: u32,
     },
     Withdrawn,
-}
-
-impl BorshSerialize for TicketAction {
-    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        match self {
-            Self::Active {
-                execution_bls,
-                key_binding,
-                issued_at_unix_ms,
-                valid_for_ms,
-            } => {
-                BorshSerialize::serialize(&0u8, writer)?;
-                BorshSerialize::serialize(execution_bls, writer)?;
-                BorshSerialize::serialize(key_binding, writer)?;
-                BorshSerialize::serialize(issued_at_unix_ms, writer)?;
-                BorshSerialize::serialize(valid_for_ms, writer)
-            }
-            Self::Withdrawn => BorshSerialize::serialize(&1u8, writer),
-        }
-    }
-}
-
-impl BorshDeserialize for TicketAction {
-    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> io::Result<Self> {
-        match u8::deserialize_reader(reader)? {
-            0 => Ok(Self::Active {
-                execution_bls: BlsPublicKey::deserialize_reader(reader)?,
-                key_binding: BlsSignature::deserialize_reader(reader)?,
-                issued_at_unix_ms: u64::deserialize_reader(reader)?,
-                valid_for_ms: u32::deserialize_reader(reader)?,
-            }),
-            1 => Ok(Self::Withdrawn),
-            tag => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown ticket action tag {tag}"),
-            )),
-        }
-    }
 }
 
 impl TicketData {
@@ -1497,7 +1467,8 @@ pub struct ActivationTickets {
 }
 
 impl ActivationTickets {
-    /// Validate the ticket count and the bounded encoded response size.
+    /// Validate the ticket count and the encoded size of the fetch frame that
+    /// carries this response.
     pub fn validate(&self) -> Result<(), NegotiationError> {
         if self.tickets.len() > MAX_FETCH_TICKETS {
             return Err(NegotiationError::FetchTooManyTickets {
@@ -1508,9 +1479,11 @@ impl ActivationTickets {
         for ticket in &self.tickets {
             ticket.validate()?;
         }
-        let len = borsh::to_vec(self)
-            .expect("ActivationTickets is serializable")
-            .len();
+        let len = crate::fetch_frame::response_body_len(
+            self.tickets
+                .iter()
+                .map(|ticket| borsh::object_length(ticket).expect("a ticket is serializable")),
+        );
         if len > MAX_FETCH_RESPONSE_BYTES {
             return Err(NegotiationError::FetchResponseTooLarge {
                 max: MAX_FETCH_RESPONSE_BYTES,
@@ -1544,7 +1517,10 @@ pub const NEGOTIATION_GOSSIP_VERSION: u16 = 1;
 const _: () = assert!(NEGOTIATION_GOSSIP_DOMAIN.len() == 24);
 
 /// One immutable program-topic negotiation fact.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+///
+/// Variants are declared in tag order: the derived codec numbers them from
+/// zero, matching the previous explicit tags.
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub enum NegotiationFact {
     /// A creator-authored unsigned offer (data + ticket hashes).
     Offer(Offer),
@@ -1552,65 +1528,10 @@ pub enum NegotiationFact {
     Ticket(Ticket),
     /// A signer's BLS confirmation over the exact `ActivationData`.
     ActivationSignature(ActivationSignature),
-    /// The creator's bounded announcement for exact prepared activation facts.
-    ActivationAnnouncement(ActivationAnnouncement),
     /// A participant's non-binding preference announcement.
     Counteroffer(Counteroffer),
-}
-
-const NEGOTIATION_FACT_OFFER: u8 = 0;
-const NEGOTIATION_FACT_TICKET: u8 = 1;
-const NEGOTIATION_FACT_ACTIVATION_SIGNATURE: u8 = 2;
-const NEGOTIATION_FACT_COUNTEROFFER: u8 = 3;
-const NEGOTIATION_FACT_ACTIVATION_ANNOUNCEMENT: u8 = 4;
-
-impl BorshSerialize for NegotiationFact {
-    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        match self {
-            Self::Offer(offer) => {
-                BorshSerialize::serialize(&NEGOTIATION_FACT_OFFER, writer)?;
-                BorshSerialize::serialize(offer, writer)
-            }
-            Self::Ticket(ticket) => {
-                BorshSerialize::serialize(&NEGOTIATION_FACT_TICKET, writer)?;
-                BorshSerialize::serialize(ticket, writer)
-            }
-            Self::ActivationSignature(signature) => {
-                BorshSerialize::serialize(&NEGOTIATION_FACT_ACTIVATION_SIGNATURE, writer)?;
-                BorshSerialize::serialize(signature, writer)
-            }
-            Self::ActivationAnnouncement(announcement) => {
-                BorshSerialize::serialize(&NEGOTIATION_FACT_ACTIVATION_ANNOUNCEMENT, writer)?;
-                BorshSerialize::serialize(announcement, writer)
-            }
-            Self::Counteroffer(counteroffer) => {
-                BorshSerialize::serialize(&NEGOTIATION_FACT_COUNTEROFFER, writer)?;
-                BorshSerialize::serialize(counteroffer, writer)
-            }
-        }
-    }
-}
-
-impl BorshDeserialize for NegotiationFact {
-    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> io::Result<Self> {
-        match u8::deserialize_reader(reader)? {
-            NEGOTIATION_FACT_OFFER => Ok(Self::Offer(Offer::deserialize_reader(reader)?)),
-            NEGOTIATION_FACT_TICKET => Ok(Self::Ticket(Ticket::deserialize_reader(reader)?)),
-            NEGOTIATION_FACT_ACTIVATION_SIGNATURE => Ok(Self::ActivationSignature(
-                ActivationSignature::deserialize_reader(reader)?,
-            )),
-            NEGOTIATION_FACT_ACTIVATION_ANNOUNCEMENT => Ok(Self::ActivationAnnouncement(
-                ActivationAnnouncement::deserialize_reader(reader)?,
-            )),
-            NEGOTIATION_FACT_COUNTEROFFER => Ok(Self::Counteroffer(
-                Counteroffer::deserialize_reader(reader)?,
-            )),
-            tag => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown negotiation fact tag {tag}"),
-            )),
-        }
-    }
+    /// The creator's bounded announcement for exact prepared activation facts.
+    ActivationAnnouncement(ActivationAnnouncement),
 }
 
 impl NegotiationFact {
@@ -2172,6 +2093,47 @@ mod tests {
             ),
             Err(NegotiationError::DuplicateTicketHash(_))
         ));
+    }
+
+    #[test]
+    fn negotiation_facts_round_trip_with_stable_tags() {
+        let activation = valid_activation();
+        let facts = [
+            NegotiationFact::Offer(activation.offer().clone()),
+            NegotiationFact::Ticket(activation.tickets()[0].clone()),
+            NegotiationFact::ActivationSignature(
+                ActivationSignature::new(
+                    SessionHash([1; 32]),
+                    TicketHash([2; 32]),
+                    BlsSignature([3; 48]),
+                )
+                .expect("valid activation signature"),
+            ),
+            NegotiationFact::Counteroffer(Counteroffer {
+                data: CounterofferData::new(
+                    NegotiationId([0x11; 32]),
+                    PeerId([1; 32]),
+                    vec![0xAA; 3],
+                    1,
+                    60_000,
+                )
+                .expect("valid counteroffer data"),
+                signature: Ed25519Signature([0; 64]),
+            }),
+            NegotiationFact::ActivationAnnouncement(ActivationAnnouncement::from_activation(
+                &activation,
+            )),
+        ];
+        // Declaration order pins the historical tags 0..=4.
+        for (tag, fact) in facts.iter().enumerate() {
+            let encoded = borsh::to_vec(fact).unwrap();
+            assert_eq!(encoded[0], tag as u8);
+            assert_eq!(
+                borsh::from_slice::<NegotiationFact>(&encoded).unwrap(),
+                *fact
+            );
+        }
+        assert!(borsh::from_slice::<NegotiationFact>(&[5]).is_err());
     }
 
     #[test]

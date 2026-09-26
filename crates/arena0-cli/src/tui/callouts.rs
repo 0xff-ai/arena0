@@ -1,11 +1,11 @@
-use super::{ExecId, HostName, PendingId, TextArea, Value, oneshot};
+use super::{CalloutId, ExecId, HostName, TextArea, Value, oneshot};
 use std::collections::VecDeque;
 
 #[derive(Debug)]
 pub(super) struct PendingCallout {
     pub(super) host: HostName,
     pub(super) exec_id: ExecId,
-    pub(super) pending_id: PendingId,
+    pub(super) pending_id: CalloutId,
     pub(super) callout_index: u32,
     pub(super) name: String,
     pub(super) prompt: String,
@@ -14,9 +14,9 @@ pub(super) struct PendingCallout {
     pub(super) editor: TextArea<'static>,
     pub(super) scroll: u16,
     pub(super) validation_error: Option<String>,
-    /// The monitor has sent this answer to the daemon and is waiting for the
-    /// explicit result.  Keeping the editor alive here protects the draft when
-    /// the transport outcome is unknown.
+    /// The monitor or run driver has sent this answer and is waiting for the
+    /// daemon result. Keeping the editor protects the draft after a program
+    /// rejection or an unknown transport outcome.
     pub(super) submitting: bool,
     pub(super) submission_error: Option<String>,
     pub(super) not_pending: bool,
@@ -28,7 +28,7 @@ impl PendingCallout {
         &self,
         host: &HostName,
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
         callout_index: u32,
     ) -> bool {
         self.host == *host
@@ -88,7 +88,7 @@ impl CalloutQueue {
         &self,
         host: &HostName,
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
     ) -> Option<&str> {
         self.requests
             .iter()
@@ -123,7 +123,7 @@ impl CalloutQueue {
         &mut self,
         host: &HostName,
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
     ) -> bool {
         let Some(index) = self.requests.iter().position(|request| {
             request.host == *host
@@ -141,7 +141,7 @@ impl CalloutQueue {
         &mut self,
         host: &HostName,
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
     ) -> Option<&mut PendingCallout> {
         self.requests.iter_mut().find(|request| {
             request.host == *host && request.exec_id == exec_id && request.pending_id == pending_id
@@ -153,15 +153,24 @@ impl CalloutQueue {
             self.selected = (self.selected + 1) % self.len();
         }
     }
+
+    /// After sending an answer, present the next callout that can accept one.
+    /// The submitted callout stays queued until the daemon responds.
+    pub(super) fn select_next_answerable(&mut self) {
+        for offset in 1..=self.len() {
+            let index = (self.selected + offset) % self.len();
+            if self.requests.get(index).is_some_and(|request| {
+                !request.submitting && !request.not_pending && request.reply.is_some()
+            }) {
+                self.selected = index;
+                break;
+            }
+        }
+    }
     pub(super) fn previous(&mut self) {
         if !self.is_empty() {
             self.selected = (self.selected + self.len() - 1) % self.len();
         }
-    }
-    pub(super) fn remove_selected(&mut self) -> Option<PendingCallout> {
-        let request = self.requests.remove(self.selected);
-        self.selected = 0;
-        request
     }
     pub(super) fn clear(&mut self) {
         self.requests.clear();
@@ -172,7 +181,7 @@ impl CalloutQueue {
         &mut self,
         host: &HostName,
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
     ) -> Option<PendingCallout> {
         let index = self.requests.iter().position(|request| {
             request.host == *host && request.exec_id == exec_id && request.pending_id == pending_id

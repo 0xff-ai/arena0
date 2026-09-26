@@ -6,6 +6,8 @@ use arena0_program::{JsonBytes, MAX_CALL_PAYLOAD_BYTES};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
+use arena0_program::bounded;
+
 use super::{MAX_TERMINAL_OUTCOME_BYTES, ProtocolError};
 
 /// The canonical Borsh outcome and its agent-facing JSON projection produced
@@ -17,7 +19,29 @@ use super::{MAX_TERMINAL_OUTCOME_BYTES, ProtocolError};
 /// evidence can be collected.
 #[derive(BorshSerialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct TerminalOutcome {
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_TERMINAL_OUTCOME_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_TERMINAL_OUTCOME_BYTES>"
+    )]
     borsh: Vec<u8>,
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_TERMINAL_OUTCOME_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_TERMINAL_OUTCOME_BYTES>"
+    )]
+    json: Vec<u8>,
+}
+
+#[derive(BorshDeserialize)]
+struct TerminalOutcomeRaw {
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_TERMINAL_OUTCOME_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_TERMINAL_OUTCOME_BYTES>"
+    )]
+    borsh: Vec<u8>,
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_TERMINAL_OUTCOME_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_TERMINAL_OUTCOME_BYTES>"
+    )]
     json: Vec<u8>,
 }
 
@@ -51,10 +75,8 @@ impl TerminalOutcome {
 
 impl BorshDeserialize for TerminalOutcome {
     fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
-        let borsh =
-            crate::bounded::read_bytes(reader, MAX_TERMINAL_OUTCOME_BYTES, "Borsh outcome")?;
-        let json = crate::bounded::read_bytes(reader, MAX_TERMINAL_OUTCOME_BYTES, "JSON outcome")?;
-        Self::new(borsh, json).map_err(to_io_error)
+        let raw = TerminalOutcomeRaw::deserialize_reader(reader)?;
+        Self::new(raw.borsh, raw.json).map_err(to_io_error)
     }
 }
 

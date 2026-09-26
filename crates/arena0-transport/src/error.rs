@@ -18,6 +18,9 @@ pub enum TransportError {
     /// The receiver declined durable responsibility for an execution frame.
     #[error("execution frame was rejected by the receiver")]
     ExecRejected,
+    /// The receiver must advance before it can apply this frame.
+    #[error("execution frame cannot be applied yet")]
+    ExecNotYet,
     /// The receiver found conflicting durable evidence for an execution frame.
     #[error("execution frame conflicts with receiver evidence")]
     ExecConflict,
@@ -43,9 +46,6 @@ pub enum TransportError {
     /// The remote peer speaks an incompatible protocol version.
     #[error("protocol mismatch: {0}")]
     ProtocolMismatch(String),
-    /// A decoded frame does not satisfy the protocol-domain contract.
-    #[error("invalid protocol frame: {0}")]
-    InvalidFrame(String),
     /// The message exceeds the maximum allowed size.
     #[error("payload too large: {size} bytes (max {max})")]
     PayloadTooLarge { size: usize, max: usize },
@@ -110,25 +110,6 @@ impl From<arena0_wire::WireError> for TransportError {
                 field: _,
             } => Self::PayloadTooLarge { size, max },
             other => Self::ProtocolMismatch(other.to_string()),
-        }
-    }
-}
-
-impl From<arena0_protocol::ExecFrameError> for TransportError {
-    fn from(error: arena0_protocol::ExecFrameError) -> Self {
-        match error {
-            arena0_protocol::ExecFrameError::Wire(error) => Self::from(error),
-            arena0_protocol::ExecFrameError::Commitment(error) => Self::InvalidFrame(error),
-            arena0_protocol::ExecFrameError::Abort(error) => Self::InvalidFrame(error),
-        }
-    }
-}
-
-impl From<arena0_protocol::FetchFrameError> for TransportError {
-    fn from(error: arena0_protocol::FetchFrameError) -> Self {
-        match error {
-            arena0_protocol::FetchFrameError::Wire(error) => Self::from(error),
-            other => Self::InvalidFrame(other.to_string()),
         }
     }
 }

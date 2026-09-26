@@ -10,23 +10,33 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
-use crate::{ABI_VERSION, Capability};
+use crate::{ABI_VERSION, CANONICAL_STATE_MEMORY_BYTES, Capability};
 
 /// Version of the canonical execution-profile representation.
-pub const EXECUTION_PROFILE_VERSION: u32 = 1;
+pub const EXECUTION_PROFILE_VERSION: u32 = 3;
 
 /// Maximum deterministic Wasm stack size.
 pub const MAX_WASM_STACK_BYTES: usize = 512 * 1024;
-/// Maximum deterministic linear memory per instance.
+/// Maximum deterministic work-memory size per resident instance.
 pub const MAX_WASM_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+/// Minimum work-memory size established by `arena0_prepare` before a resident
+/// instance captures its baseline.
+pub const MIN_PREPARED_WORK_MEMORY_BYTES: usize = 56 * 1024 * 1024;
+/// Maximum size of one fixed canonical state memory.
+pub const MAX_WASM_STATE_MEMORY_BYTES: usize = CANONICAL_STATE_MEMORY_BYTES;
+/// Aggregate declared linear-memory maximum of one resident instance.
+pub const MAX_WASM_TOTAL_MEMORY_BYTES: usize =
+    MAX_WASM_MEMORY_BYTES + (2 * MAX_WASM_STATE_MEMORY_BYTES);
 /// Maximum metadata returned by the bounded metadata probe.
 pub const MAX_METADATA_BYTES: u32 = 4 * 1024 * 1024;
 /// Maximum bytes returned by one guest projection.
 pub const MAX_OUTPUT_BYTES: u32 = 4 * 1024 * 1024;
 /// Maximum bytes in one event, parameter, query, or projection payload.
 pub const MAX_INPUT_BYTES: u32 = 4 * 1024 * 1024;
-/// Maximum cumulative bytes copied by host imports in one call.
-pub const MAX_HOST_BYTES: u32 = 16 * 1024 * 1024;
+/// Maximum cumulative bytes copied by host imports in one call. The bound
+/// covers both 4 MiB state payloads being read and written, plus the bounded
+/// dispatch envelope and ordinary effect payload copies.
+pub const MAX_HOST_BYTES: u32 = 32 * 1024 * 1024;
 /// Maximum effects emitted by one guest dispatch.
 pub const MAX_EFFECTS_PER_DISPATCH: u32 = 100;
 /// Maximum encoded bytes occupied by all effects from one call.
@@ -41,16 +51,16 @@ pub const MAX_HOST_CALLS: u32 = 10_000;
 pub const MAX_RANDOM_DRAWS: u32 = 1_000;
 /// Maximum encoded bytes in one complete guest-call input or result envelope.
 pub const MAX_CALL_ENVELOPE_BYTES: u32 = 16 * 1024 * 1024;
-/// Maximum Wasm table elements available to one fresh instance.
+/// Maximum Wasm table elements available to one resident instance.
 pub const MAX_WASM_TABLE_ELEMENTS: u32 = 100_000;
 /// Maximum Wasm instances created by one store.
 pub const MAX_WASM_INSTANCES: u32 = 1;
-/// Maximum Wasm tables available to one fresh instance.
+/// Maximum Wasm tables available to one resident instance.
 pub const MAX_WASM_TABLES: u32 = 1;
-/// Maximum Wasm memories available to one fresh instance.
-pub const MAX_WASM_MEMORIES: u32 = 1;
+/// Maximum Wasm memories available to one resident instance.
+pub const MAX_WASM_MEMORIES: u32 = 3;
 /// Revision of the deterministic sandbox semantics.
-pub const EXECUTION_SEMANTICS_VERSION: u32 = 1;
+pub const EXECUTION_SEMANTICS_VERSION: u32 = 2;
 /// Compiler/engine identity bound into the execution profile.
 pub const EXECUTION_ENGINE_ID: &str = "wasmtime-46.0.3-cranelift";
 /// Fuel made available to one guest call.
@@ -87,7 +97,7 @@ impl WasmFeatures {
             canonicalize_nan: true,
             simd: false,
             relaxed_simd: false,
-            multi_memory: false,
+            multi_memory: true,
             memory64: false,
             tail_call: false,
         }
@@ -120,7 +130,6 @@ impl ImportSemantics {
     pub fn current() -> Self {
         let capability_imports = [
             Capability::Messaging,
-            Capability::Input,
             Capability::Timers,
             Capability::Sign {
                 schemes: vec![arena0_crypto::SignScheme::Ed25519],
@@ -155,8 +164,10 @@ impl ImportSemantics {
 pub struct Limits {
     /// Maximum Wasm stack size in bytes.
     pub max_stack_bytes: u64,
-    /// Maximum linear memory per instance in bytes.
+    /// Maximum declared work-memory capacity per instance in bytes.
     pub max_memory_bytes: u64,
+    /// Minimum work-memory capacity required after allocator preparation.
+    pub min_prepared_work_memory_bytes: u64,
     /// Maximum metadata returned by the metadata probe.
     pub max_metadata_bytes: u64,
     /// Maximum bytes returned by one guest projection.
@@ -193,6 +204,8 @@ pub struct Limits {
     pub max_tables: u64,
     /// Maximum Wasm memories in one store.
     pub max_memories: u64,
+    /// Aggregate declared linear-memory maximum of one resident instance.
+    pub max_total_memory_bytes: u64,
 }
 
 impl Limits {
@@ -202,6 +215,7 @@ impl Limits {
         Self {
             max_stack_bytes: MAX_WASM_STACK_BYTES as u64,
             max_memory_bytes: MAX_WASM_MEMORY_BYTES as u64,
+            min_prepared_work_memory_bytes: MIN_PREPARED_WORK_MEMORY_BYTES as u64,
             max_metadata_bytes: MAX_METADATA_BYTES as u64,
             max_output_bytes: MAX_OUTPUT_BYTES as u64,
             max_call_envelope_bytes: MAX_CALL_ENVELOPE_BYTES as u64,
@@ -220,6 +234,7 @@ impl Limits {
             max_instances: MAX_WASM_INSTANCES as u64,
             max_tables: MAX_WASM_TABLES as u64,
             max_memories: MAX_WASM_MEMORIES as u64,
+            max_total_memory_bytes: MAX_WASM_TOTAL_MEMORY_BYTES as u64,
         }
     }
 }
@@ -285,7 +300,7 @@ impl RandomnessConfiguration {
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize,
 )]
 pub enum SerializationFormat {
-    /// Borsh version 1 canonical encoding.
+    /// Borsh canonical encoding for the current profile version.
     BorshV1,
     /// JSON encoded with the concrete DTO's stock Serde implementation.
     JsonSerde,
@@ -371,7 +386,7 @@ impl ExecutionProfile {
         }
     }
 
-    /// Serialize this profile with its canonical version-1 Borsh encoding.
+    /// Serialize this profile with its canonical versioned Borsh encoding.
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         borsh::to_vec(self).expect("execution profile Borsh serialization is infallible")
@@ -500,6 +515,11 @@ mod tests {
             profile.limits.max_call_envelope_bytes,
             MAX_CALL_ENVELOPE_BYTES as u64
         );
+        assert_eq!(
+            profile.limits.min_prepared_work_memory_bytes,
+            MIN_PREPARED_WORK_MEMORY_BYTES as u64
+        );
+        assert_eq!(profile.limits.max_host_bytes, MAX_HOST_BYTES as u64);
         assert_eq!(
             profile.limits.max_table_elements,
             MAX_WASM_TABLE_ELEMENTS as u64

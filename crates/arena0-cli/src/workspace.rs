@@ -64,7 +64,6 @@ pub(crate) struct Launch {
     pub(crate) hosts: Vec<HostName>,
     pub(crate) input_control: InputControl,
     pub(crate) params: Option<Value>,
-    pub(crate) replay: bool,
 }
 
 /// Initial values supplied by the existing launch command or bare workspace.
@@ -74,7 +73,6 @@ pub(crate) struct Setup {
     pub(crate) fixed_hosts: bool,
     pub(crate) bindings: Option<Vec<crate::coordinated::DriverBinding>>,
     pub(crate) params: Option<Value>,
-    pub(crate) replay: bool,
 }
 
 /// Which local Hosts send their callouts to the shared human interface.
@@ -194,7 +192,6 @@ struct State {
     setup_scroll_limit: std::cell::Cell<u16>,
     participants: usize,
     input_control: InputControl,
-    replay: bool,
     params: HashMap<ProgramHash, String>,
     hosts: Vec<HostName>,
     can_resize_hosts: bool,
@@ -223,7 +220,6 @@ impl State {
             input_control: InputControl::OneHost {
                 host: HostName::for_local_index(0),
             },
-            replay: true,
             params: HashMap::new(),
             hosts: crate::local_daemon::host_names(available_hosts),
             can_resize_hosts,
@@ -237,7 +233,6 @@ impl State {
     fn configure(&mut self, setup: Setup) {
         self.hosts = setup.hosts;
         self.can_resize_hosts = !setup.fixed_hosts;
-        self.replay = setup.replay;
         if let Some(params) = setup.params {
             let text = params.to_string();
             for program in &self.programs {
@@ -419,11 +414,6 @@ impl State {
                         self.error = None;
                         None
                     }
-                    KeyCode::Char('r') => {
-                        self.replay = !self.replay;
-                        self.error = None;
-                        None
-                    }
                     KeyCode::Char('p') => {
                         let draft = self.params_text().into_owned();
                         self.mode = Mode::EditParams { draft };
@@ -530,7 +520,6 @@ impl State {
                 .collect(),
             input_control: self.input_control.clone(),
             params,
-            replay: self.replay,
         })
     }
 
@@ -615,16 +604,16 @@ fn render(frame: &mut Frame<'_>, state: &State) {
         )]
     } else if matches!(state.input_control, InputControl::Configured(_)) {
         vec![Line::raw(
-            "↑↓ move  Tab pane    p params    r replay    Enter launch    ? help    q quit",
+            "↑↓ move  Tab pane    p params    Enter launch    ? help    q quit",
         )]
     } else if footer.width >= 104 {
         vec![Line::raw(
-            "↑↓ move  Tab pane    +/- Hosts    c control    h Host    p params    r replay    Enter run    ? help    q quit",
+            "↑↓ move  Tab pane    +/- Hosts    c control    h Host    p params    Enter run    ? help    q quit",
         )]
     } else {
         vec![
             Line::raw("↑↓ move  Tab pane    +/- Hosts    c control    h Host"),
-            Line::raw("p params    r replay    Enter run    ? help    q quit"),
+            Line::raw("p params    Enter run    ? help    q quit"),
         ]
     };
     frame.render_widget(
@@ -842,11 +831,7 @@ fn render_setup(frame: &mut Frame<'_>, state: &State, area: Rect) {
     ));
     lines.extend([
         labeled(state, "Parameters", state.params_text().into_owned()),
-        labeled(
-            state,
-            "Verification",
-            if state.replay { "full replay" } else { "light" }.to_owned(),
-        ),
+        labeled(state, "Verification", "portable proof".to_owned()),
     ]);
     if !state.executions.is_empty() {
         lines.push(Line::default());
@@ -857,7 +842,7 @@ fn render_setup(frame: &mut Frame<'_>, state: &State, area: Rect) {
                     format!("{}  ", execution.exec_id.fmt_short()),
                     state.palette.muted(),
                 ),
-                Span::raw(format!("{:?}", execution.lifecycle()).to_lowercase()),
+                Span::raw(crate::ui::lifecycle_label(execution.lifecycle()).to_lowercase()),
             ]));
         }
     }
@@ -1032,7 +1017,6 @@ fn render_help(frame: &mut Frame<'_>, state: &State) {
             ("c", "Toggle One Host or All Hosts human control"),
             ("h", "Select the human-controlled Host in One Host mode"),
             ("p", "Edit program parameters as JSON"),
-            ("r", "Toggle light verification or full replay"),
             ("Enter", "Launch the selected program"),
             ("q / Ctrl-C", "Quit and stop an owned local service"),
             ("? / Esc", "Close help"),
@@ -1281,7 +1265,6 @@ mod tests {
             fixed_hosts: true,
             bindings: Some(bindings.clone()),
             params: Some(serde_json::json!({"rounds":4})),
-            replay: false,
         });
         let Some(Ok(Exit::Launch(launch))) =
             state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -1292,7 +1275,6 @@ mod tests {
         assert_eq!(launch.hosts, hosts);
         assert_eq!(launch.input_control, InputControl::Configured(bindings));
         assert_eq!(launch.params, Some(serde_json::json!({"rounds":4})));
-        assert!(!launch.replay);
     }
 
     #[test]
@@ -1392,7 +1374,6 @@ mod tests {
         assert_eq!(state.participants, 2);
         assert_eq!(state.input_control, original_control);
         assert!(matches!(state.mode, Mode::Browse));
-        assert!(state.replay);
 
         let Some(Ok(Exit::Agents(launch))) =
             state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))

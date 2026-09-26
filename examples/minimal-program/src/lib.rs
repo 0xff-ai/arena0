@@ -60,7 +60,11 @@ pub struct Shared {
 
 #[arena0::local]
 #[derive(Default)]
-pub struct Local {}
+pub struct Local {
+    /// Set while this participant's choice is queued but not yet applied, so
+    /// the callout does not re-ask the answered question.
+    choice_pending: bool,
+}
 
 #[arena0::program(
     name = "minimal-choice",
@@ -72,6 +76,7 @@ pub struct Local {}
 )]
 pub mod minimal_choice {
     use super::*;
+    use arena0::ProgramTransition;
 
     type Shared = super::Shared;
     type Local = super::Local;
@@ -106,8 +111,7 @@ pub mod minimal_choice {
         }
     }
 
-    fn view(ctx: &SharedContext, vp: &Viewport) -> View {
-        let state = ctx.shared();
+    fn view(state: &Shared, _ensemble: &Ensemble, vp: &Viewport) -> View {
         let mut agents = String::new();
         for (index, choice) in state.choices.iter().enumerate() {
             let value = choice.map_or("waiting", |choice| match choice {
@@ -130,80 +134,115 @@ pub mod minimal_choice {
             .status_bar(vp.fit_text(status))
     }
 
-    fn on_session_started(_ctx: &mut SharedContext) -> Result<Transition<Phase>, ProgramFault> {
+    fn on_session_started(
+        _ctx: &mut Context<Shared, Local>,
+    ) -> Result<ProgramTransition<MinimalChoice>, ProgramFault> {
         Ok(Transition::To(Phase::Choosing))
     }
 
-    fn on_react(ctx: &mut Context) -> Result<(), ProgramFault> {
-        if writer(ctx.shared()) == Some(ctx.me()) {
+    fn callout(ctx: &CalloutContext<Shared, Local>) -> Option<Callout> {
+        (!ctx.local().choice_pending && writer(ctx.shared()) == Some(ctx.me())).then(|| {
             let previous = ctx.shared().choices.iter().flatten().next().copied();
-            ctx.effects()
-                .callout(callouts::Choose { previous })
-                .dispatch();
-        }
-        Ok(())
+            callouts::Choose { previous }.into()
+        })
     }
 
     fn on_message(
-        ctx: &mut SharedContext,
+        ctx: &mut Context<Shared, Local>,
         from: Participant,
         message: Message,
-    ) -> Result<ApplyDecision<Phase>, ProtocolFault> {
+    ) -> MessageApply<MinimalChoice> {
         if writer(ctx.shared()) != Some(from) {
             return Ok(ApplyDecision::Reject);
         }
         let Message::Choice(choice) = message;
-        ctx.mutate_shared(|state| state.choices[from.index()] = Some(choice));
-        if writer(ctx.shared()).is_none() {
-            Ok(ApplyDecision::Accept(Transition::End))
-        } else {
-            Ok(ApplyDecision::Accept(Transition::Stay))
-        }
+        let transition = apply_choice(ctx.shared_mut(), from, choice);
+        ctx.mutate_local(|local| local.choice_pending = false);
+        Ok(ApplyDecision::Accept(transition))
     }
 
-    fn on_input(ctx: &mut Context, input: Input) -> Result<(), InputFault> {
+    fn on_input(ctx: &mut LocalContext<Shared, Local>, input: Input) -> arena0::anyhow::Result<()> {
         if writer(ctx.shared()) != Some(ctx.me()) {
-            return Err(anyhow!("this participant does not own the next choice").into());
+            return Err(anyhow!("this participant does not own the next choice"));
         }
         let Input::Choose(choice) = input;
-        ctx.effects().broadcast(&Message::Choice(choice));
+        ctx.mutate_local(|local| local.choice_pending = true);
+        ctx.effects().broadcast(&Message::Choice(choice))?;
         Ok(())
     }
 
-    fn on_query(_ctx: &SharedContext, _: ()) {}
+    fn on_query(_shared: &Shared, _: ()) {}
+
+    fn apply_choice(
+        state: &mut Shared,
+        from: Participant,
+        choice: Choice,
+    ) -> ProgramTransition<MinimalChoice> {
+        state.choices[from.index()] = Some(choice);
+        if writer(state).is_none() {
+            Transition::End
+        } else {
+            Transition::Stay
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arena0::testing::{ALICE, BOB, Harness, Scenario};
     use arena0::types::{ColorDepth, Slot};
 
     #[test]
-    fn two_replicas_converge_on_the_choices() {
-        let pair = Scenario::<minimal_choice::MinimalChoice>::named("two public choices")
-            .input(ALICE, Input::Choose(Choice::One))
-            .deliver_all()
-            .input(BOB, Input::Choose(Choice::Two))
-            .deliver_all()
-            .run(());
-
-        pair.trace().assert_shared_aligned();
-        assert_eq!(pair.alice().shared().choices[0], Some(Choice::One));
-        assert_eq!(pair.alice().shared().choices[1], Some(Choice::Two));
+    fn outcome_ranks_choices_by_score() {
+        // The phase plays no role in the outcome projection; struct-update
+        // syntax leaves it at its default (the `#[arena0::state]` phase field
+        // is a `ManagedPhase`, not the plain phase enum).
+        let won = Shared {
+            choices: [Some(Choice::One), Some(Choice::Two)],
+            ..Default::default()
+        };
+        assert!(matches!(
+            <minimal_choice::MinimalChoice as Program>::outcome(&won),
+            Outcome::Win {
+                winner,
+                choices: [Choice::One, Choice::Two],
+            } if winner == Participant::new(1)
+        ));
+        let drawn = Shared {
+            choices: [Some(Choice::Two), Some(Choice::Two)],
+            ..Default::default()
+        };
+        assert!(matches!(
+            <minimal_choice::MinimalChoice as Program>::outcome(&drawn),
+            Outcome::Draw {
+                choices: [Choice::Two, Choice::Two],
+            }
+        ));
     }
 
-    #[arena0::test(MinimalChoice, ())]
-    fn view_uses_all_four_slots_and_plain_text(h: ()) {
-        h.session_started(PeerId([1; 32]));
-        let view = h.view(Viewport {
-            width: 80,
-            color: ColorDepth::Mono,
-        });
-
+    #[test]
+    fn view_uses_all_four_slots_and_plain_text() {
+        let state = Shared {
+            choices: [Some(Choice::One), None],
+            ..Default::default()
+        };
+        let ensemble =
+            Ensemble::from_peers(vec![PeerId([1; 32]), PeerId([2; 32])])
+                .expect("valid view ensemble");
+        let view = <minimal_choice::MinimalChoice as ProgramView>::view(
+            &state,
+            &ensemble,
+            &Viewport {
+                width: 80,
+                color: ColorDepth::Mono,
+            },
+        );
         for slot in [Slot::Header, Slot::Agents, Slot::State, Slot::StatusBar] {
-            assert!(view.slots.contains_key(&slot));
+            assert!(view.slots.contains_key(&slot), "missing {slot:?} view slot");
         }
         assert!(view.slots.values().all(|text| !text.contains("\x1b[")));
+        assert!(view.slots[&Slot::Agents].contains("P0: one"));
+        assert!(view.slots[&Slot::Agents].contains("P1: waiting"));
+        assert_eq!(view.slots[&Slot::StatusBar], "choosing");
     }
 }

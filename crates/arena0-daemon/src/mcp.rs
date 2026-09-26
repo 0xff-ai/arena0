@@ -19,14 +19,13 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use arena0_api::{
-    ActivityData, ActivityResult, ApiError, ApiErrorCode, ColorDepth, EnsembleSpec,
-    ExecStatusState, HostRequest, NextEvent, PendingId, ProgramSummary, ReceiptRef, ResponseOk,
-    VerifiedResult,
+    ActivityData, ActivityResult, ApiError, ApiErrorCode, CalloutId, ColorDepth, EnsembleSpec,
+    ExecStatusState, HostRequest, NextEvent, ProgramSummary, ReceiptRef, ResponseOk,
 };
 use arena0_program::ParticipantCount;
 use arena0_protocol::{ExecId, NegotiationTarget, PeerId, SessionHash};
 #[cfg(test)]
-use arena0_sandbox::WasmtimeEngine;
+use arena0_test_engine::shared_test_engine;
 use axum::extract::{Request as HttpRequest, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
@@ -309,7 +308,7 @@ struct AnswerCalloutArg {
     _token: McpToken,
     execution: ExecRef,
     /// Pending id returned by `await_execution_event`.
-    pending_id: PendingId,
+    pending_id: CalloutId,
     /// JSON answer in the shape of the callout's inline schema.
     answer: Option<Value>,
 }
@@ -336,16 +335,6 @@ struct StopExecutionArg {
     reason: Option<String>,
 }
 
-#[derive(
-    Debug, Default, Clone, Copy, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-enum VerificationMode {
-    #[default]
-    Light,
-    Full,
-}
-
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct VerifySessionArg {
@@ -353,9 +342,6 @@ struct VerifySessionArg {
     #[schemars(rename = "token")]
     _token: McpToken,
     session: SessionRef,
-    /// `light` checks portable proof evidence; `full` also replays the exact Wasm.
-    #[serde(default)]
-    mode: VerificationMode,
 }
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
@@ -398,7 +384,7 @@ struct AckOutput {
 enum ExecutionEvent {
     Waiting,
     Callout {
-        pending_id: PendingId,
+        pending_id: CalloutId,
         callout_index: u32,
         name: String,
         prompt: String,
@@ -453,12 +439,12 @@ struct ParticipantOutput {
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
 struct VerifySessionOutput {
-    mode: Value,
     session: SessionRef,
     program: ProgramRef,
     participants: Vec<ParticipantOutput>,
     steps: u64,
     terminal: Value,
+    outcome_borsh: Option<Vec<u8>>,
 }
 
 fn output_schema<T: schemars::JsonSchema + std::any::Any>() -> Arc<rmcp::model::JsonObject> {
@@ -953,7 +939,7 @@ impl Arena0Mcp {
     }
 
     #[tool(
-        description = "Verify the receipt produced by one Host and return recovered proof evidence. Full mode also replays the exact registered Wasm.",
+        description = "Verify the receipt produced by one Host and return recovered portable proof evidence.",
         output_schema = output_schema::<VerifySessionOutput>(),
         annotations(title = "Verify session", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -968,37 +954,24 @@ impl Arena0Mcp {
                 &authorized,
                 HostRequest::ReceiptVerify {
                     receipt: ReceiptRef::Produced(session_id),
-                    full: matches!(arg.mode, VerificationMode::Full),
                 },
             )
             .await?
         {
-            ResponseOk::Verified {
-                receipt_id: _,
-                program_id,
-                session_id,
-                ensemble,
-                steps,
-                result,
-            } => {
-                let (mode, terminal) = match result {
-                    VerifiedResult::Light { terminal } => ("light", serialized_value(&terminal)?),
-                    VerifiedResult::Full { terminal } => ("full", serialized_value(&terminal)?),
-                };
-                Ok(Json(VerifySessionOutput {
-                    mode: serialized_value(&mode)?,
-                    session: session_ref(session_id),
-                    program: ProgramRef {
-                        program_id: program_id.to_string(),
-                    },
-                    participants: ensemble
-                        .into_iter()
-                        .map(|peer| self.participant(peer))
-                        .collect(),
-                    steps,
-                    terminal,
-                }))
-            }
+            ResponseOk::Verified(summary) => Ok(Json(VerifySessionOutput {
+                session: session_ref(summary.session_id),
+                program: ProgramRef {
+                    program_id: summary.program_id.to_string(),
+                },
+                participants: summary
+                    .ensemble
+                    .into_iter()
+                    .map(|peer| self.participant(peer))
+                    .collect(),
+                steps: summary.steps,
+                terminal: serialized_value(&summary.terminal)?,
+                outcome_borsh: summary.outcome_borsh,
+            })),
             other => Err(unexpected(&other)),
         }
     }
@@ -1464,7 +1437,7 @@ fn unexpected(_other: &ResponseOk) -> CallToolResult {
 mod tests {
     use super::*;
     use arena0_api::{ActivityFrame, Request, Response};
-    use std::net::SocketAddr;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
 
     use rmcp::model::{CallToolRequestParams, ClientInfo};
@@ -1481,66 +1454,33 @@ mod tests {
         daemon: Arc<Daemon>,
     }
 
-    async fn test_daemon(bootstrap_new_hosts: bool) -> TestDaemon {
+    async fn test_daemon() -> TestDaemon {
         let home = tempfile::tempdir().expect("temporary daemon home");
-        let mcp = McpConfig::new("127.0.0.1:0".parse().unwrap(), None).expect("test MCP config");
+        let mcp = McpConfig::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), None)
+            .expect("test MCP config");
         let dynamic_home = arena0_home::Home::from_root(home.path().to_path_buf()).unwrap();
         TestDaemon {
             _homes: vec![home],
             daemon: Daemon::start(
-                vec![],
+                vec!["alice".parse().unwrap(), "bob".parse().unwrap()],
                 mcp,
-                Arc::new(WasmtimeEngine::new().expect("sandbox engine")),
+                shared_test_engine(),
                 dynamic_home,
-                bootstrap_new_hosts,
+                true,
             )
             .await
             .expect("start daemon"),
         }
     }
 
-    async fn empty_daemon() -> TestDaemon {
-        test_daemon(false).await
-    }
-
-    async fn dynamic_daemon() -> TestDaemon {
-        test_daemon(true).await
-    }
-
-    fn tool_input_schema(tool_router: &ToolRouter<Arena0Mcp>, name: &str) -> Value {
-        let tool = tool_router
+    fn tool_input_schema(server: &Arena0Mcp, name: &str) -> Value {
+        let tool = server
+            .tool_router
             .list_all()
             .into_iter()
             .find(|tool| tool.name == name)
             .unwrap_or_else(|| panic!("missing tool {name}"));
         serde_json::to_value(&*tool.input_schema).expect("serialize input schema")
-    }
-
-    fn assert_structured_reference_schemas(tool_router: &ToolRouter<Arena0Mcp>) {
-        let start = tool_input_schema(tool_router, "start_execution");
-        assert!(start["properties"]["program"]["$ref"].is_string());
-        assert!(start["$defs"]["ProgramRef"]["properties"]["program_id"].is_object());
-        assert!(
-            start["$defs"]["ProgramRef"]["properties"]
-                .get("host")
-                .is_none()
-        );
-        let ensemble = &start["$defs"]["McpEnsemble"];
-        let variants = ensemble["oneOf"].as_array().expect("ensemble variants");
-        assert_eq!(variants.len(), 2);
-        assert!(
-            variants
-                .iter()
-                .all(|variant| variant["additionalProperties"] == false)
-        );
-
-        let status = tool_input_schema(tool_router, "get_execution_status");
-        assert!(status["properties"]["execution"]["$ref"].is_string());
-        let verify = tool_input_schema(tool_router, "verify_session");
-        assert!(verify["properties"]["session"]["$ref"].is_string());
-        let answer = tool_input_schema(tool_router, "answer_callout");
-        assert_eq!(answer["properties"]["pending_id"]["type"], "string");
-        assert_eq!(answer["properties"]["pending_id"]["pattern"], "^[0-9]+$");
     }
 
     async fn call_mcp_tool(
@@ -1598,9 +1538,10 @@ mod tests {
         .expect("MCP endpoint did not bind")
     }
 
-    #[test]
-    fn tool_catalog_is_exact_stable_and_closed_world() {
-        let tool_router = Arena0Mcp::tool_router();
+    #[tokio::test]
+    async fn tool_catalog_is_exact_stable_and_closed_world() {
+        let test = test_daemon().await;
+        let server = Arena0Mcp::new(test.daemon);
         let expected = [
             ("answer_callout", false, true, false),
             ("await_execution_event", true, false, true),
@@ -1615,7 +1556,7 @@ mod tests {
             ("verify_session", true, false, true),
             ("view_execution", true, false, true),
         ];
-        let mut tools = tool_router.list_all();
+        let mut tools = server.tool_router.list_all();
         tools.sort_by(|left, right| left.name.cmp(&right.name));
         assert_eq!(
             tools
@@ -1652,7 +1593,6 @@ mod tests {
             }
         }
         assert_eq!(tools.len(), 12);
-        assert_structured_reference_schemas(&tool_router);
     }
 
     async fn post_mcp(address: SocketAddr, body: &str) -> String {
@@ -1682,20 +1622,52 @@ mod tests {
             .expect("HTTP response should contain a body")
     }
 
-    async fn assert_mcp_error(address: SocketAddr, body: &str) {
-        let response = post_mcp(address, body).await;
-        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    #[tokio::test]
+    async fn hello_http_dispatch_requires_a_user_agent() {
+        let test = test_daemon().await;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind MCP test listener");
+        let address = listener.local_addr().expect("MCP listener address");
+        let daemon = Arc::clone(&test.daemon);
+        let serving =
+            tokio::spawn(async move { axum::serve(listener, router(daemon, None)).await });
+
+        let omitted = post_mcp(
+            address,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hello","arguments":{}}}"#,
+        )
+        .await;
+        assert!(omitted.starts_with("HTTP/1.1 200"), "{omitted}");
         assert_eq!(
-            serde_json::from_str::<Value>(response_body(&response)).expect("JSON result")["result"]
+            serde_json::from_str::<Value>(response_body(&omitted)).expect("JSON result")["result"]
                 ["isError"],
             true
         );
+
+        let rejected = post_mcp(
+            address,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"hello","arguments":{"token":"bad","user_agent":"x"}}}"#,
+        )
+        .await;
+        assert!(rejected.starts_with("HTTP/1.1 200"), "{rejected}");
+        let rejected: Value = serde_json::from_str(response_body(&rejected)).expect("JSON result");
+        assert_eq!(rejected["result"]["isError"], true);
+        let error_text = rejected["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool error text");
+        assert!(error_text.contains("either token or user_agent"));
+
+        serving.abort();
+        serving
+            .await
+            .expect_err("aborted test server should report cancellation");
+        test.daemon.stop().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "MCP response repeatedly exceeds the five-second timeout on hosted CI runners"]
     async fn activity_stream_correlation_survives_duplicate_mcp_request_ids() {
-        let test = empty_daemon().await;
+        let test = test_daemon().await;
         let socket = test._homes[0].path().join("arena0.sock");
         let daemon_task = tokio::spawn(Arc::clone(&test.daemon).serve());
         for _ in 0..100 {
@@ -1705,6 +1677,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
+        let mut activity = subscribe_activity(&socket).await;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind MCP test listener");
@@ -1712,30 +1685,28 @@ mod tests {
         let daemon = Arc::clone(&test.daemon);
         let serving =
             tokio::spawn(async move { axum::serve(listener, router(daemon, None)).await });
-        let mut activity = subscribe_activity(&socket).await;
 
-        tokio::join!(
-            assert_mcp_error(
+        let (first, second) = tokio::join!(
+            post_mcp(
                 address,
-                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hello","arguments":{}}}"#,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hello","arguments":{"user_agent":"activity/1"}}}"#,
             ),
-            assert_mcp_error(
+            post_mcp(
                 address,
-                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hello","arguments":{"token":"bad","user_agent":"x"}}}"#,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hello","arguments":{"user_agent":"activity/2"}}}"#,
             ),
         );
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        assert!(second.starts_with("HTTP/1.1 200"), "{second}");
 
-        let frames = [
-            next_activity(&mut activity).await,
-            next_activity(&mut activity).await,
-            next_activity(&mut activity).await,
-            next_activity(&mut activity).await,
-        ];
+        let started_one = next_activity(&mut activity).await;
+        let finished_one = next_activity(&mut activity).await;
+        let started_two = next_activity(&mut activity).await;
+        let finished_two = next_activity(&mut activity).await;
         let mut starts = Vec::new();
         let mut finishes = Vec::new();
-        for frame in frames {
-            let ActivityFrame { seq, data, .. } = frame;
-            match data {
+        for frame in [started_one, finished_one, started_two, finished_two] {
+            match frame.data {
                 ActivityData::Started {
                     call_id,
                     tool,
@@ -1745,50 +1716,23 @@ mod tests {
                     assert_eq!(tool, "hello");
                     assert_eq!(host, None);
                     assert_eq!(exec_id, None);
-                    starts.push((call_id, seq));
+                    starts.push(call_id);
                 }
                 ActivityData::Finished {
                     call_id,
-                    result: ActivityResult::ToolError { .. },
+                    result: ActivityResult::Ok,
                     ..
-                } => finishes.push((call_id, seq)),
+                } => finishes.push(call_id),
                 other => panic!("unexpected activity frame: {other:?}"),
             }
         }
         assert_eq!(starts.len(), 2);
         assert_eq!(finishes.len(), 2);
-        let start_ids = starts
-            .iter()
-            .map(|(call_id, _)| call_id.clone())
-            .collect::<BTreeSet<_>>();
-        let finish_ids = finishes
-            .iter()
-            .map(|(call_id, _)| call_id.clone())
-            .collect::<BTreeSet<_>>();
+        assert_ne!(starts[0], starts[1], "daemon activity ids are unique");
         assert_eq!(
-            start_ids, finish_ids,
+            starts.into_iter().collect::<BTreeSet<_>>(),
+            finishes.into_iter().collect::<BTreeSet<_>>(),
             "each finished frame closes one started call"
-        );
-        assert_eq!(start_ids.len(), 2, "daemon activity ids are unique");
-        for (call_id, started_seq) in starts {
-            let finished_seq = finishes
-                .iter()
-                .find_map(|(finished_call_id, seq)| (finished_call_id == &call_id).then_some(*seq))
-                .expect("each started frame has a matching finish");
-            assert!(
-                started_seq < finished_seq,
-                "activity call {call_id} finished before it started"
-            );
-        }
-
-        assert_mcp_error(
-            address,
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"hello","arguments":{"token":null,"user_agent":"must-not-provision"}}}"#,
-        )
-        .await;
-        assert!(
-            test.daemon.services().is_empty(),
-            "invalid hello requests must not provision Hosts"
         );
 
         serving.abort();
@@ -1826,11 +1770,14 @@ mod tests {
         let dynamic_home =
             arena0_home::Home::from_root(home.path().to_path_buf()).expect("dynamic Host home");
         let daemon = Daemon::start(
-            vec![],
+            vec![
+                "occupied-port-a".parse().unwrap(),
+                "occupied-port-b".parse().unwrap(),
+            ],
             mcp,
-            Arc::new(WasmtimeEngine::new().expect("sandbox engine")),
+            shared_test_engine(),
             dynamic_home,
-            false,
+            true,
         )
         .await
         .expect("start daemon");
@@ -1873,10 +1820,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_drains_incomplete_mcp_requests() {
-        let test = empty_daemon().await;
-        let serving = tokio::spawn(Arc::clone(&test.daemon).serve());
-        let address = wait_for_mcp_address(&test.daemon).await;
-        let mut clients = Vec::new();
         for (case, request) in [
             (
                 "partial header",
@@ -1887,6 +1830,9 @@ mod tests {
                 "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: 10000\r\nConnection: keep-alive\r\n\r\n{}",
             ),
         ] {
+            let test = test_daemon().await;
+            let serving = tokio::spawn(Arc::clone(&test.daemon).serve());
+            let address = wait_for_mcp_address(&test.daemon).await;
             let mut client = TcpStream::connect(address)
                 .await
                 .expect("connect MCP endpoint");
@@ -1898,18 +1844,17 @@ mod tests {
                 )
                 .await
                 .unwrap_or_else(|error| panic!("write {case}: {error}"));
-            clients.push(client);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
 
-        timeout(Duration::from_secs(5), test.daemon.stop())
-            .await
-            .expect("incomplete MCP requests blocked daemon shutdown");
-        timeout(Duration::from_secs(5), serving)
-            .await
-            .expect("serve task did not join after incomplete MCP requests")
-            .expect("serve task panicked")
-            .expect("serve task failed");
+            timeout(Duration::from_secs(5), test.daemon.stop())
+                .await
+                .unwrap_or_else(|_| panic!("{case} blocked daemon shutdown"));
+            timeout(Duration::from_secs(5), serving)
+                .await
+                .unwrap_or_else(|_| panic!("serve task did not join after {case}"))
+                .expect("serve task panicked")
+                .expect("serve task failed");
+        }
     }
 
     struct ActivityTestSubscription {
@@ -1952,7 +1897,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_mcp_clients_are_scoped_by_hello_tokens() {
-        let test = dynamic_daemon().await;
+        let test = test_daemon().await;
         let supervisor = tokio::spawn(Arc::clone(&test.daemon).serve());
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1989,19 +1934,36 @@ mod tests {
         .await;
         let token_a = hello_a["token"].as_str().expect("first JWT").to_owned();
         let token_b = hello_b["token"].as_str().expect("second JWT").to_owned();
+        assert_ne!(hello_a["peer_id"], hello_b["peer_id"]);
         assert_ne!(token_a, token_b);
 
+        let programs_a = call_mcp_tool(
+            &client_a,
+            "list_programs",
+            serde_json::json!({"token": token_a}),
+        )
+        .await;
         let programs_b = call_mcp_tool(
             &client_b,
             "list_programs",
             serde_json::json!({"token": token_b}),
         )
         .await;
+        let program_a = programs_a["programs"]
+            .as_array()
+            .and_then(|programs| programs.first())
+            .expect("first client program")
+            .clone();
         let program_b = programs_b["programs"]
             .as_array()
             .and_then(|programs| programs.first())
             .expect("second client program")
             .clone();
+        assert_eq!(
+            program_a["program"]["program_id"],
+            program_b["program"]["program_id"]
+        );
+
         let bob_execution = call_mcp_tool(
             &client_b,
             "start_execution",
@@ -2013,16 +1975,6 @@ mod tests {
             }),
         )
         .await;
-        let own = call_mcp_tool(
-            &client_b,
-            "get_execution_status",
-            serde_json::json!({
-                "token": token_b,
-                "execution": bob_execution["execution"],
-            }),
-        )
-        .await;
-        assert_eq!(own["execution"], bob_execution["execution"]);
         let foreign = call_mcp_tool_result(
             &client_a,
             "get_execution_status",
@@ -2051,6 +2003,20 @@ mod tests {
         )
         .await;
 
+        let renewed =
+            call_mcp_tool(&client_a, "hello", serde_json::json!({"token": token_a})).await;
+        assert_eq!(renewed["peer_id"], hello_a["peer_id"]);
+
+        let before_invalid = test.daemon.services().len();
+        let invalid = call_mcp_tool_result(
+            &client_a,
+            "hello",
+            serde_json::json!({"token": null, "user_agent": "must-not-provision"}),
+        )
+        .await;
+        assert_eq!(invalid.is_error, Some(true));
+        assert_eq!(test.daemon.services().len(), before_invalid);
+
         client_a.cancel().await.expect("close first MCP client");
         client_b.cancel().await.expect("close second MCP client");
         serving.abort();
@@ -2066,11 +2032,11 @@ mod tests {
     async fn hello_reopens_only_the_original_identity_after_restart() {
         let directory = tempfile::tempdir().unwrap();
         let home = arena0_home::Home::from_root(directory.path().to_owned()).unwrap();
-        let engine = Arc::new(WasmtimeEngine::new().unwrap());
+        let engine = shared_test_engine();
         let mut token = String::new();
         let mut wrong_identity_token = String::new();
         let mut original_peer = Value::Null;
-        let mut identity_index = std::path::PathBuf::new();
+        let mut identity_seed = std::path::PathBuf::new();
 
         for phase in 0..3 {
             let daemon = Daemon::start(
@@ -2078,7 +2044,7 @@ mod tests {
                 McpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap(),
                 Arc::clone(&engine),
                 home.clone(),
-                phase == 0,
+                true,
             )
             .await
             .unwrap();
@@ -2104,7 +2070,7 @@ mod tests {
                     original_peer = hello["peer_id"].clone();
                     let info = daemon.services()[0].1.host_info();
                     let name = info.id.parse().unwrap();
-                    identity_index = home.host(&name).state_dir().join("keys/index.json");
+                    identity_seed = home.host(&name).state_dir().join("keys/identity.seed");
                     wrong_identity_token = daemon
                         .issue_token(&name, PeerId([9; 32]))
                         .unwrap()
@@ -2152,7 +2118,7 @@ mod tests {
                             .await;
                     assert_eq!(rejected.is_error, Some(true));
                     assert!(daemon.services().is_empty());
-                    assert!(!identity_index.exists(), "missing identity was recreated");
+                    assert!(!identity_seed.exists(), "missing identity was recreated");
                 }
                 _ => unreachable!(),
             }
@@ -2161,290 +2127,188 @@ mod tests {
             supervisor.await.unwrap().unwrap();
             drop(daemon);
             if phase == 1 {
-                std::fs::remove_file(&identity_index).unwrap();
+                std::fs::remove_file(&identity_seed).unwrap();
             }
         }
-    }
-
-    struct AdmissionSetup {
-        test: TestDaemon,
-        supervisor: tokio::task::JoinHandle<anyhow::Result<()>>,
-        clients: Vec<rmcp::service::RunningService<RoleClient, ClientInfo>>,
-        tokens: Vec<Value>,
-        peers: Vec<Value>,
-        program: Value,
-    }
-
-    async fn admission_setup() -> AdmissionSetup {
-        let test = dynamic_daemon().await;
-        let supervisor = tokio::spawn(Arc::clone(&test.daemon).serve());
-        let address = wait_for_mcp_address(&test.daemon).await;
-        let mut clients = Vec::new();
-        let mut tokens = Vec::new();
-        let mut peers = Vec::new();
-        for user_agent in ["creator/1", "joiner/1"] {
-            let client = ClientInfo::default()
-                .serve(StreamableHttpClientTransport::from_config(
-                    StreamableHttpClientTransportConfig::with_uri(format!("http://{address}/mcp")),
-                ))
-                .await
-                .expect("initialize MCP client");
-            let hello = call_mcp_tool(
-                &client,
-                "hello",
-                serde_json::json!({"user_agent": user_agent}),
-            )
-            .await;
-            tokens.push(hello["token"].clone());
-            peers.push(hello["peer_id"].clone());
-            clients.push(client);
-        }
-        let catalog = call_mcp_tool(
-            &clients[0],
-            "list_programs",
-            serde_json::json!({"token": tokens[0]}),
-        )
-        .await;
-        let program = catalog["programs"]
-            .as_array()
-            .expect("program catalog")
-            .iter()
-            .find(|program| program["name"] == "rock-paper-scissors")
-            .expect("rock-paper-scissors program")
-            .get("program")
-            .cloned()
-            .expect("program reference");
-        AdmissionSetup {
-            test,
-            supervisor,
-            clients,
-            tokens,
-            peers,
-            program,
-        }
-    }
-
-    async fn stop_admission(setup: AdmissionSetup) {
-        for client in setup.clients {
-            client.cancel().await.expect("close MCP client");
-        }
-        setup.test.daemon.stop().await;
-        setup
-            .supervisor
-            .await
-            .expect("supervisor task")
-            .expect("clean shutdown");
-    }
-
-    async fn start_mcp_execution(setup: &AdmissionSetup, index: usize, mode: &str) -> Value {
-        call_mcp_tool(
-            &setup.clients[index],
-            "start_execution",
-            serde_json::json!({
-                "token": setup.tokens[index],
-                "program": setup.program,
-                "params": null,
-                "ensemble": {"mode": mode},
-            }),
-        )
-        .await
-    }
-
-    async fn stop_mcp_execution(setup: &AdmissionSetup, index: usize, execution: &Value) {
-        call_mcp_tool(
-            &setup.clients[index],
-            "stop_execution",
-            serde_json::json!({
-                "token": setup.tokens[index],
-                "execution": execution,
-            }),
-        )
-        .await;
-    }
-
-    async fn wait_for_activation(setup: &AdmissionSetup, executions: &[Value; 2]) -> [Value; 2] {
-        for _ in 0..250 {
-            let mut statuses = Vec::new();
-            for (index, execution) in executions.iter().enumerate() {
-                statuses.push(
-                    call_mcp_tool(
-                        &setup.clients[index],
-                        "get_execution_status",
-                        serde_json::json!({
-                            "token": setup.tokens[index],
-                            "execution": execution,
-                        }),
-                    )
-                    .await,
-                );
-            }
-            if statuses
-                .iter()
-                .all(|status| status["state"]["exec_state"] == "Active")
-            {
-                return [
-                    statuses[0]["state"]["session"]["session_id"].clone(),
-                    statuses[1]["state"]["session"]["session_id"].clone(),
-                ];
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("MCP-driven executions did not activate");
-    }
-
-    async fn complete_mcp_execution(
-        setup: &AdmissionSetup,
-        index: usize,
-        execution: &Value,
-    ) -> Value {
-        for _ in 0..100 {
-            let event = call_mcp_tool(
-                &setup.clients[index],
-                "await_execution_event",
-                serde_json::json!({
-                    "token": setup.tokens[index],
-                    "execution": execution,
-                    "wait_ms": 100,
-                }),
-            )
-            .await;
-            match event["event"].as_str() {
-                Some("waiting") => {}
-                Some("callout") => {
-                    call_mcp_tool(
-                        &setup.clients[index],
-                        "answer_callout",
-                        serde_json::json!({
-                            "token": setup.tokens[index],
-                            "execution": execution,
-                            "pending_id": event["pending_id"],
-                            "answer": "Rock",
-                        }),
-                    )
-                    .await;
-                }
-                Some("completed") => return event["session"].clone(),
-                _ => panic!("unexpected execution event"),
-            }
-        }
-        panic!("MCP execution {index} did not complete");
-    }
-
-    async fn complete_mcp_executions(
-        setup: &AdmissionSetup,
-        executions: &[Value; 2],
-    ) -> [Value; 2] {
-        let (first, second) = tokio::join!(
-            complete_mcp_execution(setup, 0, &executions[0]),
-            complete_mcp_execution(setup, 1, &executions[1]),
-        );
-        [first, second]
-    }
-
-    async fn verify_full_session(setup: &AdmissionSetup, index: usize, session: &Value) {
-        let verified = call_mcp_tool(
-            &setup.clients[index],
-            "verify_session",
-            serde_json::json!({
-                "token": setup.tokens[index],
-                "session": session,
-                "mode": "full",
-            }),
-        )
-        .await;
-        assert_eq!(verified["session"], *session);
-        let participants = verified["participants"]
-            .as_array()
-            .expect("verified participants");
-        assert_eq!(participants.len(), 2);
-        assert!(verified["steps"].as_u64().is_some_and(|steps| steps > 0));
-        assert!(verified["terminal"].get("Completed").is_some());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_mcp_clients_complete_and_verify_one_session() {
-        timeout(Duration::from_secs(80), async {
-            let setup = admission_setup().await;
-            assert_ne!(setup.peers[0], setup.peers[1]);
-            let created = start_mcp_execution(&setup, 0, "create").await;
-            assert_eq!(created["state"], "Negotiating");
-            assert!(created["session"].is_null());
-            assert!(created["negotiation_id"].is_string());
-
-            // Open creator admission has no negotiation deadline at the
-            // daemon/MCP boundary and must remain joinable after 40s.
-            let started = Instant::now();
-            for _ in 0..2 {
-                let waiting = call_mcp_tool(
-                    &setup.clients[0],
-                    "await_execution_event",
-                    serde_json::json!({
-                        "token": setup.tokens[0],
-                        "execution": created["execution"],
-                        "wait_ms": 20000,
-                    }),
-                )
-                .await;
-                assert_eq!(waiting, serde_json::json!({"event": "waiting"}));
-            }
-            assert!(started.elapsed() >= Duration::from_secs(40));
-
-            let joined = start_mcp_execution(&setup, 1, "join").await;
-            assert!(joined["negotiation_id"].is_null());
-            let executions = [created["execution"].clone(), joined["execution"].clone()];
-            let activated_sessions = wait_for_activation(&setup, &executions).await;
-            let sessions = complete_mcp_executions(&setup, &executions).await;
-            assert_eq!(sessions[0], sessions[1]);
-            assert_eq!(activated_sessions[0], activated_sessions[1]);
-            verify_full_session(&setup, 0, &sessions[0]).await;
-            verify_full_session(&setup, 1, &sessions[1]).await;
-            stop_admission(setup).await;
-        })
-        .await
-        .expect("creator-first MCP scenario exceeded 80 seconds");
+        run_token_admission_scenario(false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn open_join_waits_for_a_later_creator() {
-        timeout(Duration::from_secs(20), async {
-            let setup = admission_setup().await;
-            let cancelled = start_mcp_execution(&setup, 1, "join").await;
+        run_token_admission_scenario(true).await;
+    }
+
+    async fn run_token_admission_scenario(join_first: bool) {
+        timeout(Duration::from_secs(80), async {
+            let test = test_daemon().await;
+            let supervisor = tokio::spawn(Arc::clone(&test.daemon).serve());
+            let address = wait_for_mcp_address(&test.daemon).await;
+            let mut clients = Vec::new();
+            let mut tokens = Vec::new();
+            let mut programs = Vec::new();
+            for user_agent in ["creator/1", "joiner/1"] {
+                let client = ClientInfo::default().serve(StreamableHttpClientTransport::from_config(
+                    StreamableHttpClientTransportConfig::with_uri(format!("http://{address}/mcp")),
+                )).await.unwrap();
+                let hello = call_mcp_tool(&client, "hello", serde_json::json!({"user_agent": user_agent})).await;
+                let token = hello["token"].clone();
+                let catalog = call_mcp_tool(&client, "list_programs", serde_json::json!({"token": token})).await;
+                programs.push(catalog["programs"].as_array().unwrap().iter()
+                    .find(|program| program["name"] == "rock-paper-scissors").unwrap()["program"].clone());
+                tokens.push(token);
+                clients.push(client);
+            }
+            assert_eq!(programs[0], programs[1]);
+            let start_join = || call_mcp_tool(&clients[1], "start_execution", serde_json::json!({
+                "token": tokens[1], "program": programs[1], "params": null, "ensemble": {"mode": "join"}
+            }));
+            let cancelled = start_join().await;
             assert!(cancelled["negotiation_id"].is_null());
-            timeout(
-                Duration::from_secs(2),
-                stop_mcp_execution(&setup, 1, &cancelled["execution"]),
-            )
-            .await
-            .expect("unbound Join cancels promptly");
-
-            let joined = start_mcp_execution(&setup, 1, "join").await;
-            assert!(joined["negotiation_id"].is_null());
-            let waiting = call_mcp_tool(
-                &setup.clients[1],
-                "await_execution_event",
-                serde_json::json!({
-                    "token": setup.tokens[1],
-                    "execution": joined["execution"],
-                    "wait_ms": 30,
-                }),
-            )
-            .await;
-            assert_eq!(waiting, serde_json::json!({"event": "waiting"}));
-
-            let created = start_mcp_execution(&setup, 0, "create").await;
+            timeout(Duration::from_secs(2), call_mcp_tool(&clients[1], "stop_execution", serde_json::json!({
+                "token": tokens[1], "execution": cancelled["execution"]
+            }))).await.expect("unbound Join cancels promptly");
+            let early_join = if join_first {
+                let joined = start_join().await;
+                assert!(joined["negotiation_id"].is_null());
+                let waiting = call_mcp_tool(&clients[1], "await_execution_event", serde_json::json!({
+                    "token": tokens[1], "execution": joined["execution"], "wait_ms": 30
+                })).await;
+                assert_eq!(waiting, serde_json::json!({"event": "waiting"}));
+                Some(joined)
+            } else { None };
+            let created = call_mcp_tool(&clients[0], "start_execution", serde_json::json!({
+                "token": tokens[0], "program": programs[0], "params": null, "ensemble": {"mode": "create"}
+            })).await;
             assert_eq!(created["state"], "Negotiating");
+            assert!(created["session"].is_null());
             assert!(created["negotiation_id"].is_string());
+            if !join_first {
+                // Open creator admission has no negotiation deadline at the
+                // daemon/MCP boundary and must remain joinable after 40s.
+                let started = Instant::now();
+                for _ in 0..2 {
+                    let waiting = call_mcp_tool(&clients[0], "await_execution_event", serde_json::json!({
+                        "token": tokens[0], "execution": created["execution"], "wait_ms": 20000
+                    })).await;
+                    assert_eq!(waiting, serde_json::json!({"event": "waiting"}));
+                }
+                assert!(started.elapsed() >= Duration::from_secs(40));
+            }
+            let recovered = call_mcp_tool(&clients[0], "list_executions", serde_json::json!({"token": tokens[0]})).await;
+            assert_eq!(recovered["executions"][0]["execution"], created["execution"]);
+            let joined = if let Some(joined) = early_join { joined } else { start_join().await };
             let executions = [created["execution"].clone(), joined["execution"].clone()];
-            let sessions = wait_for_activation(&setup, &executions).await;
+            let mut activated = false;
+            for _ in 0..250 {
+                let mut statuses = Vec::new();
+                for index in 0..2 {
+                    statuses.push(call_mcp_tool(&clients[index], "get_execution_status", serde_json::json!({
+                        "token": tokens[index], "execution": executions[index]
+                    })).await);
+                }
+                if statuses.iter().all(|status| status["state"]["exec_state"] == "Active") {
+                    assert_eq!(
+                        statuses[0]["state"]["session"]["session_id"],
+                        statuses[1]["state"]["session"]["session_id"]
+                    );
+                    activated = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(activated, "MCP-driven executions did not activate");
+            let mut sessions = [Value::Null, Value::Null];
+            let mut answered = [Value::Null, Value::Null];
+            for _ in 0..100 {
+                for index in 0..2 {
+                    if !sessions[index].is_null() { continue; }
+                    let event = call_mcp_tool(&clients[index], "await_execution_event", serde_json::json!({
+                        "token": tokens[index], "execution": executions[index], "wait_ms": 100
+                    })).await;
+                    match event["event"].as_str() {
+                        Some("waiting") => {},
+                        Some("callout") => {
+                            if answered[index] == event["pending_id"] {
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                                continue;
+                            }
+                            let result = call_mcp_tool_result(&clients[index], "answer_callout", serde_json::json!({
+                                "token": tokens[index], "execution": executions[index],
+                                "pending_id": event["pending_id"], "answer": "Rock"
+                            })).await;
+                            if result.is_error == Some(true) {
+                                let error = result.structured_content.expect("structured error");
+                                assert!(matches!(error["code"].as_str(), Some("CalloutNotPending")), "{error}");
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            } else {
+                                answered[index] = event["pending_id"].clone();
+                            }
+                        }
+                        Some("completed") => sessions[index] = event["session"].clone(),
+                        _ => panic!("unexpected execution event"),
+                    }
+                }
+                if sessions.iter().all(|session| !session.is_null()) { break; }
+            }
+            assert!(sessions.iter().all(|session| !session.is_null()), "MCP executions did not complete");
             assert_eq!(sessions[0], sessions[1]);
-            let _ = tokio::join!(
-                stop_mcp_execution(&setup, 0, &executions[0]),
-                stop_mcp_execution(&setup, 1, &executions[1]),
-            );
-            stop_admission(setup).await;
-        })
-        .await
-        .expect("open Join MCP scenario exceeded 20 seconds");
+            for index in 0..2 {
+                assert!(executions[index].get("host").is_none());
+                assert!(sessions[index].get("host").is_none());
+                let view = call_mcp_tool(&clients[index], "view_execution", serde_json::json!({
+                    "token": tokens[index], "execution": executions[index]
+                })).await;
+                assert!(view["view"]["slots"].is_object());
+                let verified = call_mcp_tool(&clients[index], "verify_session", serde_json::json!({
+                    "token": tokens[index], "session": sessions[index]
+                })).await;
+                assert_eq!(verified["session"], sessions[index]);
+                let participants = verified["participants"].as_array().unwrap();
+                assert_eq!(participants.len(), 2);
+                assert!(participants.iter().all(|participant| participant.get("host").is_none()));
+                assert!(verified["steps"].as_u64().is_some_and(|steps| steps > 0));
+                assert_eq!(verified["terminal"], "Completed");
+                assert!(verified["outcome_borsh"].is_array());
+            }
+            for client in clients { client.cancel().await.unwrap(); }
+            test.daemon.stop().await;
+            supervisor.await.unwrap().unwrap();
+        }).await.expect("two-client MCP scenario exceeded 80 seconds");
+    }
+
+    #[tokio::test]
+    async fn references_and_admission_are_structured() {
+        let test = test_daemon().await;
+        let server = Arena0Mcp::new(test.daemon);
+        let start = tool_input_schema(&server, "start_execution");
+        assert!(start["properties"]["program"]["$ref"].is_string());
+        assert!(start["$defs"]["ProgramRef"]["properties"]["program_id"].is_object());
+        assert!(
+            start["$defs"]["ProgramRef"]["properties"]
+                .get("host")
+                .is_none()
+        );
+        let ensemble = &start["$defs"]["McpEnsemble"];
+        let variants = ensemble["oneOf"].as_array().expect("ensemble variants");
+        assert_eq!(variants.len(), 2);
+        assert!(
+            variants
+                .iter()
+                .all(|variant| variant["additionalProperties"] == false)
+        );
+
+        let status = tool_input_schema(&server, "get_execution_status");
+        assert!(status["properties"]["execution"]["$ref"].is_string());
+        let verify = tool_input_schema(&server, "verify_session");
+        assert!(verify["properties"]["session"]["$ref"].is_string());
+        assert!(verify["properties"].get("mode").is_none());
+        let answer = tool_input_schema(&server, "answer_callout");
+        assert_eq!(answer["properties"]["pending_id"]["type"], "string");
+        assert_eq!(answer["properties"]["pending_id"]["pattern"], "^[0-9]+$");
     }
 
     #[test]

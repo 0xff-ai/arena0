@@ -3,14 +3,13 @@ use arena0_crypto::CryptoError;
 use zeroize::Zeroizing;
 
 impl Database {
-    pub(super) fn load_or_create_execution_salt(
+    pub(crate) fn load_or_create_execution_salt(
         &mut self,
         execution_id: ExecId,
         now_ms: u64,
     ) -> Result<ExecutionSalt, StoreError> {
-        self.begin()?;
-        let result = (|| {
-            let request_exists: bool = self.connection.query_row(
+        self.transaction(|store| {
+            let request_exists: bool = store.connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM exec_requests WHERE execution_id = ?1)",
                 params![execution_id.0.to_vec()],
                 |row| row.get(0),
@@ -18,7 +17,7 @@ impl Database {
             if !request_exists {
                 return Err(StoreError::ExecutionRequestNotFound(execution_id));
             }
-            let existing = self
+            let existing = store
                 .connection
                 .query_row(
                     "SELECT salt FROM execution_salts WHERE execution_id = ?1",
@@ -42,20 +41,16 @@ impl Database {
                 }
             };
             let encoded = envelope(EnvelopeKind::ExecutionSalt, salt.as_bytes())?;
-            self.connection.execute(
+            store.connection.execute(
                 "INSERT INTO execution_salts (execution_id, salt, created_at_ms)
                  VALUES (?1, ?2, ?3)",
                 params![execution_id.0.to_vec(), encoded, sqlite_u64(now_ms)?,],
             )?;
             Ok(salt)
-        })();
-        match result {
-            Ok(salt) => self.commit_result(salt),
-            Err(error) => self.rollback_result(error),
-        }
+        })
     }
 
-    pub(super) fn register_program(
+    pub(crate) fn register_program(
         &mut self,
         hash: ProgramHash,
         wasm: Vec<u8>,
@@ -107,7 +102,7 @@ impl Database {
         Ok(ProgramStoreOutcome::Stored)
     }
 
-    pub(super) fn load_program(
+    pub(crate) fn load_program(
         &mut self,
         hash: ProgramHash,
     ) -> Result<Option<StoredProgram>, StoreError> {
@@ -131,7 +126,7 @@ impl Database {
         Ok(Some(StoredProgram { hash, wasm }))
     }
 
-    pub(super) fn list_programs(&mut self, limit: usize) -> Result<Vec<ProgramHash>, StoreError> {
+    pub(crate) fn list_programs(&mut self, limit: usize) -> Result<Vec<ProgramHash>, StoreError> {
         let limit = i64::try_from(limit)
             .map_err(|_| StoreError::InvalidConfiguration("program limit is too large"))?;
         let mut statement = self.connection.prepare(
@@ -151,7 +146,7 @@ impl Database {
         Ok(hashes)
     }
 
-    pub(super) fn remove_program(
+    pub(crate) fn remove_program(
         &mut self,
         hash: ProgramHash,
         now_ms: u64,

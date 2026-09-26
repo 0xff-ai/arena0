@@ -34,7 +34,9 @@ Within one execution, the daemon preserves these causal edges:
 
 1. `exec.created` precedes all other events for that `exec_id`.
 2. Negotiation events precede `exec.session.started`.
-3. `exec.session.callout_answered` precedes the step that consumes the answer.
+3. `exec.session.callout_answered` is emitted only after the program accepts a
+   callout answer and precedes the step that consumes it. A program rejection
+   emits no answered event and leaves the same pending callout open.
 4. One terminal event, `exec.session.ended` or `exec.terminated`, closes the
    execution.
 
@@ -86,7 +88,7 @@ reload state and evidence through the direct API methods.
 ## Payload safety
 
 Event payloads contain public identity values, protocol IDs, bounded counts,
-lifecycle values, state hashes, fuel counts, and host failure descriptions.
+lifecycle values, state hashes, and host failure descriptions.
 They never contain private keys, signatures, invite tokens, opaque program
 bytes, or raw Borsh payloads.
 
@@ -119,8 +121,14 @@ Consumers can derive the public lifecycle from the event sequence:
 | `Aborted` | An aborted `exec.session.ended` or a program-aborted termination |
 | `Failed` | Any other `exec.terminated` |
 
-Pending callouts remain open until their answer or the execution terminal.
-The terminal closes any remaining callout. Queue position is reported on
+The program derives its open callout from each accepted state. After a non-answer
+event, the same index and context retain the pending ID. An accepted answer
+consumes its ID; even an identical next question receives a fresh ID.
+A different question replaces the current one, and no
+question withdraws it. A staged result leaves the committed callout visible
+until certification. A program-level input rejection changes no durable state
+and can be retried with the same pending ID. The terminal closes any remaining
+callout. Queue position is reported on
 `exec.created`; later queue state comes from `exec.status`.
 
 ## Deliberate omissions

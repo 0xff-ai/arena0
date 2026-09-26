@@ -21,22 +21,20 @@ mod response;
 
 pub use activity::{ActivityData, ActivityFrame, ActivityResult};
 pub use arena0_protocol::{
-    ColorDepth, ExecLifecycle, NegotiationTarget, PendingId, ReceiptArtifact, TerminalResult, View,
+    CalloutId, ColorDepth, EffectKind, EffectSummary, EventKind, ExecLifecycle, NegotiationTarget,
+    ReceiptArtifact, ReceiptProvenance, ReceiptSummary, ReceiptTermination, View,
 };
 pub use events::{
     EventData, EventFilter, EventFrame, ExecOrigin, ExecutionFailureKind, NegotiationStage,
     SessionTerminal,
 };
-pub use request::{
-    AwaitState, EnsembleSpec, HostRequest, IdRef, ProgramRefError, ReceiptRef, Request,
-};
+pub use request::{AwaitState, EnsembleSpec, HostRequest, ProgramRefError, ReceiptRef, Request};
 pub use response::{
     ActivationInspection, ActivationInspectionState, ActivationParticipant, ApiError, ApiErrorCode,
-    DaemonInfo, ExecStatus, ExecStatusState, ExecutionInspection, FullVerifiedTerminal, HostInfo,
-    HostStatus, IdInfo, LightVerifiedTerminal, NextEvent, PendingCalloutStatus,
-    PrivateCommitSummary, PrivateEffectKind, PrivateEffectSummary, PrivateEventKind, ProgramDetail,
-    ProgramSummary, ReceiptListEntry, ReceiptProvenance, Response, ResponseOk, SessionProgress,
-    SessionStatus, VerifiedResult,
+    DaemonInfo, EventRecordSummary, ExecEndPhase, ExecEndStatus, ExecStatus, ExecStatusState,
+    ExecutionInspection, HostInfo, HostStatus, IdInfo, NextEvent, PendingCalloutStatus,
+    ProgramDetail, ProgramSummary, ReceiptListEntry, Response, ResponseOk, SessionProgress,
+    SessionStatus,
 };
 
 #[cfg(test)]
@@ -83,7 +81,7 @@ mod tests {
     #[test]
     fn request_round_trips_with_path_tags() {
         let cases = [
-            (HostRequest::IdList, "id.list"),
+            (HostRequest::IdShow, "id.show"),
             (
                 HostRequest::ExecNext {
                     exec_id: ExecId([7u8; 32]),
@@ -104,15 +102,15 @@ mod tests {
             (
                 HostRequest::ExecInspect {
                     exec_id: ExecId([9u8; 32]),
-                    private_from: Some(4),
-                    private_limit: 32,
+                    events_from: Some(4),
+                    events_limit: 32,
                 },
                 "exec.inspect",
             ),
             (
                 HostRequest::ExecSubmit {
                     exec_id: ExecId([1u8; 32]),
-                    pending_id: PendingId::new(3),
+                    pending_id: CalloutId::new(3),
                     answer: Some(serde_json::json!("Rock")),
                 },
                 "exec.submit",
@@ -139,6 +137,12 @@ mod tests {
                 },
                 "receipt.get",
             ),
+            (
+                HostRequest::ReceiptVerify {
+                    receipt: ReceiptRef::Produced(SessionHash([10u8; 32])),
+                },
+                "receipt.verify",
+            ),
         ];
         for (req, path) in cases {
             let json = serde_json::to_value(&req).unwrap();
@@ -146,6 +150,16 @@ mod tests {
             let back: HostRequest = serde_json::from_value(json).unwrap();
             assert_eq!(req, back);
         }
+    }
+
+    #[test]
+    fn receipt_verify_rejects_removed_full_parameter() {
+        let request = HostRequest::ReceiptVerify {
+            receipt: ReceiptRef::Produced(SessionHash([10u8; 32])),
+        };
+        let mut json = serde_json::to_value(request).expect("receipt verify JSON");
+        json["params"]["full"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<HostRequest>(json).is_err());
     }
 
     #[test]
@@ -188,7 +202,7 @@ mod tests {
             join_request
         );
 
-        let pending_id = PendingId::new(u64::MAX);
+        let pending_id = CalloutId::new(u64::MAX);
         let submit = HostRequest::ExecSubmit {
             exec_id,
             pending_id,
@@ -226,7 +240,7 @@ mod tests {
             (
                 HostRequest::ExecSubmit {
                     exec_id,
-                    pending_id: PendingId::new(3),
+                    pending_id: CalloutId::new(3),
                     answer: Some(serde_json::json!({})),
                 },
                 "answer_raw",
@@ -286,6 +300,7 @@ mod tests {
     #[test]
     fn exec_status_serializes_only_state_valid_fields() {
         let status = ExecStatus {
+            end: Default::default(),
             exec_id: ExecId([5; 32]),
             negotiation_id: None,
             program_id: ProgramHash([7; 32]),
@@ -296,9 +311,8 @@ mod tests {
                     peers: vec![PeerId([8; 32])],
                     participants: 2,
                     pending_callout: Some(PendingCalloutStatus {
-                        pending_id: PendingId::new(11),
+                        pending_id: CalloutId::new(11),
                         callout_index: 1,
-                        expected_type: Some("Move".into()),
                     }),
                     receipt_available: false,
                 },
@@ -309,6 +323,10 @@ mod tests {
         assert!(json.get("host").is_none());
         assert!(json.get("step").is_none());
         assert_eq!(json["state"]["exec_state"], "Active");
+        assert_eq!(
+            json["end"],
+            serde_json::json!({"phase": "open", "unconfirmed": []})
+        );
         assert_eq!(json["state"]["session"]["step"], 3);
         let mut with_unknown_field = json.clone();
         with_unknown_field["queue_position"] = serde_json::json!(2);
@@ -317,11 +335,34 @@ mod tests {
         with_wrong_state_field["state"]["queue_position"] = serde_json::json!(2);
         assert!(serde_json::from_value::<ExecStatus>(with_wrong_state_field).is_err());
         assert_eq!(serde_json::from_value::<ExecStatus>(json).unwrap(), status);
+        for (phase, expected) in [
+            (ExecEndPhase::Ending, "ending"),
+            (ExecEndPhase::Ended, "ended"),
+        ] {
+            let mut terminal = status.clone();
+            terminal.state = ExecStatusState::Completed {
+                session: status.session().unwrap().clone(),
+            };
+            terminal.end = ExecEndStatus {
+                phase,
+                unconfirmed: vec![PeerId([8; 32])],
+            };
+            let json = serde_json::to_value(&terminal).unwrap();
+            assert_eq!(json["end"]["phase"], expected);
+            assert_eq!(
+                json["end"]["unconfirmed"],
+                serde_json::json!([PeerId([8; 32])])
+            );
+            assert_eq!(
+                serde_json::from_value::<ExecStatus>(json).unwrap(),
+                terminal
+            );
+        }
     }
 
     #[test]
     fn response_pending_ids_are_decimal_strings() {
-        let pending_id = PendingId::new(u64::MAX);
+        let pending_id = CalloutId::new(u64::MAX);
         let response = ResponseOk::Next(NextEvent::Callout {
             pending_id,
             callout_index: 0,
@@ -342,75 +383,28 @@ mod tests {
     }
 
     #[test]
-    fn public_terminal_json_contains_only_agent_values() {
-        let terminal = TerminalResult::Completed {
-            outcome: Some(serde_json::json!({"winner": "Rock"})),
-        };
-        let json = serde_json::to_value(terminal).unwrap();
-        assert_eq!(json["Completed"]["outcome"]["winner"], "Rock");
-        assert!(json["Completed"].get("outcome_raw").is_none());
-
-        let verified = LightVerifiedTerminal::Completed {
-            outcome_borsh: vec![0],
-        };
-        let json = serde_json::to_value(verified).unwrap();
-        assert_eq!(json["Completed"]["outcome_borsh"], serde_json::json!([0]));
-        assert!(json["Completed"].get("outcome_json").is_none());
-        assert!(
-            serde_json::from_value::<LightVerifiedTerminal>(serde_json::json!({
-                "Completed": {"outcome_borsh": [0], "outcome_json": null}
-            }))
-            .is_err()
-        );
-
-        let verified = FullVerifiedTerminal::Completed {
-            outcome_borsh: vec![0],
-            outcome_json: serde_json::json!({"winner": "Rock"}),
-        };
-        let json = serde_json::to_value(verified).unwrap();
-        assert_eq!(json["Completed"]["outcome_borsh"], serde_json::json!([0]));
-        assert_eq!(json["Completed"]["outcome_json"]["winner"], "Rock");
-        assert!(
-            serde_json::from_value::<FullVerifiedTerminal>(serde_json::json!({
-                "Completed": {"outcome_borsh": [0]}
-            }))
-            .is_err()
-        );
-
-        let verified = VerifiedResult::Light {
-            terminal: LightVerifiedTerminal::Completed {
-                outcome_borsh: vec![0],
-            },
-        };
-        let json = serde_json::to_value(verified).unwrap();
-        assert!(
-            json["Light"]["terminal"]["Completed"]
-                .get("outcome_json")
-                .is_none()
-        );
-
-        let response = Ok(ResponseOk::Verified {
+    fn verified_json_contains_only_agent_values() {
+        let response = Ok(ResponseOk::Verified(ReceiptSummary {
             receipt_id: arena0_protocol::ReceiptId::from_bytes([9; 32]),
             program_id: ProgramHash([1; 32]),
             session_id: SessionHash([2; 32]),
             ensemble: vec![PeerId([3; 32])],
             steps: 1,
-            result: VerifiedResult::Full {
-                terminal: FullVerifiedTerminal::Completed {
-                    outcome_borsh: vec![0],
-                    outcome_json: serde_json::json!({"ok": true}),
-                },
-            },
-        });
+            terminal: ReceiptTermination::Completed,
+            outcome_borsh: Some(vec![0]),
+        }));
         let encoded = serde_json::to_value(&response).unwrap();
-        assert!(
-            encoded["Ok"]["Verified"]["result"]["Full"]["terminal"]["Completed"]
-                .get("outcome_json")
-                .is_some()
-        );
+        let verified = &encoded["Ok"]["Verified"];
+        assert_eq!(verified["terminal"], serde_json::json!("Completed"));
+        assert_eq!(verified["outcome_borsh"], serde_json::json!([0]));
+        assert!(verified.get("outcome_json").is_none());
         assert_eq!(
-            serde_json::from_value::<Response>(encoded).unwrap(),
+            serde_json::from_value::<Response>(encoded.clone()).unwrap(),
             response
         );
+
+        let mut unknown = encoded;
+        unknown["Ok"]["Verified"]["outcome_json"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<Response>(unknown).is_err());
     }
 }

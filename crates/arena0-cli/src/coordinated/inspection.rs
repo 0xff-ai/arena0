@@ -62,7 +62,7 @@ pub(super) async fn observe(
     }
     loop {
         tokio::select! {
-            request = tui.changed_private_page() => {
+            request = tui.changed_event_page() => {
                 let Some(request) = request else { return Ok(()); };
                 if let Some(page) = pages.get(&request.host) {
                     page.send_replace(request.from);
@@ -76,7 +76,7 @@ pub(super) async fn observe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::{PrivatePageRequest, RunUpdate};
+    use crate::tui::{EventPageRequest, RunUpdate};
     use anyhow::{anyhow, bail};
     use arena0_client::api::{
         ExecStatus, ExecStatusState, ExecutionInspection, HostRequest, Request, Response,
@@ -140,7 +140,7 @@ mod tests {
             };
             assert!(matches!(
                 stalled_request,
-                HostRequest::ExecInspect { exec_id, private_from: None, .. }
+                HostRequest::ExecInspect { exec_id, events_from: None, .. }
                     if exec_id == stalled_exec
             ));
             milestone.set("first Host stalled; waiting for the second Host request");
@@ -159,16 +159,17 @@ mod tests {
             assert_ne!(responsive_host, stalled_host);
             assert!(matches!(
                 responsive_request,
-                HostRequest::ExecInspect { exec_id, private_from: None, .. }
+                HostRequest::ExecInspect { exec_id, events_from: None, .. }
                     if exec_id == responsive_exec
             ));
-            pages.send_replace(Some(PrivatePageRequest {
+            pages.send_replace(Some(EventPageRequest {
                 host: responsive_host.clone(),
                 from: Some(4),
             }));
             let response = |exec_id, from| -> Response {
                 Ok(ResponseOk::Inspection(ExecutionInspection {
                     status: ExecStatus {
+                        end: Default::default(),
                         exec_id,
                         negotiation_id: None,
                         program_id: ProgramHash([3; 32]),
@@ -177,10 +178,10 @@ mod tests {
                         },
                     },
                     activation: None,
-                    private_from: from,
-                    private: Vec::new(),
-                    private_total: 10,
-                    private_next: None,
+                    events_from: from,
+                    events: Vec::new(),
+                    events_total: 10,
+                    events_next: None,
                 }))
             };
             write_frame(&mut responsive_write, &response(responsive_exec, 0))
@@ -194,7 +195,7 @@ mod tests {
             assert_eq!(wire_host, responsive_host.to_string());
             assert!(matches!(
                 request,
-                HostRequest::ExecInspect { exec_id, private_from: Some(4), .. }
+                HostRequest::ExecInspect { exec_id, events_from: Some(4), .. }
                     if exec_id == responsive_exec
             ));
             write_frame(&mut responsive_write, &response(responsive_exec, 4))
@@ -203,7 +204,7 @@ mod tests {
             while let Some(update) = updates.recv().await {
                 if let RunUpdate::Inspection { host, inspection } = update
                     && host == responsive_host
-                    && inspection.private_from == 4
+                    && inspection.events_from == 4
                 {
                     milestone.set("requested page published while first Host remains stalled");
                     break;
@@ -217,7 +218,7 @@ mod tests {
             assert_eq!(wire_host, responsive_host.to_string());
             assert!(matches!(
                 request,
-                HostRequest::ExecInspect { exec_id, private_from: Some(4), .. }
+                HostRequest::ExecInspect { exec_id, events_from: Some(4), .. }
                     if exec_id == responsive_exec
             ));
             milestone.set("one stalled and one pending Host request");
@@ -274,7 +275,7 @@ mod tests {
         assert!(matches!(
             updates.recv().await,
             Some(RunUpdate::Inspection { host: update_host, inspection })
-                if update_host == host && inspection.private_from == 0
+                if update_host == host && inspection.events_from == 0
         ));
         let observer = tokio::spawn(observe(tui, vec![(host.clone(), client, exec_id)]));
         tokio::task::yield_now().await;
@@ -327,7 +328,7 @@ mod tests {
             assert_eq!(wire_host, expected_host);
             let HostRequest::ExecInspect {
                 exec_id,
-                private_from,
+                events_from,
                 ..
             } = request
             else {
@@ -340,6 +341,7 @@ mod tests {
                 .map_err(|_| anyhow!("inspection timestamp receiver closed"))?;
             let response: Response = Ok(ResponseOk::Inspection(ExecutionInspection {
                 status: ExecStatus {
+                    end: Default::default(),
                     exec_id,
                     negotiation_id: None,
                     program_id: ProgramHash([7; 32]),
@@ -348,10 +350,10 @@ mod tests {
                     },
                 },
                 activation: None,
-                private_from: private_from.unwrap_or(0),
-                private: Vec::new(),
-                private_total: 0,
-                private_next: None,
+                events_from: events_from.unwrap_or(0),
+                events: Vec::new(),
+                events_total: 0,
+                events_next: None,
             }));
             write_frame(&mut write, &response).await?;
         }

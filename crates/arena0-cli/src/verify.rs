@@ -1,48 +1,39 @@
-//! `arena0 verify`: spelled-out receipt evidence. Three target kinds:
+//! `arena0 verify`: spelled-out receipt evidence. Two target kinds:
 //!
 //! - a **session id** or **receipt id** the daemon holds -> the daemon verifies and
 //!   returns the evidence;
-//! - a **file path** -> verified daemonlessly against `arena0-verify` (light needs no
-//!   daemon at all; `--replay` delegates replay to a running Host).
+//! - a **file path** -> verified daemonlessly: parsing authenticates the artifact.
 
 use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, bail};
 use arena0_client::api::{
-    FullVerifiedTerminal as ApiFullVerifiedTerminal, HostRequest,
-    LightVerifiedTerminal as ApiLightVerifiedTerminal, ReceiptArtifact, ReceiptRef, ResponseOk,
-    VerifiedResult,
+    HostRequest, ReceiptArtifact, ReceiptSummary, ReceiptTermination, ResponseOk,
 };
 use arena0_client::proto::DaemonClient;
-use arena0_client::protocol::{ABI_VERSION, PeerId, ProgramHash, SessionHash};
+use arena0_client::protocol::{ABI_VERSION, PeerId, ProgramHash};
 use arena0_home::HostName;
-use arena0_verify::{LightVerifiedTerminal as LightVerifiedTerminalBytes, verify_light};
 use serde_json::json;
 use tokio::task::JoinSet;
 
-use crate::coordinated::{EvidenceAgreement, HostEvidence, compare_evidence};
+use crate::coordinated::{HostEvidence, compare_evidence};
 use crate::{Ctx, ui};
 
 /// The evidence a verification recovers, rendered the same whether it came from the
 /// daemon or a daemonless run.
 struct Evidence {
-    receipt_id: arena0_client::protocol::ReceiptId,
-    program_id: ProgramHash,
+    summary: ReceiptSummary,
     program_name: Option<String>,
-    session_id: SessionHash,
-    ensemble: Vec<PeerId>,
-    steps: u64,
-    result: VerifiedResult,
     local_peer: Option<PeerId>,
 }
 
-pub(crate) async fn verify(ctx: &Ctx, target: String, full: bool) -> anyhow::Result<()> {
+pub(crate) async fn verify(ctx: &Ctx, target: String) -> anyhow::Result<()> {
     let path = Path::new(&target);
     if is_path_target(path, &target) {
-        verify_file(ctx, path, full).await
+        verify_file(ctx, path).await
     } else {
-        verify_resident(ctx, &target, full).await
+        verify_resident(ctx, &target).await
     }
 }
 
@@ -53,7 +44,6 @@ pub(crate) async fn verify_hosts(
     palette: ui::Palette,
     target: &str,
     hosts: &[HostName],
-    replay: bool,
 ) -> anyhow::Result<()> {
     let mut names = HashSet::with_capacity(hosts.len());
     for host in hosts {
@@ -77,37 +67,18 @@ pub(crate) async fn verify_hosts(
                 .await
                 .with_context(|| format!("resolve receipt on Host '{host}'"))?;
             let response = client
-                .call_host(
-                    &host,
-                    &HostRequest::ReceiptVerify {
-                        receipt: key,
-                        full: replay,
-                    },
-                )
+                .call_host(&host, &HostRequest::ReceiptVerify { receipt: key })
                 .await
                 .with_context(|| format!("verify Host receipt on Host '{host}'"))?;
-            let ResponseOk::Verified {
-                receipt_id,
-                program_id,
-                session_id,
-                ensemble,
-                steps,
-                result,
-            } = response
-            else {
+            let ResponseOk::Verified(summary) = response else {
                 bail!("unexpected receipt.verify response from Host '{host}'");
             };
             Ok::<_, anyhow::Error>((
                 index,
                 host,
                 HostEvidence {
-                    receipt_id,
                     peer_id: info.host.peer_id,
-                    program_id,
-                    session_id,
-                    ensemble,
-                    steps,
-                    result,
+                    summary,
                 },
             ))
         });
@@ -150,7 +121,7 @@ pub(crate) async fn verify_hosts(
         );
     }
 
-    render_host_evidence(mode, palette, replay, &evidence, &agreement);
+    render_host_evidence(mode, palette, &evidence, &agreement);
     Ok(())
 }
 
@@ -166,7 +137,7 @@ pub(crate) fn is_path_target(path: &Path, target: &str) -> bool {
 }
 
 /// Verify a session/receipt id the daemon holds.
-async fn verify_resident(ctx: &Ctx, target: &str, full: bool) -> anyhow::Result<()> {
+async fn verify_resident(ctx: &Ctx, target: &str) -> anyhow::Result<()> {
     if !ctx.client().daemon_up().await {
         bail!(
             "daemon not reachable at {}. To verify a receipt file offline, pass its path.",
@@ -177,17 +148,9 @@ async fn verify_resident(ctx: &Ctx, target: &str, full: bool) -> anyhow::Result<
     // addressed daemon's peer_id.
     let key = ctx.client().resolve_receipt_ref(&ctx.host, target).await?;
     let resp = ctx
-        .call(&HostRequest::ReceiptVerify { receipt: key, full })
+        .call(&HostRequest::ReceiptVerify { receipt: key })
         .await?;
-    let ResponseOk::Verified {
-        receipt_id,
-        program_id,
-        session_id,
-        ensemble,
-        steps,
-        result,
-    } = resp
-    else {
+    let ResponseOk::Verified(summary) = resp else {
         bail!("unexpected verify response");
     };
     let names = ctx.client().program_name_map(&ctx.host).await;
@@ -196,33 +159,17 @@ async fn verify_resident(ctx: &Ctx, target: &str, full: bool) -> anyhow::Result<
         ctx.mode,
         ctx.palette,
         &Evidence {
-            receipt_id,
-            program_name: names.get(&program_id).cloned(),
-            program_id,
-            session_id,
-            ensemble,
-            steps,
-            result,
+            program_name: names.get(&summary.program_id).cloned(),
+            summary,
             local_peer,
         },
     );
     Ok(())
 }
 
-/// Verify a receipt file offline. Light needs no daemon; full belongs to a Host.
-async fn verify_file(ctx: &Ctx, path: &Path, full: bool) -> anyhow::Result<()> {
-    let receipt = full.then(|| read_receipt(path)).transpose()?;
-
-    // Full replay belongs to the Host, which owns the registered program bytes and
-    // replay sandbox. The public client never links the sandbox itself.
-    if full {
-        if ctx.client().daemon_up().await {
-            return delegate_to_daemon(ctx, receipt.expect("full receipt preflight"), true).await;
-        }
-        return full_replay_requires_daemon();
-    }
-
-    verify_file_light(Some(ctx), ctx.mode, ctx.palette, path).await
+/// Verify a receipt file's portable proof and optionally enrich its presentation.
+async fn verify_file(ctx: &Ctx, path: &Path) -> anyhow::Result<()> {
+    verify_file_offline(Some(ctx), ctx.mode, ctx.palette, path).await
 }
 
 /// Verify a receipt file without constructing a daemon client. Optional daemon
@@ -232,15 +179,7 @@ pub(crate) async fn verify_offline(
     palette: crate::ui::Palette,
     path: &Path,
 ) -> anyhow::Result<()> {
-    verify_file_light(None, mode, palette, path).await
-}
-
-/// Explain why full replay cannot proceed without a resolvable daemon socket.
-pub(crate) fn full_replay_requires_daemon() -> anyhow::Result<()> {
-    bail!(
-        "full replay requires a running arena0d Host; use light verification \
-         for an offline receipt"
-    );
+    verify_file_offline(None, mode, palette, path).await
 }
 
 /// Read and parse an explicit receipt file before consulting a Host.
@@ -250,76 +189,24 @@ pub(crate) fn read_receipt(path: &Path) -> anyhow::Result<ReceiptArtifact> {
 }
 
 /// Verify a receipt file's portable proof and render its evidence.
-async fn verify_file_light(
+async fn verify_file_offline(
     ctx: Option<&Ctx>,
     mode: crate::ui::Mode,
     palette: crate::ui::Palette,
     path: &Path,
 ) -> anyhow::Result<()> {
-    let receipt = read_receipt(path)?;
-    let receipt_id = receipt.receipt_id();
-
-    // Light: fully offline.
-    let encoded = receipt
-        .encode()
-        .map_err(|error| anyhow::anyhow!("encode receipt {}: {error}", path.display()))?;
-    let light = verify_light(&encoded).map_err(|e| anyhow::anyhow!("FAILED: {e}"))?;
-    let result = VerifiedResult::Light {
-        terminal: terminal_of(&light.terminal),
-    };
+    // Parsing authenticates the artifact entirely offline.
+    let summary = read_receipt(path)?.summary();
     let (program_name, local_peer) = match ctx {
-        Some(ctx) => enrich_offline(ctx, light.program_id).await,
+        Some(ctx) => enrich_offline(ctx, summary.program_id).await,
         None => (None, None),
     };
     render(
         mode,
         palette,
         &Evidence {
-            receipt_id,
+            summary,
             program_name,
-            program_id: light.program_id,
-            session_id: light.session_id,
-            ensemble: light.ensemble,
-            steps: light.steps,
-            result,
-            local_peer,
-        },
-    );
-    Ok(())
-}
-
-/// Delegate a file's verification to a reachable daemon (it holds the wasm).
-async fn delegate_to_daemon(ctx: &Ctx, receipt: ReceiptArtifact, full: bool) -> anyhow::Result<()> {
-    let resp = ctx
-        .call(&HostRequest::ReceiptVerify {
-            receipt: ReceiptRef::Inline(Box::new(receipt)),
-            full,
-        })
-        .await?;
-    let ResponseOk::Verified {
-        receipt_id,
-        program_id,
-        session_id,
-        ensemble,
-        steps,
-        result,
-    } = resp
-    else {
-        bail!("unexpected verify response");
-    };
-    let names = ctx.client().program_name_map(&ctx.host).await;
-    let local_peer = node_peer_id(ctx).await;
-    render(
-        ctx.mode,
-        ctx.palette,
-        &Evidence {
-            receipt_id,
-            program_name: names.get(&program_id).cloned(),
-            program_id,
-            session_id,
-            ensemble,
-            steps,
-            result,
             local_peer,
         },
     );
@@ -352,38 +239,24 @@ async fn node_peer_id(ctx: &Ctx) -> Option<PeerId> {
     }
 }
 
-/// Convert light verifier evidence into the API's light-tier result.
-fn terminal_of(t: &LightVerifiedTerminalBytes) -> ApiLightVerifiedTerminal {
-    match t {
-        LightVerifiedTerminalBytes::Completed { outcome_borsh } => {
-            ApiLightVerifiedTerminal::Completed {
-                outcome_borsh: outcome_borsh.clone(),
-            }
-        }
-        LightVerifiedTerminalBytes::Stopped { cause } => ApiLightVerifiedTerminal::Stopped {
-            cause: cause.clone(),
-        },
-    }
-}
-
 fn render(mode: crate::ui::Mode, palette: crate::ui::Palette, ev: &Evidence) {
+    let summary = &ev.summary;
     if mode.is_json() {
         crate::ui::print_json(&json!({
-            "tier": result_tier(&ev.result),
-            "program_id": ev.program_id.to_string(),
+            "program_id": summary.program_id.to_string(),
             "program": ev.program_name,
-            "session_id": ev.session_id.to_string(),
-            "receipt_id": ev.receipt_id.to_string(),
-            "ensemble": ev.ensemble.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            "steps": ev.steps,
-            "result": ev.result,
+            "session_id": summary.session_id.to_string(),
+            "receipt_id": summary.receipt_id.to_string(),
+            "ensemble": summary.ensemble.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "steps": summary.steps,
+            "terminal": summary.terminal,
+            "outcome_borsh": summary.outcome_borsh,
         }));
         return;
     }
 
     let p = palette;
-    let tier = result_tier(&ev.result);
-    println!("{} ({tier})", p.green("verified"));
+    println!("{}", p.green("verified"));
     let name = ev
         .program_name
         .clone()
@@ -391,35 +264,22 @@ fn render(mode: crate::ui::Mode, palette: crate::ui::Palette, ev: &Evidence) {
     println!(
         "  program     {}  ({}, abi {})",
         name,
-        ev.program_id.fmt_short(),
+        summary.program_id.fmt_short(),
         ABI_VERSION
     );
-    println!("  session     {}", ev.session_id.fmt_short());
-    println!("  receipt     {}", ev.receipt_id);
+    println!("  session     {}", summary.session_id.fmt_short());
+    println!("  receipt     {}", summary.receipt_id);
     println!(
         "  ensemble    {}",
-        render_ensemble(&ev.ensemble, ev.local_peer)
+        render_ensemble(&summary.ensemble, ev.local_peer)
     );
-    match &ev.result {
-        VerifiedResult::Light {
-            terminal: ApiLightVerifiedTerminal::Completed { .. },
-        } => {
-            println!("  steps       {}, chain intact, all agreed", ev.steps);
-            println!("  outcome     (JSON projection unavailable in light verification)");
+    match &summary.terminal {
+        ReceiptTermination::Completed => {
+            println!("  steps       {}, chain intact, all agreed", summary.steps);
+            println!("  outcome     (JSON projection unavailable without the program)");
         }
-        VerifiedResult::Full {
-            terminal: ApiFullVerifiedTerminal::Completed { outcome_json, .. },
-        } => {
-            println!("  steps       {}, chain intact, all agreed", ev.steps);
-            println!("  outcome     {}", crate::ui::compact_json(outcome_json));
-        }
-        VerifiedResult::Light {
-            terminal: ApiLightVerifiedTerminal::Stopped { cause },
-        }
-        | VerifiedResult::Full {
-            terminal: ApiFullVerifiedTerminal::Stopped { cause },
-        } => {
-            println!("  steps       {}, chain intact", ev.steps);
+        ReceiptTermination::Stopped { cause } => {
+            println!("  steps       {}, chain intact", summary.steps);
             println!("  {}     stopped: {cause:?}", p.yellow("terminal"));
         }
     }
@@ -428,20 +288,18 @@ fn render(mode: crate::ui::Mode, palette: crate::ui::Palette, ev: &Evidence) {
 fn render_host_evidence(
     mode: ui::Mode,
     palette: ui::Palette,
-    replay: bool,
     evidence: &[(HostName, HostEvidence)],
-    agreement: &EvidenceAgreement,
+    agreement: &ReceiptSummary,
 ) {
-    let tier = if replay { "full" } else { "light" };
     if mode.is_json() {
         ui::print_json(&json!({
-            "tier": tier,
             "program_id": agreement.program_id.to_string(),
             "session_id": agreement.session_id.to_string(),
             "receipt_id": agreement.receipt_id.to_string(),
             "ensemble": agreement.ensemble.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "steps": agreement.steps,
-            "result": agreement.result,
+            "terminal": agreement.terminal,
+            "outcome_borsh": agreement.outcome_borsh,
             "producers": evidence.iter().map(|(host, receipt)| json!({
                 "host": host.to_string(),
                 "peer_id": receipt.peer_id.to_string(),
@@ -454,11 +312,10 @@ fn render_host_evidence(
     }
 
     println!(
-        "{} {}/{} Host receipts ({})",
+        "{} {}/{} Host receipts",
         palette.green("verified"),
         evidence.len(),
-        agreement.ensemble.len(),
-        if replay { "full replay" } else { "light" }
+        agreement.ensemble.len()
     );
     println!("  program     {}", agreement.program_id.fmt_short());
     println!("  session     {}", agreement.session_id.fmt_short());
@@ -467,26 +324,13 @@ fn render_host_evidence(
     for (host, receipt) in evidence {
         println!("  peer_id    {}  {}", host, receipt.peer_id.fmt_short());
     }
-    match &agreement.result {
-        VerifiedResult::Full {
-            terminal: ApiFullVerifiedTerminal::Completed { outcome_json, .. },
-        } => println!("  outcome     {}", ui::compact_json(outcome_json)),
-        VerifiedResult::Light {
-            terminal: ApiLightVerifiedTerminal::Completed { .. },
-        } => println!("  outcome     (JSON projection unavailable in light verification)"),
-        VerifiedResult::Light {
-            terminal: ApiLightVerifiedTerminal::Stopped { cause },
+    match &agreement.terminal {
+        ReceiptTermination::Completed => {
+            println!("  outcome     (JSON projection unavailable without the program)");
         }
-        | VerifiedResult::Full {
-            terminal: ApiFullVerifiedTerminal::Stopped { cause },
-        } => println!("  {}     stopped: {cause:?}", palette.yellow("terminal")),
-    }
-}
-
-fn result_tier(result: &VerifiedResult) -> &'static str {
-    match result {
-        VerifiedResult::Light { .. } => "light",
-        VerifiedResult::Full { .. } => "full replay",
+        ReceiptTermination::Stopped { cause } => {
+            println!("  {}     stopped: {cause:?}", palette.yellow("terminal"));
+        }
     }
 }
 

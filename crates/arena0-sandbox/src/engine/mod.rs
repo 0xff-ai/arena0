@@ -1,4 +1,4 @@
-//! Wasmtime ownership for one fresh guest invocation.
+//! Wasmtime ownership for resident dispatches and fresh projections.
 
 mod entropy;
 mod imports;
@@ -6,10 +6,13 @@ mod instance;
 mod memory;
 mod runtime;
 
+pub use runtime::ProgramInstance;
+
 use std::sync::Arc;
 
 use arena0_program::{
-    ExecutionProfile, LocalStateBytes, MAX_WASM_STACK_BYTES, ProgramHash, SharedStateBytes,
+    CalloutRequest, ExecutionProfile, LocalStateBytes, MAX_WASM_STACK_BYTES, ProgramHash,
+    SharedStateBytes,
 };
 use arena0_protocol::Effect;
 use moka::sync::Cache;
@@ -26,10 +29,10 @@ const PROGRAM_CACHE_CAPACITY: u64 = 32;
 /// context API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CallKind {
+    Prepare,
     Metadata,
     Initialize,
-    Shared,
-    Local,
+    Dispatch,
     Writer,
     Query,
     View,
@@ -39,32 +42,11 @@ pub(crate) enum CallKind {
 impl CallKind {
     /// Whether this export may request any host effect or diagnostic log.
     pub(crate) const fn allows_effects(self) -> bool {
-        matches!(self, Self::Shared | Self::Local)
+        matches!(self, Self::Dispatch)
     }
 
-    pub(crate) const fn allows_random(self) -> bool {
-        matches!(self, Self::Local)
-    }
-
-    pub(crate) const fn allows_local_effects(self) -> bool {
-        matches!(self, Self::Local)
-    }
-
-    /// Whether this call kind may record the given protocol effect.
-    pub(crate) fn allows_effect(&self, effect: &Effect) -> bool {
-        match self {
-            Self::Local => true,
-            Self::Shared => matches!(
-                effect,
-                Effect::SessionEnd { .. } | Effect::SessionAbort { .. } | Effect::Fail { .. }
-            ),
-            Self::Metadata
-            | Self::Initialize
-            | Self::Writer
-            | Self::Query
-            | Self::View
-            | Self::Outcome => false,
-        }
+    pub(crate) const fn allows_state_io(self) -> bool {
+        matches!(self, Self::Dispatch)
     }
 }
 
@@ -184,28 +166,25 @@ impl ResourceLedger {
 pub(crate) struct HostState {
     pub limits: StoreLimits,
     pub call_kind: CallKind,
-    pub lifecycle: arena0_protocol::Lifecycle,
+    pub dispatch: crate::call::DispatchKind,
+    /// Committed outgoing messages before this dispatch began.
+    pub outgoing_len: usize,
     pub logs: Vec<(String, String)>,
     pub effect_queue: Vec<Effect>,
-    pub next_continuation_tag: Option<u32>,
     pub entropy: Entropy,
     pub ledger: ResourceLedger,
     pub profile: ExecutionProfile,
     pub callout_inputs: Vec<arena0_program::JsonSchemaDocument>,
+    pub signer: crate::signing::SignerSlot,
 }
 
 impl HostState {
     pub(crate) fn new(
         profile: ExecutionProfile,
         call_kind: CallKind,
-        lifecycle: arena0_protocol::Lifecycle,
-        random_replay: Option<&[Vec<u8>]>,
+        dispatch: crate::call::DispatchKind,
         callout_inputs: Vec<arena0_program::JsonSchemaDocument>,
     ) -> Self {
-        let mut entropy = Entropy::live();
-        if let Some(draws) = random_replay {
-            entropy.set_replay(draws.to_vec());
-        }
         Self {
             limits: StoreLimitsBuilder::new()
                 .memory_size(profile.limits.max_memory_bytes as usize)
@@ -215,14 +194,15 @@ impl HostState {
                 .memories(profile.limits.max_memories as usize)
                 .build(),
             call_kind,
-            lifecycle,
+            dispatch,
+            outgoing_len: 0,
             logs: Vec::new(),
             effect_queue: Vec::new(),
-            next_continuation_tag: None,
-            entropy,
+            entropy: Entropy::live(),
             ledger: ResourceLedger::new(),
             profile,
             callout_inputs,
+            signer: crate::signing::SignerSlot::default(),
         }
     }
 
@@ -233,12 +213,39 @@ impl HostState {
         Ok(crate::CallObservations {
             effects: std::mem::take(&mut self.effect_queue),
             fuel_used,
-            random_draws: self
-                .entropy
-                .finish()
-                .map_err(|error| SandboxError::dispatch_failed(error.to_string()))?,
+            random_draws: self.entropy.finish(),
             logs: std::mem::take(&mut self.logs),
         })
+    }
+
+    /// Clear every per-dispatch observation and reset deterministic host
+    /// accounting before a resident instance is re-entered.
+    pub(crate) fn reset_for_dispatch(
+        &mut self,
+        dispatch: crate::call::DispatchKind,
+        outgoing_len: usize,
+    ) {
+        self.call_kind = CallKind::Dispatch;
+        self.dispatch = dispatch;
+        self.outgoing_len = outgoing_len;
+        self.logs.clear();
+        self.effect_queue.clear();
+        self.ledger = ResourceLedger::new();
+        self.entropy.reset();
+        self.signer.clear();
+    }
+
+    /// Clear setup observations while retaining the call kind selected for a
+    /// fresh operation. Preparation is a bootstrap boundary, not a dispatch;
+    /// it must neither consume operation fuel nor leave allocator accounting
+    /// in the subsequent call.
+    pub(crate) fn reset_after_prepare(&mut self, call_kind: CallKind) {
+        self.call_kind = call_kind;
+        self.logs.clear();
+        self.effect_queue.clear();
+        self.ledger = ResourceLedger::new();
+        self.entropy.reset();
+        self.signer.clear();
     }
 }
 
@@ -317,8 +324,7 @@ pub(crate) struct InstanceConfig<'a> {
     pub schema: &'a arena0_program::ProgramSchema,
     pub profile: &'a ExecutionProfile,
     pub call_kind: CallKind,
-    pub lifecycle: arena0_protocol::Lifecycle,
-    pub random_replay: Option<&'a [Vec<u8>]>,
+    pub dispatch: crate::call::DispatchKind,
 }
 
 pub(crate) fn instantiate_module(
@@ -326,38 +332,73 @@ pub(crate) fn instantiate_module(
     module: &Module,
     config: InstanceConfig<'_>,
 ) -> Result<CallInstance, SandboxError> {
-    let InstanceConfig {
-        metadata,
-        schema,
-        profile,
-        call_kind,
-        lifecycle,
-        random_replay,
-    } = config;
+    let mut instance = prepare_instance(
+        engine,
+        module,
+        config.profile,
+        config.call_kind,
+        config.dispatch,
+        config
+            .schema
+            .callouts
+            .iter()
+            .map(|c| c.input.clone())
+            .collect(),
+        |linker| {
+            imports::register_always_available(linker)?;
+            imports::register_capability_imports(linker, &config.metadata.capabilities)
+        },
+    )?;
+    instance
+        .instance
+        .get_memory(
+            &mut instance.store,
+            arena0_program::abi::exports::WORK_MEMORY,
+        )
+        .map(|_| instance)
+        .ok_or_else(|| SandboxError::instantiation_failed("no 'memory' export"))
+}
+
+/// Shared fresh-instance bootstrap: host store, linker imports, ABI check,
+/// and the `arena0_prepare` boundary.
+///
+/// Both the capability-scoped `instantiate_module` and the metadata probe in
+/// `instance.rs` build disposable instances this way; only the import set
+/// differs (declared capabilities versus every capability), so the caller
+/// selects imports and continues with its own export call.
+fn prepare_instance(
+    engine: &Engine,
+    module: &Module,
+    profile: &ExecutionProfile,
+    call_kind: CallKind,
+    dispatch: crate::call::DispatchKind,
+    callout_inputs: Vec<arena0_program::JsonSchemaDocument>,
+    register_imports: impl FnOnce(&mut Linker<HostState>) -> Result<(), SandboxError>,
+) -> Result<CallInstance, SandboxError> {
     let mut store = Store::new(
         engine,
-        HostState::new(
-            profile.clone(),
-            call_kind,
-            lifecycle,
-            random_replay,
-            schema.callouts.iter().map(|c| c.input.clone()).collect(),
-        ),
+        HostState::new(profile.clone(), CallKind::Prepare, dispatch, callout_inputs),
     );
     store.limiter(|state| &mut state.limits);
     store
         .set_fuel(profile.fuel.per_call)
         .map_err(|e| SandboxError::instantiation_failed(e.to_string()))?;
     let mut linker = Linker::new(engine);
-    imports::register_always_available(&mut linker)?;
-    imports::register_capability_imports(&mut linker, &metadata.capabilities)?;
+    register_imports(&mut linker)?;
     let instance = linker
         .instantiate(&mut store, module)
         .map_err(|e| SandboxError::instantiation_failed(e.to_string()))?;
     validation::check_abi_version(&mut store, &instance)?;
-    instance
-        .get_memory(&mut store, "memory")
-        .ok_or_else(|| SandboxError::instantiation_failed("no 'memory' export"))?;
+    {
+        let mut guest = memory::Guest::new(&mut store, &instance);
+        guest
+            .prepare()
+            .map_err(|error| SandboxError::instantiation_failed(error.to_string()))?;
+    }
+    store.data_mut().reset_after_prepare(call_kind);
+    store
+        .set_fuel(profile.fuel.per_call)
+        .map_err(|error| SandboxError::instantiation_failed(error.to_string()))?;
     Ok(CallInstance { store, instance })
 }
 
@@ -365,26 +406,66 @@ pub(crate) fn max_output(profile: &ExecutionProfile) -> usize {
     profile.limits.max_output_bytes as usize
 }
 
+/// Validate one derived callout context against the program's declared input
+/// schema for that callout index. The index and JSON shape are guest-produced,
+/// so a mismatch is a dispatch failure rather than an agent rejection.
+pub(crate) fn validate_callout_context(
+    callout_inputs: &[arena0_program::JsonSchemaDocument],
+    callout: &CalloutRequest,
+) -> Result<(), SandboxError> {
+    let schema = callout_inputs
+        .get(callout.callout_index as usize)
+        .ok_or_else(|| SandboxError::dispatch_failed("unknown callout schema index"))?;
+    let value: serde_json::Value = serde_json::from_slice(&callout.context).map_err(|error| {
+        SandboxError::dispatch_failed(format!("callout context is not JSON: {error}"))
+    })?;
+    let validator = jsonschema::validator_for(schema.as_value()).map_err(|error| {
+        SandboxError::dispatch_failed(format!("invalid callout schema: {error}"))
+    })?;
+    validator
+        .validate(&value)
+        .map_err(|_| SandboxError::dispatch_failed("callout context schema validation failed"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn derived_callout_requires_a_declared_index_and_valid_context() {
+        let schemas = vec![
+            arena0_program::JsonSchemaDocument::new(serde_json::json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object", "required": ["round"],
+                "properties": { "round": { "type": "integer" } }
+            }))
+            .unwrap(),
+        ];
+        let mut request = CalloutRequest {
+            callout_index: 0,
+            context: br#"{"round":1}"#.to_vec(),
+        };
+        assert!(validate_callout_context(&schemas, &request).is_ok());
+        request.callout_index = 1;
+        assert!(validate_callout_context(&schemas, &request).is_err());
+        request.callout_index = 0;
+        request.context = br#"{"round":"private-value"}"#.to_vec();
+        let error = validate_callout_context(&schemas, &request).unwrap_err();
+        assert!(!error.to_string().contains("private-value"));
+        request.context = b"{".to_vec();
+        assert!(validate_callout_context(&schemas, &request).is_err());
+    }
+
+    #[test]
     fn call_kinds_expose_only_their_declared_effect_surface() {
+        assert!(!CallKind::Prepare.allows_effects());
+        assert!(!CallKind::Prepare.allows_state_io());
         assert!(!CallKind::Initialize.allows_effects());
         assert!(!CallKind::Writer.allows_effects());
         assert!(!CallKind::Query.allows_effects());
         assert!(!CallKind::View.allows_effects());
         assert!(!CallKind::Outcome.allows_effects());
-        assert!(CallKind::Shared.allows_effects());
-        assert!(CallKind::Local.allows_effects());
-        assert!(CallKind::Local.allows_random());
-        assert!(!CallKind::Shared.allows_random());
-        assert!(CallKind::Shared.allows_effect(&Effect::SessionEnd { outcome: vec![] }));
-        assert!(!CallKind::Shared.allows_effect(&Effect::Broadcast { data: vec![] }));
-        assert!(!CallKind::Initialize.allows_effect(&Effect::Fail {
-            reason: String::new(),
-        }));
+        assert!(CallKind::Dispatch.allows_effects());
     }
 
     #[test]
@@ -404,5 +485,30 @@ mod tests {
         let mut ledger = ResourceLedger::new();
         assert!(ledger.log(2, 2, 1).is_ok());
         assert!(ledger.log(0, 2, 1).is_err());
+    }
+
+    #[test]
+    fn host_copy_budget_admits_maximum_state_round_trip_and_envelope() {
+        let mut ledger = ResourceLedger::new();
+        for bytes in [
+            arena0_program::MAX_SHARED_STATE_BYTES,
+            arena0_program::MAX_LOCAL_STATE_BYTES,
+            arena0_program::MAX_SHARED_STATE_BYTES,
+            arena0_program::MAX_LOCAL_STATE_BYTES,
+            arena0_program::MAX_INPUT_BYTES as usize,
+            arena0_program::MAX_OUTPUT_BYTES as usize,
+            arena0_program::MAX_EFFECT_BYTES as usize,
+            arena0_program::MAX_EFFECT_BYTES as usize,
+        ] {
+            ledger
+                .copy_bytes(bytes, arena0_program::MAX_HOST_BYTES as u64)
+                .unwrap();
+        }
+        assert_eq!(ledger.host_bytes, 32 * 1024 * 1024);
+        assert!(
+            ledger
+                .copy_bytes(1, arena0_program::MAX_HOST_BYTES as u64)
+                .is_err()
+        );
     }
 }

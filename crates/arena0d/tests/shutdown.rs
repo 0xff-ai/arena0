@@ -91,11 +91,7 @@ fn preseed_host(home: &TempDir, name: &HostName) -> anyhow::Result<()> {
     let state = home.path().join("hosts").join(name.as_str());
     let keys = state.join("keys");
     std::fs::create_dir_all(&keys).with_context(|| format!("create {} keystore", name.as_str()))?;
-    let keystore = arena0_daemon::Keystore::open(keys)
-        .with_context(|| format!("open {} keystore", name.as_str()))?;
-    keystore
-        .new_identity(Some(name.to_string()))
-        .map_err(anyhow::Error::new)
+    arena0_daemon::Keystore::create(keys)
         .with_context(|| format!("seed {} identity", name.as_str()))?;
     std::fs::File::create(state.join("arena0.sqlite"))
         .with_context(|| format!("seed {} store", name.as_str()))?;

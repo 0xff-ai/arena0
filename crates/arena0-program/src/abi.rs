@@ -4,21 +4,30 @@ use std::io;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 
-use crate::profile::MAX_CALL_ENVELOPE_BYTES;
+use crate::bounded;
 use crate::{LocalStateBytes, SharedStateBytes};
 
 use crate::Capability;
 
 /// Current ABI version. A sandbox rejects modules declaring a different one.
-pub const ABI_VERSION: u32 = 20;
+pub const ABI_VERSION: u32 = 22;
 
 /// Wasm import module name for all arena0 host functions.
 pub const HOST_MODULE: &str = "arena0";
 
 /// Maximum bytes in one semantic call payload.
 pub const MAX_CALL_PAYLOAD_BYTES: usize = crate::profile::MAX_INPUT_BYTES as usize;
-/// Maximum bytes in the session context carried into a fresh call.
+/// Maximum bytes in the committed session context carried into a dispatch.
 pub const MAX_SESSION_CONTEXT_BYTES: usize = 1024 * 1024;
+/// Maximum UTF-8 bytes returned as the reason for a rejected input dispatch.
+pub const MAX_REJECTION_REASON_BYTES: usize = 1024;
+/// Maximum bytes in the JSON context of one derived open callout.
+pub const MAX_CALLOUT_CONTEXT_BYTES: usize = 64 * 1024;
+/// Host bytes a synchronous `sign` call adds around the guest payload: the
+/// `GuestSignData` header, the two `Vec<u8>` length prefixes of the returned
+/// `(signed_bytes, signature)` pair, and a 64-byte Ed25519 signature. A guest
+/// allocates `payload.len() + SIGN_RESULT_OVERHEAD_BYTES` for the result.
+pub const SIGN_RESULT_OVERHEAD_BYTES: usize = 256;
 
 /// Bounded, complete JSON bytes at an agent-facing request or projection boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,13 +75,13 @@ impl JsonBytes {
 
 impl BorshSerialize for JsonBytes {
     fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        write_bounded_vec(writer, &self.0, MAX_CALL_PAYLOAD_BYTES, "agent-facing JSON")
+        bounded::write_bytes::<MAX_CALL_PAYLOAD_BYTES>(&self.0, writer)
     }
 }
 
 impl BorshDeserialize for JsonBytes {
     fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let bytes = read_bounded_vec(reader, MAX_CALL_PAYLOAD_BYTES, "agent-facing JSON")?;
+        let bytes = bounded::read_bytes::<MAX_CALL_PAYLOAD_BYTES>(reader)?;
         Self::try_new(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 }
@@ -139,21 +148,29 @@ pub enum OutcomeBytesError {
     TooLarge { actual: usize, max: usize },
 }
 
-/// Export names in the fresh-instance guest ABI.
+/// Export names in the resident-instance guest ABI.
 pub mod exports {
+    /// The guest's work (linear) memory.
+    pub const WORK_MEMORY: &str = "memory";
+    /// The `i32` global holding the guest's ABI version.
+    pub const ABI_VERSION: &str = "arena0_abi_version";
     /// Guest allocation entry point.
     pub const ALLOC: &str = "arena0_alloc";
     /// Guest deallocation entry point.
     pub const DEALLOC: &str = "arena0_dealloc";
-    /// Initialize a fresh program state.
+    /// Prepare the guest allocator before a resident baseline is captured.
+    pub const PREPARE: &str = "arena0_prepare";
+    /// Initialize a program's state before a session starts.
     pub const INITIALIZE: &str = "arena0_initialize";
-    /// Apply one shared/public event.
-    pub const SHARED: &str = "arena0_shared";
-    /// Apply one local/private event.
-    pub const LOCAL: &str = "arena0_local";
+    /// Dispatch one session event against the resident state memories.
+    pub const DISPATCH: &str = "arena0_dispatch";
+    /// Canonical replicated-state memory export.
+    pub const SHARED_MEMORY: &str = "arena0_shared";
+    /// Canonical participant-local-state memory export.
+    pub const LOCAL_MEMORY: &str = "arena0_local";
     /// Produce the agent-facing terminal outcome.
     pub const OUTCOME: &str = "arena0_outcome";
-    /// Select the sole participant eligible to author the next public message.
+    /// Select the sole participant eligible to author the next program message.
     pub const WRITER: &str = "arena0_writer";
     /// Answer one agent-facing query.
     pub const QUERY: &str = "arena0_query";
@@ -163,8 +180,33 @@ pub mod exports {
     pub const METADATA: &str = "arena0_metadata";
 }
 
-/// Whether a mutating guest call accepted its event.
+/// The state memory selected by a bounded host state-I/O import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum StateMemoryKind {
+    /// The replicated state memory.
+    Shared = 0,
+    /// The participant-local state memory.
+    Local = 1,
+}
+
+impl TryFrom<u32> for StateMemoryKind {
+    type Error = io::Error;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Shared),
+            1 => Ok(Self::Local),
+            value => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown state memory kind {value}"),
+            )),
+        }
+    }
+}
+
+/// Whether a mutating guest call accepted its event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum CallStatus {
     /// The event produced a replacement state.
     Accepted,
@@ -195,18 +237,6 @@ impl CallStatus {
     }
 }
 
-impl BorshSerialize for CallStatus {
-    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        self.tag().serialize(writer)
-    }
-}
-
-impl BorshDeserialize for CallStatus {
-    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        Self::from_tag(u8::deserialize_reader(reader)?)
-    }
-}
-
 impl serde::Serialize for CallStatus {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_u8(self.tag())
@@ -233,142 +263,16 @@ pub enum AbiEnvelopeError {
         /// Maximum accepted field length.
         max: usize,
     },
-    /// The complete encoded value exceeded the ABI envelope bound.
-    #[error("ABI envelope is {actual} bytes; maximum is {max}")]
-    EnvelopeTooLarge {
-        /// Actual encoded envelope length.
-        actual: usize,
-        /// Maximum accepted envelope length.
-        max: usize,
-    },
-}
-
-fn field_error(field: &'static str, actual: usize, max: usize) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidInput,
-        AbiEnvelopeError::FieldTooLarge { field, actual, max },
-    )
-}
-
-fn write_bounded_vec<W: io::Write>(
-    writer: &mut W,
-    bytes: &[u8],
-    max: usize,
-    field: &'static str,
-) -> io::Result<()> {
-    if bytes.len() > max {
-        return Err(field_error(field, bytes.len(), max));
-    }
-    let length = u32::try_from(bytes.len())
-        .map_err(|_| field_error(field, bytes.len(), u32::MAX as usize))?;
-    length.serialize(writer)?;
-    writer.write_all(bytes)
-}
-
-fn read_bounded_vec<R: io::Read>(
-    reader: &mut R,
-    max: usize,
-    field: &'static str,
-) -> io::Result<Vec<u8>> {
-    let length = usize::try_from(u32::deserialize_reader(reader)?).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{field} length overflows usize"),
-        )
-    })?;
-    if length > max {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            AbiEnvelopeError::FieldTooLarge {
-                field,
-                actual: length,
-                max,
-            },
-        ));
-    }
-    let mut bytes = vec![0; length];
-    reader.read_exact(&mut bytes)?;
-    Ok(bytes)
-}
-
-/// Writer that rejects an envelope before it can exceed the complete ABI cap.
-struct EnvelopeWriter<'a, W> {
-    writer: &'a mut W,
-    written: usize,
-}
-
-impl<'a, W> EnvelopeWriter<'a, W> {
-    fn new(writer: &'a mut W) -> Self {
-        Self { writer, written: 0 }
-    }
-}
-
-impl<W: io::Write> io::Write for EnvelopeWriter<'_, W> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let next = self.written.checked_add(bytes.len()).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "ABI envelope length overflow")
-        })?;
-        if next > MAX_CALL_ENVELOPE_BYTES as usize {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                AbiEnvelopeError::EnvelopeTooLarge {
-                    actual: next,
-                    max: MAX_CALL_ENVELOPE_BYTES as usize,
-                },
-            ));
-        }
-        let count = self.writer.write(bytes)?;
-        self.written = self.written.saturating_add(count);
-        Ok(count)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
-    }
-}
-
-/// Reader that prevents a malformed envelope from consuming more than the
-/// complete ABI cap. Field readers still check their own bound before they
-/// allocate.
-struct EnvelopeReader<'a, R> {
-    reader: &'a mut R,
-    remaining: usize,
-}
-
-impl<'a, R> EnvelopeReader<'a, R> {
-    fn new(reader: &'a mut R) -> Self {
-        Self {
-            reader,
-            remaining: MAX_CALL_ENVELOPE_BYTES as usize,
-        }
-    }
-}
-
-impl<R: io::Read> io::Read for EnvelopeReader<'_, R> {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        if bytes.is_empty() {
-            return Ok(0);
-        }
-        if self.remaining == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                AbiEnvelopeError::EnvelopeTooLarge {
-                    actual: MAX_CALL_ENVELOPE_BYTES as usize + 1,
-                    max: MAX_CALL_ENVELOPE_BYTES as usize,
-                },
-            ));
-        }
-        let read_len = bytes.len().min(self.remaining);
-        let count = self.reader.read(&mut bytes[..read_len])?;
-        self.remaining = self.remaining.saturating_sub(count);
-        Ok(count)
-    }
 }
 
 /// A fresh initialization input. It carries only agent parameter JSON bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct InitInput {
     /// Stock-Serde JSON encoding of the program's parameter DTO.
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_CALL_PAYLOAD_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_CALL_PAYLOAD_BYTES>"
+    )]
     pub params: Vec<u8>,
 }
 
@@ -380,24 +284,8 @@ impl InitInput {
     }
 }
 
-impl BorshSerialize for InitInput {
-    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        let mut writer = EnvelopeWriter::new(writer);
-        write_bounded_vec(&mut writer, &self.params, MAX_CALL_PAYLOAD_BYTES, "params")
-    }
-}
-
-impl BorshDeserialize for InitInput {
-    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let mut reader = EnvelopeReader::new(reader);
-        Ok(Self {
-            params: read_bounded_vec(&mut reader, MAX_CALL_PAYLOAD_BYTES, "params")?,
-        })
-    }
-}
-
 /// Initialization output containing both freshly initialized state values.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct InitializedState {
     /// Initial replicated state bytes.
     pub shared: SharedStateBytes,
@@ -405,221 +293,137 @@ pub struct InitializedState {
     pub local: LocalStateBytes,
 }
 
-impl BorshSerialize for InitializedState {
-    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        let mut writer = EnvelopeWriter::new(writer);
-        self.shared.serialize(&mut writer)?;
-        self.local.serialize(&mut writer)
-    }
-}
-
-impl BorshDeserialize for InitializedState {
-    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let mut reader = EnvelopeReader::new(reader);
-        Ok(Self {
-            shared: SharedStateBytes::deserialize_reader(&mut reader)?,
-            local: LocalStateBytes::deserialize_reader(&mut reader)?,
-        })
-    }
-}
-
-/// Shared/public event input. It deliberately contains no peer or local state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SharedInput {
-    /// Explicit replicated state bytes.
-    pub shared: SharedStateBytes,
-    /// Opaque Borsh `Option<Ensemble<Committed>>` session context. It is `None`
-    /// only for the session-start event, whose ensemble is in `event`.
-    pub session: Vec<u8>,
-    /// Stock-Borsh public protocol event bytes.
-    pub event: Vec<u8>,
-}
-
-impl SharedInput {
-    /// Construct a shared input after checking its variable fields.
-    pub fn try_new(
-        shared: SharedStateBytes,
-        session: Vec<u8>,
-        event: Vec<u8>,
-    ) -> Result<Self, AbiEnvelopeError> {
-        ensure_field("session context", &session, MAX_SESSION_CONTEXT_BYTES)?;
-        ensure_field("public event", &event, MAX_CALL_PAYLOAD_BYTES)?;
-        Ok(Self {
-            shared,
-            session,
-            event,
-        })
-    }
-}
-
-impl BorshSerialize for SharedInput {
-    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        let mut writer = EnvelopeWriter::new(writer);
-        self.shared.serialize(&mut writer)?;
-        write_bounded_vec(
-            &mut writer,
-            &self.session,
-            MAX_SESSION_CONTEXT_BYTES,
-            "session context",
-        )?;
-        write_bounded_vec(
-            &mut writer,
-            &self.event,
-            MAX_CALL_PAYLOAD_BYTES,
-            "public event",
-        )
-    }
-}
-
-impl BorshDeserialize for SharedInput {
-    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let mut reader = EnvelopeReader::new(reader);
-        Ok(Self {
-            shared: SharedStateBytes::deserialize_reader(&mut reader)?,
-            session: read_bounded_vec(&mut reader, MAX_SESSION_CONTEXT_BYTES, "session context")?,
-            event: read_bounded_vec(&mut reader, MAX_CALL_PAYLOAD_BYTES, "public event")?,
-        })
-    }
-}
-
-/// Result of a shared/public event. Local state is intentionally absent: the
-/// host retains the caller's local state outside this guest call.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SharedOutput {
-    /// Whether the event was accepted or deterministically rejected.
-    pub status: CallStatus,
-    /// Replacement replicated state bytes.
-    pub shared: SharedStateBytes,
-}
-
-impl BorshSerialize for SharedOutput {
-    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        let mut writer = EnvelopeWriter::new(writer);
-        self.status.serialize(&mut writer)?;
-        self.shared.serialize(&mut writer)
-    }
-}
-
-impl BorshDeserialize for SharedOutput {
-    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let mut reader = EnvelopeReader::new(reader);
-        Ok(Self {
-            status: CallStatus::deserialize_reader(&mut reader)?,
-            shared: SharedStateBytes::deserialize_reader(&mut reader)?,
-        })
-    }
-}
-
-/// Local/private event input. This is the only ABI input carrying peer identity
-/// and participant-local state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LocalInput {
-    /// Local node identity in the protocol's canonical 32-byte form.
+/// One resident-program dispatch input.
+///
+/// State is deliberately absent: the host stores the committed values in the
+/// exported state memories and restores those memories around failure
+/// boundaries. The session and event fields are serialized protocol values,
+/// rather than host-owned DTOs, so this ABI remains independent of the
+/// concrete program's message type.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct DispatchInput {
+    /// Local participant identity in the protocol's canonical 32-byte form.
     pub peer_id: [u8; 32],
-    /// Explicit replicated state bytes, retained unchanged by the local call.
-    pub shared: SharedStateBytes,
-    /// Explicit participant-local state bytes.
-    pub local: LocalStateBytes,
-    /// Opaque Borsh committed `Ensemble` session context.
+    /// Borsh encoding of the committed session ensemble.
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_SESSION_CONTEXT_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_SESSION_CONTEXT_BYTES>"
+    )]
     pub session: Vec<u8>,
-    /// Stock-Borsh private protocol event bytes.
+    /// Borsh encoding of one flat protocol `Event<Vec<u8>>`.
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_CALL_PAYLOAD_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_CALL_PAYLOAD_BYTES>"
+    )]
     pub event: Vec<u8>,
 }
 
-impl LocalInput {
-    /// Construct a local input after checking its variable fields.
+impl DispatchInput {
+    /// Construct a dispatch input after checking its variable-field bounds.
     pub fn try_new(
         peer_id: [u8; 32],
-        shared: SharedStateBytes,
-        local: LocalStateBytes,
         session: Vec<u8>,
         event: Vec<u8>,
     ) -> Result<Self, AbiEnvelopeError> {
         ensure_field("session context", &session, MAX_SESSION_CONTEXT_BYTES)?;
-        ensure_field("private event", &event, MAX_CALL_PAYLOAD_BYTES)?;
+        ensure_field("event", &event, MAX_CALL_PAYLOAD_BYTES)?;
         Ok(Self {
             peer_id,
-            shared,
-            local,
             session,
             event,
         })
     }
 }
 
-impl BorshSerialize for LocalInput {
-    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        let mut writer = EnvelopeWriter::new(writer);
-        self.peer_id.serialize(&mut writer)?;
-        self.shared.serialize(&mut writer)?;
-        self.local.serialize(&mut writer)?;
-        write_bounded_vec(
-            &mut writer,
-            &self.session,
-            MAX_SESSION_CONTEXT_BYTES,
-            "session context",
-        )?;
-        write_bounded_vec(
-            &mut writer,
-            &self.event,
-            MAX_CALL_PAYLOAD_BYTES,
-            "private event",
-        )
-    }
+/// The one open callout derived from program state after an accepted dispatch.
+///
+/// The program returns at most one request per dispatch; the host stores it
+/// with the resulting state image and never treats it as a lock. `context` is
+/// the stock-Serde JSON projection of the typed callout request.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct CalloutRequest {
+    /// Program-local callout variant index.
+    pub callout_index: u32,
+    /// Agent-facing JSON context for that callout.
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_CALLOUT_CONTEXT_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_CALLOUT_CONTEXT_BYTES>"
+    )]
+    pub context: Vec<u8>,
 }
 
-impl BorshDeserialize for LocalInput {
-    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let mut reader = EnvelopeReader::new(reader);
-        Ok(Self {
-            peer_id: <[u8; 32]>::deserialize_reader(&mut reader)?,
-            shared: SharedStateBytes::deserialize_reader(&mut reader)?,
-            local: LocalStateBytes::deserialize_reader(&mut reader)?,
-            session: read_bounded_vec(&mut reader, MAX_SESSION_CONTEXT_BYTES, "session context")?,
-            event: read_bounded_vec(&mut reader, MAX_CALL_PAYLOAD_BYTES, "private event")?,
-        })
-    }
-}
-
-/// Result of a local/private event. Shared state is intentionally absent: the
-/// host retains it outside the guest call and rejects any attempted replacement.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LocalOutput {
-    /// Whether the event was accepted.
+/// The only value returned in the guest result envelope for a mutating
+/// dispatch. Effects remain in the host's per-call effect queue and are never
+/// duplicated in guest-owned state bytes.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize)]
+pub struct DispatchOutput {
+    /// Whether the event was accepted or deterministically rejected.
     pub status: CallStatus,
-    /// Replacement participant-local state bytes.
-    pub local: LocalStateBytes,
+    /// Bounded program reason for an input rejection. Accepted dispatches and
+    /// deterministic peer-message rejections do not carry a reason.
+    #[borsh(
+        serialize_with = "bounded::write_option_string::<MAX_REJECTION_REASON_BYTES>",
+        deserialize_with = "bounded::read_option_string::<MAX_REJECTION_REASON_BYTES>"
+    )]
+    pub reason: Option<String>,
+    /// The single open callout derived from the accepted post-state, if any.
+    /// A rejected dispatch has no callout.
+    pub callout: Option<CalloutRequest>,
 }
 
-impl BorshSerialize for LocalOutput {
-    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        let mut writer = EnvelopeWriter::new(writer);
-        self.status.serialize(&mut writer)?;
-        self.local.serialize(&mut writer)
-    }
+#[derive(BorshDeserialize)]
+struct DispatchOutputRaw {
+    status: CallStatus,
+    #[borsh(
+        serialize_with = "bounded::write_option_string::<MAX_REJECTION_REASON_BYTES>",
+        deserialize_with = "bounded::read_option_string::<MAX_REJECTION_REASON_BYTES>"
+    )]
+    reason: Option<String>,
+    callout: Option<CalloutRequest>,
 }
 
-impl BorshDeserialize for LocalOutput {
+impl BorshDeserialize for DispatchOutput {
     fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let mut reader = EnvelopeReader::new(reader);
+        let raw = DispatchOutputRaw::deserialize_reader(reader)?;
+        if raw.status == CallStatus::Accepted && raw.reason.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "accepted dispatch cannot carry a rejection reason",
+            ));
+        }
+        if raw.status == CallStatus::Rejected && raw.callout.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "rejected dispatch cannot carry an open callout",
+            ));
+        }
         Ok(Self {
-            status: CallStatus::deserialize_reader(&mut reader)?,
-            local: LocalStateBytes::deserialize_reader(&mut reader)?,
+            status: raw.status,
+            reason: raw.reason,
+            callout: raw.callout,
         })
     }
 }
 
 /// Read-only query input. It contains no peer identity or participant-local
 /// state, and the index is echoed by [`QueryOutput`] to bind schema validation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct QueryInput {
     /// Explicit replicated state bytes.
     pub shared: SharedStateBytes,
     /// Opaque Borsh committed `Ensemble` session context.
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_SESSION_CONTEXT_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_SESSION_CONTEXT_BYTES>"
+    )]
     pub session: Vec<u8>,
     /// Host-checked index into the advertised query schema list.
     pub query_index: u32,
     /// Stock-Serde JSON query DTO bytes.
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_CALL_PAYLOAD_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_CALL_PAYLOAD_BYTES>"
+    )]
     pub query: Vec<u8>,
 }
 
@@ -642,74 +446,36 @@ impl QueryInput {
     }
 }
 
-impl BorshSerialize for QueryInput {
-    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        let mut writer = EnvelopeWriter::new(writer);
-        self.shared.serialize(&mut writer)?;
-        write_bounded_vec(
-            &mut writer,
-            &self.session,
-            MAX_SESSION_CONTEXT_BYTES,
-            "session context",
-        )?;
-        self.query_index.serialize(&mut writer)?;
-        write_bounded_vec(&mut writer, &self.query, MAX_CALL_PAYLOAD_BYTES, "query")
-    }
-}
-
-impl BorshDeserialize for QueryInput {
-    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let mut reader = EnvelopeReader::new(reader);
-        Ok(Self {
-            shared: SharedStateBytes::deserialize_reader(&mut reader)?,
-            session: read_bounded_vec(&mut reader, MAX_SESSION_CONTEXT_BYTES, "session context")?,
-            query_index: u32::deserialize_reader(&mut reader)?,
-            query: read_bounded_vec(&mut reader, MAX_CALL_PAYLOAD_BYTES, "query")?,
-        })
-    }
-}
-
 /// Read-only query result. It contains no state or status.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct QueryOutput {
     /// The exact query index supplied by the host.
     pub query_index: u32,
     /// Stock-Serde JSON response DTO bytes.
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_CALL_PAYLOAD_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_CALL_PAYLOAD_BYTES>"
+    )]
     pub json: Vec<u8>,
-}
-
-impl BorshSerialize for QueryOutput {
-    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        let mut writer = EnvelopeWriter::new(writer);
-        self.query_index.serialize(&mut writer)?;
-        write_bounded_vec(
-            &mut writer,
-            &self.json,
-            MAX_CALL_PAYLOAD_BYTES,
-            "query response",
-        )
-    }
-}
-
-impl BorshDeserialize for QueryOutput {
-    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let mut reader = EnvelopeReader::new(reader);
-        Ok(Self {
-            query_index: u32::deserialize_reader(&mut reader)?,
-            json: read_bounded_vec(&mut reader, MAX_CALL_PAYLOAD_BYTES, "query response")?,
-        })
-    }
 }
 
 /// Read-only viewport input. The viewport is the current stock-Serde JSON
 /// encoding of the protocol's `Viewport` DTO, carried as opaque bytes here.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct ViewInput {
     /// Explicit replicated state bytes.
     pub shared: SharedStateBytes,
     /// Opaque Borsh committed `Ensemble` session context.
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_SESSION_CONTEXT_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_SESSION_CONTEXT_BYTES>"
+    )]
     pub session: Vec<u8>,
     /// Stock-Serde JSON viewport DTO bytes.
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_CALL_PAYLOAD_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_CALL_PAYLOAD_BYTES>"
+    )]
     pub viewport: Vec<u8>,
 }
 
@@ -730,102 +496,45 @@ impl ViewInput {
     }
 }
 
-impl BorshSerialize for ViewInput {
-    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        let mut writer = EnvelopeWriter::new(writer);
-        self.shared.serialize(&mut writer)?;
-        write_bounded_vec(
-            &mut writer,
-            &self.session,
-            MAX_SESSION_CONTEXT_BYTES,
-            "session context",
-        )?;
-        write_bounded_vec(
-            &mut writer,
-            &self.viewport,
-            MAX_CALL_PAYLOAD_BYTES,
-            "viewport",
-        )
-    }
-}
-
-impl BorshDeserialize for ViewInput {
-    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let mut reader = EnvelopeReader::new(reader);
-        Ok(Self {
-            shared: SharedStateBytes::deserialize_reader(&mut reader)?,
-            session: read_bounded_vec(&mut reader, MAX_SESSION_CONTEXT_BYTES, "session context")?,
-            viewport: read_bounded_vec(&mut reader, MAX_CALL_PAYLOAD_BYTES, "viewport")?,
-        })
-    }
-}
-
 /// Read-only viewport result. It contains no state or status.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct ViewOutput {
     /// Stock-Serde JSON view DTO bytes.
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_CALL_PAYLOAD_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_CALL_PAYLOAD_BYTES>"
+    )]
     pub json: Vec<u8>,
-}
-
-impl BorshSerialize for ViewOutput {
-    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        let mut writer = EnvelopeWriter::new(writer);
-        write_bounded_vec(
-            &mut writer,
-            &self.json,
-            MAX_CALL_PAYLOAD_BYTES,
-            "view response",
-        )
-    }
-}
-
-impl BorshDeserialize for ViewOutput {
-    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let mut reader = EnvelopeReader::new(reader);
-        Ok(Self {
-            json: read_bounded_vec(&mut reader, MAX_CALL_PAYLOAD_BYTES, "view response")?,
-        })
-    }
 }
 
 /// Read-only terminal outcome input. It contains no peer identity or local
 /// state and no call-specific payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct OutcomeInput {
     /// Explicit replicated state bytes.
     pub shared: SharedStateBytes,
     /// Opaque Borsh committed `Ensemble` session context.
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_SESSION_CONTEXT_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_SESSION_CONTEXT_BYTES>"
+    )]
     pub session: Vec<u8>,
 }
 
-/// Read-only input for selecting the next public-message writer.
+/// Read-only input for selecting the next program-message writer.
 ///
 /// Writer selection is deliberately a function of replicated state alone. The
 /// host invokes it before applying a candidate message so transport arrival
 /// order cannot choose between sibling state transitions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct WriterInput {
     /// Explicit replicated state bytes.
     pub shared: SharedStateBytes,
 }
 
-impl BorshSerialize for WriterInput {
-    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        self.shared.serialize(writer)
-    }
-}
-
-impl BorshDeserialize for WriterInput {
-    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        Ok(Self {
-            shared: SharedStateBytes::deserialize_reader(reader)?,
-        })
-    }
-}
-
-/// Sole participant eligible to author the next public message.
+/// Sole participant eligible to author the next program message.
 ///
-/// `None` means that no public message is admissible from the current shared
+/// `None` means that no program message is admissible from the current shared
 /// state. The host validates a returned index against the committed ensemble.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct WriterOutput {
@@ -841,65 +550,22 @@ impl OutcomeInput {
     }
 }
 
-impl BorshSerialize for OutcomeInput {
-    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        let mut writer = EnvelopeWriter::new(writer);
-        self.shared.serialize(&mut writer)?;
-        write_bounded_vec(
-            &mut writer,
-            &self.session,
-            MAX_SESSION_CONTEXT_BYTES,
-            "session context",
-        )
-    }
-}
-
-impl BorshDeserialize for OutcomeInput {
-    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let mut reader = EnvelopeReader::new(reader);
-        Ok(Self {
-            shared: SharedStateBytes::deserialize_reader(&mut reader)?,
-            session: read_bounded_vec(&mut reader, MAX_SESSION_CONTEXT_BYTES, "session context")?,
-        })
-    }
-}
-
 /// Read-only terminal outcome result carrying both stock projections of the
 /// same concrete DTO.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct OutcomeOutput {
     /// Stock-Borsh bytes used by the terminal protocol effect.
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_CALL_PAYLOAD_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_CALL_PAYLOAD_BYTES>"
+    )]
     pub borsh: Vec<u8>,
     /// Stock-Serde JSON bytes exposed to agents.
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_CALL_PAYLOAD_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_CALL_PAYLOAD_BYTES>"
+    )]
     pub json: Vec<u8>,
-}
-
-impl BorshSerialize for OutcomeOutput {
-    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        let mut writer = EnvelopeWriter::new(writer);
-        write_bounded_vec(
-            &mut writer,
-            &self.borsh,
-            MAX_CALL_PAYLOAD_BYTES,
-            "Borsh outcome",
-        )?;
-        write_bounded_vec(
-            &mut writer,
-            &self.json,
-            MAX_CALL_PAYLOAD_BYTES,
-            "JSON outcome",
-        )
-    }
-}
-
-impl BorshDeserialize for OutcomeOutput {
-    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let mut reader = EnvelopeReader::new(reader);
-        Ok(Self {
-            borsh: read_bounded_vec(&mut reader, MAX_CALL_PAYLOAD_BYTES, "Borsh outcome")?,
-            json: read_bounded_vec(&mut reader, MAX_CALL_PAYLOAD_BYTES, "JSON outcome")?,
-        })
-    }
 }
 
 fn ensure_field(field: &'static str, bytes: &[u8], max: usize) -> Result<(), AbiEnvelopeError> {
@@ -913,8 +579,55 @@ fn ensure_field(field: &'static str, bytes: &[u8], max: usize) -> Result<(), Abi
     Ok(())
 }
 
+/// Level tags of the `log` import. These values are part of the ABI.
+pub mod log_level {
+    /// Debug.
+    pub const DEBUG: u32 = 0;
+    /// Info.
+    pub const INFO: u32 = 1;
+    /// Warn.
+    pub const WARN: u32 = 2;
+    /// Error.
+    pub const ERROR: u32 = 3;
+}
+
+/// Scheme tags of the `sign` import. These values are part of the ABI.
+pub mod sign_scheme {
+    use arena0_crypto::SignScheme;
+
+    /// Ed25519.
+    pub const ED25519: u32 = 0;
+    /// BLS.
+    pub const BLS: u32 = 1;
+
+    /// The ABI tag of `scheme`.
+    #[must_use]
+    pub const fn tag(scheme: SignScheme) -> u32 {
+        match scheme {
+            SignScheme::Ed25519 => ED25519,
+            SignScheme::Bls => BLS,
+        }
+    }
+
+    /// The scheme an ABI tag names, if any.
+    #[must_use]
+    pub const fn from_tag(tag: u32) -> Option<SignScheme> {
+        match tag {
+            ED25519 => Some(SignScheme::Ed25519),
+            BLS => Some(SignScheme::Bls),
+            _ => None,
+        }
+    }
+}
+
 /// Names of host-function imports. These values are part of the ABI.
 pub mod imports {
+    /// Return the current payload length of one canonical state memory.
+    pub const STATE_LEN: &str = "state_len";
+    /// Copy a state payload into the guest's work memory.
+    pub const STATE_READ: &str = "state_read";
+    /// Replace a canonical state payload from bytes in the guest's work memory.
+    pub const STATE_WRITE: &str = "state_write";
     /// Terminate execution with an error message.
     pub const FAIL: &str = "fail";
     /// Emit a structured log line to the host.
@@ -923,26 +636,14 @@ pub mod imports {
     pub const RANDOM: &str = "random";
     /// Broadcast a binary message to every participant.
     pub const BROADCAST: &str = "broadcast";
-    /// Request input from the controlling agent.
-    pub const REQUEST_INPUT: &str = "request_input";
-    /// Request input with pending/expected-type trace metadata.
-    pub const REQUEST_INPUT_PENDING: &str = "request_input_pending";
-    /// Attach a generated continuation tag to the next pending effect.
-    pub const SET_CONTINUATION_TAG: &str = "set_continuation_tag";
-    /// Start an untyped one-shot timer.
+    /// Start a one-shot timer with a typed payload.
     pub const SET_TIMER: &str = "set_timer";
-    /// Start a typed one-shot timer.
-    pub const SET_TYPED_TIMER: &str = "set_typed_timer";
-    /// Sign data with the node's key.
+    /// Sign one guest payload with the node's key.
     pub const SIGN: &str = "sign";
-    /// Sign data with local pending/expected-type trace metadata.
-    pub const SIGN_PENDING: &str = "sign_pending";
     /// End the current session successfully.
     pub const END_SESSION: &str = "end_session";
     /// Abort the current session.
     pub const ABORT_SESSION: &str = "abort_session";
-    /// Signal retryable callout input error.
-    pub const RETRY_INPUT: &str = "retry_input";
 }
 
 impl Capability {
@@ -951,9 +652,8 @@ impl Capability {
     pub fn imports(&self) -> &'static [&'static str] {
         match self {
             Self::Messaging => &[imports::BROADCAST],
-            Self::Input => &[imports::REQUEST_INPUT, imports::REQUEST_INPUT_PENDING],
-            Self::Timers => &[imports::SET_TIMER, imports::SET_TYPED_TIMER],
-            Self::Sign { .. } => &[imports::SIGN, imports::SIGN_PENDING],
+            Self::Timers => &[imports::SET_TIMER],
+            Self::Sign { .. } => &[imports::SIGN],
         }
     }
 }
@@ -962,13 +662,14 @@ impl Capability {
 #[must_use]
 pub fn always_available_imports() -> &'static [&'static str] {
     &[
+        imports::STATE_LEN,
+        imports::STATE_READ,
+        imports::STATE_WRITE,
         imports::FAIL,
         imports::LOG,
         imports::RANDOM,
         imports::END_SESSION,
         imports::ABORT_SESSION,
-        imports::RETRY_INPUT,
-        imports::SET_CONTINUATION_TAG,
     ]
 }
 
@@ -980,16 +681,10 @@ pub fn all_effect_imports() -> &'static [&'static str] {
         imports::LOG,
         imports::RANDOM,
         imports::BROADCAST,
-        imports::REQUEST_INPUT,
-        imports::REQUEST_INPUT_PENDING,
         imports::SET_TIMER,
-        imports::SET_TYPED_TIMER,
         imports::SIGN,
-        imports::SIGN_PENDING,
         imports::END_SESSION,
         imports::ABORT_SESSION,
-        imports::RETRY_INPUT,
-        imports::SET_CONTINUATION_TAG,
     ]
 }
 
@@ -1000,22 +695,26 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn sign_scheme_tags_round_trip() {
+        for scheme in [SignScheme::Ed25519, SignScheme::Bls] {
+            assert_eq!(
+                sign_scheme::from_tag(sign_scheme::tag(scheme)),
+                Some(scheme)
+            );
+        }
+        assert_eq!(sign_scheme::from_tag(2), None);
+    }
+
+    #[test]
     fn imports_for_each_capability() {
         assert_eq!(Capability::Messaging.imports(), &["broadcast"]);
-        assert_eq!(
-            Capability::Input.imports(),
-            &["request_input", "request_input_pending"]
-        );
-        assert_eq!(
-            Capability::Timers.imports(),
-            &["set_timer", "set_typed_timer"]
-        );
+        assert_eq!(Capability::Timers.imports(), &["set_timer"]);
         assert_eq!(
             Capability::Sign {
                 schemes: vec![SignScheme::Ed25519]
             }
             .imports(),
-            &["sign", "sign_pending"]
+            &["sign"]
         );
     }
 
@@ -1032,7 +731,6 @@ mod tests {
         let all_effects: HashSet<&str> = all_effect_imports().iter().copied().collect();
         for capability in [
             Capability::Messaging,
-            Capability::Input,
             Capability::Timers,
             Capability::Sign {
                 schemes: vec![SignScheme::Ed25519],
@@ -1042,6 +740,17 @@ mod tests {
                 assert!(all_effects.contains(import));
             }
         }
+    }
+
+    #[test]
+    fn sign_result_overhead_covers_the_preimage_header_and_signature() {
+        // GuestSignData header: domain, version, session, program, execution,
+        // event position, call index, scheme, and payload length prefix.
+        let header = 24 + 2 + 32 + 32 + 32 + 8 + 4 + 1 + 4;
+        // Returned `(signed_bytes, signature)`: two length prefixes and a
+        // 64-byte Ed25519 signature.
+        let envelope = 4 + 4 + 64;
+        assert!(SIGN_RESULT_OVERHEAD_BYTES >= header + envelope);
     }
 
     #[test]
@@ -1089,23 +798,177 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_output_round_trips_bounded_rejection_reason() {
+        for output in [
+            DispatchOutput {
+                status: CallStatus::Accepted,
+                reason: None,
+                callout: None,
+            },
+            DispatchOutput {
+                status: CallStatus::Accepted,
+                reason: None,
+                callout: Some(CalloutRequest {
+                    callout_index: 1,
+                    context: br#"{"prompt":"choose"}"#.to_vec(),
+                }),
+            },
+            DispatchOutput {
+                status: CallStatus::Rejected,
+                reason: None,
+                callout: None,
+            },
+            DispatchOutput {
+                status: CallStatus::Rejected,
+                reason: Some("invalid answer".into()),
+                callout: None,
+            },
+        ] {
+            let encoded = borsh::to_vec(&output).unwrap();
+            assert_eq!(
+                borsh::from_slice::<DispatchOutput>(&encoded).unwrap(),
+                output
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_output_rejects_invalid_reason_combinations_and_bounds() {
+        // The derived serializer enforces field bounds but not the
+        // status/reason/callout invariant; decode still rejects it below.
+        let oversized = DispatchOutput {
+            status: CallStatus::Rejected,
+            reason: Some("x".repeat(MAX_REJECTION_REASON_BYTES + 1)),
+            callout: None,
+        };
+        assert!(borsh::to_vec(&oversized).is_err());
+
+        let oversized_context = DispatchOutput {
+            status: CallStatus::Accepted,
+            reason: None,
+            callout: Some(CalloutRequest {
+                callout_index: 0,
+                context: vec![b' '; MAX_CALLOUT_CONTEXT_BYTES + 1],
+            }),
+        };
+        assert!(borsh::to_vec(&oversized_context).is_err());
+
+        let mut accepted_with_encoded_reason = vec![CallStatus::Accepted.tag(), 1];
+        accepted_with_encoded_reason.extend_from_slice(&1u32.to_le_bytes());
+        accepted_with_encoded_reason.push(b'x');
+        assert!(borsh::from_slice::<DispatchOutput>(&accepted_with_encoded_reason).is_err());
+    }
+
+    #[test]
+    fn abi_inputs_and_outputs_round_trip() {
+        let shared = SharedStateBytes::try_from_slice(b"shared").unwrap();
+        let local = LocalStateBytes::try_from_slice(b"local").unwrap();
+
+        let init = InitInput::try_new(br#"{"answer":42}"#.to_vec()).unwrap();
+        assert_eq!(
+            borsh::from_slice::<InitInput>(&borsh::to_vec(&init).unwrap()).unwrap(),
+            init
+        );
+
+        let initialized = InitializedState {
+            shared: shared.clone(),
+            local: local.clone(),
+        };
+        assert_eq!(
+            borsh::from_slice::<InitializedState>(&borsh::to_vec(&initialized).unwrap()).unwrap(),
+            initialized
+        );
+
+        let dispatch = DispatchInput::try_new([7; 32], vec![1, 2], vec![3, 4, 5]).unwrap();
+        assert_eq!(
+            borsh::from_slice::<DispatchInput>(&borsh::to_vec(&dispatch).unwrap()).unwrap(),
+            dispatch
+        );
+
+        let callout = CalloutRequest {
+            callout_index: 1,
+            context: br#"{"prompt":"choose"}"#.to_vec(),
+        };
+        assert_eq!(
+            borsh::from_slice::<CalloutRequest>(&borsh::to_vec(&callout).unwrap()).unwrap(),
+            callout
+        );
+
+        let query =
+            QueryInput::try_new(shared.clone(), vec![1], 2, br#"{"q":1}"#.to_vec()).unwrap();
+        assert_eq!(
+            borsh::from_slice::<QueryInput>(&borsh::to_vec(&query).unwrap()).unwrap(),
+            query
+        );
+
+        let query_output = QueryOutput {
+            query_index: 2,
+            json: br#"{"a":1}"#.to_vec(),
+        };
+        assert_eq!(
+            borsh::from_slice::<QueryOutput>(&borsh::to_vec(&query_output).unwrap()).unwrap(),
+            query_output
+        );
+
+        let view = ViewInput::try_new(shared.clone(), vec![1], br#"{"v":1}"#.to_vec()).unwrap();
+        assert_eq!(
+            borsh::from_slice::<ViewInput>(&borsh::to_vec(&view).unwrap()).unwrap(),
+            view
+        );
+
+        let view_output = ViewOutput {
+            json: br#"{"w":2}"#.to_vec(),
+        };
+        assert_eq!(
+            borsh::from_slice::<ViewOutput>(&borsh::to_vec(&view_output).unwrap()).unwrap(),
+            view_output
+        );
+
+        let outcome = OutcomeInput::try_new(shared.clone(), vec![9]).unwrap();
+        assert_eq!(
+            borsh::from_slice::<OutcomeInput>(&borsh::to_vec(&outcome).unwrap()).unwrap(),
+            outcome
+        );
+
+        let outcome_output = OutcomeOutput {
+            borsh: vec![0],
+            json: b"null".to_vec(),
+        };
+        assert_eq!(
+            borsh::from_slice::<OutcomeOutput>(&borsh::to_vec(&outcome_output).unwrap()).unwrap(),
+            outcome_output
+        );
+
+        let writer = WriterInput {
+            shared: shared.clone(),
+        };
+        assert_eq!(
+            borsh::from_slice::<WriterInput>(&borsh::to_vec(&writer).unwrap()).unwrap(),
+            writer
+        );
+
+        for output in [
+            WriterOutput { participant: None },
+            WriterOutput {
+                participant: Some(3),
+            },
+        ] {
+            assert_eq!(
+                borsh::from_slice::<WriterOutput>(&borsh::to_vec(&output).unwrap()).unwrap(),
+                output
+            );
+        }
+    }
+
+    #[test]
     fn input_length_prefixes_are_checked_before_allocation() {
         let oversized = u32::MAX.to_le_bytes();
         let session = [0u32.to_le_bytes(), oversized].concat();
-        let local_session = [vec![0; 40], oversized.to_vec()].concat();
         // Omit the declared payload: a size error must precede a body read.
         for (input, error) in [
             (
                 "init",
                 borsh::from_slice::<InitInput>(&oversized).unwrap_err(),
-            ),
-            (
-                "shared",
-                borsh::from_slice::<SharedInput>(&session).unwrap_err(),
-            ),
-            (
-                "local",
-                borsh::from_slice::<LocalInput>(&local_session).unwrap_err(),
             ),
             (
                 "query",
@@ -1119,6 +982,13 @@ mod tests {
                 "outcome",
                 borsh::from_slice::<OutcomeInput>(&session).unwrap_err(),
             ),
+            (
+                "dispatch session",
+                borsh::from_slice::<DispatchInput>(
+                    &[[0; 32].as_slice(), oversized.as_slice()].concat(),
+                )
+                .unwrap_err(),
+            ),
         ] {
             assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{input}: {error}");
         }
@@ -1127,18 +997,9 @@ mod tests {
     #[test]
     fn output_length_prefixes_are_checked_before_allocation() {
         let oversized = u32::MAX.to_le_bytes();
-        let state = [vec![0], oversized.to_vec()].concat();
         let query = [0u32.to_le_bytes(), oversized].concat();
         let outcome = (MAX_CALL_PAYLOAD_BYTES as u32 + 1).to_le_bytes();
         for (output, error) in [
-            (
-                "shared",
-                borsh::from_slice::<SharedOutput>(&state).unwrap_err(),
-            ),
-            (
-                "local",
-                borsh::from_slice::<LocalOutput>(&state).unwrap_err(),
-            ),
             (
                 "query",
                 borsh::from_slice::<QueryOutput>(&query).unwrap_err(),

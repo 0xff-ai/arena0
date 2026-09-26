@@ -19,7 +19,6 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
-arena0-crypto = { path = "../arena0-crypto" }
 
 [lints]
 workspace = true

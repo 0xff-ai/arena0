@@ -21,8 +21,8 @@ use tokio::sync::{Mutex, watch};
 use tokio::task::JoinSet;
 
 use crate::tui::{
-    MonitorAction, MonitorActivity, MonitorExecutionKey, MonitorHost, MonitorSubmission,
-    MonitorUpdate, PRIVATE_INSPECTION_LIMIT, RunUpdate, TuiConfig, TuiDriver, TuiHandle, TuiHost,
+    EVENT_INSPECTION_LIMIT, MonitorAction, MonitorActivity, MonitorExecutionKey, MonitorHost,
+    MonitorSubmission, MonitorUpdate, RunUpdate, TuiConfig, TuiDriver, TuiHandle, TuiHost,
     TuiSession,
 };
 
@@ -471,8 +471,8 @@ impl HostMonitor {
                 &self.host,
                 &HostRequest::ExecInspect {
                     exec_id,
-                    private_from: None,
-                    private_limit: PRIVATE_INSPECTION_LIMIT,
+                    events_from: None,
+                    events_limit: EVENT_INSPECTION_LIMIT,
                 },
             )
             .await?
@@ -885,10 +885,10 @@ mod tests {
                 Ok(ResponseOk::Inspection(ExecutionInspection {
                     status: status.clone(),
                     activation: None,
-                    private_from: 0,
-                    private: Vec::new(),
-                    private_total: 0,
-                    private_next: None,
+                    events_from: 0,
+                    events: Vec::new(),
+                    events_total: 0,
+                    events_next: None,
                 }))
             }
             HostRequest::ExecView { .. } => {
@@ -974,10 +974,10 @@ mod tests {
                 Ok(ResponseOk::Inspection(ExecutionInspection {
                     status: status.clone(),
                     activation: None,
-                    private_from: 0,
-                    private: Vec::new(),
-                    private_total: 0,
-                    private_next: None,
+                    events_from: 0,
+                    events: Vec::new(),
+                    events_total: 0,
+                    events_next: None,
                 }))
             }
             HostRequest::ExecView { .. } => {
@@ -1032,6 +1032,7 @@ mod tests {
 
     fn status(exec_id: ExecId, program_id: ProgramHash) -> arena0_client::api::ExecStatus {
         arena0_client::api::ExecStatus {
+            end: Default::default(),
             exec_id,
             negotiation_id: None,
             program_id,

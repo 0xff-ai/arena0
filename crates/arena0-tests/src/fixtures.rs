@@ -10,12 +10,13 @@ use arena0_program::{
     StateSchema,
 };
 use arena0_protocol::{
-    Activation, ActivationData, ExecId, ExecutionAdmission, MAX_TICKET_LIFETIME_MS, NegotiationId,
-    Offer, OfferData, OfferHash, PeerId, PeerIdSource, PreparedActivation, StateHash, Ticket,
-    TicketAction, TicketData, TicketHash,
+    Activation, ActivationData, ExecFrame, ExecId, ExecutionAdmission, MAX_TICKET_LIFETIME_MS,
+    NegotiationId, Offer, OfferData, OfferHash, PeerId, PeerIdSource, PreparedActivation,
+    StateHash, Ticket, TicketAction, TicketData, TicketHash,
 };
-use arena0_sandbox::{InitializeCall, Program, WasmtimeEngine};
+use arena0_sandbox::Program;
 use arena0_store::{Store, StoreConfig, StoreHandle};
+use arena0_test_engine::shared_test_engine;
 use arena0_transport::local::{LocalNetwork, LocalTransport};
 use arena0_transport::{RecvHandle, SendHandle, Transport};
 use tempfile::TempDir;
@@ -106,31 +107,21 @@ pub fn activation_for(
     Activation::new(prepared, aggregate).expect("valid activation")
 }
 
-/// The collective signature over the activation data signed only by the given
-/// participant indices (for consensus-gate tests: a partial aggregate fails
-/// verification against the full ticket set).
-pub fn partial_aggregate(
-    cryptos: &[&NodeKeys],
-    activation: &Activation,
-    indices: &[usize],
-) -> BlsSignature {
-    let msg = activation.activation_data().signing_bytes();
-    let sigs: Vec<BlsSignature> = indices
-        .iter()
-        .map(|&i| execution_key(cryptos[i]).sign(&msg))
-        .collect();
-    BlsSignature::aggregate(&sigs).expect("aggregate")
-}
+/// The SQLite file name inside a [`seeded_store`] directory, for reopening.
+pub const STORE_FILE: &str = "arena0.sqlite";
 
-pub fn session_bls_seed(seed: &[u8; 32]) -> [u8; 32] {
-    let mut preimage = seed.to_vec();
-    preimage.extend_from_slice(b"/arena0/session-bls");
-    *blake3::hash(&preimage).as_bytes()
-}
-
-/// The node identity for a test seed.
-pub fn session_crypto(seed: &[u8; 32]) -> NodeKeys {
-    NodeKeys::from_secret(SecretKey::from_bytes(*seed))
+/// Open a fresh Host store owned by `owner` in a new temporary directory,
+/// with `wasm` registered in its program catalog.
+pub async fn seeded_store(owner: PeerId, wasm: &[u8]) -> (TempDir, Store) {
+    let directory = tempfile::tempdir().expect("temporary store directory");
+    let store = Store::open(StoreConfig::new(directory.path().join(STORE_FILE), owner))
+        .expect("open sqlite store");
+    store
+        .handle()
+        .register_program(wasm.to_vec(), 1)
+        .await
+        .expect("register program");
+    (directory, store)
 }
 
 /// Agent JSON for `Params { target_size }`.
@@ -166,23 +157,35 @@ pub struct LiveExecution {
 /// capability is moved through request, activation, and execution unchanged.
 pub async fn spawn_live_execution(
     wasm: Vec<u8>,
-    mut cryptos: Vec<NodeKeys>,
+    cryptos: Vec<NodeKeys>,
     negotiation_id: NegotiationId,
     exec_id: ExecId,
     params: Vec<u8>,
 ) -> LiveExecution {
+    spawn_live_execution_with_delivery(wasm, cryptos, negotiation_id, exec_id, params, true).await
+}
+
+/// Build the same real execution while allowing tests to receive and decide
+/// outbound frames themselves when automatic acknowledgements are disabled.
+pub async fn spawn_live_execution_with_delivery(
+    wasm: Vec<u8>,
+    mut cryptos: Vec<NodeKeys>,
+    negotiation_id: NegotiationId,
+    exec_id: ExecId,
+    params: Vec<u8>,
+    automatic_acknowledgements: bool,
+) -> LiveExecution {
     cryptos.sort_by_key(NodeKeys::peer_id);
     let peer_ids = cryptos.iter().map(NodeKeys::peer_id).collect::<Vec<_>>();
     let program = Program::try_from(wasm.clone()).expect("program");
-    let loaded = WasmtimeEngine::new()
-        .expect("sandbox engine")
-        .load(&program)
-        .expect("load program");
+    // One shared load: initialization and the actor dispatch residents of the
+    // same compiled module through the process-wide test engine.
+    let loaded = shared_test_engine().load(&program).expect("load program");
     let params_json = arena0_program::JsonBytes::try_new(params.clone()).expect("JSON params");
     let initialized = loaded
-        .initialize(InitializeCall::new(params_json.clone()))
+        .initialize(params_json.clone())
         .expect("initialize program");
-    let initial_state = StateHash::of(initialized.shared.as_bytes());
+    let initial_state = StateHash::of_shared(&initialized.shared);
     let activation = activation_for(
         &cryptos,
         negotiation_id,
@@ -207,23 +210,15 @@ pub async fn spawn_live_execution(
     // from raw participant transports.  The actor still publishes its
     // durable signatures to every selected peer, so each remaining endpoint
     // needs a real transport reader to acknowledge those frames.  This keeps
-    // the producer's outbox on the production path without introducing a
+    // the producer's delivery lanes on the production path without introducing a
     // second runtime/store implementation into the fixture.
     let remote_ack_tasks = transports[1..peer_ids.len()]
         .iter()
+        .filter(|_| automatic_acknowledgements)
         .map(|transport| tokio::spawn(acknowledge_exec_streams(Arc::clone(transport))))
         .collect::<Vec<_>>();
-    let directory = tempfile::tempdir().expect("temporary store directory");
-    let store = Store::open(StoreConfig::new(
-        directory.path().join("arena0.sqlite"),
-        identity.peer_id(),
-    ))
-    .expect("open sqlite store");
+    let (directory, store) = seeded_store(identity.peer_id(), &wasm).await;
     let store_handle = store.handle().clone();
-    store_handle
-        .register_program(wasm.clone(), 1)
-        .await
-        .expect("register program");
     let host = Host::start(
         Arc::clone(&identity),
         Arc::clone(&transports[0]) as Arc<dyn arena0_transport::Transport + Sync>,
@@ -248,10 +243,6 @@ pub async fn spawn_live_execution(
         .commit_activation(activation.clone(), 4)
         .await
         .expect("commit activation");
-    let loaded = WasmtimeEngine::new()
-        .expect("sandbox engine")
-        .load(&program)
-        .expect("load program for actor");
     let context = ExecContext::new(
         exec_id,
         loaded,
@@ -260,10 +251,8 @@ pub async fn spawn_live_execution(
         execution_key(identity.as_ref()),
     );
     let spawned = host.spawn(context, execution_store).expect("spawn actor");
-    // Keep one authenticated stream open per remote participant. The Host
-    // treats a participant stream closure as terminal evidence, so tests that
-    // inject several frames must reuse these streams instead of dropping a
-    // one-frame handle after every send.
+    // Reuse an authenticated stream per remote participant for injections;
+    // opening a replacement stream is also safe after a transport failure.
     let mut participant_streams = Vec::with_capacity(peer_ids.len().saturating_sub(1));
     for transport in transports.iter().skip(1) {
         participant_streams.push(
@@ -302,6 +291,53 @@ impl LiveExecution {
             .cloned()
             .expect("remote participant stream")
     }
+
+    /// The durable chain link after the agreed prefix, which the next
+    /// message's commitment must extend.
+    pub async fn agreed_link(&self) -> [u8; 32] {
+        self.store_handle
+            .load_execution(self.exec_id)
+            .await
+            .expect("load execution")
+            .expect("execution")
+            .agreed_link()
+    }
+
+    /// Send `frame` on remote participant `index`'s authenticated stream and
+    /// require the receiver to accept it.
+    pub async fn send_from(&self, index: usize, frame: &ExecFrame) {
+        self.participant_stream(index)
+            .send_exec(frame)
+            .await
+            .expect("send execution frame");
+    }
+}
+
+/// A one-byte message from `source` at `step` that leaves shared state
+/// `prestate` unchanged, carrying its complete `StepCommitment`.
+pub fn message_frame(
+    session_hash: arena0_protocol::SessionHash,
+    source: PeerId,
+    step: u64,
+    prestate: StateHash,
+    link: [u8; 32],
+    payload: u8,
+) -> ExecFrame {
+    let data = vec![payload];
+    let entry = arena0_protocol::TraceEntry {
+        trace_version: arena0_protocol::TRACE_FORMAT_VERSION,
+        step,
+        event: arena0_protocol::StepEvent::Message {
+            from: source,
+            data: data.clone(),
+        },
+        pre_state: prestate,
+        post_state: prestate,
+        terminal: None,
+        agreement: arena0_protocol::AggregateAttestation::empty(),
+    };
+    let commitment = arena0_protocol::StepCommitment::for_entry(session_hash, &entry, link);
+    ExecFrame::Message { commitment, data }
 }
 
 /// Complete the initial shared SessionStarted proposal with all remote
@@ -329,7 +365,7 @@ pub async fn establish_live_session(execution: &LiveExecution, cryptos: &[NodeKe
 
 /// Supply every remote signature for the actor's current shared proposal.
 /// The caller chooses when to release this quorum, which lets receive-side
-/// tests observe accepted-but-not-yet-applicable inbox rows first.
+/// tests observe retryable NotYet decisions before releasing agreement.
 pub async fn complete_pending_shared(execution: &LiveExecution, cryptos: &[NodeKeys]) {
     let deadline = tokio::time::Instant::now() + LIVE_EXECUTION_TIMEOUT;
     let commitment = loop {
@@ -338,9 +374,9 @@ pub async fn complete_pending_shared(execution: &LiveExecution, cryptos: &[NodeK
             .load_execution(execution.exec_id)
             .await
             .expect("load execution")
-            && let Some(proposal) = state.pending_shared()
+            && state.pending_shared().is_some()
         {
-            break proposal.commitment().clone();
+            break state.proposal_commitment().expect("staged commitment");
         }
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -378,7 +414,7 @@ pub async fn complete_pending_shared(execution: &LiveExecution, cryptos: &[NodeK
     if let Some((first_index, first_crypto)) = pending.next() {
         let first = send_signature(execution, first_index, commitment.clone(), first_crypto);
         if let Some((second_index, second_crypto)) = pending.next() {
-            // The producer's outbox drives every selected peer. Keep the
+            // The producer's delivery lanes drive every selected peer. Keep the
             // inbound quorum drives live at the same time so one completed
             // transport receipt cannot starve the other participant's frame.
             let second = send_signature(execution, second_index, commitment.clone(), second_crypto);
@@ -483,9 +519,8 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
     };
     let metadata = definition.encode().expect("ordering metadata");
     let init = wat_data(&[0, 0, 0, 0, 0, 0, 0, 0]);
-    let shared = wat_data(&[0, 0, 0, 0, 0]);
-    let rejected_shared = wat_data(&[1, 0, 0, 0, 0]);
-    let local = wat_data(&[0, 0, 0, 0, 0]);
+    let accepted = wat_data(&[0, 0, 0]);
+    let rejected = wat_data(&[1, 0, 0]);
     let writer = wat_data(&[1, 1]);
     let outcome = wat_data(&[0, 0, 0, 0, 4, 0, 0, 0, b'n', b'u', b'l', b'l']);
     let query = wat_data(&[0, 0, 0, 0, 4, 0, 0, 0, b'n', b'u', b'l', b'l']);
@@ -494,14 +529,13 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
     let wat = format!(
         r#"
         (module
-          (import "arena0" "broadcast" (func $broadcast (param i32 i32)))
+          (import "arena0" "broadcast" (func $broadcast (param i32 i32) (result i32)))
           {stop_import}
-          (memory (export "memory") 2)
-          (global (export "arena0_abi_version") i32 (i32.const 20))
+          (memory (export "memory") 1)
+          (global (export "arena0_abi_version") i32 (i32.const 22))
           (data (i32.const 2048) "{init}")
-          (data (i32.const 4096) "{shared}")
-          (data (i32.const 5120) "{rejected_shared}")
-          (data (i32.const 6144) "{local}")
+          (data (i32.const 32768) "{accepted}")
+          (data (i32.const 32772) "{rejected}")
           (data (i32.const 8192) "{writer}")
           (data (i32.const 10240) "{outcome}")
           (data (i32.const 12288) "{query}")
@@ -519,11 +553,14 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
             i64.or)
           (func (export "arena0_alloc") (param i32) (result i32) i32.const 1024)
           (func (export "arena0_dealloc") (param i32 i32))
+          (func (export "arena0_prepare") (result i32)
+            i32.const 895
+            memory.grow
+            drop
+            i32.const 1)
           (func (export "arena0_initialize") (param i32 i32) (result i64)
             i32.const 2048 i32.const 8 call $pack)
-          {shared_export}
-          (func (export "arena0_local") (param i32 i32) (result i64)
-            i32.const 6144 i32.const 5 call $pack)
+          {dispatch_export}
           (func (export "arena0_writer") (param i32 i32) (result i64)
             i32.const 8192 i32.const 2 call $pack)
           (func (export "arena0_outcome") (param i32 i32) (result i64)
@@ -536,39 +573,58 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
             i32.const 16384 i32.const {metadata_len} call $pack))
         "#,
         init = init,
-        shared = shared,
-        rejected_shared = rejected_shared,
+        accepted = accepted,
+        rejected = rejected,
         stop_import = if matches!(behavior, OrderingBehavior::Fail) {
             r#"(import "arena0" "fail" (func $fail (param i32 i32)))"#
         } else {
             ""
         },
-        shared_export = if matches!(behavior, OrderingBehavior::Fail) {
-            r#"(func (export "arena0_shared") (param i32 i32) (result i64)
+        dispatch_export = if matches!(behavior, OrderingBehavior::Fail) {
+            r#"(func (export "arena0_dispatch") (param i32 i32) (result i64)
             i32.const 10248 i32.const 4 call $fail
-            i32.const 4096 i32.const 5 call $pack)"#
+            i32.const 32768 i32.const 3 call $pack)"#
         } else if matches!(behavior, OrderingBehavior::RejectMessage) {
-            r#"(func (export "arena0_shared") (param $input_ptr i32) (param i32) (result i64)
-            (local $shared_len i32)
+            r#"(func (export "arena0_dispatch") (param $input_ptr i32) (param i32) (result i64)
+            (local $session_len i32)
             local.get $input_ptr
-            i32.load
-            local.set $shared_len
-            local.get $input_ptr
-            i32.const 8
+            i32.const 32
             i32.add
-            local.get $shared_len
+            i32.load
+            local.set $session_len
+            local.get $input_ptr
+            i32.const 36
+            i32.add
+            local.get $session_len
+            i32.add
+            i32.const 4
             i32.add
             i32.load8_u
+            i32.const 1
+            i32.eq
             if (result i64)
-              i32.const 5120 i32.const 5 call $pack
+              local.get $input_ptr
+              i32.const 36
+              i32.add
+              local.get $session_len
+              i32.add
+              i32.const 37
+              i32.add
+              i32.load8_u
+              i32.const 1
+              i32.eq
+              if (result i64)
+                i32.const 32772 i32.const 3 call $pack
+              else
+                i32.const 32768 i32.const 3 call $pack
+              end
             else
-              i32.const 4096 i32.const 5 call $pack
+              i32.const 32768 i32.const 3 call $pack
             end)"#
         } else {
-            r#"(func (export "arena0_shared") (param i32 i32) (result i64)
-            i32.const 4096 i32.const 5 call $pack)"#
+            r#"(func (export "arena0_dispatch") (param i32 i32) (result i64)
+            i32.const 32768 i32.const 3 call $pack)"#
         },
-        local = local,
         writer = writer,
         outcome = outcome,
         query = query,
@@ -576,7 +632,12 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
         metadata_data = metadata_data,
         metadata_len = metadata.len(),
     );
-    append_metadata(&wat::parse_str(wat).expect("ordering Wasm"), &metadata)
+    let raw = wat::parse_str(wat).expect("ordering Wasm");
+    shared_test_engine()
+        .build_program(&raw)
+        .expect("finalize ordering Wasm")
+        .bytes()
+        .to_vec()
 }
 
 fn wat_data(bytes: &[u8]) -> String {
@@ -585,30 +646,4 @@ fn wat_data(bytes: &[u8]) -> String {
         .map(|byte| format!("\\{byte:02x}"))
         .collect::<Vec<_>>()
         .join("")
-}
-
-fn append_metadata(binary: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(2 + data.len());
-    push_leb128(&mut payload, b"arena0.metadata".len() as u64);
-    payload.extend_from_slice(b"arena0.metadata");
-    payload.extend_from_slice(data);
-    let mut out = binary.to_vec();
-    out.push(0);
-    push_leb128(&mut out, payload.len() as u64);
-    out.extend_from_slice(&payload);
-    out
-}
-
-fn push_leb128(out: &mut Vec<u8>, mut value: u64) {
-    loop {
-        let mut byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        out.push(byte);
-        if value == 0 {
-            return;
-        }
-    }
 }

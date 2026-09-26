@@ -1,7 +1,40 @@
 use super::*;
 
 impl Database {
-    pub(super) fn list_recovery_candidates(
+    pub(crate) fn end_wake_candidate(
+        &mut self,
+        execution_id: ExecId,
+    ) -> Result<Option<RecoveryCandidate>, StoreError> {
+        let row: Option<(String, Vec<u8>, Option<Vec<u8>>)> = self
+            .connection
+            .query_row(
+                "SELECT a.status, a.session_id, p.program_hash FROM executions e
+             JOIN activation_records a USING (execution_id)
+             JOIN exec_requests r USING (execution_id)
+             LEFT JOIN programs p ON p.program_hash = r.program_hash
+             WHERE e.execution_id = ?1 AND e.end_phase = 2",
+                params![execution_id.0.to_vec()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((status, session, program)) = row else {
+            return Ok(None);
+        };
+        let request = self
+            .load_execution_request_in_transaction(execution_id)?
+            .ok_or(StoreError::ExecutionNotFound(execution_id))?;
+        Ok(Some(RecoveryCandidate {
+            cursor: RecoveryCursor::from_position(request.created_order()),
+            request,
+            activation_status: Some(parse_activation_status(&status)?),
+            session_id: Some(SessionHash(array32(&session, "wake session")?)),
+            execution_present: true,
+            program: program
+                .map(|p| array32(&p, "wake program").map(ProgramHash))
+                .transpose()?,
+        }))
+    }
+    pub(crate) fn list_recovery_candidates(
         &mut self,
         cursor: RecoveryCursor,
         limit: usize,
@@ -22,13 +55,7 @@ impl Database {
              LEFT JOIN programs AS p ON p.program_hash = r.program_hash
              WHERE r.created_order > ?1
                AND r.failure IS NULL
-               AND (e.execution_id IS NULL OR e.lifecycle IN (0, 1, 2, 3)
-                    OR (e.lifecycle IN (5, 7) AND NOT EXISTS (
-                        SELECT 1 FROM receipt_productions AS p
-                        WHERE p.execution_id = r.execution_id))
-                    OR (e.lifecycle <> 6 AND EXISTS (SELECT 1 FROM outbox AS o
-                        WHERE o.execution_id = r.execution_id
-                          AND o.status <> 'acknowledged')))
+               AND (e.execution_id IS NULL OR e.end_phase <> 2 OR NOT EXISTS (SELECT 1 FROM receipt_productions p WHERE p.execution_id = e.execution_id))
              ORDER BY r.created_order ASC
              LIMIT ?2",
         )?;

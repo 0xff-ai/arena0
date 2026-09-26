@@ -1,17 +1,15 @@
 //! Content-addressed message identity.
 //!
-//! A [`crate::MessageId`] is the blake3 fingerprint of one authenticated program-message
-//! envelope: the session, the authenticated sender, the global trace position the
-//! message was computed against (`position`), the declared pre-state hash, the opaque
-//! program payload, and the sender's witness commitment. Every field is either
-//! public or authenticated by the transport, so a receiver recomputes the id from
-//! what it actually knows and treats a mismatch as protocol abuse.
+//! A [`crate::MessageId`] binds the authenticated session sender, agreed
+//! position, shared pre-state and post-state hashes, and opaque program
+//! payload. The advertised post-state is part of the identity so a payload
+//! cannot be replayed with a different consensus result.
 
 use crate::id::id_type;
-use crate::{PeerId, SessionHash, StateHash, WitnessCommitment};
+use crate::{PeerId, SessionHash, StateHash};
 
 /// Domain separation tag for message-id derivation.
-pub const MESSAGE_ID_DOMAIN: [u8; 24] = *b"arena0/message/v1\0\0\0\0\0\0\0";
+pub const MESSAGE_ID_DOMAIN: [u8; 24] = *b"arena0/message/v2\0\0\0\0\0\0\0";
 const _: () = assert!(MESSAGE_ID_DOMAIN.len() == 24);
 
 id_type!(
@@ -20,19 +18,15 @@ id_type!(
 );
 
 impl Id {
-    /// Derive the message id from the canonical envelope preimage.
-    ///
-    /// `from` must be the transport-authenticated sender (the stream peer), never
-    /// a sender-claimed identity. `position` is the global trace position the message
-    /// was computed against; `pre_state` is the state hash at that position.
+    /// Derive the message id from the canonical authenticated envelope.
     #[must_use]
     pub fn derive(
         session_id: SessionHash,
         from: PeerId,
         position: u64,
         pre_state: StateHash,
+        post_state: StateHash,
         data: &[u8],
-        witness: WitnessCommitment,
     ) -> Self {
         let bytes = borsh::to_vec(&(
             MESSAGE_ID_DOMAIN,
@@ -40,11 +34,10 @@ impl Id {
             from,
             position,
             pre_state,
+            post_state,
             data,
-            witness,
         ))
         .expect("message-id preimage is serializable");
-
         Self(*blake3::hash(&bytes).as_bytes())
     }
 }
@@ -53,33 +46,26 @@ impl Id {
 mod tests {
     use super::*;
 
-    fn sample() -> (SessionHash, PeerId, StateHash, WitnessCommitment) {
+    fn sample() -> (SessionHash, PeerId, StateHash, StateHash) {
         (
             SessionHash([1u8; 32]),
             PeerId([2u8; 32]),
             StateHash([3u8; 32]),
-            WitnessCommitment([4u8; 32]),
+            StateHash([4u8; 32]),
         )
     }
 
     #[test]
     fn derive_distinguishes_every_field() {
-        let (session, from, pre, witness) = sample();
-        let base = Id::derive(session, from, 7, pre, b"payload", witness);
+        let (session, from, pre, post) = sample();
+        let base = Id::derive(session, from, 7, pre, post, b"payload");
         let cases = [
-            Id::derive(SessionHash([9u8; 32]), from, 7, pre, b"payload", witness),
-            Id::derive(session, PeerId([9u8; 32]), 7, pre, b"payload", witness),
-            Id::derive(session, from, 8, pre, b"payload", witness),
-            Id::derive(session, from, 7, StateHash([9u8; 32]), b"payload", witness),
-            Id::derive(session, from, 7, pre, b"other", witness),
-            Id::derive(
-                session,
-                from,
-                7,
-                pre,
-                b"payload",
-                WitnessCommitment([9u8; 32]),
-            ),
+            Id::derive(SessionHash([9; 32]), from, 7, pre, post, b"payload"),
+            Id::derive(session, PeerId([9; 32]), 7, pre, post, b"payload"),
+            Id::derive(session, from, 8, pre, post, b"payload"),
+            Id::derive(session, from, 7, StateHash([9; 32]), post, b"payload"),
+            Id::derive(session, from, 7, pre, StateHash([9; 32]), b"payload"),
+            Id::derive(session, from, 7, pre, post, b"other"),
         ];
         for case in cases {
             assert_ne!(base, case);

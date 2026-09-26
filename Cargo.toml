@@ -9,12 +9,12 @@ members = [
     "crates/arena0-protocol",
     "crates/arena0-sandbox",
     "crates/arena0-store",
+    "crates/arena0-test-engine",
     "crates/arena0-sdk-macros",
     "crates/arena0-sdk",
     "crates/arena0-primitives",
     "crates/arena0-transport",
     "crates/arena0-wire",
-    "crates/arena0-verify",
     "crates/arena0-node",
     "crates/arena0-tests",
     "crates/arena0-daemon",
@@ -41,7 +41,8 @@ wasmtime = { version = "46.0.3", default-features = false, features = [
     "runtime",
     "std",
 ] }
-wasmparser = "0.221"
+wasm-encoder = { version = "0.251", features = ["wasmparser"] }
+wasmparser = "0.251"
 wat = "1.221"
 moka = { version = "0.12", default-features = false, features = ["sync"] }
 

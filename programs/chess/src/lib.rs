@@ -54,6 +54,7 @@ pub enum Outcome {
 )]
 pub mod chess {
     use super::*;
+    use arena0::ProgramTransition;
 
     // Chess declares its SDK-facing types in-module (below); the module-shell
     // macro resolves them directly. Only `Outcome` lives at file scope, so it is
@@ -132,11 +133,6 @@ pub mod chess {
         Move(String),
     }
 
-    #[arena0::pending]
-    pub enum Pending {
-        Thinking,
-    }
-
     // No terminal phase: in the outcome contract the session ends via
     // `Transition::End` (which derives the outcome and emits `SessionEnd`), not
     // by moving to a "finished" phase. `Playing` is the last program phase; the
@@ -190,6 +186,15 @@ pub mod chess {
         moves
     }
 
+    /// Participant-local chess state.
+    #[arena0::local]
+    #[derive(Default)]
+    pub struct Local {
+        /// Set while this participant's move is queued but not yet applied, so
+        /// the callout does not re-ask the answered question.
+        move_pending: bool,
+    }
+
     #[arena0::state(max = 32768)]
     pub struct Shared {
         #[phase]
@@ -199,8 +204,6 @@ pub mod chess {
         status: Status,
         move_history: Vec<String>,
     }
-
-    pub type Local = ();
 
     /// Pure projection from final shared state; no context, effects, or entropy.
     ///
@@ -237,8 +240,7 @@ pub mod chess {
         state.turns.as_ref().map(TurnManager::current)
     }
 
-    fn view(ctx: &SharedContext, vp: &Viewport) -> View {
-        let state = ctx.shared();
+    fn view(state: &Shared, _ensemble: &Ensemble, vp: &Viewport) -> View {
         let board = state.current_board();
         // Read-only projections receive only shared state. Render the board in
         // canonical White-first orientation rather than depending on the local
@@ -429,10 +431,11 @@ pub mod chess {
         }
     }
 
-    /// Position-0 boundary: set up the starting board and the turn order. Shared
-    /// handler, so it issues no callout; asking the mover for a move is
-    /// `on_react`'s job.
-    fn on_session_started(ctx: &mut SharedContext) -> Result<Transition<Phase>, ProgramFault> {
+    /// Position-0 boundary: set up the starting board and the turn order. The resulting
+    /// state determines the mover's question.
+    fn on_session_started(
+        ctx: &mut Context<Shared, Local>,
+    ) -> Result<ProgramTransition<Chess>, ProgramFault> {
         let participants = vec![Participant::new(0), Participant::new(1)];
         ctx.mutate_shared(|state| {
             let board = CozyBoard::default();
@@ -443,64 +446,78 @@ pub mod chess {
         Ok(Transition::To(Phase::Playing))
     }
 
-    /// Local decision hook: when it is this node's turn, ask the agent for a move.
-    fn on_react(ctx: &mut Context) -> Result<(), ProgramFault> {
+    /// Ask the participant whose turn it is for a legal move.
+    fn callout(ctx: &CalloutContext<Shared, Local>) -> Option<Callout> {
         let state = ctx.shared();
         if state.phase() != Phase::Playing || state.status != Status::InProgress {
-            return Ok(());
+            return None;
+        }
+        // An answer already queued this participant's move; do not re-ask the
+        // same question until the author's own message is applied.
+        if ctx.local().move_pending {
+            return None;
         }
         let is_my_turn = state
             .turns
             .as_ref()
             .is_some_and(|turns| turns.current() == ctx.me());
         if !is_my_turn {
-            return Ok(());
+            return None;
         }
         let fen = state.fen.clone();
         let legal_moves = state.legal_moves_string();
-        ctx.effects()
-            .callout(callouts::MakeMove { fen, legal_moves })
-            .pending(Pending::Thinking)
-            .dispatch();
-        Ok(())
+        Some(callouts::MakeMove { fen, legal_moves }.into())
     }
 
-    fn on_input(ctx: &mut Context, input: Input) -> Result<(), InputFault> {
+    fn on_input(ctx: &mut LocalContext<Shared, Local>, input: Input) -> arena0::anyhow::Result<()> {
         let Input::MakeMove(text) = input;
         let move_str = text.trim();
-        // Validate against the current board (read-only). A bad move is retryable;
-        // the authoritative apply happens in `on_message` when the broadcast lands.
+        if writer(ctx.shared()) != Some(ctx.me()) {
+            return Err(anyhow!("this participant does not own the next move"));
+        }
+        // Validate the move against the committed board without mutating
+        // shared state; the author applies it when its own message is applied.
         ctx.shared()
             .validate_move(move_str)
-            .map_err(|e| InputFault::Retryable(e.into()))?;
+            .map_err(|e| anyhow!(e))?;
+        ctx.mutate_local(|local| local.move_pending = true);
         ctx.effects()
-            .broadcast(&Message::Move(move_str.to_string()));
+            .broadcast(&Message::Move(move_str.to_string()))?;
         Ok(())
     }
 
     fn on_message(
-        ctx: &mut SharedContext,
-        _from: Participant,
+        ctx: &mut Context<Shared, Local>,
+        from: Participant,
         msg: Message,
-    ) -> Result<ApplyDecision<Phase>, ProtocolFault> {
+    ) -> MessageApply<Chess> {
+        if writer(ctx.shared()) != Some(from) {
+            return Ok(ApplyDecision::Reject);
+        }
         let Message::Move(text) = msg;
         let move_str = text.trim();
-        let Ok((board, algebraic)) = ctx.shared().validate_move(move_str) else {
+        let Ok(finished) = apply_move(ctx.shared_mut(), move_str) else {
             return Ok(ApplyDecision::Reject);
         };
-        let finished = ctx.mutate_shared(|state| {
-            state.apply_validated_move(&board, algebraic);
-            state.turns.as_mut().expect("turns initialized").advance();
-            state.status != Status::InProgress
-        });
+        ctx.mutate_local(|local| local.move_pending = false);
         if finished {
             return Ok(ApplyDecision::Accept(Transition::End));
         }
-        // The next mover's callout is issued by `on_react`.
+        // The resulting turn determines the next mover's callout.
         Ok(ApplyDecision::Accept(Transition::Stay))
     }
 
-    fn on_query(_ctx: &SharedContext, _: ()) {}
+    fn on_query(_shared: &Shared, _: ()) {}
+
+    /// Apply one validated move to the shared board and advance the canonical
+    /// turn. Every participant, including the author applying its own message,
+    /// uses this helper.
+    fn apply_move(state: &mut Shared, move_str: &str) -> Result<bool, Error> {
+        let (board, algebraic) = state.validate_move(move_str)?;
+        state.apply_validated_move(&board, algebraic);
+        state.turns.as_mut().expect("turns initialized").advance();
+        Ok(state.status != Status::InProgress)
+    }
 
     impl Shared {
         fn current_board(&self) -> Option<CozyBoard> {
@@ -658,6 +675,162 @@ pub mod chess {
             }
         }
     }
+
+    /// Terminal projection coverage: every ruled terminal board renders all
+    /// four slots and projects its exact receipt. Expectations below are
+    /// specified literals; the boards reach them through real legal moves.
+    #[cfg(test)]
+    mod projection_tests {
+        use super::super::{DrawReason, WinReason};
+        use super::*;
+        use arena0::types::{ColorDepth, Slot};
+
+        #[test]
+        fn terminal_view_and_outcome_preserve_chess_results() {
+            // Play UCI moves legally, recording SAN history as `validate_move` does.
+            let play = |mut board: CozyBoard, moves: &[&str]| -> (CozyBoard, Vec<String>) {
+                let mut history = Vec::new();
+                for uci in moves {
+                    let mv = parse_uci_move(&board, uci).expect("fixture move parses");
+                    assert!(board.is_legal(mv), "{uci} is legal");
+                    history.push(format!("{}", display_san_move(&board, mv)));
+                    board.play(mv);
+                }
+                (board, history)
+            };
+            let (scholar, scholar_history) = play(
+                CozyBoard::default(),
+                &["e2e4", "e7e5", "d1h5", "b8c6", "f1c4", "g8f6", "h5f7"],
+            );
+            let (stalemate, stalemate_history) = play(
+                "7k/8/4Q3/6K1/8/8/8/8 w - - 0 1".parse().expect("valid FEN"),
+                &["e6f7"],
+            );
+            let (fifty, fifty_history) = play(
+                "4k3/8/8/8/8/8/4K2R/8 w - - 99 1"
+                    .parse()
+                    .expect("valid FEN"),
+                &["h2h3"],
+            );
+            let (material, material_history) = play(
+                "4k3/7b/8/8/8/8/2B1K3/8 w - - 0 1"
+                    .parse()
+                    .expect("valid FEN"),
+                &["c2h7"],
+            );
+            let cases: Vec<(&str, CozyBoard, Vec<String>, Status, &str)> = vec![
+                (
+                    "scholar's mate",
+                    scholar,
+                    scholar_history,
+                    Status::Checkmate {
+                        winner: Color::White,
+                    },
+                    "Checkmate! white wins.",
+                ),
+                (
+                    "stalemate",
+                    stalemate,
+                    stalemate_history,
+                    Status::Stalemate,
+                    "Draw by stalemate.",
+                ),
+                (
+                    "fifty-move rule",
+                    fifty,
+                    fifty_history,
+                    Status::DrawBy50MoveRule,
+                    "Draw by fifty-move rule.",
+                ),
+                (
+                    "insufficient material",
+                    material,
+                    material_history,
+                    Status::DrawByInsufficientMaterial,
+                    "Draw by insufficient material.",
+                ),
+            ];
+            let ensemble = Ensemble::from_peers(vec![PeerId([0; 32]), PeerId([1; 32])])
+                .expect("valid view ensemble");
+            for (label, board, history, expected_status, expected_text) in cases {
+                // The real rule engine must agree with the specified literal.
+                assert_eq!(Status::compute(&board), expected_status, "{label}");
+                let state = Shared {
+                    fen: board.to_string(),
+                    status: expected_status,
+                    move_history: history,
+                    ..Shared::default()
+                };
+                let viewport = Viewport {
+                    width: 120,
+                    color: ColorDepth::Mono,
+                };
+                let view = <Chess as ProgramView>::view(&state, &ensemble, &viewport);
+                assert_eq!(view.slots.len(), 4, "{label} fills every slot");
+                for slot in [Slot::Header, Slot::Agents, Slot::State, Slot::StatusBar] {
+                    assert!(
+                        view.slots.contains_key(&slot),
+                        "{label} is missing {slot:?}"
+                    );
+                }
+                assert!(
+                    view.slots[&Slot::State].contains('\u{2654}'),
+                    "{label} shows the white king"
+                );
+                assert!(
+                    view.slots[&Slot::State].contains('\u{265A}'),
+                    "{label} shows the black king"
+                );
+                assert!(
+                    view.slots[&Slot::StatusBar].contains(expected_text),
+                    "{label} reports its terminal status"
+                );
+                assert!(
+                    view.slots.values().all(|text| !text.contains("\x1b[")),
+                    "{label} mono view must not contain escapes"
+                );
+                let outcome = <Chess as Program>::outcome(&state);
+                match expected_status {
+                    Status::Checkmate {
+                        winner: Color::White,
+                    } => assert!(
+                        matches!(outcome, Outcome::Win { winner, reason: WinReason::Checkmate } if winner == Participant::new(0)),
+                        "{label} is a white checkmate win"
+                    ),
+                    Status::Stalemate => assert!(
+                        matches!(
+                            outcome,
+                            Outcome::Draw {
+                                reason: DrawReason::Stalemate
+                            }
+                        ),
+                        "{label} is a stalemate draw"
+                    ),
+                    Status::DrawBy50MoveRule => assert!(
+                        matches!(
+                            outcome,
+                            Outcome::Draw {
+                                reason: DrawReason::FiftyMoveRule
+                            }
+                        ),
+                        "{label} is a fifty-move draw"
+                    ),
+                    Status::DrawByInsufficientMaterial => assert!(
+                        matches!(
+                            outcome,
+                            Outcome::Draw {
+                                reason: DrawReason::InsufficientMaterial
+                            }
+                        ),
+                        "{label} is an insufficient-material draw"
+                    ),
+                    Status::InProgress | Status::Checkmate { .. } => {
+                        panic!("{label} is not a specified terminal status")
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -707,324 +880,34 @@ mod tests {
     }
 
     #[test]
+    fn draw_rules_classify_terminal_boards() {
+        for (fen, uci, expected) in [
+            ("7k/8/4Q3/6K1/8/8/8/8 w - - 0 1", "e6f7", Status::Stalemate),
+            (
+                "4k3/8/8/8/8/8/4K2R/8 w - - 99 1",
+                "h2h3",
+                Status::DrawBy50MoveRule,
+            ),
+            (
+                "4k3/7b/8/8/8/8/2B1K3/8 w - - 0 1",
+                "c2h7",
+                Status::DrawByInsufficientMaterial,
+            ),
+        ] {
+            let mut board: CozyBoard = fen.parse().expect("valid FEN");
+            let mv = parse_uci_move(&board, uci).expect("valid UCI move");
+            assert!(board.is_legal(mv), "{uci} is legal in {fen}");
+            board.play(mv);
+            assert_eq!(Status::compute(&board), expected, "{fen} then {uci}");
+        }
+    }
+
+    #[test]
     fn color_participant_mapping_round_trips() {
         for color in [Color::White, Color::Black] {
             let participant = Participant::from(color);
             assert_eq!(Color::from(participant), color);
             assert_eq!(Participant::from(Color::from(participant)), participant);
-        }
-    }
-
-    mod harness {
-        use super::*;
-        use arena0::testing::{
-            ALICE, BOB, FaultStatus, HandlerResult, Harness, Scenario, TestHarness,
-        };
-        use arena0::types::{ColorDepth, Slot};
-
-        fn peer_a() -> PeerId {
-            PeerId([1u8; 32])
-        }
-
-        fn peer_zero() -> PeerId {
-            PeerId([0u8; 32])
-        }
-
-        const STARTING_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-
-        fn slot(view: &View, slot: Slot) -> &str {
-            view.slots.get(&slot).map_or("", String::as_str)
-        }
-
-        fn assert_no_sgr(view: &View) {
-            for text in view.slots.values() {
-                assert!(!text.contains("\x1b["), "mono view contains SGR: {text:?}");
-            }
-        }
-
-        #[arena0::test(Chess, ())]
-        fn session_started_initializes_board(h: ()) {
-            let fx = h.session_started(peer_a());
-            assert!(matches!(fx.fault, FaultStatus::None));
-
-            let state = h.shared();
-            assert_eq!(state.phase(), Phase::Playing);
-            assert_eq!(state.fen, STARTING_FEN);
-            assert_eq!(state.status, Status::InProgress);
-            assert!(state.move_history.is_empty());
-            assert!(fx.has_callout());
-        }
-
-        /// Make the local side's move on a single native replica: answer the
-        /// pending `MakeMove` callout (which broadcasts the move) and apply the
-        /// node's own broadcast, which mutates the board and advances the turn.
-        /// The local node is White (participant 0). Returns the apply result.
-        fn play_move<H>(h: &mut H, uci: &str) -> arena0::testing::HandlerResult
-        where
-            H: Harness<Chess>,
-        {
-            let fx = h.resolve_callout::<callouts::MakeMove>(uci.to_string());
-            let mv = fx.messages::<Message>().remove(0);
-            h.message(h.peer_id(), mv)
-        }
-
-        fn session_end_outcome(result: &HandlerResult) -> Outcome {
-            let outcome = result
-                .step
-                .as_ref()
-                .and_then(TraceEntry::completed_outcome)
-                .expect("terminal handler result should carry a completed outcome");
-            arena0::borsh::from_slice(outcome).expect("terminal outcome must decode")
-        }
-
-        fn terminal_move(h: &mut TestHarness<Chess>, fen: &str, uci: &str) -> (Status, Outcome) {
-            h.session_started(peer_a());
-            h.shared_mut().fen = fen.to_owned();
-            let result = h.message(h.peer_id(), Message::Move(uci.to_owned()));
-            assert!(
-                result.has_session_end(),
-                "terminal move should end the session"
-            );
-            assert!(
-                h.trace().last().is_some_and(TraceEntry::is_terminal),
-                "terminal move should produce terminal trace evidence"
-            );
-            (h.shared().status, session_end_outcome(&result))
-        }
-
-        #[arena0::test(Chess, ())]
-        fn valid_move_updates_board(h: ()) {
-            h.session_started(peer_a());
-
-            // The move is broadcast by the local decision code, then applied to
-            // shared state when the broadcast lands through the shared handler.
-            let fx = h.resolve_callout::<callouts::MakeMove>("e2e4".to_string());
-            assert!(matches!(fx.fault, FaultStatus::None));
-            assert!(fx.has_broadcast());
-            let mv = fx.messages::<Message>().remove(0);
-            h.message(h.peer_id(), mv);
-
-            let state = h.shared();
-            assert!(!state.fen.is_empty());
-            assert_ne!(state.fen, STARTING_FEN, "FEN should change after move");
-            assert_eq!(state.move_history.len(), 1);
-            assert_eq!(state.move_history[0], "e4");
-        }
-
-        #[arena0::test(Chess, ())]
-        fn view_renders_canonical_board_for_every_replica(h: ()) {
-            h.session_started(peer_a());
-            let white_view = h.view(Viewport {
-                width: 80,
-                color: ColorDepth::Ansi16,
-            });
-
-            let mut black = TestHarness::<Chess>::with_peer_id(peer_a(), ());
-            black.session_started(peer_zero());
-            let black_view = black.view(Viewport {
-                width: 80,
-                color: ColorDepth::Ansi16,
-            });
-
-            let white_state = slot(&white_view, Slot::State);
-            let black_state = slot(&black_view, Slot::State);
-            assert!(white_state.contains("♔"));
-            assert!(white_state.contains("♚"));
-            assert!(black_state.contains("♔"));
-            assert!(black_state.contains("♚"));
-            assert!(
-                white_state.find("8 |").expect("white top rank")
-                    < white_state.find("1 |").expect("white bottom rank")
-            );
-            assert_eq!(black_state, white_state);
-        }
-
-        #[arena0::test(Chess, ())]
-        fn view_mono_contains_no_sgr(h: ()) {
-            h.session_started(peer_a());
-            play_move(&mut h, "e2e4");
-
-            let view = h.view(Viewport {
-                width: 80,
-                color: ColorDepth::Mono,
-            });
-            assert_no_sgr(&view);
-            assert!(slot(&view, Slot::State).contains("Last move: e4"));
-        }
-
-        #[arena0::test(Chess, ())]
-        fn invalid_move_rejected(h: ()) {
-            h.session_started(peer_a());
-            let fx = h.input(Input::MakeMove("z9z9".into()));
-            assert!(fx.has_input_fault());
-            assert!(!fx.has_broadcast());
-        }
-
-        #[arena0::test(Chess, ())]
-        fn remote_move_applied(h: ()) {
-            h.session_started(peer_a());
-            play_move(&mut h, "e2e4");
-            // The opponent's move applies through the shared handler and advances
-            // the turn back to us, so react asks for our next move.
-            let fx = h.message(peer_a(), Message::Move("e7e5".to_string()));
-            assert!(matches!(fx.fault, FaultStatus::None));
-
-            let state = h.shared();
-            assert_eq!(state.move_history.len(), 2);
-            assert_eq!(state.move_history[0], "e4");
-            assert_eq!(state.move_history[1], "e5");
-            assert!(fx.has_callout());
-        }
-
-        #[arena0::test(Chess, ())]
-        fn invalid_awaited_move_is_retryable(h: ()) {
-            h.session_started(peer_a());
-            play_move(&mut h, "e2e4");
-            h.message(peer_a(), Message::Move("e7e5".to_string()));
-
-            let fx = h.resolve_callout::<callouts::MakeMove>("z9z9".to_string());
-            assert!(matches!(fx.fault, FaultStatus::Retryable(_)));
-            assert!(!fx.has_broadcast());
-        }
-
-        #[arena0::test(Chess, ())]
-        fn scholars_mate(h: ()) {
-            h.session_started(peer_a());
-
-            // 1. e4 e5
-            play_move(&mut h, "e2e4");
-            h.message(peer_a(), Message::Move("e7e5".to_string()));
-
-            // 2. Bc4 Nc6
-            play_move(&mut h, "f1c4");
-            h.message(peer_a(), Message::Move("b8c6".to_string()));
-
-            // 3. Qh5 Nf6
-            play_move(&mut h, "d1h5");
-            h.message(peer_a(), Message::Move("g8f6".to_string()));
-
-            // 4. Qxf7# (checkmate). The winning move is broadcast by the local
-            // decision code first; applying it through the shared handler ends the
-            // session. The broadcast entry precedes the End entry (they are now
-            // separate dispatches, not two effects on one).
-            let broadcast = h.resolve_callout::<callouts::MakeMove>("h5f7".to_string());
-            assert!(
-                broadcast.has_broadcast(),
-                "winning move is broadcast before it applies"
-            );
-            let mv = broadcast.messages::<Message>().remove(0);
-            let apply = h.message(h.peer_id(), mv);
-            assert!(
-                apply.has_session_end(),
-                "applying the mate ends the session"
-            );
-
-            let state = h.shared();
-            assert_eq!(
-                state.status,
-                Status::Checkmate {
-                    winner: Color::White
-                }
-            );
-            assert_eq!(state.move_history.len(), 7);
-            assert_eq!(
-                session_end_outcome(&apply),
-                Outcome::Win {
-                    winner: Participant::new(0),
-                    reason: WinReason::Checkmate,
-                }
-            );
-        }
-
-        #[test]
-        fn terminal_draws_project_real_handler_outcomes() {
-            // ponytail: keep each draw rule as data, with one real-handler check.
-            let cases = [
-                (
-                    "7k/8/4Q3/6K1/8/8/8/8 w - - 0 1",
-                    "e6f7",
-                    Status::Stalemate,
-                    DrawReason::Stalemate,
-                ),
-                (
-                    "4k3/8/8/8/8/8/4K2R/8 w - - 99 1",
-                    "h2h3",
-                    Status::DrawBy50MoveRule,
-                    DrawReason::FiftyMoveRule,
-                ),
-                (
-                    "4k3/7b/8/8/8/8/2B1K3/8 w - - 0 1",
-                    "c2h7",
-                    Status::DrawByInsufficientMaterial,
-                    DrawReason::InsufficientMaterial,
-                ),
-            ];
-            for (fen, uci, expected_status, reason) in cases {
-                assert_eq!(
-                    terminal_move(&mut TestHarness::<Chess>::new(()), fen, uci),
-                    (expected_status, Outcome::Draw { reason })
-                );
-            }
-        }
-
-        #[arena0::test(Chess, ())]
-        fn move_after_game_over_rejected(h: ()) {
-            h.session_started(peer_a());
-
-            play_move(&mut h, "e2e4");
-            h.message(peer_a(), Message::Move("e7e5".to_string()));
-            play_move(&mut h, "f1c4");
-            h.message(peer_a(), Message::Move("b8c6".to_string()));
-            play_move(&mut h, "d1h5");
-            h.message(peer_a(), Message::Move("g8f6".to_string()));
-            let broadcast = h.resolve_callout::<callouts::MakeMove>("h5f7".to_string());
-            let mv = broadcast.messages::<Message>().remove(0);
-            h.message(h.peer_id(), mv);
-            assert_eq!(
-                h.shared().status,
-                Status::Checkmate {
-                    winner: Color::White
-                }
-            );
-
-            let fx = h.input(Input::MakeMove("a2a3".into()));
-            assert!(fx.has_input_fault());
-            assert!(!fx.has_broadcast());
-        }
-
-        #[arena0::test(Chess, ())]
-        fn move_too_short_rejected(h: ()) {
-            h.session_started(peer_a());
-            let fx = h.input(Input::MakeMove("e2".into()));
-            assert!(fx.has_input_fault());
-            assert!(!fx.has_broadcast());
-        }
-
-        #[arena0::test(Chess, ())]
-        fn illegal_move_rejected(h: ()) {
-            h.session_started(peer_a());
-            let fx = h.input(Input::MakeMove("e1e3".into()));
-            assert!(fx.has_input_fault());
-            assert!(!fx.has_broadcast());
-        }
-
-        #[test]
-        fn scenario_public_transcript_snapshot_for_opening() {
-            let run = Scenario::<Chess>::named("king pawn opening")
-                .input(ALICE, Input::MakeMove("e2e4".into()))
-                .deliver_all()
-                .input(BOB, Input::MakeMove("e7e5".into()))
-                .deliver_all()
-                .snapshot("after-e5")
-                .run_with_snapshots(());
-
-            let trace = run.pair().trace();
-            trace.assert_shared_aligned();
-            trace.assert_replayable();
-            let snapshot = run.snapshot("after-e5").expect("snapshot");
-            assert!(!snapshot.transcript.contains("InputReceived"));
-            assert!(snapshot.transcript.contains("MessageReceived"));
-            assert!(!snapshot.transcript.contains("Broadcast"));
         }
     }
 

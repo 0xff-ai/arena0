@@ -1,20 +1,19 @@
 //! Authenticated stop evidence through a real Wasm-backed Host execution.
 //!
-//! A peer abort is accepted only after transport attribution, durable inbox
-//! acceptance, and occurrence validation. The light verifier then checks the
+//! A peer abort is acknowledged only after transport attribution, occurrence
+//! validation, and persistence of the resulting stop. Receipt verification then checks the
 //! resulting stopped receipt.
 
 use arena0_crypto::NodeKeys;
 use arena0_node::SessionMessage;
 use arena0_protocol::{
-    AbortKind, AbortOccurrence, ExecFrame, ExecId, NegotiationId, PeerIdSource, PublicCursor,
-    StepCommitment,
+    AbortKind, AbortOccurrence, ExecFrame, ExecId, NegotiationId, PeerIdSource, StepCommitment,
+    StepCursor,
 };
 use arena0_tests::fixtures::{
     LIVE_EXECUTION_TIMEOUT, establish_live_session, provider, spawn_live_execution,
 };
 use arena0_tests::wasm::program_wasm;
-use arena0_verify::{LightVerifiedTerminal, verify_full, verify_light};
 
 const EXEC_ID: ExecId = ExecId([0xA0; 32]);
 const NEGOTIATION_ID: NegotiationId = NegotiationId([0xA1; 32]);
@@ -47,7 +46,7 @@ async fn bilateral_peer_abort_publishes_a_stopped_receipt() {
         .fold(arena0_protocol::CHAIN_START, |link, entry| {
             StepCommitment::for_entry(execution.session_hash, entry, link).link_hash()
         });
-    let cursor = PublicCursor::new(trace.len() as u64, last.post_state, link);
+    let cursor = StepCursor::new(trace.len() as u64, last.post_state, link);
     let sender = execution.peer_ids[1];
     let sender_crypto = participants
         .iter()
@@ -98,15 +97,12 @@ async fn bilateral_peer_abort_publishes_a_stopped_receipt() {
         arena0_protocol::ReceiptTermination::Stopped { .. }
     ));
     let bytes = receipt.encode().expect("encode stopped receipt");
-    let light = verify_light(&bytes).expect("light verify stopped receipt");
+    let verified = arena0_protocol::ReceiptArtifact::decode(&bytes)
+        .expect("verify stopped receipt")
+        .summary();
     assert!(matches!(
-        light.terminal,
-        LightVerifiedTerminal::Stopped { .. }
-    ));
-    let full = verify_full(&wasm, &bytes).expect("full verify stopped receipt");
-    assert!(matches!(
-        full.terminal,
-        arena0_verify::VerifiedTerminal::Stopped { .. }
+        verified.terminal,
+        arena0_protocol::ReceiptTermination::Stopped { .. }
     ));
 }
 
@@ -121,17 +117,22 @@ async fn shared_program_stop_produces_one_canonical_receipt() {
     let mut run = arena.run().await;
     run.wait_all_terminal().await;
     run.wait_all_receipts().await;
-    // ponytail: assert canonical bytes/IDs before the single replay below.
-    let (canonical_receipt, canonical_bytes) = run.assert_canonical_receipt_equality();
-    assert!(matches!(
-        canonical_receipt,
-        arena0_protocol::ReceiptArtifact::Receipt(_)
-    ));
-    let verified = verify_full(&wasm, &canonical_bytes).expect("shared stop replay");
-    assert!(matches!(
-        verified.terminal,
-        arena0_verify::VerifiedTerminal::Stopped {
-            cause: arena0_protocol::StopCause::Shared { .. }
-        }
-    ));
+    let expected = run.receipt_bytes(0);
+    for i in 0..run.node_count() {
+        assert!(matches!(
+            run.receipt(i),
+            arena0_protocol::ReceiptArtifact::Receipt(_)
+        ));
+        assert_eq!(run.receipt_bytes(i), expected);
+        assert_eq!(run.receipt(i).receipt_id(), run.receipt(0).receipt_id());
+        let verified = arena0_protocol::ReceiptArtifact::decode(&run.receipt_bytes(i))
+            .expect("shared stop verification")
+            .summary();
+        assert!(matches!(
+            verified.terminal,
+            arena0_protocol::ReceiptTermination::Stopped {
+                cause: arena0_protocol::StopCause::Shared { .. }
+            }
+        ));
+    }
 }

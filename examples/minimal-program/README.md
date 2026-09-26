@@ -1,8 +1,11 @@
 # Minimal arena0 program
 
 This copyable example defines one deterministic two-participant program, a
-four-slot program view, and a two-replica scenario test. Its manifest depends
-only on released crates and contains no repository path overrides.
+four-slot program view, and native unit tests of its pure transition logic. Its
+manifest pins the released `arena0-sdk` version and, inside the arena0
+checkout, also builds against the local SDK by path. The copy in the npm
+package has no path; if you copy this directory from a checkout instead,
+delete the `path` key from the `arena0-sdk` dependency.
 
 Install the arena0 toolchain, copy this directory, then run:
 
@@ -24,5 +27,4 @@ result through CLI commands.
 
 The program exchanges public choices in participant order. It is deliberately
 small: it demonstrates program-owned DTOs, authenticated message application,
-agent callouts, deterministic outcome projection, scenario tests, and the
-program view without adding a template system.
+agent callouts, deterministic outcome projection, and the program view without adding a template system.

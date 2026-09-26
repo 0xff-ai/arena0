@@ -149,6 +149,11 @@ impl Shared {
         }
     }
 
+    /// Whether `participant` is the unique writer the state waits for.
+    fn is_writer(&self, participant: Participant) -> bool {
+        self.expected_writer() == Some(participant)
+    }
+
     fn plan(&self) -> AssignmentPlan {
         allocate(&self.tasks, &self.offers)
     }
@@ -164,6 +169,7 @@ impl Shared {
 )]
 pub mod contract_net {
     use super::*;
+    use arena0::ProgramTransition;
 
     type Shared = super::Shared;
     type Local = super::Local;
@@ -188,19 +194,17 @@ pub mod contract_net {
         state.expected_writer()
     }
 
-    fn initialize(ctx: &mut SharedContext, params: Params) -> Result<(), ProgramFault> {
+    fn initialize(shared: &mut Shared, params: Params) -> Result<(), ProgramFault> {
         params.validate().map_err(|error| anyhow!(error))?;
-        ctx.mutate_shared(|state| {
-            state.target_size = params.target_size;
-            state.tasks = params.tasks;
-        });
+        shared.target_size = params.target_size;
+        shared.tasks = params.tasks;
         Ok(())
     }
 
     fn on_session_started(
-        ctx: &mut SharedContext,
+        ctx: &mut Context<Shared, Local>,
         ensemble: &Ensemble,
-    ) -> Result<Transition<Phase>, ProgramFault> {
+    ) -> Result<ProgramTransition<ContractNet>, ProgramFault> {
         if ensemble.len() != ctx.shared().target_size as usize {
             return Err(anyhow!(
                 "expected {} participants, got {}",
@@ -209,80 +213,88 @@ pub mod contract_net {
             )
             .into());
         }
-        ctx.mutate_shared(|state| state.offers = vec![None; ensemble.len()]);
+        ctx.shared_mut().offers = vec![None; ensemble.len()];
         Ok(Transition::Stay)
     }
 
-    fn on_react(ctx: &mut Context) -> Result<(), ProgramFault> {
-        if ctx.shared().expected_writer() != Some(ctx.me()) {
-            return Ok(());
-        }
-
-        match ctx.shared().phase() {
-            Phase::CollectingOffers if ctx.me() == COORDINATOR => {
-                if !ctx.local().proposal_sent {
-                    let plan = ctx.shared().plan();
-                    ctx.effects().broadcast(&Message::Proposal { plan });
-                    ctx.mutate_local(|local| local.proposal_sent = true);
+    fn callout(ctx: &CalloutContext<Shared, Local>) -> Option<Callout> {
+        (ctx.shared().phase() == Phase::CollectingOffers
+            && ctx.me() != COORDINATOR
+            && ctx.shared().is_writer(ctx.me())
+            && !ctx.local().offer_sent)
+            .then(|| {
+                let tasks = ctx.shared().tasks.clone();
+                let maximum_capacity = tasks.len() as u16;
+                callouts::SubmitOffer {
+                    tasks,
+                    maximum_capacity,
+                    maximum_cost: MAX_COST,
                 }
-            }
-            Phase::CollectingOffers => {
-                if !ctx.local().offer_sent {
-                    let tasks = ctx.shared().tasks.clone();
-                    let maximum_capacity = tasks.len() as u16;
-                    ctx.effects()
-                        .callout(callouts::SubmitOffer {
-                            tasks,
-                            maximum_capacity,
-                            maximum_cost: MAX_COST,
-                        })
-                        .dispatch();
-                }
-            }
-            Phase::ReviewingProposal => {
-                let expected_plan = ctx.shared().plan();
-                let Some(proposal) = ctx.shared().agreement.proposal() else {
-                    return Err(anyhow!("reviewing phase has no proposal").into());
-                };
-                if proposal.value != &expected_plan {
-                    return Err(
-                        anyhow!("stored proposal differs from deterministic allocation").into(),
-                    );
-                }
-                let proposal_id = proposal.id;
-                if ctx.local().accepted_proposal != Some(proposal_id) {
-                    ctx.effects().broadcast(&Message::Accept {
-                        proposal: proposal_id,
-                    });
-                    ctx.mutate_local(|local| local.accepted_proposal = Some(proposal_id));
-                }
-            }
-        }
-        Ok(())
+                .into()
+            })
     }
 
-    fn on_input(ctx: &mut Context, input: Input) -> Result<(), InputFault> {
+    fn on_input(ctx: &mut LocalContext<Shared, Local>, input: Input) -> arena0::anyhow::Result<()> {
         let Input::SubmitOffer(offer) = input;
         if ctx.shared().phase() != Phase::CollectingOffers
             || ctx.shared().expected_offer_writer() != Some(ctx.me())
         {
-            return Err(anyhow!("offer is not due from this participant").into());
+            return Err(anyhow!("offer is not due from this participant"));
         }
         offer
             .validate(&ctx.shared().tasks)
-            .map_err(|error| anyhow!(error))
-            .retryable()?;
-        ctx.effects().broadcast(&Message::Offer(offer));
+            .map_err(|error| anyhow!(error))?;
         ctx.mutate_local(|local| local.offer_sent = true);
+        ctx.effects().broadcast(&Message::Offer(offer))?;
+        Ok(())
+    }
+
+    /// Queue the coordinator's deterministic proposal once every offer is in.
+    fn queue_proposal_if_due(ctx: &mut Context<Shared, Local>) -> arena0::anyhow::Result<()> {
+        if ctx.me() != COORDINATOR
+            || !ctx.shared().all_offers_received()
+            || ctx.local().proposal_sent
+        {
+            return Ok(());
+        }
+        let plan = ctx.shared().plan();
+        ctx.mutate_local(|local| local.proposal_sent = true);
+        ctx.effects().broadcast(&Message::Proposal { plan });
+        Ok(())
+    }
+
+    /// Queue this node's acceptance when the ballot selects it next.
+    fn queue_accept_if_due(ctx: &mut Context<Shared, Local>) -> arena0::anyhow::Result<()> {
+        let Some(proposal) = ctx.shared().agreement.proposal() else {
+            return Ok(());
+        };
+        let expected_plan = ctx.shared().plan();
+        if proposal.value != &expected_plan {
+            return Err(anyhow!(
+                "stored proposal differs from deterministic allocation"
+            ));
+        }
+        let proposal_id = proposal.id;
+        let next_voter = ctx
+            .shared()
+            .agreement
+            .ballot()
+            .and_then(|ballot| ballot.next_voter());
+        if next_voter == Some(ctx.me()) && ctx.local().accepted_proposal != Some(proposal_id) {
+            ctx.mutate_local(|local| local.accepted_proposal = Some(proposal_id));
+            ctx.effects().broadcast(&Message::Accept {
+                proposal: proposal_id,
+            });
+        }
         Ok(())
     }
 
     fn on_message(
-        ctx: &mut SharedContext,
+        ctx: &mut Context<Shared, Local>,
         from: Participant,
         message: Message,
-    ) -> Result<ApplyDecision<Phase>, ProtocolFault> {
-        if ctx.shared().expected_writer() != Some(from) {
+    ) -> MessageApply<ContractNet> {
+        if !ctx.shared().is_writer(from) {
             return Ok(ApplyDecision::Reject);
         }
 
@@ -294,7 +306,8 @@ pub mod contract_net {
                 {
                     return Ok(ApplyDecision::Reject);
                 }
-                ctx.mutate_shared(|state| state.offers[from.index()] = Some(offer));
+                apply_offer(ctx.shared_mut(), from, offer);
+                queue_proposal_if_due(ctx).map_err(ProtocolFault::shared_violation)?;
                 Ok(ApplyDecision::Accept(Transition::Stay))
             }
             Message::Proposal { plan } => {
@@ -306,21 +319,11 @@ pub mod contract_net {
                     return Ok(ApplyDecision::Reject);
                 }
 
-                let eligible = (0..ctx.ensemble().len())
-                    .map(|index| {
-                        Participant::try_from(index)
-                            .expect("validated participant count fits a participant index")
-                    })
-                    .collect();
-                let threshold = ctx.ensemble().len() as u16;
-                let proposed = ctx.mutate_shared(|state| {
-                    state
-                        .agreement
-                        .propose(PROPOSAL_VERSION, plan, eligible, threshold)
-                });
-                if proposed.is_err() {
+                let participant_count = ctx.ensemble().len();
+                if apply_proposal(ctx.shared_mut(), plan, participant_count).is_err() {
                     return Ok(ApplyDecision::Reject);
                 }
+                queue_accept_if_due(ctx).map_err(ProtocolFault::shared_violation)?;
                 Ok(ApplyDecision::Accept(Transition::To(
                     Phase::ReviewingProposal,
                 )))
@@ -329,49 +332,42 @@ pub mod contract_net {
                 if ctx.shared().phase() != Phase::ReviewingProposal {
                     return Ok(ApplyDecision::Reject);
                 }
-                let tally =
-                    ctx.mutate_shared(|state| state.agreement.vote(from, proposal, Vote::Accept));
-                let Ok(tally) = tally else {
+                let Ok(tally) = apply_accept(ctx.shared_mut(), from, proposal) else {
                     return Ok(ApplyDecision::Reject);
                 };
-                match tally {
-                    Tally::Pending { .. } => Ok(ApplyDecision::Accept(Transition::Stay)),
-                    Tally::Accepted { .. } => Ok(ApplyDecision::Accept(Transition::End)),
-                    Tally::NotStarted | Tally::Rejected { .. } => {
-                        Err(ProtocolFault::shared_violation(anyhow!(
-                            "accept-only ballot reached an impossible result"
-                        )))
-                    }
+                let transition = transition_for_tally(tally)?;
+                if matches!(transition, Transition::Stay) {
+                    queue_accept_if_due(ctx).map_err(ProtocolFault::shared_violation)?;
                 }
+                Ok(ApplyDecision::Accept(transition))
             }
         }
     }
 
-    fn view(ctx: &SharedContext, vp: &Viewport) -> View {
-        let state = ctx.shared();
+    fn view(state: &Shared, ensemble: &Ensemble, vp: &Viewport) -> View {
         View::new()
             .header(vp.fit_text(format!(
                 "Contract net - {} task{}",
                 state.tasks.len(),
                 if state.tasks.len() == 1 { "" } else { "s" }
             )))
-            .agents(vp.fit_text(render_agents(ctx)))
+            .agents(vp.fit_text(render_agents(state, ensemble)))
             .state(vp.fit_text(render_state(state)))
             .status_bar(vp.fit_text(render_status(state)))
     }
 
-    fn on_query(_ctx: &SharedContext, _: ()) {}
+    fn on_query(_shared: &Shared, _: ()) {}
 
-    fn render_agents(ctx: &SharedContext) -> String {
+    fn render_agents(state: &Shared, ensemble: &Ensemble) -> String {
         let mut output = String::new();
-        for index in 0..ctx.ensemble().len() {
+        for index in 0..ensemble.len() {
             let participant = Participant::try_from(index)
                 .expect("validated participant count fits a participant index");
             if participant == COORDINATOR {
                 let _ = writeln!(output, "P{index}: coordinator");
                 continue;
             }
-            let offer = ctx.shared().offers.get(index).and_then(Option::as_ref);
+            let offer = state.offers.get(index).and_then(Option::as_ref);
             match offer {
                 Some(offer) => {
                     let _ = writeln!(output, "P{index}: worker, capacity {}", offer.capacity);
@@ -425,6 +421,50 @@ pub mod contract_net {
             }
             AgreementStatus::Accepted => "assignment plan accepted".to_string(),
             AgreementStatus::Rejected => "assignment plan rejected".to_string(),
+        }
+    }
+
+    fn apply_offer(state: &mut Shared, from: Participant, offer: WorkerOffer) {
+        state.offers[from.index()] = Some(offer);
+    }
+
+    fn apply_proposal(
+        state: &mut Shared,
+        plan: AssignmentPlan,
+        participant_count: usize,
+    ) -> Result<(), arena0::anyhow::Error> {
+        let eligible = (0..participant_count)
+            .map(|index| {
+                Participant::try_from(index)
+                    .expect("validated participant count fits a participant index")
+            })
+            .collect();
+        let threshold = participant_count as u16;
+        state
+            .agreement
+            .propose(PROPOSAL_VERSION, plan, eligible, threshold)
+            .map(|_| ())
+            .map_err(|error| anyhow!(error))
+    }
+
+    fn apply_accept(
+        state: &mut Shared,
+        from: Participant,
+        proposal: ProposalId,
+    ) -> Result<Tally, arena0::anyhow::Error> {
+        state
+            .agreement
+            .vote(from, proposal, Vote::Accept)
+            .map_err(|error| anyhow!(error))
+    }
+
+    fn transition_for_tally(tally: Tally) -> Result<ProgramTransition<ContractNet>, ProgramFault> {
+        match tally {
+            Tally::Pending { .. } => Ok(Transition::Stay),
+            Tally::Accepted { .. } => Ok(Transition::End),
+            Tally::NotStarted | Tally::Rejected { .. } => {
+                Err(anyhow!("accept-only ballot reached an impossible result").into())
+            }
         }
     }
 }
@@ -548,7 +588,6 @@ fn allocate(tasks: &[Task], offers: &[Option<WorkerOffer>]) -> AssignmentPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arena0::testing::{FaultStatus, Harness, TestHarness};
     use arena0::types::{ColorDepth, Slot};
 
     fn tasks() -> Vec<Task> {
@@ -583,6 +622,101 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn terminal_view_renders_accepted_assignment() {
+        // One task awarded to P1 at cost 7: propose the exact plan to both
+        // participants with a unanimous threshold, then accept from each. The
+        // view and outcome below read only this agreed agreement state.
+        let plan = AssignmentPlan {
+            assignments: vec![Assignment {
+                task: 0,
+                award: Award::Assigned {
+                    worker: Participant::new(1),
+                    cost: 7,
+                },
+            }],
+        };
+        let mut agreement = Agreement::default();
+        let proposal = agreement
+            .propose(
+                PROPOSAL_VERSION,
+                plan.clone(),
+                vec![Participant::new(0), Participant::new(1)],
+                2,
+            )
+            .expect("proposal applies");
+        for index in [0, 1] {
+            agreement
+                .vote(Participant::new(index), proposal, Vote::Accept)
+                .expect("accept applies");
+        }
+        assert_eq!(agreement.status(), AgreementStatus::Accepted);
+
+        let state = Shared {
+            target_size: 2,
+            tasks: vec![Task {
+                name: "compile".to_string(),
+                capability: "rust".to_string(),
+            }],
+            offers: vec![
+                None,
+                Some(WorkerOffer {
+                    capabilities: vec!["rust".to_string()],
+                    capacity: 1,
+                    bids: vec![Bid { task: 0, cost: 7 }],
+                }),
+            ],
+            agreement,
+            ..Shared::default()
+        };
+        let ensemble = Ensemble::from_peers(vec![PeerId([0; 32]), PeerId([1; 32])])
+            .expect("valid view ensemble");
+        for color in [ColorDepth::Mono, ColorDepth::Ansi16] {
+            let view = <contract_net::ContractNet as ProgramView>::view(
+                &state,
+                &ensemble,
+                &Viewport { width: 120, color },
+            );
+            assert_eq!(view.slots.len(), 4, "{color:?} fills every slot");
+            for slot in [Slot::Header, Slot::Agents, Slot::State, Slot::StatusBar] {
+                assert!(
+                    view.slots.contains_key(&slot),
+                    "{color:?} is missing {slot:?}"
+                );
+            }
+            assert!(
+                view.slots[&Slot::State].contains("compile"),
+                "state names the task: {:?}",
+                view.slots[&Slot::State]
+            );
+            assert!(
+                view.slots[&Slot::State].contains("P1 @ 7"),
+                "state shows the assignment: {:?}",
+                view.slots[&Slot::State]
+            );
+            assert!(
+                view.slots[&Slot::Agents].contains("P1"),
+                "agents list the worker: {:?}",
+                view.slots[&Slot::Agents]
+            );
+            assert_eq!(view.slots[&Slot::StatusBar], "assignment plan accepted");
+            if color == ColorDepth::Mono {
+                assert!(
+                    view.slots.values().all(|text| !text.contains("\x1b[")),
+                    "mono view must not contain escapes"
+                );
+            }
+        }
+
+        let outcome = <contract_net::ContractNet as Program>::outcome(&state);
+        assert_eq!(outcome.proposal, proposal);
+        assert_eq!(outcome.plan.assignments.len(), 1);
+        assert!(matches!(
+            outcome.plan.assignments[0].award,
+            Award::Assigned { worker, cost: 7 } if worker == Participant::new(1)
+        ));
     }
 
     #[test]
@@ -621,110 +755,6 @@ mod tests {
                 ],
             }
         );
-    }
-
-    #[test]
-    fn invalid_offers_are_rejected_at_input_and_message_boundaries() {
-        let params = Params {
-            target_size: 2,
-            tasks: tasks(),
-        };
-        let coordinator = PeerId([0; 32]);
-        let worker = PeerId([1; 32]);
-        let invalid = [
-            offer(&["design"], 1, &[(0, 4)]),
-            offer(&["rust"], 1, &[(0, 4), (0, 5)]),
-            offer(&["rust"], 4, &[(0, 4)]),
-        ];
-
-        // The input boundary classifies invalid local answers as retryable and
-        // does not mark the worker's offer as sent.
-        let mut input_harness = TestHarness::<ContractNet>::with_peer_id(worker, params.clone());
-        input_harness.session_started(coordinator);
-        for offer in invalid.iter().cloned() {
-            let before = input_harness.shared_hash();
-            let result = input_harness.input(Input::SubmitOffer(offer));
-            assert!(matches!(result.fault, FaultStatus::Retryable(_)));
-            assert!(!result.has_broadcast());
-            assert_eq!(input_harness.shared_hash(), before);
-            assert!(!input_harness.local().offer_sent);
-        }
-
-        // The shared message boundary rejects the same malformed offers before
-        // state mutation, trace creation, or effects.
-        let mut message_harness = TestHarness::<ContractNet>::new(params);
-        message_harness.session_started(worker);
-        for offer in invalid {
-            let before = message_harness.shared_hash();
-            let result = message_harness.message(worker, Message::Offer(offer));
-            assert!(result.rejected);
-            assert!(result.effects.is_empty());
-            assert!(result.step.is_none());
-            assert_eq!(message_harness.shared_hash(), before);
-        }
-    }
-
-    #[arena0::test(
-        ContractNet,
-        Params {
-            target_size: 2,
-            tasks: vec![Task {
-                name: "compile".to_string(),
-                capability: "rust".to_string(),
-            }],
-        }
-    )]
-    fn native_scenario_accepts_only_the_exact_plan(h: _) {
-        let worker = PeerId([1; 32]);
-        let coordinator = h.peer_id();
-        let started = h.session_started(worker);
-        assert!(matches!(started.fault, FaultStatus::None));
-
-        let offered = h.message(worker, Message::Offer(offer(&["rust"], 1, &[(0, 7)])));
-        let proposal = offered
-            .messages::<Message>()
-            .into_iter()
-            .find(|message| matches!(message, Message::Proposal { .. }))
-            .expect("coordinator emits the deterministic proposal");
-        let proposed = h.message(coordinator, proposal);
-        assert!(matches!(proposed.fault, FaultStatus::None));
-
-        let wrong = ProposalId {
-            version: PROPOSAL_VERSION,
-            hash: [0xff; 32],
-        };
-        assert!(
-            h.message(coordinator, Message::Accept { proposal: wrong })
-                .rejected
-        );
-
-        let id = h
-            .shared()
-            .agreement
-            .proposal()
-            .expect("proposal is active")
-            .id;
-        let first = h.message(coordinator, Message::Accept { proposal: id });
-        assert!(matches!(first.fault, FaultStatus::None));
-        let finished = h.message(worker, Message::Accept { proposal: id });
-        assert!(matches!(finished.fault, FaultStatus::None));
-        assert!(
-            finished
-                .step
-                .as_ref()
-                .is_some_and(|step| step.is_terminal())
-        );
-        assert_eq!(h.shared().agreement.status(), AgreementStatus::Accepted);
-
-        let view = h.view(Viewport {
-            width: 96,
-            color: ColorDepth::Mono,
-        });
-        for slot in [Slot::Header, Slot::Agents, Slot::State, Slot::StatusBar] {
-            assert!(view.slots.contains_key(&slot), "missing {slot:?} view slot");
-        }
-        assert!(view.slots[&Slot::State].contains("P1 @ 7"));
-        assert!(view.slots[&Slot::StatusBar].contains("accepted"));
     }
 
     #[test]

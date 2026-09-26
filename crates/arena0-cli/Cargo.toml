@@ -14,7 +14,6 @@ path = "src/main.rs"
 [dependencies]
 arena0-client = { path = "../arena0-client" }
 arena0-home = { path = "../arena0-home" }
-arena0-verify = { path = "../arena0-verify" }
 
 clap = { workspace = true }
 crossterm = { workspace = true }

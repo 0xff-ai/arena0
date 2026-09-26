@@ -2,12 +2,9 @@
 //! actors.
 //!
 //! One private execution actor is the only runtime owner for each
-//! [`arena0_protocol::ExecId`]. It keeps
-//! a loaded Wasm program and live transport capabilities in memory, while
-//! every protocol fact is loaded from and committed through its claimed
-//! [`arena0_store::ExecutionStore`].
-//! The protocol reducer and store are intentionally below this crate; this
-//! crate only orchestrates guest calls and external delivery.
+//! [`arena0_protocol::ExecId`]. It owns the execution state, a loaded Wasm
+//! program, and live transport capabilities, and persists each protocol
+//! transition through [`arena0_store::ExecutionStore`].
 
 mod context;
 mod ensemble;
@@ -26,5 +23,6 @@ pub use machines::negotiation::{
     ApplyError, ApplyOutcome, DurableOutcome, FETCH_TIMEOUT, LocalTicketWithdrawal,
     NegotiationAttempt, NegotiationBook, NegotiationDriveError, NegotiationEffects,
     NegotiationStart, NegotiationSupervision, PersistActivationEffect, PrepareEffect,
-    PrepareOutcome, RecomputeInitialStateEffect, serve_fetch_evidence, unix_time_ms,
+    PrepareOutcome, RecomputeInitialStateEffect, serve_fetch_evidence, store_activation_effects,
+    unix_time_ms,
 };

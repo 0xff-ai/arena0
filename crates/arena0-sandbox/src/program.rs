@@ -1,4 +1,4 @@
-//! Immutable program artifacts and their private metadata-section codec.
+//! Immutable program artifacts and their internal metadata-section codec.
 //!
 //! Completed artifacts are parse-only: building a section-less Wasm module is
 //! the only path that executes the bounded metadata export probe.
@@ -165,7 +165,7 @@ mod tests {
 
     use arena0_program::{JsonSchemaDocument, ProgramMetadata, ProgramSchema, StateSchema};
 
-    use crate::WasmtimeEngine;
+    use crate::{WasmtimeEngine, test_support::shared_test_engine};
 
     fn unit_schema() -> JsonSchemaDocument {
         JsonSchemaDocument::new(serde_json::json!({
@@ -298,7 +298,7 @@ mod tests {
             r#"
             (module
               (memory (export "memory") 1)
-              (global (export "arena0_abi_version") i32 (i32.const 20))
+              (global (export "arena0_abi_version") i32 (i32.const 22))
               (data (i32.const 64) "{metadata_data}")
               (func $pack (param $ptr i32) (param $len i32) (result i64)
                 local.get $ptr
@@ -312,9 +312,9 @@ mod tests {
                 i64.or)
               (func (export "arena0_alloc") (param i32) (result i32) i32.const 2048)
               (func (export "arena0_dealloc") (param i32 i32))
+              (func (export "arena0_prepare") (result i32) i32.const 1)
               (func (export "arena0_initialize") (param i32 i32) (result i64) i64.const 0)
-              (func (export "arena0_shared") (param i32 i32) (result i64) i64.const 0)
-              (func (export "arena0_local") (param i32 i32) (result i64) i64.const 0)
+              (func (export "arena0_dispatch") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_writer") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_outcome") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_query") (param i32 i32) (result i64) i64.const 0)
@@ -332,7 +332,7 @@ mod tests {
     #[test]
     fn embedding_exports_a_versioned_definition() {
         let wasm = metadata_export_module();
-        let engine = WasmtimeEngine::new().unwrap();
+        let engine = shared_test_engine();
         let embedded = engine.build_program(&wasm).unwrap().bytes().to_vec();
 
         assert_ne!(embedded, wasm);
@@ -397,8 +397,31 @@ mod tests {
 
     #[test]
     fn persistent_compilation_cache_survives_engine_restart() {
-        let builder = WasmtimeEngine::new().unwrap();
+        let builder = shared_test_engine();
         let program = builder.build_program(&metadata_export_module()).unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        let first = WasmtimeEngine::new_persistent(cache_dir.path()).unwrap();
+        first.load(&program).unwrap();
+        assert_eq!(first.persistent_cache.as_ref().unwrap().cache_misses(), 1);
+        drop(first);
+
+        let second = WasmtimeEngine::new_persistent(cache_dir.path()).unwrap();
+        second.load(&program).unwrap();
+        assert_eq!(second.persistent_cache.as_ref().unwrap().cache_hits(), 1);
+    }
+
+    #[test]
+    fn persistent_compilation_cache_reuses_a_real_guest_across_engines() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../programs/target/wasm32-unknown-unknown/release/rock_paper_scissors.wasm");
+        let wasm = std::fs::read(&path).unwrap_or_else(|error| {
+            panic!(
+                "cannot read required guest {}: {error}; run `just build-programs`",
+                path.display()
+            )
+        });
+        let program = Program::try_from(wasm).expect("parse rock-paper-scissors guest");
         let cache_dir = tempfile::tempdir().unwrap();
 
         let first = WasmtimeEngine::new_persistent(cache_dir.path()).unwrap();

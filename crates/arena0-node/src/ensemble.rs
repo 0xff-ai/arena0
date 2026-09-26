@@ -122,7 +122,6 @@ impl Ensemble {
         let transport = Arc::new(transport);
         let host_transport: Arc<dyn Transport + Sync> = transport.clone();
         let host = Host::start(identity, host_transport, store);
-        debug_assert_eq!(host.peer_id, peer_id);
         state.hosts.insert(
             peer_id,
             RuntimeHost {
@@ -275,24 +274,24 @@ mod tests {
             .expect("attach second host");
         assert!(
             ensemble
-                .host(&second.peer_id)
+                .host(&second.peer_id())
                 .is_some_and(|host| Arc::ptr_eq(&host, &second))
         );
-        assert!(ensemble.transport(&second.peer_id).is_some());
+        assert!(ensemble.transport(&second.peer_id()).is_some());
 
         assert!(matches!(
             ensemble.add_host(Arc::clone(&second_identity), second_store.handle().clone()),
-            Err(EnsembleError::DuplicateHost { peer_id }) if peer_id == second.peer_id
+            Err(EnsembleError::DuplicateHost { peer_id }) if peer_id == second.peer_id()
         ));
 
-        ensemble.remove_host(second.peer_id).await.unwrap();
-        assert!(ensemble.host(&second.peer_id).is_none());
-        assert!(ensemble.transport(&second.peer_id).is_none());
+        ensemble.remove_host(second.peer_id()).await.unwrap();
+        assert!(ensemble.host(&second.peer_id()).is_none());
+        assert!(ensemble.transport(&second.peer_id()).is_none());
         let reopened = ensemble
             .add_host(Arc::clone(&second_identity), second_store.handle().clone())
             .expect("reopen removed host");
-        assert_eq!(reopened.peer_id, second.peer_id);
-        let mut expected = vec![first_peer, second.peer_id];
+        assert_eq!(reopened.peer_id(), second.peer_id());
+        let mut expected = vec![first_peer, second.peer_id()];
         expected.sort();
         assert_eq!(ensemble.peer_ids(), expected);
 

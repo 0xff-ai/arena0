@@ -1,22 +1,18 @@
-use crate::PrivateRecord;
+use arena0_crypto::BlsPublicKey;
+
 use crate::trace::{
-    AggregateAttestation, PendingRecord, ReceiptTermination, SessionTerminal, StepCommitment,
+    AggregateAttestation, ReceiptTermination, StepCommitment, StepEvent, StepTerminal,
     TRACE_FORMAT_VERSION, TraceEntry,
 };
-use crate::{
-    Ensemble, OutcomeHash, PrivateEffect, PrivateEvent, PublicEffect, PublicEvent, StateHash,
-};
+use crate::{Effect, StateHash};
 
 use super::{
-    AbortKind, ActiveTimer, ExecutionBinding, ExecutionState, MAX_ACTIVE_TIMERS,
-    MAX_EFFECT_PAYLOAD_BYTES, MAX_PRIVATE_EFFECTS, MAX_PRIVATE_RECORD_BYTES, MAX_RECEIPT_BYTES,
-    MAX_SHARED_EFFECTS, MAX_TERMINAL_OUTCOME_BYTES, MAX_TERMINAL_REASON_BYTES,
-    MAX_TIMER_PAYLOAD_BYTES, MAX_TRACE_ENTRY_BYTES, ParticipantTerminalSignature, ProtocolError,
-    PublicCursor, ReceiptBody, SharedProposal, StopCause, TerminalCertificate, TerminalOutcome,
-    TerminalProof, TimerMutation,
+    AbortKind, ExecutionBinding, MAX_EFFECTS, MAX_RECEIPT_BYTES, MAX_TERMINAL_OUTCOME_BYTES,
+    MAX_TERMINAL_REASON_BYTES, MAX_TIMER_PAYLOAD_BYTES, MAX_TRACE_ENTRY_BYTES,
+    ParticipantStepSignature, ProtocolError, ReceiptBody, SharedProposal, StepCursor, StopCause,
 };
 
-/// Validate an input's total encoded size without decoding it first.
+/// Validate an encoded value's total size without decoding it first.
 pub(crate) fn ensure_encoded(
     kind: &'static str,
     actual: usize,
@@ -40,29 +36,54 @@ pub(crate) fn ensure_payload(
     Ok(())
 }
 
+/// Validate all evidence retained by a pending shared proposal.
 pub(crate) fn validate_proposal(
     binding: &ExecutionBinding,
-    public: PublicCursor,
+    agreed: StepCursor,
+    event_position: u64,
     proposal: &SharedProposal,
 ) -> Result<(), ProtocolError> {
-    validate_shared_entry(binding, public.next_step, &proposal.entry)?;
-    if proposal.entry.agreement != AggregateAttestation::empty() {
+    validate_shared_entry(binding, agreed.next_step(), &proposal.entry)?;
+    if proposal.event_position != event_position {
         return Err(ProtocolError::InvalidCertificate(
-            "pending proposal carries a certificate".into(),
+            "pending proposal event position is not the expected event".into(),
         ));
     }
-    if proposal.commitment.domain != crate::STEP_COMMIT_DOMAIN
-        || proposal.commitment.session_id != binding.session_id()
-        || proposal.commitment.step != public.next_step
-        || proposal.commitment.pre_state != public.state_hash
-        || proposal.commitment.link != public.chain_hash
-        || proposal.commitment.post_state != StateHash::of(proposal.shared_state.as_bytes())
-        || proposal.commitment.entry_hash != proposal.entry.entry_hash()
-    {
+    if proposal.entry.agreement != AggregateAttestation::empty() {
+        return Err(ProtocolError::InvalidCertificate(
+            "pending proposal carries an agreement".into(),
+        ));
+    }
+    // The commitment derives from this same entry, so the staged pre-state
+    // is pinned to the agreed cursor explicitly here; without the former
+    // stored-commitment comparison this mutation would otherwise reach
+    // `advance` as a different error variant.
+    if proposal.entry.pre_state != agreed.state_hash() {
+        return Err(ProtocolError::InvalidCertificate(
+            "pending proposal pre-state is not the agreed state".into(),
+        ));
+    }
+    let expected_commitment =
+        StepCommitment::for_entry(binding.session_id(), &proposal.entry, agreed.chain_hash());
+    // The commitment is derived, never stored: the only consistency check
+    // is that the proposed bytes hash to the entry's post-state.
+    if expected_commitment.post_state != StateHash::of_shared(&proposal.shared_state) {
         return Err(ProtocolError::InvalidCertificate(
             "pending proposal commitment is inconsistent".into(),
         ));
     }
+    let advanced = agreed.advance(&expected_commitment)?;
+
+    let lifecycle_terminal =
+        single_lifecycle_effect(proposal.effects.iter().map(|(_, effect)| effect))?
+            .and_then(StepTerminal::from_effect);
+    if lifecycle_terminal != proposal.entry.terminal {
+        return Err(ProtocolError::InvalidCertificate(
+            "proposal effects and trace terminal do not match".into(),
+        ));
+    }
+    proposal.status.validate_binding(binding, advanced)?;
+    validate_proposal_status(&proposal.entry, &expected_commitment, &proposal.status)?;
 
     let participants = binding.participant_keys()?;
     if proposal.signatures.len() > participants.len() {
@@ -73,36 +94,120 @@ pub(crate) fn validate_proposal(
         });
     }
     for signature in &proposal.signatures {
-        let key = binding.participant_key(&signature.participant)?;
-        if signature.signature.step != proposal.commitment.step {
-            return Err(ProtocolError::InvalidStepSignature {
-                participant: signature.participant,
-                step: proposal.commitment.step,
-            });
+        let key = participants
+            .binary_search_by_key(&signature.participant(), |(participant, _)| *participant)
+            .map(|index| participants[index].1)
+            .map_err(|_| ProtocolError::UnknownParticipant {
+                participant: signature.participant(),
+            })?;
+        verify_step_signature(&key, &expected_commitment, signature)?;
+    }
+    validate_step_signature_order(&proposal.signatures)
+}
+
+/// Verify one participant's BLS signature over an exact step commitment.
+pub(crate) fn verify_step_signature(
+    key: &BlsPublicKey,
+    commitment: &StepCommitment,
+    signature: &ParticipantStepSignature,
+) -> Result<(), ProtocolError> {
+    let invalid = || ProtocolError::InvalidStepSignature {
+        participant: signature.participant(),
+        step: commitment.step,
+    };
+    if signature.signature().step != commitment.step {
+        return Err(invalid());
+    }
+    let valid = key
+        .verify(&commitment.signing_bytes(), &signature.signature().sig)
+        .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
+    if !valid {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// Verify an N-of-N aggregate agreement over an exact step commitment.
+///
+/// `keys` are the committed participants' execution keys in participant
+/// order, the order the signer bitmap indexes.
+pub(crate) fn verify_full_agreement(
+    agreement: &AggregateAttestation,
+    commitment: &StepCommitment,
+    keys: &[BlsPublicKey],
+) -> Result<(), ProtocolError> {
+    if agreement.signers.count() != keys.len() || !agreement.signers.is_full(keys.len()) {
+        return Err(ProtocolError::IncompleteProof {
+            actual: agreement.signers.count(),
+            expected: keys.len(),
+        });
+    }
+    agreement
+        .verify_signatures(commitment.step, &commitment.signing_bytes(), keys)
+        .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))
+}
+
+fn validate_proposal_status(
+    entry: &TraceEntry,
+    commitment: &StepCommitment,
+    status: &super::ExecutionStatus,
+) -> Result<(), ProtocolError> {
+    match (&entry.terminal, status) {
+        (None, super::ExecutionStatus::Active) => Ok(()),
+        (None, _) => Err(ProtocolError::InvalidTerminalStatus),
+        (
+            Some(StepTerminal::Abort { reason }),
+            super::ExecutionStatus::Stopped {
+                cause:
+                    super::StopCause::Shared {
+                        kind: AbortKind::Abort,
+                        commitment: actual_commitment,
+                        reason: actual_reason,
+                    },
+            },
+        ) if actual_commitment == commitment && actual_reason == reason => Ok(()),
+        (
+            Some(StepTerminal::Fail { reason }),
+            super::ExecutionStatus::Stopped {
+                cause:
+                    super::StopCause::Shared {
+                        kind: AbortKind::Fail,
+                        commitment: actual_commitment,
+                        reason: actual_reason,
+                    },
+            },
+        ) if actual_commitment == commitment && actual_reason == reason => Ok(()),
+        (
+            Some(StepTerminal::End { outcome }),
+            super::ExecutionStatus::Certified { outcome: actual },
+        ) => {
+            actual.validate()?;
+            if actual.borsh() == outcome.as_slice() {
+                Ok(())
+            } else {
+                Err(ProtocolError::TerminalOutcomeMismatch)
+            }
         }
-        let valid = key
-            .verify(
-                &proposal.commitment.signing_bytes(),
-                &signature.signature.sig,
-            )
-            .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
-        if !valid {
-            return Err(ProtocolError::InvalidStepSignature {
-                participant: signature.participant,
-                step: proposal.commitment.step,
-            });
+        (Some(StepTerminal::End { .. }), _) => Err(ProtocolError::TerminalOutcomeRequired),
+        (Some(StepTerminal::Abort { .. } | StepTerminal::Fail { .. }), _) => {
+            Err(ProtocolError::InvalidTerminalStatus)
         }
     }
-    for pair in proposal.signatures.windows(2) {
-        if pair[0].participant >= pair[1].participant {
-            if pair[0].participant == pair[1].participant {
-                return Err(if pair[0].signature == pair[1].signature {
+}
+
+fn validate_step_signature_order(
+    signatures: &[ParticipantStepSignature],
+) -> Result<(), ProtocolError> {
+    for pair in signatures.windows(2) {
+        if pair[0].participant() >= pair[1].participant() {
+            if pair[0].participant() == pair[1].participant() {
+                return Err(if pair[0].signature() == pair[1].signature() {
                     ProtocolError::DuplicateStepSignature {
-                        participant: pair[0].participant,
+                        participant: pair[0].participant(),
                     }
                 } else {
                     ProtocolError::ConflictingStepSignature {
-                        participant: pair[0].participant,
+                        participant: pair[0].participant(),
                     }
                 });
             }
@@ -114,120 +219,7 @@ pub(crate) fn validate_proposal(
     Ok(())
 }
 
-pub(crate) fn validate_terminal_progress(
-    binding: &ExecutionBinding,
-    public: PublicCursor,
-    terminal: &TerminalProof,
-) -> Result<(), ProtocolError> {
-    if let Some((commitment, outcome, signatures)) = terminal.pending_parts() {
-        validate_terminal_outcome(commitment, outcome)?;
-        if commitment.domain != crate::TERMINAL_DOMAIN
-            || commitment.session_id != binding.session_id()
-            || commitment.final_step >= public.next_step
-            || commitment.final_state != public.state_hash
-        {
-            return Err(ProtocolError::InvalidCertificate(
-                "pending terminal commitment is inconsistent".into(),
-            ));
-        }
-        if signatures.len() > binding.activation.tickets().len() {
-            return Err(ProtocolError::CollectionTooLarge {
-                kind: "terminal signatures",
-                actual: signatures.len(),
-                max: binding.activation.tickets().len(),
-            });
-        }
-        for signature in signatures {
-            let key = binding.participant_key(&signature.participant)?;
-            let valid = key
-                .verify(&commitment.signing_bytes(), &signature.signature)
-                .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
-            if !valid {
-                return Err(ProtocolError::InvalidTerminalSignature {
-                    participant: signature.participant,
-                });
-            }
-        }
-        validate_terminal_signature_order(signatures)?;
-        return Ok(());
-    }
-
-    if let Some((certificate, outcome)) = terminal.certified_parts() {
-        validate_terminal_outcome(&certificate.commitment, outcome)?;
-        return validate_terminal_certificate(binding, public, certificate);
-    }
-    Err(ProtocolError::InvalidCertificate(
-        "unknown terminal proof state".into(),
-    ))
-}
-
-fn validate_terminal_signature_order(
-    signatures: &[ParticipantTerminalSignature],
-) -> Result<(), ProtocolError> {
-    for pair in signatures.windows(2) {
-        if pair[0].participant >= pair[1].participant {
-            if pair[0].participant == pair[1].participant {
-                return Err(if pair[0].signature == pair[1].signature {
-                    ProtocolError::DuplicateTerminalSignature {
-                        participant: pair[0].participant,
-                    }
-                } else {
-                    ProtocolError::ConflictingTerminalSignature {
-                        participant: pair[0].participant,
-                    }
-                });
-            }
-            return Err(ProtocolError::InvalidCertificate(
-                "pending terminal signatures are not canonical".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_terminal_certificate(
-    binding: &ExecutionBinding,
-    public: PublicCursor,
-    certificate: &TerminalCertificate,
-) -> Result<(), ProtocolError> {
-    if certificate.commitment.domain != crate::TERMINAL_DOMAIN
-        || certificate.commitment.session_id != binding.session_id()
-        || certificate.commitment.final_step >= public.next_step
-        || certificate.commitment.final_state != public.state_hash
-    {
-        return Err(ProtocolError::InvalidCertificate(
-            "terminal certificate is inconsistent with the public cursor".into(),
-        ));
-    }
-    let participants = binding.participant_keys()?;
-    if !certificate.agreement.signers.is_full(participants.len()) {
-        return Err(ProtocolError::IncompleteProof {
-            actual: certificate.agreement.signers.count(),
-            expected: participants.len(),
-        });
-    }
-    certificate
-        .agreement
-        .verify_signatures(
-            certificate.commitment.final_step,
-            &certificate.commitment.signing_bytes(),
-            &participants.iter().map(|(_, key)| *key).collect::<Vec<_>>(),
-        )
-        .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))
-}
-
-fn validate_terminal_outcome(
-    commitment: &crate::trace::TerminalCommitment,
-    outcome: &TerminalOutcome,
-) -> Result<(), ProtocolError> {
-    outcome.validate()?;
-    if commitment.outcome_hash != OutcomeHash::of(outcome.borsh()) {
-        return Err(ProtocolError::OutcomeProjectionMismatch);
-    }
-    Ok(())
-}
-
-/// Validate the complete receipt body independently of terminal state.
+/// Validate receipt structure independently of its binding.
 pub(crate) fn validate_receipt_body_shape(body: &ReceiptBody) -> Result<(), ProtocolError> {
     let encoded =
         borsh::to_vec(body).map_err(|error| ProtocolError::Serialization(error.to_string()))?;
@@ -243,7 +235,7 @@ pub(crate) fn validate_receipt_body_shape(body: &ReceiptBody) -> Result<(), Prot
         validate_trace_entry(entry)?;
     }
     match body.termination() {
-        ReceiptTermination::Completed { .. } => {}
+        ReceiptTermination::Completed => {}
         ReceiptTermination::Stopped { cause } => {
             cause.validate()?;
             if !body.outcome().is_empty() {
@@ -254,12 +246,7 @@ pub(crate) fn validate_receipt_body_shape(body: &ReceiptBody) -> Result<(), Prot
     Ok(())
 }
 
-/// Validate receipt identity, activation binding, full trace, and terminal proof.
-///
-/// The body is self-describing: completion carries its terminal certificate and
-/// stopped receipts carry their authenticated/shared stop cause.  No separate
-/// optional terminal argument is accepted, so callers cannot accidentally
-/// validate an abort body against a successful certificate.
+/// Validate receipt identity, activation binding, ordered trace, and terminal evidence.
 pub(crate) fn validate_receipt_body(
     binding: &ExecutionBinding,
     body: &ReceiptBody,
@@ -277,94 +264,33 @@ pub(crate) fn validate_receipt_body(
     {
         return Err(ProtocolError::ReceiptBodyMismatch);
     }
-    let participants = binding.participant_keys()?;
-    let participant_keys = participants.iter().map(|(_, key)| *key).collect::<Vec<_>>();
-    match header.terminal {
-        ReceiptTermination::Completed { ref terminal } => validate_completed_receipt(
+    match &header.terminal {
+        ReceiptTermination::Completed => validate_receipt_trace(
             binding,
-            body,
-            terminal,
-            &participant_keys,
-            participants.len(),
-        ),
-        ReceiptTermination::Stopped { ref cause } => {
-            validate_stopped_receipt(binding, body, cause, &participant_keys, participants.len())
-        }
+            body.trace(),
+            ReceiptTraceTerminal::Completed {
+                outcome: body.outcome(),
+            },
+        )
+        .map(|_| ()),
+        ReceiptTermination::Stopped { cause } => validate_stopped_receipt(binding, body, cause),
     }
-}
-
-fn validate_completed_receipt(
-    binding: &ExecutionBinding,
-    body: &ReceiptBody,
-    terminal: &SessionTerminal,
-    participant_keys: &[arena0_crypto::BlsPublicKey],
-    participant_count: usize,
-) -> Result<(), ProtocolError> {
-    if body.trace().is_empty()
-        || terminal.final_step
-            != u64::try_from(body.trace().len() - 1)
-                .map_err(|_| ProtocolError::ReceiptBodyMismatch)?
-        || terminal.outcome_hash != OutcomeHash::of(body.outcome())
-        || terminal.agreement.signers.count() != participant_count
-        || !terminal.agreement.signers.is_full(participant_count)
-    {
-        return Err(ProtocolError::ReceiptBodyMismatch);
-    }
-    let commitment = crate::TerminalCommitment::new(
-        binding.session_id(),
-        terminal.final_step,
-        terminal.final_state,
-        terminal.outcome_hash,
-    );
-    if terminal.agreement != AggregateAttestation::empty() {
-        terminal
-            .agreement
-            .verify_signatures(
-                terminal.final_step,
-                &commitment.signing_bytes(),
-                participant_keys,
-            )
-            .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
-    }
-    validate_receipt_trace(
-        binding,
-        body.trace(),
-        participant_keys,
-        participant_count,
-        ReceiptTraceTerminal::Completed {
-            outcome: body.outcome(),
-            final_state: terminal.final_state,
-        },
-    )
-    .map(|_| ())
 }
 
 fn validate_stopped_receipt(
     binding: &ExecutionBinding,
     body: &ReceiptBody,
     cause: &StopCause,
-    participant_keys: &[arena0_crypto::BlsPublicKey],
-    participant_count: usize,
 ) -> Result<(), ProtocolError> {
     cause.validate()?;
     match cause {
         StopCause::Authenticated(occurrence) => {
             occurrence.validate_for_session(binding.session_id())?;
-            if !binding
-                .participant_keys()?
-                .into_iter()
-                .any(|(participant, _)| participant == occurrence.sender())
-                || !occurrence.verify_signature()?
-            {
+            if !binding.is_participant(occurrence.sender()) || !occurrence.verify_signature()? {
                 return Err(ProtocolError::UnauthenticatedAbort);
             }
-            let cursor = validate_receipt_trace(
-                binding,
-                body.trace(),
-                participant_keys,
-                participant_count,
-                ReceiptTraceTerminal::Authenticated,
-            )?;
+            let cursor =
+                validate_receipt_trace(binding, body.trace(), ReceiptTraceTerminal::Authenticated)?;
             if *occurrence.coordinate() != cursor {
                 return Err(ProtocolError::InvalidAbortCoordinate);
             }
@@ -375,17 +301,15 @@ fn validate_stopped_receipt(
             commitment,
             reason,
         } => {
-            if body.trace().is_empty()
-                || body.trace().last().map(|entry| entry.step) != Some(commitment.step)
-                || body.trace().last().map(TraceEntry::entry_hash) != Some(commitment.entry_hash)
-            {
+            let Some(entry) = body.trace().last() else {
+                return Err(ProtocolError::ReceiptBodyMismatch);
+            };
+            if entry.step != commitment.step || entry.entry_hash() != commitment.entry_hash {
                 return Err(ProtocolError::ReceiptBodyMismatch);
             }
             let cursor = validate_receipt_trace(
                 binding,
                 body.trace(),
-                participant_keys,
-                participant_count,
                 ReceiptTraceTerminal::Stopped {
                     kind: *kind,
                     reason,
@@ -397,24 +321,16 @@ fn validate_stopped_receipt(
 }
 
 enum ReceiptTraceTerminal<'a> {
-    Completed {
-        outcome: &'a [u8],
-        final_state: crate::StateHash,
-    },
+    Completed { outcome: &'a [u8] },
     Authenticated,
-    Stopped {
-        kind: AbortKind,
-        reason: &'a str,
-    },
+    Stopped { kind: AbortKind, reason: &'a str },
 }
 
 fn validate_receipt_trace(
     binding: &ExecutionBinding,
     trace: &[TraceEntry],
-    participant_keys: &[arena0_crypto::BlsPublicKey],
-    participant_count: usize,
     terminal: ReceiptTraceTerminal<'_>,
-) -> Result<PublicCursor, ProtocolError> {
+) -> Result<StepCursor, ProtocolError> {
     if matches!(
         &terminal,
         ReceiptTraceTerminal::Completed { .. } | ReceiptTraceTerminal::Stopped { .. }
@@ -422,51 +338,20 @@ fn validate_receipt_trace(
     {
         return Err(ProtocolError::ReceiptBodyMismatch);
     }
-    let mut previous_state = binding.activation.offer().data().initial_state;
-    let mut previous_link = crate::CHAIN_START;
-    for (index, entry) in trace.iter().enumerate() {
-        let step = u64::try_from(index).map_err(|_| ProtocolError::ReceiptBodyMismatch)?;
-        validate_shared_entry(binding, step, entry)?;
-        if entry.step != step || entry.pre_state != previous_state {
-            return Err(ProtocolError::ReceiptBodyMismatch);
-        }
-        if entry.agreement.signers.count() != participant_count
-            || !entry.agreement.signers.is_full(participant_count)
-        {
-            return Err(ProtocolError::IncompleteProof {
-                actual: entry.agreement.signers.count(),
-                expected: participant_count,
-            });
-        }
-        let commitment = StepCommitment::for_entry(binding.session_id(), entry, previous_link);
-        if commitment.post_state != entry.post_state || commitment.entry_hash != entry.entry_hash()
-        {
-            return Err(ProtocolError::ReceiptBodyMismatch);
-        }
-        entry
-            .agreement
-            .verify_signatures(step, &commitment.signing_bytes(), participant_keys)
-            .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
-        let terminal_count = terminal_effect_count(entry);
-        if index + 1 < trace.len() && terminal_count != 0 {
-            return Err(ProtocolError::TerminalTraceMismatch);
-        }
-        previous_state = entry.post_state;
-        previous_link = commitment.link_hash();
-    }
+    let cursor = validate_agreed_trace(binding, trace)?;
 
     let final_entry = trace.last();
     match terminal {
-        ReceiptTraceTerminal::Completed {
-            outcome,
-            final_state,
-        } => {
+        ReceiptTraceTerminal::Completed { outcome } => {
             let Some(entry) = final_entry else {
                 return Err(ProtocolError::ReceiptBodyMismatch);
             };
-            if !matches!(entry.effects.as_slice(), [PublicEffect::SessionEnd { .. }])
-                || entry.completed_outcome() != Some(outcome)
-                || entry.post_state != final_state
+            let completed = entry
+                .terminal
+                .as_ref()
+                .and_then(StepTerminal::completed_outcome);
+            if !matches!(entry.terminal, Some(StepTerminal::End { .. }))
+                || completed != Some(outcome)
             {
                 return Err(ProtocolError::TerminalTraceMismatch);
             }
@@ -480,9 +365,11 @@ fn validate_receipt_trace(
             let Some(entry) = final_entry else {
                 return Err(ProtocolError::ReceiptBodyMismatch);
             };
-            let valid = match (kind, entry.effects.as_slice()) {
-                (AbortKind::Abort, [PublicEffect::SessionAbort { reason: actual }])
-                | (AbortKind::Fail, [PublicEffect::Fail { reason: actual }]) => actual == reason,
+            let valid = match (kind, entry.terminal.as_ref()) {
+                (AbortKind::Abort, Some(StepTerminal::Abort { reason: actual }))
+                | (AbortKind::Fail, Some(StepTerminal::Fail { reason: actual })) => {
+                    actual == reason
+                }
                 _ => false,
             };
             if !valid {
@@ -490,11 +377,40 @@ fn validate_receipt_trace(
             }
         }
     }
-    Ok(PublicCursor::new(
-        u64::try_from(trace.len()).map_err(|_| ProtocolError::ReceiptBodyMismatch)?,
-        previous_state,
-        previous_link,
-    ))
+    Ok(cursor)
+}
+
+/// Validate a certified trace prefix from the activation's genesis state and
+/// return the agreed cursor after its last entry.
+///
+/// Every entry must be well formed at its position, extend the hash chain from
+/// the previous entry's post-state, and carry an N-of-N aggregate agreement
+/// over its derived [`StepCommitment`]. Only the final entry may carry a
+/// terminal. The receipt verifier and the store's reopen check share this path.
+pub fn validate_agreed_trace(
+    binding: &ExecutionBinding,
+    trace: &[TraceEntry],
+) -> Result<StepCursor, ProtocolError> {
+    let keys = binding.participant_bls_keys()?;
+    let mut cursor = StepCursor::new(
+        0,
+        binding.activation.offer().data().initial_state,
+        crate::CHAIN_START,
+    );
+    for (index, entry) in trace.iter().enumerate() {
+        validate_shared_entry(binding, cursor.next_step(), entry)?;
+        let commitment =
+            StepCommitment::for_entry(binding.session_id(), entry, cursor.chain_hash());
+        let next = cursor
+            .advance(&commitment)
+            .map_err(|_| ProtocolError::ReceiptBodyMismatch)?;
+        verify_full_agreement(&entry.agreement, &commitment, &keys)?;
+        if index + 1 < trace.len() && terminal_effect_count(entry) != 0 {
+            return Err(ProtocolError::TerminalTraceMismatch);
+        }
+        cursor = next;
+    }
+    Ok(cursor)
 }
 
 pub(crate) fn validate_trace_entry(entry: &TraceEntry) -> Result<(), ProtocolError> {
@@ -514,23 +430,35 @@ pub(crate) fn validate_trace_entry(entry: &TraceEntry) -> Result<(), ProtocolErr
             other => other,
         },
     )?;
-    validate_public_event_payload(&entry.event)?;
-    if entry.effects.len() > MAX_SHARED_EFFECTS {
-        return Err(ProtocolError::CollectionTooLarge {
-            kind: "shared effects",
-            actual: entry.effects.len(),
-            max: MAX_SHARED_EFFECTS,
-        });
+    match &entry.event {
+        StepEvent::SessionStarted { .. } => {}
+        StepEvent::Message { data, .. } => {
+            ensure_payload(
+                "message payload",
+                data.len(),
+                super::MAX_EFFECT_PAYLOAD_BYTES,
+            )?;
+        }
     }
-    for effect in &entry.effects {
-        validate_public_effect(effect)?;
+    if let Some(terminal) = &entry.terminal {
+        validate_terminal(terminal)?;
     }
     Ok(())
 }
 
-/// Validate the event/effect class allowed at a public consensus boundary.
-/// Local answers, timers, reactions, and guest suspension effects never enter
-/// ensemble evidence.
+fn validate_terminal(terminal: &StepTerminal) -> Result<(), ProtocolError> {
+    match terminal {
+        StepTerminal::End { outcome } => ensure_payload(
+            "terminal outcome",
+            outcome.len(),
+            MAX_TERMINAL_OUTCOME_BYTES,
+        ),
+        StepTerminal::Abort { reason } | StepTerminal::Fail { reason } => {
+            ensure_payload("terminal reason", reason.len(), MAX_TERMINAL_REASON_BYTES)
+        }
+    }
+}
+
 pub(crate) fn validate_shared_entry(
     binding: &ExecutionBinding,
     expected_step: u64,
@@ -544,92 +472,101 @@ pub(crate) fn validate_shared_entry(
         });
     }
     match &entry.event {
-        PublicEvent::SessionStarted { ensemble } => {
+        StepEvent::SessionStarted { ensemble } => {
             if expected_step != 0 {
                 return Err(ProtocolError::SessionStartPosition);
             }
-            let expected = Ensemble::from_peers(
-                binding
-                    .participant_keys()?
-                    .into_iter()
-                    .map(|(peer, _)| peer)
-                    .collect(),
-            )
-            .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
+            let expected = binding
+                .ensemble()
+                .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
             if ensemble != &expected {
                 return Err(ProtocolError::SessionStartMismatch);
             }
         }
-        PublicEvent::MessageReceived { .. } => {
+        StepEvent::Message { from, .. } => {
             if expected_step == 0 {
                 return Err(ProtocolError::MissingSessionStart);
             }
+            binding.participant_key(from)?;
         }
-    }
-    if terminal_effect_count(entry) > 1 {
-        return Err(ProtocolError::MultipleTerminalEffects);
     }
     Ok(())
 }
 
-pub(crate) fn validate_private_record(record: &PrivateRecord) -> Result<(), ProtocolError> {
-    let encoded =
-        borsh::to_vec(record).map_err(|error| ProtocolError::Serialization(error.to_string()))?;
-    ensure_encoded("private record", encoded.len(), MAX_PRIVATE_RECORD_BYTES).map_err(|error| {
-        match error {
-            ProtocolError::EncodedTooLarge { actual, max, .. } => {
-                ProtocolError::PrivateRecordTooLarge { actual, max }
-            }
-            other => other,
+/// Check every protocol limit one dispatch's effects must satisfy: the count
+/// bound, each effect's payload bounds, and the exact canonical `Vec<Effect>`
+/// encoding bound, including the vector's length prefix.
+///
+/// Three callers share this one owner: the sandbox at emission,
+/// `ExecutionState::apply_dispatch` before staging or installing, and the
+/// store when it reopens event records. Recovery reaches it through
+/// `validate_effects`.
+pub fn check_effect_budget<'a>(
+    effects: impl IntoIterator<Item = &'a Effect>,
+) -> Result<(), ProtocolError> {
+    let mut total = std::mem::size_of::<u32>();
+    let mut count = 0usize;
+    for effect in effects {
+        count += 1;
+        if count > MAX_EFFECTS {
+            return Err(ProtocolError::CollectionTooLarge {
+                kind: "effects",
+                actual: count,
+                max: MAX_EFFECTS,
+            });
         }
-    })?;
-    if record.effects.len() > MAX_PRIVATE_EFFECTS {
-        return Err(ProtocolError::CollectionTooLarge {
-            kind: "private effects",
-            actual: record.effects.len(),
-            max: MAX_PRIVATE_EFFECTS,
-        });
+        validate_effect_payload(effect)?;
+        total = add_effect_len(total, effect)?;
     }
-    for effect in &record.effects {
-        validate_private_effect(effect)?;
-    }
-    for draw in &record.draws {
-        ensure_payload("random draw", draw.len(), MAX_EFFECT_PAYLOAD_BYTES)?;
-    }
-    validate_private_event_payload(&record.event)?;
-    Ok(())
+    ensure_encoded("effects", total, arena0_program::MAX_EFFECT_BYTES as usize)
 }
 
-pub(crate) fn validate_pending_record(pending: &PendingRecord) -> Result<(), ProtocolError> {
-    if pending
-        .label
-        .as_ref()
-        .is_some_and(|label| label.len() > MAX_TERMINAL_REASON_BYTES)
-        || pending
-            .expected_type
-            .as_ref()
-            .is_some_and(|value| value.len() > MAX_TERMINAL_REASON_BYTES)
-    {
-        return Err(ProtocolError::InvalidPendingContinuation);
-    }
-    Ok(())
+/// Accumulate one effect's canonical encoding length into an aggregate total.
+fn add_effect_len(total: usize, effect: &Effect) -> Result<usize, ProtocolError> {
+    let len = borsh::object_length(effect)
+        .map_err(|error| ProtocolError::Serialization(error.to_string()))?;
+    total
+        .checked_add(len)
+        .ok_or(ProtocolError::EncodedTooLarge {
+            kind: "effects",
+            actual: usize::MAX,
+            max: arena0_program::MAX_EFFECT_BYTES as usize,
+        })
 }
 
-fn validate_public_event_payload(event: &PublicEvent) -> Result<(), ProtocolError> {
-    match event {
-        PublicEvent::MessageReceived { msg, .. } => {
-            ensure_payload("event payload", msg.len(), MAX_EFFECT_PAYLOAD_BYTES)
+pub(crate) fn validate_effects(effects: &[(u32, Effect)]) -> Result<(), ProtocolError> {
+    for (ordinal, _) in effects {
+        if *ordinal as usize >= MAX_EFFECTS {
+            return Err(ProtocolError::InvalidCertificate(
+                "effect ordinal is outside the dispatch range".into(),
+            ));
         }
-        PublicEvent::SessionStarted { .. } => Ok(()),
     }
+    if effects.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+        return Err(ProtocolError::InvalidCertificate(
+            "effect ordinals are not strictly increasing".into(),
+        ));
+    }
+    check_effect_budget(effects.iter().map(|(_, effect)| effect))
 }
 
-fn validate_private_event_payload(event: &PrivateEvent) -> Result<(), ProtocolError> {
-    match event {
-        PrivateEvent::InputReceived { data: msg, .. } => {
-            ensure_payload("event payload", msg.len(), MAX_EFFECT_PAYLOAD_BYTES)
+/// Check one effect's payload against its protocol bound.
+fn validate_effect_payload(effect: &Effect) -> Result<(), ProtocolError> {
+    match effect {
+        Effect::SessionEnd { outcome } => ensure_payload(
+            "terminal outcome",
+            outcome.len(),
+            MAX_TERMINAL_OUTCOME_BYTES,
+        ),
+        Effect::SessionAbort { reason } | Effect::Fail { reason } => {
+            ensure_payload("terminal reason", reason.len(), MAX_TERMINAL_REASON_BYTES)
         }
-        PrivateEvent::TypedTimerFired { timer } => {
+        Effect::Broadcast { data } => ensure_payload(
+            "broadcast payload",
+            data.len(),
+            super::MAX_EFFECT_PAYLOAD_BYTES,
+        ),
+        Effect::SetTimer { timer, .. } => {
             ensure_payload(
                 "timer type name",
                 timer.type_name.len(),
@@ -637,143 +574,21 @@ fn validate_private_event_payload(event: &PrivateEvent) -> Result<(), ProtocolEr
             )?;
             ensure_payload("timer data", timer.data.len(), MAX_TIMER_PAYLOAD_BYTES)
         }
-        PrivateEvent::Signed { signature, .. } => ensure_payload(
-            "signature payload",
-            signature.len(),
-            MAX_EFFECT_PAYLOAD_BYTES,
-        ),
-        PrivateEvent::TimerFired | PrivateEvent::React => Ok(()),
     }
 }
 
-fn validate_public_effect(effect: &PublicEffect) -> Result<(), ProtocolError> {
-    match effect {
-        PublicEffect::SessionEnd { outcome } => ensure_payload(
-            "terminal outcome",
-            outcome.len(),
-            MAX_TERMINAL_OUTCOME_BYTES,
-        ),
-        PublicEffect::SessionAbort { reason } | PublicEffect::Fail { reason } => {
-            ensure_payload("terminal reason", reason.len(), MAX_TERMINAL_REASON_BYTES)
-        }
+/// Return the dispatch's lifecycle effect, rejecting more than one.
+pub(crate) fn single_lifecycle_effect<'a>(
+    effects: impl IntoIterator<Item = &'a Effect>,
+) -> Result<Option<&'a Effect>, ProtocolError> {
+    let mut lifecycle = effects.into_iter().filter(|effect| effect.is_lifecycle());
+    let first = lifecycle.next();
+    if lifecycle.next().is_some() {
+        return Err(ProtocolError::MultipleTerminalEffects);
     }
-}
-
-fn validate_private_effect(effect: &PrivateEffect) -> Result<(), ProtocolError> {
-    match effect {
-        PrivateEffect::Broadcast { data } => {
-            ensure_payload("guest effect payload", data.len(), MAX_EFFECT_PAYLOAD_BYTES)
-        }
-        PrivateEffect::Sign { data, .. } => {
-            ensure_payload("guest effect payload", data.len(), MAX_EFFECT_PAYLOAD_BYTES)
-        }
-        PrivateEffect::Callout {
-            context,
-            pending_label,
-            expected_type,
-            ..
-        } => {
-            ensure_payload("callout context", context.len(), MAX_EFFECT_PAYLOAD_BYTES)?;
-            if let Some(label) = pending_label {
-                ensure_payload("pending label", label.len(), MAX_TERMINAL_REASON_BYTES)?;
-            }
-            if let Some(expected) = expected_type {
-                ensure_payload("expected type", expected.len(), MAX_TERMINAL_REASON_BYTES)?;
-            }
-            Ok(())
-        }
-        PrivateEffect::SetTimer { timer, .. } => {
-            if let Some(timer) = timer {
-                ensure_payload(
-                    "timer type name",
-                    timer.type_name.len(),
-                    MAX_TERMINAL_REASON_BYTES,
-                )?;
-                ensure_payload("timer data", timer.data.len(), MAX_TIMER_PAYLOAD_BYTES)?;
-            }
-            Ok(())
-        }
-        PrivateEffect::RetryInput { reason } => {
-            ensure_payload("retry reason", reason.len(), MAX_TERMINAL_REASON_BYTES)
-        }
-    }
+    Ok(first)
 }
 
 pub(crate) fn terminal_effect_count(entry: &TraceEntry) -> usize {
-    entry
-        .effects
-        .iter()
-        .filter(|effect| {
-            matches!(
-                effect,
-                PublicEffect::SessionEnd { .. }
-                    | PublicEffect::SessionAbort { .. }
-                    | PublicEffect::Fail { .. }
-            )
-        })
-        .count()
-}
-
-/// Apply the one-shot timer mutations owned by one plan.
-pub(crate) fn apply_timer_mutations(
-    active: &mut Vec<ActiveTimer>,
-    mutations: &[TimerMutation],
-) -> Result<(), ProtocolError> {
-    let mut seen = std::collections::BTreeSet::new();
-    for mutation in mutations {
-        mutation.validate()?;
-        if !seen.insert(mutation.timer_id()) {
-            return Err(ProtocolError::DuplicateTimerMutation {
-                timer_id: mutation.timer_id(),
-            });
-        }
-        match mutation {
-            TimerMutation::Arm { timer_id, .. } => {
-                if active.iter().any(|timer| timer.id == *timer_id) {
-                    return Err(ProtocolError::DuplicateTimerMutation {
-                        timer_id: *timer_id,
-                    });
-                }
-                active.push(ActiveTimer { id: *timer_id });
-            }
-            TimerMutation::Cancel { timer_id } => {
-                let Some(index) = active.iter().position(|timer| timer.id == *timer_id) else {
-                    return Err(ProtocolError::StaleTimerFiring);
-                };
-                active.remove(index);
-            }
-        }
-        if active.len() > MAX_ACTIVE_TIMERS {
-            return Err(ProtocolError::TooManyTimers {
-                actual: active.len(),
-                max: MAX_ACTIVE_TIMERS,
-            });
-        }
-    }
-    active.sort_by_key(|timer| timer.id);
-    if active.windows(2).any(|pair| pair[0].id == pair[1].id) {
-        return Err(ProtocolError::TimerSetNotCanonical);
-    }
-    Ok(())
-}
-
-pub(crate) fn require_active(
-    state: &ExecutionState,
-    input: &'static str,
-) -> Result<(), ProtocolError> {
-    if !state.status().is_runnable() {
-        return Err(illegal(state, input));
-    }
-    Ok(())
-}
-
-pub(crate) fn illegal(state: &ExecutionState, input: &'static str) -> ProtocolError {
-    if state.status().is_terminal() {
-        ProtocolError::AlreadyTerminal
-    } else {
-        ProtocolError::IllegalLifecycle {
-            current: state.lifecycle(),
-            input,
-        }
-    }
+    usize::from(entry.terminal.is_some())
 }

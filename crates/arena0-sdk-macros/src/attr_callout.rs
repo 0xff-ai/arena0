@@ -74,11 +74,9 @@ pub(crate) fn expand_arena0_callouts(item: ItemEnum) -> Result<TokenStream2> {
     let mut request_callout_index_arms = Vec::new();
     let mut request_serialize_arms = Vec::new();
     let mut from_raw_arms = Vec::new();
-    let mut to_event_data_arms = Vec::new();
     let mut named_request_structs = Vec::new();
     let mut named_request_from_impls = Vec::new();
     let mut named_request_impls = Vec::new();
-    let mut callout_spec_impls = Vec::new();
     let mut request_types = Vec::new();
     let mut response_types = Vec::new();
     let mut named_request_program_value_impls = Vec::new();
@@ -93,12 +91,12 @@ pub(crate) fn expand_arena0_callouts(item: ItemEnum) -> Result<TokenStream2> {
         response_types.push(output_ty.clone());
         request_types.extend(v.context_fields.named.iter().map(|field| field.ty.clone()));
         let request_variant_doc = format!(
-            "Arena-owned callout `{name}`. Await this request to produce an `{output_ty_name}` response."
+            "Arena-owned callout `{name}`. The controlling agent supplies an `{output_ty_name}` response."
         );
         let response_variant_doc =
             format!("Input response for the `{name}` callout, carrying `{output_ty_name}`.");
         let request_struct_doc = format!(
-            "Typed request payload for callout `{name}`. `ctx.effects().callout(callouts::{name} {{ ... }}).await` resumes with `{output_ty_name}`."
+            "Typed request payload for callout `{name}`. Return it from `callout(ctx)`; the response reaches `on_input` as `{output_ty_name}`."
         );
 
         // Response variant: VariantName(OutputType)
@@ -175,49 +173,6 @@ pub(crate) fn expand_arena0_callouts(item: ItemEnum) -> Result<TokenStream2> {
                 fn callout_index(&self) -> u32 {
                     #idx_u32
                 }
-
-                fn expected_type_name(&self) -> Option<&'static str> {
-                    Some(::core::any::type_name::<#output_ty>())
-                }
-            }
-
-            impl ::arena0::Arena0TypedCalloutRequest for callouts::#variant_ident {
-                type Output = #output_ty;
-            }
-        });
-
-        callout_spec_impls.push(quote! {
-            impl<P> ::arena0::CalloutSpec<P> for callouts::#variant_ident
-            where
-                P: ::arena0::Program<Callout = #request_ident, Input = #response_ident>,
-            {
-                const CALLOUT_INDEX: u32 = #idx_u32;
-                const CALLOUT_NAME: &'static str = stringify!(#variant_ident);
-
-                type Output = #output_ty;
-
-                fn into_callout(self) -> P::Callout {
-                    self.into()
-                }
-
-                fn into_input(output: Self::Output) -> P::Input {
-                    #response_ident::#variant_ident(output)
-                }
-
-                fn decode(input: P::Input) -> Result<Self::Output, ::arena0::InputFault> {
-                    use ::arena0::anyhow::anyhow;
-
-                    match input {
-                        #response_ident::#variant_ident(value) => Ok(value),
-                        _ => Err(::arena0::InputFault::Unrecoverable(
-                            anyhow!(
-                                "expected input variant {} for callout {}",
-                                stringify!(#variant_ident),
-                                stringify!(#variant_ident),
-                            ),
-                        )),
-                    }
-                }
             }
         });
 
@@ -258,15 +213,8 @@ pub(crate) fn expand_arena0_callouts(item: ItemEnum) -> Result<TokenStream2> {
         // from_raw: build response variant
         from_raw_arms.push(quote! {
             #idx_u32 => {
-                let value: #output_ty = ::arena0::__parse_input_data(&data);
-                #response_ident::#variant_ident(value)
-            }
-        });
-
-        // to_event_data: destructure response variant
-        to_event_data_arms.push(quote! {
-            #response_ident::#variant_ident(value) => {
-                (#idx_u32, ::arena0::__serialize_input_data::<#output_ty>(value))
+                let value: #output_ty = ::arena0::__parse_input_data(&data)?;
+                Ok(#response_ident::#variant_ident(value))
             }
         });
     }
@@ -298,7 +246,6 @@ pub(crate) fn expand_arena0_callouts(item: ItemEnum) -> Result<TokenStream2> {
 
         #(#named_request_from_impls)*
         #(#named_request_impls)*
-        #(#callout_spec_impls)*
         #(#named_request_program_value_impls)*
 
         impl ::arena0::serde::Serialize for #request_ident {
@@ -315,10 +262,6 @@ pub(crate) fn expand_arena0_callouts(item: ItemEnum) -> Result<TokenStream2> {
                     #(#request_callout_index_arms),*
                 }
             }
-        }
-
-        impl ::arena0::Arena0TypedCalloutRequest for #request_ident {
-            type Output = #response_ident;
         }
 
         #[doc = concat!("Typed input enum generated from `", stringify!(#request_ident), "`. Each variant maps one callout to its output type.")]
@@ -340,23 +283,21 @@ pub(crate) fn expand_arena0_callouts(item: ItemEnum) -> Result<TokenStream2> {
         #response_program_value_impl
 
         impl ::arena0::Arena0Callout for #request_ident {
-            type Request = #request_ident;
             type Response = #response_ident;
 
             fn schemas() -> Vec<::arena0::CalloutSchema> {
                 vec![#(#schema_entries),*]
             }
 
-            fn from_raw(callout_index: u32, data: Vec<u8>) -> #response_ident {
+            fn from_raw(
+                callout_index: u32,
+                data: Vec<u8>,
+            ) -> ::arena0::anyhow::Result<#response_ident> {
                 match callout_index {
                     #(#from_raw_arms)*
-                    _ => panic!("unknown callout index: {callout_index}"),
-                }
-            }
-
-            fn to_event_data(response: &#response_ident) -> (u32, Vec<u8>) {
-                match response {
-                    #(#to_event_data_arms)*
+                    _ => Err(::arena0::anyhow::anyhow!(
+                        "unknown callout index: {callout_index}"
+                    )),
                 }
             }
         }

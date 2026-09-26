@@ -30,9 +30,7 @@ use arena0_protocol::{
     ExecFrame as DomainExecFrame, FetchFrame as DomainFetchFrame, NegotiationId, PeerId,
     SessionHash,
 };
-use arena0_wire::{
-    Codec, ExecFrame as WireExecFrame, FetchFrame as WireFetchFrame, StreamProtocol,
-};
+use arena0_wire::{Codec, StreamProtocol};
 use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
@@ -98,6 +96,8 @@ impl AcceptedExecStream {
 /// A receiver-side decision that does not grant durable responsibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecDeliveryRejection {
+    /// The receiver has not reached the frame's prerequisite state.
+    NotYet,
     /// The receiver declined the frame without a conflicting durable record.
     Rejected,
     /// The frame conflicts with an existing durable record.
@@ -106,6 +106,7 @@ pub enum ExecDeliveryRejection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecDeliveryFailure {
+    NotYet,
     Rejected,
     Conflict,
     ReceiverDropped,
@@ -138,6 +139,7 @@ impl ExecDeliveryReceipt {
             return Err(TransportError::ConnectionClosed);
         };
         let failure = match rejection {
+            ExecDeliveryRejection::NotYet => ExecDeliveryFailure::NotYet,
             ExecDeliveryRejection::Rejected => ExecDeliveryFailure::Rejected,
             ExecDeliveryRejection::Conflict => ExecDeliveryFailure::Conflict,
         };
@@ -306,7 +308,6 @@ impl SendHandle {
     /// Send an [`arena0_protocol::ExecFrame`] on an `Exec` stream.
     pub async fn send_exec(&self, msg: &DomainExecFrame) -> Result<(), TransportError> {
         self.validate_exec_route(msg)?;
-        let wire = WireExecFrame::try_from(msg)?;
         if self.proto != StreamProtocol::Exec {
             return Err(TransportError::ProtocolMismatch(format!(
                 "sent {:?} frame on a {:?} stream",
@@ -314,27 +315,33 @@ impl SendHandle {
                 self.proto
             )));
         }
-        let frame = Codec::new(StreamProtocol::Exec.max_frame_body()).encode(&wire)?;
-        let (responsibility, receipt) = oneshot::channel();
+        let frame = Codec::new(StreamProtocol::Exec.max_frame_body()).encode(msg)?;
+        let (responsibility, mut receipt) = oneshot::channel();
         self.send_packet(StreamPacket {
             bytes: frame,
             responsibility: Some(responsibility),
         })
         .await?;
-        if self.state.is_closed() {
-            return Err(TransportError::ConnectionClosed);
-        }
         let mut closed = self.state.subscribe();
+        // A receiver may complete the receipt and immediately close its stream.
+        // That completed decision remains authoritative after closure.
         match tokio::select! {
-            result = receipt => result,
-            result = closed.changed() => {
-                let _ = result;
-                return Err(TransportError::ConnectionClosed);
+            biased;
+            result = &mut receipt => result,
+            () = async {
+                if !self.state.is_closed() {
+                    let _ = closed.changed().await;
+                }
+            } => {
+                match receipt.try_recv() {
+                    Ok(outcome) => Ok(outcome),
+                    Err(_) => return Err(TransportError::ConnectionClosed),
+                }
             }
         } {
-            Ok(Ok(_)) if self.state.is_closed() => Err(TransportError::ConnectionClosed),
             Ok(Ok(outcome)) => Ok(outcome),
             Ok(Err(ExecDeliveryFailure::Rejected)) => Err(TransportError::ExecRejected),
+            Ok(Err(ExecDeliveryFailure::NotYet)) => Err(TransportError::ExecNotYet),
             Ok(Err(ExecDeliveryFailure::Conflict)) => Err(TransportError::ExecConflict),
             Ok(Err(ExecDeliveryFailure::ReceiverDropped)) => {
                 Err(TransportError::ExecReceiverDropped)
@@ -345,8 +352,7 @@ impl SendHandle {
 
     /// Send an [`arena0_protocol::FetchFrame`] on a `Fetch` stream (the convergence fetch).
     pub async fn send_fetch(&self, msg: &DomainFetchFrame) -> Result<(), TransportError> {
-        let wire = WireFetchFrame::try_from(msg)?;
-        self.send_typed(StreamProtocol::Fetch, &wire).await
+        self.send_typed(StreamProtocol::Fetch, msg).await
     }
 
     async fn send_typed<T: borsh::BorshSerialize>(
@@ -393,7 +399,7 @@ impl SendHandle {
                 "execution handle has no session binding".into(),
             ));
         };
-        validate_exec_route(frame, session_hash, self.local)
+        validate_exec_route(frame, session_hash)
     }
 }
 
@@ -458,21 +464,15 @@ impl RecvHandle {
             ));
         };
         let frame = match Codec::new(StreamProtocol::Exec.max_frame_body())
-            .decode::<WireExecFrame>(&packet.bytes)
+            .decode::<DomainExecFrame>(&packet.bytes)
         {
-            Ok(frame) => match DomainExecFrame::try_from(frame) {
-                Ok(frame) => {
-                    if let Err(error) = self.validate_exec_route(&frame) {
-                        let _ = responsibility.send(Err(ExecDeliveryFailure::Rejected));
-                        return Err(error);
-                    }
-                    frame
-                }
-                Err(error) => {
+            Ok(frame) => {
+                if let Err(error) = self.validate_exec_route(&frame) {
                     let _ = responsibility.send(Err(ExecDeliveryFailure::Rejected));
-                    return Err(error.into());
+                    return Err(error);
                 }
-            },
+                frame
+            }
             Err(error) => {
                 let _ = responsibility.send(Err(ExecDeliveryFailure::Rejected));
                 return Err(error.into());
@@ -495,9 +495,7 @@ impl RecvHandle {
                 "fetch packet unexpectedly carries an exec responsibility receipt".into(),
             ));
         }
-        let frame: WireFetchFrame =
-            Codec::new(StreamProtocol::Fetch.max_frame_body()).decode(&packet.bytes)?;
-        Ok(DomainFetchFrame::try_from(frame)?)
+        Ok(Codec::new(StreamProtocol::Fetch.max_frame_body()).decode(&packet.bytes)?)
     }
 
     async fn recv_packet(&self, expected: StreamProtocol) -> Result<StreamPacket, TransportError> {
@@ -535,28 +533,27 @@ impl RecvHandle {
                 "execution handle has no session binding".into(),
             ));
         };
-        validate_exec_route(frame, session_hash, self.remote)
+        validate_exec_route(frame, session_hash)
     }
 }
 
 fn validate_exec_route(
     frame: &DomainExecFrame,
     session_hash: SessionHash,
-    authenticated_sender: PeerId,
 ) -> Result<(), TransportError> {
     match frame {
         DomainExecFrame::Message { .. } => {}
+        DomainExecFrame::StepCertificate { certificate } => {
+            if certificate.commitment().session_id != session_hash {
+                return Err(TransportError::ProtocolMismatch(
+                    "step certificate does not match the execution stream session".into(),
+                ));
+            }
+        }
         DomainExecFrame::StepSignature { commitment, .. } => {
             if commitment.session_id != session_hash {
                 return Err(TransportError::ProtocolMismatch(
                     "step signature does not match the execution stream session".into(),
-                ));
-            }
-        }
-        DomainExecFrame::End { commitment, .. } => {
-            if commitment.session_id != session_hash {
-                return Err(TransportError::ProtocolMismatch(
-                    "terminal signature does not match the execution stream session".into(),
                 ));
             }
         }
@@ -566,11 +563,8 @@ fn validate_exec_route(
                     "abort does not match the execution stream session".into(),
                 ));
             }
-            if occurrence.sender() != authenticated_sender {
-                return Err(TransportError::ProtocolMismatch(
-                    "abort sender does not match the authenticated stream peer".into(),
-                ));
-            }
+            // Adopted occurrences may be forwarded. The actor authenticates
+            // their original signer against the committed session binding.
         }
     }
     Ok(())

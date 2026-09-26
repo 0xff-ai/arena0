@@ -99,7 +99,8 @@ for (const binary of BINARIES) {
 }
 
 // The main package carries one copyable, version-only program example. Copy
-// only its authored inputs so local Cargo artifacts can never enter a tarball.
+// only its authored inputs so local Cargo artifacts can never enter a tarball,
+// and drop the manifest's checkout-only `path` keys as `cargo publish` would.
 const exampleSource = join(repoRoot, 'examples', 'minimal-program');
 const exampleDest = join(npmDir, 'arena0', 'examples', 'minimal-program');
 const exampleFiles = ['Cargo.toml', 'README.md', 'rust-toolchain.toml', 'src/lib.rs'];
@@ -108,7 +109,16 @@ for (const file of exampleFiles) {
   const source = join(exampleSource, file);
   const dest = join(exampleDest, file);
   mkdirSync(dirname(dest), { recursive: true });
-  copyFileSync(source, dest);
+  if (file === 'Cargo.toml') {
+    const manifest = readFileSync(source, 'utf8').replace(/, path = "[^"]*"/g, '');
+    if (/\bpath\s*=/.test(manifest)) {
+      console.error(`${source} has a path dependency the example copy cannot keep`);
+      process.exit(1);
+    }
+    writeFileSync(dest, manifest);
+  } else {
+    copyFileSync(source, dest);
+  }
 }
 console.log(`copied minimal program example -> ${exampleDest}`);
 

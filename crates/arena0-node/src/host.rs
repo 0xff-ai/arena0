@@ -22,16 +22,6 @@ use crate::machines::negotiation::{
 };
 use crate::router::{ExecStreamRouter, FetchRegistry};
 
-/// Maximum number of inbound execution streams buffered before an execution
-/// is spawned. This bounds routing memory for unknown session identities.
-const UNCLAIMED_INBOX_CAP: usize = 64;
-
-#[derive(Debug)]
-struct ExecInbox {
-    tx: mpsc::Sender<InboundStreamPayload>,
-    rx: Option<mpsc::Receiver<InboundStreamPayload>>,
-}
-
 /// Errors at the host/actor construction boundary.
 #[derive(Debug, Error)]
 pub enum HostError {
@@ -56,12 +46,14 @@ pub enum HostError {
 #[allow(missing_debug_implementations)]
 pub struct Host {
     identity: Arc<NodeKeys>,
-    /// Persistent peer identity exposed for local ensemble construction.
-    pub peer_id: PeerId,
     transport: Arc<dyn Transport + Sync>,
     store: StoreHandle,
-    inboxes: Arc<StdMutex<HashMap<SessionHash, ExecInbox>>>,
+    /// One entry per session with a live actor handle. The entry is the
+    /// session's routing claim; the weak sender leaves the actor's handle as
+    /// the only owner of its stream queue.
+    routes: Arc<StdMutex<HashMap<SessionHash, mpsc::WeakSender<InboundStreamPayload>>>>,
     fetch_registry: FetchRegistry,
+    end_wakes: StdMutex<Option<mpsc::Receiver<ExecId>>>,
     owner_token: Arc<()>,
     negotiation_lock: TokioMutex<()>,
     tasks: TokioMutex<JoinSet<()>>,
@@ -74,17 +66,19 @@ impl Host {
         transport: Arc<dyn Transport + Sync>,
         store: StoreHandle,
     ) -> Arc<Self> {
-        let peer_id = identity.peer_id();
-        let inboxes = Arc::new(StdMutex::new(HashMap::new()));
+        let routes = Arc::new(StdMutex::new(HashMap::new()));
         let exec_router: ExecStreamRouter = {
-            let inboxes = Arc::clone(&inboxes);
-            Arc::new(move |session| inbox_sender(&inboxes, session))
+            let routes = Arc::clone(&routes);
+            Arc::new(move |session| route_sender(&routes, session))
         };
         let fetch_registry: FetchRegistry = Arc::new(StdMutex::new(HashMap::new()));
+        let (end_wake_tx, end_wake_rx) = mpsc::channel(64);
         let mut tasks = JoinSet::new();
         tasks.spawn(crate::router::run_exec_accept_router(
             Arc::clone(&transport),
             exec_router,
+            store.clone(),
+            end_wake_tx,
         ));
         tasks.spawn(crate::router::run_fetch_accept_router(
             Arc::clone(&transport),
@@ -92,15 +86,28 @@ impl Host {
         ));
         Arc::new(Self {
             identity,
-            peer_id,
             transport,
             store,
-            inboxes,
+            routes,
             fetch_registry,
+            end_wakes: StdMutex::new(Some(end_wake_rx)),
             owner_token: Arc::new(()),
             negotiation_lock: TokioMutex::new(()),
             tasks: TokioMutex::new(tasks),
         })
+    }
+
+    /// Claim dormant-session wake requests. The embedding supervisor must
+    /// reconstruct each requested actor through its normal startup path.
+    /// Requests are advisory: peers receive NotYet and retry until it is live.
+    pub fn take_end_wakes(&self) -> Option<mpsc::Receiver<ExecId>> {
+        self.end_wakes.lock().unwrap().take()
+    }
+
+    /// Persistent peer identity of this Host's signer.
+    #[must_use]
+    pub fn peer_id(&self) -> PeerId {
+        self.identity.peer_id()
     }
 
     /// Share the durable node identity signer.
@@ -184,8 +191,7 @@ impl Host {
     ///
     /// The execution aggregate remains the authority after activation commit.
     /// This method therefore signs a `Fail` occurrence against the current
-    /// public cursor, or interrupts an in-flight terminal proof when an abort
-    /// occurrence is no longer legal. The supplied writer is consumed so the
+    /// public cursor, or preserves certified terminal evidence for publication. The supplied writer is consumed so the
     /// recovery pass cannot leave a failed execution claimed as live.
     pub async fn fail_recovered_execution(
         &self,
@@ -197,9 +203,7 @@ impl Host {
                 "execution store belongs to another host".into(),
             ));
         }
-        crate::execution::fail_execution(execution_store.store_mut(), &self.identity, reason)
-            .await
-            .map(|_| ())
+        crate::execution::fail_execution(execution_store.store_mut(), &self.identity, reason).await
     }
 
     /// Register a convergence-fetch handler for one session.
@@ -241,11 +245,10 @@ impl Host {
         }
         let execution_store = execution_store.into_store();
         let session_hash = context.activation.session_hash();
-        let mut inbound = self.try_claim_inbox(session_hash)?;
-        let inboxes = Arc::clone(&self.inboxes);
-        let session_claim = SessionStreamClaim::new(move || {
-            inboxes.lock().unwrap().remove(&session_hash);
-        });
+        let mut routes = self.routes.lock().unwrap();
+        if routes.contains_key(&session_hash) {
+            return Err(HostError::DuplicateSession(session_hash));
+        }
         let spawned = spawn_execution(
             context.bind(
                 Arc::clone(&self.identity),
@@ -254,56 +257,23 @@ impl Host {
             ),
             Arc::clone(self),
         );
-        let stream_tx = spawned.stream_tx.clone();
-        let forwarder = tokio::spawn(async move {
-            while let Some(payload) = inbound.recv().await {
-                if stream_tx.send(payload).await.is_err() {
-                    break;
-                }
-            }
+        routes.insert(session_hash, spawned.stream_tx.downgrade());
+        drop(routes);
+        let routes = Arc::clone(&self.routes);
+        let session_claim = SessionStreamClaim::new(move || {
+            routes.lock().unwrap().remove(&session_hash);
         });
-        Ok(spawned
-            .with_session_claim(session_claim)
-            .with_forwarder(forwarder))
-    }
-
-    fn try_claim_inbox(
-        &self,
-        key: SessionHash,
-    ) -> Result<mpsc::Receiver<InboundStreamPayload>, HostError> {
-        let mut inboxes = self.inboxes.lock().unwrap();
-        let inbox = inboxes.entry(key).or_insert_with(|| {
-            let (tx, rx) = mpsc::channel(64);
-            ExecInbox { tx, rx: Some(rx) }
-        });
-        inbox.rx.take().ok_or(HostError::DuplicateSession(key))
+        Ok(spawned.with_session_claim(session_claim))
     }
 }
 
-fn inbox_sender(
-    inboxes: &StdMutex<HashMap<SessionHash, ExecInbox>>,
+fn route_sender(
+    routes: &StdMutex<HashMap<SessionHash, mpsc::WeakSender<InboundStreamPayload>>>,
     key: SessionHash,
 ) -> Option<mpsc::Sender<InboundStreamPayload>> {
-    let mut inboxes = inboxes.lock().unwrap();
-    if !inboxes.contains_key(&key) {
-        let unclaimed = inboxes.values().filter(|inbox| inbox.rx.is_some()).count();
-        if unclaimed >= UNCLAIMED_INBOX_CAP {
-            tracing::warn!(
-                ?key,
-                cap = UNCLAIMED_INBOX_CAP,
-                "unclaimed execution inbox cap reached"
-            );
-            return None;
-        }
-    }
-    Some(
-        inboxes
-            .entry(key)
-            .or_insert_with(|| {
-                let (tx, rx) = mpsc::channel(64);
-                ExecInbox { tx, rx: Some(rx) }
-            })
-            .tx
-            .clone(),
-    )
+    routes
+        .lock()
+        .unwrap()
+        .get(&key)
+        .and_then(mpsc::WeakSender::upgrade)
 }
