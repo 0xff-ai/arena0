@@ -14,9 +14,9 @@ pub(super) struct PendingCallout {
     pub(super) editor: TextArea<'static>,
     pub(super) scroll: u16,
     pub(super) validation_error: Option<String>,
-    /// The monitor has sent this answer to the daemon and is waiting for the
-    /// explicit result.  Keeping the editor alive here protects the draft when
-    /// the transport outcome is unknown.
+    /// The monitor or run driver has sent this answer and is waiting for the
+    /// daemon result. Keeping the editor protects the draft after a program
+    /// rejection or an unknown transport outcome.
     pub(super) submitting: bool,
     pub(super) submission_error: Option<String>,
     pub(super) not_pending: bool,
@@ -153,15 +153,24 @@ impl CalloutQueue {
             self.selected = (self.selected + 1) % self.len();
         }
     }
+
+    /// After sending an answer, present the next callout that can accept one.
+    /// The submitted callout stays queued until the daemon responds.
+    pub(super) fn select_next_answerable(&mut self) {
+        for offset in 1..=self.len() {
+            let index = (self.selected + offset) % self.len();
+            if self.requests.get(index).is_some_and(|request| {
+                !request.submitting && !request.not_pending && request.reply.is_some()
+            }) {
+                self.selected = index;
+                break;
+            }
+        }
+    }
     pub(super) fn previous(&mut self) {
         if !self.is_empty() {
             self.selected = (self.selected + self.len() - 1) % self.len();
         }
-    }
-    pub(super) fn remove_selected(&mut self) -> Option<PendingCallout> {
-        let request = self.requests.remove(self.selected);
-        self.selected = 0;
-        request
     }
     pub(super) fn clear(&mut self) {
         self.requests.clear();

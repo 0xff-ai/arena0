@@ -1475,51 +1475,73 @@ async fn drive_loop(
                     }
                     continue;
                 }
-                let answer = driver.answer(
-                    DriverAnswerContext {
-                        host,
-                        client,
-                        exec_id,
-                    },
-                    pending_id,
-                    callout_index,
-                    Callout {
-                        name: &name,
-                        prompt: &prompt,
-                        context: &context,
-                        schema: schema.as_value(),
-                    },
-                    progress,
-                );
-                tokio::pin!(answer);
-                let answer = tokio::select! {
-                    answer = &mut answer => answer?,
-                    () = wait_for_cancel(cancelled) => {
-                        bail!("coordinated run cancelled while waiting for driver {exec_id}")
-                    }
-                };
-                let submit = async {
-                    match client
-                        .call_host_raw(
-                            host,
-                            &HostRequest::ExecSubmit {
+                let mut rejection = None;
+                loop {
+                    let answer = {
+                        let answer = driver.answer(
+                            DriverAnswerContext {
+                                host,
+                                client,
                                 exec_id,
-                                pending_id,
-                                answer: Some(answer),
                             },
-                        )
-                        .await?
-                    {
-                        Ok(ResponseOk::Ack) => Ok(()),
-                        Err(error) if error.code == ApiErrorCode::CalloutNotPending => Ok(()),
-                        Err(error) => Err(error.into()),
-                        other => bail!("unexpected exec.submit response: {other:?}"),
-                    }
-                };
-                tokio::select! {
-                    result = submit => result?,
-                    () = wait_for_cancel(cancelled) => {
-                        bail!("coordinated run cancelled while submitting driver answer for {exec_id}")
+                            pending_id,
+                            callout_index,
+                            Callout {
+                                name: &name,
+                                prompt: &prompt,
+                                context: &context,
+                                schema: schema.as_value(),
+                            },
+                            rejection.take(),
+                            progress,
+                        );
+                        tokio::pin!(answer);
+                        tokio::select! {
+                            answer = &mut answer => answer?,
+                            () = wait_for_cancel(cancelled) => {
+                                bail!("coordinated run cancelled while waiting for driver {exec_id}")
+                            }
+                        }
+                    };
+                    let submit = async {
+                        match client
+                            .call_host_raw(
+                                host,
+                                &HostRequest::ExecSubmit {
+                                    exec_id,
+                                    pending_id,
+                                    answer: Some(answer),
+                                },
+                            )
+                            .await?
+                        {
+                            Ok(ResponseOk::Ack) => Ok(None),
+                            Err(error) if error.code == ApiErrorCode::CalloutNotPending => Ok(None),
+                            Err(error) if error.code == ApiErrorCode::InputRejected => {
+                                Ok(Some(error))
+                            }
+                            Err(error) => Err(error.into()),
+                            other => bail!("unexpected exec.submit response: {other:?}"),
+                        }
+                    };
+                    let rejected = tokio::select! {
+                        result = submit => result?,
+                        () = wait_for_cancel(cancelled) => {
+                            bail!("coordinated run cancelled while submitting driver answer for {exec_id}")
+                        }
+                    };
+                    match rejected {
+                        None => {
+                            if let ActiveDriver::Human(Some(tui)) = driver {
+                                tui.answer_accepted(host.clone(), exec_id, pending_id)
+                                    .await?;
+                            }
+                            break;
+                        }
+                        Some(error) if matches!(driver, ActiveDriver::Human(_)) => {
+                            rejection = Some(error.message);
+                        }
+                        Some(error) => return Err(error.into()),
                     }
                 }
                 answered = Some(pending_id);
@@ -1845,24 +1867,33 @@ impl ActiveDriver {
         pending_id: CalloutId,
         callout_index: u32,
         callout: Callout<'_>,
+        rejection: Option<String>,
         progress: &RunProgress,
     ) -> anyhow::Result<Value> {
         match self {
             Self::Human(Some(tui)) => {
-                tui.answer(TuiCalloutRequest {
-                    host: scope.host.clone(),
-                    exec_id: scope.exec_id,
-                    pending_id,
-                    callout_index,
-                    name: callout.name.to_owned(),
-                    prompt: callout.prompt.to_owned(),
-                    context: callout.context.clone(),
-                    schema: callout.schema.clone(),
-                })
-                .await
+                if let Some(reason) = rejection {
+                    tui.retry_answer(scope.host.clone(), scope.exec_id, pending_id, reason)
+                        .await
+                } else {
+                    tui.answer(TuiCalloutRequest {
+                        host: scope.host.clone(),
+                        exec_id: scope.exec_id,
+                        pending_id,
+                        callout_index,
+                        name: callout.name.to_owned(),
+                        prompt: callout.prompt.to_owned(),
+                        context: callout.context.clone(),
+                        schema: callout.schema.clone(),
+                    })
+                    .await
+                }
             }
             Self::Human(None) => {
                 progress.suspend_for_callout();
+                if let Some(reason) = rejection {
+                    eprintln!("program rejected answer: {reason}");
+                }
                 let answer = prompt_human(
                     scope.host,
                     scope.client,
@@ -2684,6 +2715,120 @@ mod tests {
         assert!(
             matches!(requests.as_slice(), [HostRequest::ExecNext { .. }, HostRequest::ExecSubmit { pending_id: id, .. }, HostRequest::ExecNext { .. }] if *id == pending_id)
         );
+    }
+
+    #[tokio::test]
+    async fn human_driver_retries_a_program_rejection_for_the_same_callout() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("input-rejected.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let host = host("host-01");
+        let exec_id = ExecId([0x91; 32]);
+        let session_id = SessionHash([0x92; 32]);
+        let pending_id = CalloutId::new(21);
+        let server = tokio::spawn(serve_script(
+            listener,
+            host.clone(),
+            vec![
+                Ok(ResponseOk::Next(NextEvent::Callout {
+                    pending_id,
+                    callout_index: 0,
+                    name: "Move".into(),
+                    prompt: "Choose a move".into(),
+                    schema: arena0_client::program::JsonSchemaDocument::new(schema(
+                        json!({"type":"string"}),
+                    ))
+                    .unwrap(),
+                    context: Value::Null,
+                })),
+                Err(ApiError::new(ApiErrorCode::InputRejected, "illegal move")),
+                Ok(ResponseOk::Ack),
+                Ok(ResponseOk::Next(NextEvent::Completed {
+                    session_id,
+                    outcome: None,
+                })),
+            ],
+        ));
+        let (tui, mut updates, _pages) = TuiHandle::test_channel();
+        let (cancel, mut cancelled) = watch::channel(false);
+        let run = tokio::spawn(async move {
+            let _cancel = cancel;
+            let client = DaemonClient::new(socket);
+            let mut driver = ActiveDriver::start(DriverSpec::Human, Some(tui)).unwrap();
+            let progress = test_progress();
+            drive_loop(
+                &host,
+                &client,
+                exec_id,
+                &mut driver,
+                &mut cancelled,
+                None,
+                &progress,
+            )
+            .await
+        });
+
+        let first = tokio::time::timeout(Duration::from_secs(3), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let RunUpdate::Callout {
+            reply,
+            pending_id: id,
+            ..
+        } = first
+        else {
+            panic!("expected first callout");
+        };
+        assert_eq!(id, pending_id);
+        reply.send(json!("illegal move")).unwrap();
+
+        let retry = tokio::time::timeout(Duration::from_secs(3), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let RunUpdate::CalloutRejected {
+            reply,
+            reason,
+            pending_id: id,
+            ..
+        } = retry
+        else {
+            panic!("expected rejected callout");
+        };
+        assert_eq!(id, pending_id);
+        assert_eq!(reason, "illegal move");
+        reply.send(json!("legal move")).unwrap();
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(3), updates.recv())
+                .await
+                .unwrap(),
+            Some(RunUpdate::CalloutAccepted { pending_id: id, .. }) if id == pending_id
+        ));
+        let terminal = tokio::time::timeout(Duration::from_secs(3), run)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            terminal,
+            HostTerminal::Completed {
+                session_id,
+                outcome: None
+            }
+        );
+        let requests = server.await.unwrap();
+        assert!(matches!(
+            requests.as_slice(),
+            [HostRequest::ExecNext { .. },
+             HostRequest::ExecSubmit { pending_id: first, answer: Some(first_answer), .. },
+             HostRequest::ExecSubmit { pending_id: second, answer: Some(second_answer), .. },
+             HostRequest::ExecNext { .. }]
+             if *first == pending_id && *second == pending_id
+                && first_answer == &json!("illegal move")
+                && second_answer == &json!("legal move")
+        ));
     }
 
     #[tokio::test]

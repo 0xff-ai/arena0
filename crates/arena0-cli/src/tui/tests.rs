@@ -302,12 +302,77 @@ fn invalid_tui_answer_keeps_the_callout_until_valid_input() {
 
     state.set_answer_text("Cooperate");
     state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert!(state.callouts.is_empty());
-    assert_eq!(state.focus, Focus::Workspace);
+    assert!(!state.callouts.is_empty());
+    assert!(state.callouts.selected().unwrap().submitting);
     assert_eq!(
         answer.blocking_recv().unwrap(),
         serde_json::json!("Cooperate")
     );
+    state.apply(RunUpdate::CalloutAccepted {
+        host: first_host(),
+        exec_id: active_status().exec_id,
+        pending_id: CalloutId::new(1),
+    });
+    assert!(state.callouts.is_empty());
+    assert_eq!(state.focus, Focus::Workspace);
+}
+
+#[test]
+fn program_rejection_keeps_the_tui_draft_for_the_same_callout() {
+    let mut state = ScreenState::new(config());
+    let host = first_host();
+    let exec_id = active_status().exec_id;
+    let pending_id = CalloutId::new(1);
+    let (reply, first_answer) = oneshot::channel();
+    state.apply(RunUpdate::Callout {
+        host: host.clone(),
+        exec_id,
+        pending_id,
+        callout_index: 1,
+        name: "Move".to_owned(),
+        prompt: "Choose a move".to_owned(),
+        context: Value::Null,
+        schema: serde_json::json!({"type": "string"}),
+        reply,
+    });
+    state.set_answer_text("illegal move");
+    state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        first_answer.blocking_recv().unwrap(),
+        serde_json::json!("illegal move")
+    );
+
+    let (reply, second_answer) = oneshot::channel();
+    state.apply(RunUpdate::CalloutRejected {
+        host: host.clone(),
+        exec_id,
+        pending_id,
+        reason: "illegal move".to_owned(),
+        reply,
+    });
+    assert_eq!(state.answer_text(), "illegal move");
+    assert_eq!(
+        state
+            .callouts
+            .selected()
+            .unwrap()
+            .submission_error
+            .as_deref(),
+        Some("illegal move")
+    );
+    assert!(!state.callouts.selected().unwrap().submitting);
+    state.set_answer_text("legal move");
+    state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        second_answer.blocking_recv().unwrap(),
+        serde_json::json!("legal move")
+    );
+    state.apply(RunUpdate::CalloutAccepted {
+        host,
+        exec_id,
+        pending_id,
+    });
+    assert!(state.callouts.is_empty());
 }
 
 #[test]
@@ -597,6 +662,11 @@ fn arrivals_preserve_callout_order_and_submission_selects_the_oldest() {
     );
     assert!(answers[0].try_recv().is_err());
     assert!(answers[1].try_recv().is_err());
+    state.apply(RunUpdate::CalloutAccepted {
+        host: HostName::for_local_index(2),
+        exec_id: active_status().exec_id,
+        pending_id: CalloutId::new(1),
+    });
     assert_eq!(state.callouts.position(), 1);
     assert_eq!(state.answer_text(), "first draft");
     state.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));

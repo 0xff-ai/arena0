@@ -383,6 +383,18 @@ pub(crate) enum RunUpdate {
         schema: Value,
         reply: oneshot::Sender<Value>,
     },
+    CalloutRejected {
+        host: HostName,
+        exec_id: ExecId,
+        pending_id: CalloutId,
+        reason: String,
+        reply: oneshot::Sender<Value>,
+    },
+    CalloutAccepted {
+        host: HostName,
+        exec_id: ExecId,
+        pending_id: CalloutId,
+    },
     ReceiptVerified {
         host: HostName,
         peer_id: PeerId,
@@ -587,6 +599,41 @@ impl TuiHandle {
         })
         .await?;
         answer.await.context("run TUI closed before answering")
+    }
+
+    pub(crate) async fn retry_answer(
+        &self,
+        host: HostName,
+        exec_id: ExecId,
+        pending_id: CalloutId,
+        reason: String,
+    ) -> anyhow::Result<Value> {
+        let (reply, answer) = oneshot::channel();
+        self.update(RunUpdate::CalloutRejected {
+            host,
+            exec_id,
+            pending_id,
+            reason,
+            reply,
+        })
+        .await?;
+        answer
+            .await
+            .context("run TUI closed before retrying answer")
+    }
+
+    pub(crate) async fn answer_accepted(
+        &self,
+        host: HostName,
+        exec_id: ExecId,
+        pending_id: CalloutId,
+    ) -> anyhow::Result<()> {
+        self.update(RunUpdate::CalloutAccepted {
+            host,
+            exec_id,
+            pending_id,
+        })
+        .await
     }
 
     #[must_use]
@@ -1631,6 +1678,34 @@ impl ScreenState {
                 if self.callouts.push(callout) && self.callouts.len() == 1 {
                     self.focus = Focus::Composer;
                 }
+            }
+            RunUpdate::CalloutRejected {
+                host,
+                exec_id,
+                pending_id,
+                reason,
+                reply,
+            } => {
+                if let Some(callout) = self.callouts.get_mut(&host, exec_id, pending_id) {
+                    callout.reply = Some(reply);
+                    callout.submitting = false;
+                    callout.submission_error = Some(plain_slot(&reason));
+                    callout.validation_error = None;
+                    self.callouts.select_for_pending(&host, exec_id, pending_id);
+                    self.focus = Focus::Composer;
+                }
+            }
+            RunUpdate::CalloutAccepted {
+                host,
+                exec_id,
+                pending_id,
+            } => {
+                let _ = self.callouts.remove(&host, exec_id, pending_id);
+                self.focus = if self.callouts.is_empty() {
+                    Focus::Workspace
+                } else {
+                    Focus::Composer
+                };
             }
             RunUpdate::ReceiptVerified { host, peer_id } => {
                 if !self
@@ -2956,17 +3031,14 @@ impl ScreenState {
             }
             return;
         }
-        let callout = self
-            .callouts
-            .remove_selected()
-            .expect("callout checked above");
-        if let Some(reply) = callout.reply {
+        if let Some(callout) = self.callouts.selected_mut()
+            && !callout.submitting
+            && let Some(reply) = callout.reply.take()
+        {
+            callout.submitting = true;
+            callout.submission_error = None;
             let _ = reply.send(value);
-        }
-        if !self.callouts.is_empty() {
-            self.focus = Focus::Composer;
-        } else {
-            self.focus = Focus::Workspace;
+            self.callouts.select_next_answerable();
         }
     }
 }

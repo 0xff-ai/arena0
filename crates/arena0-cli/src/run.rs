@@ -1,9 +1,10 @@
 //! Standalone execution helpers for low-level `arena0 exec` commands.
 
 use std::io::{IsTerminal as _, Write as _};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
-use arena0_client::api::{EnsembleSpec, HostRequest, NextEvent, ResponseOk};
+use arena0_client::api::{ApiErrorCode, EnsembleSpec, HostRequest, NextEvent, ResponseOk};
 use arena0_client::protocol::{ExecId, NegotiationId, NegotiationTarget, PeerId, SessionHash};
 use serde_json::Value;
 
@@ -27,6 +28,7 @@ pub(crate) fn parse_join_ensemble(values: &[String]) -> anyhow::Result<EnsembleS
 
 /// Prompt for local callouts and drive one existing execution to its terminal.
 pub(crate) async fn drive_loop(ctx: &Ctx, exec_id: ExecId) -> anyhow::Result<Completed> {
+    let mut answered = None;
     loop {
         match ctx.call(&HostRequest::ExecNext { exec_id }).await? {
             ResponseOk::Next(NextEvent::Callout {
@@ -37,6 +39,10 @@ pub(crate) async fn drive_loop(ctx: &Ctx, exec_id: ExecId) -> anyhow::Result<Com
                 context,
                 ..
             }) => {
+                if answered == Some(pending_id) {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                }
                 if !ctx.mode.is_json()
                     && let Some((_step, view)) = ctx.fetch_exec_view(exec_id).await?
                 {
@@ -46,15 +52,29 @@ pub(crate) async fn drive_loop(ctx: &Ctx, exec_id: ExecId) -> anyhow::Result<Com
                         eprint!("{rendered}");
                     }
                 }
-                let answer =
-                    prompt_answer(ctx, exec_id, &name, &prompt, &context, schema.as_value())
-                        .await?;
-                ctx.call(&HostRequest::ExecSubmit {
-                    exec_id,
-                    pending_id,
-                    answer: Some(answer),
-                })
-                .await?;
+                loop {
+                    let answer =
+                        prompt_answer(ctx, exec_id, &name, &prompt, &context, schema.as_value())
+                            .await?;
+                    match ctx
+                        .call_raw(&HostRequest::ExecSubmit {
+                            exec_id,
+                            pending_id,
+                            answer: Some(answer),
+                        })
+                        .await?
+                    {
+                        Ok(ResponseOk::Ack) => {
+                            answered = Some(pending_id);
+                            break;
+                        }
+                        Err(error) if error.code == ApiErrorCode::InputRejected => {
+                            eprintln!("{} {}", ctx.palette.yellow("rejected:"), error.message);
+                        }
+                        Err(error) => return Err(error.into()),
+                        other => bail!("unexpected exec.submit response: {other:?}"),
+                    }
+                }
                 eprintln!(
                     "{}",
                     ctx.palette
