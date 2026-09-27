@@ -4,9 +4,10 @@ use crate::call::DispatchKind;
 use arena0_crypto::SignScheme;
 use arena0_program::Capability;
 use arena0_program::abi::{self, imports};
-use arena0_protocol::execution::{MAX_DIRECT_QUEUE, MAX_OUTGOING_MESSAGES};
+use arena0_protocol::execution::{BlobChange, MAX_DIRECT_QUEUE, MAX_OUTGOING_MESSAGES};
 use arena0_protocol::{
-    BlobError, BlobHash, MAX_DIRECT_CONTROL_BYTES, MAX_DIRECT_RANGE_BYTES, PeerId, RangeAttachment,
+    BlobError, BlobHash, CvSource, MAX_BLOB_BYTES, MAX_DIRECT_CONTROL_BYTES,
+    MAX_DIRECT_RANGE_BYTES, PeerId, RangeAttachment,
 };
 use arena0_protocol::{Effect, TimerPayload};
 use std::sync::Arc;
@@ -188,24 +189,148 @@ fn read_blob_hash(
     ))
 }
 
-/// `blob_append(hash_ptr, length, attachment) -> status`. Contract in U2.
+/// The receive state of `hash` as this dispatch sees it: the view's partial
+/// overlaid with this dispatch's staged changes.
+struct Receive {
+    /// Declared length, from the partial or the first staged append.
+    length: Option<u64>,
+    /// Durable written bytes plus staged appended bytes.
+    written: u64,
+    /// Whether the partial is committed, or a `Commit` is staged.
+    committed: bool,
+    /// Whether the view has a partial row (so `hash_partial` applies).
+    durable: bool,
+}
+
+fn receive_state(state: &HostState, hash: BlobHash) -> Result<Receive, wasmtime::Error> {
+    let partial = blob_view(state)?
+        .partial(hash)
+        .map_err(wasmtime::Error::msg)?;
+    let mut receive = Receive {
+        length: partial.as_ref().map(|p| p.length),
+        written: partial.as_ref().map_or(0, |p| p.written),
+        committed: partial.as_ref().is_some_and(|p| p.committed),
+        durable: partial.is_some(),
+    };
+    for change in &state.staged_blobs {
+        match change {
+            BlobChange::Append {
+                hash: h,
+                length,
+                bytes,
+                ..
+            } if *h == hash => {
+                receive.length = Some(*length);
+                receive.written += bytes.len() as u64;
+            }
+            BlobChange::Commit { hash: h } if *h == hash => receive.committed = true,
+            _ => {}
+        }
+    }
+    Ok(receive)
+}
+
+/// The staged appended bytes for `hash`, concatenated in call order.
+fn staged_tail(state: &HostState, hash: BlobHash) -> Vec<u8> {
+    state
+        .staged_blobs
+        .iter()
+        .filter_map(|change| match change {
+            BlobChange::Append { hash: h, bytes, .. } if *h == hash => Some(bytes.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect()
+}
+
+/// The attachment stays readable for the entire dispatch; staging owns a copy.
 fn blob_append(
     caller: &mut Caller<'_, HostState>,
     hash_ptr: u32,
     length: u64,
     attachment: u32,
 ) -> Result<u32, wasmtime::Error> {
-    let _ = (caller, hash_ptr, length, attachment);
-    todo!("U2: blob_append")
+    let hash = read_blob_hash(caller, hash_ptr, imports::BLOB_APPEND)?;
+    if length > MAX_BLOB_BYTES {
+        return Ok(blob_status(BlobError::Quota));
+    }
+    let Some(bytes) = caller
+        .data()
+        .attachment
+        .as_ref()
+        .filter(|b| attachment == 0 && !b.is_empty())
+    else {
+        return Ok(blob_status(BlobError::BadAttachment));
+    };
+    let len = bytes.len();
+    let receive = receive_state(caller.data(), hash)?;
+    if receive.committed
+        || receive.length.is_some_and(|known| known != length)
+        || receive.written + len as u64 > length
+    {
+        return Ok(blob_status(BlobError::BadRange));
+    }
+    let max = caller.data().profile.limits.max_host_bytes;
+    caller
+        .data_mut()
+        .ledger
+        .copy_bytes(len, max)
+        .map_err(wasmtime::Error::new)?;
+    let bytes = caller
+        .data()
+        .attachment
+        .as_ref()
+        .expect("attachment checked")
+        .clone();
+    caller.data_mut().staged_blobs.push(BlobChange::Append {
+        hash,
+        length,
+        offset: receive.written,
+        bytes,
+    });
+    Ok(0)
 }
 
-/// `blob_commit(hash_ptr) -> status`. Contract in U2.
+/// Hash only after completeness and fuel checks, leaving mismatches unstaged.
 fn blob_commit(caller: &mut Caller<'_, HostState>, hash_ptr: u32) -> Result<u32, wasmtime::Error> {
-    let _ = (caller, hash_ptr);
-    todo!("U2: blob_commit")
+    let hash = read_blob_hash(caller, hash_ptr, imports::BLOB_COMMIT)?;
+    let receive = receive_state(caller.data(), hash)?;
+    let Some(length) = receive.length else {
+        return Ok(blob_status(BlobError::NotFound));
+    };
+    if receive.committed {
+        return Ok(blob_status(BlobError::BadRange));
+    }
+    if receive.written != length {
+        return Ok(blob_status(BlobError::Incomplete));
+    }
+    caller.charge_fuel(
+        length * caller.data().profile.fuel.hash_per_byte,
+        imports::BLOB_COMMIT,
+    )?;
+    let tail = staged_tail(caller.data(), hash);
+    let digest = if receive.durable {
+        blob_view(caller.data())?
+            .hash_partial(hash, &tail)
+            .map_err(wasmtime::Error::msg)?
+    } else {
+        BlobHash(arena0_crypto::hash(
+            arena0_crypto::HashAlgorithm::Blake3,
+            &tail,
+        ))
+    };
+    if digest != hash {
+        return Ok(blob_status(BlobError::Mismatch));
+    }
+    caller
+        .data_mut()
+        .staged_blobs
+        .push(BlobChange::Commit { hash });
+    Ok(0)
 }
 
-/// `subtree_cv(source_ptr, source_len, offset, out_ptr) -> status`. Contract in U2.
+/// Validate subtree geometry and charge before reading the granted bytes.
 fn subtree_cv(
     caller: &mut Caller<'_, HostState>,
     source_ptr: u32,
@@ -213,8 +338,76 @@ fn subtree_cv(
     offset: u64,
     out_ptr: u32,
 ) -> Result<u32, wasmtime::Error> {
-    let _ = (caller, source_ptr, source_len, offset, out_ptr);
-    todo!("U2: subtree_cv")
+    if source_len > 64 {
+        return Err(wasmtime::Error::msg("subtree_cv: source exceeds limit"));
+    }
+    let source: CvSource =
+        borsh::from_slice(&caller.read_guest_bytes(source_ptr, source_len, imports::SUBTREE_CV)?)
+            .map_err(wasmtime::Error::new)?;
+    let view = blob_view(caller.data())?;
+    let len = match source {
+        CvSource::Blob { hash, start, end } => {
+            if start >= end || end - start > MAX_DIRECT_RANGE_BYTES {
+                return Ok(blob_status(BlobError::BadRange));
+            }
+            let Some(length) = view.granted(hash).map_err(wasmtime::Error::msg)? else {
+                return Ok(blob_status(BlobError::NotFound));
+            };
+            if end > length {
+                return Ok(blob_status(BlobError::BadRange));
+            }
+            end - start
+        }
+        CvSource::Attachment(token) => {
+            let Some(bytes) = caller
+                .data()
+                .attachment
+                .as_ref()
+                .filter(|b| token.0 == 0 && !b.is_empty())
+            else {
+                return Ok(blob_status(BlobError::BadAttachment));
+            };
+            let len = bytes.len() as u64;
+            if len > MAX_DIRECT_RANGE_BYTES {
+                return Ok(blob_status(BlobError::BadRange));
+            }
+            len
+        }
+    };
+    if !arena0_crypto::blake3_tree::is_subtree(offset, len) {
+        return Ok(blob_status(BlobError::BadRange));
+    }
+    caller.charge_fuel(
+        len * caller.data().profile.fuel.hash_per_byte,
+        imports::SUBTREE_CV,
+    )?;
+    let max = caller.data().profile.limits.max_host_bytes;
+    caller
+        .data_mut()
+        .ledger
+        .copy_bytes(32, max)
+        .map_err(wasmtime::Error::new)?;
+    let blob_bytes;
+    let bytes = match source {
+        CvSource::Blob { hash, start, end } => {
+            let Some(bytes) = view.read(hash, start..end).map_err(wasmtime::Error::msg)? else {
+                return Ok(blob_status(BlobError::NotFound));
+            };
+            blob_bytes = bytes;
+            blob_bytes.as_slice()
+        }
+        CvSource::Attachment(_) => caller
+            .data()
+            .attachment
+            .as_deref()
+            .expect("attachment checked"),
+    };
+    let cv = arena0_crypto::blake3_tree::subtree_cv(bytes, offset);
+    caller
+        .work_memory()?
+        .write(&mut *caller, out_ptr as usize, &cv)
+        .map_err(wasmtime::Error::new)?;
+    Ok(0)
 }
 
 fn register_blobs(linker: &mut Linker<HostState>) -> Result<(), SandboxError> {

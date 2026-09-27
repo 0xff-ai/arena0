@@ -1309,6 +1309,87 @@ mod resident_runtime_tests {
     }
 
     #[test]
+    fn blob_dispatch_installs_context_and_returns_changes() {
+        use arena0_protocol::BlobHash;
+        use arena0_protocol::execution::BlobChange;
+        let bytes = b"opaque attachment".to_vec();
+        let hash = BlobHash(arena0_crypto::hash(
+            arena0_crypto::HashAlgorithm::Blake3,
+            &bytes,
+        ));
+        let imports = format!(
+            r#"
+            (import "arena0" "blob_append" (func $append (param i32 i64 i32) (result i32)))
+            (import "arena0" "blob_commit" (func $commit (param i32) (result i32)))
+            (data (i32.const 1200) "{}")
+        "#,
+            wat_data(&hash.0)
+        );
+        let body = format!(
+            r#"
+            i32.const 1200 i64.const {} i32.const 0 call $append if unreachable end
+            i32.const 1200 call $commit if unreachable end
+            i32.const 32768 i32.const 3 call $pack
+        "#,
+            bytes.len()
+        );
+        let mut instance = resident(
+            &body,
+            vec![Capability::Blobs, Capability::Messaging],
+            &imports,
+        );
+        let result = instance
+            .dispatch(
+                call()
+                    .with_blobs(std::sync::Arc::new(
+                        crate::engine::imports::blob_tests::View::default(),
+                    ))
+                    .with_attachment(bytes.clone()),
+            )
+            .unwrap();
+        assert_eq!(result.status, arena0_program::CallStatus::Accepted);
+        assert_eq!(
+            result.blobs,
+            vec![
+                BlobChange::Append {
+                    hash,
+                    length: bytes.len() as u64,
+                    offset: 0,
+                    bytes
+                },
+                BlobChange::Commit { hash },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejected_dispatch_discards_staged_blob_changes() {
+        let body = format!(
+            "i32.const 0 i64.const 1 i32.const 0 call $append if unreachable end {}",
+            rejected_body()
+        );
+        let mut instance = resident(
+            &body,
+            vec![Capability::Blobs],
+            r#"(import "arena0" "blob_append" (func $append (param i32 i64 i32) (result i32)))"#,
+        );
+        let result = instance
+            .dispatch(
+                call()
+                    .with_blobs(std::sync::Arc::new(
+                        crate::engine::imports::blob_tests::View::default(),
+                    ))
+                    .with_attachment(vec![1]),
+            )
+            .unwrap();
+        assert_eq!(result.status, arena0_program::CallStatus::Rejected);
+        assert!(result.blobs.is_empty());
+        // Supply valid bytes again so only the missing view can cause the trap:
+        // a rejected dispatch must not lend its authority to the next one.
+        assert!(instance.dispatch(call().with_attachment(vec![1])).is_err());
+    }
+
+    #[test]
     fn allocator_mutation_trap_rolls_back_both_state_memories() {
         let shared = arena0_program::SharedStateBytes::try_new(b"old".to_vec()).unwrap();
         let local = arena0_program::LocalStateBytes::try_new(b"keep".to_vec()).unwrap();
