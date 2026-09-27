@@ -1118,3 +1118,129 @@ async fn one_endpoint_routes_multiple_hosts_and_rejects_invalid_host_calls() {
         "missing Host must close the malformed request: {missing_host:?}"
     );
 }
+
+/// Blobs are linked by path, granted by hash at `exec.new`, and exported to a
+/// new file; unknown hashes and unusable paths are rejected before anything
+/// is published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blobs_link_grant_and_export_by_hash() {
+    let wasm = rps_wasm();
+    let d = daemon(&wasm).await;
+    let files = tempfile::tempdir().expect("blob files");
+    let bytes: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+    let first = files.path().join("first.bin");
+    std::fs::write(&first, &bytes).unwrap();
+
+    let ResponseOk::BlobImported { hash, length } = ok(call(
+        &d.host_a,
+        &HostRequest::BlobImport {
+            path: first.clone(),
+        },
+    )
+    .await) else {
+        panic!("expected BlobImported");
+    };
+    assert_eq!(length, bytes.len() as u64);
+    assert_eq!(
+        hash.0,
+        arena0_crypto::hash(arena0_crypto::HashAlgorithm::Blake3, &bytes)
+    );
+
+    // Relinking the same content from another path keeps the hash and makes
+    // the new path the one the Host reads.
+    let second = files.path().join("second.bin");
+    std::fs::write(&second, &bytes).unwrap();
+    assert_eq!(
+        ok(call(&d.host_a, &HostRequest::BlobImport { path: second }).await),
+        ResponseOk::BlobImported { hash, length }
+    );
+    std::fs::remove_file(&first).unwrap();
+
+    let missing = call(
+        &d.host_a,
+        &HostRequest::BlobImport {
+            path: files.path().join("absent.bin"),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(missing.code, arena0_api::ApiErrorCode::BadRequest);
+
+    let unknown = arena0_protocol::BlobHash([7; 32]);
+    let refused = call(
+        &d.host_a,
+        &HostRequest::ExecNew {
+            exec_id: ExecId([line!() as u8; 32]),
+            program: d.program_id.to_string(),
+            params: Some(serde_json::json!(null)),
+            ensemble: EnsembleSpec::Create {
+                participant_count: 2,
+            },
+            blobs: vec![hash, unknown],
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, arena0_api::ApiErrorCode::NotFound);
+
+    let granted = ExecId([line!() as u8; 32]);
+    assert!(matches!(
+        ok(call(
+            &d.host_a,
+            &HostRequest::ExecNew {
+                exec_id: granted,
+                program: d.program_id.to_string(),
+                params: Some(serde_json::json!(null)),
+                ensemble: EnsembleSpec::Create {
+                    participant_count: 2,
+                },
+                blobs: vec![hash],
+            },
+        )
+        .await),
+        ResponseOk::ExecCreated { .. }
+    ));
+    assert_eq!(
+        ok(call(
+            &d.host_a,
+            &HostRequest::ExecCancelCreation { exec_id: granted }
+        )
+        .await),
+        ResponseOk::Ack
+    );
+
+    let exported = files.path().join("exported.bin");
+    assert_eq!(
+        ok(call(
+            &d.host_a,
+            &HostRequest::BlobExport {
+                hash,
+                path: exported.clone(),
+            },
+        )
+        .await),
+        ResponseOk::BlobExported { length }
+    );
+    assert_eq!(std::fs::read(&exported).unwrap(), bytes);
+    let again = call(
+        &d.host_a,
+        &HostRequest::BlobExport {
+            hash,
+            path: exported,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(again.code, arena0_api::ApiErrorCode::BadRequest);
+    let absent = call(
+        &d.host_a,
+        &HostRequest::BlobExport {
+            hash: unknown,
+            path: files.path().join("never.bin"),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(absent.code, arena0_api::ApiErrorCode::NotFound);
+    assert!(!files.path().join("never.bin").exists());
+}
