@@ -365,11 +365,27 @@ never defines execution serialization and never participates in commitments,
 receipts, or portable verification. Other program Borsh values, including
 receipt params and outcomes, remain opaque bytes to the Host.
 
+Every cryptographic operation and every file-byte operation runs in the Host,
+for every program. A program holds handles and small control values: terms,
+indexes, acknowledgement bodies, and opaque signed envelopes it stores or
+forwards. It hashes with the `hash` import, derives a seeded shuffle with the
+`permutation` import, signs with `sign`, and checks a signature with `verify`.
+`hash` and `permutation` are pure, so they are allowed in every dispatch mode,
+compute identically on every participant, and repeat exactly on a rerun. Each
+charges its input and output against the dispatch's import ledger before the
+Host allocates. `verify` checks the envelope's session, program, and the
+signer's activation key, and returns the signed payload or a `VerifyError`; the
+signer's execution and coordinates stay in the preimage but cannot be checked
+against the verifier's own. The cryptography crates are Host-only dependencies
+(`cfg(not(target_arch = "wasm32"))`), so a guest that calls one fails to build;
+`scripts/check-guest-crypto.sh` asserts that no program's Wasm dependency tree
+contains them.
+
 Program import validates every required guest export before the artifact enters
 the Host's program catalog. The canonical list of names and signatures is
 `arena0_sandbox::validation::REQUIRED_FUNC_EXPORTS`, and the ABI is
-`ABI_VERSION = 22`.
-The execution profile is version 3 and binds the fixed shared/local memories,
+`ABI_VERSION = 23`.
+The execution profile is version 4 and binds the fixed shared/local memories,
 resident dispatch semantics, resource limits, and engine identity used by the
 Host. Activation carries its profile hash, so a Host rejects a different
 execution environment before the session starts.
@@ -576,11 +592,68 @@ agreement. An accepted answer consumes the ID, so a question asked again after
 an answer gets a fresh one. Any other handler keeps the ID while the state
 derives the same index and context, and replaces it when they differ.
 
-Direct messages are a future delivery extension. It would use per-recipient
-sequence numbers, a small queue of unacknowledged sends whose payload remains in
-the event record, receiver-side last-applied sequence numbers committed with
-the handler result, and attachments pinned until acknowledgement. This note
-does not define that extension's wire or storage format.
+### Blobs
+
+A blob is immutable content up to `MAX_BLOB_BYTES` (16 MiB) in a Host's store,
+named by its BLAKE3 `BlobHash` and length. A participant imports a file with
+`blob.import` before a session and passes the hash and length as ordinary
+program params; `blob.export` reads received content back out. The store never
+deletes blobs.
+
+Programs with `Capability::Blobs` see blobs only through `BlobHandle`s, and only
+in local handlers. `resolve(hash, length)` returns a handle to stored content.
+`create(hash, length)` returns an output bound to that one object.
+`accept_range(output, attachment, range)` has the Host check the Bao slice
+behind a received attachment against the output's bound hash and length, then
+write exactly those bytes; the attachment is consumed even when the check
+fails. `commit(output)` requires the written ranges to tile the whole object and
+publishes it under the bound hash. Because every range was proven against that
+hash, full coverage means the content is the object; a zero-length object
+commits only when its bound hash is BLAKE3 of empty input.
+
+Blob operations are staged during the dispatch and saved as `BlobChange`s in
+its `TransitionRecord`, so a write is durable exactly when its transition is and
+a rejected dispatch leaves none. Reads during the dispatch see the staged
+changes over the committed store. A handle is `(event_position, call_index)`,
+counting resolve and create calls, so rerunning a dispatch after a crash mints
+the same handles. A dispatch stages at most one slice, and the Host charges its
+decoded bytes against the dispatch's copied-byte budget before allocating them.
+
+### Direct messages
+
+A local handler may queue a direct message to one other participant with
+`send_direct(to, msg, range)`. Direct messages travel outside agreement: they
+never enter the public trace, a commitment, or a receipt. `msg` is at most
+`MAX_DIRECT_CONTROL_BYTES`. The optional range names a committed source blob
+and at most `MAX_DIRECT_RANGE_BYTES` of it. The Host checks both bounds at the
+call, so every queued entry is sendable. Each recipient has a queue of at most
+`MAX_DIRECT_QUEUE` unacknowledged entries in execution state; a full queue
+returns `QueueFull` and records nothing.
+
+Each peer's send lane sends any eligible agreement or terminal frame first and a
+direct frame only when none is eligible. Direct frames go in sequence order. For
+a ranged entry the lane reads the source and Bao-encodes the range when it
+sends; encoded slices are never stored. The worst-case slice fits the frame
+limit with the control message, which is a compile-time assertion. A `not yet`
+answer or a transport error delays only direct frames to that peer. An
+acknowledgement, a rejection, or a conflict removes the entry, so the lane moves
+on; transfer progress comes from signed program messages, and a program retries
+on its own timers.
+
+The receiver classifies each frame against the last sequence it applied from
+that sender. A duplicate is acknowledged without a dispatch, and a gap is
+rejected. The next frame waits with `not yet` while a proposal is staged.
+Otherwise it dispatches as a local `DirectReceived` event. The slice bytes stay
+in the dispatch's Host context, and the program receives only an `Attachment`
+token that is valid during that dispatch. The transition that commits the
+dispatch also records the applied sequence, and the Host acknowledges after
+saving it. A rejected dispatch restores memories and still records the
+sequence, so one bad frame cannot block the lane. A crash before the save
+leaves the frame unacknowledged, and the sender redelivers it with its slice.
+
+The transition that enters `EndPhase` clears every direct queue. `EndPhase`
+never waits for direct traffic, and direct frames that arrive afterwards are
+acknowledged and dropped.
 
 ### Terminal evidence and publication
 
@@ -698,7 +771,7 @@ bytes. A stopped result includes the exact `StopCause`, preserving the
 distinction between an authenticated unilateral report and a shared N-of-N
 stop. Verification does not execute Wasm and stops at these checks.
 
-This release uses store schema version 7 and rejects earlier databases with an
+This release uses store schema version 8 and rejects earlier databases with an
 unsupported-schema error. It does not rewrite or delete old evidence. Version-1
 producer-sealed receipts are also rejected; they must be inspected with the
 matching older release. Automatic migration is not provided.
@@ -867,10 +940,10 @@ The public release guarantees:
 - canonical receipt identity, distinct unilateral stop reports, and local provenance;
 - the `Transport` seam without changing runtime or proof semantics.
 
-The current compatibility boundary is `ABI_VERSION = 22`, execution profile
-version 3, `TraceEntry` format 3, the v4 `StepCommitment` domain, receipt
+The current compatibility boundary is `ABI_VERSION = 23`, execution profile
+version 4, `TraceEntry` format 3, the v4 `StepCommitment` domain, receipt
 artifact and body version 5, the v5 `ReceiptId` domain, and store schema
-version 7. Decoders reject unsupported versions, and no format silently accepts
+version 8. Decoders reject unsupported versions, and no format silently accepts
 evidence from an earlier release.
 
 The public workspace has no remote discovery, addressing, relay, remote program

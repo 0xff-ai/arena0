@@ -66,6 +66,21 @@ supported counts. Fixed programs use `{"kind":"exact","count":2}`,
 while variable-size programs use `{"kind":"range","min":2,"max":64}`. The
 requested participant count must fall within it.
 
+## Blobs
+
+| Method | Params | Success |
+|---|---|---|
+| `blob.import` | `{bytes}` | `BlobImported` `{hash, length}` |
+| `blob.export` | `{hash}` | `Blob` `{bytes}` |
+
+A blob is immutable content of at most 16 MiB in the Host's store, named by its
+BLAKE3 hash as 64 hex characters. Import a file before a session and pass its
+`hash` and `length` to the program as ordinary params; export content a session
+received. Importing content already stored succeeds with the same hash. Content
+over the limit is `BadRequest`; exporting an unknown hash is `NotFound`. The
+Host never logs blob bytes. The CLI wraps both as `arena0 blob import FILE` and
+`arena0 blob export HASH FILE`.
+
 ## Execution
 
 | Method | Params | Success |
