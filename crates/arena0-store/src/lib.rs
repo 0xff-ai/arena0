@@ -745,7 +745,9 @@ impl StoredReceipt {
 /// Execution mutations require an [`ExecutionStore`] claimed for the target
 /// execution, so cloning this handle cannot create a second live writer.
 ///
-/// Operations run on the blocking pool and serialize on the connection mutex.
+/// Async operations run on the blocking pool; SQL access serializes on the
+/// connection mutex. Blob reads, hashing, linking, and export release the
+/// mutex before file I/O. Appends retain it for their persist transaction.
 /// Dropping an operation's future does not cancel work already submitted to
 /// that pool; a lost response must be treated as an unknown outcome.
 #[derive(Clone, Debug)]
@@ -912,15 +914,73 @@ impl Drop for Store {
 impl StoreHandle {
     /// Link a daemon-local file as a blob: canonicalize `path`, stream the file
     /// once through BLAKE3, and record `(hash, length, path)` as a linked blob.
-    /// The file is neither copied nor read into memory. Linking content the
+    /// The file is neither copied nor read whole into memory. Linking content the
     /// store already owns keeps the owned file; relinking linked content
     /// records the new path. Fails `BlobTooLarge` over `MAX_BLOB_BYTES`.
     pub async fn link_blob(
         &self,
         path: PathBuf,
     ) -> Result<(arena0_protocol::BlobHash, u64), StoreError> {
-        let _ = path;
-        todo!("U1: link_blob")
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let path = std::fs::canonicalize(path)?;
+            if path.to_str().is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "blob path is not UTF-8",
+                )
+                .into());
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                // Opening a FIFO must not wait for a writer before the
+                // descriptor-based regular-file check can reject it.
+                options.custom_flags(libc::O_NONBLOCK);
+            }
+            let mut file = options.open(&path)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "blob is not a regular file",
+                )
+                .into());
+            }
+            if metadata.len() > arena0_protocol::MAX_BLOB_BYTES {
+                return Err(StoreError::BlobTooLarge {
+                    length: metadata.len(),
+                });
+            }
+            let mut hasher = blake3::Hasher::new();
+            // Bound working memory independently of the linked file's size.
+            let mut buffer = [0; 64 * 1024];
+            let mut length = 0;
+            loop {
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                length += count as u64;
+                if length > arena0_protocol::MAX_BLOB_BYTES {
+                    return Err(StoreError::BlobTooLarge { length });
+                }
+                hasher.update(&buffer[..count]);
+            }
+            let hash = arena0_protocol::BlobHash(*hasher.finalize().as_bytes());
+            let mut guard = inner.db.lock().map_err(|_| StoreError::Closed)?;
+            let db = guard.as_mut().ok_or(StoreError::Closed)?;
+            if db.is_poisoned() {
+                return Err(StoreError::Closed);
+            }
+            db.insert_linked_blob(hash, length, &path)?;
+            Ok((hash, length))
+        })
+        .await
+        .map_err(|_| StoreError::Closed)?
     }
 
     /// Copy blob `hash`'s bytes `[0, length)` to a new file at `destination`
@@ -933,8 +993,31 @@ impl StoreHandle {
         hash: arena0_protocol::BlobHash,
         destination: PathBuf,
     ) -> Result<Option<u64>, StoreError> {
-        let _ = (hash, destination);
-        todo!("U1: export_blob")
+        let location = self.run(move |db| db.blob_location(hash)).await?;
+        let Some((path, length)) = location else {
+            return Ok(None);
+        };
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let source = std::fs::File::open(path).map_err(|_| StoreError::BlobUnreadable(hash))?;
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination)?;
+            match std::io::copy(&mut source.take(length), &mut output) {
+                Ok(copied) if copied == length => Ok(Some(length)),
+                result => {
+                    drop(output);
+                    std::fs::remove_file(destination)?;
+                    match result {
+                        Ok(_) => Err(StoreError::BlobUnreadable(hash)),
+                        Err(error) => Err(StoreError::Io(error)),
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| StoreError::Closed)?
     }
 
     /// The length of `hash` if it is granted to `execution_id`. One indexed
@@ -944,8 +1027,12 @@ impl StoreHandle {
         execution_id: ExecId,
         hash: arena0_protocol::BlobHash,
     ) -> Result<Option<u64>, StoreError> {
-        let _ = (execution_id, hash);
-        todo!("U1: blob_granted_blocking")
+        let guard = self.inner.db.lock().map_err(|_| StoreError::Closed)?;
+        let db = guard.as_ref().ok_or(StoreError::Closed)?;
+        if db.is_poisoned() {
+            return Err(StoreError::Closed);
+        }
+        db.blob_granted(execution_id, hash)
     }
 
     /// Bytes `range` of blob `hash` from its file, on the caller's thread. The
@@ -957,8 +1044,27 @@ impl StoreHandle {
         hash: arena0_protocol::BlobHash,
         range: std::ops::Range<u64>,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        let _ = (hash, range);
-        todo!("U1: read_blob_range_blocking")
+        use std::io::{Read, Seek, SeekFrom};
+        let location = {
+            let guard = self.inner.db.lock().map_err(|_| StoreError::Closed)?;
+            let db = guard.as_ref().ok_or(StoreError::Closed)?;
+            if db.is_poisoned() {
+                return Err(StoreError::Closed);
+            }
+            db.blob_location(hash)?
+        };
+        let Some((path, _)) = location else {
+            return Ok(None);
+        };
+        let read = || -> std::io::Result<Vec<u8>> {
+            let mut file = std::fs::File::open(path)?;
+            file.seek(SeekFrom::Start(range.start))?;
+            let mut bytes =
+                vec![0; usize::try_from(range.end - range.start).expect("blob range fits memory")];
+            file.read_exact(&mut bytes)?;
+            Ok(bytes)
+        };
+        Ok(read().ok())
     }
 
     /// `execution_id`'s partial object for `hash`, if it received any of it.
@@ -967,8 +1073,12 @@ impl StoreHandle {
         execution_id: ExecId,
         hash: arena0_protocol::BlobHash,
     ) -> Result<Option<arena0_protocol::execution::BlobPartial>, StoreError> {
-        let _ = (execution_id, hash);
-        todo!("U1: blob_partial_blocking")
+        let guard = self.inner.db.lock().map_err(|_| StoreError::Closed)?;
+        let db = guard.as_ref().ok_or(StoreError::Closed)?;
+        if db.is_poisoned() {
+            return Err(StoreError::Closed);
+        }
+        db.blob_partial(execution_id, hash)
     }
 
     /// BLAKE3 of the partial's durable bytes `[0, written)` followed by
@@ -981,8 +1091,39 @@ impl StoreHandle {
         hash: arena0_protocol::BlobHash,
         tail: &[u8],
     ) -> Result<arena0_protocol::BlobHash, StoreError> {
-        let _ = (execution_id, hash, tail);
-        todo!("U1: hash_blob_partial_blocking")
+        use std::io::Read;
+        let (partial, path) = {
+            let guard = self.inner.db.lock().map_err(|_| StoreError::Closed)?;
+            let db = guard.as_ref().ok_or(StoreError::Closed)?;
+            if db.is_poisoned() {
+                return Err(StoreError::Closed);
+            }
+            let partial = db
+                .blob_partial(execution_id, hash)?
+                .ok_or_else(|| StoreError::Corruption("hashing a missing blob partial".into()))?;
+            (partial, db.received_path(execution_id, hash))
+        };
+        let mut hasher = blake3::Hasher::new();
+        let read = || -> std::io::Result<()> {
+            let mut file = std::fs::File::open(path)?.take(partial.written);
+            // Read only the SQL-committed prefix; failed appends may leave tails.
+            let mut buffer = [0; 64 * 1024];
+            let mut remaining = partial.written;
+            while remaining > 0 {
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
+                hasher.update(&buffer[..count]);
+                remaining -= count as u64;
+            }
+            Ok(())
+        };
+        read().map_err(|_| {
+            StoreError::Corruption("blob partial file is shorter than written".into())
+        })?;
+        hasher.update(tail);
+        Ok(arena0_protocol::BlobHash(*hasher.finalize().as_bytes()))
     }
 
     /// Read bounded reconstruction metadata for a dormant end handshake.
@@ -1296,8 +1437,7 @@ impl ExecutionStore {
         grants: &[arena0_protocol::BlobHash],
         created_at_ms: u64,
     ) -> Result<ExecutionRequestOutcome, StoreError> {
-        // S0: U1 stores and validates grants.
-        assert!(grants.is_empty(), "U1: grants at admission");
+        let grants = grants.to_vec();
         let params_len = params.as_ref().map_or(0, JsonBytes::len);
         if params_len > arena0_protocol::MAX_PARAMS_LEN {
             return Err(StoreError::PayloadTooLarge {
@@ -1313,6 +1453,7 @@ impl ExecutionStore {
                     program_hash,
                     params.map(JsonBytes::into_bytes),
                     admission,
+                    grants,
                     created_at_ms,
                 )
             })

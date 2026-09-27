@@ -90,7 +90,7 @@ fn owner_lock_path(path: &Path) -> PathBuf {
     PathBuf::from(value)
 }
 
-fn sync_parent_directory(path: &Path) -> Result<(), StoreError> {
+pub(super) fn sync_parent_directory(path: &Path) -> Result<(), StoreError> {
     #[cfg(unix)]
     {
         let parent = path
