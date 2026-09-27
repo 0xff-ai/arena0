@@ -278,6 +278,13 @@ enum ExecCommand {
         join: Option<Vec<String>>,
         #[arg(long, value_name = "KEY=VALUE")]
         param: Vec<String>,
+        /// Grant the execution read access to an imported blob. Repeatable.
+        #[arg(
+            long = "blob",
+            value_name = "HASH",
+            value_parser = |value: &str| value.parse::<arena0_client::protocol::BlobHash>().map_err(|error| error.to_string()),
+        )]
+        blobs: Vec<arena0_client::protocol::BlobHash>,
     },
     /// List executions known by the Host.
     List,
@@ -1404,6 +1411,7 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
             participants,
             join,
             param,
+            blobs,
         } => {
             let ensemble = ensemble_spec(ctx, &program, participants, join.as_deref()).await?;
             let params = answer::assemble_params(&param).map_err(anyhow::Error::msg)?;
@@ -1414,7 +1422,7 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
                     program,
                     params,
                     ensemble,
-                    blobs: vec![],
+                    blobs,
                 })
                 .await;
             let created = match created {
@@ -2025,6 +2033,20 @@ mod tests {
                 .is_ok()
         );
         assert!(Cli::try_parse_from(["arena0", "exec", "create", "program", "--join"]).is_ok());
+        let hash = "ab".repeat(32);
+        let granted = Cli::try_parse_from([
+            "arena0", "exec", "create", "program", "--join", "--blob", &hash, "--blob", &hash,
+        ])
+        .unwrap();
+        assert!(matches!(
+            granted.command,
+            Some(Command::Exec {
+                command: ExecCommand::Create { blobs, .. }
+            }) if blobs.len() == 2
+        ));
+        assert!(
+            Cli::try_parse_from(["arena0", "exec", "create", "program", "--blob", "zz"]).is_err()
+        );
         assert!(
             Cli::try_parse_from([
                 "arena0",

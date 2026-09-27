@@ -70,22 +70,34 @@ requested participant count must fall within it.
 
 | Method | Params | Success |
 |---|---|---|
-| `blob.import` | `{bytes}` | `BlobImported` `{hash, length}` |
-| `blob.export` | `{hash}` | `Blob` `{bytes}` |
+| `blob.import` | `{path}` | `BlobImported` `{hash, length}` |
+| `blob.export` | `{hash, path}` | `BlobExported` `{length}` |
 
-A blob is immutable content of at most 16 MiB in the Host's store, named by its
-BLAKE3 hash as 64 hex characters. Import a file before a session and pass its
-`hash` and `length` to the program as ordinary params; export content a session
-received. Importing content already stored succeeds with the same hash. Content
-over the limit is `BadRequest`; exporting an unknown hash is `NotFound`. The
-Host never logs blob bytes. The CLI wraps both as `arena0 blob import FILE` and
-`arena0 blob export HASH FILE`.
+A blob is immutable content of at most 16 MiB, named by its BLAKE3 hash as 64
+hex characters. Paths are absolute paths on the Host's machine.
+
+`blob.import` links the file in place: the Host hashes it once and records its
+path, without copying it or reading it whole into memory. The file must stay
+unchanged while executions use it; a program that checks what it receives
+detects a changed file, but the Host does not. Importing the same content again
+succeeds with the same hash and records the new path. A missing or unreadable
+path, or content over the limit, is `BadRequest`.
+
+`blob.export` writes the blob to a new file at `path` and never replaces an
+existing file (`BadRequest`). An unknown hash is `NotFound`; a blob whose file
+is gone or shorter than its length is `BadRequest`.
+
+An execution reads only the blobs its participant grants in `exec.new` and the
+blobs it receives and commits. Pass a blob's `hash` and `length` to the program
+as ordinary params. The Host never logs blob bytes. The CLI wraps these as
+`arena0 blob import FILE`, `arena0 blob export HASH FILE`, and
+`arena0 exec create PROGRAM --blob HASH` (repeatable).
 
 ## Execution
 
 | Method | Params | Success |
 |---|---|---|
-| `exec.new` | `{exec_id, program, params?, ensemble}` | `ExecCreated` |
+| `exec.new` | `{exec_id, program, params?, ensemble, blobs?}` | `ExecCreated` |
 | `exec.list` | — | `ExecList` |
 | `exec.status` | `{exec_id}` | `Status` |
 | `exec.inspect` | `{exec_id, events_from?, events_limit}` | `Inspection` |
@@ -102,6 +114,12 @@ Host never logs blob bytes. The CLI wraps both as `arena0 blob import FILE` and
 `exec.view` renders the program's shared-state view during execution and after
 termination. Terminal views use the saved shared state and remain available
 after the live execution driver exits. Negotiating executions have no view yet.
+
+`blobs` lists hashes of imported blobs this participant grants the execution;
+it defaults to none. An unknown hash is `NotFound`, before anything is
+published. The grants are part of the request: retrying the same `exec_id`
+with different grants is `BadRequest`. The MCP `start_execution` tool grants
+no blobs yet.
 
 The client generates a unique `exec_id` before calling `exec.new`. The Host
 uses that exact identifier, allowing the client to send
