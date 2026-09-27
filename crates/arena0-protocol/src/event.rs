@@ -54,8 +54,8 @@ pub enum Event<M = Vec<u8>> {
     /// A previously set timer fired with its scheduled payload.
     TimerFired { timer: TimerPayload },
     /// A direct message from `from`, delivered outside agreement as a local
-    /// event. `slice` names the Bao slice the frame carried; its bytes stay in
-    /// the Host for the duration of this dispatch.
+    /// event. `attachment` names the bytes the frame carried; they stay in the
+    /// Host for the duration of this dispatch.
     DirectReceived {
         from: PeerId,
         #[borsh(
@@ -63,7 +63,7 @@ pub enum Event<M = Vec<u8>> {
             deserialize_with = "bounded::read_bytes::<MAX_DIRECT_CONTROL_BYTES>"
         )]
         msg: Vec<u8>,
-        slice: Option<Attachment>,
+        attachment: Option<Attachment>,
     },
 }
 
@@ -87,7 +87,15 @@ impl Event<Vec<u8>> {
                 data,
             },
             Self::TimerFired { timer } => Event::TimerFired { timer },
-            Self::DirectReceived { from, msg, slice } => Event::DirectReceived { from, msg, slice },
+            Self::DirectReceived {
+                from,
+                msg,
+                attachment,
+            } => Event::DirectReceived {
+                from,
+                msg,
+                attachment,
+            },
         })
     }
 }

@@ -188,6 +188,7 @@ async fn variable_size_program_accepts_supported_creator_count() {
                 ensemble: EnsembleSpec::Create {
                     participant_count: 3,
                 },
+                blobs: vec![],
             },
         ),
     )
@@ -206,6 +207,7 @@ async fn variable_size_program_accepts_supported_creator_count() {
                 ensemble: EnsembleSpec::Create {
                     participant_count: 3,
                 },
+                blobs: vec![],
             },
         ),
     )

@@ -8,8 +8,9 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod keys;
 
+/// BLAKE3 tree primitives: subtree chaining values and parent merges.
 #[cfg(not(target_arch = "wasm32"))]
-pub mod bao;
+pub mod blake3_tree;
 
 /// Host-only BLS12-381 (MinSig) aggregate signing and verification.
 #[cfg(not(target_arch = "wasm32"))]

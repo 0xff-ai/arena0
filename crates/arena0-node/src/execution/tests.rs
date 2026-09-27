@@ -41,7 +41,7 @@ async fn duplicate_and_gap_direct_frames_are_acked_or_rejected_without_dispatch(
     let frame = |seq| ExecFrame::Direct {
         seq,
         msg: vec![1],
-        slice: None,
+        attachment: None,
     };
     assert_eq!(actor.accept_frame(peer, frame(1)).await.unwrap(), None);
     let state = borsh::to_vec(&actor.state).unwrap();
@@ -83,7 +83,7 @@ async fn direct_frames_wait_while_a_proposal_is_staged() {
                 ExecFrame::Direct {
                     seq: 1,
                     msg: vec![1],
-                    slice: None
+                    attachment: None
                 }
             )
             .await
@@ -240,6 +240,7 @@ impl Fixture {
                     || ExecutionAdmission::create(NEGOTIATION_ID, 2).expect("admission"),
                     |peer| ExecutionAdmission::join(peer.local_keys.peer_id(), NEGOTIATION_ID),
                 ),
+                &[],
                 2,
             )
             .await
@@ -2930,7 +2931,7 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
           (import "arena0" "state_write" (func $state_write (param i32 i32 i32)))
           {extra_imports}
           (memory (export "memory") 1)
-          (global (export "arena0_abi_version") i32 (i32.const 23))
+          (global (export "arena0_abi_version") i32 (i32.const 24))
           (data (i32.const 1024) "\01")
           (data (i32.const 1030) "\02")
           (data (i32.const 1040) "\09")

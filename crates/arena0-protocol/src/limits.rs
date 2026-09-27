@@ -12,16 +12,14 @@ pub const MAX_TERMINAL_OUTCOME_BYTES: usize = 64 * 1024;
 /// in one offer and one convergence-fetch response.
 pub const MAX_PARTICIPANTS: usize = 64;
 
-/// Maximum length of one object in the local blob store. `create` and
-/// `resolve` reject larger objects.
+/// Maximum length of one object in the local blob store. Import and `append`
+/// reject larger objects.
 pub const MAX_BLOB_BYTES: u64 = 16 * 1024 * 1024;
 /// Maximum program bytes in one direct message (`Effect::SendDirect::msg`).
 pub const MAX_DIRECT_CONTROL_BYTES: usize = 2 * 1024;
-/// Maximum length of the object range one direct message carries.
-pub const MAX_DIRECT_RANGE_BYTES: u64 = 56 * 1024;
-/// Maximum Bao slice bytes in one direct frame: the worst case for a
-/// `MAX_DIRECT_RANGE_BYTES` range of a `MAX_BLOB_BYTES` object under Bao 0.13
-/// combined encoding (8-byte header, whole 1 KiB leaves, 64-byte parents).
-/// `ExecFrame::Direct` asserts that this, `MAX_DIRECT_CONTROL_BYTES`, and the
-/// frame's fixed fields fit `MAX_EXEC_FRAME_BYTES`.
-pub const MAX_DIRECT_SLICE_BYTES: usize = 63_304;
+/// Maximum length of the blob range one direct message carries, and of the
+/// bytes one `subtree_cv` call hashes. A power of two of BLAKE3 chunks, so
+/// ranges aligned to it are whole BLAKE3 subtrees. `ExecFrame::Direct` asserts
+/// that this, `MAX_DIRECT_CONTROL_BYTES`, and the frame's fixed fields fit
+/// `MAX_EXEC_FRAME_BYTES`.
+pub const MAX_DIRECT_RANGE_BYTES: u64 = 32 * 1024;

@@ -28,8 +28,8 @@ pub enum ResponseOk {
         hash: BlobHash,
         length: u64,
     },
-    Blob {
-        bytes: Vec<u8>,
+    BlobExported {
+        length: u64,
     },
     /// `exec.new` returns immediately; negotiation runs in the background. The state
     /// is `Negotiating` (or its later observable states); `queue_position` is `Some`

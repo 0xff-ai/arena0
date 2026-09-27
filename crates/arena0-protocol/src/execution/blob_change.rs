@@ -1,45 +1,36 @@
 //! Blob-store changes staged by one dispatch.
 //!
 //! The sandbox stages these while a local handler runs; the store applies them
-//! in the dispatch's transaction, so a write is durable exactly when its
-//! transition is, and a rejected dispatch leaves none.
+//! in the dispatch's transaction, so received bytes are durable exactly when
+//! their transition is, and a rejected dispatch leaves none.
 
-use crate::{BlobHandle, BlobHash};
+use crate::BlobHash;
 
 /// One blob-store mutation, in call order within its dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlobChange {
-    /// A new output bound to object `(hash, length)`.
-    Create {
-        handle: BlobHandle,
+    /// Received bytes of object `(hash, length)` at `offset`. The first append
+    /// of an object in an execution creates its partial; later appends
+    /// continue at the partial's `written` offset.
+    Append {
         hash: BlobHash,
         length: u64,
-    },
-    /// Verified bytes for `output` at `offset`.
-    Write {
-        handle: BlobHandle,
         offset: u64,
         bytes: Vec<u8>,
     },
-    /// `handle`'s output is complete; its content is published under its hash.
-    Commit { handle: BlobHandle },
-    /// A handle naming already stored content `(hash, length)`.
-    Resolve {
-        handle: BlobHandle,
-        hash: BlobHash,
-        length: u64,
-    },
+    /// The execution's partial for `hash` is complete and the dispatch checked
+    /// that its bytes hash to `hash`. Publishes it, grants it to the execution,
+    /// and marks the partial committed.
+    Commit { hash: BlobHash },
 }
 
-/// What one handle names in the blob store.
+/// An object an execution is receiving or received: its declared length and
+/// the bytes durably written so far, `[0, written)`. Once `committed`, the
+/// execution can never append to or commit that hash again, so a published
+/// file is never rewritten.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BlobResource {
-    /// The object the handle is bound to.
-    pub hash: BlobHash,
+pub struct BlobPartial {
     pub length: u64,
-    /// `true` for an output minted by `create`; `false` for `resolve`.
-    pub output: bool,
-    /// For an output, whether `commit` published it. Resolved handles name
-    /// complete content and are always `true`.
+    pub written: u64,
     pub committed: bool,
 }

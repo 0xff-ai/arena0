@@ -47,6 +47,40 @@ pub(crate) fn register_always_available(
     linker
         .func_wrap(
             abi::HOST_MODULE,
+            imports::MERGE_CV,
+            |mut caller: Caller<'_, HostState>,
+             left_ptr: u32,
+             right_ptr: u32,
+             root: u32,
+             out_ptr: u32| {
+                caller.begin_import(imports::MERGE_CV)?;
+                let left = caller.read_guest_bytes(left_ptr, 32, imports::MERGE_CV)?;
+                let right = caller.read_guest_bytes(right_ptr, 32, imports::MERGE_CV)?;
+                // One BLAKE3 compression over the 64-byte parent block.
+                let fuel = 64 * caller.data().profile.fuel.hash_per_byte;
+                caller.charge_fuel(fuel, imports::MERGE_CV)?;
+                let max = caller.data().profile.limits.max_host_bytes;
+                caller
+                    .data_mut()
+                    .ledger
+                    .copy_bytes(32, max)
+                    .map_err(wasmtime::Error::new)?;
+                let parent = arena0_crypto::blake3_tree::merge_cv(
+                    &left.try_into().expect("cv width"),
+                    &right.try_into().expect("cv width"),
+                    root != 0,
+                );
+                caller
+                    .work_memory()?
+                    .write(&mut caller, out_ptr as usize, &parent)
+                    .map_err(|error| wasmtime::Error::msg(error.to_string()))
+            },
+        )
+        .map_err(map_err)?;
+
+    linker
+        .func_wrap(
+            abi::HOST_MODULE,
             imports::PERMUTATION,
             |mut caller: Caller<'_, HostState>, seed_ptr: u32, n: u32, out_ptr: u32| {
                 caller.begin_import(imports::PERMUTATION)?;

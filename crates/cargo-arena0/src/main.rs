@@ -1,7 +1,7 @@
 //! `cargo-arena0`: finalize an arena0 program and embed its metadata section.
 //!
 //! `cargo arena0 build` runs `cargo build` for `wasm32-unknown-unknown`, then
-//! finalizes each produced wasm to the bounded ABI-23 memory layout and appends
+//! finalizes each produced wasm to the bounded ABI-24 memory layout and appends
 //! its Borsh `ProgramDefinition` as a custom section.
 
 use std::ffi::OsString;

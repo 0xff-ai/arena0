@@ -331,11 +331,11 @@ fn module_handler_methods(items: &[Item]) -> Result<Vec<TokenStream2>> {
                 ctx: &mut ::arena0::LocalContext<Self::Shared, Self::Local>,
                 from: ::arena0::Participant,
                 msg: ::std::vec::Vec<u8>,
-                slice: ::core::option::Option<::arena0::Attachment>,
+                attachment: ::core::option::Option<::arena0::Attachment>,
             ) -> Result<(), ::arena0::ProgramFault> {
                 let msg: #direct_ty = ::arena0::borsh::from_slice(&msg)
                     .map_err(|error| ::arena0::anyhow::anyhow!("direct message decode failed: {error}"))?;
-                self::on_direct(ctx, from, msg, slice)
+                self::on_direct(ctx, from, msg, attachment)
             }
         });
     }
@@ -374,7 +374,7 @@ fn module_view_impl(items: &[Item], program_ident: &Ident, shared_ty: &Type) -> 
     }
 }
 
-/// The direct-message type of a module's `on_direct(ctx, from, msg: T, slice)`, if any.
+/// The direct-message type of a module's `on_direct(ctx, from, msg: T, attachment)`, if any.
 fn module_direct_arg(items: &[Item]) -> Result<Option<Type>> {
     let Some(function) = items.iter().find_map(|item| match item {
         Item::Fn(function) if function.sig.ident == "on_direct" => Some(function),
@@ -392,7 +392,7 @@ fn module_direct_arg(items: &[Item]) -> Result<Option<Type>> {
         ] => Ok(Some((*msg.ty).clone())),
         _ => Err(Error::new(
             function.sig.span(),
-            "on_direct must take (ctx: &mut LocalContext, from: Participant, msg: T, slice: Option<Attachment>)",
+            "on_direct must take (ctx: &mut LocalContext, from: Participant, msg: T, attachment: Option<Attachment>)",
         )),
     }
 }

@@ -1,23 +1,20 @@
-//! Capability-gated host function registration (messaging, timers, and sign).
+//! Capability-gated host function registration (messaging, timers, sign, and blobs).
 
 use crate::call::DispatchKind;
 use arena0_crypto::SignScheme;
 use arena0_program::Capability;
 use arena0_program::abi::{self, imports};
-use arena0_protocol::execution::{
-    BlobChange, BlobResource, MAX_DIRECT_QUEUE, MAX_OUTGOING_MESSAGES,
-};
+use arena0_protocol::execution::{MAX_DIRECT_QUEUE, MAX_OUTGOING_MESSAGES};
 use arena0_protocol::{
-    BlobError, BlobHandle, BlobHash, MAX_BLOB_BYTES, MAX_DIRECT_CONTROL_BYTES,
-    MAX_DIRECT_RANGE_BYTES, PeerId, RangeAttachment,
+    BlobError, BlobHash, MAX_DIRECT_CONTROL_BYTES, MAX_DIRECT_RANGE_BYTES, PeerId, RangeAttachment,
 };
 use arena0_protocol::{Effect, TimerPayload};
-use std::ops::Range;
+use std::sync::Arc;
 use wasmtime::{Caller, Linker};
 
 use super::{CallerExt as _, u32_to_sign_scheme};
-use crate::SandboxError;
 use crate::engine::HostState;
+use crate::{BlobView, SandboxError};
 
 /// Register host functions for each declared capability into the linker.
 pub(crate) fn register_capability_imports(
@@ -90,11 +87,12 @@ fn register_messaging(linker: &mut Linker<HostState>) -> Result<(), SandboxError
                         caller.read_guest_bytes(range_ptr, range_len, imports::SEND_DIRECT)?;
                     let range: RangeAttachment =
                         borsh::from_slice(&bytes).map_err(wasmtime::Error::new)?;
-                    let resource = blob_resource(caller.data(), range.source)?
-                        .ok_or_else(|| wasmtime::Error::msg("send_direct: unknown source"))?;
-                    if !resource.committed
-                        || range.start >= range.end
-                        || range.end > resource.length
+                    let length = blob_view(caller.data())?
+                        .granted(range.hash)
+                        .map_err(wasmtime::Error::msg)?
+                        .ok_or_else(|| wasmtime::Error::msg("send_direct: blob not granted"))?;
+                    if range.start >= range.end
+                        || range.end > length
                         || range.end - range.start > MAX_DIRECT_RANGE_BYTES
                     {
                         return Err(wasmtime::Error::msg("send_direct: invalid source range"));
@@ -166,231 +164,72 @@ fn require_local(caller: &Caller<'_, HostState>, name: &str) -> Result<(), wasmt
     Ok(())
 }
 
-/// Staged creates/resolves own their resource metadata; commits overlay either
-/// those records or a previously persisted resource. Store failures are traps.
-fn blob_resource(
-    state: &HostState,
-    handle: BlobHandle,
-) -> Result<Option<BlobResource>, wasmtime::Error> {
-    let view = state
-        .blobs
-        .as_ref()
-        .ok_or_else(|| wasmtime::Error::msg("blob view unavailable"))?;
-    let staged = state.staged_blobs.iter().find_map(|change| match change {
-        BlobChange::Create {
-            handle: h,
-            hash,
-            length,
-        } if *h == handle => Some(BlobResource {
-            hash: *hash,
-            length: *length,
-            output: true,
-            committed: false,
-        }),
-        BlobChange::Resolve {
-            handle: h,
-            hash,
-            length,
-        } if *h == handle => Some(BlobResource {
-            hash: *hash,
-            length: *length,
-            output: false,
-            committed: true,
-        }),
-        _ => None,
-    });
-    let mut resource = match staged {
-        Some(resource) => Some(resource),
-        None => view.resource(handle).map_err(wasmtime::Error::msg)?,
-    };
-    if let Some(resource) = &mut resource
-        && state
-            .staged_blobs
-            .iter()
-            .any(|c| matches!(c, BlobChange::Commit { handle: h } if *h == handle))
-    {
-        resource.committed = true;
-    }
-    Ok(resource)
-}
-
-fn blob_written(state: &HostState, handle: BlobHandle) -> Result<Vec<Range<u64>>, wasmtime::Error> {
-    let created_here = state
-        .staged_blobs
-        .iter()
-        .any(|c| matches!(c, BlobChange::Create { handle: h, .. } if *h == handle));
-    let mut ranges = if created_here {
-        Vec::new()
-    } else {
-        state
-            .blobs
-            .as_ref()
-            .expect("blob view checked")
-            .written(handle)
-            .map_err(wasmtime::Error::msg)?
-    };
-    for change in &state.staged_blobs {
-        if let BlobChange::Write {
-            handle: h,
-            offset,
-            bytes,
-        } = change
-            && *h == handle
-        {
-            ranges.push(*offset..*offset + bytes.len() as u64);
-        }
-    }
-    ranges.sort_by_key(|r| r.start);
-    Ok(ranges)
-}
-
 fn blob_status(error: BlobError) -> u32 {
     u32::from(borsh::to_vec(&error).expect("blob error encoding")[0]) + 1
 }
 
-fn read_blob_handle(
+fn blob_view(state: &HostState) -> Result<Arc<dyn BlobView>, wasmtime::Error> {
+    state
+        .blobs
+        .clone()
+        .ok_or_else(|| wasmtime::Error::msg("blob view unavailable"))
+}
+
+fn read_blob_hash(
     caller: &mut Caller<'_, HostState>,
     ptr: u32,
-) -> Result<BlobHandle, wasmtime::Error> {
-    let bytes = caller.read_guest_bytes(ptr, 12, "blob handle")?;
-    borsh::from_slice(&bytes).map_err(wasmtime::Error::new)
+    name: &str,
+) -> Result<BlobHash, wasmtime::Error> {
+    Ok(BlobHash(
+        caller
+            .read_guest_bytes(ptr, 32, name)?
+            .try_into()
+            .expect("hash width"),
+    ))
+}
+
+/// `blob_append(hash_ptr, length, attachment) -> status`. Contract in U2.
+fn blob_append(
+    caller: &mut Caller<'_, HostState>,
+    hash_ptr: u32,
+    length: u64,
+    attachment: u32,
+) -> Result<u32, wasmtime::Error> {
+    let _ = (caller, hash_ptr, length, attachment);
+    todo!("U2: blob_append")
+}
+
+/// `blob_commit(hash_ptr) -> status`. Contract in U2.
+fn blob_commit(caller: &mut Caller<'_, HostState>, hash_ptr: u32) -> Result<u32, wasmtime::Error> {
+    let _ = (caller, hash_ptr);
+    todo!("U2: blob_commit")
+}
+
+/// `subtree_cv(source_ptr, source_len, offset, out_ptr) -> status`. Contract in U2.
+fn subtree_cv(
+    caller: &mut Caller<'_, HostState>,
+    source_ptr: u32,
+    source_len: u32,
+    offset: u64,
+    out_ptr: u32,
+) -> Result<u32, wasmtime::Error> {
+    let _ = (caller, source_ptr, source_len, offset, out_ptr);
+    todo!("U2: subtree_cv")
 }
 
 fn register_blobs(linker: &mut Linker<HostState>) -> Result<(), SandboxError> {
-    for (name, resolve) in [(imports::BLOB_RESOLVE, true), (imports::BLOB_CREATE, false)] {
-        linker
-            .func_wrap(
-                abi::HOST_MODULE,
-                name,
-                move |mut caller: Caller<'_, HostState>,
-                      hash_ptr: u32,
-                      length: u64,
-                      out_ptr: u32|
-                      -> Result<u32, wasmtime::Error> {
-                    caller.begin_import(name)?;
-                    require_local(&caller, name)?;
-                    let view = caller
-                        .data()
-                        .blobs
-                        .clone()
-                        .ok_or_else(|| wasmtime::Error::msg("blob view unavailable"))?;
-                    if length > MAX_BLOB_BYTES {
-                        return Ok(blob_status(BlobError::Quota));
-                    }
-                    let hash = BlobHash(
-                        caller
-                            .read_guest_bytes(hash_ptr, 32, name)?
-                            .try_into()
-                            .expect("hash width"),
-                    );
-                    if resolve {
-                        let mut contained = false;
-                        for change in &caller.data().staged_blobs {
-                            if let BlobChange::Commit { handle } = change {
-                                let resource = blob_resource(caller.data(), *handle)?
-                                    .expect("staged commit resource");
-                                if resource.hash == hash && resource.length == length {
-                                    contained = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if !contained
-                            && !view.contains(hash, length).map_err(wasmtime::Error::msg)?
-                        {
-                            return Ok(blob_status(BlobError::NotFound));
-                        }
-                    }
-                    let handle = BlobHandle {
-                        event_position: caller.data().event_position,
-                        call_index: caller.data().blob_calls,
-                    };
-                    caller.data_mut().blob_calls += 1;
-                    let change = if resolve {
-                        BlobChange::Resolve {
-                            handle,
-                            hash,
-                            length,
-                        }
-                    } else {
-                        BlobChange::Create {
-                            handle,
-                            hash,
-                            length,
-                        }
-                    };
-                    let encoded = borsh::to_vec(&handle).expect("blob handle encoding");
-                    let max = caller.data().profile.limits.max_host_bytes;
-                    caller
-                        .data_mut()
-                        .ledger
-                        .copy_bytes(encoded.len(), max)
-                        .map_err(wasmtime::Error::new)?;
-                    caller
-                        .work_memory()?
-                        .write(&mut caller, out_ptr as usize, &encoded)
-                        .map_err(wasmtime::Error::new)?;
-                    caller.data_mut().staged_blobs.push(change);
-                    Ok(0)
-                },
-            )
-            .map_err(map_err)?;
-    }
     linker
         .func_wrap(
             abi::HOST_MODULE,
-            imports::BLOB_ACCEPT_RANGE,
+            imports::BLOB_APPEND,
             |mut caller: Caller<'_, HostState>,
-             handle_ptr: u32,
-             attachment: u32,
-             start: u64,
-             end: u64|
+             hash_ptr: u32,
+             length: u64,
+             attachment: u32|
              -> Result<u32, wasmtime::Error> {
-                caller.begin_import(imports::BLOB_ACCEPT_RANGE)?;
-                require_local(&caller, imports::BLOB_ACCEPT_RANGE)?;
-                let handle = read_blob_handle(&mut caller, handle_ptr)?;
-                let Some(resource) = blob_resource(caller.data(), handle)? else {
-                    return Ok(blob_status(BlobError::NotFound));
-                };
-                if !resource.output || resource.committed {
-                    return Ok(blob_status(BlobError::BadRange));
-                }
-                if attachment != 0 {
-                    return Ok(blob_status(BlobError::BadSlice));
-                }
-                let Some(slice) = caller.data_mut().slice.take() else {
-                    return Ok(blob_status(BlobError::BadSlice));
-                };
-                if start >= end
-                    || end > resource.length
-                    || end - start > MAX_DIRECT_RANGE_BYTES
-                    || blob_written(caller.data(), handle)?
-                        .iter()
-                        .any(|r| start < r.end && r.start < end)
-                {
-                    return Ok(blob_status(BlobError::BadRange));
-                }
-                let max = caller.data().profile.limits.max_host_bytes;
-                caller
-                    .data_mut()
-                    .ledger
-                    .copy_bytes((end - start) as usize, max)
-                    .map_err(wasmtime::Error::new)?;
-                let Some(bytes) = arena0_crypto::bao::decode_slice(
-                    &slice,
-                    &resource.hash.0,
-                    resource.length,
-                    start,
-                    end - start,
-                ) else {
-                    return Ok(blob_status(BlobError::BadSlice));
-                };
-                caller.data_mut().staged_blobs.push(BlobChange::Write {
-                    handle,
-                    offset: start,
-                    bytes,
-                });
-                Ok(0)
+                caller.begin_import(imports::BLOB_APPEND)?;
+                require_local(&caller, imports::BLOB_APPEND)?;
+                blob_append(&mut caller, hash_ptr, length, attachment)
             },
         )
         .map_err(map_err)?;
@@ -398,37 +237,26 @@ fn register_blobs(linker: &mut Linker<HostState>) -> Result<(), SandboxError> {
         .func_wrap(
             abi::HOST_MODULE,
             imports::BLOB_COMMIT,
-            |mut caller: Caller<'_, HostState>, handle_ptr: u32| -> Result<u32, wasmtime::Error> {
+            |mut caller: Caller<'_, HostState>, hash_ptr: u32| -> Result<u32, wasmtime::Error> {
                 caller.begin_import(imports::BLOB_COMMIT)?;
                 require_local(&caller, imports::BLOB_COMMIT)?;
-                let handle = read_blob_handle(&mut caller, handle_ptr)?;
-                let Some(resource) = blob_resource(caller.data(), handle)? else {
-                    return Ok(blob_status(BlobError::NotFound));
-                };
-                if !resource.output || resource.committed {
-                    return Ok(blob_status(BlobError::BadRange));
-                }
-                let mut end = 0;
-                for range in blob_written(caller.data(), handle)? {
-                    if range.start != end {
-                        return Ok(blob_status(BlobError::Incomplete));
-                    }
-                    end = range.end;
-                }
-                if end != resource.length {
-                    return Ok(blob_status(BlobError::Incomplete));
-                }
-                if resource.length == 0
-                    && resource.hash.0
-                        != arena0_crypto::hash(arena0_crypto::HashAlgorithm::Blake3, b"")
-                {
-                    return Ok(blob_status(BlobError::BadSlice));
-                }
-                caller
-                    .data_mut()
-                    .staged_blobs
-                    .push(BlobChange::Commit { handle });
-                Ok(0)
+                blob_commit(&mut caller, hash_ptr)
+            },
+        )
+        .map_err(map_err)?;
+    linker
+        .func_wrap(
+            abi::HOST_MODULE,
+            imports::SUBTREE_CV,
+            |mut caller: Caller<'_, HostState>,
+             source_ptr: u32,
+             source_len: u32,
+             offset: u64,
+             out_ptr: u32|
+             -> Result<u32, wasmtime::Error> {
+                caller.begin_import(imports::SUBTREE_CV)?;
+                require_local(&caller, imports::SUBTREE_CV)?;
+                subtree_cv(&mut caller, source_ptr, source_len, offset, out_ptr)
             },
         )
         .map_err(map_err)?;

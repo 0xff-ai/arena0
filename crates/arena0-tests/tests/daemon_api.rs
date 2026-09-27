@@ -47,6 +47,7 @@ async fn exec_new_returns_immediately_and_await_blocks() {
             ensemble: EnsembleSpec::Create {
                 participant_count: 2,
             },
+            blobs: vec![],
         },
     )
     .await;
@@ -75,6 +76,7 @@ async fn exec_new_returns_immediately_and_await_blocks() {
             ensemble: EnsembleSpec::Join {
                 target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
             },
+            blobs: vec![],
         },
     )
     .await;
@@ -150,6 +152,7 @@ async fn competing_callout_submissions_return_typed_conflict_and_execution_conti
             ensemble: EnsembleSpec::Create {
                 participant_count: 2,
             },
+            blobs: vec![],
         },
     )
     .await)
@@ -171,6 +174,7 @@ async fn competing_callout_submissions_return_typed_conflict_and_execution_conti
                 ensemble: EnsembleSpec::Join {
                     target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
                 },
+                blobs: vec![],
             },
         )
         .await,
@@ -243,6 +247,7 @@ async fn rejected_input_is_typed_and_emits_no_answered_event() {
             ensemble: EnsembleSpec::Create {
                 participant_count: 2,
             },
+            blobs: vec![],
         },
     )
     .await)
@@ -264,6 +269,7 @@ async fn rejected_input_is_typed_and_emits_no_answered_event() {
                 ensemble: EnsembleSpec::Join {
                     target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
                 },
+                blobs: vec![],
             },
         )
         .await,
@@ -361,6 +367,7 @@ async fn stale_callout_after_terminal_is_typed_conflict_and_missing_exec_is_not_
             ensemble: EnsembleSpec::Create {
                 participant_count: 2,
             },
+            blobs: vec![],
         },
     )
     .await)
@@ -382,6 +389,7 @@ async fn stale_callout_after_terminal_is_typed_conflict_and_missing_exec_is_not_
                 ensemble: EnsembleSpec::Join {
                     target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
                 },
+                blobs: vec![],
             },
         )
         .await,
@@ -538,6 +546,7 @@ async fn negotiating_ticket_can_be_withdrawn() {
                 ensemble: EnsembleSpec::Create {
                     participant_count: 2,
                 },
+                blobs: vec![],
             },
         )
         .await,
@@ -579,6 +588,7 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
             ensemble: EnsembleSpec::Create {
                 participant_count: 2,
             },
+            blobs: vec![],
         },
     )
     .await)
@@ -618,6 +628,7 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
                 ensemble: EnsembleSpec::Join {
                     target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
                 },
+                blobs: vec![],
             },
         )
         .await,
@@ -737,6 +748,7 @@ async fn events_subscribe_streams_negotiation_step_terminal() {
             ensemble: EnsembleSpec::Create {
                 participant_count: 2,
             },
+            blobs: vec![],
         },
     )
     .await)
@@ -758,6 +770,7 @@ async fn events_subscribe_streams_negotiation_step_terminal() {
                 ensemble: EnsembleSpec::Join {
                     target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
                 },
+                blobs: vec![],
             },
         )
         .await,
@@ -889,6 +902,7 @@ async fn receipt_id_import_idempotence_and_list() {
             ensemble: EnsembleSpec::Create {
                 participant_count: 2,
             },
+            blobs: vec![],
         },
     )
     .await)
@@ -910,6 +924,7 @@ async fn receipt_id_import_idempotence_and_list() {
                 ensemble: EnsembleSpec::Join {
                     target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
                 },
+                blobs: vec![],
             },
         )
         .await,
@@ -1060,6 +1075,7 @@ async fn one_endpoint_routes_multiple_hosts_and_rejects_invalid_host_calls() {
                 ensemble: EnsembleSpec::Create {
                     participant_count: 2,
                 },
+                blobs: vec![],
             },
         )
         .await,

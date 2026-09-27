@@ -206,7 +206,11 @@ impl ExecutionActor {
                 })?;
                 self.persist_step_signature(next, Some(certified)).await?;
             }
-            ExecFrame::Direct { seq, msg, slice } => {
+            ExecFrame::Direct {
+                seq,
+                msg,
+                attachment,
+            } => {
                 if !matches!(self.state.end_phase(), EndPhase::Open) {
                     return Ok(None);
                 }
@@ -220,7 +224,7 @@ impl ExecutionActor {
                 {
                     return Ok(Some(NotYet));
                 }
-                return match self.dispatch_direct(source, seq, msg, slice).await? {
+                return match self.dispatch_direct(source, seq, msg, attachment).await? {
                     super::guest::DispatchOutcome::Committed
                     | super::guest::DispatchOutcome::Rejected { .. } => Ok(None),
                     super::guest::DispatchOutcome::Frozen => Ok(Some(NotYet)),
@@ -308,7 +312,6 @@ impl ExecutionActor {
             let transport = self.context.transport.clone();
             let session = self.context.activation.session_hash();
             let store = self.context.blob_store.clone();
-            let execution_id = self.context.exec_id;
             self.send_tasks.spawn(async move {
                 let frame = match frame {
                     Some(frame) => frame,
@@ -316,54 +319,34 @@ impl ExecutionActor {
                         let entry = entry.expect("direct send owns its queue entry");
                         let seq = entry.seq;
                         let prepared = async {
-                            let slice = if let Some(range) = entry.range {
-                                let view = store.clone();
-                                let resource = tokio::task::spawn_blocking(move || {
-                                    view.blob_resource_blocking(execution_id, range.source)
+                            // A source the Host can no longer read (file gone
+                            // or shorter than the range) still sends the
+                            // frame, without its attachment: the receiver's
+                            // program sees none and settles the transfer.
+                            let attachment = match entry.range {
+                                Some(range) => tokio::task::spawn_blocking(move || {
+                                    store.read_blob_range_blocking(
+                                        range.hash,
+                                        range.start..range.end,
+                                    )
                                 })
                                 .await
                                 .map_err(|_| {
-                                    ExecError::DeliveryInvariant("blob lookup task failed")
-                                })??
-                                .ok_or_else(|| {
-                                    ExecError::InvalidState(
-                                        "direct source resource is missing".into(),
-                                    )
-                                })?;
-                                let content =
-                                    store.read_blob(resource.hash).await?.ok_or_else(|| {
-                                        ExecError::InvalidState(
-                                            "direct source content is missing".into(),
-                                        )
-                                    })?;
-                                Some(
-                                    tokio::task::spawn_blocking(move || {
-                                        arena0_crypto::bao::encode_slice(
-                                            &content,
-                                            range.start,
-                                            range.end - range.start,
-                                        )
-                                    })
-                                    .await
-                                    .map_err(|_| {
-                                        ExecError::DeliveryInvariant("Bao encoding task failed")
-                                    })?,
-                                )
-                            } else {
-                                None
+                                    ExecError::DeliveryInvariant("blob read task failed")
+                                })??,
+                                None => None,
                             };
                             Ok::<_, ExecError>(ExecFrame::Direct {
                                 seq,
                                 msg: entry.msg,
-                                slice,
+                                attachment,
                             })
                         }
                         .await;
                         prepared.map_err(|error| (peer, seq, error))?
                     }
                 };
-                // The task owns the encoded slice only until send settlement.
-                // No encoded proof enters the execution state or blob store.
+                // The task owns the attachment bytes only until send settlement.
                 let operation = async move {
                     let handle = match handle {
                         Some(handle) => handle,

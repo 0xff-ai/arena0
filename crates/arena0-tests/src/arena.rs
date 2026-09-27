@@ -32,7 +32,7 @@ use tokio::sync::Barrier;
 /// Configuration phase.
 #[allow(missing_debug_implementations)]
 pub struct Arena {
-    blobs: Vec<(usize, Vec<u8>)>,
+    blobs: Vec<ArenaBlob>,
     wasm: Option<Vec<u8>>,
     participant_count: usize,
     params: Vec<u8>,
@@ -42,6 +42,33 @@ pub struct Arena {
 struct HarnessNode {
     identity: Arc<NodeKeys>,
     peer_id: PeerId,
+}
+
+/// A file one participant imports and grants before the run.
+struct ArenaBlob {
+    participant: usize,
+    bytes: Vec<u8>,
+    /// Same-length content written over the linked file after import, so the
+    /// Host holds a link whose file no longer matches its hash.
+    replaced: Option<Vec<u8>>,
+}
+
+/// The harness identities, sorted by PeerId: index `i` is participant `i`.
+fn harness_identities(n: usize) -> Vec<HarnessNode> {
+    let mut identities: Vec<HarnessNode> = (0..n)
+        .map(|i| {
+            let mut seed = [0u8; 32];
+            seed[0] = i as u8;
+            seed[31] = 0xFF;
+            let identity = Arc::new(NodeKeys::from_secret(SecretKey::from_bytes(seed)));
+            HarnessNode {
+                peer_id: identity.peer_id(),
+                identity,
+            }
+        })
+        .collect();
+    identities.sort_by_key(|node| node.peer_id);
+    identities
 }
 
 /// One safe progress fact captured by the direct greybox harness.
@@ -197,11 +224,40 @@ impl Arena {
         self
     }
 
-    /// Store `bytes` in the participant's blob store before the run starts.
-    /// Participant indexes use the harness's PeerId-sorted program order.
+    /// Write `bytes` to a file, link it into the participant's blob store, and
+    /// grant it to the participant's execution at admission. Participant
+    /// indexes use the harness's PeerId-sorted program order.
     pub fn blob(&mut self, participant: usize, bytes: Vec<u8>) -> &mut Self {
-        self.blobs.push((participant, bytes));
+        self.blobs.push(ArenaBlob {
+            participant,
+            bytes,
+            replaced: None,
+        });
         self
+    }
+
+    /// Like [`Arena::blob`], then overwrite the linked file with `replaced`
+    /// (same length) before the run: the grant names `bytes`' hash while the
+    /// file holds other content.
+    pub fn replaced_blob(
+        &mut self,
+        participant: usize,
+        bytes: Vec<u8>,
+        replaced: Vec<u8>,
+    ) -> &mut Self {
+        assert_eq!(bytes.len(), replaced.len(), "replacement keeps the length");
+        self.blobs.push(ArenaBlob {
+            participant,
+            bytes,
+            replaced: Some(replaced),
+        });
+        self
+    }
+
+    /// The PeerId of participant `participant` in a run of `participants`
+    /// (the harness's PeerId-sorted order), for params that name peers.
+    pub fn peer_id(participants: usize, participant: usize) -> PeerId {
+        harness_identities(participants)[participant].peer_id
     }
 
     /// Form and run one real multiparty session through Host and LocalTransport.
@@ -211,19 +267,7 @@ impl Arena {
         let wasm = self.wasm.clone().expect("program not set");
         let n = self.participant_count;
 
-        let mut identities: Vec<HarnessNode> = (0..n)
-            .map(|i| {
-                let mut seed = [0u8; 32];
-                seed[0] = i as u8;
-                seed[31] = 0xFF;
-                let identity = Arc::new(NodeKeys::from_secret(SecretKey::from_bytes(seed)));
-                HarnessNode {
-                    peer_id: identity.peer_id(),
-                    identity,
-                }
-            })
-            .collect();
-        identities.sort_by_key(|node| node.peer_id);
+        let identities = harness_identities(n);
         let peer_ids: Vec<PeerId> = identities.iter().map(|node| node.peer_id).collect();
 
         let program = Program::try_from(wasm.clone()).expect("program");
@@ -247,15 +291,22 @@ impl Arena {
             stores.push((directory, store));
         }
 
-        // Import through the real store owner before any session can dispatch
-        // a source resolve. `stores` follows the sorted participant identities.
-        for (participant, bytes) in &self.blobs {
-            stores[*participant]
-                .1
+        // Link through the real store owner before admission grants them.
+        // `stores` follows the sorted participant identities.
+        let mut grants: Vec<Vec<BlobHash>> = vec![Vec::new(); n];
+        for (index, blob) in self.blobs.iter().enumerate() {
+            let (directory, store) = &stores[blob.participant];
+            let path = directory.path().join(format!("import-{index}"));
+            std::fs::write(&path, &blob.bytes).expect("write participant blob file");
+            let (hash, _) = store
                 .handle()
-                .import_blob(bytes.clone())
+                .link_blob(path.clone())
                 .await
-                .expect("import participant blob");
+                .expect("link participant blob");
+            if let Some(replaced) = &blob.replaced {
+                std::fs::write(&path, replaced).expect("replace participant blob file");
+            }
+            grants[blob.participant].push(hash);
         }
 
         let negotiation_id = NegotiationId([0xA7; 32]);
@@ -331,6 +382,7 @@ impl Arena {
                     program_id,
                     Some(JsonBytes::try_new(creator_params.clone()).expect("valid request params")),
                     admission,
+                    &grants[i],
                     unix_time_ms(),
                 )
                 .await
@@ -563,13 +615,22 @@ pub struct Run {
 }
 
 impl Run {
-    /// Complete content with `hash` in the participant's blob store.
+    /// The bytes of blob `hash` in the participant's blob store, exported
+    /// through the store to a file in the participant's directory.
     pub async fn read_blob(&self, participant: usize, hash: BlobHash) -> Option<Vec<u8>> {
-        self.participants[participant]
+        let handle = &self.participants[participant];
+        let path = handle
+            ._directory
+            .path()
+            .join(format!("export-{}", hex::encode(hash.0)));
+        handle
             .store_handle
-            .read_blob(hash)
+            .export_blob(hash, path.clone())
             .await
-            .expect("read participant blob")
+            .expect("export participant blob")?;
+        let bytes = std::fs::read(&path).expect("read exported blob");
+        std::fs::remove_file(&path).expect("remove exported blob");
+        Some(bytes)
     }
 
     pub fn expect_input(&mut self, participant: usize) -> Expect<'_> {

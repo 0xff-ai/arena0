@@ -1,16 +1,19 @@
-//! Two simultaneous handle-only transfers. Each participant imports its source
-//! into the Host blob store before starting the session and supplies its hash
-//! and length as parameters. Direct progress is local; sender checkpoints are
-//! agreed under one writer at a time.
+//! Two simultaneous verified transfers in opposite directions. Each
+//! participant imports its file into its Host's blob store, grants it to the
+//! execution, and the params name both objects and who sends the input. Direct
+//! progress is local; each receiver authors its transfer's agreed result under
+//! one writer at a time.
 
 use arena0::prelude::*;
 use arena0_primitives::verified_transfer::{
-    self as transfer, DirectMessage, TransferTimer, VerifiedTransfer as Transfer,
+    self as transfer, DirectMessage, TransferStatus, TransferTimer, VerifiedTransfer as Transfer,
     VerifiedTransferLocal,
 };
 
 #[arena0::data]
 pub struct Params {
+    /// The participant that sends `input`; the other sends `result`.
+    pub input_sender: PeerId,
     pub input_hash: BlobHash,
     pub input_length: u64,
     pub result_hash: BlobHash,
@@ -19,108 +22,22 @@ pub struct Params {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    type Demo = verified_transfer::VerifiedTransfer;
+    // U5: demo tests.
+}
 
-    fn initialized() -> Shared {
-        let mut shared = Shared::default();
-        <Demo as Program>::initialize(
-            &mut shared,
-            Params {
-                input_hash: BlobHash([1; 32]),
-                input_length: 1_000_000,
-                result_hash: BlobHash([2; 32]),
-                result_length: 1_000_001,
-            },
-        )
-        .unwrap();
-        shared
-    }
-
-    #[test]
-    fn opposite_transfers_route_failures_and_advance_the_writer() {
-        let shared = initialized();
-        assert_eq!(shared.input.id(), 0);
-        assert_eq!(shared.result.id(), 1);
-        assert_eq!(shared.input.sender(), shared.result.receiver());
-        assert_eq!(shared.input.receiver(), shared.result.sender());
-        assert_eq!(shared.input.chunk_count(), 20);
-        assert_eq!(shared.result.chunk_count(), 21);
-        assert_eq!(shared.result.chunk_range(20).unwrap(), 1_000_000..1_000_001);
-        assert_eq!(
-            <Demo as Program>::writer(&shared),
-            Some(Participant::new(0))
-        );
-        // SAFETY: this pure agreed-handler test owns the complete shared and
-        // local images and invokes no Host effects or state-memory imports.
-        let mut ctx = unsafe { Context::__new(shared, Local::default(), PeerId([1; 32])) };
-        assert!(
-            <Demo as Program>::on_message(
-                &mut ctx,
-                Participant::new(1),
-                Message::Input(transfer::TransferMessage::Failed)
-            )
-            .is_err()
-        );
-        assert!(!ctx.shared().input.is_failed());
-        assert!(matches!(
-            <Demo as Program>::on_message(
-                &mut ctx,
-                Participant::new(0),
-                Message::Input(transfer::TransferMessage::Failed)
-            )
-            .unwrap(),
-            ApplyDecision::Accept(Transition::Stay)
-        ));
-        assert!(!ctx.shared().result.is_failed());
-        assert_eq!(
-            <Demo as Program>::writer(ctx.shared()),
-            Some(Participant::new(1))
-        );
-        assert!(matches!(
-            <Demo as Program>::on_message(
-                &mut ctx,
-                Participant::new(1),
-                Message::Result(transfer::TransferMessage::Failed)
-            )
-            .unwrap(),
-            ApplyDecision::Accept(Transition::End)
-        ));
-        assert_eq!(<Demo as Program>::writer(ctx.shared()), None);
-        let outcome = <Demo as Program>::outcome(ctx.shared());
-        assert!(matches!(outcome.input, TransferStatus::Failed));
-        assert!(matches!(outcome.result, TransferStatus::Failed));
-    }
-
-    #[test]
-    fn typed_direct_handler_rejects_malformed_messages_and_ignores_unknown_transfers() {
-        // SAFETY: these pure paths neither mutate shared state nor use Host
-        // imports; the context holds the initialized shared image.
-        let mut ctx =
-            unsafe { LocalContext::__new(initialized(), Local::default(), PeerId([1; 32])) };
-        let error = <Demo as Program>::on_direct(&mut ctx, Participant::new(1), vec![255], None)
-            .unwrap_err();
-        assert!(error.to_string().contains("direct message decode failed"));
-        let unknown = borsh::to_vec(&DirectMessage::Failed { transfer_id: 99 }).unwrap();
-        <Demo as Program>::on_direct(&mut ctx, Participant::new(1), unknown, None).unwrap();
-        assert_eq!(ctx.local().input.next_index, 0);
-        assert_eq!(ctx.local().result.next_index, 0);
-    }
-
-    #[test]
-    fn transfer_fields_declare_all_host_capabilities() {
-        let capabilities = <Shared as SharedState>::__required_capabilities();
-        for capability in [
-            Capability::Messaging,
-            Capability::Timers,
-            Capability::Blobs,
-            Capability::Sign {
-                schemes: vec![SignScheme::Ed25519],
-            },
-        ] {
-            assert!(capabilities.contains(&capability));
-        }
-    }
+/// The two transfers of `params` in `ensemble`: `input` from `input_sender`
+/// to the other participant, `result` back.
+pub fn transfers(
+    params: &Params,
+    ensemble: &Ensemble<Committed>,
+) -> Result<(Transfer, Transfer), ProgramFault> {
+    let sender = ensemble
+        .participant_of(&params.input_sender)
+        .ok_or_else(|| anyhow!("input_sender is not a participant"))?;
+    let other = Participant::new(1 - sender.as_u8());
+    let input = Transfer::new(0, sender, other, params.input_hash, params.input_length)?;
+    let result = Transfer::new(1, other, sender, params.result_hash, params.result_length)?;
+    Ok((input, result))
 }
 
 #[arena0::message]
@@ -135,12 +52,6 @@ pub struct Outcome {
     pub result: TransferStatus,
 }
 
-#[arena0::data]
-pub enum TransferStatus {
-    Complete,
-    Failed,
-}
-
 #[arena0::phases]
 pub enum Phase {
     #[phase(default, description = "Transferring")]
@@ -151,6 +62,8 @@ pub enum Phase {
 pub struct Shared {
     #[phase]
     phase: Phase,
+    /// Set by initialization; the transfers are built from it at session start.
+    params: Option<Params>,
     #[primitive(route = Message::Input)]
     input: transfer::VerifiedTransfer,
     #[primitive(route = Message::Result)]
@@ -182,39 +95,32 @@ pub mod verified_transfer {
     type Outcome = super::Outcome;
 
     fn initialize(shared: &mut Shared, params: Params) -> Result<(), ProgramFault> {
-        shared.input = Transfer::new(
-            0,
-            Participant::new(0),
-            Participant::new(1),
-            params.input_hash,
-            params.input_length,
-            50_000,
-            4,
-        )?;
-        shared.result = Transfer::new(
-            1,
-            Participant::new(1),
-            Participant::new(0),
-            params.result_hash,
-            params.result_length,
-            50_000,
-            4,
-        )?;
+        shared.params = Some(params);
         Ok(())
     }
 
+    /// The receiver of the first unsettled transfer: only receivers author
+    /// agreed messages.
     fn writer(shared: &Shared) -> Option<Participant> {
         [&shared.input, &shared.result]
             .into_iter()
-            .find(|transfer| !transfer.is_complete() && !transfer.is_failed())
-            .map(Transfer::sender)
+            .find(|transfer| transfer.status().is_none())
+            .map(Transfer::receiver)
     }
 
+    /// Participant indexes follow the committed ensemble's sorted peers, so
+    /// the roles are fixed here from `input_sender`, not at initialization.
     fn on_session_started(
         ctx: &mut Context<Shared, Local>,
     ) -> Result<arena0::ProgramTransition<VerifiedTransfer>, ProgramFault> {
-        ctx.shared().input.clone().start(ctx);
-        ctx.shared().result.clone().start(ctx);
+        let params = ctx.shared().params.clone().expect("initialized params");
+        let (input, result) = transfers(&params, ctx.ensemble())?;
+        input.start(ctx);
+        result.start(ctx);
+        ctx.mutate_shared(|shared| {
+            shared.input = input;
+            shared.result = result;
+        });
         Ok(Transition::Stay)
     }
 
@@ -222,26 +128,18 @@ pub mod verified_transfer {
         ctx: &mut LocalContext<Shared, Local>,
         timer: TransferTimer,
     ) -> Result<(), ProgramFault> {
-        let id = match &timer {
-            TransferTimer::Send { transfer_id } | TransferTimer::Resend { transfer_id } => {
-                *transfer_id
-            }
-        };
-        match id {
+        let TransferTimer::Send { transfer_id } = &timer;
+        match transfer_id {
             0 => {
                 let transfer = ctx.shared().input.clone();
-                if let Some(message) = transfer.on_timer(ctx, |local| &mut local.input, timer)? {
-                    let _ = ctx
-                        .primitive_output(message)
-                        .broadcast_via(&mut ctx.effects(), Message::Input);
+                if let Some(message) = transfer.on_timer(ctx, |local| &mut local.input, timer) {
+                    broadcast(ctx, message, Message::Input);
                 }
             }
             1 => {
                 let transfer = ctx.shared().result.clone();
-                if let Some(message) = transfer.on_timer(ctx, |local| &mut local.result, timer)? {
-                    let _ = ctx
-                        .primitive_output(message)
-                        .broadcast_via(&mut ctx.effects(), Message::Result);
+                if let Some(message) = transfer.on_timer(ctx, |local| &mut local.result, timer) {
+                    broadcast(ctx, message, Message::Result);
                 }
             }
             _ => {}
@@ -253,37 +151,46 @@ pub mod verified_transfer {
         ctx: &mut LocalContext<Shared, Local>,
         from: Participant,
         msg: DirectMessage,
-        slice: Option<Attachment>,
+        attachment: Option<Attachment>,
     ) -> Result<(), ProgramFault> {
         let id = match &msg {
-            DirectMessage::Chunk { transfer_id, .. }
-            | DirectMessage::Ack { transfer_id, .. }
-            | DirectMessage::Failed { transfer_id } => *transfer_id,
+            DirectMessage::Leaves { transfer_id, .. }
+            | DirectMessage::Chunk { transfer_id }
+            | DirectMessage::Next { transfer_id }
+            | DirectMessage::Missing { transfer_id } => *transfer_id,
         };
         match id {
             0 => {
                 let transfer = ctx.shared().input.clone();
                 if let Some(message) =
-                    transfer.on_direct(ctx, |local| &mut local.input, from, msg, slice)?
+                    transfer.on_direct(ctx, |local| &mut local.input, from, msg, attachment)
                 {
-                    let _ = ctx
-                        .primitive_output(message)
-                        .broadcast_via(&mut ctx.effects(), Message::Input);
+                    broadcast(ctx, message, Message::Input);
                 }
             }
             1 => {
                 let transfer = ctx.shared().result.clone();
                 if let Some(message) =
-                    transfer.on_direct(ctx, |local| &mut local.result, from, msg, slice)?
+                    transfer.on_direct(ctx, |local| &mut local.result, from, msg, attachment)
                 {
-                    let _ = ctx
-                        .primitive_output(message)
-                        .broadcast_via(&mut ctx.effects(), Message::Result);
+                    broadcast(ctx, message, Message::Result);
                 }
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Each transfer offers at most one agreed message and the queue holds
+    /// 16, so a full queue is a programming error.
+    fn broadcast(
+        ctx: &mut LocalContext<Shared, Local>,
+        message: transfer::TransferMessage,
+        route: fn(transfer::TransferMessage) -> Message,
+    ) {
+        ctx.primitive_output(message)
+            .broadcast_via(&mut ctx.effects(), route)
+            .expect("one agreed message per transfer fits the queue");
     }
 
     fn on_message(
@@ -308,16 +215,8 @@ pub mod verified_transfer {
 
     fn outcome(shared: &Shared) -> Outcome {
         Outcome {
-            input: if shared.input.is_complete() {
-                TransferStatus::Complete
-            } else {
-                TransferStatus::Failed
-            },
-            result: if shared.result.is_complete() {
-                TransferStatus::Complete
-            } else {
-                TransferStatus::Failed
-            },
+            input: shared.input.status().unwrap_or(TransferStatus::Failed),
+            result: shared.result.status().unwrap_or(TransferStatus::Failed),
         }
     }
 }

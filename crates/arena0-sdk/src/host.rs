@@ -3,11 +3,15 @@
 //! every participant, and a rerun after a crash repeats them. Native builds
 //! (SDK and primitive unit tests) call `arena0_crypto` directly.
 
+use arena0_protocol::ChainingValue;
+
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "arena0")]
 unsafe extern "C" {
     #[link_name = "hash"]
     fn import_hash(data_ptr: u32, data_len: u32, out_ptr: u32);
+    #[link_name = "merge_cv"]
+    fn import_merge_cv(left_ptr: u32, right_ptr: u32, root: u32, out_ptr: u32);
     #[link_name = "permutation"]
     fn import_permutation(seed_ptr: u32, n: u32, out_ptr: u32);
 }
@@ -30,6 +34,30 @@ pub fn hash(data: &[u8]) -> [u8; 32] {
     }
     #[cfg(not(target_arch = "wasm32"))]
     arena0_crypto::hash(arena0_crypto::HashAlgorithm::Blake3, data)
+}
+
+/// The BLAKE3 parent of two sibling chaining values, computed by the Host: a
+/// chaining value, or the root hash when `root` is true. See
+/// [`crate::Blobs::subtree_cv`] for the leaves.
+#[must_use]
+pub fn merge_cv(left: &ChainingValue, right: &ChainingValue, root: bool) -> ChainingValue {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mut out = [0u8; 32];
+        // SAFETY: all three buffers remain live for the call; the Host reads
+        // 32 bytes from each input and writes exactly 32 bytes.
+        unsafe {
+            import_merge_cv(
+                left.as_ptr() as u32,
+                right.as_ptr() as u32,
+                u32::from(root),
+                out.as_mut_ptr() as u32,
+            )
+        };
+        out
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    arena0_crypto::blake3_tree::merge_cv(left, right, root)
 }
 
 /// The Fisher-Yates permutation of `0..n` drawn from ChaCha20 seeded with

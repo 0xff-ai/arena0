@@ -61,7 +61,6 @@ jsonschema = { version = "=0.51.0", default-features = false }
 hex = "0.4"
 # Hashing
 blake3 = "1.5"
-bao = "=0.13.1"
 sha2 = "0.10"
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 # Secret material is explicitly wiped when its owning value is dropped.

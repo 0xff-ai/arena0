@@ -8,7 +8,8 @@ use arena0_crypto::SignScheme;
 #[cfg(not(target_arch = "wasm32"))]
 use arena0_program::abi::imports;
 use arena0_protocol::{
-    Attachment, BlobError, BlobHandle, BlobHash, LogLevel, PeerId, RangeAttachment, TimerPayload,
+    Attachment, BlobError, BlobHash, ChainingValue, CvSource, LogLevel, PeerId, RangeAttachment,
+    TimerPayload,
 };
 
 /// State-memory selector used by the always-available state imports.
@@ -26,10 +27,9 @@ unsafe extern "C" {
     fn random(buf_ptr: u32, buf_len: u32);
     fn broadcast(data_ptr: u32, data_len: u32) -> u32;
     fn send_direct(to_ptr: u32, msg_ptr: u32, msg_len: u32, range_ptr: u32, range_len: u32) -> u32;
-    fn blob_resolve(hash_ptr: u32, length: u64, out_ptr: u32) -> u32;
-    fn blob_create(hash_ptr: u32, length: u64, out_ptr: u32) -> u32;
-    fn blob_accept_range(handle_ptr: u32, attachment: u32, start: u64, end: u64) -> u32;
-    fn blob_commit(handle_ptr: u32) -> u32;
+    fn blob_append(hash_ptr: u32, length: u64, attachment: u32) -> u32;
+    fn blob_commit(hash_ptr: u32) -> u32;
+    fn subtree_cv(source_ptr: u32, source_len: u32, offset: u64, out_ptr: u32) -> u32;
     fn set_timer(delay_ms: u64, type_ptr: u32, type_len: u32, data_ptr: u32, data_len: u32);
     fn sign(scheme: u32, data_ptr: u32, data_len: u32, out_ptr: u32, out_cap: u32) -> u32;
     fn verify(
@@ -209,38 +209,33 @@ pub(crate) fn host_send_direct(
     })
 }
 
-pub(crate) fn host_blob_resolve(hash: BlobHash, length: u64) -> Result<BlobHandle, BlobError> {
-    host_import!(BLOB_RESOLVE(hash, length) {
-        // Borsh encodes the u64 event position and u32 call index in 12 bytes.
-        let mut out = [0u8; 12];
-        blob_result(blob_resolve(hash.0.as_ptr() as u32, length, out.as_mut_ptr() as u32))?;
-        Ok(borsh::from_slice(&out).expect("host blob handle decode failed"))
-    })
-}
-
-pub(crate) fn host_blob_create(hash: BlobHash, length: u64) -> Result<BlobHandle, BlobError> {
-    host_import!(BLOB_CREATE(hash, length) {
-        let mut out = [0u8; 12];
-        blob_result(blob_create(hash.0.as_ptr() as u32, length, out.as_mut_ptr() as u32))?;
-        Ok(borsh::from_slice(&out).expect("host blob handle decode failed"))
-    })
-}
-
-pub(crate) fn host_blob_accept_range(
-    output: BlobHandle,
-    slice: Attachment,
-    range: std::ops::Range<u64>,
+pub(crate) fn host_blob_append(
+    hash: BlobHash,
+    length: u64,
+    attachment: Attachment,
 ) -> Result<(), BlobError> {
-    host_import!(BLOB_ACCEPT_RANGE(output, slice, range) {
-        let handle = borsh::to_vec(&output).expect("blob handle serialization failed");
-        blob_result(blob_accept_range(handle.as_ptr() as u32, slice.0, range.start, range.end))
+    host_import!(BLOB_APPEND(hash, length, attachment) {
+        blob_result(blob_append(hash.0.as_ptr() as u32, length, attachment.0))
     })
 }
 
-pub(crate) fn host_blob_commit(output: BlobHandle) -> Result<(), BlobError> {
-    host_import!(BLOB_COMMIT(output) {
-        let handle = borsh::to_vec(&output).expect("blob handle serialization failed");
-        blob_result(blob_commit(handle.as_ptr() as u32))
+pub(crate) fn host_blob_commit(hash: BlobHash) -> Result<(), BlobError> {
+    host_import!(BLOB_COMMIT(hash) {
+        blob_result(blob_commit(hash.0.as_ptr() as u32))
+    })
+}
+
+pub(crate) fn host_subtree_cv(source: CvSource, offset: u64) -> Result<ChainingValue, BlobError> {
+    host_import!(SUBTREE_CV(source, offset) {
+        let source = borsh::to_vec(&source).expect("cv source serialization failed");
+        let mut out = [0u8; 32];
+        blob_result(subtree_cv(
+            source.as_ptr() as u32,
+            source.len() as u32,
+            offset,
+            out.as_mut_ptr() as u32,
+        ))?;
+        Ok(out)
     })
 }
 

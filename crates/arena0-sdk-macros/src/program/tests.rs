@@ -513,7 +513,7 @@ fn module_shell_decodes_typed_direct_messages() {
             #[arena0::state(max = 256)]
             pub struct Shared { round: u64 }
             fn on_direct(ctx: &mut LocalContext, from: Participant,
-                msg: TransferMessage, slice: Option<Attachment>) -> Result<(), ProgramFault> {
+                msg: TransferMessage, attachment: Option<Attachment>) -> Result<(), ProgramFault> {
                 Ok(())
             }
         }
@@ -531,7 +531,7 @@ fn module_shell_decodes_typed_direct_messages() {
         "{expanded}"
     );
     assert!(
-        expanded.contains("self :: on_direct (ctx , from , msg , slice)"),
+        expanded.contains("self :: on_direct (ctx , from , msg , attachment)"),
         "{expanded}"
     );
 }
@@ -541,7 +541,7 @@ fn module_shell_rejects_an_on_direct_with_the_wrong_arity() {
     for parameters in [
         quote::quote! { ctx: &mut LocalContext },
         quote::quote! { ctx: &mut LocalContext, from: Participant, msg: TransferMessage },
-        quote::quote! { ctx: &mut LocalContext, from: Participant, msg: TransferMessage, slice: Option<Attachment>, extra: u8 },
+        quote::quote! { ctx: &mut LocalContext, from: Participant, msg: TransferMessage, attachment: Option<Attachment>, extra: u8 },
     ] {
         let item: Item = syn::parse_quote! {
             pub mod transfer {
@@ -554,7 +554,7 @@ fn module_shell_rejects_an_on_direct_with_the_wrong_arity() {
         let error = expand_arena0_program_item(args(), item).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "on_direct must take (ctx: &mut LocalContext, from: Participant, msg: T, slice: Option<Attachment>)"
+            "on_direct must take (ctx: &mut LocalContext, from: Participant, msg: T, attachment: Option<Attachment>)"
         );
     }
 }

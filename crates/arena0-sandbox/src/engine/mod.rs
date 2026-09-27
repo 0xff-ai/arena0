@@ -177,10 +177,8 @@ pub(crate) struct HostState {
     pub signer: crate::signing::SignerSlot,
     pub verifier: Option<Arc<dyn crate::GuestVerifier>>,
     pub blobs: Option<Arc<dyn crate::BlobView>>,
-    pub event_position: u64,
-    pub blob_calls: u32,
     pub staged_blobs: Vec<arena0_protocol::execution::BlobChange>,
-    pub slice: Option<Vec<u8>>,
+    pub attachment: Option<Vec<u8>>,
     pub direct_queued: Vec<(arena0_protocol::PeerId, usize)>,
     pub peer_id: Option<arena0_protocol::PeerId>,
     pub session: Option<arena0_protocol::Ensemble<arena0_protocol::Committed>>,
@@ -213,10 +211,8 @@ impl HostState {
             signer: crate::signing::SignerSlot::default(),
             verifier: None,
             blobs: None,
-            event_position: 0,
-            blob_calls: 0,
             staged_blobs: Vec::new(),
-            slice: None,
+            attachment: None,
             direct_queued: Vec::new(),
             peer_id: None,
             session: None,
@@ -252,10 +248,8 @@ impl HostState {
         self.signer.clear();
         self.verifier = None;
         self.blobs = None;
-        self.event_position = 0;
-        self.blob_calls = 0;
         self.staged_blobs.clear();
-        self.slice = None;
+        self.attachment = None;
         self.direct_queued.clear();
         self.peer_id = None;
         self.session = None;
@@ -274,10 +268,8 @@ impl HostState {
         self.signer.clear();
         self.verifier = None;
         self.blobs = None;
-        self.event_position = 0;
-        self.blob_calls = 0;
         self.staged_blobs.clear();
-        self.slice = None;
+        self.attachment = None;
         self.direct_queued.clear();
         self.peer_id = None;
         self.session = None;

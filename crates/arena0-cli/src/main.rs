@@ -253,9 +253,11 @@ enum ProgramCommand {
 
 #[derive(Debug, Subcommand)]
 enum BlobCommand {
-    /// Store a file; prints its hash and length for use as program parameters.
+    /// Link a file on the Host's machine into its blob store; prints its hash
+    /// and length for use as program parameters. The Host reads the file in
+    /// place, so it must stay unchanged while executions use it.
     Import { file: PathBuf },
-    /// Write stored content with this hash to a file.
+    /// Write the blob with this hash to a new file on the Host's machine.
     Export {
         #[arg(value_parser = |value: &str| value.parse::<arena0_client::protocol::BlobHash>().map(|_| value.to_owned()))]
         hash: String,
@@ -1283,9 +1285,10 @@ fn id_json(info: &arena0_client::api::IdInfo) -> Value {
 async fn blob(ctx: &Ctx, command: BlobCommand) -> anyhow::Result<()> {
     match command {
         BlobCommand::Import { file } => {
-            let bytes = std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
+            let path = std::fs::canonicalize(&file)
+                .with_context(|| format!("resolve {}", file.display()))?;
             let ResponseOk::BlobImported { hash, length } =
-                ctx.call(&HostRequest::BlobImport { bytes }).await?
+                ctx.call(&HostRequest::BlobImport { path }).await?
             else {
                 bail!("unexpected response to blob.import");
             };
@@ -1297,15 +1300,21 @@ async fn blob(ctx: &Ctx, command: BlobCommand) -> anyhow::Result<()> {
         }
         BlobCommand::Export { hash, file } => {
             let hash = hash.parse::<arena0_client::protocol::BlobHash>()?;
-            let ResponseOk::Blob { bytes } = ctx.call(&HostRequest::BlobExport { hash }).await?
+            let path = std::path::absolute(&file)
+                .with_context(|| format!("resolve {}", file.display()))?;
+            let ResponseOk::BlobExported { length } = ctx
+                .call(&HostRequest::BlobExport {
+                    hash,
+                    path: path.clone(),
+                })
+                .await?
             else {
                 bail!("unexpected response to blob.export");
             };
-            std::fs::write(&file, &bytes).with_context(|| format!("write {}", file.display()))?;
             if ctx.mode.is_json() {
-                ui::print_json(&json!({ "file": file, "length": bytes.len() }));
+                ui::print_json(&json!({ "file": path, "length": length }));
             } else {
-                println!("wrote {} bytes to {}", bytes.len(), file.display());
+                println!("wrote {length} bytes to {}", path.display());
             }
         }
     }
@@ -1405,6 +1414,7 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
                     program,
                     params,
                     ensemble,
+                    blobs: vec![],
                 })
                 .await;
             let created = match created {

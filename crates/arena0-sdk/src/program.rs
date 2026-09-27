@@ -154,14 +154,14 @@ pub trait Program: Sized {
     /// result. The callout is computed from state only; it must not depend on
     /// the dispatch that produced the state.
     /// A direct message from `from`, outside agreement. `msg` is the sender's
-    /// raw control bytes; `slice`, when present, is the token for the Bao slice
-    /// the frame carried, valid only during this call. An `Err` rejects the
+    /// raw control bytes; `attachment`, when present, is the token for the
+    /// bytes the frame carried, valid only during this call. An `Err` rejects the
     /// dispatch: local state is restored and the message is still consumed.
     fn on_direct(
         _ctx: &mut LocalContext<Self::Shared, Self::Local>,
         _from: Participant,
         _msg: Vec<u8>,
-        _slice: Option<Attachment>,
+        _attachment: Option<Attachment>,
     ) -> Result<(), ProgramFault> {
         Ok(())
     }

@@ -1933,25 +1933,30 @@ impl HostService {
                         ApiError::new(ApiErrorCode::Internal, "imported program vanished")
                     })
             }
-            HostRequest::BlobImport { bytes } => {
-                let (hash, length) = self.store.import_blob(bytes).await.map_err(|error| {
-                    let code = if matches!(error, arena0_store::StoreError::BlobTooLarge { .. }) {
-                        ApiErrorCode::BadRequest
-                    } else {
-                        ApiErrorCode::Storage
+            HostRequest::BlobImport { path } => {
+                let (hash, length) = self.store.link_blob(path).await.map_err(|error| {
+                    let code = match error {
+                        arena0_store::StoreError::BlobTooLarge { .. }
+                        | arena0_store::StoreError::Io(_) => ApiErrorCode::BadRequest,
+                        _ => ApiErrorCode::Storage,
                     };
                     ApiError::new(code, format!("import blob: {error}"))
                 })?;
                 Ok(ResponseOk::BlobImported { hash, length })
             }
-            HostRequest::BlobExport { hash } => self
+            HostRequest::BlobExport { hash, path } => self
                 .store
-                .read_blob(hash)
+                .export_blob(hash, path)
                 .await
                 .map_err(|error| {
-                    ApiError::new(ApiErrorCode::Storage, format!("export blob: {error}"))
+                    let code = match error {
+                        arena0_store::StoreError::Io(_)
+                        | arena0_store::StoreError::BlobUnreadable(_) => ApiErrorCode::BadRequest,
+                        _ => ApiErrorCode::Storage,
+                    };
+                    ApiError::new(code, format!("export blob: {error}"))
                 })?
-                .map(|bytes| ResponseOk::Blob { bytes })
+                .map(|length| ResponseOk::BlobExported { length })
                 .ok_or_else(|| ApiError::new(ApiErrorCode::NotFound, "no such blob")),
             HostRequest::ProgramRemove { program } => {
                 let program_id = self.resolve_program(&program).await?;
@@ -1974,7 +1979,11 @@ impl HostService {
                 program,
                 params,
                 ensemble,
-            } => self.new_exec(exec_id, program, params, ensemble).await,
+                blobs,
+            } => {
+                self.new_exec(exec_id, program, params, ensemble, blobs)
+                    .await
+            }
             HostRequest::ExecList => self.exec_statuses().await.map(ResponseOk::ExecList),
             HostRequest::ExecStatus { exec_id } => {
                 self.exec_status(exec_id).await.map(ResponseOk::Status)
@@ -2276,6 +2285,7 @@ impl HostService {
         program: String,
         params: Option<serde_json::Value>,
         ensemble: EnsembleSpec,
+        blobs: Vec<arena0_protocol::BlobHash>,
     ) -> Response {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
@@ -2295,7 +2305,7 @@ impl HostService {
         let daemon = Arc::clone(self);
         tasks.spawn(async move {
             let response = daemon
-                .new_exec_inner(exec_id, program, params, ensemble)
+                .new_exec_inner(exec_id, program, params, ensemble, blobs)
                 .await;
             if response_tx.send(response).is_err() {
                 daemon.finish_creation(exec_id, true).await;
@@ -2359,6 +2369,7 @@ impl HostService {
         program: String,
         params: Option<serde_json::Value>,
         ensemble: EnsembleSpec,
+        blobs: Vec<arena0_protocol::BlobHash>,
     ) -> Response {
         let (program_id, plan, admission) = match ensemble {
             EnsembleSpec::Create { participant_count } => {
@@ -2428,10 +2439,22 @@ impl HostService {
             .claim_execution(exec_id)
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
         match execution_store
-            .create_execution_request(program_id, request_params, admission, unix_time_ms())
+            .create_execution_request(
+                program_id,
+                request_params,
+                admission,
+                &blobs,
+                unix_time_ms(),
+            )
             .await
-            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
-        {
+            .map_err(|error| {
+                let code = if matches!(error, arena0_store::StoreError::BlobNotFound(_)) {
+                    ApiErrorCode::NotFound
+                } else {
+                    ApiErrorCode::Storage
+                };
+                ApiError::new(code, error.to_string())
+            })? {
             arena0_store::ExecutionRequestOutcome::Created
             | arena0_store::ExecutionRequestOutcome::AlreadyExists => {}
             arena0_store::ExecutionRequestOutcome::Conflict => {
@@ -3967,77 +3990,6 @@ async fn offer_is_usable_for_join(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn blob_import_then_export_round_trips() {
-        let (_dir, _store, daemon, _peer) = test_daemon();
-        for bytes in [vec![], vec![0, 1, 127, 128, 255]] {
-            let request = HostRequest::BlobImport {
-                bytes: bytes.clone(),
-            };
-            let request = serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
-            let imported = daemon.dispatch(request).await.unwrap();
-            let ResponseOk::BlobImported { hash, length } = imported else {
-                panic!("expected blob import result");
-            };
-            assert_eq!(length, bytes.len() as u64);
-            assert_eq!(
-                daemon
-                    .dispatch(HostRequest::BlobImport {
-                        bytes: bytes.clone()
-                    })
-                    .await
-                    .unwrap(),
-                ResponseOk::BlobImported { hash, length }
-            );
-            let response = daemon
-                .dispatch(HostRequest::BlobExport { hash })
-                .await
-                .unwrap();
-            let response: ResponseOk =
-                serde_json::from_value(serde_json::to_value(response).unwrap()).unwrap();
-            assert_eq!(response, ResponseOk::Blob { bytes });
-            assert_eq!(
-                serde_json::to_value(hash).unwrap().as_str().unwrap().len(),
-                64
-            );
-        }
-        daemon.stop().await;
-    }
-
-    #[tokio::test]
-    async fn blob_export_of_unknown_hash_is_not_found() {
-        let (_dir, _store, daemon, _peer) = test_daemon();
-        let error = daemon
-            .dispatch(HostRequest::BlobExport {
-                hash: arena0_protocol::BlobHash([7; 32]),
-            })
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, ApiErrorCode::NotFound);
-        assert_eq!(error.message, "no such blob");
-        daemon.stop().await;
-    }
-
-    #[tokio::test]
-    async fn blob_import_over_the_limit_is_rejected() {
-        let (_dir, _store, daemon, _peer) = test_daemon();
-        let length = arena0_protocol::MAX_BLOB_BYTES + 1;
-        let error = daemon
-            .dispatch(HostRequest::BlobImport {
-                bytes: vec![0; length as usize],
-            })
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, ApiErrorCode::BadRequest);
-        assert_eq!(
-            error.message,
-            format!(
-                "import blob: {}",
-                arena0_store::StoreError::BlobTooLarge { length }
-            )
-        );
-        daemon.stop().await;
-    }
     use arena0_api::NextEvent;
     use arena0_crypto::bls::BlsSecretKey;
     use arena0_crypto::{BlsSignature, SecretKey, key_binding_message};
@@ -4502,6 +4454,7 @@ mod tests {
                 ensemble: EnsembleSpec::Create {
                     participant_count: 2,
                 },
+                blobs: vec![],
             })
             .await;
         assert!(matches!(
@@ -4593,6 +4546,7 @@ mod tests {
                 program_hash,
                 Some(JsonBytes::try_new(b"null".to_vec()).unwrap()),
                 ExecutionAdmission::join(PeerId([0x11; 32]), negotiation_id),
+                &[],
                 1,
             )
             .await
@@ -4702,6 +4656,7 @@ mod tests {
                         2,
                     )
                     .expect("admission"),
+                    &[],
                     index,
                 )
                 .await
@@ -4750,7 +4705,7 @@ mod tests {
             ExecutionAdmission::create(offer.negotiation_id, offer.target_size).expect("admission");
         let mut writer = daemon.runtime.claim_execution(execution_id).unwrap();
         writer
-            .create_execution_request(program_hash, Some(params), admission, 1)
+            .create_execution_request(program_hash, Some(params), admission, &[], 1)
             .await
             .expect("request");
         writer
@@ -5243,6 +5198,7 @@ mod tests {
                 program_hash,
                 Some(JsonBytes::try_new(b"null".to_vec()).expect("params")),
                 ExecutionAdmission::create(negotiation_id, 2).expect("admission"),
+                &[],
                 4,
             )
             .await

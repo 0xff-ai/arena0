@@ -241,16 +241,18 @@ impl HostExecutionStore {
         self.store.execution_id()
     }
 
-    /// Create the durable admission root for this execution.
+    /// Create the durable admission root for this execution, granting it
+    /// `grants` (see `ExecutionStore::create_execution_request`).
     pub async fn create_execution_request(
         &mut self,
         program_hash: ProgramHash,
         params: Option<JsonBytes>,
         admission: ExecutionAdmission,
+        grants: &[arena0_protocol::BlobHash],
         created_at_ms: u64,
     ) -> Result<ExecutionRequestOutcome, StoreError> {
         self.store
-            .create_execution_request(program_hash, params, admission, created_at_ms)
+            .create_execution_request(program_hash, params, admission, grants, created_at_ms)
             .await
     }
 

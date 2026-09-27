@@ -10,7 +10,7 @@ use crate::{LocalStateBytes, SharedStateBytes};
 use crate::Capability;
 
 /// Current ABI version. A sandbox rejects modules declaring a different one.
-pub const ABI_VERSION: u32 = 23;
+pub const ABI_VERSION: u32 = 24;
 
 /// Wasm import module name for all arena0 host functions.
 pub const HOST_MODULE: &str = "arena0";
@@ -664,16 +664,21 @@ pub mod imports {
     /// non-zero, a Borsh `RangeAttachment`. Returns `0`, or `1` when the
     /// recipient's direct queue is full. Gated by `Capability::Messaging`.
     pub const SEND_DIRECT: &str = "send_direct";
-    /// Handle to stored content: `(hash_ptr, length: u64, out_ptr) -> status`;
-    /// reads a 32-byte `BlobHash`, writes a Borsh `BlobHandle` on success.
-    pub const BLOB_RESOLVE: &str = "blob_resolve";
-    /// New output bound to one object: same signature as `blob_resolve`.
-    pub const BLOB_CREATE: &str = "blob_create";
-    /// Check and write one received slice: `(handle_ptr, attachment: u32,
-    /// start: u64, end: u64) -> status`; reads a Borsh `BlobHandle`.
-    pub const BLOB_ACCEPT_RANGE: &str = "blob_accept_range";
-    /// Require full coverage and publish: `(handle_ptr) -> status`.
+    /// Append the dispatch's attachment to the execution's partial object
+    /// `(hash, length)`: `(hash_ptr, length: u64, attachment: u32) -> status`;
+    /// reads a 32-byte `BlobHash`. Status is `0` or a `BlobError` tag plus one.
+    pub const BLOB_APPEND: &str = "blob_append";
+    /// Hash the complete partial object and publish it under its hash:
+    /// `(hash_ptr) -> status`; reads a 32-byte `BlobHash`.
     pub const BLOB_COMMIT: &str = "blob_commit";
+    /// BLAKE3 chaining value of a blob range or the attachment placed at
+    /// `offset` in a larger input: `(source_ptr, source_len, offset: u64,
+    /// out_ptr) -> status`; reads a Borsh `CvSource`, writes 32 bytes on success.
+    pub const SUBTREE_CV: &str = "subtree_cv";
+    /// BLAKE3 parent node of two chaining values: `(left_ptr, right_ptr,
+    /// root: u32, out_ptr)`; reads 2 x 32 bytes and writes 32. `root != 0`
+    /// yields the root hash instead of a chaining value.
+    pub const MERGE_CV: &str = "merge_cv";
 }
 
 impl Capability {
@@ -685,10 +690,9 @@ impl Capability {
             Self::Timers => &[imports::SET_TIMER],
             Self::Sign { .. } => &[imports::SIGN],
             Self::Blobs => &[
-                imports::BLOB_RESOLVE,
-                imports::BLOB_CREATE,
-                imports::BLOB_ACCEPT_RANGE,
+                imports::BLOB_APPEND,
                 imports::BLOB_COMMIT,
+                imports::SUBTREE_CV,
             ],
         }
     }
@@ -707,6 +711,7 @@ pub fn always_available_imports() -> &'static [&'static str] {
         imports::END_SESSION,
         imports::ABORT_SESSION,
         imports::HASH,
+        imports::MERGE_CV,
         imports::PERMUTATION,
         imports::VERIFY,
     ]
@@ -725,10 +730,9 @@ pub fn all_effect_imports() -> &'static [&'static str] {
         imports::END_SESSION,
         imports::ABORT_SESSION,
         imports::SEND_DIRECT,
-        imports::BLOB_RESOLVE,
-        imports::BLOB_CREATE,
-        imports::BLOB_ACCEPT_RANGE,
+        imports::BLOB_APPEND,
         imports::BLOB_COMMIT,
+        imports::SUBTREE_CV,
     ]
 }
 
@@ -757,12 +761,7 @@ mod tests {
         );
         assert_eq!(
             Capability::Blobs.imports(),
-            &[
-                "blob_resolve",
-                "blob_create",
-                "blob_accept_range",
-                "blob_commit"
-            ]
+            &["blob_append", "blob_commit", "subtree_cv"]
         );
         assert_eq!(Capability::Timers.imports(), &["set_timer"]);
         assert_eq!(

@@ -12,418 +12,6 @@ use arena0_protocol::{
 };
 use std::path::Path;
 
-#[tokio::test]
-async fn dispatch_blob_changes_commit_with_the_transition() {
-    use arena0_protocol::execution::BlobChange;
-    let fixture = activation_fixture();
-    let directory = tempfile::tempdir().unwrap();
-    let execution_id = ExecId([0x92; 32]);
-    let store = create_execution(
-        &directory.path().join("blobs.sqlite"),
-        &fixture,
-        execution_id,
-    )
-    .await;
-    let shared = store.handle();
-    let mut writer = shared.claim_execution(execution_id).unwrap();
-    let before = writer.load_execution().await.unwrap().unwrap();
-    let handle = arena0_protocol::BlobHandle {
-        event_position: before.event_position(),
-        call_index: 0,
-    };
-    let hash = arena0_protocol::BlobHash(*blake3::hash(b"abcdef").as_bytes());
-    let event = Event::TimerFired {
-        timer: TimerPayload::unit(),
-    };
-    let mut next = before.clone();
-    next.apply_dispatch(
-        &event,
-        before.shared_state().clone(),
-        before.local_state().clone(),
-        &[],
-        None,
-        None,
-        None,
-    )
-    .unwrap();
-    writer
-        .persist(TransitionRecord {
-            expected: before.version(),
-            next: next.clone(),
-            change: Change::Dispatch {
-                event,
-                effects: vec![],
-                timer_id: None,
-                blobs: vec![
-                    BlobChange::Create {
-                        handle,
-                        hash,
-                        length: 6,
-                    },
-                    BlobChange::Write {
-                        handle,
-                        offset: 3,
-                        bytes: b"def".to_vec(),
-                    },
-                    BlobChange::Write {
-                        handle,
-                        offset: 0,
-                        bytes: b"abc".to_vec(),
-                    },
-                    BlobChange::Commit { handle },
-                ],
-            },
-            now_ms: 10,
-        })
-        .await
-        .unwrap();
-    assert_eq!(writer.load_execution().await.unwrap().unwrap(), next);
-    assert_eq!(
-        shared.read_blob(hash).await.unwrap(),
-        Some(b"abcdef".to_vec())
-    );
-    let resource = shared
-        .blob_resource_blocking(execution_id, handle)
-        .unwrap()
-        .unwrap();
-    assert!(resource.output && resource.committed);
-    assert_eq!((resource.hash, resource.length), (hash, 6));
-    assert!(
-        shared
-            .blob_written_blocking(execution_id, handle)
-            .unwrap()
-            .is_empty()
-    );
-    drop(writer);
-    store.shutdown().await.unwrap();
-    let reopened = Store::open(StoreConfig::new(
-        directory.path().join("blobs.sqlite"),
-        fixture.producer,
-    ))
-    .unwrap();
-    assert_eq!(
-        reopened.handle().read_blob(hash).await.unwrap(),
-        Some(b"abcdef".to_vec())
-    );
-    reopened.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn a_failed_transition_leaves_no_blob_rows() {
-    use arena0_protocol::execution::BlobChange;
-    let fixture = activation_fixture();
-    let directory = tempfile::tempdir().unwrap();
-    let execution_id = ExecId([0x92; 32]);
-    let store = create_execution(
-        &directory.path().join("blobs.sqlite"),
-        &fixture,
-        execution_id,
-    )
-    .await;
-    let shared = store.handle();
-    let mut writer = shared.claim_execution(execution_id).unwrap();
-    let before = writer.load_execution().await.unwrap().unwrap();
-    let handle = arena0_protocol::BlobHandle {
-        event_position: before.event_position(),
-        call_index: 0,
-    };
-    let hash = arena0_protocol::BlobHash(*blake3::hash(b"abcdef").as_bytes());
-    let event = Event::TimerFired {
-        timer: TimerPayload::unit(),
-    };
-    let mut next = before.clone();
-    next.apply_dispatch(
-        &event,
-        before.shared_state().clone(),
-        before.local_state().clone(),
-        &[],
-        None,
-        None,
-        None,
-    )
-    .unwrap();
-    let result = writer
-        .persist(TransitionRecord {
-            expected: ExecutionVersion::ZERO,
-            next,
-            change: Change::Dispatch {
-                event,
-                effects: vec![],
-                timer_id: None,
-                blobs: vec![
-                    BlobChange::Create {
-                        handle,
-                        hash,
-                        length: 6,
-                    },
-                    BlobChange::Write {
-                        handle,
-                        offset: 3,
-                        bytes: b"def".to_vec(),
-                    },
-                    BlobChange::Write {
-                        handle,
-                        offset: 0,
-                        bytes: b"abc".to_vec(),
-                    },
-                    BlobChange::Commit { handle },
-                ],
-            },
-            now_ms: 10,
-        })
-        .await;
-    assert!(
-        matches!(result, Err(StoreError::Corruption(reason)) if reason == "execution version moved")
-    );
-    assert_eq!(writer.load_execution().await.unwrap().unwrap(), before);
-    assert!(shared.read_blob(hash).await.unwrap().is_none());
-    assert!(
-        shared
-            .blob_resource_blocking(execution_id, handle)
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        shared
-            .blob_written_blocking(execution_id, handle)
-            .unwrap()
-            .is_empty()
-    );
-    drop(writer);
-    store.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn commit_rejects_writes_that_do_not_tile_the_object() {
-    use arena0_protocol::execution::BlobChange;
-    let fixture = activation_fixture();
-    let directory = tempfile::tempdir().unwrap();
-    let execution_id = ExecId([0x92; 32]);
-    let store = create_execution(
-        &directory.path().join("blobs.sqlite"),
-        &fixture,
-        execution_id,
-    )
-    .await;
-    let shared = store.handle();
-    let mut writer = shared.claim_execution(execution_id).unwrap();
-    let before = writer.load_execution().await.unwrap().unwrap();
-    let handle = arena0_protocol::BlobHandle {
-        event_position: before.event_position(),
-        call_index: 0,
-    };
-    let hash = arena0_protocol::BlobHash(*blake3::hash(b"abcdef").as_bytes());
-    let event = Event::TimerFired {
-        timer: TimerPayload::unit(),
-    };
-    let mut next = before.clone();
-    next.apply_dispatch(
-        &event,
-        before.shared_state().clone(),
-        before.local_state().clone(),
-        &[],
-        None,
-        None,
-        None,
-    )
-    .unwrap();
-    for writes in [
-        vec![(0, b"ab".to_vec()), (3, b"def".to_vec())],
-        vec![(0, b"abcd".to_vec()), (3, b"def".to_vec())],
-        vec![(0, b"abc".to_vec())],
-        vec![(0, b"abcdefg".to_vec())],
-    ] {
-        let mut blobs = vec![BlobChange::Create {
-            handle,
-            hash,
-            length: 6,
-        }];
-        blobs.extend(writes.into_iter().map(|(offset, bytes)| BlobChange::Write {
-            handle,
-            offset,
-            bytes,
-        }));
-        blobs.push(BlobChange::Commit { handle });
-        let result = writer
-            .persist(TransitionRecord {
-                expected: before.version(),
-                next: next.clone(),
-                change: Change::Dispatch {
-                    event: event.clone(),
-                    effects: vec![],
-                    timer_id: None,
-                    blobs,
-                },
-                now_ms: 10,
-            })
-            .await;
-        assert!(
-            matches!(result, Err(StoreError::Corruption(reason)) if reason == "blob writes do not tile the object")
-        );
-        assert_eq!(writer.load_execution().await.unwrap().unwrap(), before);
-        assert!(shared.read_blob(hash).await.unwrap().is_none());
-        assert!(
-            shared
-                .blob_resource_blocking(execution_id, handle)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            shared
-                .blob_written_blocking(execution_id, handle)
-                .unwrap()
-                .is_empty()
-        );
-    }
-    drop(writer);
-    store.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn import_blob_is_idempotent_and_bounded() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(StoreConfig::new(
-        directory.path().join("import.sqlite"),
-        host(9),
-    ))
-    .unwrap();
-    let shared = store.handle();
-    let expected = (
-        arena0_protocol::BlobHash(*blake3::hash(b"content").as_bytes()),
-        7,
-    );
-    assert_eq!(
-        shared.import_blob(b"content".to_vec()).await.unwrap(),
-        expected
-    );
-    assert_eq!(
-        shared.import_blob(b"content".to_vec()).await.unwrap(),
-        expected
-    );
-    assert_eq!(
-        shared.read_blob(expected.0).await.unwrap(),
-        Some(b"content".to_vec())
-    );
-    let at_limit = vec![7; arena0_protocol::MAX_BLOB_BYTES as usize];
-    let (hash, length) = shared.import_blob(at_limit.clone()).await.unwrap();
-    assert_eq!(length, arena0_protocol::MAX_BLOB_BYTES);
-    assert_eq!(shared.read_blob(hash).await.unwrap(), Some(at_limit));
-    let over = arena0_protocol::MAX_BLOB_BYTES + 1;
-    assert!(matches!(shared.import_blob(vec![0; over as usize]).await,
-        Err(StoreError::BlobTooLarge { length }) if length == over));
-    let empty = shared.import_blob(vec![]).await.unwrap();
-    assert_eq!(empty.1, 0);
-    assert_eq!(shared.read_blob(empty.0).await.unwrap(), Some(vec![]));
-    store.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn blocking_reads_see_committed_rows() {
-    use arena0_protocol::execution::BlobChange;
-    let fixture = activation_fixture();
-    let directory = tempfile::tempdir().unwrap();
-    let execution_id = ExecId([0x92; 32]);
-    let store = create_execution(
-        &directory.path().join("blobs.sqlite"),
-        &fixture,
-        execution_id,
-    )
-    .await;
-    let shared = store.handle();
-    let mut writer = shared.claim_execution(execution_id).unwrap();
-    let before = writer.load_execution().await.unwrap().unwrap();
-    let handle = arena0_protocol::BlobHandle {
-        event_position: before.event_position(),
-        call_index: 0,
-    };
-    let hash = arena0_protocol::BlobHash(*blake3::hash(b"abcdef").as_bytes());
-    let event = Event::TimerFired {
-        timer: TimerPayload::unit(),
-    };
-    let mut next = before.clone();
-    next.apply_dispatch(
-        &event,
-        before.shared_state().clone(),
-        before.local_state().clone(),
-        &[],
-        None,
-        None,
-        None,
-    )
-    .unwrap();
-    let resolved = arena0_protocol::BlobHandle {
-        call_index: 1,
-        ..handle
-    };
-    assert!(!shared.blob_contains_blocking(hash, 6).unwrap());
-    shared.import_blob(b"abcdef".to_vec()).await.unwrap();
-    assert!(shared.blob_contains_blocking(hash, 6).unwrap());
-    assert!(!shared.blob_contains_blocking(hash, 7).unwrap());
-    writer
-        .persist(TransitionRecord {
-            expected: before.version(),
-            next,
-            change: Change::Dispatch {
-                event,
-                effects: vec![],
-                timer_id: None,
-                blobs: vec![
-                    BlobChange::Resolve {
-                        handle: resolved,
-                        hash,
-                        length: 6,
-                    },
-                    BlobChange::Create {
-                        handle,
-                        hash,
-                        length: 6,
-                    },
-                    BlobChange::Write {
-                        handle,
-                        offset: 3,
-                        bytes: b"def".to_vec(),
-                    },
-                    BlobChange::Write {
-                        handle,
-                        offset: 0,
-                        bytes: b"ab".to_vec(),
-                    },
-                ],
-            },
-            now_ms: 10,
-        })
-        .await
-        .unwrap();
-    let resource = shared
-        .blob_resource_blocking(execution_id, resolved)
-        .unwrap()
-        .unwrap();
-    assert!(!resource.output && resource.committed);
-    let output = shared
-        .blob_resource_blocking(execution_id, handle)
-        .unwrap()
-        .unwrap();
-    assert!(output.output && !output.committed);
-    assert_eq!(
-        shared.blob_written_blocking(execution_id, handle).unwrap(),
-        vec![0..2, 3..6]
-    );
-    assert!(
-        shared
-            .blob_resource_blocking(ExecId([0x93; 32]), handle)
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        shared
-            .blob_written_blocking(ExecId([0x93; 32]), handle)
-            .unwrap()
-            .is_empty()
-    );
-    drop(writer);
-    store.shutdown().await.unwrap();
-}
-
 pub(crate) struct ActivationFixture {
     pub(crate) activation: Activation,
     prepared: PreparedActivation,
@@ -448,6 +36,7 @@ async fn create_execution(path: &Path, fixture: &ActivationFixture, execution_id
             program_hash,
             Some(JsonBytes::try_new(br#"{}"#.to_vec()).expect("params")),
             ExecutionAdmission::create(NegotiationId([0x11; 32]), 2).expect("admission"),
+            &[],
             2,
         )
         .await
@@ -889,6 +478,7 @@ async fn failed_rollback_closes_store_calls() {
             program,
             Some(JsonBytes::try_new(b"{}".to_vec()).expect("params")),
             creator_admission(NegotiationId([1; 32])),
+            &[],
             2,
         )
         .await;
@@ -1071,14 +661,14 @@ async fn request_is_idempotent_and_salt_is_durable() {
         .expect("execution writer");
     assert_eq!(
         writer
-            .create_execution_request(hash, Some(params.clone()), admission.clone(), 2)
+            .create_execution_request(hash, Some(params.clone()), admission.clone(), &[], 2)
             .await
             .expect("request"),
         ExecutionRequestOutcome::Created
     );
     assert_eq!(
         writer
-            .create_execution_request(hash, Some(params), admission, 3)
+            .create_execution_request(hash, Some(params), admission, &[], 3)
             .await
             .expect("retry"),
         ExecutionRequestOutcome::AlreadyExists
@@ -1130,6 +720,7 @@ async fn persisted_zero_execution_salt_is_store_corruption() {
             program_hash,
             Some(JsonBytes::try_new(br#"{}"#.to_vec()).expect("params")),
             ExecutionAdmission::create(NegotiationId([0x74; 32]), 2).expect("admission"),
+            &[],
             2,
         )
         .await
@@ -1182,7 +773,13 @@ async fn creator_admission_requires_params() {
         .claim_execution(execution_id)
         .expect("execution writer");
     let result = writer
-        .create_execution_request(hash, None, creator_admission(NegotiationId([0x72; 32])), 2)
+        .create_execution_request(
+            hash,
+            None,
+            creator_admission(NegotiationId([0x72; 32])),
+            &[],
+            2,
+        )
         .await;
     assert!(matches!(result, Err(StoreError::InvalidAdmission(_))));
     assert!(
@@ -1225,6 +822,7 @@ async fn create_admission_rejects_invalid_participant_counts() {
                     negotiation_id: NegotiationId([byte; 32]),
                     participant_count,
                 },
+                &[],
                 2,
             )
             .await;
@@ -1272,6 +870,7 @@ async fn join_preferred_params_must_match_creator_activation() {
             hash,
             Some(JsonBytes::try_new(br#"{"preferred":true}"#.to_vec()).expect("params")),
             ExecutionAdmission::join(fixture.producer, NegotiationId([0x11; 32])),
+            &[],
             2,
         )
         .await
@@ -1307,7 +906,7 @@ async fn open_join_target_binding_is_compare_and_set_and_durable() {
         .claim_execution(execution_id)
         .expect("execution writer");
     writer
-        .create_execution_request(hash, None, ExecutionAdmission::join_open(), 2)
+        .create_execution_request(hash, None, ExecutionAdmission::join_open(), &[], 2)
         .await
         .expect("request");
     let request = writer
@@ -1346,7 +945,7 @@ async fn open_join_target_binding_is_compare_and_set_and_durable() {
         .claim_execution(failed_execution_id)
         .expect("failed execution writer");
     failed_writer
-        .create_execution_request(hash, None, ExecutionAdmission::join_open(), 3)
+        .create_execution_request(hash, None, ExecutionAdmission::join_open(), &[], 3)
         .await
         .expect("failed request");
     assert_eq!(
@@ -1406,6 +1005,7 @@ async fn join_without_params_survives_reopen_recovery() {
             hash,
             None,
             ExecutionAdmission::join(fixture.producer, NegotiationId([0x11; 32])),
+            &[],
             2,
         )
         .await
@@ -1536,6 +1136,7 @@ async fn request_failure_is_compare_and_set() {
             hash,
             Some(JsonBytes::try_new(b"null".to_vec()).expect("json")),
             admission,
+            &[],
             1,
         )
         .await
@@ -1590,6 +1191,7 @@ async fn request_failure_cannot_compete_with_activation_authority() {
             program_hash,
             Some(JsonBytes::try_new(br#"{}"#.to_vec()).expect("params")),
             ExecutionAdmission::create(NegotiationId([0x11; 32]), 2).expect("admission"),
+            &[],
             2,
         )
         .await
@@ -1649,6 +1251,7 @@ async fn recovery_projection_filters_terminal_history_before_paging() {
                 program_hash,
                 Some(JsonBytes::try_new(b"null".to_vec()).expect("params")),
                 creator_admission(NegotiationId([index; 32])),
+                &[],
                 u64::from(index),
             )
             .await
@@ -1712,6 +1315,7 @@ async fn recovery_projection_pages_a_maximal_execution_state() {
             program_hash,
             Some(JsonBytes::try_new(br#"{}"#.to_vec()).expect("params")),
             ExecutionAdmission::create(NegotiationId([0x11; 32]), 2).expect("admission"),
+            &[],
             2,
         )
         .await
@@ -1790,6 +1394,7 @@ async fn activation_prepare_commit_is_idempotent_and_recoverable() {
             hash,
             Some(JsonBytes::try_new(b"{}".to_vec()).expect("json")),
             admission,
+            &[],
             1,
         )
         .await
@@ -2499,6 +2104,7 @@ async fn activation_cannot_exceed_durable_admission_authority() {
             hash,
             Some(JsonBytes::try_new(b"{}".to_vec()).expect("json")),
             creator,
+            &[],
             2,
         )
         .await
@@ -2520,6 +2126,7 @@ async fn activation_cannot_exceed_durable_admission_authority() {
             hash,
             Some(JsonBytes::try_new(b"{}".to_vec()).expect("json")),
             ExecutionAdmission::join(PeerId([0xfe; 32]), NegotiationId([0x11; 32])),
+            &[],
             4,
         )
         .await

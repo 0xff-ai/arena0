@@ -658,6 +658,7 @@ impl Arena0Mcp {
                     program: arg.program.program_id,
                     params: arg.params,
                     ensemble,
+                    blobs: vec![],
                 },
             )
             .await?;

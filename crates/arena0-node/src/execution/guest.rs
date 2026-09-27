@@ -37,11 +37,11 @@ pub(super) enum DispatchSource {
     },
     /// This participant's own queued message.
     OwnMessage,
-    /// A direct frame; its slice is exposed only as Attachment(0) to the guest.
+    /// A direct frame; its attachment is exposed only as Attachment(0) to the guest.
     Direct {
         from: arena0_protocol::PeerId,
         seq: u64,
-        slice: Option<Vec<u8>>,
+        attachment: Option<Vec<u8>>,
     },
 }
 
@@ -146,15 +146,22 @@ impl ExecutionActor {
         from: arena0_protocol::PeerId,
         seq: u64,
         msg: Vec<u8>,
-        slice: Option<Vec<u8>>,
+        attachment: Option<Vec<u8>>,
     ) -> Result<DispatchOutcome, ExecError> {
         let event = Event::DirectReceived {
             from,
             msg,
-            slice: slice.as_ref().map(|_| arena0_protocol::Attachment(0)),
+            attachment: attachment.as_ref().map(|_| arena0_protocol::Attachment(0)),
         };
         let outcome = self
-            .dispatch_event(event, DispatchSource::Direct { from, seq, slice })
+            .dispatch_event(
+                event,
+                DispatchSource::Direct {
+                    from,
+                    seq,
+                    attachment,
+                },
+            )
             .await?;
         if matches!(outcome, DispatchOutcome::Rejected { .. }) {
             let mut next = self.state.clone();
@@ -486,13 +493,10 @@ impl ExecutionActor {
                     | Event::DirectReceived { .. }
             ) {
                 call = call
-                    .with_blobs(
-                        event_position,
-                        Arc::new(super::blobs::StoreBlobView {
-                            store: self.context.blob_store.clone(),
-                            execution_id: self.context.exec_id,
-                        }),
-                    )
+                    .with_blobs(Arc::new(super::blobs::StoreBlobView {
+                        store: self.context.blob_store.clone(),
+                        execution_id: self.context.exec_id,
+                    }))
                     .with_direct_queued(self.state.direct_queue_lens());
                 call = call.with_signer(Arc::new(DispatchSigner {
                     session_id: self.context.activation.session_hash(),
@@ -504,10 +508,11 @@ impl ExecutionActor {
                 }));
             }
             if let DispatchSource::Direct {
-                slice: Some(bytes), ..
+                attachment: Some(bytes),
+                ..
             } = &source
             {
-                call = call.with_slice(bytes.clone());
+                call = call.with_attachment(bytes.clone());
             }
             call
         };

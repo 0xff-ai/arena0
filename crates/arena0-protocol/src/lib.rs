@@ -13,11 +13,11 @@
 pub mod blob;
 mod id;
 pub mod limits;
-pub use blob::{Attachment, BlobError, BlobHandle, BlobHash, RangeAttachment};
+pub use blob::{Attachment, BlobError, BlobHash, ChainingValue, CvSource, RangeAttachment};
 pub use limits::{
-    MAX_BLOB_BYTES, MAX_DIRECT_CONTROL_BYTES, MAX_DIRECT_RANGE_BYTES, MAX_DIRECT_SLICE_BYTES,
-    MAX_EFFECT_PAYLOAD_BYTES, MAX_PARTICIPANTS, MAX_TERMINAL_OUTCOME_BYTES,
-    MAX_TERMINAL_REASON_BYTES, MAX_TIMER_PAYLOAD_BYTES,
+    MAX_BLOB_BYTES, MAX_DIRECT_CONTROL_BYTES, MAX_DIRECT_RANGE_BYTES, MAX_EFFECT_PAYLOAD_BYTES,
+    MAX_PARTICIPANTS, MAX_TERMINAL_OUTCOME_BYTES, MAX_TERMINAL_REASON_BYTES,
+    MAX_TIMER_PAYLOAD_BYTES,
 };
 
 #[cfg(not(target_arch = "wasm32"))]

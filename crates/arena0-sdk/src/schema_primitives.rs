@@ -1,7 +1,7 @@
 //! `ProgramValue` implementations for the closed set of public ABI values.
 
 use crate::Signed;
-use arena0_protocol::{Attachment, BlobHandle, BlobHash, Participant, PeerId, RangeAttachment};
+use arena0_protocol::{Attachment, BlobHash, Participant, PeerId, RangeAttachment};
 
 use crate::ProgramValue;
 
@@ -28,7 +28,6 @@ impl_program_value!(
     PeerId,
     Participant,
     BlobHash,
-    BlobHandle,
     Attachment,
     RangeAttachment,
     Signed,
@@ -144,7 +143,6 @@ mod tests {
         assert_program_value::<Option<Vec<(u32, [u8; 2])>>>();
         assert_program_value::<PeerId>();
         assert_program_value::<BlobHash>();
-        assert_program_value::<BlobHandle>();
         assert_program_value::<Attachment>();
         assert_program_value::<RangeAttachment>();
         assert_program_value::<Signed>();

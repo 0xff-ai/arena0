@@ -45,7 +45,7 @@ pub const MAX_RECEIPT_TRACE_ENTRIES: usize = 65_536;
 
 pub use abort::{ABORT_OCCURRENCE_DOMAIN, ABORT_OCCURRENCE_VERSION, AbortKind, AbortOccurrence};
 pub use binding::ExecutionBinding;
-pub use blob_change::{BlobChange, BlobResource};
+pub use blob_change::{BlobChange, BlobPartial};
 pub use callout::{CalloutId, CalloutIdParseError, OpenCallout, callout_id};
 pub use certificate::{
     ParticipantStepSignature, Receipt, ReceiptArtifact, ReceiptBody, ReceiptId, ReceiptKind,

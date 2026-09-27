@@ -29,8 +29,7 @@ pub(crate) struct DispatchParts {
     pub(crate) peer_id: PeerId,
     pub(crate) session: Ensemble<Committed>,
     pub(crate) blobs: Option<Arc<dyn BlobView>>,
-    pub(crate) event_position: u64,
-    pub(crate) slice: Option<Vec<u8>>,
+    pub(crate) attachment: Option<Vec<u8>>,
     pub(crate) direct_queued: Vec<(PeerId, usize)>,
 }
 
@@ -38,8 +37,7 @@ pub(crate) struct DispatchParts {
 #[derive(Clone)]
 pub struct DispatchCall {
     pub(crate) blobs: Option<Arc<dyn BlobView>>,
-    pub(crate) event_position: u64,
-    pub(crate) slice: Option<Vec<u8>>,
+    pub(crate) attachment: Option<Vec<u8>>,
     pub(crate) direct_queued: Vec<(PeerId, usize)>,
     pub(crate) peer_id: PeerId,
     pub(crate) session: Ensemble<Committed>,
@@ -75,8 +73,7 @@ impl DispatchCall {
             signer: None,
             verifier: None,
             blobs: None,
-            event_position: 0,
-            slice: None,
+            attachment: None,
             direct_queued: Vec::new(),
         }
     }
@@ -109,20 +106,17 @@ impl DispatchCall {
         self
     }
 
-    /// Expose the blob store to this dispatch. The n-th handle-minting call
-    /// (resolve or create) gets `BlobHandle { event_position, call_index: n }`,
-    /// so a rerun mints the same handles.
+    /// Expose the executing program's view of the blob store to this dispatch.
     #[must_use]
-    pub fn with_blobs(mut self, event_position: u64, view: Arc<dyn BlobView>) -> Self {
-        self.event_position = event_position;
+    pub fn with_blobs(mut self, view: Arc<dyn BlobView>) -> Self {
         self.blobs = Some(view);
         self
     }
 
-    /// The slice bytes behind `Event::DirectReceived { slice: Some(Attachment(0)), .. }`.
+    /// The bytes behind `Event::DirectReceived { attachment: Some(Attachment(0)), .. }`.
     #[must_use]
-    pub fn with_slice(mut self, slice: Vec<u8>) -> Self {
-        self.slice = Some(slice);
+    pub fn with_attachment(mut self, attachment: Vec<u8>) -> Self {
+        self.attachment = Some(attachment);
         self
     }
 
@@ -142,8 +136,7 @@ impl DispatchCall {
             signer,
             verifier,
             blobs,
-            event_position,
-            slice,
+            attachment,
             direct_queued,
         } = self;
         let session_bytes = serialize(&session)?;
@@ -165,8 +158,7 @@ impl DispatchCall {
             peer_id,
             session,
             blobs,
-            event_position,
-            slice,
+            attachment,
             direct_queued,
         })
     }

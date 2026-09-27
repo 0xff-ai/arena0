@@ -394,14 +394,14 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                         outcome.1,
                     )
                 }
-                ::arena0::Event::DirectReceived { from, msg, slice } => {
+                ::arena0::Event::DirectReceived { from, msg, attachment } => {
                     let (mut local_ctx, shared_bytes) = __arena0_make_local_ctx(&input);
                     let from = local_ctx.participant_for_peer(from);
                     let outcome = match <#program_ty as ::arena0::Program>::on_direct(
                         &mut local_ctx,
                         from,
                         msg,
-                        slice,
+                        attachment,
                     ) {
                         Ok(()) => __arena0_local_outcome(&local_ctx, &shared_bytes),
                         Err(::arena0::ProgramFault(error)) => {

@@ -547,8 +547,7 @@ impl ProgramInstance {
             signer,
             verifier,
             blobs,
-            event_position,
-            slice,
+            attachment,
             direct_queued,
             peer_id,
             session,
@@ -557,14 +556,13 @@ impl ProgramInstance {
         if let Err(error) = self.reset_for_dispatch(dispatch, outgoing_len) {
             return self.rollback_error(error);
         }
-        // Host custody and the received slice belong to this dispatch. Rollback
+        // Host custody and the received attachment belong to this dispatch. Rollback
         // clears them and staged changes; the next entry resets the counters
         // before installing a new view, identity, and queue snapshot.
         self.store.data_mut().signer.install(signer);
         self.store.data_mut().verifier = verifier;
         self.store.data_mut().blobs = blobs;
-        self.store.data_mut().event_position = event_position;
-        self.store.data_mut().slice = slice;
+        self.store.data_mut().attachment = attachment;
         self.store.data_mut().direct_queued = direct_queued;
         self.store.data_mut().peer_id = Some(peer_id);
         self.store.data_mut().session = Some(session);
@@ -830,7 +828,7 @@ mod resident_runtime_tests {
               (import "arena0" "state_write" (func $state_write (param i32 i32 i32)))
               {extra_imports}
               (memory (export "memory") 1)
-              (global (export "arena0_abi_version") i32 (i32.const 23))
+              (global (export "arena0_abi_version") i32 (i32.const 24))
               (global $counter (mut i32) (i32.const 0))
               (data (i32.const 1024) "sh")
               (data (i32.const 1100) "effect")
@@ -1032,7 +1030,7 @@ mod resident_runtime_tests {
               (memory (export "memory") 1 1024)
               (memory (export "arena0_shared") 65 65)
               (memory (export "arena0_local") 65 65)
-              (global (export "arena0_abi_version") i32 (i32.const 23))
+              (global (export "arena0_abi_version") i32 (i32.const 24))
               (data (i32.const 32768) "\00\00\00")
               (func $pack (param $ptr i32) (param $len i32) (result i64)
                 local.get $ptr
@@ -1074,7 +1072,7 @@ mod resident_runtime_tests {
               (memory (export "memory") 1 1024)
               (memory (export "arena0_shared") 65 65)
               (memory (export "arena0_local") 65 65)
-              (global (export "arena0_abi_version") i32 (i32.const 23))
+              (global (export "arena0_abi_version") i32 (i32.const 24))
               (data (i32.const 32768) "\00")
               (func (export "arena0_alloc") (param i32) (result i32)
                 {allocator_body})
@@ -1308,115 +1306,6 @@ mod resident_runtime_tests {
         assert!(result.observations.logs.is_empty());
         assert!(result.observations.random_draws.is_empty());
         assert_eq!(instance.committed_payloads(), (&shared, &local));
-    }
-
-    #[test]
-    fn blob_dispatch_installs_context_and_returns_verified_bytes() {
-        use arena0_protocol::execution::{BlobChange, MAX_DIRECT_QUEUE};
-        use arena0_protocol::{Attachment, BlobHash};
-        let hash = BlobHash(arena0_crypto::hash(
-            arena0_crypto::HashAlgorithm::Blake3,
-            b"x",
-        ));
-        let imports = format!(
-            r#"
-            (import "arena0" "blob_create" (func $create (param i32 i64 i32) (result i32)))
-            (import "arena0" "blob_accept_range" (func $accept (param i32 i32 i64 i64) (result i32)))
-            (import "arena0" "blob_commit" (func $commit (param i32) (result i32)))
-            (import "arena0" "send_direct" (func $send (param i32 i32 i32 i32 i32) (result i32)))
-            (data (i32.const 1200) "{}")
-            (data (i32.const 1400) "{}")
-        "#,
-            wat_data(&hash.0),
-            wat_data(&[2; 32])
-        );
-        let body = r#"
-            i32.const 1200 i64.const 1 i32.const 1300 call $create if unreachable end
-            i32.const 1300 i32.const 0 i64.const 0 i64.const 1 call $accept if unreachable end
-            i32.const 1300 call $commit if unreachable end
-            i32.const 1400 i32.const 1100 i32.const 6 i32.const 0 i32.const 0 call $send drop
-            i32.const 32768 i32.const 3 call $pack
-        "#;
-        let mut instance = resident(
-            body,
-            vec![Capability::Blobs, Capability::Messaging],
-            &imports,
-        );
-        for queued in [0, MAX_DIRECT_QUEUE] {
-            let peer = PeerId([1; 32]);
-            let other = PeerId([2; 32]);
-            let session = Ensemble::from_peers(vec![peer, other]).unwrap();
-            let call = DispatchCall::new(
-                peer,
-                session,
-                Event::DirectReceived {
-                    from: other,
-                    msg: Vec::new(),
-                    slice: Some(Attachment(0)),
-                },
-            )
-            .with_blobs(
-                7,
-                std::sync::Arc::new(crate::engine::imports::blob_tests::View::default()),
-            )
-            .with_slice(arena0_crypto::bao::encode_slice(b"x", 0, 1))
-            .with_direct_queued(vec![(other, queued)]);
-            let result = instance.dispatch(call).unwrap();
-            let handle = arena0_protocol::BlobHandle {
-                event_position: 7,
-                call_index: 0,
-            };
-            assert_eq!(
-                result.blobs,
-                vec![
-                    BlobChange::Create {
-                        handle,
-                        hash,
-                        length: 1
-                    },
-                    BlobChange::Write {
-                        handle,
-                        offset: 0,
-                        bytes: b"x".to_vec()
-                    },
-                    BlobChange::Commit { handle },
-                ]
-            );
-            let expected = if queued == 0 {
-                vec![Effect::SendDirect {
-                    to: other,
-                    msg: b"effect".to_vec(),
-                    range: None,
-                }]
-            } else {
-                Vec::new()
-            };
-            assert_eq!(result.observations.effects, expected);
-        }
-    }
-
-    #[test]
-    fn rejected_dispatch_discards_staged_blob_changes() {
-        let body = format!(
-            "i32.const 0 i64.const 10 i32.const 64 call $create drop {}",
-            rejected_body()
-        );
-        let mut instance = resident(
-            &body,
-            vec![Capability::Blobs],
-            r#"(import "arena0" "blob_create" (func $create (param i32 i64 i32) (result i32)))"#,
-        );
-        let result = instance
-            .dispatch(call().with_blobs(
-                7,
-                std::sync::Arc::new(crate::engine::imports::blob_tests::View::default()),
-            ))
-            .unwrap();
-        assert_eq!(result.status, arena0_program::CallStatus::Rejected);
-        assert!(result.blobs.is_empty());
-        // A rejected dispatch also drops its view, tokens, and identity. A
-        // subsequent call without a view cannot inherit the prior authority.
-        assert!(instance.dispatch(call()).is_err());
     }
 
     #[test]

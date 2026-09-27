@@ -113,7 +113,7 @@ pub use effects::{
 #[doc(hidden)]
 pub use effects::{host_fail as __host_fail, host_log as __host_log};
 pub use fault::{ProgramFault, ProtocolFault};
-pub use host::{hash, permutation};
+pub use host::{hash, merge_cv, permutation};
 #[doc(hidden)]
 #[cfg(target_arch = "wasm32")]
 pub use io_alloc::prepare_allocator as __prepare_allocator;
@@ -145,9 +145,9 @@ pub use arena0_program::{
 };
 pub use arena0_protocol as types;
 pub use arena0_protocol::{
-    Attachment, BlobError, BlobHandle, BlobHash, Committed, Effect, Ensemble, EnsembleError, Event,
-    LogLevel, Open, Participant, PeerId, RangeAttachment, SessionHash, StateHash, TimerPayload,
-    VerifyError, View, Viewport,
+    Attachment, BlobError, BlobHash, ChainingValue, Committed, CvSource, Effect, Ensemble,
+    EnsembleError, Event, LogLevel, Open, Participant, PeerId, RangeAttachment, SessionHash,
+    StateHash, TimerPayload, VerifyError, View, Viewport,
 };
 pub use borsh;
 pub use schemars;

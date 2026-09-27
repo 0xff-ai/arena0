@@ -1696,10 +1696,7 @@ mod tests {
         let mut state = active_state(&fixture);
         let peer = fixture.participants[1].0;
         let range = crate::RangeAttachment {
-            source: crate::BlobHandle {
-                event_position: 3,
-                call_index: 1,
-            },
+            hash: crate::BlobHash([3; 32]),
             start: 0,
             end: 32,
         };
