@@ -30,3 +30,16 @@ pub enum BlobChange {
         length: u64,
     },
 }
+
+/// What one handle names in the blob store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobResource {
+    /// The object the handle is bound to.
+    pub hash: BlobHash,
+    pub length: u64,
+    /// `true` for an output minted by `create`; `false` for `resolve`.
+    pub output: bool,
+    /// For an output, whether `commit` published it. Resolved handles name
+    /// complete content and are always `true`.
+    pub committed: bool,
+}
