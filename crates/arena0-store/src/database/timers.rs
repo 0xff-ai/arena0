@@ -61,11 +61,13 @@ impl Database {
                 )?,
                 // Lifecycle effects and broadcasts have no side rows: the
                 // lifecycle effect is in the trace entry and the broadcast is
-                // in the durable outgoing queue carried by the state blob.
+                // in the durable outgoing queue carried by the state blob, as
+                // is a direct message's queue entry.
                 Effect::SessionEnd { .. }
                 | Effect::SessionAbort { .. }
                 | Effect::Fail { .. }
-                | Effect::Broadcast { .. } => {}
+                | Effect::Broadcast { .. }
+                | Effect::SendDirect { .. } => {}
             }
         }
         Ok(())

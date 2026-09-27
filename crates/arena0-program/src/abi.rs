@@ -659,6 +659,21 @@ pub mod imports {
     /// signer_ptr, out_ptr, out_cap) -> len`; reads a 32-byte signer `PeerId`
     /// and writes a Borsh `Result<Vec<u8>, VerifyError>`.
     pub const VERIFY: &str = "verify";
+    /// Queue one direct message: `(to_ptr, msg_ptr, msg_len, range_ptr,
+    /// range_len) -> status`; reads a 32-byte `PeerId` and, when `range_len` is
+    /// non-zero, a Borsh `RangeAttachment`. Returns `0`, or `1` when the
+    /// recipient's direct queue is full. Gated by `Capability::Messaging`.
+    pub const SEND_DIRECT: &str = "send_direct";
+    /// Handle to stored content: `(hash_ptr, length: u64, out_ptr) -> status`;
+    /// reads a 32-byte `BlobHash`, writes a Borsh `BlobHandle` on success.
+    pub const BLOB_RESOLVE: &str = "blob_resolve";
+    /// New output bound to one object: same signature as `blob_resolve`.
+    pub const BLOB_CREATE: &str = "blob_create";
+    /// Check and write one received slice: `(handle_ptr, attachment: u32,
+    /// start: u64, end: u64) -> status`; reads a Borsh `BlobHandle`.
+    pub const BLOB_ACCEPT_RANGE: &str = "blob_accept_range";
+    /// Require full coverage and publish: `(handle_ptr) -> status`.
+    pub const BLOB_COMMIT: &str = "blob_commit";
 }
 
 impl Capability {
@@ -666,9 +681,15 @@ impl Capability {
     #[must_use]
     pub fn imports(&self) -> &'static [&'static str] {
         match self {
-            Self::Messaging => &[imports::BROADCAST],
+            Self::Messaging => &[imports::BROADCAST, imports::SEND_DIRECT],
             Self::Timers => &[imports::SET_TIMER],
             Self::Sign { .. } => &[imports::SIGN],
+            Self::Blobs => &[
+                imports::BLOB_RESOLVE,
+                imports::BLOB_CREATE,
+                imports::BLOB_ACCEPT_RANGE,
+                imports::BLOB_COMMIT,
+            ],
         }
     }
 }
@@ -703,6 +724,11 @@ pub fn all_effect_imports() -> &'static [&'static str] {
         imports::SIGN,
         imports::END_SESSION,
         imports::ABORT_SESSION,
+        imports::SEND_DIRECT,
+        imports::BLOB_RESOLVE,
+        imports::BLOB_CREATE,
+        imports::BLOB_ACCEPT_RANGE,
+        imports::BLOB_COMMIT,
     ]
 }
 
@@ -725,7 +751,19 @@ mod tests {
 
     #[test]
     fn imports_for_each_capability() {
-        assert_eq!(Capability::Messaging.imports(), &["broadcast"]);
+        assert_eq!(
+            Capability::Messaging.imports(),
+            &["broadcast", "send_direct"]
+        );
+        assert_eq!(
+            Capability::Blobs.imports(),
+            &[
+                "blob_resolve",
+                "blob_create",
+                "blob_accept_range",
+                "blob_commit"
+            ]
+        );
         assert_eq!(Capability::Timers.imports(), &["set_timer"]);
         assert_eq!(
             Capability::Sign {

@@ -251,6 +251,8 @@ pub enum Capability {
     Timers,
     /// Sign data with the given schemes.
     Sign { schemes: Vec<SignScheme> },
+    /// Resolve, create, fill, and commit objects in the local blob store.
+    Blobs,
 }
 
 /// An owned, deduplicated set of declared and inferred capabilities.

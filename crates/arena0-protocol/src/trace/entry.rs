@@ -105,7 +105,7 @@ impl StepTerminal {
             Effect::Fail { reason } => Some(Self::Fail {
                 reason: reason.clone(),
             }),
-            Effect::Broadcast { .. } | Effect::SetTimer { .. } => None,
+            Effect::Broadcast { .. } | Effect::SetTimer { .. } | Effect::SendDirect { .. } => None,
         }
     }
 

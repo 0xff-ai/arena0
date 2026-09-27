@@ -9,7 +9,7 @@ use arena0_program::bounded;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
-use crate::TimerPayload;
+use crate::{MAX_DIRECT_CONTROL_BYTES, PeerId, RangeAttachment, TimerPayload};
 use crate::{MAX_EFFECT_PAYLOAD_BYTES, MAX_TERMINAL_OUTCOME_BYTES, MAX_TERMINAL_REASON_BYTES};
 
 /// Kind of an [`Effect`], for diagnostics that never expose its payload.
@@ -21,6 +21,7 @@ pub enum EffectKind {
     Broadcast,
     SetTimer,
     Fail,
+    SendDirect,
 }
 
 /// Kind and bounded payload size of one effect. The payload itself is
@@ -68,6 +69,18 @@ pub enum Effect {
             deserialize_with = "bounded::read_string::<MAX_TERMINAL_REASON_BYTES>"
         )]
         reason: String,
+    },
+    /// Queue one point-to-point message to `to`, outside agreement. Only local
+    /// handlers may emit it. `range`, when present, names an object range the
+    /// Host Bao-encodes from its immutable source when it sends the frame.
+    SendDirect {
+        to: PeerId,
+        #[borsh(
+            serialize_with = "bounded::write_bytes::<MAX_DIRECT_CONTROL_BYTES>",
+            deserialize_with = "bounded::read_bytes::<MAX_DIRECT_CONTROL_BYTES>"
+        )]
+        msg: Vec<u8>,
+        range: Option<RangeAttachment>,
     },
 }
 

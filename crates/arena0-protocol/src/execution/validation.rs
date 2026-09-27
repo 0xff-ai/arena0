@@ -574,6 +574,20 @@ fn validate_effect_payload(effect: &Effect) -> Result<(), ProtocolError> {
             )?;
             ensure_payload("timer data", timer.data.len(), MAX_TIMER_PAYLOAD_BYTES)
         }
+        Effect::SendDirect { msg, range, .. } => {
+            ensure_payload("direct message", msg.len(), crate::MAX_DIRECT_CONTROL_BYTES)?;
+            match range {
+                Some(range)
+                    if range.start >= range.end
+                        || range.end - range.start > crate::MAX_DIRECT_RANGE_BYTES =>
+                {
+                    Err(ProtocolError::InvalidCertificate(
+                        "direct range is empty or over its bound".into(),
+                    ))
+                }
+                _ => Ok(()),
+            }
+        }
     }
 }
 

@@ -195,6 +195,7 @@ fn effect_name(effect: &Effect) -> &'static str {
         Effect::Fail { .. } => imports::FAIL,
         Effect::SetTimer { .. } => imports::SET_TIMER,
         Effect::Broadcast { .. } => imports::BROADCAST,
+        Effect::SendDirect { .. } => imports::SEND_DIRECT,
     }
 }
 

@@ -569,6 +569,12 @@ impl ExecutionState {
             Event::SessionStarted { .. } | Event::MessageReceived { .. }
         );
 
+        if effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::SendDirect { .. }))
+        {
+            unimplemented!("direct message queues");
+        }
         if !agreed_event {
             // The sandbox rejects a lifecycle effect from a local event at
             // emission; keep the durable boundary defensive here.
@@ -623,7 +629,9 @@ impl ExecutionState {
                 from: *from,
                 data: msg.clone(),
             },
-            Event::InputReceived { .. } | Event::TimerFired { .. } => {
+            Event::InputReceived { .. }
+            | Event::TimerFired { .. }
+            | Event::DirectReceived { .. } => {
                 return Err(ProtocolError::InvalidCertificate(
                     "shared dispatch requires a portable event".into(),
                 ));

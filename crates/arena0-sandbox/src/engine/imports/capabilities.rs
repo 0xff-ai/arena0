@@ -22,6 +22,7 @@ pub(crate) fn register_capability_imports(
             Capability::Messaging => register_messaging(linker)?,
             Capability::Timers => register_timers(linker)?,
             Capability::Sign { schemes } => sign_schemes.extend(schemes.iter().copied()),
+            Capability::Blobs => unimplemented!("blob imports"),
         }
     }
     if !sign_schemes.is_empty() {

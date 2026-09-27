@@ -110,7 +110,9 @@ impl DispatchCall {
             .map_err(|error| crate::SandboxError::input_limit(error.to_string()))?;
         let dispatch = match event {
             Event::SessionStarted { .. } | Event::MessageReceived { .. } => DispatchKind::Agreed,
-            Event::InputReceived { .. } | Event::TimerFired { .. } => DispatchKind::Local,
+            Event::InputReceived { .. }
+            | Event::TimerFired { .. }
+            | Event::DirectReceived { .. } => DispatchKind::Local,
         };
         Ok((input, dispatch, outgoing_len, signer, verifier))
     }

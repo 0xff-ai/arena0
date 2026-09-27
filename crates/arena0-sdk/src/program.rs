@@ -1,7 +1,7 @@
 //! The [`Program`] trait that every arena0 program implements.
 
 use arena0_protocol::TimerPayload;
-use arena0_protocol::{Ensemble, Participant, View, Viewport};
+use arena0_protocol::{Attachment, Ensemble, Participant, View, Viewport};
 use borsh::BorshDeserialize;
 
 use crate::{
@@ -153,6 +153,19 @@ pub trait Program: Sized {
     /// withdraws it. A terminal transition has no callout regardless of this
     /// result. The callout is computed from state only; it must not depend on
     /// the dispatch that produced the state.
+    /// A direct message from `from`, outside agreement. `msg` is the sender's
+    /// raw control bytes; `slice`, when present, is the token for the Bao slice
+    /// the frame carried, valid only during this call. An `Err` rejects the
+    /// dispatch: local state is restored and the message is still consumed.
+    fn on_direct(
+        _ctx: &mut LocalContext<Self::Shared, Self::Local>,
+        _from: Participant,
+        _msg: Vec<u8>,
+        _slice: Option<Attachment>,
+    ) -> Result<(), ProgramFault> {
+        Ok(())
+    }
+
     fn callout(_ctx: &CalloutContext<Self::Shared, Self::Local>) -> Option<Self::Callout> {
         None
     }

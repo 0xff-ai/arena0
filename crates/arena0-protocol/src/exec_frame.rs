@@ -24,6 +24,18 @@ const EXEC_KIND_STEP_SIGNATURE: u8 = 0x01;
 const EXEC_KIND_ABORT: u8 = 0x02;
 /// Frame kind of [`ExecFrame::StepCertificate`].
 const EXEC_KIND_STEP_CERTIFICATE: u8 = 0x03;
+/// Frame kind of [`ExecFrame::Direct`].
+const EXEC_KIND_DIRECT: u8 = 0x04;
+/// Largest direct frame: kind, sequence, the control message with its length
+/// prefix, and an optional slice with its option tag and length prefix.
+const MAX_DIRECT_FRAME_BYTES: usize = 1
+    + size_of::<u64>()
+    + size_of::<u32>()
+    + crate::MAX_DIRECT_CONTROL_BYTES
+    + 1
+    + size_of::<u32>()
+    + crate::MAX_DIRECT_SLICE_BYTES;
+const _: () = assert!(MAX_DIRECT_FRAME_BYTES <= MAX_EXEC_FRAME_BYTES);
 /// Maximum signer bitmap size for the protocol's participant bound.
 const MAX_EXEC_SIGNER_BYTES: usize = crate::MAX_PARTICIPANTS.div_ceil(8);
 /// Borsh size of a [`StepCommitment`]: domain, session, step, entry hash,
@@ -65,6 +77,15 @@ pub enum ExecFrame {
     StepCertificate {
         /// The certified commitment and its aggregate agreement.
         certificate: StepCertificate,
+    },
+    /// One point-to-point message outside agreement, numbered per recipient.
+    Direct {
+        /// The sender's sequence number for this recipient, starting at 1.
+        seq: u64,
+        /// The program's control message.
+        msg: Vec<u8>,
+        /// The Bao slice for the message's range, encoded at send time.
+        slice: Option<Vec<u8>>,
     },
     /// Unilateral termination.
     Abort {
@@ -108,6 +129,28 @@ impl BorshSerialize for ExecFrame {
                 )?;
                 BorshSerialize::serialize(&agreement.aggregate, writer)
             }
+            Self::Direct { seq, msg, slice } => {
+                BorshSerialize::serialize(&EXEC_KIND_DIRECT, writer)?;
+                BorshSerialize::serialize(seq, writer)?;
+                serialize_bounded_bytes(
+                    writer,
+                    msg,
+                    crate::MAX_DIRECT_CONTROL_BYTES,
+                    "exec.direct.msg",
+                )?;
+                match slice {
+                    None => BorshSerialize::serialize(&0u8, writer),
+                    Some(slice) => {
+                        BorshSerialize::serialize(&1u8, writer)?;
+                        serialize_bounded_bytes(
+                            writer,
+                            slice,
+                            crate::MAX_DIRECT_SLICE_BYTES,
+                            "exec.direct.slice",
+                        )
+                    }
+                }
+            }
         }
     }
 }
@@ -140,6 +183,28 @@ impl BorshDeserialize for ExecFrame {
                     },
                 })
             }
+            EXEC_KIND_DIRECT => Ok(Self::Direct {
+                seq: u64::deserialize_reader(reader)?,
+                msg: read_bounded_bytes(
+                    reader,
+                    crate::MAX_DIRECT_CONTROL_BYTES,
+                    "exec.direct.msg",
+                )?,
+                slice: match u8::deserialize_reader(reader)? {
+                    0 => None,
+                    1 => Some(read_bounded_bytes(
+                        reader,
+                        crate::MAX_DIRECT_SLICE_BYTES,
+                        "exec.direct.slice",
+                    )?),
+                    tag => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid direct slice option tag {tag}"),
+                        ));
+                    }
+                },
+            }),
             tag => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown execution frame tag {tag}"),

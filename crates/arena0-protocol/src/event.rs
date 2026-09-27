@@ -10,7 +10,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 use crate::MAX_EFFECT_PAYLOAD_BYTES;
-use crate::{Ensemble, PeerId, TimerPayload};
+use crate::{Attachment, Ensemble, MAX_DIRECT_CONTROL_BYTES, PeerId, TimerPayload};
 
 /// Kind of an [`Event`], for diagnostics that never expose its payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,6 +20,7 @@ pub enum EventKind {
     MessageReceived,
     InputReceived,
     TimerFired,
+    DirectReceived,
 }
 
 /// An event dispatched to a program during a single execution step.
@@ -52,6 +53,18 @@ pub enum Event<M = Vec<u8>> {
     },
     /// A previously set timer fired with its scheduled payload.
     TimerFired { timer: TimerPayload },
+    /// A direct message from `from`, delivered outside agreement as a local
+    /// event. `slice` names the Bao slice the frame carried; its bytes stay in
+    /// the Host for the duration of this dispatch.
+    DirectReceived {
+        from: PeerId,
+        #[borsh(
+            serialize_with = "bounded::write_bytes::<MAX_DIRECT_CONTROL_BYTES>",
+            deserialize_with = "bounded::read_bytes::<MAX_DIRECT_CONTROL_BYTES>"
+        )]
+        msg: Vec<u8>,
+        slice: Option<Attachment>,
+    },
 }
 
 impl Event<Vec<u8>> {
@@ -74,6 +87,7 @@ impl Event<Vec<u8>> {
                 data,
             },
             Self::TimerFired { timer } => Event::TimerFired { timer },
+            Self::DirectReceived { from, msg, slice } => Event::DirectReceived { from, msg, slice },
         })
     }
 }

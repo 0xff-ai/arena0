@@ -143,6 +143,7 @@ impl ImportSemantics {
             Capability::Sign {
                 schemes: vec![arena0_crypto::SignScheme::Ed25519],
             },
+            Capability::Blobs,
         ]
         .into_iter()
         .map(|capability| CapabilityImport {

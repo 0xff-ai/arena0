@@ -162,6 +162,7 @@ impl ExecutionActor {
                 })?;
                 self.persist_step_signature(next, Some(certified)).await?;
             }
+            ExecFrame::Direct { .. } => return Ok(Some(Rejected)),
             ExecFrame::Abort { occurrence } => {
                 if occurrence.coordinate().next_step() < step {
                     return Ok(None);
@@ -343,7 +344,7 @@ pub(crate) fn authenticates(state: &ExecutionState, source: PeerId, frame: &Exec
         ExecFrame::StepSignature { commitment, .. } => {
             commitment.session_id == binding.session_id()
         }
-        ExecFrame::Message { .. } => true,
+        ExecFrame::Message { .. } | ExecFrame::Direct { .. } => true,
     }
 }
 

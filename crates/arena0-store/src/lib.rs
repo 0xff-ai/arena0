@@ -531,6 +531,7 @@ impl EventRecordSummary {
             Event::MessageReceived { msg, .. } => (EventKind::MessageReceived, bytes(msg)),
             Event::InputReceived { data, .. } => (EventKind::InputReceived, bytes(data)),
             Event::TimerFired { timer } => (EventKind::TimerFired, bytes(&timer.data)),
+            Event::DirectReceived { msg, .. } => (EventKind::DirectReceived, bytes(msg)),
         };
         let effects = effects
             .iter()
@@ -543,6 +544,7 @@ impl EventRecordSummary {
                     Effect::Broadcast { data } => (EffectKind::Broadcast, data.as_slice()),
                     Effect::SetTimer { timer, .. } => (EffectKind::SetTimer, timer.data.as_slice()),
                     Effect::Fail { reason } => (EffectKind::Fail, reason.as_bytes()),
+                    Effect::SendDirect { msg, .. } => (EffectKind::SendDirect, msg.as_slice()),
                 };
                 EffectSummary {
                     kind,
