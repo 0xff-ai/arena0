@@ -136,12 +136,18 @@ synchronous host call; neither is an effect. A timer is a program value:
 `ctx.send_direct(to, &msg, range)` queues a message to one other participant
 outside agreement. It never enters the trace or the receipt, so use it for bulk
 or private traffic and agree on what matters through program messages. A full
-per-recipient queue returns `SendError::QueueFull`. With the `Blobs` capability,
-`ctx.blobs()` gives handles to content in the Host's blob store: the optional
-`range` asks the Host to send a proven slice of a stored object, and the
-receiver's `on_direct` hands the slice token to `accept_range`, which the Host
-checks against the object's hash before writing. The program sees handles and
-results, never the bytes.
+per-recipient queue returns `SendError::QueueFull`. The stack delivers each
+queued message once, in order, across crashes, so programs do not resend.
+
+With the `Blobs` capability, local handlers use the blobs granted to the
+execution, by hash. The optional `range` attaches raw bytes of a granted blob
+to the message. The receiver's `on_direct` gets an `Attachment` token;
+`ctx.blobs().append(hash, length, attachment)` adds those bytes to the object
+being received, and `commit(hash)` checks the whole object against its hash
+and publishes it. The Host verifies nothing else on its own: to check bytes
+before appending them, compute `ctx.blobs().subtree_cv(..)` and merge chaining
+values with `arena0::merge_cv`, as the verified-transfer primitive does. The
+program sees hashes and results, never the bytes.
 
 An agent may use external tools or model inference to answer a callout. The
 program must decide which answers are valid and how accepted observations enter
@@ -172,7 +178,7 @@ interfaces. Bundled programs provide examples of composition:
 | [Contract net](../programs/contract-net) | Collect work proposals and select an award. |
 | [Prisoner's Dilemma](../programs/prisoner-dilemma) | Repeat a choice under a shared scoring rule. |
 | [Chess](../programs/chess) | Enforce turn order and legal moves. |
-| [Verified transfer](../programs/verified-transfer) | Exchange two files in opposite directions with signed receipts of every step. |
+| [Verified transfer](../programs/verified-transfer) | Exchange two files in opposite directions, checking every piece before storing it. |
 
 ## Test the rules
 
