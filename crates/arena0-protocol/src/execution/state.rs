@@ -1,6 +1,8 @@
+use super::{DirectArrival, DirectEntry, DirectLane, MAX_DIRECT_QUEUE};
 use arena0_program::{CalloutRequest, LocalStateBytes, SharedStateBytes};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 #[cfg(feature = "performance-tracing")]
 use std::time::Instant;
 
@@ -238,6 +240,8 @@ pub struct ExecutionState {
     pub(crate) agreed_link: [u8; 32],
     pub(crate) last_certificate: Option<StepCertificate>,
     pub(crate) end_phase: super::EndPhase,
+    /// Per-peer direct history is local progress, never an agreed commitment.
+    pub(crate) direct: BTreeMap<PeerId, DirectLane>,
     /// Local FIFO queue of authored messages. Never part of a commitment,
     /// `StateHash`, or receipt.
     pub(crate) outgoing: Vec<Vec<u8>>,
@@ -248,6 +252,71 @@ pub struct ExecutionState {
 }
 
 impl ExecutionState {
+    /// Queued messages to `peer`, oldest first.
+    pub fn direct_queue(&self, peer: PeerId) -> &[DirectEntry] {
+        self.direct
+            .get(&peer)
+            .map_or(&[], |lane| lane.queue.as_slice())
+    }
+
+    /// Queue length per peer with a non-empty queue, for the sandbox's QueueFull check.
+    pub fn direct_queue_lens(&self) -> Vec<(PeerId, usize)> {
+        self.direct
+            .iter()
+            .filter(|(_, lane)| !lane.queue.is_empty())
+            .map(|(peer, lane)| (*peer, lane.queue.len()))
+            .collect()
+    }
+
+    /// Classify an incoming frame from `from`.
+    pub fn direct_arrival(&self, from: PeerId, seq: u64) -> DirectArrival {
+        let last = self.direct.get(&from).map_or(0, |lane| lane.last_applied);
+        if seq <= last {
+            DirectArrival::Duplicate
+        } else if last.checked_add(1) == Some(seq) {
+            DirectArrival::Next
+        } else {
+            DirectArrival::Gap
+        }
+    }
+
+    /// Record an applied or discarded frame on the candidate being persisted.
+    ///
+    /// Accepted dispatches persist this with their state and blob changes.
+    /// Rejected dispatches persist only this progress, so redelivery cannot
+    /// repeatedly dispatch the rejected event. Only the next sequence is legal.
+    pub fn record_direct(&mut self, from: PeerId, seq: u64) -> Result<(), ProtocolError> {
+        if from == self.producer || !self.binding.is_participant(from) {
+            return Err(ProtocolError::UnknownParticipant { participant: from });
+        }
+        if self.direct_arrival(from, seq) != DirectArrival::Next {
+            return Err(ProtocolError::DirectOutOfOrder { from, seq });
+        }
+        let version = self.next_version()?;
+        self.direct.entry(from).or_default().last_applied = seq;
+        self.version = version;
+        Ok(())
+    }
+
+    /// Drop acknowledged entries. A duplicate acknowledgement neither changes
+    /// the version nor requires persistence.
+    pub fn ack_direct(&mut self, to: PeerId, seq: u64) -> Result<bool, ProtocolError> {
+        if to == self.producer || !self.binding.is_participant(to) {
+            return Err(ProtocolError::UnknownParticipant { participant: to });
+        }
+        if !self.direct_queue(to).iter().any(|entry| entry.seq <= seq) {
+            return Ok(false);
+        }
+        let version = self.next_version()?;
+        self.direct
+            .get_mut(&to)
+            .expect("non-empty queue has a lane")
+            .queue
+            .retain(|entry| entry.seq > seq);
+        self.version = version;
+        Ok(true)
+    }
+
     fn next_version(&self) -> Result<ExecutionVersion, ProtocolError> {
         self.version.next().ok_or(ProtocolError::VersionExhausted)
     }
@@ -293,6 +362,7 @@ impl ExecutionState {
             agreed_link: cursor.chain_hash(),
             last_certificate: None,
             end_phase: super::EndPhase::Open,
+            direct: BTreeMap::new(),
             outgoing: Vec::new(),
             shared_state,
             local_state,
@@ -569,11 +639,12 @@ impl ExecutionState {
             Event::SessionStarted { .. } | Event::MessageReceived { .. }
         );
 
-        if effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::SendDirect { .. }))
+        if agreed_event
+            && effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::SendDirect { .. }))
         {
-            unimplemented!("direct message queues");
+            return Err(ProtocolError::DirectFromAgreedEvent);
         }
         if !agreed_event {
             // The sandbox rejects a lifecycle effect from a local event at
@@ -589,6 +660,28 @@ impl ExecutionState {
             }
             let mut outgoing = self.outgoing.clone();
             append_broadcasts(&mut outgoing, effects)?;
+            let mut direct = self.direct.clone();
+            for effect in effects {
+                if let Effect::SendDirect { to, msg, range } = effect {
+                    if *to == self.producer || !self.binding.is_participant(*to) {
+                        return Err(ProtocolError::UnknownParticipant { participant: *to });
+                    }
+                    let lane = direct.entry(*to).or_default();
+                    if lane.queue.len() == MAX_DIRECT_QUEUE {
+                        return Err(ProtocolError::DirectQueueFull { to: *to });
+                    }
+                    let seq = lane
+                        .last_queued
+                        .checked_add(1)
+                        .ok_or(ProtocolError::VersionExhausted)?;
+                    lane.queue.push(DirectEntry {
+                        seq,
+                        msg: msg.clone(),
+                        range: *range,
+                    });
+                    lane.last_queued = seq;
+                }
+            }
             let status = ExecutionStatus::active();
             let next_callout = next_open_callout(self, event, event_position, &status, callout);
             self.install_dispatch(
@@ -600,6 +693,7 @@ impl ExecutionState {
                 status,
                 next_callout,
             )?;
+            self.direct = direct;
             return Ok(None);
         }
 
@@ -1126,6 +1220,41 @@ impl ExecutionState {
             });
         }
         validate_outgoing(&self.outgoing)?;
+        if self.direct.len() > crate::MAX_PARTICIPANTS {
+            return Err(ProtocolError::CollectionTooLarge {
+                kind: "direct lanes",
+                actual: self.direct.len(),
+                max: crate::MAX_PARTICIPANTS,
+            });
+        }
+        for (peer, lane) in &self.direct {
+            if *peer == self.producer || !self.binding.is_participant(*peer) {
+                return Err(ProtocolError::UnknownParticipant { participant: *peer });
+            }
+            if lane.queue.len() > MAX_DIRECT_QUEUE {
+                return Err(ProtocolError::DirectQueueFull { to: *peer });
+            }
+            if !matches!(self.end_phase, super::EndPhase::Open) && !lane.queue.is_empty() {
+                return Err(ProtocolError::InvalidTerminalStatus);
+            }
+            for (index, entry) in lane.queue.iter().enumerate() {
+                if entry.seq == 0
+                    || entry.seq > lane.last_queued
+                    || (index > 0 && lane.queue[index - 1].seq.checked_add(1) != Some(entry.seq))
+                    || (index + 1 == lane.queue.len() && entry.seq != lane.last_queued)
+                {
+                    return Err(ProtocolError::DirectOutOfOrder {
+                        from: *peer,
+                        seq: entry.seq,
+                    });
+                }
+                check_effect_budget(&[Effect::SendDirect {
+                    to: *peer,
+                    msg: entry.msg.clone(),
+                    range: entry.range,
+                }])?;
+            }
+        }
         self.validate_end()?;
         match &self.last_certificate {
             Some(certificate)
@@ -1335,6 +1464,278 @@ mod tests {
     use arena0_crypto::{BlsSignature, NodeKeys, SecretKey};
 
     use super::super::test_fixtures::{Fixture, fixture, fixture_with_initial};
+
+    #[test]
+    fn send_direct_effects_queue_in_order_and_ack_drops_them() {
+        let fixture = fixture();
+        let mut state = active_state(&fixture);
+        let peer = fixture.participants[1].0;
+        let effects = vec![
+            Effect::SendDirect {
+                to: peer,
+                msg: vec![1],
+                range: None,
+            },
+            Effect::SendDirect {
+                to: peer,
+                msg: vec![2],
+                range: None,
+            },
+        ];
+        let cursor = state.step_cursor();
+        state
+            .apply_dispatch(
+                &Event::TimerFired {
+                    timer: crate::TimerPayload::unit(),
+                },
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &effects,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .direct_queue(peer)
+                .iter()
+                .map(|entry| (entry.seq, entry.msg.clone()))
+                .collect::<Vec<_>>(),
+            vec![(1, vec![1]), (2, vec![2])]
+        );
+        assert_eq!(state.step_cursor(), cursor);
+        assert_eq!(state.direct_queue_lens(), vec![(peer, 2)]);
+        let version = state.version();
+        assert!(state.ack_direct(peer, 1).unwrap());
+        assert!(state.version() > version);
+        assert_eq!(state.direct_queue(peer)[0].seq, 2);
+        let before = state.clone();
+        assert!(!state.ack_direct(peer, 1).unwrap());
+        assert_eq!(state, before);
+        assert!(state.ack_direct(peer, 2).unwrap());
+        assert!(state.direct_queue_lens().is_empty());
+        state
+            .apply_dispatch(
+                &Event::TimerFired {
+                    timer: crate::TimerPayload::unit(),
+                },
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &effects,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(state.direct_queue(peer)[0].seq, 3);
+    }
+
+    #[test]
+    fn direct_queue_full_and_unknown_recipient_are_rejected() {
+        let fixture = fixture();
+        let mut state = active_state(&fixture);
+        let peer = fixture.participants[1].0;
+        for to in [state.producer(), PeerId([0xff; 32])] {
+            let effects = vec![
+                Effect::SendDirect {
+                    to: peer,
+                    msg: vec![],
+                    range: None,
+                },
+                Effect::SendDirect {
+                    to,
+                    msg: vec![],
+                    range: None,
+                },
+            ];
+            let before = state.clone();
+            assert_eq!(
+                state.apply_dispatch(
+                    &Event::TimerFired {
+                        timer: crate::TimerPayload::unit()
+                    },
+                    state.shared_state().clone(),
+                    state.local_state().clone(),
+                    &effects,
+                    None,
+                    None,
+                    None
+                ),
+                Err(ProtocolError::UnknownParticipant { participant: to })
+            );
+            assert_eq!(state, before);
+        }
+        let effects = vec![
+            Effect::SendDirect {
+                to: peer,
+                msg: vec![1],
+                range: None
+            };
+            MAX_DIRECT_QUEUE
+        ];
+        let before = state.clone();
+        assert_eq!(
+            state.apply_dispatch(
+                &Event::SessionStarted {
+                    ensemble: state.binding().ensemble().unwrap()
+                },
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &effects,
+                None,
+                None,
+                None
+            ),
+            Err(ProtocolError::DirectFromAgreedEvent)
+        );
+        assert_eq!(state, before);
+        state
+            .apply_dispatch(
+                &Event::TimerFired {
+                    timer: crate::TimerPayload::unit(),
+                },
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &effects,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let before = state.clone();
+        assert_eq!(
+            state.apply_dispatch(
+                &Event::TimerFired {
+                    timer: crate::TimerPayload::unit()
+                },
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &effects,
+                None,
+                None,
+                None
+            ),
+            Err(ProtocolError::DirectQueueFull { to: peer })
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn direct_arrival_classifies_and_record_direct_requires_next() {
+        let fixture = fixture();
+        let mut state = active_state(&fixture);
+        let peer = fixture.participants[1].0;
+        assert_eq!(state.direct_arrival(peer, 0), DirectArrival::Duplicate);
+        assert_eq!(state.direct_arrival(peer, 1), DirectArrival::Next);
+        assert_eq!(state.direct_arrival(peer, 2), DirectArrival::Gap);
+        let before = state.clone();
+        assert_eq!(
+            state.record_direct(peer, 2),
+            Err(ProtocolError::DirectOutOfOrder { from: peer, seq: 2 })
+        );
+        assert_eq!(state, before);
+        state.record_direct(peer, 1).unwrap();
+        assert!(state.version() > before.version());
+        assert_eq!(state.local_state(), before.local_state());
+        assert_eq!(state.direct_arrival(peer, 1), DirectArrival::Duplicate);
+        assert_eq!(state.direct_arrival(peer, 2), DirectArrival::Next);
+        let before = state.clone();
+        assert!(state.record_direct(peer, 1).is_err());
+        assert!(state.record_direct(state.producer(), 1).is_err());
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn leaving_open_end_phase_clears_direct_queues() {
+        let fixture = fixture();
+        let mut state = active_state(&fixture);
+        let peer = fixture.participants[1].0;
+        let effects = vec![Effect::SendDirect {
+            to: peer,
+            msg: vec![1],
+            range: None,
+        }];
+        state
+            .apply_dispatch(
+                &Event::TimerFired {
+                    timer: crate::TimerPayload::unit(),
+                },
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &effects,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        state.record_direct(peer, 1).unwrap();
+        state
+            .apply_dispatch(
+                &Event::SessionStarted {
+                    ensemble: state.binding().ensemble().unwrap(),
+                },
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[Effect::SessionEnd { outcome: vec![7] }],
+                Some(TerminalOutcome::new(vec![7], b"7").unwrap()),
+                None,
+                None,
+            )
+            .unwrap();
+        certify_pending(&mut state, &fixture, &mut Vec::new());
+        assert!(!matches!(state.end_phase(), super::super::EndPhase::Open));
+        assert!(state.direct_queue(peer).is_empty());
+        assert_eq!(state.direct_arrival(peer, 1), DirectArrival::Duplicate);
+        assert_eq!(state.direct.get(&peer).unwrap().last_queued, 1);
+    }
+
+    #[test]
+    fn direct_lanes_survive_encode_decode() {
+        let fixture = fixture();
+        let mut state = active_state(&fixture);
+        let peer = fixture.participants[1].0;
+        let range = crate::RangeAttachment {
+            source: crate::BlobHandle {
+                event_position: 3,
+                call_index: 1,
+            },
+            start: 0,
+            end: 32,
+        };
+        let effects = vec![Effect::SendDirect {
+            to: peer,
+            msg: vec![1, 2],
+            range: Some(range),
+        }];
+        state
+            .apply_dispatch(
+                &Event::TimerFired {
+                    timer: crate::TimerPayload::unit(),
+                },
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &effects,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        state.record_direct(peer, 1).unwrap();
+        let recovered = ExecutionState::decode(&state.encode().unwrap()).unwrap();
+        assert_eq!(recovered, state);
+        assert_eq!(recovered.direct_queue(peer)[0].range, Some(range));
+        assert_eq!(recovered.direct_arrival(peer, 2), DirectArrival::Next);
+        let mut invalid = state.clone();
+        let lane = invalid.direct.get_mut(&peer).unwrap();
+        lane.queue = vec![lane.queue[0].clone(); MAX_DIRECT_QUEUE + 1];
+        assert!(borsh::to_vec(&invalid).is_err());
+        let mut invalid = state.clone();
+        invalid
+            .direct
+            .insert(state.producer(), DirectLane::default());
+        assert!(ExecutionState::decode(&borsh::to_vec(&invalid).unwrap()).is_err());
+    }
 
     #[test]
     fn end_confirmation_is_local_idempotent_and_retains_silent_peers() {

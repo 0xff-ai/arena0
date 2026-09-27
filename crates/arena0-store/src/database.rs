@@ -2,6 +2,7 @@ use super::*;
 use crate::lock::restrict_database_companions;
 
 mod activation;
+mod blobs;
 mod execution;
 mod integrity;
 mod receipt;

@@ -42,7 +42,7 @@ use lock::{
     OwnerLock, acquire_process_lock, configure_connection, initialize_schema, prepare_database_file,
 };
 
-const SCHEMA_VERSION: u64 = 7;
+const SCHEMA_VERSION: u64 = 8;
 const ENVELOPE_VERSION: u16 = 2;
 const ENVELOPE_MAGIC: [u8; 8] = *b"AR0STOR1";
 const ENVELOPE_DOMAIN: &[u8] = b"arena0/store-envelope/v2";
@@ -354,6 +354,9 @@ impl StoredProgram {
 /// Errors returned by the concrete SQLite store.
 #[derive(Debug, Error)]
 pub enum StoreError {
+    /// Imported content exceeds the blob object bound.
+    #[error("blob length {length} exceeds the maximum")]
+    BlobTooLarge { length: u64 },
     /// SQLite rejected an operation.
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
@@ -679,6 +682,8 @@ pub enum Change {
         event: Event<Vec<u8>>,
         effects: Vec<Effect>,
         timer_id: Option<TimerId>,
+        /// Blob changes staged in call order and applied in this transaction.
+        blobs: Vec<arena0_protocol::execution::BlobChange>,
     },
     /// Record a signature, releasing a certified proposal when present.
     StepSignature {
@@ -899,6 +904,64 @@ impl Drop for Store {
 }
 
 impl StoreHandle {
+    /// Store bounded content and return its BLAKE3 hash and length. Idempotent.
+    pub async fn import_blob(
+        &self,
+        bytes: Vec<u8>,
+    ) -> Result<(arena0_protocol::BlobHash, u64), StoreError> {
+        self.run(move |db| db.import_blob(bytes)).await
+    }
+
+    /// Complete stored content, if present.
+    pub async fn read_blob(
+        &self,
+        hash: arena0_protocol::BlobHash,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        self.run(move |db| db.read_blob(hash)).await
+    }
+
+    /// Whether the exact object is stored. One indexed lookup on the caller's thread.
+    pub fn blob_contains_blocking(
+        &self,
+        hash: arena0_protocol::BlobHash,
+        length: u64,
+    ) -> Result<bool, StoreError> {
+        let guard = self.inner.db.lock().map_err(|_| StoreError::Closed)?;
+        let db = guard.as_ref().ok_or(StoreError::Closed)?;
+        if db.is_poisoned() {
+            return Err(StoreError::Closed);
+        }
+        db.blob_contains(hash, length)
+    }
+
+    /// Resource bound to an execution-scoped handle. One indexed lookup on the caller's thread.
+    pub fn blob_resource_blocking(
+        &self,
+        execution_id: ExecId,
+        handle: arena0_protocol::BlobHandle,
+    ) -> Result<Option<arena0_protocol::execution::BlobResource>, StoreError> {
+        let guard = self.inner.db.lock().map_err(|_| StoreError::Closed)?;
+        let db = guard.as_ref().ok_or(StoreError::Closed)?;
+        if db.is_poisoned() {
+            return Err(StoreError::Closed);
+        }
+        db.blob_resource(execution_id, handle)
+    }
+
+    /// Written ranges of an uncommitted output, sorted by start. Runs under the connection mutex.
+    pub fn blob_written_blocking(
+        &self,
+        execution_id: ExecId,
+        handle: arena0_protocol::BlobHandle,
+    ) -> Result<Vec<std::ops::Range<u64>>, StoreError> {
+        let guard = self.inner.db.lock().map_err(|_| StoreError::Closed)?;
+        let db = guard.as_ref().ok_or(StoreError::Closed)?;
+        if db.is_poisoned() {
+            return Err(StoreError::Closed);
+        }
+        db.blob_written(execution_id, handle)
+    }
+
     /// Read bounded reconstruction metadata for a dormant end handshake.
     pub async fn end_wake_candidate(
         &self,

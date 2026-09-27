@@ -357,7 +357,9 @@ impl Database {
                 event,
                 effects,
                 timer_id,
+                blobs,
             } => {
+                self.apply_blob_changes(execution_id, blobs)?;
                 let event_position = next.event_position().checked_sub(1).ok_or_else(|| {
                     StoreError::Corruption("dispatch event position is zero".into())
                 })?;

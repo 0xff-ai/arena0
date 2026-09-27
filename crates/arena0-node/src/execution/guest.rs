@@ -582,6 +582,7 @@ impl ExecutionActor {
         self.persist(
             next,
             Change::Dispatch {
+                blobs: Vec::new(),
                 event,
                 effects,
                 timer_id: match &source {

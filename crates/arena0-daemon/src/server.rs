@@ -4837,6 +4837,7 @@ mod tests {
                     event,
                     effects,
                     timer_id: None,
+                    blobs: Vec::new(),
                 },
                 now_ms: 5,
             })

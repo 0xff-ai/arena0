@@ -3029,6 +3029,7 @@ async fn failed_persist_reloads_state_and_rebuilds_resident_on_next_dispatch() {
             expected: before.version(),
             next: durable.clone(),
             change: Change::Dispatch {
+                blobs: Vec::new(),
                 event: Event::TimerFired {
                     timer: arena0_protocol::TimerPayload::unit(),
                 },

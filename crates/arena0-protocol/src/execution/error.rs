@@ -9,6 +9,15 @@ use crate::{ActivationError, PeerId, StateHash};
 /// durable boundary.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProtocolError {
+    /// A recipient's unacknowledged direct queue has reached its bound.
+    #[error("direct queue is full for {to}")]
+    DirectQueueFull { to: PeerId },
+    /// Only the next direct sequence may be consumed.
+    #[error("direct message {seq} from {from} is out of order")]
+    DirectOutOfOrder { from: PeerId, seq: u64 },
+    /// Direct traffic is local and cannot be emitted by an agreed event.
+    #[error("an agreed event cannot send direct messages")]
+    DirectFromAgreedEvent,
     /// An event is not legal for the current lifecycle.
     #[error("event {event} is illegal while execution is {current:?}")]
     IllegalLifecycle {

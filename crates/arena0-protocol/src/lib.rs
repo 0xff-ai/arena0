@@ -76,12 +76,13 @@ pub use exec_frame::{ExecFrame, MAX_EXEC_FRAME_BYTES};
 #[cfg(not(target_arch = "wasm32"))]
 pub use execution::{
     ABORT_OCCURRENCE_DOMAIN, ABORT_OCCURRENCE_VERSION, AbortKind, AbortOccurrence, CalloutId,
-    CalloutIdParseError, EndMatch, EndPhase, ExecutionBinding, ExecutionState, ExecutionStatus,
-    ExecutionVersion, MAX_ACTIVE_TIMERS, MAX_EFFECTS, MAX_EXECUTION_STATE_BYTES,
-    MAX_PROOF_SIGNATURES, MAX_RECEIPT_BYTES, MAX_TRACE_ENTRY_BYTES, OpenCallout,
-    ParticipantStepSignature, ProtocolError, Receipt, ReceiptArtifact, ReceiptBody, ReceiptId,
-    ReceiptKind, ReceiptProvenance, ReceiptSummary, ReceiptWork, SharedProposal, StepCertificate,
-    StepCursor, StopCause, StopReport, TerminalOutcome, TimerId, callout_id, validate_agreed_trace,
+    CalloutIdParseError, DirectArrival, DirectEntry, DirectLane, EndMatch, EndPhase,
+    ExecutionBinding, ExecutionState, ExecutionStatus, ExecutionVersion, MAX_ACTIVE_TIMERS,
+    MAX_EFFECTS, MAX_EXECUTION_STATE_BYTES, MAX_PROOF_SIGNATURES, MAX_RECEIPT_BYTES,
+    MAX_TRACE_ENTRY_BYTES, OpenCallout, ParticipantStepSignature, ProtocolError, Receipt,
+    ReceiptArtifact, ReceiptBody, ReceiptId, ReceiptKind, ReceiptProvenance, ReceiptSummary,
+    ReceiptWork, SharedProposal, StepCertificate, StepCursor, StopCause, StopReport,
+    TerminalOutcome, TimerId, callout_id, validate_agreed_trace,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use fetch_frame::FetchFrame;

@@ -10,6 +10,7 @@ mod blob_change;
 mod callout;
 mod certificate;
 mod cursor;
+mod direct;
 mod end;
 mod error;
 mod outcome;
@@ -51,6 +52,7 @@ pub use certificate::{
     ReceiptProvenance, ReceiptSummary, StopReport,
 };
 pub use cursor::{ExecutionVersion, StepCursor};
+pub use direct::{DirectArrival, DirectEntry, DirectLane};
 pub use end::{EndMatch, EndPhase};
 pub use error::ProtocolError;
 pub use outcome::TerminalOutcome;
