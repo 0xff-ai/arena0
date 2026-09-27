@@ -6,23 +6,13 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
-/// Content address of one immutable object: the BLAKE3 (Bao root) hash of its
-/// bytes.
-#[derive(
-    BorshSerialize,
-    BorshDeserialize,
-    Serialize,
-    Deserialize,
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-)]
-pub struct BlobHash(pub [u8; 32]);
+use crate::id::id_type;
+
+id_type!(
+    /// Content address of one immutable object: the BLAKE3 (Bao root) hash of
+    /// its bytes. JSON and display use 64 lowercase hex characters.
+    pub struct BlobHash
+);
 
 /// A program's durable name for one stored or in-progress object.
 ///
