@@ -1,5 +1,7 @@
 //! Capability-gated imports and per-call resource accounting.
 
+#[cfg(test)]
+pub(crate) mod blob_tests;
 mod capabilities;
 mod core;
 
@@ -23,6 +25,7 @@ pub(super) fn register_metadata_imports(
     let capabilities = [
         Capability::Messaging,
         Capability::Timers,
+        Capability::Blobs,
         Capability::Sign {
             schemes: vec![SignScheme::Ed25519, SignScheme::Bls],
         },
@@ -133,6 +136,13 @@ impl CallerExt for Caller<'_, HostState> {
                 effect,
                 self.data().call_kind
             )));
+        }
+        if matches!(effect, Effect::SendDirect { .. })
+            && self.data().dispatch != DispatchKind::Local
+        {
+            return Err(wasmtime::Error::msg(
+                "send_direct: only available in local handlers",
+            ));
         }
         let queue = &self.data().effect_queue;
         if effect.is_lifecycle() {

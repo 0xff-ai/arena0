@@ -2,9 +2,9 @@
 
 use crate::call::DispatchKind;
 use arena0_program::{
-    CallStatus, DispatchInput, DispatchOutput, InitInput, JsonBytes, LocalStateBytes, OutcomeInput,
-    OutcomeOutput, QueryInput, QueryOutput, SharedStateBytes, StateFrameError, ViewInput,
-    ViewOutput, WriterInput, WriterOutput, abi,
+    CallStatus, DispatchOutput, InitInput, JsonBytes, LocalStateBytes, OutcomeInput, OutcomeOutput,
+    QueryInput, QueryOutput, SharedStateBytes, StateFrameError, ViewInput, ViewOutput, WriterInput,
+    WriterOutput, abi,
 };
 use arena0_protocol::{Committed, Ensemble};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -12,7 +12,7 @@ use wasmtime::{Global, Instance, Memory, Store, StoreLimitsBuilder, Val};
 
 use super::memory::Guest;
 use super::{CallKind, InstanceConfig, instantiate_module, max_output};
-use crate::call::{DispatchCall, serialize};
+use crate::call::{DispatchCall, DispatchParts, serialize};
 use crate::finalize::MUTABLE_GLOBAL_EXPORT_PREFIX;
 use crate::{
     CallObservations, DispatchCallResult, GuestOutcomeResult, GuestProjectionResult,
@@ -460,8 +460,7 @@ impl std::fmt::Debug for ProgramInstance {
 impl ProgramInstance {
     /// Dispatch one event through the sole mutating guest export.
     pub fn dispatch(&mut self, call: DispatchCall) -> Result<DispatchCallResult, SandboxError> {
-        let (input, dispatch, outgoing_len, signer, verifier) = call.into_input()?;
-        self.dispatch_input(input, dispatch, outgoing_len, signer, verifier)
+        self.dispatch_input(call.into_input()?)
     }
 
     /// Replace the resident state with durable committed payloads during actor
@@ -540,22 +539,35 @@ impl ProgramInstance {
         Err(error)
     }
 
-    fn dispatch_input(
-        &mut self,
-        input: DispatchInput,
-        dispatch: DispatchKind,
-        outgoing_len: usize,
-        signer: Option<std::sync::Arc<dyn crate::GuestSigner>>,
-        verifier: Option<std::sync::Arc<dyn crate::GuestVerifier>>,
-    ) -> Result<DispatchCallResult, SandboxError> {
+    fn dispatch_input(&mut self, parts: DispatchParts) -> Result<DispatchCallResult, SandboxError> {
+        let DispatchParts {
+            input,
+            dispatch,
+            outgoing_len,
+            signer,
+            verifier,
+            blobs,
+            event_position,
+            slice,
+            direct_queued,
+            peer_id,
+            session,
+        } = parts;
         let bytes = encode_envelope(&input, self.profile.limits.max_call_envelope_bytes)?;
         if let Err(error) = self.reset_for_dispatch(dispatch, outgoing_len) {
             return self.rollback_error(error);
         }
-        // Signing and verification custody lasts only for this dispatch; any
-        // rollback path clears both with the rest of the per-call host state.
+        // Host custody and the received slice belong to this dispatch. Rollback
+        // clears them and staged changes; the next entry resets the counters
+        // before installing a new view, identity, and queue snapshot.
         self.store.data_mut().signer.install(signer);
         self.store.data_mut().verifier = verifier;
+        self.store.data_mut().blobs = blobs;
+        self.store.data_mut().event_position = event_position;
+        self.store.data_mut().slice = slice;
+        self.store.data_mut().direct_queued = direct_queued;
+        self.store.data_mut().peer_id = Some(peer_id);
+        self.store.data_mut().session = Some(session);
         let (output, fuel_used) = call_export::<DispatchOutput>(
             &mut self.store,
             &self.instance,
@@ -581,6 +593,7 @@ impl ProgramInstance {
             // A rejection carries no images: the caller keeps its committed
             // state and nothing is cloned here.
             return Ok(DispatchCallResult {
+                blobs: Vec::new(),
                 status: output.status,
                 reason: output.reason,
                 callout: None,
@@ -611,6 +624,7 @@ impl ProgramInstance {
             .resident_payloads()
             .or_else(|error| self.rollback_error(error))?;
         Ok(DispatchCallResult {
+            blobs: std::mem::take(&mut self.store.data_mut().staged_blobs),
             status: output.status,
             reason: output.reason,
             callout: output.callout,
@@ -1294,6 +1308,115 @@ mod resident_runtime_tests {
         assert!(result.observations.logs.is_empty());
         assert!(result.observations.random_draws.is_empty());
         assert_eq!(instance.committed_payloads(), (&shared, &local));
+    }
+
+    #[test]
+    fn blob_dispatch_installs_context_and_returns_verified_bytes() {
+        use arena0_protocol::execution::{BlobChange, MAX_DIRECT_QUEUE};
+        use arena0_protocol::{Attachment, BlobHash};
+        let hash = BlobHash(arena0_crypto::hash(
+            arena0_crypto::HashAlgorithm::Blake3,
+            b"x",
+        ));
+        let imports = format!(
+            r#"
+            (import "arena0" "blob_create" (func $create (param i32 i64 i32) (result i32)))
+            (import "arena0" "blob_accept_range" (func $accept (param i32 i32 i64 i64) (result i32)))
+            (import "arena0" "blob_commit" (func $commit (param i32) (result i32)))
+            (import "arena0" "send_direct" (func $send (param i32 i32 i32 i32 i32) (result i32)))
+            (data (i32.const 1200) "{}")
+            (data (i32.const 1400) "{}")
+        "#,
+            wat_data(&hash.0),
+            wat_data(&[2; 32])
+        );
+        let body = r#"
+            i32.const 1200 i64.const 1 i32.const 1300 call $create if unreachable end
+            i32.const 1300 i32.const 0 i64.const 0 i64.const 1 call $accept if unreachable end
+            i32.const 1300 call $commit if unreachable end
+            i32.const 1400 i32.const 1100 i32.const 6 i32.const 0 i32.const 0 call $send drop
+            i32.const 32768 i32.const 3 call $pack
+        "#;
+        let mut instance = resident(
+            body,
+            vec![Capability::Blobs, Capability::Messaging],
+            &imports,
+        );
+        for queued in [0, MAX_DIRECT_QUEUE] {
+            let peer = PeerId([1; 32]);
+            let other = PeerId([2; 32]);
+            let session = Ensemble::from_peers(vec![peer, other]).unwrap();
+            let call = DispatchCall::new(
+                peer,
+                session,
+                Event::DirectReceived {
+                    from: other,
+                    msg: Vec::new(),
+                    slice: Some(Attachment(0)),
+                },
+            )
+            .with_blobs(
+                7,
+                std::sync::Arc::new(crate::engine::imports::blob_tests::View::default()),
+            )
+            .with_slice(arena0_crypto::bao::encode_slice(b"x", 0, 1))
+            .with_direct_queued(vec![(other, queued)]);
+            let result = instance.dispatch(call).unwrap();
+            let handle = arena0_protocol::BlobHandle {
+                event_position: 7,
+                call_index: 0,
+            };
+            assert_eq!(
+                result.blobs,
+                vec![
+                    BlobChange::Create {
+                        handle,
+                        hash,
+                        length: 1
+                    },
+                    BlobChange::Write {
+                        handle,
+                        offset: 0,
+                        bytes: b"x".to_vec()
+                    },
+                    BlobChange::Commit { handle },
+                ]
+            );
+            let expected = if queued == 0 {
+                vec![Effect::SendDirect {
+                    to: other,
+                    msg: b"effect".to_vec(),
+                    range: None,
+                }]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(result.observations.effects, expected);
+        }
+    }
+
+    #[test]
+    fn rejected_dispatch_discards_staged_blob_changes() {
+        let body = format!(
+            "i32.const 0 i64.const 10 i32.const 64 call $create drop {}",
+            rejected_body()
+        );
+        let mut instance = resident(
+            &body,
+            vec![Capability::Blobs],
+            r#"(import "arena0" "blob_create" (func $create (param i32 i64 i32) (result i32)))"#,
+        );
+        let result = instance
+            .dispatch(call().with_blobs(
+                7,
+                std::sync::Arc::new(crate::engine::imports::blob_tests::View::default()),
+            ))
+            .unwrap();
+        assert_eq!(result.status, arena0_program::CallStatus::Rejected);
+        assert!(result.blobs.is_empty());
+        // A rejected dispatch also drops its view, tokens, and identity. A
+        // subsequent call without a view cannot inherit the prior authority.
+        assert!(instance.dispatch(call()).is_err());
     }
 
     #[test]

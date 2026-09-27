@@ -71,6 +71,8 @@
 //! Programs are pure state machines. The runtime handles transport,
 //! callout/input collection, and state verification.
 
+mod blobs;
+pub use blobs::Blobs;
 pub mod context;
 mod effects;
 pub mod fault;
@@ -98,8 +100,8 @@ pub use arena0_sdk_macros::{
     callout, callouts, data, local, message, outcome, phases, primitive, program, query, state,
 };
 pub use context::{
-    AgreedMode, BroadcastError, CalloutContext, Context, Ctx, EffectMode, Effects, LocalContext,
-    LocalMode, Mode, PrimitiveField, PrimitiveOutput, PrimitiveRoute, RawPrimitiveRoute, ReadMode,
+    AgreedMode, CalloutContext, Context, Ctx, EffectMode, Effects, LocalContext, LocalMode, Mode,
+    PrimitiveField, PrimitiveOutput, PrimitiveRoute, RawPrimitiveRoute, ReadMode, SendError,
     Signed,
 };
 #[doc(hidden)]
@@ -143,8 +145,9 @@ pub use arena0_program::{
 };
 pub use arena0_protocol as types;
 pub use arena0_protocol::{
-    Committed, Effect, Ensemble, EnsembleError, Event, LogLevel, Open, Participant, PeerId,
-    SessionHash, StateHash, TimerPayload, VerifyError, View, Viewport,
+    Attachment, BlobError, BlobHandle, BlobHash, Committed, Effect, Ensemble, EnsembleError, Event,
+    LogLevel, Open, Participant, PeerId, RangeAttachment, SessionHash, StateHash, TimerPayload,
+    VerifyError, View, Viewport,
 };
 pub use borsh;
 pub use schemars;
@@ -194,6 +197,12 @@ macro_rules! __arena0_capability_vec {
         capabilities
     }};
     (Timers) => { ::std::vec![$crate::Capability::Timers] };
+    (Blobs, $($rest:tt)*) => {{
+        let mut capabilities = ::std::vec![$crate::Capability::Blobs];
+        capabilities.extend($crate::__arena0_capability_vec!($($rest)*));
+        capabilities
+    }};
+    (Blobs) => { ::std::vec![$crate::Capability::Blobs] };
     (Sign { schemes: [$($scheme:ident),* $(,)?] }, $($rest:tt)*) => {{
         let mut capabilities = ::std::vec![
             $crate::Capability::Sign {

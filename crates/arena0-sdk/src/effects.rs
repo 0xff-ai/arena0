@@ -7,7 +7,9 @@
 use arena0_crypto::SignScheme;
 #[cfg(not(target_arch = "wasm32"))]
 use arena0_program::abi::imports;
-use arena0_protocol::{LogLevel, PeerId, TimerPayload};
+use arena0_protocol::{
+    Attachment, BlobError, BlobHandle, BlobHash, LogLevel, PeerId, RangeAttachment, TimerPayload,
+};
 
 /// State-memory selector used by the always-available state imports.
 #[doc(hidden)]
@@ -23,6 +25,11 @@ unsafe extern "C" {
     fn log(level: u32, msg_ptr: u32, msg_len: u32);
     fn random(buf_ptr: u32, buf_len: u32);
     fn broadcast(data_ptr: u32, data_len: u32) -> u32;
+    fn send_direct(to_ptr: u32, msg_ptr: u32, msg_len: u32, range_ptr: u32, range_len: u32) -> u32;
+    fn blob_resolve(hash_ptr: u32, length: u64, out_ptr: u32) -> u32;
+    fn blob_create(hash_ptr: u32, length: u64, out_ptr: u32) -> u32;
+    fn blob_accept_range(handle_ptr: u32, attachment: u32, start: u64, end: u64) -> u32;
+    fn blob_commit(handle_ptr: u32) -> u32;
     fn set_timer(delay_ms: u64, type_ptr: u32, type_len: u32, data_ptr: u32, data_len: u32);
     fn sign(scheme: u32, data_ptr: u32, data_len: u32, out_ptr: u32, out_cap: u32) -> u32;
     fn verify(
@@ -104,12 +111,12 @@ pub(crate) fn host_random(buf: &mut [u8]) {
 
 /// Broadcast a message to every participant.
 ///
-/// Returns [`BroadcastError::QueueFull`] when the durable outgoing queue is
+/// Returns [`SendError::QueueFull`] when the durable outgoing queue is
 /// full; the host then queues nothing.
-pub(crate) fn host_broadcast(msg_bytes: &[u8]) -> Result<(), crate::context::BroadcastError> {
+pub(crate) fn host_broadcast(msg_bytes: &[u8]) -> Result<(), crate::context::SendError> {
     host_import!(BROADCAST(msg_bytes) {
         if broadcast(msg_bytes.as_ptr() as u32, msg_bytes.len() as u32) != 0 {
-            return Err(crate::context::BroadcastError::QueueFull);
+            return Err(crate::context::SendError::QueueFull);
         }
         Ok(())
     })
@@ -174,6 +181,66 @@ pub(crate) fn host_guest_verify(
         let bytes = core::slice::from_raw_parts(out, written).to_vec();
         crate::io_alloc::io_dealloc(out, capacity);
         borsh::from_slice(&bytes).expect("host verify result decode failed")
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn blob_result(status: u32) -> Result<(), BlobError> {
+    if status == 0 {
+        Ok(())
+    } else {
+        let tag = u8::try_from(status - 1).expect("host blob error tag fits u8");
+        Err(borsh::from_slice(&[tag]).expect("host blob error decode failed"))
+    }
+}
+
+pub(crate) fn host_send_direct(
+    to: PeerId,
+    msg: &[u8],
+    range: Option<RangeAttachment>,
+) -> Result<(), crate::SendError> {
+    host_import!(SEND_DIRECT(to, msg, range) {
+        let range = range.map(|r| borsh::to_vec(&r).expect("range serialization failed")).unwrap_or_default();
+        match send_direct(to.0.as_ptr() as u32, msg.as_ptr() as u32, msg.len() as u32, range.as_ptr() as u32, range.len() as u32) {
+            0 => Ok(()),
+            1 => Err(crate::SendError::QueueFull),
+            _ => panic!("invalid host send_direct status"),
+        }
+    })
+}
+
+pub(crate) fn host_blob_resolve(hash: BlobHash, length: u64) -> Result<BlobHandle, BlobError> {
+    host_import!(BLOB_RESOLVE(hash, length) {
+        // Borsh encodes the u64 event position and u32 call index in 12 bytes.
+        let mut out = [0u8; 12];
+        blob_result(blob_resolve(hash.0.as_ptr() as u32, length, out.as_mut_ptr() as u32))?;
+        Ok(borsh::from_slice(&out).expect("host blob handle decode failed"))
+    })
+}
+
+pub(crate) fn host_blob_create(hash: BlobHash, length: u64) -> Result<BlobHandle, BlobError> {
+    host_import!(BLOB_CREATE(hash, length) {
+        let mut out = [0u8; 12];
+        blob_result(blob_create(hash.0.as_ptr() as u32, length, out.as_mut_ptr() as u32))?;
+        Ok(borsh::from_slice(&out).expect("host blob handle decode failed"))
+    })
+}
+
+pub(crate) fn host_blob_accept_range(
+    output: BlobHandle,
+    slice: Attachment,
+    range: std::ops::Range<u64>,
+) -> Result<(), BlobError> {
+    host_import!(BLOB_ACCEPT_RANGE(output, slice, range) {
+        let handle = borsh::to_vec(&output).expect("blob handle serialization failed");
+        blob_result(blob_accept_range(handle.as_ptr() as u32, slice.0, range.start, range.end))
+    })
+}
+
+pub(crate) fn host_blob_commit(output: BlobHandle) -> Result<(), BlobError> {
+    host_import!(BLOB_COMMIT(output) {
+        let handle = borsh::to_vec(&output).expect("blob handle serialization failed");
+        blob_result(blob_commit(handle.as_ptr() as u32))
     })
 }
 

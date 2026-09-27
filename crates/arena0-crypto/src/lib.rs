@@ -8,6 +8,9 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod keys;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod bao;
+
 /// Host-only BLS12-381 (MinSig) aggregate signing and verification.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod bls;

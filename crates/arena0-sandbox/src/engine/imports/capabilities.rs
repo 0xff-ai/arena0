@@ -1,10 +1,18 @@
 //! Capability-gated host function registration (messaging, timers, and sign).
 
+use crate::call::DispatchKind;
 use arena0_crypto::SignScheme;
 use arena0_program::Capability;
 use arena0_program::abi::{self, imports};
-use arena0_protocol::execution::MAX_OUTGOING_MESSAGES;
+use arena0_protocol::execution::{
+    BlobChange, BlobResource, MAX_DIRECT_QUEUE, MAX_OUTGOING_MESSAGES,
+};
+use arena0_protocol::{
+    BlobError, BlobHandle, BlobHash, MAX_BLOB_BYTES, MAX_DIRECT_CONTROL_BYTES,
+    MAX_DIRECT_RANGE_BYTES, PeerId, RangeAttachment,
+};
 use arena0_protocol::{Effect, TimerPayload};
+use std::ops::Range;
 use wasmtime::{Caller, Linker};
 
 use super::{CallerExt as _, u32_to_sign_scheme};
@@ -22,7 +30,7 @@ pub(crate) fn register_capability_imports(
             Capability::Messaging => register_messaging(linker)?,
             Capability::Timers => register_timers(linker)?,
             Capability::Sign { schemes } => sign_schemes.extend(schemes.iter().copied()),
-            Capability::Blobs => unimplemented!("blob imports"),
+            Capability::Blobs => register_blobs(linker)?,
         }
     }
     if !sign_schemes.is_empty() {
@@ -44,6 +52,76 @@ fn map_err(e: wasmtime::Error) -> SandboxError {
 }
 
 fn register_messaging(linker: &mut Linker<HostState>) -> Result<(), SandboxError> {
+    linker
+        .func_wrap(
+            abi::HOST_MODULE,
+            imports::SEND_DIRECT,
+            |mut caller: Caller<'_, HostState>,
+             to_ptr: u32,
+             msg_ptr: u32,
+             msg_len: u32,
+             range_ptr: u32,
+             range_len: u32|
+             -> Result<u32, wasmtime::Error> {
+                caller.begin_import(imports::SEND_DIRECT)?;
+                require_local(&caller, imports::SEND_DIRECT)?;
+                let to = PeerId(
+                    caller
+                        .read_guest_bytes(to_ptr, 32, imports::SEND_DIRECT)?
+                        .try_into()
+                        .expect("peer width"),
+                );
+                let state = caller.data();
+                let session = state.session.as_ref().expect("dispatch session installed");
+                if Some(to) == state.peer_id || !session.peers().contains(&to) {
+                    return Err(wasmtime::Error::msg(
+                        "send_direct: recipient must be another participant",
+                    ));
+                }
+                if msg_len as usize > MAX_DIRECT_CONTROL_BYTES {
+                    return Err(wasmtime::Error::msg(
+                        "send_direct: control message exceeds limit",
+                    ));
+                }
+                let range = if range_len == 0 {
+                    None
+                } else {
+                    let bytes =
+                        caller.read_guest_bytes(range_ptr, range_len, imports::SEND_DIRECT)?;
+                    let range: RangeAttachment =
+                        borsh::from_slice(&bytes).map_err(wasmtime::Error::new)?;
+                    let resource = blob_resource(caller.data(), range.source)?
+                        .ok_or_else(|| wasmtime::Error::msg("send_direct: unknown source"))?;
+                    if !resource.committed
+                        || range.start >= range.end
+                        || range.end > resource.length
+                        || range.end - range.start > MAX_DIRECT_RANGE_BYTES
+                    {
+                        return Err(wasmtime::Error::msg("send_direct: invalid source range"));
+                    }
+                    Some(range)
+                };
+                let queued = caller
+                    .data()
+                    .direct_queued
+                    .iter()
+                    .find(|(peer, _)| *peer == to)
+                    .map_or(0, |(_, len)| *len);
+                let here = caller
+                    .data()
+                    .effect_queue
+                    .iter()
+                    .filter(|e| matches!(e, Effect::SendDirect { to: peer, .. } if *peer == to))
+                    .count();
+                if queued + here >= MAX_DIRECT_QUEUE {
+                    return Ok(1);
+                }
+                let msg = caller.read_guest_bytes(msg_ptr, msg_len, imports::SEND_DIRECT)?;
+                caller.record_effect(Effect::SendDirect { to, msg, range })?;
+                Ok(0)
+            },
+        )
+        .map_err(map_err)?;
     linker
         .func_wrap(
             abi::HOST_MODULE,
@@ -71,6 +149,285 @@ fn register_messaging(linker: &mut Linker<HostState>) -> Result<(), SandboxError
                 }
                 let data = caller.read_guest_bytes(data_ptr, data_len, "broadcast:data")?;
                 caller.record_effect(Effect::Broadcast { data })?;
+                Ok(0)
+            },
+        )
+        .map_err(map_err)?;
+    Ok(())
+}
+
+fn require_local(caller: &Caller<'_, HostState>, name: &str) -> Result<(), wasmtime::Error> {
+    caller.reject_read_only(name)?;
+    if caller.data().dispatch != DispatchKind::Local {
+        return Err(wasmtime::Error::msg(format!(
+            "{name}: only available in local handlers"
+        )));
+    }
+    Ok(())
+}
+
+/// Staged creates/resolves own their resource metadata; commits overlay either
+/// those records or a previously persisted resource. Store failures are traps.
+fn blob_resource(
+    state: &HostState,
+    handle: BlobHandle,
+) -> Result<Option<BlobResource>, wasmtime::Error> {
+    let view = state
+        .blobs
+        .as_ref()
+        .ok_or_else(|| wasmtime::Error::msg("blob view unavailable"))?;
+    let staged = state.staged_blobs.iter().find_map(|change| match change {
+        BlobChange::Create {
+            handle: h,
+            hash,
+            length,
+        } if *h == handle => Some(BlobResource {
+            hash: *hash,
+            length: *length,
+            output: true,
+            committed: false,
+        }),
+        BlobChange::Resolve {
+            handle: h,
+            hash,
+            length,
+        } if *h == handle => Some(BlobResource {
+            hash: *hash,
+            length: *length,
+            output: false,
+            committed: true,
+        }),
+        _ => None,
+    });
+    let mut resource = match staged {
+        Some(resource) => Some(resource),
+        None => view.resource(handle).map_err(wasmtime::Error::msg)?,
+    };
+    if let Some(resource) = &mut resource
+        && state
+            .staged_blobs
+            .iter()
+            .any(|c| matches!(c, BlobChange::Commit { handle: h } if *h == handle))
+    {
+        resource.committed = true;
+    }
+    Ok(resource)
+}
+
+fn blob_written(state: &HostState, handle: BlobHandle) -> Result<Vec<Range<u64>>, wasmtime::Error> {
+    let created_here = state
+        .staged_blobs
+        .iter()
+        .any(|c| matches!(c, BlobChange::Create { handle: h, .. } if *h == handle));
+    let mut ranges = if created_here {
+        Vec::new()
+    } else {
+        state
+            .blobs
+            .as_ref()
+            .expect("blob view checked")
+            .written(handle)
+            .map_err(wasmtime::Error::msg)?
+    };
+    for change in &state.staged_blobs {
+        if let BlobChange::Write {
+            handle: h,
+            offset,
+            bytes,
+        } = change
+            && *h == handle
+        {
+            ranges.push(*offset..*offset + bytes.len() as u64);
+        }
+    }
+    ranges.sort_by_key(|r| r.start);
+    Ok(ranges)
+}
+
+fn blob_status(error: BlobError) -> u32 {
+    u32::from(borsh::to_vec(&error).expect("blob error encoding")[0]) + 1
+}
+
+fn read_blob_handle(
+    caller: &mut Caller<'_, HostState>,
+    ptr: u32,
+) -> Result<BlobHandle, wasmtime::Error> {
+    let bytes = caller.read_guest_bytes(ptr, 12, "blob handle")?;
+    borsh::from_slice(&bytes).map_err(wasmtime::Error::new)
+}
+
+fn register_blobs(linker: &mut Linker<HostState>) -> Result<(), SandboxError> {
+    for (name, resolve) in [(imports::BLOB_RESOLVE, true), (imports::BLOB_CREATE, false)] {
+        linker
+            .func_wrap(
+                abi::HOST_MODULE,
+                name,
+                move |mut caller: Caller<'_, HostState>,
+                      hash_ptr: u32,
+                      length: u64,
+                      out_ptr: u32|
+                      -> Result<u32, wasmtime::Error> {
+                    caller.begin_import(name)?;
+                    require_local(&caller, name)?;
+                    let view = caller
+                        .data()
+                        .blobs
+                        .clone()
+                        .ok_or_else(|| wasmtime::Error::msg("blob view unavailable"))?;
+                    if length > MAX_BLOB_BYTES {
+                        return Ok(blob_status(BlobError::Quota));
+                    }
+                    let hash = BlobHash(
+                        caller
+                            .read_guest_bytes(hash_ptr, 32, name)?
+                            .try_into()
+                            .expect("hash width"),
+                    );
+                    if resolve {
+                        let mut contained = false;
+                        for change in &caller.data().staged_blobs {
+                            if let BlobChange::Commit { handle } = change {
+                                let resource = blob_resource(caller.data(), *handle)?
+                                    .expect("staged commit resource");
+                                if resource.hash == hash && resource.length == length {
+                                    contained = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !contained
+                            && !view.contains(hash, length).map_err(wasmtime::Error::msg)?
+                        {
+                            return Ok(blob_status(BlobError::NotFound));
+                        }
+                    }
+                    let handle = BlobHandle {
+                        event_position: caller.data().event_position,
+                        call_index: caller.data().blob_calls,
+                    };
+                    caller.data_mut().blob_calls += 1;
+                    let change = if resolve {
+                        BlobChange::Resolve {
+                            handle,
+                            hash,
+                            length,
+                        }
+                    } else {
+                        BlobChange::Create {
+                            handle,
+                            hash,
+                            length,
+                        }
+                    };
+                    let encoded = borsh::to_vec(&handle).expect("blob handle encoding");
+                    let max = caller.data().profile.limits.max_host_bytes;
+                    caller
+                        .data_mut()
+                        .ledger
+                        .copy_bytes(encoded.len(), max)
+                        .map_err(wasmtime::Error::new)?;
+                    caller
+                        .work_memory()?
+                        .write(&mut caller, out_ptr as usize, &encoded)
+                        .map_err(wasmtime::Error::new)?;
+                    caller.data_mut().staged_blobs.push(change);
+                    Ok(0)
+                },
+            )
+            .map_err(map_err)?;
+    }
+    linker
+        .func_wrap(
+            abi::HOST_MODULE,
+            imports::BLOB_ACCEPT_RANGE,
+            |mut caller: Caller<'_, HostState>,
+             handle_ptr: u32,
+             attachment: u32,
+             start: u64,
+             end: u64|
+             -> Result<u32, wasmtime::Error> {
+                caller.begin_import(imports::BLOB_ACCEPT_RANGE)?;
+                require_local(&caller, imports::BLOB_ACCEPT_RANGE)?;
+                let handle = read_blob_handle(&mut caller, handle_ptr)?;
+                let Some(resource) = blob_resource(caller.data(), handle)? else {
+                    return Ok(blob_status(BlobError::NotFound));
+                };
+                if !resource.output || resource.committed {
+                    return Ok(blob_status(BlobError::BadRange));
+                }
+                if attachment != 0 {
+                    return Ok(blob_status(BlobError::BadSlice));
+                }
+                let Some(slice) = caller.data_mut().slice.take() else {
+                    return Ok(blob_status(BlobError::BadSlice));
+                };
+                if start >= end
+                    || end > resource.length
+                    || end - start > MAX_DIRECT_RANGE_BYTES
+                    || blob_written(caller.data(), handle)?
+                        .iter()
+                        .any(|r| start < r.end && r.start < end)
+                {
+                    return Ok(blob_status(BlobError::BadRange));
+                }
+                let max = caller.data().profile.limits.max_host_bytes;
+                caller
+                    .data_mut()
+                    .ledger
+                    .copy_bytes((end - start) as usize, max)
+                    .map_err(wasmtime::Error::new)?;
+                let Some(bytes) = arena0_crypto::bao::decode_slice(
+                    &slice,
+                    &resource.hash.0,
+                    resource.length,
+                    start,
+                    end - start,
+                ) else {
+                    return Ok(blob_status(BlobError::BadSlice));
+                };
+                caller.data_mut().staged_blobs.push(BlobChange::Write {
+                    handle,
+                    offset: start,
+                    bytes,
+                });
+                Ok(0)
+            },
+        )
+        .map_err(map_err)?;
+    linker
+        .func_wrap(
+            abi::HOST_MODULE,
+            imports::BLOB_COMMIT,
+            |mut caller: Caller<'_, HostState>, handle_ptr: u32| -> Result<u32, wasmtime::Error> {
+                caller.begin_import(imports::BLOB_COMMIT)?;
+                require_local(&caller, imports::BLOB_COMMIT)?;
+                let handle = read_blob_handle(&mut caller, handle_ptr)?;
+                let Some(resource) = blob_resource(caller.data(), handle)? else {
+                    return Ok(blob_status(BlobError::NotFound));
+                };
+                if !resource.output || resource.committed {
+                    return Ok(blob_status(BlobError::BadRange));
+                }
+                let mut end = 0;
+                for range in blob_written(caller.data(), handle)? {
+                    if range.start != end {
+                        return Ok(blob_status(BlobError::Incomplete));
+                    }
+                    end = range.end;
+                }
+                if end != resource.length {
+                    return Ok(blob_status(BlobError::Incomplete));
+                }
+                if resource.length == 0
+                    && resource.hash.0
+                        != arena0_crypto::hash(arena0_crypto::HashAlgorithm::Blake3, b"")
+                {
+                    return Ok(blob_status(BlobError::BadSlice));
+                }
+                caller
+                    .data_mut()
+                    .staged_blobs
+                    .push(BlobChange::Commit { handle });
                 Ok(0)
             },
         )

@@ -504,3 +504,43 @@ fn scopes_effect_bindings_to_the_declaring_function() {
     let expanded = expand_sign_module(item);
     assert!(!expanded.contains("Capability :: Messaging"), "{expanded}");
 }
+
+#[test]
+fn infers_blob_and_direct_capabilities_from_local_context() {
+    let item: Item = syn::parse_quote! {
+        pub mod transfer {
+            use arena0::prelude::*;
+            #[arena0::state(max = 256)]
+            pub struct Shared { round: u64 }
+            fn on_input(ctx: &mut LocalContext, _input: Input) -> arena0::anyhow::Result<()> {
+                let local = &mut *ctx;
+                let _ = local.blobs();
+                local.send_direct(Participant::new(1), &(), None)?;
+                Ok(())
+            }
+        }
+    };
+    let expanded = expand_sign_module(item);
+    assert!(expanded.contains("Capability :: Blobs"), "{expanded}");
+    assert!(expanded.contains("Capability :: Messaging"), "{expanded}");
+}
+
+#[test]
+fn ignores_blob_and_direct_methods_on_other_receivers() {
+    let item: Item = syn::parse_quote! {
+        pub mod transfer {
+            use arena0::prelude::*;
+            #[arena0::state(max = 256)]
+            pub struct Shared { round: u64 }
+            fn on_input(ctx: &mut LocalContext, _input: Input) -> arena0::anyhow::Result<()> {
+                let ctx = Helper;
+                ctx.blobs();
+                ctx.send_direct();
+                Ok(())
+            }
+        }
+    };
+    let expanded = expand_sign_module(item);
+    assert!(!expanded.contains("Capability :: Blobs"), "{expanded}");
+    assert!(!expanded.contains("Capability :: Messaging"), "{expanded}");
+}

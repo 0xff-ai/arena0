@@ -59,7 +59,7 @@ pub trait Mode: sealed::Sealed {}
 /// ```
 pub trait EffectMode: Mode + Sized {
     /// The result of one broadcast: `()` for agreed handlers,
-    /// `Result<(), BroadcastError>` for local handlers.
+    /// `Result<(), SendError>` for local handlers.
     type Broadcast;
 
     #[doc(hidden)]
@@ -75,7 +75,7 @@ pub trait EffectMode: Mode + Sized {
 pub struct AgreedMode;
 
 /// A local handler (`on_input`, `on_timer`): shared state is read-only, a
-/// broadcast can fail with [`BroadcastError::QueueFull`], and it may `sign`.
+/// broadcast can fail with [`SendError::QueueFull`], and it may `sign`.
 #[derive(Debug, Clone, Copy)]
 pub struct LocalMode;
 
@@ -100,7 +100,7 @@ impl EffectMode for AgreedMode {
 }
 
 impl EffectMode for LocalMode {
-    type Broadcast = Result<(), BroadcastError>;
+    type Broadcast = Result<(), SendError>;
 
     fn __broadcast<Shared>(_: &mut Effects<'_, Shared, Self>, bytes: Vec<u8>) -> Self::Broadcast {
         effects::host_broadcast(&bytes)
@@ -491,6 +491,27 @@ impl<Shared, Local> Ctx<Shared, Local, AgreedMode> {
 }
 
 impl<Shared, Local> Ctx<Shared, Local, LocalMode> {
+    /// Queue a direct message to `to`, outside agreement, optionally carrying an
+    /// object range the Host proves and sends. `to` must be another participant.
+    pub fn send_direct<T: BorshSerialize>(
+        &mut self,
+        to: Participant,
+        msg: &T,
+        range: Option<crate::RangeAttachment>,
+    ) -> Result<(), SendError> {
+        let to = self
+            .ensemble()
+            .peer_at(to)
+            .expect("direct recipient is a participant");
+        let msg = borsh::to_vec(msg).expect("direct message serialization failed");
+        effects::host_send_direct(to, &msg, range)
+    }
+
+    /// The blob store, for local handlers of programs with Capability::Blobs.
+    pub fn blobs(&mut self) -> crate::Blobs<'_> {
+        crate::Blobs::new()
+    }
+
     /// Build the context for one local dispatch.
     ///
     /// # Safety
@@ -513,7 +534,7 @@ impl<Shared, Local> Ctx<Shared, Local, LocalMode> {
     /// coordinates and returns both that exact preimage and its signature; both
     /// schemes are deterministic, so re-running the handler after a crash
     /// produces the same signature. Available only in local handlers
-    /// (`InputReceived`, `TimerFired`) whose program declared a `Sign`
+    /// (`InputReceived`, `TimerFired`, `DirectReceived`) whose program declared a `Sign`
     /// capability for the requested scheme.
     pub fn sign(&mut self, scheme: SignScheme, payload: &[u8]) -> Signed {
         let (signed_bytes, signature) = effects::host_guest_sign(scheme, payload);
@@ -524,17 +545,14 @@ impl<Shared, Local> Ctx<Shared, Local, LocalMode> {
     }
 }
 
-/// Failure to emit a broadcast.
-///
-/// A broadcast that returns an error queued nothing; the program may retry or
-/// carry on.
+/// Failure to queue a message. A call that returns an error queued nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BroadcastError {
+pub enum SendError {
     /// The durable outgoing queue has reached its bound.
     QueueFull,
 }
 
-impl std::fmt::Display for BroadcastError {
+impl std::fmt::Display for SendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::QueueFull => write!(f, "the outgoing message queue is full"),
@@ -542,7 +560,7 @@ impl std::fmt::Display for BroadcastError {
     }
 }
 
-impl std::error::Error for BroadcastError {}
+impl std::error::Error for SendError {}
 
 /// Host side-effect handle passed to [`Context::effects`].
 ///
@@ -638,7 +656,7 @@ impl<Shared, M: EffectMode> Effects<'_, Shared, M> {
     /// In an agreed handler this cannot fail: an agreed handler never observes
     /// the local queue, and if the agreed step would overflow the queue the
     /// Host fails the session instead of signing it. In a local handler it
-    /// returns [`BroadcastError::QueueFull`] when the queue is full and queues
+    /// returns [`SendError::QueueFull`] when the queue is full and queues
     /// nothing.
     pub fn broadcast<T: BorshSerialize>(&mut self, msg: &T) -> M::Broadcast {
         M::__broadcast(self, borsh::to_vec(msg).expect("message serialization"))
