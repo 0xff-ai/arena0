@@ -25,7 +25,7 @@ const EXEC_KIND_ABORT: u8 = 0x02;
 /// Frame kind of [`ExecFrame::StepCertificate`].
 const EXEC_KIND_STEP_CERTIFICATE: u8 = 0x03;
 /// Maximum signer bitmap size for the protocol's participant bound.
-const MAX_EXEC_SIGNER_BYTES: usize = crate::negotiation::MAX_PARTICIPANTS.div_ceil(8);
+const MAX_EXEC_SIGNER_BYTES: usize = crate::MAX_PARTICIPANTS.div_ceil(8);
 /// Borsh size of a [`StepCommitment`]: domain, session, step, entry hash,
 /// pre/post state hashes, and chain link.
 const STEP_COMMITMENT_BYTES: usize = 24 + 32 + 8 + 32 + 32 + 32 + 32;

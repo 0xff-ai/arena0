@@ -14,9 +14,10 @@ use crate::trace::StepCommitment;
 use arena0_program::bounded;
 
 use super::{
-    AbortKind, AbortOccurrence, ExecutionBinding, MAX_TERMINAL_REASON_BYTES, ProtocolError,
-    ReceiptId, StepCursor, TerminalOutcome, ensure_payload,
+    AbortKind, AbortOccurrence, ExecutionBinding, ProtocolError, ReceiptId, StepCursor,
+    TerminalOutcome, ensure_payload,
 };
+use crate::MAX_TERMINAL_REASON_BYTES;
 
 /// The one persisted owner of execution lifecycle progress,
 /// certified terminal outcomes, and receipt identities.
@@ -280,7 +281,7 @@ fn ensure_reason(reason: &str) -> Result<(), ProtocolError> {
     ensure_payload(
         "terminal reason",
         reason.len(),
-        super::MAX_TERMINAL_REASON_BYTES,
+        crate::MAX_TERMINAL_REASON_BYTES,
     )
 }
 

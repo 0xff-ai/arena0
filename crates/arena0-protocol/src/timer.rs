@@ -4,7 +4,7 @@ use arena0_program::bounded;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
-use crate::execution::{MAX_TERMINAL_REASON_BYTES, MAX_TIMER_PAYLOAD_BYTES};
+use crate::{MAX_TERMINAL_REASON_BYTES, MAX_TIMER_PAYLOAD_BYTES};
 
 /// Program-defined typed timer value carried from `SetTimer` to timer dispatch.
 #[derive(

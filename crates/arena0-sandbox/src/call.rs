@@ -5,7 +5,7 @@ use arena0_protocol::{Committed, Ensemble, Event, PeerId};
 use borsh::BorshSerialize;
 use std::sync::Arc;
 
-use crate::GuestSigner;
+use crate::{GuestSigner, GuestVerifier};
 
 /// Whether a dispatch event is an agreed event or a local event.
 ///
@@ -19,12 +19,13 @@ pub(crate) enum DispatchKind {
 
 /// Decoded inputs for one resident dispatch: the ABI envelope, the dispatch
 /// kind the guest sees, the committed outgoing length, and the per-dispatch
-/// signer.
+/// signer and verifier.
 type DispatchParts = (
     DispatchInput,
     DispatchKind,
     usize,
     Option<Arc<dyn GuestSigner>>,
+    Option<Arc<dyn GuestVerifier>>,
 );
 
 /// One event dispatched through the resident Wasm instance.
@@ -35,6 +36,7 @@ pub struct DispatchCall {
     pub(crate) event: Event<Vec<u8>>,
     pub(crate) outgoing_len: usize,
     pub(crate) signer: Option<Arc<dyn GuestSigner>>,
+    pub(crate) verifier: Option<Arc<dyn GuestVerifier>>,
 }
 
 impl std::fmt::Debug for DispatchCall {
@@ -45,6 +47,7 @@ impl std::fmt::Debug for DispatchCall {
             .field("session", &self.session)
             .field("event", &self.event)
             .field("signer", &self.signer.is_some())
+            .field("verifier", &self.verifier.is_some())
             .finish()
     }
 }
@@ -60,6 +63,7 @@ impl DispatchCall {
             event,
             outgoing_len: 0,
             signer: None,
+            verifier: None,
         }
     }
 
@@ -83,6 +87,14 @@ impl DispatchCall {
         self
     }
 
+    /// Install the verifier exposed to this dispatch's `verify` calls. Every
+    /// dispatch kind may carry one; a call without one traps on `verify`.
+    #[must_use]
+    pub fn with_verifier(mut self, verifier: Arc<dyn GuestVerifier>) -> Self {
+        self.verifier = Some(verifier);
+        self
+    }
+
     pub(crate) fn into_input(self) -> Result<DispatchParts, crate::SandboxError> {
         let Self {
             peer_id,
@@ -90,6 +102,7 @@ impl DispatchCall {
             event,
             outgoing_len,
             signer,
+            verifier,
         } = self;
         let session_bytes = serialize(&session)?;
         let event_bytes = serialize(&event)?;
@@ -99,7 +112,7 @@ impl DispatchCall {
             Event::SessionStarted { .. } | Event::MessageReceived { .. } => DispatchKind::Agreed,
             Event::InputReceived { .. } | Event::TimerFired { .. } => DispatchKind::Local,
         };
-        Ok((input, dispatch, outgoing_len, signer))
+        Ok((input, dispatch, outgoing_len, signer, verifier))
     }
 }
 

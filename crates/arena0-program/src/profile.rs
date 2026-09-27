@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::{ABI_VERSION, CANONICAL_STATE_MEMORY_BYTES, Capability};
 
 /// Version of the canonical execution-profile representation.
-pub const EXECUTION_PROFILE_VERSION: u32 = 3;
+pub const EXECUTION_PROFILE_VERSION: u32 = 4;
 
 /// Maximum deterministic Wasm stack size.
 pub const MAX_WASM_STACK_BYTES: usize = 512 * 1024;
@@ -60,7 +60,16 @@ pub const MAX_WASM_TABLES: u32 = 1;
 /// Maximum Wasm memories available to one resident instance.
 pub const MAX_WASM_MEMORIES: u32 = 3;
 /// Revision of the deterministic sandbox semantics.
-pub const EXECUTION_SEMANTICS_VERSION: u32 = 2;
+pub const EXECUTION_SEMANTICS_VERSION: u32 = 3;
+
+/// Maximum `n` accepted by the `permutation` import.
+pub const MAX_PERMUTATION_LEN: u32 = 4_096;
+/// Fuel charged per input byte by the `hash` import.
+pub const HASH_FUEL_PER_BYTE: u64 = 1;
+/// Fuel charged per output element by the `permutation` import.
+pub const PERMUTATION_FUEL_PER_ITEM: u64 = 32;
+/// Fuel charged once per `verify` import call.
+pub const VERIFY_FUEL: u64 = 1_000_000;
 /// Compiler/engine identity bound into the execution profile.
 pub const EXECUTION_ENGINE_ID: &str = "wasmtime-46.0.3-cranelift";
 /// Fuel made available to one guest call.
@@ -162,6 +171,8 @@ impl ImportSemantics {
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize,
 )]
 pub struct Limits {
+    /// Maximum number of elements allocated by the permutation import.
+    pub max_permutation_len: u64,
     /// Maximum Wasm stack size in bytes.
     pub max_stack_bytes: u64,
     /// Maximum declared work-memory capacity per instance in bytes.
@@ -214,6 +225,7 @@ impl Limits {
     pub const fn current() -> Self {
         Self {
             max_stack_bytes: MAX_WASM_STACK_BYTES as u64,
+            max_permutation_len: MAX_PERMUTATION_LEN as u64,
             max_memory_bytes: MAX_WASM_MEMORY_BYTES as u64,
             min_prepared_work_memory_bytes: MIN_PREPARED_WORK_MEMORY_BYTES as u64,
             max_metadata_bytes: MAX_METADATA_BYTES as u64,
@@ -248,6 +260,12 @@ pub struct FuelConfiguration {
     pub enabled: bool,
     /// Fuel budget reset before each guest call.
     pub per_call: u64,
+    /// Fuel charged per input byte by the hash import.
+    pub hash_per_byte: u64,
+    /// Fuel charged per output element by the permutation import.
+    pub permutation_per_item: u64,
+    /// Fuel charged once per verification import, including rejected envelopes.
+    pub verify: u64,
 }
 
 impl FuelConfiguration {
@@ -257,6 +275,9 @@ impl FuelConfiguration {
         Self {
             enabled: true,
             per_call: DISPATCH_FUEL,
+            hash_per_byte: HASH_FUEL_PER_BYTE,
+            permutation_per_item: PERMUTATION_FUEL_PER_ITEM,
+            verify: VERIFY_FUEL,
         }
     }
 }
@@ -394,6 +415,7 @@ impl ExecutionProfile {
 
     /// Hash this profile's canonical versioned Borsh representation.
     #[must_use]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn hash(&self) -> ExecutionProfileHash {
         ExecutionProfileHash::of_bytes(&self.canonical_bytes())
     }
@@ -424,6 +446,7 @@ pub struct ExecutionProfileHash(pub [u8; 32]);
 impl ExecutionProfileHash {
     /// Hash canonical profile bytes with blake3.
     #[must_use]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn of_bytes(bytes: &[u8]) -> Self {
         Self(*blake3::hash(bytes).as_bytes())
     }

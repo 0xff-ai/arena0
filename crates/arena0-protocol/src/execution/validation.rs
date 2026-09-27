@@ -7,10 +7,10 @@ use crate::trace::{
 use crate::{Effect, StateHash};
 
 use super::{
-    AbortKind, ExecutionBinding, MAX_EFFECTS, MAX_RECEIPT_BYTES, MAX_TERMINAL_OUTCOME_BYTES,
-    MAX_TERMINAL_REASON_BYTES, MAX_TIMER_PAYLOAD_BYTES, MAX_TRACE_ENTRY_BYTES,
+    AbortKind, ExecutionBinding, MAX_EFFECTS, MAX_RECEIPT_BYTES, MAX_TRACE_ENTRY_BYTES,
     ParticipantStepSignature, ProtocolError, ReceiptBody, SharedProposal, StepCursor, StopCause,
 };
+use crate::{MAX_TERMINAL_OUTCOME_BYTES, MAX_TERMINAL_REASON_BYTES, MAX_TIMER_PAYLOAD_BYTES};
 
 /// Validate an encoded value's total size without decoding it first.
 pub(crate) fn ensure_encoded(
@@ -436,7 +436,7 @@ pub(crate) fn validate_trace_entry(entry: &TraceEntry) -> Result<(), ProtocolErr
             ensure_payload(
                 "message payload",
                 data.len(),
-                super::MAX_EFFECT_PAYLOAD_BYTES,
+                crate::MAX_EFFECT_PAYLOAD_BYTES,
             )?;
         }
     }
@@ -564,7 +564,7 @@ fn validate_effect_payload(effect: &Effect) -> Result<(), ProtocolError> {
         Effect::Broadcast { data } => ensure_payload(
             "broadcast payload",
             data.len(),
-            super::MAX_EFFECT_PAYLOAD_BYTES,
+            crate::MAX_EFFECT_PAYLOAD_BYTES,
         ),
         Effect::SetTimer { timer, .. } => {
             ensure_payload(

@@ -31,7 +31,7 @@ mod validation;
 pub use call::DispatchCall;
 pub use engine::{LoadedProgram, ProgramInstance, WasmtimeEngine};
 pub use error::SandboxError;
-pub use signing::GuestSigner;
+pub use signing::{GuestSigner, GuestVerifier};
 
 mod program;
 pub use program::Program;

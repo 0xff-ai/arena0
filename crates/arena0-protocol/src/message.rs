@@ -6,6 +6,7 @@
 //! cannot be replayed with a different consensus result.
 
 use crate::id::id_type;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::{PeerId, SessionHash, StateHash};
 
 /// Domain separation tag for message-id derivation.
@@ -17,6 +18,7 @@ id_type!(
     pub struct Id
 );
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Id {
     /// Derive the message id from the canonical authenticated envelope.
     #[must_use]

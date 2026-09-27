@@ -16,7 +16,7 @@ use arena0_protocol::{
     ParticipantStepSignature, PeerIdSource, SessionHash, SharedProposal, StepEvent,
     TerminalOutcome,
 };
-use arena0_sandbox::{DispatchCall, GuestSigner};
+use arena0_sandbox::{DispatchCall, GuestSigner, GuestVerifier};
 use arena0_store::Change;
 use std::sync::Arc;
 
@@ -85,6 +85,23 @@ struct DispatchSigner {
     event_position: u64,
     identity: Arc<NodeKeys>,
     execution_key: Arc<ExecutionKey>,
+}
+
+/// Per-dispatch verifier for the guest `verify` import, backed by the
+/// execution's binding.
+struct DispatchVerifier {
+    binding: arena0_protocol::ExecutionBinding,
+}
+
+impl GuestVerifier for DispatchVerifier {
+    fn verify(
+        &self,
+        signed: &[u8],
+        signature: &[u8],
+        signer: &arena0_protocol::PeerId,
+    ) -> Result<Vec<u8>, arena0_protocol::VerifyError> {
+        GuestSignData::verify(signed, signature, signer, &self.binding)
+    }
 }
 
 impl GuestSigner for DispatchSigner {
@@ -422,6 +439,9 @@ impl ExecutionActor {
                 event.clone(),
             )
             .with_outgoing_len(outgoing_len);
+            call = call.with_verifier(Arc::new(DispatchVerifier {
+                binding: self.state.binding().clone(),
+            }));
             // Only local handlers may sign. `SessionStarted` is a
             // pre-session dispatch and `MessageReceived` reproduces a
             // peer's agreed result, so neither is offered a signer.

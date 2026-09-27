@@ -2338,7 +2338,7 @@ async fn session_started_may_end_the_session() {
 
 #[tokio::test]
 async fn input_broadcast_at_the_payload_bound_is_accepted() {
-    let at_limit = arena0_protocol::execution::MAX_EFFECT_PAYLOAD_BYTES as u32;
+    let at_limit = arena0_protocol::MAX_EFFECT_PAYLOAD_BYTES as u32;
     let fixture = Fixture::with_mode(false, GuestMode::InputBroadcast(at_limit)).await;
     let (messages, observations) = mpsc::channel(32);
     let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
@@ -2355,7 +2355,7 @@ async fn input_broadcast_at_the_payload_bound_is_accepted() {
 
 #[tokio::test]
 async fn input_broadcast_over_the_payload_bound_is_rejected_and_changes_nothing() {
-    let over = arena0_protocol::execution::MAX_EFFECT_PAYLOAD_BYTES as u32 + 1;
+    let over = arena0_protocol::MAX_EFFECT_PAYLOAD_BYTES as u32 + 1;
     let fixture = Fixture::with_mode(false, GuestMode::InputBroadcast(over)).await;
     let mut actor = fixture.prepare_active_actor().await;
     fixture.commit_session_started(&mut actor).await;
@@ -2864,7 +2864,7 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
           (import "arena0" "state_write" (func $state_write (param i32 i32 i32)))
           {extra_imports}
           (memory (export "memory") 1)
-          (global (export "arena0_abi_version") i32 (i32.const 22))
+          (global (export "arena0_abi_version") i32 (i32.const 23))
           (data (i32.const 1024) "\01")
           (data (i32.const 1030) "\02")
           (data (i32.const 1040) "\09")

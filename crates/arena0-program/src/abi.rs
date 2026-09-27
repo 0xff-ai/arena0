@@ -10,7 +10,7 @@ use crate::{LocalStateBytes, SharedStateBytes};
 use crate::Capability;
 
 /// Current ABI version. A sandbox rejects modules declaring a different one.
-pub const ABI_VERSION: u32 = 22;
+pub const ABI_VERSION: u32 = 23;
 
 /// Wasm import module name for all arena0 host functions.
 pub const HOST_MODULE: &str = "arena0";
@@ -685,6 +685,9 @@ pub fn always_available_imports() -> &'static [&'static str] {
         imports::RANDOM,
         imports::END_SESSION,
         imports::ABORT_SESSION,
+        imports::HASH,
+        imports::PERMUTATION,
+        imports::VERIFY,
     ]
 }
 

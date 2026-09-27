@@ -34,10 +34,6 @@ id_type!(
     pub struct Id
 );
 
-/// At most 64 participants in one activation, and therefore at most 64 tickets
-/// in one offer and one convergence-fetch response.
-pub const MAX_PARTICIPANTS: usize = 64;
-
 /// Maximum accepted difference between a receiver's clock and a ticket issue
 /// time, in milliseconds.
 pub const MAX_CLOCK_SKEW_MS: u64 = 5_000;
@@ -515,7 +511,7 @@ fn check_version(kind: &'static str, actual: u16, expected: u16) -> Result<(), N
 }
 
 fn check_target_size(target_size: u16) -> Result<(), NegotiationError> {
-    let max = u16::try_from(crate::negotiation::MAX_PARTICIPANTS).expect("64 fits in u16");
+    let max = u16::try_from(crate::MAX_PARTICIPANTS).expect("64 fits in u16");
     if !(2..=max).contains(&target_size) {
         return Err(NegotiationError::InvalidTargetSize { target_size, max });
     }
@@ -1244,7 +1240,7 @@ impl ActivationData {
     pub fn validate(&self) -> Result<(), NegotiationError> {
         check_domain("activation", self.domain, ACTIVATION_DOMAIN)?;
         check_version("activation", self.version, ACTIVATION_VERSION)?;
-        let max = crate::negotiation::MAX_PARTICIPANTS;
+        let max = crate::MAX_PARTICIPANTS;
         if !(2..=max).contains(&self.tickets.len()) {
             return Err(NegotiationError::TicketCount {
                 actual: self.tickets.len(),

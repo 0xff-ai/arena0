@@ -15,6 +15,8 @@ mod outcome;
 mod signing;
 mod state;
 mod status;
+#[cfg(test)]
+mod test_fixtures;
 mod timer;
 mod validation;
 
@@ -30,16 +32,8 @@ pub const MAX_PROOF_SIGNATURES: usize = crate::MAX_PARTICIPANTS;
 /// proposal can retain both the current and proposed shared/local memories,
 /// plus up to the program's complete dispatch-effect budget.
 pub const MAX_EXECUTION_STATE_BYTES: usize = 32 * 1024 * 1024;
-/// Maximum opaque bytes in one effect payload.
-pub const MAX_EFFECT_PAYLOAD_BYTES: usize = 64 * 1024;
 /// Maximum opaque bytes in one receipt artifact.
 pub const MAX_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
-/// Maximum opaque bytes in one timer payload.
-pub const MAX_TIMER_PAYLOAD_BYTES: usize = 64 * 1024;
-/// Maximum UTF-8 bytes in one terminal reason.
-pub const MAX_TERMINAL_REASON_BYTES: usize = 4 * 1024;
-/// Maximum opaque bytes in one successful terminal outcome.
-pub const MAX_TERMINAL_OUTCOME_BYTES: usize = 64 * 1024;
 /// Maximum total encoded bytes for one trace entry.
 pub const MAX_TRACE_ENTRY_BYTES: usize = 256 * 1024;
 /// Maximum number of entries in a complete receipt trace.

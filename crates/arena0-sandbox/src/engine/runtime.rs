@@ -460,8 +460,8 @@ impl std::fmt::Debug for ProgramInstance {
 impl ProgramInstance {
     /// Dispatch one event through the sole mutating guest export.
     pub fn dispatch(&mut self, call: DispatchCall) -> Result<DispatchCallResult, SandboxError> {
-        let (input, dispatch, outgoing_len, signer) = call.into_input()?;
-        self.dispatch_input(input, dispatch, outgoing_len, signer)
+        let (input, dispatch, outgoing_len, signer, verifier) = call.into_input()?;
+        self.dispatch_input(input, dispatch, outgoing_len, signer, verifier)
     }
 
     /// Replace the resident state with durable committed payloads during actor
@@ -546,14 +546,16 @@ impl ProgramInstance {
         dispatch: DispatchKind,
         outgoing_len: usize,
         signer: Option<std::sync::Arc<dyn crate::GuestSigner>>,
+        verifier: Option<std::sync::Arc<dyn crate::GuestVerifier>>,
     ) -> Result<DispatchCallResult, SandboxError> {
         let bytes = encode_envelope(&input, self.profile.limits.max_call_envelope_bytes)?;
         if let Err(error) = self.reset_for_dispatch(dispatch, outgoing_len) {
             return self.rollback_error(error);
         }
-        // A signer is installed only for this dispatch; any rollback path
-        // clears it together with the rest of the per-call host state.
+        // Signing and verification custody lasts only for this dispatch; any
+        // rollback path clears both with the rest of the per-call host state.
         self.store.data_mut().signer.install(signer);
+        self.store.data_mut().verifier = verifier;
         let (output, fuel_used) = call_export::<DispatchOutput>(
             &mut self.store,
             &self.instance,
@@ -814,7 +816,7 @@ mod resident_runtime_tests {
               (import "arena0" "state_write" (func $state_write (param i32 i32 i32)))
               {extra_imports}
               (memory (export "memory") 1)
-              (global (export "arena0_abi_version") i32 (i32.const 22))
+              (global (export "arena0_abi_version") i32 (i32.const 23))
               (global $counter (mut i32) (i32.const 0))
               (data (i32.const 1024) "sh")
               (data (i32.const 1100) "effect")
@@ -1016,7 +1018,7 @@ mod resident_runtime_tests {
               (memory (export "memory") 1 1024)
               (memory (export "arena0_shared") 65 65)
               (memory (export "arena0_local") 65 65)
-              (global (export "arena0_abi_version") i32 (i32.const 22))
+              (global (export "arena0_abi_version") i32 (i32.const 23))
               (data (i32.const 32768) "\00\00\00")
               (func $pack (param $ptr i32) (param $len i32) (result i64)
                 local.get $ptr
@@ -1058,7 +1060,7 @@ mod resident_runtime_tests {
               (memory (export "memory") 1 1024)
               (memory (export "arena0_shared") 65 65)
               (memory (export "arena0_local") 65 65)
-              (global (export "arena0_abi_version") i32 (i32.const 22))
+              (global (export "arena0_abi_version") i32 (i32.const 23))
               (data (i32.const 32768) "\00")
               (func (export "arena0_alloc") (param i32) (result i32)
                 {allocator_body})

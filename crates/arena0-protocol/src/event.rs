@@ -9,7 +9,7 @@ use arena0_program::bounded;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
-use crate::execution::MAX_EFFECT_PAYLOAD_BYTES;
+use crate::MAX_EFFECT_PAYLOAD_BYTES;
 use crate::{Ensemble, PeerId, TimerPayload};
 
 /// Kind of an [`Event`], for diagnostics that never expose its payload.
@@ -154,10 +154,10 @@ mod tests {
             effect
         );
 
-        let oversized_name = u32::try_from(crate::execution::MAX_TERMINAL_REASON_BYTES + 1)
+        let oversized_name = u32::try_from(crate::MAX_TERMINAL_REASON_BYTES + 1)
             .unwrap()
             .to_le_bytes();
-        let oversized_data = u32::try_from(crate::execution::MAX_TIMER_PAYLOAD_BYTES + 1)
+        let oversized_data = u32::try_from(crate::MAX_TIMER_PAYLOAD_BYTES + 1)
             .unwrap()
             .to_le_bytes();
         for payload in [

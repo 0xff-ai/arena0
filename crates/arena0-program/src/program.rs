@@ -33,6 +33,7 @@ pub struct Hash(pub [u8; 32]);
 impl Hash {
     /// Content address of a Wasm binary: blake3 of the bytes.
     #[must_use]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn of(wasm: &[u8]) -> Self {
         Self(*blake3::hash(wasm).as_bytes())
     }

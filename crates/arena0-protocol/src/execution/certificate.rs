@@ -10,10 +10,10 @@ use arena0_program::ProgramHash;
 use arena0_program::bounded;
 
 use super::{
-    ExecutionBinding, MAX_RECEIPT_BYTES, MAX_RECEIPT_TRACE_ENTRIES, MAX_TERMINAL_OUTCOME_BYTES,
-    ProtocolError, SharedProposal, StepCertificate, ensure_payload, verify_full_agreement,
-    verify_step_signature,
+    ExecutionBinding, MAX_RECEIPT_BYTES, MAX_RECEIPT_TRACE_ENTRIES, ProtocolError, SharedProposal,
+    StepCertificate, ensure_payload, verify_full_agreement, verify_step_signature,
 };
+use crate::MAX_TERMINAL_OUTCOME_BYTES;
 
 impl StepCertificate {
     /// Verify N-of-N evidence against its session binding, independently of
@@ -116,7 +116,7 @@ impl ReceiptBody {
         ensure_payload(
             "receipt outcome",
             outcome.len(),
-            super::MAX_TERMINAL_OUTCOME_BYTES,
+            crate::MAX_TERMINAL_OUTCOME_BYTES,
         )?;
         ensure_payload("receipt params", params.len(), MAX_PARAMS_LEN)?;
         if trace.len() > super::MAX_RECEIPT_TRACE_ENTRIES {
@@ -397,7 +397,7 @@ impl ReceiptArtifact {
 
         let activation = binding.activation();
         let initial = activation.offer().data().initial_state;
-        let reason = "x".repeat(super::MAX_TERMINAL_REASON_BYTES);
+        let reason = "x".repeat(crate::MAX_TERMINAL_REASON_BYTES);
         let occurrence = AbortOccurrence::unsigned(
             binding.session_id(),
             activation.tickets()[0].data.signer,
@@ -423,7 +423,7 @@ impl ReceiptArtifact {
         for (terminal, outcome) in [
             (
                 ReceiptTermination::Completed,
-                vec![0; super::MAX_TERMINAL_OUTCOME_BYTES],
+                vec![0; crate::MAX_TERMINAL_OUTCOME_BYTES],
             ),
             (
                 ReceiptTermination::Stopped {

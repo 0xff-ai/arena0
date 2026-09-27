@@ -162,7 +162,6 @@ impl ResourceLedger {
 }
 
 /// Mutable state threaded through `wasmtime::Caller` for one call only.
-#[derive(Debug)]
 pub(crate) struct HostState {
     pub limits: StoreLimits,
     pub call_kind: CallKind,
@@ -176,6 +175,7 @@ pub(crate) struct HostState {
     pub profile: ExecutionProfile,
     pub callout_inputs: Vec<arena0_program::JsonSchemaDocument>,
     pub signer: crate::signing::SignerSlot,
+    pub verifier: Option<Arc<dyn crate::GuestVerifier>>,
 }
 
 impl HostState {
@@ -203,6 +203,7 @@ impl HostState {
             profile,
             callout_inputs,
             signer: crate::signing::SignerSlot::default(),
+            verifier: None,
         }
     }
 
@@ -233,6 +234,7 @@ impl HostState {
         self.ledger = ResourceLedger::new();
         self.entropy.reset();
         self.signer.clear();
+        self.verifier = None;
     }
 
     /// Clear setup observations while retaining the call kind selected for a
@@ -246,6 +248,7 @@ impl HostState {
         self.ledger = ResourceLedger::new();
         self.entropy.reset();
         self.signer.clear();
+        self.verifier = None;
     }
 }
 

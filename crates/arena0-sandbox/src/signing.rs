@@ -8,6 +8,18 @@ use std::fmt;
 use std::sync::Arc;
 
 use arena0_crypto::SignScheme;
+use arena0_protocol::{PeerId, VerifyError};
+
+/// Verifies one guest-signed envelope for a dispatch. The Host implements it
+/// from the execution's binding; the result depends only on the arguments.
+pub trait GuestVerifier: Send + Sync {
+    fn verify(
+        &self,
+        signed: &[u8],
+        signature: &[u8],
+        signer: &PeerId,
+    ) -> Result<Vec<u8>, VerifyError>;
+}
 
 /// Signs one guest payload within a dispatch.
 ///

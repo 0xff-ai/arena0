@@ -1,8 +1,7 @@
 //! Portable trace entries.
 
-use crate::execution::{
-    MAX_EFFECT_PAYLOAD_BYTES, MAX_TERMINAL_OUTCOME_BYTES, MAX_TERMINAL_REASON_BYTES,
-};
+use crate::{MAX_EFFECT_PAYLOAD_BYTES, MAX_TERMINAL_OUTCOME_BYTES, MAX_TERMINAL_REASON_BYTES};
+
 use crate::{Effect, Ensemble, Event, MessageId, PeerId, SessionHash, StateHash};
 use arena0_program::bounded;
 use borsh::{BorshDeserialize, BorshSerialize};

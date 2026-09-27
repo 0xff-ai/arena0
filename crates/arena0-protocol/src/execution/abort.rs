@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{PeerId, SessionHash};
 
-use super::{MAX_TERMINAL_REASON_BYTES, ProtocolError, StepCursor, ensure_payload};
+use super::{ProtocolError, StepCursor, ensure_payload};
+use crate::MAX_TERMINAL_REASON_BYTES;
 
 /// Domain separator for the signed abort occurrence preimage.
 pub const ABORT_OCCURRENCE_DOMAIN: [u8; 24] = *b"arena0/abort-occurrence\0";

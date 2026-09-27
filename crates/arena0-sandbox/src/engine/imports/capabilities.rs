@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn broadcast_payload_bound_is_enforced_at_emission() {
-        let at_limit = arena0_protocol::execution::MAX_EFFECT_PAYLOAD_BYTES;
+        let at_limit = arena0_protocol::MAX_EFFECT_PAYLOAD_BYTES;
         let (mut store, call) = instantiate_effect_test_module_with_pages(
             crate::call::DispatchKind::Local,
             &format!("i32.const 0 i32.const {at_limit} call $broadcast"),
