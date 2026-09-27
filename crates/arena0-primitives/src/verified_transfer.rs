@@ -5,6 +5,8 @@
 //! outgoing ack. Direct progress stays local; only sender-authored checkpoints
 //! advance the agreed state. Envelopes remain opaque: only `ctx.verify` extracts
 //! an acknowledgement payload.
+//! A single sender heartbeat retries the current chunk and re-offers the complete
+//! checkpoint until agreement records completion, including after queue backpressure.
 
 use arena0::prelude::*;
 use arena0::types::{MAX_BLOB_BYTES, MAX_DIRECT_RANGE_BYTES};
@@ -54,10 +56,17 @@ pub enum DirectMessage {
 }
 
 /// Local timers.
+/// Each participant holds at most one active timer per transfer: the sender's
+/// heartbeat (after initial Send), or the receiver's empty-object Send retry.
 #[arena0::data]
 pub enum TransferTimer {
-    Send { transfer_id: u64 },
-    Resend { transfer_id: u64, index: u64 },
+    Send {
+        transfer_id: u64,
+    },
+    /// The sender's single repeating heartbeat for this transfer.
+    Resend {
+        transfer_id: u64,
+    },
 }
 
 /// Agreed terms and receiver-certified progress for one object.
@@ -211,7 +220,7 @@ impl VerifiedTransfer {
         );
     }
 
-    /// Resolve and send the current chunk, or retry it while its index is current.
+    /// Start the sender's heartbeat, which retries until completion is agreed.
     /// Empty outputs are committed and acknowledged by the receiver's Send timer.
     pub fn on_timer<S, L>(
         &self,
@@ -223,14 +232,15 @@ impl VerifiedTransfer {
             return Ok(None);
         }
         let progress = ctx.mutate_local(|state| local(state).clone());
-        match timer {
-            TransferTimer::Send { transfer_id } if transfer_id == self.id => {}
-            TransferTimer::Resend { transfer_id, index }
-                if transfer_id == self.id
-                    && index == progress.next_index
-                    && ctx.me() == self.sender => {}
+        let resend = match timer {
+            TransferTimer::Send { transfer_id } if transfer_id == self.id => false,
+            TransferTimer::Resend { transfer_id }
+                if transfer_id == self.id && ctx.me() == self.sender =>
+            {
+                true
+            }
             _ => return Ok(None),
-        }
+        };
         if ctx.me() == self.receiver && self.length == 0 {
             let signed = if let Some(signed) = progress.last_ack {
                 signed
@@ -276,6 +286,19 @@ impl VerifiedTransfer {
         if ctx.me() != self.sender {
             return Ok(None);
         }
+        if resend {
+            ctx.effects().set_timer(
+                TransferTimer::Resend {
+                    transfer_id: self.id,
+                },
+                RESEND_AFTER,
+            );
+            if let Some(signed) = &progress.last_ack
+                && self.verified_ack(ctx, signed)?.complete
+            {
+                return Ok(Some(TransferMessage::Checkpoint(signed.clone())));
+            }
+        }
         let source = match progress.blob {
             Some(source) => source,
             None => match ctx.blobs().resolve(self.hash, self.length) {
@@ -286,17 +309,36 @@ impl VerifiedTransfer {
                 Err(_) => return Ok(Some(TransferMessage::Failed)),
             },
         };
-        if progress.next_index >= self.chunk_count() {
-            return Ok(None);
+        self.send_chunk(ctx, local, source);
+        if !resend {
+            ctx.effects().set_timer(
+                TransferTimer::Resend {
+                    transfer_id: self.id,
+                },
+                RESEND_AFTER,
+            );
         }
-        let range = self.chunk_range(progress.next_index)?;
-        // Backpressure is transient. Retain the retry even when this attempt
-        // queued nothing; propagating QueueFull would reject that timer too.
+        Ok(None)
+    }
+
+    /// Queue the current chunk without arming timers. The heartbeat owns retries
+    /// when the direct queue is full, so backpressure must not reject progress.
+    fn send_chunk<S, L>(
+        &self,
+        ctx: &mut LocalContext<S, L>,
+        local: fn(&mut L) -> &mut VerifiedTransferLocal,
+        source: BlobHandle,
+    ) {
+        let index = ctx.mutate_local(|state| local(state).next_index);
+        if index >= self.chunk_count() {
+            return;
+        }
+        let range = self.chunk_range(index).expect("current chunk is in bounds");
         let _ = ctx.send_direct(
             self.receiver,
             &DirectMessage::Chunk {
                 transfer_id: self.id,
-                index: progress.next_index,
+                index,
             },
             Some(RangeAttachment {
                 source,
@@ -304,14 +346,6 @@ impl VerifiedTransfer {
                 end: range.end,
             }),
         );
-        ctx.effects().set_timer(
-            TransferTimer::Resend {
-                transfer_id: self.id,
-                index: progress.next_index,
-            },
-            RESEND_AFTER,
-        );
-        Ok(None)
     }
 
     /// Apply direct progress locally. Only the sender returns agreed messages;
@@ -418,16 +452,8 @@ impl VerifiedTransfer {
                         ack.accepted / u64::from(self.chunk_size)
                     };
                 });
-                if !ack.complete
-                    && let Some(failed) = self.on_timer(
-                        ctx,
-                        local,
-                        TransferTimer::Send {
-                            transfer_id: self.id,
-                        },
-                    )?
-                {
-                    return Ok(Some(failed));
+                if !ack.complete {
+                    self.send_chunk(ctx, local, progress.blob.expect("sent chunk has a source"));
                 }
                 if due {
                     ctx.mutate_local(|state| local(state).last_checkpointed = ack.accepted);

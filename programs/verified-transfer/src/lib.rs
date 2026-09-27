@@ -223,7 +223,7 @@ pub mod verified_transfer {
         timer: TransferTimer,
     ) -> Result<(), ProgramFault> {
         let id = match &timer {
-            TransferTimer::Send { transfer_id } | TransferTimer::Resend { transfer_id, .. } => {
+            TransferTimer::Send { transfer_id } | TransferTimer::Resend { transfer_id } => {
                 *transfer_id
             }
         };
