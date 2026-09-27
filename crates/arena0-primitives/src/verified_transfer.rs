@@ -12,30 +12,27 @@ use arena0::prelude::*;
 use arena0::types::{MAX_BLOB_BYTES, MAX_DIRECT_RANGE_BYTES};
 use std::{ops::Range, time::Duration};
 
-/// Domain and version bound into every acknowledgement.
-pub const ACK_DOMAIN: [u8; 28] = *b"arena0/verified-transfer/ack";
-pub const ACK_VERSION: u16 = 1;
+/// Domain (with format version) bound into every acknowledgement.
+pub const ACK_DOMAIN: [u8; 31] = *b"arena0/verified-transfer/ack/v1";
 /// Delay before the sender resends an unacknowledged chunk.
 pub const RESEND_AFTER: Duration = Duration::from_secs(2);
 
-/// The receiver's signed statement: "I durably hold bytes 0..accepted of object hash".
+/// The receiver's signed statement: "I durably hold bytes 0..accepted of object
+/// hash". `accepted == length` means the output is committed (complete).
 #[arena0::data]
 pub struct TransferAck {
-    pub domain: [u8; 28],
-    pub version: u16,
+    pub domain: [u8; 31],
     pub transfer_id: u64,
     pub sender: PeerId,
     pub hash: BlobHash,
     pub length: u64,
     pub chunk_size: u32,
-    pub sequence: u64,
     pub accepted: u64,
-    pub complete: bool,
 }
 
-/// A verified checkpoint: the receiver's envelope and the body `ctx.verify` returned.
+/// A verified acknowledgement: the receiver's envelope and the body `ctx.verify` returned.
 #[arena0::data]
-pub struct Checkpoint {
+pub struct SignedAck {
     pub ack: TransferAck,
     pub signed: Signed,
 }
@@ -79,7 +76,7 @@ pub struct VerifiedTransfer {
     length: u64,
     chunk_size: u32,
     checkpoint_every: u32,
-    checkpoint: Option<Checkpoint>,
+    checkpoint: Option<SignedAck>,
     failed: bool,
 }
 
@@ -93,9 +90,7 @@ pub struct VerifiedTransferLocal {
     pub next_index: u64,
     /// Receiver: its latest signed ack (resent for duplicates).
     /// Sender: the latest verified ack received (the next checkpoint candidate).
-    pub last_ack: Option<Signed>,
-    /// The sequence of `last_ack`; 0 before the first.
-    pub last_sequence: u64,
+    pub last_ack: Option<SignedAck>,
     /// Sender: accepted prefix of the last checkpoint offered for broadcast.
     /// It advances even if the program's bounded broadcast queue is full.
     pub last_checkpointed: u64,
@@ -111,10 +106,6 @@ pub enum Error {
     ChunkOutOfRange,
     #[error("invalid transfer acknowledgement")]
     InvalidAck,
-    #[error("conflicting transfer acknowledgements")]
-    ConflictingAck,
-    #[error("acknowledgement progress decreased")]
-    DecreasingAck,
     #[error("blob operation failed: {0}")]
     Blob(#[from] BlobError),
     #[error("acknowledgement verification failed: {0}")]
@@ -183,7 +174,9 @@ impl VerifiedTransfer {
         self.receiver
     }
     pub fn is_complete(&self) -> bool {
-        self.checkpoint.as_ref().is_some_and(|c| c.ack.complete)
+        self.checkpoint
+            .as_ref()
+            .is_some_and(|c| c.ack.accepted == self.length)
     }
     pub fn is_failed(&self) -> bool {
         self.failed
@@ -243,7 +236,7 @@ impl VerifiedTransfer {
         };
         if ctx.me() == self.receiver && self.length == 0 {
             let signed = if let Some(signed) = progress.last_ack {
-                signed
+                signed.signed
             } else {
                 let result = (|| {
                     let mut blobs = ctx.blobs();
@@ -259,7 +252,7 @@ impl VerifiedTransfer {
                     }
                 };
                 ctx.mutate_local(|state| local(state).blob = Some(output));
-                self.sign_ack(ctx, local, 0, true)?
+                self.sign_ack(ctx, local, 0)?
             };
             // An empty object has no duplicate chunk to trigger another ack.
             // Retry its Send timer if the direct queue could not retain it.
@@ -293,10 +286,10 @@ impl VerifiedTransfer {
                 },
                 RESEND_AFTER,
             );
-            if let Some(signed) = &progress.last_ack
-                && self.verified_ack(ctx, signed)?.complete
+            if let Some(ack) = &progress.last_ack
+                && ack.ack.accepted == self.length
             {
-                return Ok(Some(TransferMessage::Checkpoint(signed.clone())));
+                return Ok(Some(TransferMessage::Checkpoint(ack.signed.clone())));
             }
         }
         let source = match progress.blob {
@@ -369,7 +362,8 @@ impl VerifiedTransfer {
                 if index < progress.next_index {
                     let ack = progress
                         .last_ack
-                        .expect("accepted chunk has a retained ack");
+                        .expect("accepted chunk has a retained ack")
+                        .signed;
                     let _ = ctx.send_direct(
                         self.sender,
                         &DirectMessage::Ack {
@@ -408,7 +402,7 @@ impl VerifiedTransfer {
                     return Ok(None);
                 }
                 ctx.mutate_local(|state| local(state).next_index = index + 1);
-                let ack = self.sign_ack(ctx, local, range.end, range.end == self.length)?;
+                let ack = self.sign_ack(ctx, local, range.end)?;
                 // The sender's resend timer solicits this same retained ack if
                 // the direct queue is full; successful blob work stays durable.
                 let _ = ctx.send_direct(
@@ -427,16 +421,16 @@ impl VerifiedTransfer {
             } if transfer_id == self.id && ctx.me() == self.sender && from == self.receiver => {
                 let ack = self.verified_ack(ctx, &signed)?;
                 let progress = ctx.mutate_local(|state| local(state).clone());
-                if ack.sequence <= progress.last_sequence {
+                if progress
+                    .last_ack
+                    .as_ref()
+                    .is_some_and(|last| ack.accepted <= last.ack.accepted)
+                {
                     return Ok(None);
-                }
-                if let Some(previous) = &progress.last_ack {
-                    let previous = self.verified_ack(ctx, previous)?;
-                    monotonic(Some(&previous), &ack)?;
                 }
                 let due = checkpoint_due(
                     ack.accepted,
-                    ack.complete,
+                    self.length,
                     self.acknowledged(),
                     progress.last_checkpointed,
                     self.chunk_size,
@@ -444,15 +438,17 @@ impl VerifiedTransfer {
                 );
                 ctx.mutate_local(|state| {
                     let progress = local(state);
-                    progress.last_sequence = ack.sequence;
-                    progress.last_ack = Some(signed.clone());
-                    progress.next_index = if ack.complete {
+                    progress.last_ack = Some(SignedAck {
+                        ack: ack.clone(),
+                        signed: signed.clone(),
+                    });
+                    progress.next_index = if ack.accepted == self.length {
                         self.chunk_count()
                     } else {
                         ack.accepted / u64::from(self.chunk_size)
                     };
                 });
-                if !ack.complete {
+                if ack.accepted != self.length {
                     self.send_chunk(ctx, local, progress.blob.expect("sent chunk has a source"));
                 }
                 if due {
@@ -485,9 +481,13 @@ impl VerifiedTransfer {
             TransferMessage::Failed => ctx.mutate_shared(|state| field(state).failed = true),
             TransferMessage::Checkpoint(signed) => {
                 let ack = transfer.verified_ack(ctx, &signed)?;
-                if monotonic(transfer.checkpoint.as_ref().map(|c| &c.ack), &ack)? {
+                if transfer
+                    .checkpoint
+                    .as_ref()
+                    .is_none_or(|c| ack.accepted > c.ack.accepted)
+                {
                     ctx.mutate_shared(|state| {
-                        field(state).checkpoint = Some(Checkpoint { ack, signed })
+                        field(state).checkpoint = Some(SignedAck { ack, signed })
                     });
                 }
             }
@@ -519,15 +519,9 @@ impl VerifiedTransfer {
         ctx: &mut LocalContext<S, L>,
         local: fn(&mut L) -> &mut VerifiedTransferLocal,
         accepted: u64,
-        complete: bool,
     ) -> Result<Signed, Error> {
-        let sequence = ctx
-            .mutate_local(|state| local(state).last_sequence)
-            .checked_add(1)
-            .ok_or(Error::Overflow)?;
         let ack = TransferAck {
             domain: ACK_DOMAIN,
-            version: ACK_VERSION,
             transfer_id: self.id,
             sender: ctx
                 .ensemble()
@@ -536,9 +530,7 @@ impl VerifiedTransfer {
             hash: self.hash,
             length: self.length,
             chunk_size: self.chunk_size,
-            sequence,
             accepted,
-            complete,
         };
         let signed = ctx.sign(
             SignScheme::Ed25519,
@@ -546,8 +538,10 @@ impl VerifiedTransfer {
         );
         ctx.mutate_local(|state| {
             let progress = local(state);
-            progress.last_sequence = sequence;
-            progress.last_ack = Some(signed.clone());
+            progress.last_ack = Some(SignedAck {
+                ack,
+                signed: signed.clone(),
+            });
         });
         Ok(signed)
     }
@@ -575,18 +569,15 @@ impl VerifiedTransfer {
 
     fn validate_ack(&self, ack: &TransferAck, sender: PeerId) -> Result<(), Error> {
         if ack.domain != ACK_DOMAIN
-            || ack.version != ACK_VERSION
             || ack.transfer_id != self.id
             || ack.sender != sender
             || ack.hash != self.hash
             || ack.length != self.length
             || ack.chunk_size != self.chunk_size
-            || ack.sequence == 0
             || ack.accepted > self.length
-            || (ack.complete && ack.accepted != self.length)
             || (ack.accepted != self.length
                 && !ack.accepted.is_multiple_of(u64::from(self.chunk_size)))
-            || (ack.accepted == 0 && !(self.length == 0 && ack.complete))
+            || (ack.accepted == 0 && self.length != 0)
         {
             return Err(Error::InvalidAck);
         }
@@ -594,39 +585,15 @@ impl VerifiedTransfer {
     }
 }
 
-fn monotonic(previous: Option<&TransferAck>, next: &TransferAck) -> Result<bool, Error> {
-    let Some(previous) = previous else {
-        return Ok(true);
-    };
-    if next.sequence == previous.sequence {
-        return if previous == next {
-            Ok(false)
-        } else {
-            Err(Error::ConflictingAck)
-        };
-    }
-    if next.sequence < previous.sequence {
-        return if next.accepted <= previous.accepted {
-            Ok(false)
-        } else {
-            Err(Error::DecreasingAck)
-        };
-    }
-    if next.accepted < previous.accepted || (previous.complete && !next.complete) {
-        return Err(Error::DecreasingAck);
-    }
-    Ok(true)
-}
-
 fn checkpoint_due(
     accepted: u64,
-    complete: bool,
+    length: u64,
     acknowledged: u64,
     last_checkpointed: u64,
     chunk_size: u32,
     checkpoint_every: u32,
 ) -> bool {
-    complete
+    accepted == length
         || accepted.saturating_sub(acknowledged.max(last_checkpointed))
             >= u64::from(chunk_size) * u64::from(checkpoint_every)
 }
@@ -648,18 +615,15 @@ mod tests {
         .unwrap()
     }
 
-    fn ack(terms: &VerifiedTransfer, sequence: u64, accepted: u64, complete: bool) -> TransferAck {
+    fn ack(terms: &VerifiedTransfer, accepted: u64) -> TransferAck {
         TransferAck {
             domain: ACK_DOMAIN,
-            version: ACK_VERSION,
             transfer_id: terms.id,
             sender: PeerId([1; 32]),
             hash: terms.hash,
             length: terms.length,
             chunk_size: terms.chunk_size,
-            sequence,
             accepted,
-            complete,
         }
     }
 
@@ -732,21 +696,18 @@ mod tests {
     #[test]
     fn acknowledgements_bind_one_transfer() {
         let terms = transfer(100_001, 50_000);
-        let valid = ack(&terms, 1, 50_000, false);
+        let valid = ack(&terms, 50_000);
         terms.validate_ack(&valid, PeerId([1; 32])).unwrap();
         let mutations: &[fn(&mut TransferAck)] = &[
             |a| a.domain[0] ^= 1,
-            |a| a.version += 1,
             |a| a.transfer_id += 1,
             |a| a.sender = PeerId([2; 32]),
             |a| a.hash = BlobHash([8; 32]),
             |a| a.length += 1,
             |a| a.chunk_size += 1,
-            |a| a.sequence = 0,
             |a| a.accepted = 0,
             |a| a.accepted = 999,
             |a| a.accepted = 100_002,
-            |a| a.complete = true,
         ];
         for mutate in mutations {
             let mut invalid = valid.clone();
@@ -760,76 +721,48 @@ mod tests {
         let mut other = terms.clone();
         other.id += 1;
         assert!(other.validate_ack(&valid, PeerId([1; 32])).is_err());
-        // Holding the full prefix does not itself claim final publication.
-        for complete in [false, true] {
-            terms
-                .validate_ack(&ack(&terms, 3, terms.length, complete), PeerId([1; 32]))
-                .unwrap();
-        }
+        terms
+            .validate_ack(&ack(&terms, terms.length), PeerId([1; 32]))
+            .unwrap();
         let empty = transfer(0, 1);
         empty
-            .validate_ack(&ack(&empty, 1, 0, true), PeerId([1; 32]))
+            .validate_ack(&ack(&empty, 0), PeerId([1; 32]))
             .unwrap();
-        assert!(
-            empty
-                .validate_ack(&ack(&empty, 1, 0, false), PeerId([1; 32]))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn monotonic_orders_and_rejects_conflicts() {
-        let terms = transfer(100_001, 50_000);
-        let first = ack(&terms, 1, 50_000, false);
-        let later = ack(&terms, 2, 100_000, false);
-        assert!(monotonic(None, &first).unwrap());
-        assert!(monotonic(Some(&first), &later).unwrap());
-        assert!(!monotonic(Some(&later), &first).unwrap());
-        assert!(!monotonic(Some(&first), &first).unwrap());
-        assert!(matches!(
-            monotonic(Some(&first), &ack(&terms, 1, 100_000, false)),
-            Err(Error::ConflictingAck)
-        ));
-        assert!(matches!(
-            monotonic(Some(&later), &ack(&terms, 3, 50_000, false)),
-            Err(Error::DecreasingAck)
-        ));
-        assert!(matches!(
-            monotonic(Some(&first), &ack(&terms, 0, 100_000, false)),
-            Err(Error::DecreasingAck)
-        ));
-        let full = ack(&terms, 3, terms.length, false);
-        let complete = ack(&terms, 4, terms.length, true);
-        assert!(monotonic(Some(&full), &complete).unwrap());
-        assert!(matches!(
-            monotonic(Some(&complete), &ack(&terms, 5, terms.length, false)),
-            Err(Error::DecreasingAck)
-        ));
-        let mut conflict = complete.clone();
-        conflict.hash = BlobHash([8; 32]);
-        assert!(matches!(
-            monotonic(Some(&complete), &conflict),
-            Err(Error::ConflictingAck)
-        ));
     }
 
     #[test]
     fn checkpoint_cadence() {
-        assert!(!checkpoint_due(150_000, false, 0, 0, 50_000, 4));
-        assert!(checkpoint_due(200_000, false, 0, 0, 50_000, 4));
+        assert!(!checkpoint_due(150_000, u64::MAX, 0, 0, 50_000, 4));
+        assert!(checkpoint_due(200_000, u64::MAX, 0, 0, 50_000, 4));
         // The other transfer may hold the writer: queued checkpoints still
         // count toward cadence even while acknowledged() remains at zero.
-        assert!(!checkpoint_due(250_000, false, 0, 200_000, 50_000, 4));
-        assert!(!checkpoint_due(350_000, false, 0, 200_000, 50_000, 4));
-        assert!(checkpoint_due(400_000, false, 0, 200_000, 50_000, 4));
-        assert!(!checkpoint_due(450_000, false, 400_000, 200_000, 50_000, 4));
-        assert!(checkpoint_due(600_000, false, 400_000, 200_000, 50_000, 4));
-        assert!(checkpoint_due(450_001, true, 400_000, 400_000, 50_000, 4));
-        assert!(checkpoint_due(0, true, 0, 0, 50_000, 4));
-        assert!(!checkpoint_due(1, false, 2, 3, 1, 1));
+        assert!(!checkpoint_due(250_000, u64::MAX, 0, 200_000, 50_000, 4));
+        assert!(!checkpoint_due(350_000, u64::MAX, 0, 200_000, 50_000, 4));
+        assert!(checkpoint_due(400_000, u64::MAX, 0, 200_000, 50_000, 4));
+        assert!(!checkpoint_due(
+            450_000,
+            u64::MAX,
+            400_000,
+            200_000,
+            50_000,
+            4
+        ));
+        assert!(checkpoint_due(
+            600_000,
+            u64::MAX,
+            400_000,
+            200_000,
+            50_000,
+            4
+        ));
+        assert!(checkpoint_due(
+            450_001, 450_001, 400_000, 400_000, 50_000, 4
+        ));
+        assert!(checkpoint_due(0, 0, 0, 0, 50_000, 4));
+        assert!(!checkpoint_due(1, u64::MAX, 2, 3, 1, 1));
         assert!(!checkpoint_due(
             u64::from(u32::MAX),
-            false,
+            u64::MAX,
             0,
             0,
             u32::MAX,
