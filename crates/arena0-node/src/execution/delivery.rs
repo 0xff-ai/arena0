@@ -6,7 +6,8 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use arena0_protocol::{
-    ExecFrame, ExecutionState, ParticipantStepSignature, PeerId, PeerIdSource, ProtocolError,
+    DirectArrival, DirectEntry, EndPhase, ExecFrame, ExecutionState, ExecutionStatus,
+    ParticipantStepSignature, PeerId, PeerIdSource, ProtocolError,
 };
 use arena0_store::Change;
 use arena0_transport::{ExecDelivery, ExecDeliveryRejection, SendHandle, TransportError};
@@ -27,13 +28,56 @@ pub(super) struct SendLane {
     busy: bool,
     suppressed: bool,
     retry_at: Option<Instant>,
+    /// Direct backoff never delays an eligible protocol frame.
+    direct_retry_at: Option<Instant>,
 }
 
 pub(super) struct SendResult {
     peer: PeerId,
-    digest: [u8; 32],
+    sent: Sent,
     handle: Option<SendHandle>,
     result: Result<(), TransportError>,
+}
+
+pub(super) enum Sent {
+    Protocol { digest: [u8; 32] },
+    Direct { seq: u64 },
+}
+
+// Preparation failures retain the direct coordinate without pretending to be
+// transport failures. Only InvalidState (a missing source) discards the entry.
+pub(super) type SendTaskResult = Result<SendResult, (PeerId, u64, ExecError)>;
+
+#[derive(Debug, PartialEq, Eq)]
+enum Pick {
+    Protocol(usize),
+    Direct,
+}
+
+/// Prefer eligible protocol evidence. Each traffic class owns its own retry
+/// clock, so a retryable direct refusal cannot stall shared agreement.
+fn next_send(
+    lane: &SendLane,
+    frames: &[([u8; 32], ExecFrame)],
+    direct_head: Option<&DirectEntry>,
+    ending: bool,
+    now: Instant,
+) -> Option<Pick> {
+    if lane.retry_at.is_none_or(|deadline| now >= deadline)
+        && let Some(index) = frames.iter().position(|(digest, _)| {
+            !lane.acked.contains(digest) && (ending || !lane.rejected.contains(digest))
+        })
+    {
+        return Some(Pick::Protocol(index));
+    }
+    if !ending
+        && direct_head.is_some()
+        && lane.direct_retry_at.is_none_or(|deadline| now >= deadline)
+    {
+        Some(Pick::Direct)
+    } else {
+        None
+    }
 }
 
 impl ExecutionActor {
@@ -162,7 +206,26 @@ impl ExecutionActor {
                 })?;
                 self.persist_step_signature(next, Some(certified)).await?;
             }
-            ExecFrame::Direct { .. } => return Ok(Some(Rejected)),
+            ExecFrame::Direct { seq, msg, slice } => {
+                if !matches!(self.state.end_phase(), EndPhase::Open) {
+                    return Ok(None);
+                }
+                match self.state.direct_arrival(source, seq) {
+                    DirectArrival::Duplicate => return Ok(None),
+                    DirectArrival::Gap => return Ok(Some(Rejected)),
+                    DirectArrival::Next => {}
+                }
+                if self.state.pending_shared().is_some()
+                    || !matches!(self.state.status(), ExecutionStatus::Active)
+                {
+                    return Ok(Some(NotYet));
+                }
+                return match self.dispatch_direct(source, seq, msg, slice).await? {
+                    super::guest::DispatchOutcome::Committed
+                    | super::guest::DispatchOutcome::Rejected { .. } => Ok(None),
+                    super::guest::DispatchOutcome::Frozen => Ok(Some(NotYet)),
+                };
+            }
             ExecFrame::Abort { occurrence } => {
                 if occurrence.coordinate().next_step() < step {
                     return Ok(None);
@@ -220,28 +283,87 @@ impl ExecutionActor {
                 .retain(|digest| frames.iter().any(|(current, _)| current == digest));
             lane.rejected
                 .retain(|digest| frames.iter().any(|(current, _)| current == digest));
-            if lane.suppressed {
+            if lane.suppressed || lane.busy {
                 continue;
             }
-            let Some((digest, frame)) = frames.iter().find(|(digest, _)| {
-                !lane.acked.contains(digest) && (ending || !lane.rejected.contains(digest))
-            }) else {
+            let direct_head = self.state.direct_queue(peer).first();
+            let Some(pick) = next_send(lane, &frames, direct_head, ending, Instant::now()) else {
                 continue;
             };
-            if lane.busy
-                || lane
-                    .retry_at
-                    .is_some_and(|deadline| Instant::now() < deadline)
-            {
-                continue;
-            }
+            let (sent, frame, entry) = match pick {
+                Pick::Protocol(index) => (
+                    Sent::Protocol {
+                        digest: frames[index].0,
+                    },
+                    Some(frames[index].1.clone()),
+                    None,
+                ),
+                Pick::Direct => {
+                    let entry = direct_head.expect("direct pick requires a head").clone();
+                    (Sent::Direct { seq: entry.seq }, None, Some(entry))
+                }
+            };
             lane.busy = true;
             let handle = lane.handle.take();
             let transport = self.context.transport.clone();
             let session = self.context.activation.session_hash();
-            let digest = *digest;
-            let frame = frame.clone();
+            let store = self.context.blob_store.clone();
+            let execution_id = self.context.exec_id;
             self.send_tasks.spawn(async move {
+                let frame = match frame {
+                    Some(frame) => frame,
+                    None => {
+                        let entry = entry.expect("direct send owns its queue entry");
+                        let seq = entry.seq;
+                        let prepared = async {
+                            let slice = if let Some(range) = entry.range {
+                                let view = store.clone();
+                                let resource = tokio::task::spawn_blocking(move || {
+                                    view.blob_resource_blocking(execution_id, range.source)
+                                })
+                                .await
+                                .map_err(|_| {
+                                    ExecError::DeliveryInvariant("blob lookup task failed")
+                                })??
+                                .ok_or_else(|| {
+                                    ExecError::InvalidState(
+                                        "direct source resource is missing".into(),
+                                    )
+                                })?;
+                                let content =
+                                    store.read_blob(resource.hash).await?.ok_or_else(|| {
+                                        ExecError::InvalidState(
+                                            "direct source content is missing".into(),
+                                        )
+                                    })?;
+                                Some(
+                                    tokio::task::spawn_blocking(move || {
+                                        arena0_crypto::bao::encode_slice(
+                                            &content,
+                                            range.start,
+                                            range.end - range.start,
+                                        )
+                                    })
+                                    .await
+                                    .map_err(|_| {
+                                        ExecError::DeliveryInvariant("Bao encoding task failed")
+                                    })?,
+                                )
+                            } else {
+                                None
+                            };
+                            Ok::<_, ExecError>(ExecFrame::Direct {
+                                seq,
+                                msg: entry.msg,
+                                slice,
+                            })
+                        }
+                        .await;
+                        prepared.map_err(|error| (peer, seq, error))?
+                    }
+                };
+                // The task owns the encoded slice only until send settlement.
+                // No encoded proof enters the execution state or blob store.
                 let operation = async move {
                     let handle = match handle {
                         Some(handle) => handle,
@@ -255,12 +377,12 @@ impl ExecutionActor {
                     Ok(Err(error)) => (None, Err(error)),
                     Err(_) => (None, Err(TransportError::Timeout(5000))),
                 };
-                SendResult {
+                Ok(SendResult {
                     peer,
-                    digest,
+                    sent,
                     handle,
                     result,
-                }
+                })
             });
         }
         Ok(())
@@ -274,13 +396,59 @@ impl ExecutionActor {
         Ok(())
     }
 
-    pub(super) async fn settle_send(&mut self, result: SendResult) -> Result<(), ExecError> {
+    pub(super) async fn settle_send(&mut self, result: SendTaskResult) -> Result<(), ExecError> {
+        let result = match result {
+            Ok(result) => result,
+            Err((peer, seq, error)) => {
+                self.send_lanes.entry(peer).or_default().busy = false;
+                if !matches!(error, ExecError::InvalidState(_)) {
+                    return Err(error);
+                }
+                tracing::warn!(exec_id = %self.context.exec_id, %peer, seq, %error,
+                    "dropping direct entry with missing blob source");
+                let mut next = self.state.clone();
+                if next.ack_direct(peer, seq)? {
+                    self.persist(next, Change::State).await?;
+                }
+                return Ok(());
+            }
+        };
         let SendResult {
             peer,
-            digest,
+            sent,
             handle,
             result,
         } = result;
+        let digest = match sent {
+            Sent::Protocol { digest } => digest,
+            Sent::Direct { seq } => {
+                let lane = self.send_lanes.entry(peer).or_default();
+                lane.busy = false;
+                lane.direct_retry_at = None;
+                match result {
+                    Ok(()) => lane.handle = handle,
+                    Err(TransportError::ExecRejected | TransportError::ExecConflict) => {
+                        tracing::warn!(exec_id = %self.context.exec_id, %peer, seq,
+                            "peer rejected direct frame; dropping entry");
+                        lane.handle = handle;
+                    }
+                    Err(TransportError::ExecNotYet) => {
+                        lane.handle = handle;
+                        lane.direct_retry_at = Some(Instant::now() + PROGRESS_INTERVAL);
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        lane.direct_retry_at = Some(Instant::now() + PROGRESS_INTERVAL);
+                        return Ok(());
+                    }
+                }
+                let mut next = self.state.clone();
+                if next.ack_direct(peer, seq)? {
+                    self.persist(next, Change::State).await?;
+                }
+                return Ok(());
+            }
+        };
         let final_frame = self
             .state
             .terminal_evidence()
@@ -351,4 +519,107 @@ pub(crate) fn authenticates(state: &ExecutionState, source: PeerId, frame: &Exec
 fn frame_digest(frame: &ExecFrame) -> Result<[u8; 32], ExecError> {
     let bytes = borsh::to_vec(frame).map_err(|error| ExecError::InvalidState(error.to_string()))?;
     Ok(*blake3::hash(&bytes).as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frames() -> Vec<([u8; 32], ExecFrame)> {
+        vec![(
+            [1; 32],
+            ExecFrame::Message {
+                commitment: arena0_protocol::StepCommitment {
+                    domain: arena0_protocol::STEP_COMMIT_DOMAIN,
+                    session_id: arena0_protocol::SessionHash([2; 32]),
+                    step: 1,
+                    entry_hash: [3; 32],
+                    pre_state: arena0_protocol::StateHash([4; 32]),
+                    post_state: arena0_protocol::StateHash([5; 32]),
+                    link: [6; 32],
+                },
+                data: vec![],
+            },
+        )]
+    }
+
+    fn head() -> DirectEntry {
+        DirectEntry {
+            seq: 1,
+            msg: vec![7],
+            range: None,
+        }
+    }
+
+    #[test]
+    fn protocol_frames_preempt_direct_frames() {
+        assert_eq!(
+            next_send(
+                &SendLane::default(),
+                &frames(),
+                Some(&head()),
+                false,
+                Instant::now()
+            ),
+            Some(Pick::Protocol(0))
+        );
+    }
+
+    #[test]
+    fn direct_retry_delays_only_direct_frames() {
+        let now = Instant::now();
+        let mut lane = SendLane {
+            direct_retry_at: Some(now + PROGRESS_INTERVAL),
+            ..Default::default()
+        };
+        assert_eq!(
+            next_send(&lane, &frames(), Some(&head()), false, now),
+            Some(Pick::Protocol(0))
+        );
+        assert_eq!(next_send(&lane, &[], Some(&head()), false, now), None);
+        assert_eq!(
+            next_send(&lane, &[], Some(&head()), false, now + PROGRESS_INTERVAL),
+            Some(Pick::Direct)
+        );
+        lane.direct_retry_at = None;
+        lane.retry_at = Some(now + PROGRESS_INTERVAL);
+        assert_eq!(
+            next_send(&lane, &frames(), Some(&head()), false, now),
+            Some(Pick::Direct)
+        );
+    }
+
+    #[test]
+    fn no_direct_frames_while_ending() {
+        assert_eq!(
+            next_send(
+                &SendLane::default(),
+                &[],
+                Some(&head()),
+                true,
+                Instant::now()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn direct_head_goes_when_no_protocol_frame_is_eligible() {
+        let mut lane = SendLane::default();
+        lane.acked.insert([1; 32]);
+        assert_eq!(
+            next_send(&lane, &frames(), Some(&head()), false, Instant::now()),
+            Some(Pick::Direct)
+        );
+        lane.acked.clear();
+        lane.rejected.insert([1; 32]);
+        assert_eq!(
+            next_send(&lane, &frames(), Some(&head()), false, Instant::now()),
+            Some(Pick::Direct)
+        );
+        assert_eq!(
+            next_send(&lane, &frames(), None, false, Instant::now()),
+            None
+        );
+    }
 }

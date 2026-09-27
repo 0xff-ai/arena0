@@ -359,6 +359,8 @@ pub(crate) struct ActorContext {
     pub(crate) execution_key: Arc<ExecutionKey>,
     pub(crate) identity: Arc<NodeKeys>,
     pub(crate) store: ExecutionStore,
+    /// Shared blob reads; execution mutations still require the writer above.
+    pub(crate) blob_store: arena0_store::StoreHandle,
     pub(crate) transport: Arc<dyn Transport + Sync>,
 }
 
@@ -367,6 +369,7 @@ impl ExecContext {
         self,
         identity: Arc<NodeKeys>,
         store: ExecutionStore,
+        blob_store: arena0_store::StoreHandle,
         transport: Arc<dyn Transport + Sync>,
     ) -> ActorContext {
         ActorContext {
@@ -378,6 +381,7 @@ impl ExecContext {
             execution_key: Arc::new(self.execution_key),
             identity,
             store,
+            blob_store,
             transport,
         }
     }

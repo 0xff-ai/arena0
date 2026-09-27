@@ -32,6 +32,71 @@ use crate::context::ExecContext;
 const EXEC_ID: ExecId = ExecId([0x44; 32]);
 const NEGOTIATION_ID: NegotiationId = NegotiationId([0x11; 32]);
 
+#[tokio::test(start_paused = true)]
+async fn duplicate_and_gap_direct_frames_are_acked_or_rejected_without_dispatch() {
+    let fixture = Fixture::new(false).await;
+    let mut actor = fixture.prepare_active_actor().await;
+    fixture.commit_session_started(&mut actor).await;
+    let peer = fixture.remote_keys.peer_id();
+    let frame = |seq| ExecFrame::Direct {
+        seq,
+        msg: vec![1],
+        slice: None,
+    };
+    assert_eq!(actor.accept_frame(peer, frame(1)).await.unwrap(), None);
+    let state = borsh::to_vec(&actor.state).unwrap();
+    assert_eq!(actor.accept_frame(peer, frame(1)).await.unwrap(), None);
+    assert_eq!(
+        actor.accept_frame(peer, frame(3)).await.unwrap(),
+        Some(arena0_transport::ExecDeliveryRejection::Rejected)
+    );
+    assert_eq!(borsh::to_vec(&actor.state).unwrap(), state);
+    assert_eq!(
+        actor.state.direct_arrival(peer, 2),
+        arena0_protocol::DirectArrival::Next
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn direct_frames_wait_while_a_proposal_is_staged() {
+    let fixture = Fixture::new(false).await;
+    let mut actor = fixture.prepare_active_actor().await;
+    assert_eq!(
+        actor
+            .dispatch_event(
+                Event::SessionStarted {
+                    ensemble: actor.ensemble()
+                },
+                DispatchSource::Local
+            )
+            .await
+            .unwrap(),
+        DispatchOutcome::Committed
+    );
+    assert!(actor.state.proposal_commitment().is_some());
+    let state = borsh::to_vec(&actor.state).unwrap();
+    let peer = fixture.remote_keys.peer_id();
+    assert_eq!(
+        actor
+            .accept_frame(
+                peer,
+                ExecFrame::Direct {
+                    seq: 1,
+                    msg: vec![1],
+                    slice: None
+                }
+            )
+            .await
+            .unwrap(),
+        Some(arena0_transport::ExecDeliveryRejection::NotYet)
+    );
+    assert_eq!(borsh::to_vec(&actor.state).unwrap(), state);
+    assert_eq!(
+        actor.state.direct_arrival(peer, 1),
+        arena0_protocol::DirectArrival::Next
+    );
+}
+
 fn guest_wasm(stem: &str) -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../programs/target/wasm32-unknown-unknown/release")
@@ -252,6 +317,7 @@ impl Fixture {
                 .handle()
                 .claim_execution(EXEC_ID)
                 .expect("execution writer"),
+            self.store.handle().clone(),
             self.local_transport.clone() as Arc<dyn Transport + Sync>,
         );
         let state = ExecutionActor::ensure_execution(&mut context)

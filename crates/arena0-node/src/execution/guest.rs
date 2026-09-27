@@ -37,6 +37,12 @@ pub(super) enum DispatchSource {
     },
     /// This participant's own queued message.
     OwnMessage,
+    /// A direct frame; its slice is exposed only as Attachment(0) to the guest.
+    Direct {
+        from: arena0_protocol::PeerId,
+        seq: u64,
+        slice: Option<Vec<u8>>,
+    },
 }
 
 /// Classification for the agent-facing input command.
@@ -131,6 +137,33 @@ impl GuestSigner for DispatchSigner {
 }
 
 impl ExecutionActor {
+    /// Dispatch the next direct frame. Accepted dispatches persist the sequence
+    /// with their result; rejected dispatches restore the resident and persist
+    /// only sequence progress so a bad frame cannot block its lane.
+    /// Frozen dispatches leave the sequence untouched for a later retry.
+    pub(super) async fn dispatch_direct(
+        &mut self,
+        from: arena0_protocol::PeerId,
+        seq: u64,
+        msg: Vec<u8>,
+        slice: Option<Vec<u8>>,
+    ) -> Result<DispatchOutcome, ExecError> {
+        let event = Event::DirectReceived {
+            from,
+            msg,
+            slice: slice.as_ref().map(|_| arena0_protocol::Attachment(0)),
+        };
+        let outcome = self
+            .dispatch_event(event, DispatchSource::Direct { from, seq, slice })
+            .await?;
+        if matches!(outcome, DispatchOutcome::Rejected { .. }) {
+            let mut next = self.state.clone();
+            next.record_direct(from, seq)?;
+            self.persist(next, Change::State).await?;
+        }
+        Ok(outcome)
+    }
+
     /// Submit the answer to the open callout. A rejected guest event leaves
     /// the callout open and both durable memories intact;
     /// the command reports that rejection without taking the actor down.
@@ -390,6 +423,7 @@ impl ExecutionActor {
             DispatchSource::OwnMessage => self.state.outgoing().len().saturating_sub(1),
             DispatchSource::Local
             | DispatchSource::Answer(_)
+            | DispatchSource::Direct { .. }
             | DispatchSource::Timer(_)
             | DispatchSource::PeerMessage { .. } => self.state.outgoing().len(),
         };
@@ -447,8 +481,19 @@ impl ExecutionActor {
             // peer's agreed result, so neither is offered a signer.
             if matches!(
                 &event,
-                Event::InputReceived { .. } | Event::TimerFired { .. }
+                Event::InputReceived { .. }
+                    | Event::TimerFired { .. }
+                    | Event::DirectReceived { .. }
             ) {
+                call = call
+                    .with_blobs(
+                        event_position,
+                        Arc::new(super::blobs::StoreBlobView {
+                            store: self.context.blob_store.clone(),
+                            execution_id: self.context.exec_id,
+                        }),
+                    )
+                    .with_direct_queued(self.state.direct_queue_lens());
                 call = call.with_signer(Arc::new(DispatchSigner {
                     session_id: self.context.activation.session_hash(),
                     program_hash: self.context.program.program().hash(),
@@ -457,6 +502,12 @@ impl ExecutionActor {
                     identity: Arc::clone(&self.context.identity),
                     execution_key: Arc::clone(&self.context.execution_key),
                 }));
+            }
+            if let DispatchSource::Direct {
+                slice: Some(bytes), ..
+            } = &source
+            {
+                call = call.with_slice(bytes.clone());
             }
             call
         };
@@ -470,6 +521,7 @@ impl ExecutionActor {
                 self.instance = None;
                 let handler = match &event {
                     Event::InputReceived { .. } => Some("input"),
+                    Event::DirectReceived { .. } => Some("direct"),
                     Event::MessageReceived { .. } => Some("message"),
                     _ => None,
                 };
@@ -513,6 +565,7 @@ impl ExecutionActor {
             match source {
                 DispatchSource::Answer(pending_id) => Some(pending_id),
                 DispatchSource::Local
+                | DispatchSource::Direct { .. }
                 | DispatchSource::Timer(_)
                 | DispatchSource::PeerMessage { .. }
                 | DispatchSource::OwnMessage => None,
@@ -544,6 +597,7 @@ impl ExecutionActor {
                 (
                     DispatchSource::Local
                     | DispatchSource::Answer(_)
+                    | DispatchSource::Direct { .. }
                     | DispatchSource::Timer(_)
                     | DispatchSource::OwnMessage,
                     other,
@@ -579,16 +633,20 @@ impl ExecutionActor {
             }
         }
         let proposal_staged = next.pending_shared().is_some();
+        if let DispatchSource::Direct { from, seq, .. } = &source {
+            next.record_direct(*from, *seq)?;
+        }
         self.persist(
             next,
             Change::Dispatch {
-                blobs: Vec::new(),
+                blobs: result.blobs,
                 event,
                 effects,
                 timer_id: match &source {
                     DispatchSource::Timer(timer_id) => Some(*timer_id),
                     DispatchSource::Local
                     | DispatchSource::Answer(_)
+                    | DispatchSource::Direct { .. }
                     | DispatchSource::PeerMessage { .. }
                     | DispatchSource::OwnMessage => None,
                 },
