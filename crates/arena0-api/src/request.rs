@@ -9,6 +9,7 @@
 //! and forwards it unchanged; the guest converts it to concrete DTOs.
 
 use arena0_program::ProgramHash;
+use arena0_protocol::BlobHash;
 use arena0_protocol::{
     CalloutId, ColorDepth, ExecId, NegotiationTarget, ReceiptArtifact, SessionHash,
 };
@@ -60,6 +61,10 @@ pub enum HostRequest {
     ProgramGet { program: String },
     #[serde(rename = "program.import")]
     ProgramImport { wasm: Vec<u8> },
+    #[serde(rename = "blob.import")]
+    BlobImport { bytes: Vec<u8> },
+    #[serde(rename = "blob.export")]
+    BlobExport { hash: BlobHash },
     #[serde(rename = "program.remove")]
     ProgramRemove { program: String },
 

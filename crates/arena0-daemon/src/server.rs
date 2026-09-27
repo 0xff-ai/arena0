@@ -1933,6 +1933,26 @@ impl HostService {
                         ApiError::new(ApiErrorCode::Internal, "imported program vanished")
                     })
             }
+            HostRequest::BlobImport { bytes } => {
+                let (hash, length) = self.store.import_blob(bytes).await.map_err(|error| {
+                    let code = if matches!(error, arena0_store::StoreError::BlobTooLarge { .. }) {
+                        ApiErrorCode::BadRequest
+                    } else {
+                        ApiErrorCode::Storage
+                    };
+                    ApiError::new(code, format!("import blob: {error}"))
+                })?;
+                Ok(ResponseOk::BlobImported { hash, length })
+            }
+            HostRequest::BlobExport { hash } => self
+                .store
+                .read_blob(hash)
+                .await
+                .map_err(|error| {
+                    ApiError::new(ApiErrorCode::Storage, format!("export blob: {error}"))
+                })?
+                .map(|bytes| ResponseOk::Blob { bytes })
+                .ok_or_else(|| ApiError::new(ApiErrorCode::NotFound, "no such blob")),
             HostRequest::ProgramRemove { program } => {
                 let program_id = self.resolve_program(&program).await?;
                 let removed = self
@@ -3946,6 +3966,78 @@ async fn offer_is_usable_for_join(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn blob_import_then_export_round_trips() {
+        let (_dir, _store, daemon, _peer) = test_daemon();
+        for bytes in [vec![], vec![0, 1, 127, 128, 255]] {
+            let request = HostRequest::BlobImport {
+                bytes: bytes.clone(),
+            };
+            let request = serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
+            let imported = daemon.dispatch(request).await.unwrap();
+            let ResponseOk::BlobImported { hash, length } = imported else {
+                panic!("expected blob import result");
+            };
+            assert_eq!(length, bytes.len() as u64);
+            assert_eq!(
+                daemon
+                    .dispatch(HostRequest::BlobImport {
+                        bytes: bytes.clone()
+                    })
+                    .await
+                    .unwrap(),
+                ResponseOk::BlobImported { hash, length }
+            );
+            let response = daemon
+                .dispatch(HostRequest::BlobExport { hash })
+                .await
+                .unwrap();
+            let response: ResponseOk =
+                serde_json::from_value(serde_json::to_value(response).unwrap()).unwrap();
+            assert_eq!(response, ResponseOk::Blob { bytes });
+            assert_eq!(
+                serde_json::to_value(hash).unwrap().as_str().unwrap().len(),
+                64
+            );
+        }
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn blob_export_of_unknown_hash_is_not_found() {
+        let (_dir, _store, daemon, _peer) = test_daemon();
+        let error = daemon
+            .dispatch(HostRequest::BlobExport {
+                hash: arena0_protocol::BlobHash([7; 32]),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ApiErrorCode::NotFound);
+        assert_eq!(error.message, "no such blob");
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn blob_import_over_the_limit_is_rejected() {
+        let (_dir, _store, daemon, _peer) = test_daemon();
+        let length = arena0_protocol::MAX_BLOB_BYTES + 1;
+        let error = daemon
+            .dispatch(HostRequest::BlobImport {
+                bytes: vec![0; length as usize],
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ApiErrorCode::BadRequest);
+        assert_eq!(
+            error.message,
+            format!(
+                "import blob: {}",
+                arena0_store::StoreError::BlobTooLarge { length }
+            )
+        );
+        daemon.stop().await;
+    }
     use arena0_api::NextEvent;
     use arena0_crypto::bls::BlsSecretKey;
     use arena0_crypto::{BlsSignature, SecretKey, key_binding_message};

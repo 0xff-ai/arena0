@@ -113,6 +113,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Move files in and out of this Host's blob store.
+    #[command(subcommand)]
+    Blob(BlobCommand),
     /// Print the agent-facing arena0 skill without contacting a Host.
     Skill,
     /// Open the Host bound to the current harness context.
@@ -246,6 +249,18 @@ enum ProgramCommand {
     Import { file: PathBuf },
     /// Remove a local program by name or id.
     Remove { program: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum BlobCommand {
+    /// Store a file; prints its hash and length for use as program parameters.
+    Import { file: PathBuf },
+    /// Write stored content with this hash to a file.
+    Export {
+        #[arg(value_parser = |value: &str| value.parse::<arena0_client::protocol::BlobHash>().map(|_| value.to_owned()))]
+        hash: String,
+        file: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -854,6 +869,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Stop => stop(&ctx).await,
         Command::Identity => identity(&ctx).await,
         Command::Program { command } => program(&ctx, command).await,
+        Command::Blob(command) => blob(&ctx, command).await,
         Command::Exec { command } => execution(&ctx, command).await,
         Command::Watch { exec } => watch::watch(&ctx, exec).await,
         Command::Receipt { command } => receipt(&ctx, command).await,
@@ -1262,6 +1278,38 @@ fn id_json(info: &arena0_client::api::IdInfo) -> Value {
         "peer_id": info.peer_id.to_string(),
         "transport_key": info.transport_key.to_string(),
     })
+}
+
+async fn blob(ctx: &Ctx, command: BlobCommand) -> anyhow::Result<()> {
+    match command {
+        BlobCommand::Import { file } => {
+            let bytes = std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
+            let ResponseOk::BlobImported { hash, length } =
+                ctx.call(&HostRequest::BlobImport { bytes }).await?
+            else {
+                bail!("unexpected response to blob.import");
+            };
+            if ctx.mode.is_json() {
+                ui::print_json(&json!({ "hash": hash, "length": length }));
+            } else {
+                println!("{hash} {length}");
+            }
+        }
+        BlobCommand::Export { hash, file } => {
+            let hash = hash.parse::<arena0_client::protocol::BlobHash>()?;
+            let ResponseOk::Blob { bytes } = ctx.call(&HostRequest::BlobExport { hash }).await?
+            else {
+                bail!("unexpected response to blob.export");
+            };
+            std::fs::write(&file, &bytes).with_context(|| format!("write {}", file.display()))?;
+            if ctx.mode.is_json() {
+                ui::print_json(&json!({ "file": file, "length": bytes.len() }));
+            } else {
+                println!("wrote {} bytes to {}", bytes.len(), file.display());
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn program(ctx: &Ctx, command: ProgramCommand) -> anyhow::Result<()> {
@@ -1929,6 +1977,23 @@ mod tests {
 
     #[test]
     fn current_command_paths_parse() {
+        let imported = Cli::try_parse_from(["arena0", "blob", "import", "input.bin"]).unwrap();
+        assert!(
+            matches!(imported.command, Some(Command::Blob(BlobCommand::Import { file }))
+            if file == Path::new("input.bin"))
+        );
+        let hash = "ab".repeat(32);
+        let exported =
+            Cli::try_parse_from(["arena0", "blob", "export", &hash, "output.bin"]).unwrap();
+        assert!(
+            matches!(exported.command, Some(Command::Blob(BlobCommand::Export { hash: parsed, file }))
+            if parsed == hash && file == Path::new("output.bin"))
+        );
+        for invalid in ["", "ab", &"g".repeat(64), &"a".repeat(63), &"a".repeat(65)] {
+            let error = Cli::try_parse_from(["arena0", "blob", "export", invalid, "output.bin"])
+                .unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        }
         assert!(Cli::try_parse_from(["arena0", "--tmp"]).is_ok());
         assert!(
             Cli::try_parse_from(["arena0", "--tmp", "--socket", "/tmp/arena0.sock", "status"])
