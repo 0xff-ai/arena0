@@ -263,6 +263,7 @@ dependencies = [
 name = "arena0-primitives"
 version = "0.1.0"
 dependencies = [
+ "arena0-crypto",
  "arena0-sdk",
  "borsh",
  "serde",

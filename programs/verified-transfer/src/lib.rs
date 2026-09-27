@@ -22,7 +22,147 @@ pub struct Params {
 
 #[cfg(test)]
 mod tests {
-    // U5: demo tests.
+    use super::*;
+    use verified_transfer::VerifiedTransfer;
+
+    #[test]
+    fn transfers_assign_roles_from_input_sender() {
+        let ensemble = Ensemble::from_peers(vec![PeerId([1; 32]), PeerId([0; 32])]).unwrap();
+        let mut params = Params {
+            input_sender: PeerId([1; 32]),
+            input_hash: BlobHash([2; 32]),
+            input_length: 1,
+            result_hash: BlobHash([3; 32]),
+            result_length: 1,
+        };
+        let (input, result) = transfers(&params, &ensemble).unwrap();
+        assert_eq!(input.sender(), Participant::new(1));
+        assert_eq!(input.receiver(), Participant::new(0));
+        assert_eq!(result.sender(), Participant::new(0));
+        assert_eq!(result.receiver(), Participant::new(1));
+        params.input_sender = PeerId([9; 32]);
+        assert!(transfers(&params, &ensemble).is_err());
+    }
+
+    #[test]
+    fn writer_is_the_receiver_of_the_first_unsettled_transfer() {
+        let shared = Shared {
+            input: Transfer::new(
+                0,
+                Participant::new(1),
+                Participant::new(0),
+                BlobHash([2; 32]),
+                1,
+            )
+            .unwrap(),
+            result: Transfer::new(
+                1,
+                Participant::new(0),
+                Participant::new(1),
+                BlobHash([3; 32]),
+                1,
+            )
+            .unwrap(),
+            ..Shared::default()
+        };
+        // SAFETY: only pure agreed-message handlers run; no host effects are applied.
+        let mut ctx = unsafe { Context::__new(shared, Local::default(), PeerId([0; 32])) };
+        assert_eq!(
+            VerifiedTransfer::writer(ctx.shared()),
+            Some(Participant::new(0))
+        );
+        assert!(
+            VerifiedTransfer::on_message(
+                &mut ctx,
+                Participant::new(1),
+                Message::Input(transfer::TransferMessage::Complete)
+            )
+            .is_err()
+        );
+        assert!(ctx.shared().input.status().is_none());
+        assert_eq!(
+            VerifiedTransfer::writer(ctx.shared()),
+            Some(Participant::new(0))
+        );
+        assert!(matches!(
+            VerifiedTransfer::on_message(
+                &mut ctx,
+                Participant::new(0),
+                Message::Input(transfer::TransferMessage::Complete)
+            )
+            .unwrap(),
+            ApplyDecision::Accept(Transition::Stay)
+        ));
+        assert_eq!(
+            VerifiedTransfer::writer(ctx.shared()),
+            Some(Participant::new(1))
+        );
+        assert!(
+            VerifiedTransfer::on_message(
+                &mut ctx,
+                Participant::new(0),
+                Message::Result(transfer::TransferMessage::Failed)
+            )
+            .is_err()
+        );
+        assert!(ctx.shared().result.status().is_none());
+        assert!(matches!(
+            VerifiedTransfer::on_message(
+                &mut ctx,
+                Participant::new(1),
+                Message::Result(transfer::TransferMessage::Failed)
+            )
+            .unwrap(),
+            ApplyDecision::Accept(Transition::End)
+        ));
+        assert_eq!(VerifiedTransfer::writer(ctx.shared()), None);
+    }
+
+    #[test]
+    fn outcome_reports_both_statuses() {
+        let shared = Shared {
+            input: Transfer::new(
+                0,
+                Participant::new(0),
+                Participant::new(1),
+                BlobHash([2; 32]),
+                1,
+            )
+            .unwrap(),
+            result: Transfer::new(
+                1,
+                Participant::new(1),
+                Participant::new(0),
+                BlobHash([3; 32]),
+                1,
+            )
+            .unwrap(),
+            ..Shared::default()
+        };
+        // SAFETY: the context models agreed dispatches without applying host effects.
+        let mut ctx = unsafe { Context::__new(shared, Local::default(), PeerId([0; 32])) };
+        assert!(matches!(
+            VerifiedTransfer::on_message(
+                &mut ctx,
+                Participant::new(1),
+                Message::Input(transfer::TransferMessage::Complete)
+            )
+            .unwrap(),
+            ApplyDecision::Accept(Transition::Stay)
+        ));
+        assert!(matches!(
+            VerifiedTransfer::on_message(
+                &mut ctx,
+                Participant::new(0),
+                Message::Result(transfer::TransferMessage::Failed)
+            )
+            .unwrap(),
+            ApplyDecision::Accept(Transition::End)
+        ));
+        let outcome = VerifiedTransfer::outcome(ctx.shared());
+        assert_eq!(outcome.input, TransferStatus::Complete);
+        assert_eq!(outcome.result, TransferStatus::Failed);
+    }
 }
 
 /// The two transfers of `params` in `ensemble`: `input` from `input_sender`
