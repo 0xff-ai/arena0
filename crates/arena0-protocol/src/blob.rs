@@ -20,6 +20,7 @@ id_type!(
 /// and the blob call's index in that dispatch), so rerunning a dispatch after a
 /// crash mints the same handles. Handles are scoped to one execution.
 #[derive(
+    schemars::JsonSchema,
     BorshSerialize,
     BorshDeserialize,
     Serialize,
@@ -41,14 +42,32 @@ pub struct BlobHandle {
 /// A received slice's token, valid only during the dispatch that delivered
 /// it. The slice bytes stay in the Host; `accept_range` consumes the token.
 #[derive(
-    BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq,
+    schemars::JsonSchema,
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
 )]
 pub struct Attachment(pub u32);
 
 /// The object range a direct message carries. The Host Bao-encodes it from the
 /// immutable `source` when it sends the frame.
 #[derive(
-    BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq,
+    schemars::JsonSchema,
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
 )]
 pub struct RangeAttachment {
     pub source: BlobHandle,
@@ -61,6 +80,7 @@ pub struct RangeAttachment {
 /// The Borsh tags are part of the ABI: blob imports return `0` for success and
 /// `tag + 1` for an error.
 #[derive(
+    schemars::JsonSchema,
     BorshSerialize,
     BorshDeserialize,
     Serialize,
