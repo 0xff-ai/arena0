@@ -12,6 +12,11 @@ mod keys;
 pub mod bls;
 
 #[cfg(not(target_arch = "wasm32"))]
+mod permutation;
+#[cfg(not(target_arch = "wasm32"))]
+pub use permutation::permutation;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub use keys::ExecutionKey;
 pub use keys::NodeKeys;
 pub use keys::{BLS_BINDING_DOMAIN, key_binding_message, verify_key_binding};

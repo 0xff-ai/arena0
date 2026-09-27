@@ -29,6 +29,7 @@ pub mod system_event;
 pub mod timer;
 pub mod topic;
 pub mod trace;
+pub mod verify;
 pub mod view;
 
 // Flat id aliases for convenience; the qualified forms (`peer::Id`, ...) remain.
@@ -88,4 +89,5 @@ pub use trace::{
     SessionHeader, SignerSet, StepCommitment, StepEvent, StepSig, StepTerminal,
     TRACE_FORMAT_VERSION, TraceEntry,
 };
+pub use verify::VerifyError;
 pub use view::{ColorDepth, Slot, View, Viewport};

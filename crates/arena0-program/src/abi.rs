@@ -29,6 +29,12 @@ pub const MAX_CALLOUT_CONTEXT_BYTES: usize = 64 * 1024;
 /// allocates `payload.len() + SIGN_RESULT_OVERHEAD_BYTES` for the result.
 pub const SIGN_RESULT_OVERHEAD_BYTES: usize = 256;
 
+/// Host bytes a synchronous `verify` call adds around the recovered payload:
+/// the Borsh `Result` tag and the payload's `Vec<u8>` length prefix. The
+/// payload is shorter than the signed preimage it sits in, so a guest allocates
+/// `signed_bytes.len() + VERIFY_RESULT_OVERHEAD_BYTES` for the result.
+pub const VERIFY_RESULT_OVERHEAD_BYTES: usize = 8;
+
 /// Bounded, complete JSON bytes at an agent-facing request or projection boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsonBytes(Vec<u8>);
@@ -644,6 +650,15 @@ pub mod imports {
     pub const END_SESSION: &str = "end_session";
     /// Abort the current session.
     pub const ABORT_SESSION: &str = "abort_session";
+    /// BLAKE3 of guest bytes: `(data_ptr, data_len, out_ptr)`; writes 32 bytes.
+    pub const HASH: &str = "hash";
+    /// Seeded permutation of `0..n`: `(seed_ptr, n, out_ptr)`; reads a 32-byte
+    /// seed and writes `n` little-endian `u32`s.
+    pub const PERMUTATION: &str = "permutation";
+    /// Verify a guest signature: `(signed_ptr, signed_len, sig_ptr, sig_len,
+    /// signer_ptr, out_ptr, out_cap) -> len`; reads a 32-byte signer `PeerId`
+    /// and writes a Borsh `Result<Vec<u8>, VerifyError>`.
+    pub const VERIFY: &str = "verify";
 }
 
 impl Capability {
