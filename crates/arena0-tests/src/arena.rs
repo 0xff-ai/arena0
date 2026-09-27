@@ -17,9 +17,9 @@ use arena0_node::{
 use arena0_node::{ExecContext, NegotiationBook};
 use arena0_program::JsonBytes;
 use arena0_protocol::{
-    EventSource, ExecId, ExecutionAdmission, NegotiationEvent, NegotiationId, OfferData, PeerId,
-    PeerIdSource, ReceiptArtifact, SessionHash, SessionTermination, StateHash, TraceEntry, View,
-    Viewport,
+    BlobHash, EventSource, ExecId, ExecutionAdmission, NegotiationEvent, NegotiationId, OfferData,
+    PeerId, PeerIdSource, ReceiptArtifact, SessionHash, SessionTermination, StateHash, TraceEntry,
+    View, Viewport,
 };
 use arena0_sandbox::Program;
 use arena0_store::{Store, StoreHandle};
@@ -32,6 +32,7 @@ use tokio::sync::Barrier;
 /// Configuration phase.
 #[allow(missing_debug_implementations)]
 pub struct Arena {
+    blobs: Vec<(usize, Vec<u8>)>,
     wasm: Option<Vec<u8>>,
     participant_count: usize,
     params: Vec<u8>,
@@ -164,6 +165,7 @@ impl Default for Arena {
 impl Arena {
     pub fn new() -> Self {
         Self {
+            blobs: Vec::new(),
             wasm: None,
             participant_count: 2,
             // Generated programs without a Params DTO use stock Serde's unit
@@ -192,6 +194,13 @@ impl Arena {
     /// Set the immutable parameters shared by every participant.
     pub fn params(&mut self, params: Vec<u8>) -> &mut Self {
         self.params = params;
+        self
+    }
+
+    /// Store `bytes` in the participant's blob store before the run starts.
+    /// Participant indexes use the harness's PeerId-sorted program order.
+    pub fn blob(&mut self, participant: usize, bytes: Vec<u8>) -> &mut Self {
+        self.blobs.push((participant, bytes));
         self
     }
 
@@ -236,6 +245,17 @@ impl Arena {
             let (directory, store) = crate::fixtures::seeded_store(node.peer_id, &wasm).await;
             host_specs.push((Arc::clone(&node.identity), store.handle().clone()));
             stores.push((directory, store));
+        }
+
+        // Import through the real store owner before any session can dispatch
+        // a source resolve. `stores` follows the sorted participant identities.
+        for (participant, bytes) in &self.blobs {
+            stores[*participant]
+                .1
+                .handle()
+                .import_blob(bytes.clone())
+                .await
+                .expect("import participant blob");
         }
 
         let negotiation_id = NegotiationId([0xA7; 32]);
@@ -543,6 +563,15 @@ pub struct Run {
 }
 
 impl Run {
+    /// Complete content with `hash` in the participant's blob store.
+    pub async fn read_blob(&self, participant: usize, hash: BlobHash) -> Option<Vec<u8>> {
+        self.participants[participant]
+            .store_handle
+            .read_blob(hash)
+            .await
+            .expect("read participant blob")
+    }
+
     pub fn expect_input(&mut self, participant: usize) -> Expect<'_> {
         Expect {
             run: self,

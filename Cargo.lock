@@ -396,6 +396,7 @@ dependencies = [
  "arena0-store",
  "arena0-test-engine",
  "arena0-transport",
+ "borsh",
  "hex",
  "serde_json",
  "tempfile",
