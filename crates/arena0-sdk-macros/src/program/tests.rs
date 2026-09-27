@@ -506,6 +506,60 @@ fn scopes_effect_bindings_to_the_declaring_function() {
 }
 
 #[test]
+fn module_shell_decodes_typed_direct_messages() {
+    let item: Item = syn::parse_quote! {
+        pub mod transfer {
+            use arena0::prelude::*;
+            #[arena0::state(max = 256)]
+            pub struct Shared { round: u64 }
+            fn on_direct(ctx: &mut LocalContext, from: Participant,
+                msg: TransferMessage, slice: Option<Attachment>) -> Result<(), ProgramFault> {
+                Ok(())
+            }
+        }
+    };
+    let expanded = expand_arena0_program_item(args(), item)
+        .unwrap()
+        .to_string();
+    assert!(expanded.contains("let msg : TransferMessage"), "{expanded}");
+    assert!(
+        expanded.contains(":: arena0 :: borsh :: from_slice (& msg)"),
+        "{expanded}"
+    );
+    assert!(
+        expanded.contains("direct message decode failed"),
+        "{expanded}"
+    );
+    assert!(
+        expanded.contains("self :: on_direct (ctx , from , msg , slice)"),
+        "{expanded}"
+    );
+}
+
+#[test]
+fn module_shell_rejects_an_on_direct_with_the_wrong_arity() {
+    for parameters in [
+        quote::quote! { ctx: &mut LocalContext },
+        quote::quote! { ctx: &mut LocalContext, from: Participant, msg: TransferMessage },
+        quote::quote! { ctx: &mut LocalContext, from: Participant, msg: TransferMessage, slice: Option<Attachment>, extra: u8 },
+    ] {
+        let item: Item = syn::parse_quote! {
+            pub mod transfer {
+                use arena0::prelude::*;
+                #[arena0::state(max = 256)]
+                pub struct Shared { round: u64 }
+                fn on_direct(#parameters) -> Result<(), ProgramFault> { Ok(()) }
+            }
+        };
+        let error = expand_arena0_program_item(args(), item).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "on_direct must take (ctx: &mut LocalContext, from: Participant, msg: T, slice: Option<Attachment>)"
+        );
+    }
+}
+
+#[test]
 fn infers_blob_and_direct_capabilities_from_local_context() {
     let item: Item = syn::parse_quote! {
         pub mod transfer {

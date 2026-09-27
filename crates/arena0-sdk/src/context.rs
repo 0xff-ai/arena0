@@ -575,7 +575,18 @@ pub struct Effects<'a, Shared, M = AgreedMode> {
 ///
 /// The guest receives both so it can persist or forward the exact preimage the
 /// host signed; the host never lets the guest guess what was signed.
-#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+    borsh::BorshSchema,
+)]
 pub struct Signed {
     /// The exact versioned, execution-bound preimage the host signed.
     pub signed_bytes: Vec<u8>,

@@ -30,3 +30,6 @@ pub mod joint_randomness;
 
 /// Round-robin turn management.
 pub mod turn_manager;
+
+/// Verified object transfer with Host-owned blobs and receiver-signed checkpoints.
+pub mod verified_transfer;
