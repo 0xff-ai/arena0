@@ -184,6 +184,7 @@ dependencies = [
  "borsh",
  "ed25519-dalek",
  "hex",
+ "rand_chacha 0.3.1",
  "schemars",
  "serde",
  "sha2",
