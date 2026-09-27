@@ -17,6 +17,7 @@ const PROGRAMS: &[&str] = &[
     "sequential_count",
     "vickrey_auction",
     "contract_net",
+    "verified_transfer",
 ];
 
 fn main() {
