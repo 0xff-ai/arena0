@@ -6,6 +6,7 @@
 
 mod abort;
 mod binding;
+mod blob_change;
 mod callout;
 mod certificate;
 mod cursor;
@@ -24,6 +25,8 @@ mod validation;
 pub const MAX_EFFECTS: usize = 128;
 /// Maximum number of messages one execution may hold in its outgoing queue.
 pub const MAX_OUTGOING_MESSAGES: usize = 16;
+/// Maximum unacknowledged direct messages queued for one recipient.
+pub const MAX_DIRECT_QUEUE: usize = 8;
 /// Maximum number of active one-shot timers in one execution.
 pub const MAX_ACTIVE_TIMERS: usize = 64;
 /// Maximum number of signatures retained for one step proposal.
@@ -41,6 +44,7 @@ pub const MAX_RECEIPT_TRACE_ENTRIES: usize = 65_536;
 
 pub use abort::{ABORT_OCCURRENCE_DOMAIN, ABORT_OCCURRENCE_VERSION, AbortKind, AbortOccurrence};
 pub use binding::ExecutionBinding;
+pub use blob_change::BlobChange;
 pub use callout::{CalloutId, CalloutIdParseError, OpenCallout, callout_id};
 pub use certificate::{
     ParticipantStepSignature, Receipt, ReceiptArtifact, ReceiptBody, ReceiptId, ReceiptKind,
