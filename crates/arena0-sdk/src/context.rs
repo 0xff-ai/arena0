@@ -13,9 +13,10 @@
 //! value and emit effects; the runtime decides whether the complete dispatch
 //! result is accepted at the dispatch boundary.
 
-use arena0_crypto::{CryptoError, HashAlgorithm, SignScheme};
-use arena0_protocol::{Committed, Ensemble, LogLevel, Participant, PeerId};
+use arena0_crypto::SignScheme;
+use arena0_protocol::{Committed, Ensemble, LogLevel, Participant, PeerId, VerifyError};
 use borsh::{BorshDeserialize, BorshSerialize};
+use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 
 use crate::effects;
@@ -155,6 +156,17 @@ impl<Shared: std::fmt::Debug, Local: std::fmt::Debug, M> std::fmt::Debug for Ctx
 }
 
 impl<Shared, Local, M: Mode> Ctx<Shared, Local, M> {
+    /// Ask the Host to verify `signed` as produced by `signer`'s `sign` call in
+    /// this session, and return its payload. The Host checks the preimage's
+    /// session and program, that `signer` is a participant, and the signature
+    /// under `signer`'s key for the preimage's scheme. The result depends only on
+    /// the arguments and the session, so agreed handlers compute it identically on
+    /// every participant and on a rerun after a crash. Available in every handler
+    /// mode; the Host traps outside a dispatch.
+    pub fn verify(&self, signed: &Signed, signer: PeerId) -> Result<Vec<u8>, VerifyError> {
+        effects::host_guest_verify(&signed.signed_bytes, &signed.signature, signer)
+    }
+
     #[doc(hidden)]
     pub fn __set_participant(&mut self, participant: Participant) {
         self.participant = Some(participant);
@@ -379,11 +391,6 @@ impl<Shared, Local, M: EffectMode> Ctx<Shared, Local, M> {
         buf
     }
 
-    /// Pure synchronous cryptographic helpers.
-    pub fn crypto(&self) -> Crypto {
-        Crypto
-    }
-
     /// Convert a primitive-produced peer message into a detached broadcast output.
     pub fn primitive_output<T>(&mut self, msg: T) -> PrimitiveOutput<T> {
         PrimitiveOutput {
@@ -550,7 +557,7 @@ pub struct Effects<'a, Shared, M = AgreedMode> {
 ///
 /// The guest receives both so it can persist or forward the exact preimage the
 /// host signed; the host never lets the guest guess what was signed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
 pub struct Signed {
     /// The exact versioned, execution-bound preimage the host signed.
     pub signed_bytes: Vec<u8>,
@@ -611,29 +618,6 @@ impl<Shared, Local, P, Route, Mode> std::fmt::Debug
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrimitiveField").finish_non_exhaustive()
-    }
-}
-
-/// Pure cryptographic helpers available inside deterministic handlers.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Crypto;
-
-impl Crypto {
-    /// Hash `data` synchronously inside the guest.
-    #[must_use]
-    pub fn hash(&self, algorithm: HashAlgorithm, data: &[u8]) -> [u8; 32] {
-        arena0_crypto::hash(algorithm, data)
-    }
-
-    /// Verify a signature synchronously inside the guest.
-    pub fn verify(
-        &self,
-        scheme: SignScheme,
-        key: &[u8],
-        data: &[u8],
-        signature: &[u8],
-    ) -> Result<bool, CryptoError> {
-        arena0_crypto::verify(scheme, key, data, signature)
     }
 }
 
@@ -744,87 +728,5 @@ impl<Shared, Local, P, Route> PrimitiveField<'_, Shared, Local, P, Route, Agreed
     pub fn mutate<R>(&mut self, f: impl FnOnce(&mut P) -> R) -> R {
         let field = self.field;
         self.ctx.mutate_shared(|shared| f(field(shared)))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sha2::Digest as _;
-    use tiny_keccak::Hasher as _;
-
-    #[test]
-    fn crypto_hash_matches_supported_algorithms() {
-        let crypto = Crypto;
-        let data = b"arena0";
-
-        assert_eq!(
-            crypto.hash(HashAlgorithm::Blake3, data),
-            *blake3::hash(data).as_bytes()
-        );
-
-        let sha256 = sha2::Sha256::digest(data);
-        let mut expected_sha256 = [0u8; 32];
-        expected_sha256.copy_from_slice(&sha256);
-        assert_eq!(crypto.hash(HashAlgorithm::Sha256, data), expected_sha256);
-
-        let mut expected_keccak = [0u8; 32];
-        let mut keccak = tiny_keccak::Keccak::v256();
-        keccak.update(data);
-        keccak.finalize(&mut expected_keccak);
-        assert_eq!(crypto.hash(HashAlgorithm::Keccak256, data), expected_keccak);
-    }
-
-    #[test]
-    fn crypto_verifies_ed25519_synchronously() {
-        use ed25519_dalek::Signer as _;
-
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let verifying_key = signing_key.verifying_key();
-        let data = b"sign me";
-        let signature = signing_key.sign(data);
-        let crypto = Crypto;
-
-        assert!(
-            crypto
-                .verify(
-                    SignScheme::Ed25519,
-                    verifying_key.as_bytes(),
-                    data,
-                    &signature.to_bytes(),
-                )
-                .expect("valid ed25519 verification"),
-        );
-        assert!(
-            !crypto
-                .verify(
-                    SignScheme::Ed25519,
-                    verifying_key.as_bytes(),
-                    b"tampered",
-                    &signature.to_bytes(),
-                )
-                .expect("invalid signatures return false"),
-        );
-    }
-
-    #[test]
-    fn crypto_rejects_malformed_ed25519_inputs() {
-        let crypto = Crypto;
-
-        let key_err = crypto
-            .verify(SignScheme::Ed25519, &[1, 2, 3], b"data", &[0u8; 64])
-            .expect_err("short key should fail before verification");
-        assert!(matches!(
-            key_err,
-            CryptoError::InvalidKeyLength {
-                expected: 32,
-                actual: 3
-            }
-        ));
-
-        let sig_err = crypto
-            .verify(SignScheme::Ed25519, &[0u8; 32], b"data", &[0u8; 8])
-            .expect_err("short signature should be rejected");
-        assert!(matches!(sig_err, CryptoError::InvalidSignature));
     }
 }

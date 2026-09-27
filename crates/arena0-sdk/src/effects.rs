@@ -7,7 +7,7 @@
 use arena0_crypto::SignScheme;
 #[cfg(not(target_arch = "wasm32"))]
 use arena0_program::abi::imports;
-use arena0_protocol::{LogLevel, TimerPayload};
+use arena0_protocol::{LogLevel, PeerId, TimerPayload};
 
 /// State-memory selector used by the always-available state imports.
 #[doc(hidden)]
@@ -25,6 +25,15 @@ unsafe extern "C" {
     fn broadcast(data_ptr: u32, data_len: u32) -> u32;
     fn set_timer(delay_ms: u64, type_ptr: u32, type_len: u32, data_ptr: u32, data_len: u32);
     fn sign(scheme: u32, data_ptr: u32, data_len: u32, out_ptr: u32, out_cap: u32) -> u32;
+    fn verify(
+        signed_ptr: u32,
+        signed_len: u32,
+        sig_ptr: u32,
+        sig_len: u32,
+        signer_ptr: u32,
+        out_ptr: u32,
+        out_cap: u32,
+    ) -> u32;
     fn end_session(result_ptr: u32, result_len: u32);
     fn abort_session(reason_ptr: u32, reason_len: u32);
     fn state_len(kind: u32) -> u32;
@@ -139,6 +148,32 @@ pub(crate) fn host_guest_sign(scheme: SignScheme, payload: &[u8]) -> (Vec<u8>, V
         let bytes = core::slice::from_raw_parts(out, written).to_vec();
         crate::io_alloc::io_dealloc(out, capacity);
         borsh::from_slice(&bytes).expect("host sign result decode failed")
+    })
+}
+
+/// Allocate room for the payload and Borsh result envelope, then decode the
+/// Host's verification result. Native builds panic through `host_import!`.
+pub(crate) fn host_guest_verify(
+    signed_bytes: &[u8],
+    signature: &[u8],
+    signer: PeerId,
+) -> Result<Vec<u8>, arena0_protocol::VerifyError> {
+    host_import!(VERIFY(signed_bytes, signature, signer) {
+        let capacity = signed_bytes.len()
+            .saturating_add(arena0_program::VERIFY_RESULT_OVERHEAD_BYTES);
+        let out = crate::io_alloc::io_alloc(capacity);
+        assert!(!out.is_null(), "guest verify buffer allocation failed");
+        // A verified payload cannot exceed its signed preimage. The overhead
+        // covers the Borsh result tag and vector length (or encoded error).
+        let written = verify(
+            signed_bytes.as_ptr() as u32, signed_bytes.len() as u32,
+            signature.as_ptr() as u32, signature.len() as u32,
+            signer.0.as_ptr() as u32, out as u32, capacity as u32,
+        ) as usize;
+        debug_assert!(written <= capacity);
+        let bytes = core::slice::from_raw_parts(out, written).to_vec();
+        crate::io_alloc::io_dealloc(out, capacity);
+        borsh::from_slice(&bytes).expect("host verify result decode failed")
     })
 }
 

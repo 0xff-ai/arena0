@@ -146,7 +146,7 @@ fn proposal_id<T: BorshSerialize>(version: u32, value: &T) -> Result<ProposalId,
     preimage.extend_from_slice(&encoded);
     Ok(ProposalId {
         version,
-        hash: *blake3::hash(&preimage).as_bytes(),
+        hash: arena0::hash(&preimage),
     })
 }
 

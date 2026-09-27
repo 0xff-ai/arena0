@@ -263,9 +263,7 @@ name = "arena0-primitives"
 version = "0.1.0"
 dependencies = [
  "arena0-sdk",
- "blake3",
  "borsh",
- "rand_chacha 0.3.1",
  "serde",
  "thiserror 2.0.18",
 ]
@@ -336,14 +334,10 @@ dependencies = [
  "arena0-program",
  "arena0-protocol",
  "arena0-sdk-macros",
- "blake3",
  "borsh",
- "ed25519-dalek",
  "schemars",
  "serde",
  "serde_json",
- "sha2",
- "tiny-keccak",
 ]
 
 [[package]]

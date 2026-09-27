@@ -14,8 +14,6 @@ ignored = ["arena0-sdk", "serde"]
 arena0-sdk = { path = "../arena0-sdk", version = "0.1.0" }
 serde.workspace = true
 borsh.workspace = true
-blake3.workspace = true
-rand_chacha.workspace = true
 thiserror.workspace = true
 
 [features]
