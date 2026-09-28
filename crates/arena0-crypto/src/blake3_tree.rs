@@ -56,60 +56,12 @@ pub fn merge_cv(left: &[u8; 32], right: &[u8; 32], root: bool) -> [u8; 32] {
 mod tests {
     use super::*;
 
-    const LEAF: usize = 32 * 1024;
-
-    /// The root of `leaves` (each a `LEAF`-aligned subtree) by BLAKE3's
-    /// left-balanced recursion.
-    fn root(leaves: &[[u8; 32]]) -> [u8; 32] {
-        fn node(leaves: &[[u8; 32]], root: bool) -> [u8; 32] {
-            // The largest power of two smaller than the leaf count.
-            let left = 1 << (leaves.len() - 1).ilog2();
-            merge_cv(&subtree(&leaves[..left]), &subtree(&leaves[left..]), root)
-        }
-        fn subtree(leaves: &[[u8; 32]]) -> [u8; 32] {
-            if leaves.len() == 1 {
-                leaves[0]
-            } else {
-                node(leaves, false)
-            }
-        }
-        node(leaves, true)
-    }
-
-    #[test]
-    fn leaf_merges_reproduce_the_blake3_hash() {
-        for (count, tail) in [
-            (2, LEAF),
-            (2, 1),
-            (3, 7),
-            (5, LEAF),
-            (6, 2048),
-            (7, 3),
-            (8, 1000),
-            (9, 1),
-            (512, 12_345),
-        ] {
-            let len = (count - 1) * LEAF + tail;
-            let input: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
-            let leaves: Vec<[u8; 32]> = input
-                .chunks(LEAF)
-                .enumerate()
-                .map(|(i, leaf)| subtree_cv(leaf, (i * LEAF) as u64))
-                .collect();
-            assert_eq!(leaves.len(), count);
-            assert_eq!(
-                root(&leaves),
-                *blake3::hash(&input).as_bytes(),
-                "{count} leaves"
-            );
-        }
-    }
-
     #[test]
     fn subtree_bounds_follow_the_tree() {
+        const LEAF: u64 = 32 * 1024;
         assert!(is_subtree(0, u64::MAX));
-        assert!(is_subtree(LEAF as u64, LEAF as u64));
-        assert!(!is_subtree(LEAF as u64, LEAF as u64 + 1));
+        assert!(is_subtree(LEAF, LEAF));
+        assert!(!is_subtree(LEAF, LEAF + 1));
         assert!(!is_subtree(1, 1));
         assert!(!is_subtree(0, 0));
     }

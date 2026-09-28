@@ -506,37 +506,6 @@ fn scopes_effect_bindings_to_the_declaring_function() {
 }
 
 #[test]
-fn module_shell_decodes_typed_direct_messages() {
-    let item: Item = syn::parse_quote! {
-        pub mod transfer {
-            use arena0::prelude::*;
-            #[arena0::state(max = 256)]
-            pub struct Shared { round: u64 }
-            fn on_direct(ctx: &mut LocalContext, from: Participant,
-                msg: TransferMessage, attachment: Option<Attachment>) -> Result<(), ProgramFault> {
-                Ok(())
-            }
-        }
-    };
-    let expanded = expand_arena0_program_item(args(), item)
-        .unwrap()
-        .to_string();
-    assert!(expanded.contains("let msg : TransferMessage"), "{expanded}");
-    assert!(
-        expanded.contains(":: arena0 :: borsh :: from_slice (& msg)"),
-        "{expanded}"
-    );
-    assert!(
-        expanded.contains("direct message decode failed"),
-        "{expanded}"
-    );
-    assert!(
-        expanded.contains("self :: on_direct (ctx , from , msg , attachment)"),
-        "{expanded}"
-    );
-}
-
-#[test]
 fn module_shell_rejects_an_on_direct_with_the_wrong_arity() {
     for parameters in [
         quote::quote! { ctx: &mut LocalContext },

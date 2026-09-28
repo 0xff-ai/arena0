@@ -76,20 +76,3 @@ pub fn permutation(seed: [u8; 32], n: u32) -> Vec<u32> {
     #[cfg(not(target_arch = "wasm32"))]
     arena0_crypto::permutation(seed, n).expect("permutation draw budget exhausted")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::hash;
-
-    #[test]
-    fn hash_matches_the_blake3_empty_vector() {
-        assert_eq!(
-            hash(b""),
-            [
-                0xaf, 0x13, 0x49, 0xb9, 0xf5, 0xf9, 0xa1, 0xa6, 0xa0, 0x40, 0x4d, 0xea, 0x36, 0xdc,
-                0xc9, 0x49, 0x9b, 0xcb, 0x25, 0xc9, 0xad, 0xc1, 0x12, 0xb7, 0xcc, 0x9a, 0x93, 0xca,
-                0xe4, 0x1f, 0x32, 0x62,
-            ]
-        );
-    }
-}

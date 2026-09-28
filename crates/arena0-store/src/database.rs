@@ -45,12 +45,16 @@ impl Database {
         let connection = Connection::open(&config.path)?;
         configure_connection(&connection, config.busy_timeout)?;
         initialize_schema(&connection)?;
+        // Use the full database filename, including its extension. The owner
+        // lock and the sweep must cover exactly the same store's files.
+        let mut blob_dir = config.path.as_os_str().to_os_string();
+        blob_dir.push(".blobs");
         let mut database = Self {
             connection,
             _lock: lock,
             host_id: config.host_id,
             transaction_poison: None,
-            blob_dir: config.path.parent().expect("database parent").join("blobs"),
+            blob_dir: PathBuf::from(blob_dir),
         };
         database.bind_metadata()?;
         database.validate_database()?;

@@ -469,7 +469,7 @@ impl ExecutionActor {
     async fn dispatch_inner(
         &mut self,
         event: Event<Vec<u8>>,
-        source: DispatchSource,
+        mut source: DispatchSource,
         outgoing_len: usize,
     ) -> Result<DispatchOutcome, ExecError> {
         let event_position = self.state.event_position();
@@ -507,12 +507,10 @@ impl ExecutionActor {
                     execution_key: Arc::clone(&self.context.execution_key),
                 }));
             }
-            if let DispatchSource::Direct {
-                attachment: Some(bytes),
-                ..
-            } = &source
+            if let DispatchSource::Direct { attachment, .. } = &mut source
+                && let Some(bytes) = attachment.take()
             {
-                call = call.with_attachment(bytes.clone());
+                call = call.with_attachment(bytes);
             }
             call
         };

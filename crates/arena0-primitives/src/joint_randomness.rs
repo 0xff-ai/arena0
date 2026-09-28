@@ -172,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_or_invalid_bounds_are_rejected() {
+    fn incomplete_round_cannot_seed_or_shuffle() {
         let protocol = CommitReveal::<[u8; 32]>::default();
         assert_eq!(seed(&protocol), None);
         let mut values = [1, 2, 3];

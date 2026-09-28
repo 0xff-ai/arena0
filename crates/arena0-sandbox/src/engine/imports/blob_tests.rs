@@ -13,6 +13,8 @@ use wasmtime::{Config, Engine, Instance, Linker, Module, Store};
 #[derive(Default)]
 pub(crate) struct View {
     pub(crate) granted: Vec<(BlobHash, Vec<u8>)>,
+    // Stored bytes that this execution has no authority to read.
+    pub(crate) ungranted: Vec<(BlobHash, Vec<u8>)>,
     pub(crate) partials: Vec<(BlobHash, u64, Vec<u8>, bool)>,
     // Model a granted file that cannot supply its advertised bytes.
     pub(crate) short_read: bool,
@@ -26,13 +28,14 @@ impl crate::BlobView for View {
             .find(|(h, _)| *h == hash)
             .map(|(_, bytes)| bytes.len() as u64))
     }
-    fn read(&self, hash: BlobHash, range: Range<u64>) -> Result<Option<Vec<u8>>, String> {
+    fn read_granted(&self, hash: BlobHash, range: Range<u64>) -> Result<Option<Vec<u8>>, String> {
         if self.short_read {
             return Ok(None);
         }
         Ok(self
             .granted
             .iter()
+            .chain(&self.ungranted)
             .find(|(h, _)| *h == hash)
             .and_then(|(_, bytes)| {
                 bytes
@@ -289,6 +292,7 @@ fn subtree_cv_hashes_granted_blobs_and_the_attachment() {
     let mut f = Fixture::new(
         View {
             granted: vec![(hash, bytes.clone())],
+            ungranted: vec![(BlobHash([8; 32]), bytes.clone())],
             ..View::default()
         },
         Some(bytes.clone()),

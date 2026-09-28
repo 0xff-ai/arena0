@@ -42,7 +42,9 @@ use lock::{
     OwnerLock, acquire_process_lock, configure_connection, initialize_schema, prepare_database_file,
 };
 
-const SCHEMA_VERSION: u64 = 9;
+// Version 10 gives each database its own blob directory. Older partial rows
+// reconstruct paths in a shared directory and cannot be reopened under this layout.
+const SCHEMA_VERSION: u64 = 10;
 const ENVELOPE_VERSION: u16 = 2;
 const ENVELOPE_MAGIC: [u8; 8] = *b"AR0STOR1";
 const ENVELOPE_DOMAIN: &[u8] = b"arena0/store-envelope/v2";
@@ -74,6 +76,8 @@ pub struct StoreConfig {
 
 impl StoreConfig {
     /// Bind a store to a database path and the owning Host identity.
+    /// Received files live beside it in `<database filename>.blobs`, so separate
+    /// databases in the same directory never sweep one another's files.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>, host_id: PeerId) -> Self {
         Self {
@@ -911,6 +915,27 @@ impl Drop for Store {
     }
 }
 
+/// Validate the opened descriptor, not a path that could change before open.
+/// A linked file can be replaced after admission; nonblocking open lets us
+/// reject a replacement FIFO without waiting for a writer.
+fn open_blob_file(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "blob is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 impl StoreHandle {
     /// Link a daemon-local file as a blob: canonicalize `path`, stream the file
     /// once through BLAKE3, and record `(hash, length, path)` as a linked blob.
@@ -932,24 +957,8 @@ impl StoreHandle {
                 )
                 .into());
             }
-            let mut options = std::fs::OpenOptions::new();
-            options.read(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                // Opening a FIFO must not wait for a writer before the
-                // descriptor-based regular-file check can reject it.
-                options.custom_flags(libc::O_NONBLOCK);
-            }
-            let mut file = options.open(&path)?;
+            let mut file = open_blob_file(&path)?;
             let metadata = file.metadata()?;
-            if !metadata.is_file() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "blob is not a regular file",
-                )
-                .into());
-            }
             if metadata.len() > arena0_protocol::MAX_BLOB_BYTES {
                 return Err(StoreError::BlobTooLarge {
                     length: metadata.len(),
@@ -999,7 +1008,7 @@ impl StoreHandle {
         };
         tokio::task::spawn_blocking(move || {
             use std::io::Read;
-            let source = std::fs::File::open(path).map_err(|_| StoreError::BlobUnreadable(hash))?;
+            let source = open_blob_file(&path).map_err(|_| StoreError::BlobUnreadable(hash))?;
             let mut output = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -1057,7 +1066,7 @@ impl StoreHandle {
             return Ok(None);
         };
         let read = || -> std::io::Result<Vec<u8>> {
-            let mut file = std::fs::File::open(path)?;
+            let mut file = open_blob_file(&path)?;
             file.seek(SeekFrom::Start(range.start))?;
             let mut bytes =
                 vec![0; usize::try_from(range.end - range.start).expect("blob range fits memory")];
@@ -1104,8 +1113,8 @@ impl StoreHandle {
             (partial, db.received_path(execution_id, hash))
         };
         let mut hasher = blake3::Hasher::new();
-        let read = || -> std::io::Result<()> {
-            let mut file = std::fs::File::open(path)?.take(partial.written);
+        let mut read = || -> std::io::Result<()> {
+            let mut file = open_blob_file(&path)?.take(partial.written);
             // Read only the SQL-committed prefix; failed appends may leave tails.
             let mut buffer = [0; 64 * 1024];
             let mut remaining = partial.written;

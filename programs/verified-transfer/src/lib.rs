@@ -202,7 +202,8 @@ pub enum Phase {
 pub struct Shared {
     #[phase]
     phase: Phase,
-    /// Set by initialization; the transfers are built from it at session start.
+    /// Held until session start resolves participant roles, then discarded;
+    /// the two transfers own the resulting terms.
     params: Option<Params>,
     #[primitive(route = Message::Input)]
     input: transfer::VerifiedTransfer,
@@ -253,11 +254,12 @@ pub mod verified_transfer {
     fn on_session_started(
         ctx: &mut Context<Shared, Local>,
     ) -> Result<arena0::ProgramTransition<VerifiedTransfer>, ProgramFault> {
-        let params = ctx.shared().params.clone().expect("initialized params");
-        let (input, result) = transfers(&params, ctx.ensemble())?;
+        let params = ctx.shared().params.as_ref().expect("initialized params");
+        let (input, result) = transfers(params, ctx.ensemble())?;
         input.start(ctx);
         result.start(ctx);
         ctx.mutate_shared(|shared| {
+            shared.params = None;
             shared.input = input;
             shared.result = result;
         });
@@ -272,15 +274,11 @@ pub mod verified_transfer {
         match transfer_id {
             0 => {
                 let transfer = ctx.shared().input.clone();
-                if let Some(message) = transfer.on_timer(ctx, |local| &mut local.input, timer) {
-                    broadcast(ctx, message, Message::Input);
-                }
+                transfer.on_timer(ctx, |local| &mut local.input, timer);
             }
             1 => {
                 let transfer = ctx.shared().result.clone();
-                if let Some(message) = transfer.on_timer(ctx, |local| &mut local.result, timer) {
-                    broadcast(ctx, message, Message::Result);
-                }
+                transfer.on_timer(ctx, |local| &mut local.result, timer);
             }
             _ => {}
         }

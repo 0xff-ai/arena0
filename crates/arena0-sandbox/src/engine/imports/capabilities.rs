@@ -390,7 +390,10 @@ fn subtree_cv(
     let blob_bytes;
     let bytes = match source {
         CvSource::Blob { hash, start, end } => {
-            let Some(bytes) = view.read(hash, start..end).map_err(wasmtime::Error::msg)? else {
+            let Some(bytes) = view
+                .read_granted(hash, start..end)
+                .map_err(wasmtime::Error::msg)?
+            else {
                 return Ok(blob_status(BlobError::NotFound));
             };
             blob_bytes = bytes;

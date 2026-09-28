@@ -28,7 +28,7 @@ async fn linking_hashes_the_file_in_place() {
     assert_eq!(hash.0, *blake3::hash(&bytes).as_bytes());
     assert_eq!(length, bytes.len() as u64);
     assert_eq!(
-        std::fs::read_dir(directory.path().join("blobs"))
+        std::fs::read_dir(directory.path().join("store.sqlite.blobs"))
             .unwrap()
             .count(),
         0
@@ -117,6 +117,80 @@ async fn linking_hashes_the_file_in_place() {
         assert!(matches!(shared.link_blob(invalid).await,
             Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidInput));
     }
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn replaced_linked_file_cannot_block_export_or_direct_reads() {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreConfig::new(
+        directory.path().join("store.sqlite"),
+        host(9),
+    ))
+    .unwrap();
+    let shared = store.handle();
+    let source = directory.path().join("source");
+    let destination = directory.path().join("export");
+    std::fs::write(&source, b"abc").unwrap();
+    let (hash, _) = shared.link_blob(source.clone()).await.unwrap();
+    std::fs::remove_file(&source).unwrap();
+    let name = std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+    // SAFETY: name is a live, NUL-terminated path for this call.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+
+    for export in [false, true] {
+        let handle = shared.clone();
+        let output_path = destination.clone();
+        let mut task = tokio::spawn(async move {
+            if export {
+                matches!(handle.export_blob(hash, output_path).await,
+                    Err(StoreError::BlobUnreadable(found)) if found == hash)
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    handle
+                        .read_blob_range_blocking(hash, 0..3)
+                        .unwrap()
+                        .is_none()
+                })
+                .await
+                .unwrap()
+            }
+        });
+        match tokio::time::timeout(Duration::from_secs(2), &mut task).await {
+            Ok(result) => assert!(result.unwrap()),
+            Err(_) => {
+                // Release a regressed blocking open/read before failing so
+                // the runtime can join its blocking workers at shutdown.
+                let mut writer = OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&source)
+                    .unwrap();
+                let _ = writer.write_all(b"abc");
+                drop(writer);
+                let _ = task.await;
+                panic!("linked FIFO blocked a blob read (export={export})");
+            }
+        }
+        assert!(!destination.exists());
+    }
+    std::fs::remove_file(&source).unwrap();
+    std::fs::create_dir(&source).unwrap();
+    assert!(
+        shared
+            .read_blob_range_blocking(hash, 0..3)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        matches!(shared.export_blob(hash, destination.clone()).await,
+        Err(StoreError::BlobUnreadable(found)) if found == hash)
+    );
+    assert!(!destination.exists());
     store.shutdown().await.unwrap();
 }
 
@@ -263,12 +337,23 @@ async fn received_blob_is_durable_with_its_transition() {
         shared.blob_granted_blocking(execution_id, hash).unwrap(),
         None
     );
-    let received = directory.path().join("blobs").join(format!(
+    let received = directory.path().join("store.sqlite.blobs").join(format!(
         "recv-{}-{}",
         blake3::Hash::from_bytes(execution_id.0).to_hex(),
         blake3::hash(b"abcdef").to_hex()
     ));
     assert_eq!(std::fs::read(&received).unwrap(), b"abcd");
+    // A database with the same stem must not sweep this store's partial,
+    // whether this store is open or shut down.
+    let other_path = directory.path().join("store.other");
+    let other = Store::open(StoreConfig::new(&other_path, fixture.producer)).unwrap();
+    assert_eq!(
+        shared
+            .hash_blob_partial_blocking(execution_id, hash, b"ef")
+            .unwrap(),
+        hash
+    );
+    other.shutdown().await.unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -277,7 +362,7 @@ async fn received_blob_is_durable_with_its_transition() {
             0o600
         );
         assert_eq!(
-            std::fs::metadata(directory.path().join("blobs"))
+            std::fs::metadata(directory.path().join("store.sqlite.blobs"))
                 .unwrap()
                 .permissions()
                 .mode()
@@ -287,6 +372,8 @@ async fn received_blob_is_durable_with_its_transition() {
     }
     drop(writer);
     store.shutdown().await.unwrap();
+    let other = Store::open(StoreConfig::new(&other_path, fixture.producer)).unwrap();
+    other.shutdown().await.unwrap();
     let store = Store::open(StoreConfig::new(&path, fixture.producer)).unwrap();
     let shared = store.handle();
     assert_eq!(
@@ -440,7 +527,7 @@ async fn failed_transition_leaves_no_partial_and_reopen_sweeps_its_file() {
         None
     );
     assert_eq!(writer.load_execution().await.unwrap().unwrap(), before);
-    let blob_dir = directory.path().join("blobs");
+    let blob_dir = directory.path().join("store.sqlite.blobs");
     let received = blob_dir.join(format!(
         "recv-{}-{}",
         blake3::Hash::from_bytes(execution_id.0).to_hex(),
@@ -513,7 +600,7 @@ async fn bytes_past_written_are_ignored() {
         })
         .await
         .unwrap();
-    let received = directory.path().join("blobs").join(format!(
+    let received = directory.path().join("store.sqlite.blobs").join(format!(
         "recv-{}-{}",
         blake3::Hash::from_bytes(execution_id.0).to_hex(),
         blake3::hash(b"abcdef").to_hex()
@@ -712,7 +799,7 @@ async fn owned_received_content_replaces_a_link() {
             std::fs::remove_file(&linked).unwrap();
         }
     }
-    let blob_dir = directory.path().join("blobs");
+    let blob_dir = directory.path().join("store.sqlite.blobs");
     let first_received = blob_dir.join(format!(
         "recv-{}-{}",
         blake3::Hash::from_bytes(first_id.0).to_hex(),

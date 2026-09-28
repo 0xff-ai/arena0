@@ -13,10 +13,12 @@ use std::ops::Range;
 pub trait BlobView: Send + Sync {
     /// The length of `hash` if it is granted to this execution.
     fn granted(&self, hash: BlobHash) -> Result<Option<u64>, String>;
-    /// Bytes `range` of granted blob `hash`, read from its file. `Ok(None)` when
-    /// the blob is not granted or its file cannot supply the whole range
-    /// (missing, unreadable, or shorter than `range.end`).
-    fn read(&self, hash: BlobHash, range: Range<u64>) -> Result<Option<Vec<u8>>, String>;
+    /// Bytes `range` of blob `hash`, after the caller has checked [`Self::granted`]
+    /// and bounded the range by that length. This method does not recheck the
+    /// grant. Grants remain valid for the duration of a dispatch.
+    /// `Ok(None)` when the file cannot supply the whole range (missing,
+    /// unreadable, or shorter than `range.end`).
+    fn read_granted(&self, hash: BlobHash, range: Range<u64>) -> Result<Option<Vec<u8>>, String>;
     /// This execution's partial object for `hash`, if it received any of it.
     fn partial(&self, hash: BlobHash) -> Result<Option<BlobPartial>, String>;
     /// BLAKE3 of the partial's durable bytes `[0, written)` followed by `tail`.

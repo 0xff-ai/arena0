@@ -44,9 +44,8 @@ pub(super) enum Sent {
     Direct { seq: u64 },
 }
 
-// Preparation failures retain the direct coordinate without pretending to be
-// transport failures. Only InvalidState (a missing source) discards the entry.
-pub(super) type SendTaskResult = Result<SendResult, (PeerId, u64, ExecError)>;
+// Preparation failures retain the peer so settlement can release its send lane.
+pub(super) type SendTaskResult = Result<SendResult, (PeerId, ExecError)>;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Pick {
@@ -343,7 +342,7 @@ impl ExecutionActor {
                             })
                         }
                         .await;
-                        prepared.map_err(|error| (peer, seq, error))?
+                        prepared.map_err(|error| (peer, error))?
                     }
                 };
                 // The task owns the attachment bytes only until send settlement.
@@ -382,18 +381,9 @@ impl ExecutionActor {
     pub(super) async fn settle_send(&mut self, result: SendTaskResult) -> Result<(), ExecError> {
         let result = match result {
             Ok(result) => result,
-            Err((peer, seq, error)) => {
+            Err((peer, error)) => {
                 self.send_lanes.entry(peer).or_default().busy = false;
-                if !matches!(error, ExecError::InvalidState(_)) {
-                    return Err(error);
-                }
-                tracing::warn!(exec_id = %self.context.exec_id, %peer, seq, %error,
-                    "dropping direct entry with missing blob source");
-                let mut next = self.state.clone();
-                if next.ack_direct(peer, seq)? {
-                    self.persist(next, Change::State).await?;
-                }
-                return Ok(());
+                return Err(error);
             }
         };
         let SendResult {

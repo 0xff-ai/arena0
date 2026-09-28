@@ -16,10 +16,7 @@ impl arena0_sandbox::BlobView for StoreBlobView {
             .map_err(|error| error.to_string())
     }
 
-    fn read(&self, hash: BlobHash, range: Range<u64>) -> Result<Option<Vec<u8>>, String> {
-        if self.granted(hash)?.is_none() {
-            return Ok(None);
-        }
+    fn read_granted(&self, hash: BlobHash, range: Range<u64>) -> Result<Option<Vec<u8>>, String> {
         self.store
             .read_blob_range_blocking(hash, range)
             .map_err(|error| error.to_string())

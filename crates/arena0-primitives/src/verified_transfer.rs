@@ -164,22 +164,20 @@ impl VerifiedTransfer {
     }
 
     /// The sender's Send timer sends step 0 (the first `Leaves` batch), or
-    /// `Missing` when its Host cannot read the object. Returns the receiver's
-    /// agreed message to broadcast, which is always `None` here.
+    /// `Missing` when its Host cannot read the object.
     pub fn on_timer<S, L>(
         &self,
         ctx: &mut LocalContext<S, L>,
         local: fn(&mut L) -> &mut VerifiedTransferLocal,
         timer: TransferTimer,
-    ) -> Option<TransferMessage> {
+    ) {
         let TransferTimer::Send { transfer_id } = timer;
         if transfer_id != self.id || self.status.is_some() {
-            return None;
+            return;
         }
         if ctx.me() == self.sender {
             self.send_step(ctx, local, 0);
         }
-        None
     }
 
     /// Apply one direct message. Returns the receiver's agreed message to
@@ -438,8 +436,24 @@ mod tests {
 
     #[test]
     fn root_matches_blake3_for_left_balanced_trees() {
-        for count in [2, 3, 5, 6, 7, 8, 9, 64, 512] {
-            let bytes: Vec<u8> = (0..(count - 1) * LEAF_BYTES as usize + 137)
+        // Exercise the production assembly, including full and short final
+        // leaves. The whole-file hash is independent of that assembly.
+        for (count, tail) in [2, 3, 5, 6, 7, 8, 9, 64, 512]
+            .map(|count| (count, 137))
+            .into_iter()
+            .chain([
+                (2, LEAF_BYTES as usize),
+                (2, 1),
+                (3, 7),
+                (5, LEAF_BYTES as usize),
+                (6, 2048),
+                (7, 3),
+                (8, 1000),
+                (9, 1),
+                (512, 12_345),
+            ])
+        {
+            let bytes: Vec<u8> = (0..(count - 1) * LEAF_BYTES as usize + tail)
                 .map(|i| (i % 251) as u8)
                 .collect();
             let leaves: Vec<_> = bytes

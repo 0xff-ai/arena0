@@ -72,7 +72,8 @@ pub enum Effect {
     },
     /// Queue one point-to-point message to `to`, outside agreement. Only local
     /// handlers may emit it. `range`, when present, names an object range the
-    /// Host Bao-encodes from its immutable source when it sends the frame.
+    /// Host reads when it sends the frame. An unavailable range is delivered
+    /// without an attachment; the receiving program decides how to handle it.
     SendDirect {
         to: PeerId,
         #[borsh(

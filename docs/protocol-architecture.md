@@ -628,8 +628,13 @@ latency is not bounded by fuel. Blob operations are staged during the dispatch
 and saved as `BlobChange`s in its `TransitionRecord`: appended bytes are written
 at their offset and synced before the transition commits, so received bytes are
 durable exactly when their transition is, and a rejected dispatch leaves
-none. Bytes past a partial's recorded length are never read. At open the store
-deletes received files that no blob or unfinished partial names.
+none. Bytes past a partial's recorded length are never read. Each database owns
+the adjacent `<database filename>.blobs` directory. At open it sweeps only that
+directory, deleting received files that no blob or unfinished partial names.
+Separate databases in one parent directory therefore have separate cleanup
+ownership. Linked sources are reopened nonblocking and checked through the
+opened descriptor on every read; replacing a source with a FIFO cannot block
+the regular-file check.
 
 ### Direct messages
 
@@ -786,7 +791,7 @@ bytes. A stopped result includes the exact `StopCause`, preserving the
 distinction between an authenticated unilateral report and a shared N-of-N
 stop. Verification does not execute Wasm and stops at these checks.
 
-This release uses store schema version 8 and rejects earlier databases with an
+This release uses store schema version 10 and rejects earlier databases with an
 unsupported-schema error. It does not rewrite or delete old evidence. Version-1
 producer-sealed receipts are also rejected; they must be inspected with the
 matching older release. Automatic migration is not provided.
