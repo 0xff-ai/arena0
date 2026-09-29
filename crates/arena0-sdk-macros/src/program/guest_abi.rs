@@ -1,0 +1,548 @@
+//! Resident-compatible guest ABI emission for module-shell programs.
+//!
+//! This module owns only the generated ABI exports and their state restoration
+//! helpers. Associated-type defaults and handler extraction stay in the module
+//! shell expansion.
+
+use proc_macro2::TokenStream as TokenStream2;
+use quote::quote;
+use syn::Type;
+
+pub(super) struct GuestAbi {
+    pub(super) program_impl: TokenStream2,
+    pub(super) view_impl: TokenStream2,
+    pub(super) program_ty: Box<Type>,
+    pub(super) shared_ty: Type,
+    pub(super) local_ty: Type,
+    pub(super) callout_ty: Type,
+    pub(super) message_ty: Type,
+    pub(super) params_ty: Type,
+    pub(super) outcome_ty: Type,
+    pub(super) query_ty: Type,
+    pub(super) name: syn::LitStr,
+    pub(super) version: syn::LitStr,
+    pub(super) description: syn::LitStr,
+    pub(super) display_name: syn::LitStr,
+    pub(super) participants: TokenStream2,
+    pub(super) capabilities: TokenStream2,
+    pub(super) inferred_effect_capability_tokens: Vec<TokenStream2>,
+}
+
+pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
+    let GuestAbi {
+        program_impl,
+        view_impl,
+        program_ty,
+        shared_ty,
+        local_ty,
+        callout_ty,
+        message_ty,
+        params_ty,
+        outcome_ty,
+        query_ty,
+        name,
+        version,
+        description,
+        display_name,
+        participants,
+        capabilities,
+        inferred_effect_capability_tokens,
+    } = input;
+
+    quote! {
+        #program_impl
+        #view_impl
+
+        #[cfg(target_arch = "wasm32")]
+        const _: () = {
+        const __ARENA0_STATE_MAX: usize = <#shared_ty as ::arena0::SharedState>::STATE_MAX;
+
+        fn __arena0_pack(ptr: i32, len: i32) -> i64 {
+            ((ptr as i64) << 32) | ((len as i64) & 0xFFFF_FFFF)
+        }
+
+        /// Copy `bytes` into a fresh guest allocation and pack its pointer
+        /// and length for the host.
+        fn __arena0_write_bytes(bytes: &[u8], what: &str) -> i64 {
+            if bytes.is_empty() {
+                return __arena0_pack(0, 0);
+            }
+            let len = ::core::convert::TryFrom::try_from(bytes.len())
+                .unwrap_or_else(|_| panic!("{what} length overflows i32"));
+            // SAFETY: the guest allocator owns the returned linear-memory
+            // range until the host reads and deallocates it.
+            let ptr = unsafe { arena0_alloc(len) };
+            assert!(ptr > 0, "{what} allocation failed");
+            unsafe {
+                ::core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+            }
+            __arena0_pack(ptr, len)
+        }
+
+        fn __arena0_write_result<T: ::arena0::borsh::BorshSerialize>(result: &T) -> i64 {
+            let bytes = ::arena0::borsh::to_vec(result)
+                .expect("guest call result serialization failed");
+            assert!(
+                bytes.len() <= ::arena0::MAX_CALL_ENVELOPE_BYTES as usize,
+                "guest call result exceeds ABI envelope bound"
+            );
+            __arena0_write_bytes(&bytes, "guest result")
+        }
+
+        fn __arena0_read_input<T: ::arena0::borsh::BorshDeserialize>(ptr: i32, len: i32) -> T {
+            assert!(ptr >= 0 && len >= 0, "negative guest input pointer or length");
+            assert!(
+                (len as usize) <= ::arena0::MAX_CALL_ENVELOPE_BYTES as usize,
+                "guest input envelope exceeds ABI bound"
+            );
+            // SAFETY: the host writes one bounded call-specific envelope before
+            // invoking the export; its decoder checks every variable prefix.
+            let bytes = unsafe {
+                ::core::slice::from_raw_parts(ptr as *const u8, len as usize)
+            };
+            ::arena0::borsh::from_slice(bytes).expect("guest call input deserialization failed")
+        }
+
+        fn __arena0_serialize_shared(shared: &#shared_ty) -> ::std::vec::Vec<u8> {
+            let bytes = ::arena0::borsh::to_vec(shared)
+                .expect("shared state serialization failed");
+            assert!(
+                bytes.len() <= __ARENA0_STATE_MAX,
+                "shared state exceeds STATE_MAX"
+            );
+            bytes
+        }
+
+        fn __arena0_serialize_local(local: &#local_ty) -> ::std::vec::Vec<u8> {
+            let bytes = ::arena0::borsh::to_vec(local)
+                .expect("local state serialization failed");
+            assert!(
+                bytes.len() <= ::arena0::MAX_LOCAL_STATE_BYTES as usize,
+                "local state exceeds the ABI state bound"
+            );
+            bytes
+        }
+
+        /// Read one host state memory after checking its length against `max`.
+        fn __arena0_read_state(kind: u32, max: usize, too_large: &str) -> ::std::vec::Vec<u8> {
+            let len = ::arena0::__host_state_len(kind);
+            assert!(len <= max, "{too_large}");
+            let mut bytes = ::std::vec![0u8; len];
+            ::arena0::__host_state_read(kind, &mut bytes);
+            bytes
+        }
+
+        fn __arena0_load_shared_bytes() -> ::std::vec::Vec<u8> {
+            __arena0_read_state(
+                ::arena0::__STATE_KIND_SHARED,
+                __ARENA0_STATE_MAX,
+                "shared state exceeds STATE_MAX",
+            )
+        }
+
+        fn __arena0_decode_shared(bytes: &[u8]) -> #shared_ty {
+            ::arena0::borsh::from_slice(bytes).expect("shared state deserialization failed")
+        }
+
+        fn __arena0_restore_shared(bytes: &::arena0::SharedStateBytes) -> #shared_ty {
+            __arena0_decode_shared(bytes.as_bytes())
+        }
+
+        fn __arena0_load_local() -> #local_ty {
+            let bytes = __arena0_read_state(
+                ::arena0::__STATE_KIND_LOCAL,
+                ::arena0::MAX_LOCAL_STATE_BYTES as usize,
+                "local state exceeds the ABI state bound",
+            );
+            ::arena0::borsh::from_slice(&bytes).expect("local state deserialization failed")
+        }
+
+        fn __arena0_store_parts(shared: &#shared_ty, local: &#local_ty) {
+            let shared = __arena0_serialize_shared(shared);
+            let local = __arena0_serialize_local(local);
+            ::arena0::__host_state_write(::arena0::__STATE_KIND_SHARED, &shared);
+            ::arena0::__host_state_write(::arena0::__STATE_KIND_LOCAL, &local);
+        }
+
+        /// Whether a local handler left the typed shared image unchanged.
+        ///
+        /// Compares serialized bytes, so an interior-mutable shared DTO is
+        /// caught too.
+        fn __arena0_local_shared_changed(
+            ctx: &::arena0::LocalContext<#shared_ty, #local_ty>,
+            original: &[u8],
+        ) -> bool {
+            ::arena0::borsh::to_vec(ctx.shared())
+                .map(|bytes| bytes != original)
+                .unwrap_or(true)
+        }
+
+        /// The outcome of an accepted local handler: reject if it changed the
+        /// typed shared image, otherwise accept. A rejection derives no callout
+        /// and stores neither image.
+        fn __arena0_local_outcome(
+            ctx: &::arena0::LocalContext<#shared_ty, #local_ty>,
+            original: &[u8],
+        ) -> (::arena0::CallStatus, ::core::option::Option<::std::string::String>) {
+            if __arena0_local_shared_changed(ctx, original) {
+                (
+                    ::arena0::CallStatus::Rejected,
+                    Some(::std::string::String::from(
+                        "a local handler changed the agreed shared state",
+                    )),
+                )
+            } else {
+                (::arena0::CallStatus::Accepted, None)
+            }
+        }
+
+        /// Write back the original shared bytes a local dispatch received and
+        /// the accepted local image.
+        fn __arena0_store_local(shared: &[u8], local: &#local_ty) {
+            let local = __arena0_serialize_local(local);
+            ::arena0::__host_state_write(::arena0::__STATE_KIND_SHARED, shared);
+            ::arena0::__host_state_write(::arena0::__STATE_KIND_LOCAL, &local);
+        }
+
+        /// The handler context for one accepted dispatch. A local handler owns
+        /// a read-only [`LocalContext`](::arena0::LocalContext); an agreed
+        /// handler owns a mutable [`Context`](::arena0::Context). A local arm
+        /// also carries the original shared bytes to write back unchanged.
+        enum __Arena0Dispatch {
+            Agreed(::arena0::Context<#shared_ty, #local_ty>),
+            Local(::arena0::LocalContext<#shared_ty, #local_ty>, ::std::vec::Vec<u8>),
+        }
+
+        /// Build the handler context of mode `M` for one dispatch from the
+        /// decoded shared image, the durable local image, and the committed
+        /// session. `new` is the mode's unsafe constructor; this is the
+        /// generated dispatch glue that meets its precondition.
+        fn __arena0_make_ctx<M: ::arena0::Mode>(
+            input: &::arena0::DispatchInput,
+            shared: #shared_ty,
+            new: unsafe fn(
+                #shared_ty,
+                #local_ty,
+                ::arena0::types::PeerId,
+            ) -> ::arena0::Ctx<#shared_ty, #local_ty, M>,
+        ) -> ::arena0::Ctx<#shared_ty, #local_ty, M> {
+            let peer_id = ::arena0::types::PeerId(input.peer_id);
+            let session: ::arena0::Ensemble<::arena0::Committed> =
+                ::arena0::borsh::from_slice(&input.session)
+                    .expect("session context deserialization failed");
+            let participant = session
+                .participant_of(&peer_id)
+                .expect("local peer is not in the committed ensemble");
+            // SAFETY: this is the generated dispatch glue; the images are the
+            // Host's committed shared image and the durable local image.
+            let mut ctx = unsafe { new(shared, __arena0_load_local(), peer_id) };
+            ctx.__set_participant(participant);
+            if let Some(remote) = session.others(&peer_id).next() {
+                ctx.__set_remote_peer(remote);
+            }
+            ctx.__set_committed_ensemble(session);
+            ctx
+        }
+
+        fn __arena0_make_agreed_ctx(
+            input: &::arena0::DispatchInput,
+        ) -> ::arena0::Context<#shared_ty, #local_ty> {
+            let shared = __arena0_decode_shared(&__arena0_load_shared_bytes());
+            __arena0_make_ctx(input, shared, ::arena0::Context::<#shared_ty, #local_ty>::__new)
+        }
+
+        /// A local context and the shared bytes it was decoded from, read
+        /// from the Host once; the bytes are written back unchanged.
+        fn __arena0_make_local_ctx(
+            input: &::arena0::DispatchInput,
+        ) -> (::arena0::LocalContext<#shared_ty, #local_ty>, ::std::vec::Vec<u8>) {
+            let shared_bytes = __arena0_load_shared_bytes();
+            let shared = __arena0_decode_shared(&shared_bytes);
+            (
+                __arena0_make_ctx(input, shared, ::arena0::LocalContext::<#shared_ty, #local_ty>::__new),
+                shared_bytes,
+            )
+        }
+
+        #[unsafe(no_mangle)]
+        pub static arena0_abi_version: i32 = ::arena0::ABI_VERSION as i32;
+
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn arena0_alloc(len: i32) -> i32 {
+            if len <= 0 {
+                return 0;
+            }
+            ::arena0::io_alloc::io_alloc(len as usize) as i32
+        }
+
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn arena0_dealloc(ptr: i32, len: i32) {
+            if ptr == 0 || len <= 0 {
+                return;
+            }
+            // SAFETY: `ptr` and `len` are the unchanged pair returned by
+            // `arena0_alloc`, and the Host releases each ABI buffer once.
+            unsafe {
+                ::arena0::io_alloc::io_dealloc(ptr as *mut u8, len as usize);
+            }
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn arena0_prepare() -> i32 {
+            ::arena0::__prepare_allocator() as i32
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn arena0_initialize(input_ptr: i32, input_len: i32) -> i64 {
+            let input: ::arena0::InitInput = __arena0_read_input(input_ptr, input_len);
+            let mut shared = <#shared_ty as ::core::default::Default>::default();
+            let params: #params_ty = ::arena0::serde_json::from_slice(&input.params)
+                .expect("params deserialization failed");
+            match <#program_ty as ::arena0::Program>::initialize(&mut shared, params) {
+                Ok(()) => {}
+                Err(::arena0::ProgramFault(error)) => {
+                    // Initialization is state-only. The host does not link
+                    // effect imports for this call, so a fault traps here.
+                    panic!("program initialization failed: {error:#}");
+                }
+            }
+            let local = <#local_ty as ::core::default::Default>::default();
+            let shared = ::arena0::SharedStateBytes::try_from(__arena0_serialize_shared(&shared))
+                .expect("initialized shared state exceeds ABI bound");
+            let local = ::arena0::LocalStateBytes::try_from(__arena0_serialize_local(&local))
+                .expect("initialized local state exceeds ABI bound");
+            __arena0_write_result(&::arena0::InitializedState {
+                shared,
+                local,
+            })
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn arena0_dispatch(input_ptr: i32, input_len: i32) -> i64 {
+            let input: ::arena0::DispatchInput = __arena0_read_input(input_ptr, input_len);
+            let raw_event: ::arena0::Event = ::arena0::borsh::from_slice(&input.event)
+                .expect("dispatch event deserialization failed");
+            let (ctx, status, reason) = match raw_event {
+                ::arena0::Event::SessionStarted { ensemble } => {
+                    // The dispatch session is the committed ensemble the
+                    // event carries; the context already holds it.
+                    let mut ctx = __arena0_make_agreed_ctx(&input);
+                    let outcome = match <#program_ty as ::arena0::Program>::on_session_started(
+                        &mut ctx,
+                        &ensemble,
+                    ) {
+                        Ok(transition) => {
+                            ctx.__apply_transition::<#program_ty>(transition);
+                            (::arena0::CallStatus::Accepted, None)
+                        }
+                        Err(::arena0::ProgramFault(error)) => {
+                            panic!("session-start handler failed: {error:#}");
+                        }
+                    };
+                    (__Arena0Dispatch::Agreed(ctx), outcome.0, outcome.1)
+                }
+                ::arena0::Event::MessageReceived { from, msg } => {
+                    let mut ctx = __arena0_make_agreed_ctx(&input);
+                    let typed_msg: #message_ty = ::arena0::borsh::from_slice(&msg)
+                        .expect("message deserialization failed");
+                    let from = ctx.participant_for_peer(from);
+                    let outcome = match <#program_ty as ::arena0::Program>::on_message(
+                        &mut ctx,
+                        from,
+                        typed_msg,
+                    ) {
+                        Ok(::arena0::ApplyDecision::Accept(transition)) => {
+                            ctx.__apply_transition::<#program_ty>(transition);
+                            (::arena0::CallStatus::Accepted, None)
+                        }
+                        Ok(::arena0::ApplyDecision::Reject) => {
+                            (::arena0::CallStatus::Rejected, None)
+                        }
+                        Err(error) => panic!("message handler failed: {error}"),
+                    };
+                    (__Arena0Dispatch::Agreed(ctx), outcome.0, outcome.1)
+                }
+                ::arena0::Event::InputReceived {
+                    callout_index,
+                    data,
+                } => {
+                    let (mut local_ctx, shared_bytes) = __arena0_make_local_ctx(&input);
+                    let outcome = match <#callout_ty as ::arena0::Arena0Callout>::from_raw(
+                        callout_index,
+                        data,
+                    ) {
+                        Ok(input) => {
+                            match <#program_ty as ::arena0::Program>::on_input(
+                                &mut local_ctx,
+                                input,
+                            ) {
+                                Ok(()) => __arena0_local_outcome(&local_ctx, &shared_bytes),
+                                Err(error) => (
+                                    ::arena0::CallStatus::Rejected,
+                                    Some(::arena0::__truncate_rejection_reason(&error)),
+                                ),
+                            }
+                        }
+                        Err(error) => (
+                            ::arena0::CallStatus::Rejected,
+                            Some(::arena0::__truncate_rejection_reason(&error)),
+                        ),
+                    };
+                    (
+                        __Arena0Dispatch::Local(local_ctx, shared_bytes),
+                        outcome.0,
+                        outcome.1,
+                    )
+                }
+                ::arena0::Event::TimerFired { timer } => {
+                    let (mut local_ctx, shared_bytes) = __arena0_make_local_ctx(&input);
+                    let outcome = match <#program_ty as ::arena0::Program>::on_timer(
+                        &mut local_ctx,
+                        timer,
+                    ) {
+                        Ok(()) => __arena0_local_outcome(&local_ctx, &shared_bytes),
+                        Err(::arena0::ProgramFault(error)) => {
+                            panic!("timer handler failed: {error:#}");
+                        }
+                    };
+                    (
+                        __Arena0Dispatch::Local(local_ctx, shared_bytes),
+                        outcome.0,
+                        outcome.1,
+                    )
+                }
+            };
+            let (ctx, local_shared) = match ctx {
+                __Arena0Dispatch::Agreed(ctx) => (ctx.__read(), None),
+                __Arena0Dispatch::Local(ctx, shared_bytes) => (ctx.__read(), Some(shared_bytes)),
+            };
+            let callout = if status == ::arena0::CallStatus::Accepted {
+                <#program_ty as ::arena0::Program>::callout(&ctx).map(|callout| {
+                    let context = ::arena0::serde_json::to_vec(&callout)
+                        .expect("callout context serialization failed");
+                    ::arena0::CalloutRequest {
+                        callout_index: ::arena0::Arena0CalloutRequest::callout_index(&callout),
+                        context,
+                    }
+                })
+            } else {
+                None
+            };
+            if status == ::arena0::CallStatus::Accepted {
+                let (shared, local) = ctx.__into_parts();
+                match local_shared {
+                    None => __arena0_store_parts(&shared, &local),
+                    // A local dispatch still writes back the original shared
+                    // bytes, never the context's shared value.
+                    Some(shared_bytes) => __arena0_store_local(&shared_bytes, &local),
+                }
+            }
+            __arena0_write_result(&::arena0::DispatchOutput {
+                status,
+                reason,
+                callout,
+            })
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn arena0_query(input_ptr: i32, input_len: i32) -> i64 {
+            let input: ::arena0::QueryInput = __arena0_read_input(input_ptr, input_len);
+            let query: #query_ty = ::arena0::serde_json::from_slice(&input.query)
+                .expect("query deserialization failed");
+            let shared = __arena0_restore_shared(&input.shared);
+            let ensemble: ::arena0::Ensemble<::arena0::Committed> =
+                ::arena0::borsh::from_slice(&input.session)
+                    .expect("query session context deserialization failed");
+            let response = <#program_ty as ::arena0::ProgramQuery>::query(
+                &shared,
+                &ensemble,
+                query,
+            );
+            let json = ::arena0::serde_json::to_vec(&response)
+                .expect("query response serialization failed");
+            __arena0_write_result(&::arena0::QueryOutput {
+                query_index: input.query_index,
+                json,
+            })
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn arena0_view(input_ptr: i32, input_len: i32) -> i64 {
+            let input: ::arena0::ViewInput = __arena0_read_input(input_ptr, input_len);
+            let viewport: ::arena0::Viewport = ::arena0::serde_json::from_slice(&input.viewport)
+                .expect("viewport deserialization failed");
+            let shared = __arena0_restore_shared(&input.shared);
+            let ensemble: ::arena0::Ensemble<::arena0::Committed> =
+                ::arena0::borsh::from_slice(&input.session)
+                    .expect("view session context deserialization failed");
+            let view = <#program_ty as ::arena0::ProgramView>::view(
+                &shared,
+                &ensemble,
+                &viewport,
+            );
+            let json = ::arena0::serde_json::to_vec(&view)
+                .expect("view serialization failed");
+            __arena0_write_result(&::arena0::ViewOutput { json })
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn arena0_writer(input_ptr: i32, input_len: i32) -> i64 {
+            let input: ::arena0::WriterInput = __arena0_read_input(input_ptr, input_len);
+            let shared = __arena0_restore_shared(&input.shared);
+            let participant = <#program_ty as ::arena0::Program>::writer(&shared)
+                .map(::arena0::Participant::as_u8);
+            __arena0_write_result(&::arena0::WriterOutput { participant })
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn arena0_outcome(input_ptr: i32, input_len: i32) -> i64 {
+            let input: ::arena0::OutcomeInput = __arena0_read_input(input_ptr, input_len);
+            let shared = __arena0_restore_shared(&input.shared);
+            let outcome = <#program_ty as ::arena0::Program>::outcome(&shared);
+            let borsh = ::arena0::borsh::to_vec(&outcome)
+                .expect("outcome Borsh serialization failed");
+            let json = ::arena0::serde_json::to_vec(&outcome)
+                .expect("outcome serialization failed");
+            __arena0_write_result(&::arena0::OutcomeOutput { borsh, json })
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn arena0_metadata() -> i64 {
+            let declared_capabilities: ::std::vec::Vec<::arena0::Capability> =
+                ::arena0::__arena0_capability_vec!(#capabilities);
+            let mut capabilities = ::arena0::CapabilitySet::new();
+            capabilities.extend(declared_capabilities);
+            #(
+                capabilities.insert(#inferred_effect_capability_tokens);
+            )*
+            capabilities.extend(<#shared_ty as ::arena0::SharedState>::__required_capabilities());
+            let metadata = ::arena0::ProgramMetadata {
+                name: #name.into(),
+                version: #version.into(),
+                description: #description.into(),
+                author: None,
+                capabilities: capabilities.into_vec(),
+                display_name: #display_name.into(),
+                participants: #participants,
+            };
+            let schema = ::arena0::ProgramSchema {
+                state: ::arena0::StateSchema {
+                    schema: <#shared_ty as ::arena0::ProgramValue>::json_schema(),
+                    max_bytes: <#shared_ty as ::arena0::SharedState>::STATE_MAX as u32,
+                },
+                callouts: <#callout_ty as ::arena0::Arena0Callout>::schemas(),
+                messages: ::std::vec![::arena0::MessageSchema {
+                    borsh: ::arena0::BorshSchemaDocument::for_type::<#message_ty>(),
+                }],
+                params: <#params_ty as ::arena0::ProgramValue>::json_schema(),
+                queries: <#query_ty as ::arena0::Arena0Query>::schemas(),
+                outcome: <#outcome_ty as ::arena0::ProgramValue>::json_schema(),
+            };
+            let bytes = ::arena0::ProgramDefinition { metadata, schema }
+                .encode()
+                .expect("metadata serialization failed");
+            __arena0_write_bytes(&bytes, "metadata")
+        }
+        };
+    }
+}

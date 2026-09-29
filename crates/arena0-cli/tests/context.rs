@@ -53,6 +53,41 @@ fn invoke(home: &Path, args: &[&str], environment: &[(&str, &str)]) -> Output {
         .unwrap_or_else(|error| panic!("run arena0 {args:?}: {error}"))
 }
 
+fn invoke_with_timeout(
+    home: &Path,
+    args: &[&str],
+    environment: &[(&str, &str)],
+    timeout: Duration,
+) -> Output {
+    let mut command = base_command(env!("CARGO_BIN_EXE_arena0"), home);
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let mut child = command.spawn().expect("spawn arena0 CLI");
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().expect("poll arena0 CLI").is_some() {
+            return child.wait_with_output().expect("collect arena0 CLI output");
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .expect("collect timed out CLI output");
+            panic!(
+                "arena0 {args:?} did not finish within {timeout:?}; stdout: {}; stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn json_output(output: Output, invocation: &str) -> serde_json::Value {
     assert!(
         output.status.success(),
@@ -135,22 +170,40 @@ fn host_count(home: &Path) -> usize {
         .len()
 }
 
-fn assert_context_host_routing(
+fn assert_context_host_operations(
     home: &Path,
     context: &str,
     peer_id: arena0_client::protocol::PeerId,
 ) {
     let environment = [("ARENA0_CONTEXT", context)];
-    let identities = json_output(
-        invoke(home, &["--json", "identity", "list"], &environment),
-        "arena0 --json identity list",
+    let programs = json_output(
+        invoke(home, &["--json", "program", "list"], &environment),
+        "arena0 --json program list",
     );
-    let identities = identities["identities"]
-        .as_array()
-        .expect("identity list should contain identities");
-    assert_eq!(identities.len(), 1);
-    assert_eq!(identities[0]["peer_id"], peer_id.to_string());
-    assert_eq!(identities[0]["active"], true);
+    assert!(
+        !programs["programs"]
+            .as_array()
+            .expect("program list should contain programs")
+            .is_empty(),
+        "a bootstrapped Host should expose its built-in programs"
+    );
+
+    let identity = json_output(
+        invoke(home, &["--json", "identity"], &environment),
+        "arena0 --json identity",
+    );
+    assert_eq!(identity["peer_id"], peer_id.to_string());
+
+    let executions = json_output(
+        invoke(home, &["--json", "exec", "list"], &environment),
+        "arena0 --json exec list",
+    );
+    assert!(
+        executions["executions"]
+            .as_array()
+            .expect("execution list should contain executions")
+            .is_empty()
+    );
 }
 
 struct DaemonGuard {
@@ -264,29 +317,14 @@ fn context_hello_is_deterministic_concurrent_distinct_and_persistent() {
     let (repeated_id, repeated_peer) = host_info(repeated, None, USER_AGENT);
     assert_eq!((repeated_id, repeated_peer), (first_id.clone(), first_peer));
 
-    let other_context = "harness:other";
-    let value = hello(home.path(), Some(other_context), USER_AGENT);
-    let (other_id, other_peer) = host_info(value, None, USER_AGENT);
-    assert_ne!(other_id, first_id);
-    assert_ne!(other_peer, first_peer);
-    assert_eq!(host_count(home.path()), 2);
-
-    let programs = json_output(
-        invoke(
-            home.path(),
-            &["--json", "program", "list"],
-            &[("ARENA0_CONTEXT", context)],
-        ),
-        "arena0 --json program list",
-    );
-    assert!(
-        !programs["programs"]
-            .as_array()
-            .expect("program list should contain programs")
-            .is_empty(),
-        "a bootstrapped Host should expose its built-in programs"
-    );
-    assert_context_host_routing(home.path(), context, first_peer);
+    for context in ["harness:alpha", "harness:beta"] {
+        let value = hello(home.path(), Some(context), USER_AGENT);
+        let (id, peer) = host_info(value, None, USER_AGENT);
+        assert_ne!(id, first_id);
+        assert_ne!(peer, first_peer);
+    }
+    assert_eq!(host_count(home.path()), 3);
+    assert_context_host_operations(home.path(), context, first_peer);
 
     daemon.stop();
     let mut restarted = DaemonGuard::start(home.path());
@@ -295,7 +333,7 @@ fn context_hello_is_deterministic_concurrent_distinct_and_persistent() {
     assert_eq!(reopened_id, first_id);
     assert_eq!(reopened_peer, first_peer);
     assert_eq!(host_count(home.path()), 1);
-    assert_context_host_routing(home.path(), context, first_peer);
+    assert_context_host_operations(home.path(), context, first_peer);
     restarted.stop();
 }
 
@@ -404,47 +442,83 @@ fn codex_context_fallback_and_explicit_host_override_are_observable() {
 
     let explicit_context = "harness:other";
     let explicit = hello(home.path(), Some(explicit_context), USER_AGENT);
-    let (explicit_id, _explicit_peer) = host_info(explicit, None, USER_AGENT);
-
-    let new_identity = json_output(
-        invoke(
-            home.path(),
-            &[
-                "--json",
-                "--host",
-                explicit_id.as_str(),
-                "identity",
-                "new",
-                "override",
-            ],
-            &[("ARENA0_CONTEXT", fallback_context)],
-        ),
-        "arena0 --json --host <explicit> identity new",
-    );
-    assert_eq!(new_identity["label"], "override");
+    let (explicit_id, explicit_peer) = host_info(explicit, None, USER_AGENT);
 
     let selected = json_output(
         invoke(
             home.path(),
-            &["--json", "--host", explicit_id.as_str(), "identity", "list"],
+            &["--json", "--host", explicit_id.as_str(), "identity"],
             &[("ARENA0_CONTEXT", fallback_context)],
         ),
-        "arena0 --json --host <explicit> identity list",
+        "arena0 --json --host <explicit> identity",
     );
-    assert_eq!(selected["identities"].as_array().unwrap().len(), 2);
+    assert_eq!(selected["peer_id"], explicit_peer.to_string());
 
-    let fallback_identities = json_output(
+    let fallback_identity = json_output(
         invoke(
             home.path(),
-            &["--json", "identity", "list"],
+            &["--json", "identity"],
             &[("ARENA0_CONTEXT", fallback_context)],
         ),
-        "arena0 --json identity list from fallback context",
+        "arena0 --json identity from fallback context",
     );
-    let fallback_identities = fallback_identities["identities"].as_array().unwrap();
-    assert_eq!(fallback_identities.len(), 1);
-    assert_eq!(fallback_identities[0]["peer_id"], fallback_peer.to_string());
+    assert_eq!(fallback_identity["peer_id"], fallback_peer.to_string());
     assert_eq!(host_count(home.path()), 2);
 
+    daemon.stop();
+}
+
+#[test]
+fn cli_create_and_open_join_activate_two_context_hosts() {
+    let home = tempfile::tempdir().expect("temporary arena0 home");
+    let mut daemon = DaemonGuard::start(home.path());
+    let creator_context = [("ARENA0_CONTEXT", "harness:creator")];
+    let joiner_context = [("ARENA0_CONTEXT", "harness:joiner")];
+    hello(home.path(), Some("harness:creator"), USER_AGENT);
+    hello(home.path(), Some("harness:joiner"), USER_AGENT);
+
+    let creator = json_output(
+        invoke(
+            home.path(),
+            &[
+                "--json",
+                "exec",
+                "create",
+                "rock-paper-scissors",
+                "--participants",
+                "2",
+            ],
+            &creator_context,
+        ),
+        "arena0 exec create --participants 2",
+    );
+    let joiner = json_output(
+        invoke(
+            home.path(),
+            &["--json", "exec", "create", "rock-paper-scissors", "--join"],
+            &joiner_context,
+        ),
+        "arena0 exec create --join",
+    );
+    let creator_exec = creator["exec_id"].as_str().expect("creator exec id");
+    let joiner_exec = joiner["exec_id"].as_str().expect("joiner exec id");
+    assert!(creator["negotiation_id"].is_string());
+
+    for (context, exec_id) in [
+        (&creator_context[..], creator_exec),
+        (&joiner_context[..], joiner_exec),
+    ] {
+        let active = json_output(
+            invoke_with_timeout(
+                home.path(),
+                &["--json", "exec", "await", exec_id],
+                context,
+                Duration::from_secs(30),
+            ),
+            "arena0 exec await",
+        );
+        assert_eq!(active["exec_id"], exec_id);
+        assert_eq!(active["exec_state"], "Active");
+    }
     daemon.stop();
 }

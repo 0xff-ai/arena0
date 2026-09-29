@@ -193,6 +193,7 @@ mod tests {
     use arena0_crypto::{NodeKeys, SecretKey};
     use arena0_protocol::PeerIdSource;
     use arena0_store::{Store, StoreConfig};
+    use arena0_test_engine::shared_test_engine;
     use tempfile::TempDir;
 
     fn store(seed: u8, directory: &TempDir) -> Store {
@@ -205,16 +206,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catalogs_are_isolated_per_host() {
+        let first_dir = tempfile::tempdir().expect("first directory");
+        let second_dir = tempfile::tempdir().expect("second directory");
+        let first = store(1, &first_dir);
+        let second = store(2, &second_dir);
+        let first_catalog = ProgramCatalog::new(first.handle().clone());
+        let second_catalog = ProgramCatalog::new(second.handle().clone());
+        let engine = shared_test_engine();
+        let (hash, _) = first_catalog
+            .import(crate::assets::PROGRAMS[0].to_vec(), &engine, 1)
+            .await
+            .expect("register first program");
+
+        let programs = first_catalog.list().await.unwrap();
+        assert_eq!(programs.len(), 1);
+        assert_eq!(programs[0].program_hash, hash);
+        assert_eq!(programs[0].name, "rock-paper-scissors");
+        assert_eq!(
+            first_catalog.resolve("rock-paper-scissors").await.unwrap(),
+            Ok(hash)
+        );
+        assert!(second_catalog.list().await.unwrap().is_empty());
+        assert!(second_catalog.detail(hash).await.unwrap().is_none());
+        assert!(second_catalog.load_program(hash).await.is_err());
+        assert!(matches!(
+            second_catalog.resolve("rock-paper-scissors").await.unwrap(),
+            Err(ProgramRefError::NotFound { .. })
+        ));
+        assert!(matches!(
+            second_catalog.import(vec![1, 2, 3], &engine, 2).await,
+            Err(CatalogError::InvalidProgram(_))
+        ));
+        assert!(second_catalog.list().await.unwrap().is_empty());
+        first.shutdown().await.expect("shutdown first store");
+        second.shutdown().await.expect("shutdown second store");
+    }
+
+    #[tokio::test]
     async fn catalog_membership_and_bytes_survive_reopen() {
-        let first_directory = tempfile::tempdir().expect("first directory");
-        let second_directory = tempfile::tempdir().expect("second directory");
-        let first = store(3, &first_directory);
-        let second = store(4, &second_directory);
+        let directory = tempfile::tempdir().expect("directory");
+        let first = store(3, &directory);
         let catalog = ProgramCatalog::new(first.handle().clone());
-        let other_catalog = ProgramCatalog::new(second.handle().clone());
         assert!(catalog.list().await.unwrap().is_empty());
-        assert!(other_catalog.list().await.unwrap().is_empty());
-        let engine = WasmtimeEngine::new().expect("engine");
+        let engine = shared_test_engine();
         let wasm = crate::assets::PROGRAMS[0];
         let (hash, _) = catalog
             .import(wasm.to_vec(), &engine, 2)
@@ -223,26 +258,9 @@ mod tests {
         let before = catalog.detail(hash).await.unwrap().unwrap();
         assert_eq!(before.summary.name, "rock-paper-scissors");
         assert!(!before.schema.callouts.is_empty());
-        assert_eq!(catalog.list().await.unwrap(), vec![before.summary.clone()]);
-        assert_eq!(
-            catalog.resolve("rock-paper-scissors").await.unwrap(),
-            Ok(hash)
-        );
-        assert!(other_catalog.list().await.unwrap().is_empty());
-        assert!(other_catalog.detail(hash).await.unwrap().is_none());
-        assert!(other_catalog.load_program(hash).await.is_err());
-        assert!(matches!(
-            other_catalog.resolve("rock-paper-scissors").await.unwrap(),
-            Err(ProgramRefError::NotFound { .. })
-        ));
-        assert!(matches!(
-            other_catalog.import(vec![1, 2, 3], &engine, 3).await,
-            Err(CatalogError::InvalidProgram(_))
-        ));
-        assert!(other_catalog.list().await.unwrap().is_empty());
         first.shutdown().await.expect("shutdown store");
 
-        let reopened = store(3, &first_directory);
+        let reopened = store(3, &directory);
         let catalog = ProgramCatalog::new(reopened.handle().clone());
         assert_eq!(catalog.list().await.unwrap(), vec![before.summary.clone()]);
         assert_eq!(
@@ -253,6 +271,5 @@ mod tests {
         assert_eq!(catalog.schema(hash).await.unwrap(), Some(before.schema));
         assert_eq!(catalog.load_program(hash).await.unwrap().bytes(), wasm);
         reopened.shutdown().await.expect("shutdown reopened store");
-        second.shutdown().await.expect("shutdown second store");
     }
 }

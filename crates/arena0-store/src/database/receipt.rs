@@ -38,7 +38,7 @@ impl Database {
 
     /// Resolve this Host's own publication, including a unilateral stop report.
     /// Imported evidence for the same session cannot replace that local fact.
-    pub(super) fn load_receipt(
+    pub(crate) fn load_receipt(
         &mut self,
         session_id: SessionHash,
     ) -> Result<Option<StoredReceipt>, StoreError> {
@@ -52,14 +52,14 @@ impl Database {
         }
     }
 
-    pub(super) fn load_receipt_by_id(
+    pub(crate) fn load_receipt_by_id(
         &mut self,
         receipt_id: ReceiptId,
     ) -> Result<Option<StoredReceipt>, StoreError> {
         let Some(row) = self.receipt_row_by_id(receipt_id)? else {
             return Ok(None);
         };
-        let stored = self.decode_stored_receipt(row)?;
+        let (stored, _) = self.decode_stored_receipt(row)?;
         if stored.receipt_id != receipt_id {
             return Err(StoreError::Corruption(
                 "receipt id lookup returned a different artifact".into(),
@@ -68,7 +68,14 @@ impl Database {
         Ok(Some(stored))
     }
 
-    fn decode_stored_receipt(&mut self, row: RawReceiptRow) -> Result<StoredReceipt, StoreError> {
+    /// Decode one receipt row, checking its id, session and kind indexes
+    /// against the artifact and, for a produced artifact, that the producing
+    /// execution is this Host's ended execution of the same session. Returns
+    /// the producing execution alongside the artifact.
+    fn decode_stored_receipt(
+        &mut self,
+        row: RawReceiptRow,
+    ) -> Result<(StoredReceipt, Option<ExecId>), StoreError> {
         let payload = open_envelope(
             EnvelopeKind::Receipt,
             &row.artifact,
@@ -89,23 +96,35 @@ impl Database {
         let imported = self.receipt_import_exists(receipt_id)?;
         let produced_execution = self.receipt_production(receipt_id)?;
         if let Some(execution_id) = produced_execution {
-            let state = self
-                .load_execution(execution_id)?
-                .ok_or(StoreError::ExecutionNotFound(execution_id))?;
-            if state.binding().session_id() != session_id
-                || state.producer() != self.host_id
-                || state.published_receipt_id() != Some(receipt_id)
-            {
+            // The production row is committed atomically with publication.
+            // Validate its routing indexes without decoding guest memories;
+            // actors also compare the artifact with their in-memory receipt id.
+            let bound: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM executions
+                 WHERE execution_id = ?1 AND session_id = ?2 AND producer = ?3
+                   AND end_phase <> 0)",
+                params![
+                    execution_id.0.to_vec(),
+                    session_id.0.to_vec(),
+                    self.host_id.0.to_vec()
+                ],
+                |row| row.get(0),
+            )?;
+            if !bound {
                 return Err(StoreError::Corruption(
                     "produced receipt is not bound to its Host execution".into(),
                 ));
             }
         }
-        Ok(StoredReceipt {
+        let stored = StoredReceipt {
             receipt_id,
-            provenance: ReceiptProvenance::from_facts(imported, produced_execution.is_some())?,
+            provenance: ReceiptProvenance::from_facts(imported, produced_execution.is_some())
+                .ok_or_else(|| {
+                    StoreError::Corruption("receipt artifact has no provenance fact".into())
+                })?,
             receipt,
-        })
+        };
+        Ok((stored, produced_execution))
     }
 
     fn receipt_import_exists(&self, receipt_id: ReceiptId) -> Result<bool, StoreError> {
@@ -132,7 +151,7 @@ impl Database {
             .transpose()
     }
 
-    pub(super) fn list_receipts(&mut self, limit: usize) -> Result<Vec<StoredReceipt>, StoreError> {
+    pub(crate) fn list_receipts(&mut self, limit: usize) -> Result<Vec<StoredReceipt>, StoreError> {
         let limit = i64::try_from(limit)
             .map_err(|_| StoreError::InvalidConfiguration("receipt limit is too large"))?;
         let mut statement = self
@@ -156,17 +175,12 @@ impl Database {
             .collect()
     }
 
-    pub(super) fn import_receipt(
+    pub(crate) fn import_receipt(
         &mut self,
         receipt: ReceiptArtifact,
         now_ms: u64,
     ) -> Result<ReceiptImportOutcome, StoreError> {
-        self.begin()?;
-        let result = self.import_receipt_in_transaction(receipt, now_ms);
-        match result {
-            Ok(outcome) => self.commit_result(outcome),
-            Err(error) => self.rollback_result(error),
-        }
+        self.transaction(|store| store.import_receipt_in_transaction(receipt, now_ms))
     }
 
     fn import_receipt_in_transaction(
@@ -247,21 +261,34 @@ impl Database {
         Ok(())
     }
 
-    pub(super) fn persist_terminal(
+    pub(super) fn persist_terminal_publication(
         &mut self,
         execution_id: ExecId,
-        version: ExecutionVersion,
-        plan: &CommitPlan,
+        receipt: &ReceiptArtifact,
         now_ms: u64,
     ) -> Result<(), StoreError> {
-        let Some(terminal) = plan.terminal() else {
-            return Ok(());
-        };
-        let receipt = terminal.receipt();
-        let publication_bytes = borsh::to_vec(terminal).map_err(|error| {
-            StoreError::Corruption(format!("terminal publication encode: {error}"))
-        })?;
         self.insert_artifact(receipt, now_ms)?;
+        let published = self
+            .connection
+            .query_row(
+                "SELECT receipt_id FROM receipt_productions WHERE execution_id = ?1",
+                params![execution_id.0.to_vec()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        if let Some(published) = published {
+            if published != receipt.receipt_id().as_bytes().to_vec() {
+                return Err(StoreError::Corruption(
+                    "terminal publication identity was reused with different evidence".into(),
+                ));
+            }
+            return Ok(());
+        }
+        if self.receipt_production(receipt.receipt_id())?.is_some() {
+            return Err(StoreError::Corruption(
+                "receipt is already produced by another execution".into(),
+            ));
+        }
         self.connection.execute(
             "INSERT INTO receipt_productions (receipt_id, execution_id) VALUES (?1, ?2)",
             params![
@@ -269,27 +296,24 @@ impl Database {
                 execution_id.0.to_vec()
             ],
         )?;
-        self.connection.execute("INSERT INTO terminal_proofs (execution_id, version, receipt_id, publication) VALUES (?1, ?2, ?3, ?4)", params![execution_id.0.to_vec(), sqlite_u64(version.get())?, receipt.receipt_id().as_bytes().to_vec(), envelope(EnvelopeKind::TerminalPublication, &publication_bytes)?])?;
         Ok(())
     }
 
+    /// Validate one execution's publication rows against its already
+    /// validated agreed `trace`. This is the only open-time decode of a
+    /// produced artifact; [`Self::validate_receipts`] skips produced rows.
     pub(super) fn validate_terminal_rows(
         &mut self,
         state: &ExecutionState,
+        trace: &[arena0_protocol::TraceEntry],
     ) -> Result<(), StoreError> {
         let execution_id = state.execution_id();
-        let count: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM terminal_proofs WHERE execution_id = ?1",
-            params![execution_id.0.to_vec()],
-            |row| row.get(0),
-        )?;
         let production_count: i64 = self.connection.query_row(
             "SELECT COUNT(*) FROM receipt_productions WHERE execution_id = ?1",
             params![execution_id.0.to_vec()],
             |row| row.get(0),
         )?;
-        let expected = i64::from(state.published_receipt_id().is_some());
-        if count != expected || production_count != expected {
+        if production_count != i64::from(state.published_receipt_id().is_some()) {
             return Err(StoreError::Corruption(
                 "terminal publication rows do not match execution status".into(),
             ));
@@ -297,46 +321,33 @@ impl Database {
         let Some(receipt_id) = state.published_receipt_id() else {
             return Ok(());
         };
-        let (version, row_id, publication): (i64, Vec<u8>, Vec<u8>) = self.connection.query_row(
-            "SELECT version, receipt_id, publication FROM terminal_proofs WHERE execution_id = ?1",
-            params![execution_id.0.to_vec()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        let payload = open_envelope(
-            EnvelopeKind::TerminalPublication,
-            &publication,
-            arena0_protocol::MAX_RECEIPT_BYTES,
-        )?;
-        let terminal: arena0_protocol::TerminalPublication =
-            decode_borsh(&payload, "terminal publication")?;
-        let receipt = terminal.receipt();
-        if sqlite_i64(version)? != state.version().get()
-            || row_id != receipt_id.as_bytes().to_vec()
-            || receipt.receipt_id() != receipt_id
+        let row = self
+            .receipt_row_by_id(receipt_id)?
+            .ok_or_else(|| StoreError::Corruption("published receipt row is missing".into()))?;
+        // The row decode checks the id and session indexes and binds the
+        // production to this Host's execution of that session. The session
+        // itself derives from the activation compared here.
+        let (stored, production) = self.decode_stored_receipt(row)?;
+        let receipt = stored.receipt;
+        if production != Some(execution_id)
             || receipt.body().header().activation != *state.binding().activation()
             || state.producer() != self.host_id
-            || self.receipt_production(receipt_id)? != Some(execution_id)
         {
             return Err(StoreError::Corruption(
-                "terminal proof does not match published execution state".into(),
+                "terminal record does not match published execution state".into(),
             ));
         }
-        if receipt.body().trace() != self.load_public_trace_in_transaction(state)? {
+        if receipt.body().trace() != trace {
             return Err(StoreError::Corruption(
                 "receipt trace does not match durable public commits".into(),
             ));
         }
         match receipt.body().termination() {
-            arena0_protocol::ReceiptTermination::Completed { terminal } => {
-                let certificate = state.terminal_certificate().ok_or_else(|| {
-                    StoreError::Corruption("completed receipt has no execution certificate".into())
-                })?;
+            arena0_protocol::ReceiptTermination::Completed => {
                 let outcome = state.terminal_outcome().ok_or_else(|| {
                     StoreError::Corruption("completed receipt has no execution outcome".into())
                 })?;
-                if terminal.agreement != *certificate.agreement()
-                    || receipt.body().outcome() != outcome.borsh()
-                {
+                if receipt.body().outcome() != outcome.borsh() {
                     return Err(StoreError::Corruption(
                         "receipt completion does not match execution evidence".into(),
                     ));
@@ -349,22 +360,6 @@ impl Database {
                     ));
                 }
             }
-        }
-        let row = self
-            .receipt_row_by_id(receipt_id)?
-            .ok_or_else(|| StoreError::Corruption("published receipt row is missing".into()))?;
-        let bytes = open_envelope(
-            EnvelopeKind::Receipt,
-            &row.artifact,
-            arena0_protocol::MAX_RECEIPT_BYTES,
-        )?;
-        if ReceiptArtifact::decode(&bytes)? != *receipt
-            || row.session_id != state.binding().session_id().0.to_vec()
-            || row.kind != artifact_kind(receipt)
-        {
-            return Err(StoreError::Corruption(
-                "receipt artifact does not match terminal publication".into(),
-            ));
         }
         Ok(())
     }
@@ -406,6 +401,11 @@ impl Database {
             };
             let full_page = ids.len() == DATABASE_VALIDATION_PAGE_SIZE as usize;
             for receipt_id in ids {
+                // Produced artifacts were decoded with their execution by
+                // `validate_terminal_rows`, which requires this relation.
+                if self.receipt_production(receipt_id)?.is_some() {
+                    continue;
+                }
                 let row = self.receipt_row_by_id(receipt_id)?.ok_or_else(|| {
                     StoreError::Corruption("receipt disappeared while validating".into())
                 })?;

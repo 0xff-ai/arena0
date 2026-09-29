@@ -1,0 +1,13 @@
+[package]
+name = "arena0-test-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false          # test support only; never ships
+
+[dependencies]
+arena0-sandbox = { path = "../arena0-sandbox" }
+tracing.workspace = true
+
+[lints]
+workspace = true

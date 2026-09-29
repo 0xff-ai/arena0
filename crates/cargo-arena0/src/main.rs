@@ -1,8 +1,8 @@
-//! `cargo-arena0`: build an arena0 program and embed its metadata section.
+//! `cargo-arena0`: finalize an arena0 program and embed its metadata section.
 //!
 //! `cargo arena0 build` runs `cargo build` for `wasm32-unknown-unknown`, then
-//! appends each produced wasm's borsh `ProgramDefinition` as a custom section so
-//! `arena0 program import` reads metadata without compiling.
+//! finalizes each produced wasm to the bounded ABI-22 memory layout and appends
+//! its Borsh `ProgramDefinition` as a custom section.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// cargo build for wasm32-unknown-unknown + embed the metadata section.
+    /// cargo build for wasm32-unknown-unknown + finalize and embed metadata.
     Build {
         /// Debug build (default is release).
         #[arg(long)]

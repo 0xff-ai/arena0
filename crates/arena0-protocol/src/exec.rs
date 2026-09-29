@@ -16,7 +16,7 @@ pub enum ExecLifecycle {
     Negotiating,
     /// The committed activation is proposed and participants are ratifying it.
     Activating,
-    /// Execution is waiting for a private continuation answer or timer resume.
+    /// Execution has an open callout; other events continue dispatching.
     Waiting,
     /// The session was confirmed and started; execution is running.
     Active,
@@ -24,9 +24,6 @@ pub enum ExecLifecycle {
     Completed,
     /// The session aborted.
     Aborted,
-    /// Terminal evidence was interrupted before a receipt could be published.
-    /// Collected terminal proof remains durable, but no receipt exists.
-    Incomplete,
     /// Negotiation or execution failed.
     Failed,
 }
@@ -35,9 +32,6 @@ impl ExecLifecycle {
     /// Whether this lifecycle is terminal and cannot make further progress.
     #[must_use]
     pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Completed | Self::Aborted | Self::Incomplete | Self::Failed
-        )
+        matches!(self, Self::Completed | Self::Aborted | Self::Failed)
     }
 }

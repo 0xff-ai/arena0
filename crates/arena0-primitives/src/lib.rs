@@ -6,11 +6,11 @@
 //! [`turn_manager`] owns round-robin order, [`ballot`] owns exact-set votes,
 //! and [`agreement`] owns a single proposal lifecycle.
 //!
-//! The state-machine primitive [`commit_reveal`] follows arena0's shared/local
-//! discipline with an explicit pair of DTOs: [`commit_reveal::CommitReveal`]
-//! contains only shared-visible fields, while
+//! The state-machine primitive [`commit_reveal`] uses an explicit pair of
+//! DTOs: [`commit_reveal::CommitReveal`] contains shared-visible fields, while
 //! [`commit_reveal::CommitRevealLocal`] carries the participant-local secret
-//! stash and never enters the session hash.
+//! stash and never enters the session hash. A local handler updates only the
+//! local value; shared state changes when an agreed handler applies a message.
 
 /// Single-proposal agreement lifecycle composed over [`ballot`].
 pub mod agreement;

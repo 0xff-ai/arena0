@@ -49,8 +49,10 @@ scenario that waits at least 40 seconds, Unix `daemon_e2e`, and actual process
 startup and shutdown tests. Daemon survival tests do not prove the full public
 negotiation-deadline timeout.
 
-The program test recipe builds program Wasm, runs host `arena0-tests`, and runs
-the guest-native tests in `programs`.
+The program test recipe builds program Wasm (`just build-programs` first), runs
+host `arena0-tests`, and runs the guest-native tests in `programs`. Pure logic
+gets native unit tests in the program crate; behavior gets Arena tests in
+`crates/arena0-tests`. Test runs share one Wasmtime compilation cache per process under `<target dir>/wasmtime-cache` (preserved by the CI target-dir cache; override with `$ARENA0_WASMTIME_TEST_CACHE`), so the first run compiles each guest once and later runs reuse it. A relative override or `CARGO_TARGET_DIR` resolves against the workspace root, never the process working directory, so every package's test process uses the same directory.
 
 The scoped recipes retain the configured compiler wrapper and cache and the
 `NEXTEST_PROFILE` environment (`ci` in CI). Keep those settings unchanged.

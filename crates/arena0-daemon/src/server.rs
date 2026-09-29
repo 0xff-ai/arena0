@@ -18,34 +18,30 @@ use anyhow::Context as _;
 use arena0_api::{
     ActivationInspection, ActivationInspectionState, ActivationParticipant, ActivityData,
     ActivityFrame, ApiError, ApiErrorCode, EnsembleSpec, EventData, EventFilter, EventFrame,
-    ExecLifecycle, ExecOrigin, ExecStatus, ExecStatusState, ExecutionFailureKind,
-    ExecutionInspection, FullVerifiedTerminal, HostInfo, LightVerifiedTerminal, NegotiationStage,
-    NextEvent, PendingCalloutStatus, PrivateCommitSummary as ApiPrivateCommitSummary,
-    PrivateEffectKind as ApiPrivateEffectKind, PrivateEffectSummary as ApiPrivateEffectSummary,
-    PrivateEventKind as ApiPrivateEventKind, ProgramRefError, ReceiptRef, Response, ResponseOk,
-    SessionProgress, SessionStatus, VerifiedResult, frame,
+    EventRecordSummary as ApiEventRecordSummary, ExecLifecycle, ExecStatus, ExecStatusState,
+    ExecutionInspection, HostInfo, NextEvent, PendingCalloutStatus, ProgramRefError, ReceiptRef,
+    Response, ResponseOk, SessionProgress, SessionStatus, frame,
 };
 use arena0_api::{HostRequest, HostStatus};
 use arena0_crypto::{AgentPubKey, ExecutionKey, NodeKeys};
 use arena0_node::{ActivatedSession, NegotiationBook};
 use arena0_node::{
-    DurableOutcome, HostExecutionStore, NegotiationAttempt, NegotiationEffects, NegotiationStart,
-    NegotiationSupervision, PrepareOutcome, unix_time_ms,
+    HostExecutionStore, NegotiationAttempt, NegotiationEffects, NegotiationStart,
+    NegotiationSupervision, store_activation_effects, unix_time_ms,
 };
 use arena0_program::{
     ABI_VERSION, JsonBytes, JsonSchemaDocument, ParticipantCount, ProgramHash, ProgramSchema,
 };
 use arena0_protocol::{
-    ActivationAnnouncement, EventSource, ExecCreationOrigin, ExecId, ExecutionAdmission,
-    ExecutionEvent, ExecutionFailureCode, ExecutionStatus, FetchFrame, MAX_CLOCK_SKEW_MS,
-    MAX_TICKET_LIFETIME_MS, NegotiationEvent, NegotiationFact, NegotiationGossip, NegotiationId,
-    NegotiationTarget, Offer, OfferData, OfferHash, PREPARE_WINDOW_MS, PeerId, PeerIdSource,
-    PendingId, ReceiptArtifact, SessionHash, StateHash, TerminalKind, Ticket, TicketAction,
-    TicketData, TicketHash, Viewport, system_event::SystemEvent,
+    ActivationAnnouncement, CalloutId, EventSource, ExecCreationOrigin, ExecId, ExecutionAdmission,
+    ExecutionEvent, ExecutionFailureCode, FetchFrame, MAX_CLOCK_SKEW_MS, MAX_TICKET_LIFETIME_MS,
+    NegotiationEvent, NegotiationFact, NegotiationGossip, NegotiationId, NegotiationTarget, Offer,
+    OfferData, OfferHash, PREPARE_WINDOW_MS, PeerId, ReceiptArtifact, SessionHash, StateHash,
+    TerminalKind, Ticket, TicketAction, TicketData, TicketHash, Viewport,
+    system_event::SystemEvent,
 };
-use arena0_sandbox::{InitializeCall, LoadedProgram, Program, ViewCall, WasmtimeEngine};
+use arena0_sandbox::{LoadedProgram, Program, WasmtimeEngine};
 use arena0_transport::{NegotiationTopic, ProgramTopicEvent, Transport};
-use arena0_verify::{LightVerifiedTerminal as VerifiedLightTerminal, verify_full, verify_light};
 use retry::delay::{Exponential, jitter};
 use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
@@ -57,16 +53,16 @@ use tracing::Instrument as _;
 use crate::catalog::{CatalogError, ProgramCatalog};
 use crate::exec_manager::{
     ExecutionHandle, ExecutionHandles, NEGOTIATION_TIMEOUT, Supervisor, project_durable_next,
-    satisfies,
+    project_lifecycle, satisfies,
 };
 use crate::schema;
 use crate::startup::{StartupStage, StartupTimeline};
-use crate::store::{Keystore, KeystoreError};
+use crate::store::Keystore;
 use arena0_store::{
-    ActivationRecord, ActivationRecordStatus, AdmissionBindingOutcome, ExecutionRequest,
-    ExecutionRequestFailureOutcome, MAX_PRIVATE_INSPECTION_RECORDS,
-    PrivateCommitSummary as StorePrivateCommitSummary, RecoveryCandidate, RecoveryCursor,
-    StoreHandle,
+    ActivationRecord, ActivationRecordStatus, AdmissionBindingOutcome,
+    EventRecordSummary as StoreEventRecordSummary, ExecutionRequest,
+    ExecutionRequestFailureOutcome, MAX_EVENT_INSPECTION_RECORDS, RecoveryCandidate,
+    RecoveryCursor, StoreHandle,
 };
 
 /// Capacity of the event broadcast bus. A slow subscriber that falls this far
@@ -345,6 +341,20 @@ struct SpawnPlan {
     committed: ActivatedSession,
     actor_execution_key: ExecutionKey,
     execution_store: HostExecutionStore,
+    /// Whether the actor's observations replay a session this Host already
+    /// reported (an end wake), so the supervisor must not project them again
+    /// and the ended session gets no relay.
+    replay: bool,
+}
+
+/// Why a durable execution is being resumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeCause {
+    /// Startup recovery reports each resumed execution to a new observer.
+    Startup,
+    /// A peer poked an ended session. The actor only finishes end
+    /// confirmation; its creation and terminal were already reported.
+    EndWake,
 }
 
 /// One validated negotiation or execution occurrence. `Events` owns every
@@ -385,13 +395,12 @@ pub(crate) enum HostEvent {
         step: u64,
         pre_state: arena0_protocol::StateHash,
         post_state: arena0_protocol::StateHash,
-        fuel_used: u64,
         signers: u16,
         participants: u16,
     },
     SessionCallout {
         source: EventSource,
-        pending_id: PendingId,
+        pending_id: CalloutId,
         callout_index: u32,
         name: String,
         prompt: String,
@@ -400,7 +409,7 @@ pub(crate) enum HostEvent {
     },
     SessionCalloutAnswered {
         source: EventSource,
-        pending_id: PendingId,
+        pending_id: CalloutId,
     },
     SessionCompleted {
         source: EventSource,
@@ -455,25 +464,10 @@ impl HostEvent {
                     ensemble: ensemble.clone(),
                 },
             }),
-            Self::SessionStep {
-                source,
-                step,
-                pre_state,
-                post_state,
-                fuel_used,
-                signers,
-                participants,
-            } => Some(SystemEvent::Execution {
-                source: source.clone(),
-                event: ExecutionEvent::StepCommitted {
-                    step: *step,
-                    pre_state: *pre_state,
-                    post_state: *post_state,
-                    fuel_used: *fuel_used,
-                    signer_count: *signers,
-                    participant_count: *participants,
-                },
-            }),
+            // The durable trace no longer carries fuel telemetry. Keep the
+            // semantic step on the API event stream, but do not fabricate an
+            // operational value for the process-local system projection.
+            Self::SessionStep { .. } => None,
             Self::SessionCallout {
                 source,
                 pending_id,
@@ -575,16 +569,13 @@ impl HostEvent {
                 },
                 negotiation_id: *negotiation_id,
                 queue_position: *queue_position,
-                origin: match origin {
-                    ExecCreationOrigin::Request => ExecOrigin::Request,
-                    ExecCreationOrigin::Recovery => ExecOrigin::Recovery,
-                },
+                origin: (*origin).into(),
             },
             Self::Failed {
                 reason, failure, ..
             } => EventData::Terminated {
                 reason: reason.clone(),
-                failed_class: Some(api_failure(*failure)),
+                failed_class: Some((*failure).into()),
             },
             Self::SessionStarted { ensemble, .. } => EventData::SessionStarted {
                 ensemble: ensemble.clone(),
@@ -593,7 +584,6 @@ impl HostEvent {
                 step,
                 pre_state,
                 post_state,
-                fuel_used,
                 signers,
                 participants,
                 ..
@@ -601,7 +591,6 @@ impl HostEvent {
                 step: *step,
                 pre_state: *pre_state,
                 post_state: *post_state,
-                fuel_used: *fuel_used,
                 signers: *signers,
                 participants: *participants,
             },
@@ -643,20 +632,10 @@ impl HostEvent {
                 },
                 _ => EventData::Terminated {
                     reason: reason.clone(),
-                    failed_class: Some(api_failure(*failure)),
+                    failed_class: Some((*failure).into()),
                 },
             },
         }
-    }
-}
-
-fn api_failure(failure: ExecutionFailureCode) -> ExecutionFailureKind {
-    match failure {
-        ExecutionFailureCode::Negotiation => ExecutionFailureKind::Negotiation,
-        ExecutionFailureCode::HostStopped => ExecutionFailureKind::HostStopped,
-        ExecutionFailureCode::ProgramAborted => ExecutionFailureKind::ProgramAborted,
-        ExecutionFailureCode::Runtime => ExecutionFailureKind::Runtime,
-        ExecutionFailureCode::InvalidGuestOutput => ExecutionFailureKind::InvalidGuestOutput,
     }
 }
 
@@ -979,10 +958,7 @@ fn negotiation_api_event(event: &NegotiationEvent) -> EventData {
             target_size,
         } => EventData::NegotiationRetried {
             attempt: *attempt,
-            stage: match stage {
-                arena0_protocol::NegotiationStage::Gossiping => NegotiationStage::Gossiping,
-                arena0_protocol::NegotiationStage::Prepared => NegotiationStage::Prepared,
-            },
+            stage: (*stage).into(),
             ticket_count: *ticket_count,
             sig_count: *sig_count,
             target_size: *target_size,
@@ -994,10 +970,7 @@ fn negotiation_api_event(event: &NegotiationEvent) -> EventData {
             sig_count,
             target_size,
         } => EventData::NegotiationTimedOut {
-            stage: match stage {
-                arena0_protocol::NegotiationStage::Gossiping => NegotiationStage::Gossiping,
-                arena0_protocol::NegotiationStage::Prepared => NegotiationStage::Prepared,
-            },
+            stage: (*stage).into(),
             ticket_count: *ticket_count,
             sig_count: *sig_count,
             target_size: *target_size,
@@ -1028,9 +1001,9 @@ fn load_and_initialize(
     let params =
         JsonBytes::try_new(params).map_err(|error| anyhow::anyhow!("{context} params: {error}"))?;
     let initialized = loaded
-        .initialize(InitializeCall::new(params))
+        .initialize(params)
         .map_err(|error| anyhow::anyhow!("{context} initialize: {error}"))?;
-    Ok((loaded, StateHash::of(initialized.shared.as_bytes())))
+    Ok((loaded, StateHash::of_shared(&initialized.shared)))
 }
 
 /// Load and initialize one program in a blocking worker. Wasmtime loading and
@@ -1152,7 +1125,7 @@ impl HostService {
     /// Start the daemon's protocol runtime and host services.
     #[cfg(test)]
     fn start(init: HostServiceInit) -> anyhow::Result<Arc<Self>> {
-        let identity = Arc::new(init.keystore.active_crypto()?);
+        let identity = init.keystore.node_keys();
         let runtime =
             arena0_node::Host::start(identity, Arc::clone(&init.transport), init.store.clone());
         Self::start_with_runtime_owned(init, runtime, true)
@@ -1187,12 +1160,7 @@ impl HostService {
         } = init;
 
         let identity = runtime.identity_keys();
-        let peer_id = identity.peer_id();
-        anyhow::ensure!(
-            runtime.peer_id == peer_id,
-            "runtime host identity {runtime_peer} does not match keystore identity {peer_id}",
-            runtime_peer = runtime.peer_id,
-        );
+        let peer_id = runtime.peer_id();
         let execs = Arc::new(ExecutionHandles::new(store.clone()));
         let events = Events::new(HostInfo {
             id: name.clone(),
@@ -1390,6 +1358,30 @@ impl HostService {
             .write()
             .unwrap_or_else(|error| error.into_inner())
             .user_agent = user_agent;
+        if let Some(mut wakes) = self.runtime.take_end_wakes() {
+            let service = Arc::downgrade(self);
+            self.tasks.lock().await.spawn(async move {
+                while let Some(execution_id) = wakes.recv().await {
+                    let Some(service) = service.upgrade() else {
+                        return;
+                    };
+                    let result = async {
+                        if let Some(candidate) =
+                            service.store.end_wake_candidate(execution_id).await?
+                        {
+                            service
+                                .resume_candidate(candidate, ResumeCause::EndWake)
+                                .await?;
+                        }
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        tracing::error!(%execution_id, %error, "unable to resume end handshake");
+                    }
+                }
+            });
+        }
         if let Err(error) = self.resume_durable().await {
             self.startup.host_progress(StartupStage::Failed, &self.name);
             return Err(error);
@@ -1411,7 +1403,8 @@ impl HostService {
                 .await?;
             let next = page.next_cursor();
             for candidate in page.into_candidates() {
-                self.resume_candidate(candidate).await?;
+                self.resume_candidate(candidate, ResumeCause::Startup)
+                    .await?;
             }
             let Some(next) = next else {
                 return Ok(());
@@ -1431,22 +1424,22 @@ impl HostService {
     async fn resume_candidate(
         self: &Arc<Self>,
         candidate: RecoveryCandidate,
+        cause: ResumeCause,
     ) -> anyhow::Result<()> {
         let request = candidate.request().clone();
         let exec_id = request.execution_id();
         if self.execs.get(&exec_id).is_some() {
             return Ok(());
         }
-        self.events.emit(HostEvent::Created {
-            source: EventSource::Execution {
-                peer_id: self.peer_id,
+        if cause == ResumeCause::Startup {
+            self.emit_created(
                 exec_id,
-                program_id: request.program_hash(),
-            },
-            negotiation_id: request.negotiation_id(),
-            queue_position: None,
-            origin: ExecCreationOrigin::Recovery,
-        });
+                request.program_hash(),
+                request.negotiation_id(),
+                None,
+                ExecCreationOrigin::Recovery,
+            );
+        }
 
         // The recovery page intentionally contains only bounded metadata.
         // Load each potentially large aggregate separately and complete all
@@ -1479,8 +1472,10 @@ impl HostService {
                 )
                 .await;
         }
-        let execution = match self.store.load_execution(exec_id).await {
-            Ok(execution) => execution,
+        // Store open validated every aggregate, and the actor loads it at
+        // startup; recovery needs only its presence.
+        let execution_present = match self.store.execution_exists(exec_id).await {
+            Ok(present) => present,
             Err(error) => {
                 return self
                     .fail_recovery_candidate(
@@ -1491,7 +1486,6 @@ impl HostService {
                     .await;
             }
         };
-        let execution_present = execution.is_some();
         if execution_present != page_execution_present {
             return self
                 .fail_recovery_candidate(
@@ -1524,29 +1518,9 @@ impl HostService {
                 )
                 .await;
         }
-        if let Some(execution) = &execution {
-            let Some(activation) = record.as_ref().and_then(ActivationRecord::activation) else {
-                return self
-                    .fail_recovery_candidate(
-                        candidate,
-                        true,
-                        "execution aggregate has no committed activation",
-                    )
-                    .await;
-            };
-            if execution.binding().activation() != activation
-                || execution.binding().program_hash() != request.program_hash()
-                || execution.producer() != self.peer_id
-            {
-                return self
-                    .fail_recovery_candidate(
-                        candidate,
-                        true,
-                        "execution aggregate does not match its request, activation, or Host",
-                    )
-                    .await;
-            }
-        }
+        // The actor's startup check (`ensure_execution`) compares the
+        // aggregate's binding and producer with the request, the committed
+        // activation, and this Host, and fails the execution on a mismatch.
 
         let stored_program = match self.store.load_program(request.program_hash()).await {
             Ok(program) => program,
@@ -1744,6 +1718,7 @@ impl HostService {
                             committed,
                             actor_execution_key: actor_key,
                             execution_store,
+                            replay: cause == ResumeCause::EndWake,
                         },
                     )
                     .await
@@ -1763,6 +1738,29 @@ impl HostService {
                 Ok(())
             }
         }
+    }
+
+    /// Announce an execution this Host created, from a request or recovery.
+    /// Creation precedes any negotiation or session, so the event names the
+    /// bare execution source.
+    fn emit_created(
+        &self,
+        exec_id: ExecId,
+        program_id: ProgramHash,
+        negotiation_id: Option<NegotiationId>,
+        queue_position: Option<usize>,
+        origin: ExecCreationOrigin,
+    ) {
+        self.events.emit(HostEvent::Created {
+            source: EventSource::Execution {
+                peer_id: self.peer_id,
+                exec_id,
+                program_id,
+            },
+            negotiation_id,
+            queue_position,
+            origin,
+        });
     }
 
     /// Persist a recovery failure at the authoritative lifecycle boundary.
@@ -1896,26 +1894,7 @@ impl HostService {
     pub(crate) async fn dispatch(self: &Arc<Self>, req: HostRequest) -> Response {
         match req {
             HostRequest::Info => self.host_status().await.map(ResponseOk::HostStatus),
-            HostRequest::IdNew { label } => {
-                let ks = Arc::clone(&self.keystore);
-                blocking(move || ks.new_identity(label))
-                    .await
-                    .map(ResponseOk::Id)
-            }
-            HostRequest::IdList => {
-                let ks = Arc::clone(&self.keystore);
-                blocking(move || ks.list()).await.map(ResponseOk::IdList)
-            }
-            HostRequest::IdShow { id } => {
-                let ks = Arc::clone(&self.keystore);
-                blocking(move || ks.show(&id)).await.map(ResponseOk::Id)
-            }
-            HostRequest::IdRemove { id } => {
-                let ks = Arc::clone(&self.keystore);
-                blocking(move || ks.remove(&id))
-                    .await
-                    .map(|()| ResponseOk::Ack)
-            }
+            HostRequest::IdShow => Ok(ResponseOk::Id(self.keystore.info())),
 
             HostRequest::ProgramList => self
                 .catalog
@@ -1982,10 +1961,10 @@ impl HostService {
             }
             HostRequest::ExecInspect {
                 exec_id,
-                private_from,
-                private_limit,
+                events_from,
+                events_limit,
             } => self
-                .exec_inspect(exec_id, private_from, private_limit)
+                .exec_inspect(exec_id, events_from, events_limit)
                 .await
                 .map(ResponseOk::Inspection),
             HostRequest::ExecAwait { exec_id, until } => {
@@ -2051,7 +2030,7 @@ impl HostService {
                     receipts.into_iter().map(receipt_list_entry).collect(),
                 ))
             }
-            HostRequest::ReceiptVerify { receipt, full } => self.verify(receipt, full).await,
+            HostRequest::ReceiptVerify { receipt } => self.verify(receipt).await,
         }
     }
 
@@ -2092,16 +2071,16 @@ impl HostService {
     async fn exec_inspect(
         &self,
         exec_id: ExecId,
-        private_from: Option<u64>,
-        private_limit: u16,
+        events_from: Option<u64>,
+        events_limit: u16,
     ) -> Result<ExecutionInspection, ApiError> {
-        let private_limit = usize::from(private_limit);
-        if private_limit == 0 || private_limit > MAX_PRIVATE_INSPECTION_RECORDS {
+        let events_limit = usize::from(events_limit);
+        if events_limit == 0 || events_limit > MAX_EVENT_INSPECTION_RECORDS {
             return Err(ApiError::new(
                 ApiErrorCode::BadRequest,
                 format!(
-                    "private inspection limit must be between 1 and {}",
-                    MAX_PRIVATE_INSPECTION_RECORDS
+                    "event inspection limit must be between 1 and {}",
+                    MAX_EVENT_INSPECTION_RECORDS
                 ),
             ));
         }
@@ -2120,32 +2099,32 @@ impl HostService {
         {
             Some(_) => self
                 .store
-                .read_private_summaries(exec_id, private_from, private_limit)
+                .read_event_summaries(exec_id, events_from, events_limit)
                 .await
                 .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?,
             None => {
                 return Ok(empty_execution_inspection(
                     status,
                     activation,
-                    private_from.unwrap_or(0),
+                    events_from.unwrap_or(0),
                 ));
             }
         };
-        let private_from = page.from();
-        let private_total = page.total();
-        let private_next = page.next();
-        let private = page
+        let events_from = page.from();
+        let events_total = page.total();
+        let events_next = page.next();
+        let events = page
             .into_summaries()
             .into_iter()
-            .map(project_private_commit_summary)
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(project_event_record_summary)
+            .collect();
         Ok(ExecutionInspection {
             status,
             activation,
-            private_from,
-            private,
-            private_total,
-            private_next,
+            events_from,
+            events,
+            events_total,
+            events_next,
         })
     }
 
@@ -2166,16 +2145,6 @@ impl HostService {
             .load_execution(exec_id)
             .await
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
-        let pending = if state.is_some() {
-            self.store
-                .list_pending_requests(exec_id)
-                .await
-                .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
-                .into_iter()
-                .find(|request| matches!(request, arena0_store::PendingRequest::Callout { .. }))
-        } else {
-            None
-        };
         let receipt_available = if let Some(state) = &state {
             self.store
                 .load_receipt(state.binding().session_id())
@@ -2185,15 +2154,8 @@ impl HostService {
         } else {
             false
         };
-        project_exec_status_facts(
-            self.peer_id,
-            request,
-            activation,
-            state,
-            pending,
-            receipt_available,
-        )
-        .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))
+        project_exec_status_facts(self.peer_id, request, activation, state, receipt_available)
+            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))
     }
 
     async fn active_execution_count(&self) -> Result<usize, ApiError> {
@@ -2204,7 +2166,7 @@ impl HostService {
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
         Ok(executions
             .iter()
-            .filter(|state| !state.status().is_terminal())
+            .filter(|state| !state.lifecycle().is_terminal())
             .count())
     }
 
@@ -2262,14 +2224,7 @@ impl HostService {
                 "execution has no live driver",
             ));
         };
-        if let Some(event) = project_durable_next(
-            state,
-            self.store
-                .list_pending_requests(exec_id)
-                .await
-                .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?,
-            &schema,
-        )? {
+        if let Some(event) = project_durable_next(state, &schema)? {
             return Ok(NextProjection::Ready(event));
         }
         Err(ApiError::new(
@@ -2470,16 +2425,13 @@ impl HostService {
         let queue_position = (queue_slot > 0).then_some(queue_slot);
         let negotiation_id = plan.negotiation_id();
         let entry = self.execs.register_live(exec_id);
-        self.events.emit(HostEvent::Created {
-            source: EventSource::Execution {
-                peer_id: self.peer_id,
-                exec_id,
-                program_id,
-            },
+        self.emit_created(
+            exec_id,
+            program_id,
             negotiation_id,
             queue_position,
-            origin: ExecCreationOrigin::Request,
-        });
+            ExecCreationOrigin::Request,
+        );
 
         let daemon = Arc::clone(self);
         let entry_task = Arc::clone(&entry);
@@ -2553,10 +2505,9 @@ impl HostService {
                 .terminate("execution creation cancelled before acknowledgement".to_owned())
                 .await
                 .map(|()| ResponseOk::Ack),
-            ExecLifecycle::Completed
-            | ExecLifecycle::Aborted
-            | ExecLifecycle::Incomplete
-            | ExecLifecycle::Failed => Ok(ResponseOk::Ack),
+            ExecLifecycle::Completed | ExecLifecycle::Aborted | ExecLifecycle::Failed => {
+                Ok(ResponseOk::Ack)
+            }
         }
     }
 
@@ -2633,8 +2584,7 @@ impl HostService {
                 | ExecLifecycle::Waiting
                 | ExecLifecycle::Active
                 | ExecLifecycle::Completed
-                | ExecLifecycle::Aborted
-                | ExecLifecycle::Incomplete => {
+                | ExecLifecycle::Aborted => {
                     return Err(ApiError::new(
                         ApiErrorCode::Negotiation,
                         "ticket is no longer revocable",
@@ -2734,9 +2684,7 @@ impl HostService {
                 ApiError::new(ApiErrorCode::Storage, format!("load program: {error}"))
             })?;
         let peers = prepared
-            .tickets()
-            .iter()
-            .map(|ticket| ticket.data.signer)
+            .signers()
             .filter(|peer| *peer != self.peer_id)
             .collect::<Vec<_>>();
         let bootstrap = negotiation_bootstrap(self.peer_id, None, peers.iter().copied());
@@ -3156,7 +3104,7 @@ impl HostService {
             .install_negotiation(offer.clone(), ticket_tx.clone(), withdrawals_tx)
             .await;
 
-        let (prepare, persist_commit) = activation_callbacks();
+        let (prepare, persist_commit) = store_activation_effects();
         let publish_event = |source, event| {
             self.events.emit(HostEvent::Negotiation { source, event });
         };
@@ -3216,6 +3164,7 @@ impl HostService {
                 committed,
                 actor_execution_key,
                 execution_store,
+                replay: false,
             },
         )
         .await?;
@@ -3234,6 +3183,7 @@ impl HostService {
             committed,
             actor_execution_key,
             execution_store,
+            replay,
         } = plan;
         let exec_id = entry.exec_id();
         let params = JsonBytes::try_new(params)
@@ -3255,13 +3205,16 @@ impl HostService {
             spawned,
             events: self.events.clone(),
             transport: Arc::clone(&self.transport),
+            session: None,
+            replay,
         });
 
         // The post-commit relay: session-lived, re-emits the final offer and
         // the exact tickets on the program topic and serves the convergence
         // fetch from the committed ActivationRecord. The creator is the
-        // convergence authority: only it relays.
-        if self.peer_id == committed.activation().offer().data().creator {
+        // convergence authority: only it relays. An end wake resumes a
+        // session that already ended, so it has nothing to relay.
+        if !replay && self.peer_id == committed.activation().offer().data().creator {
             let relay = Arc::clone(self);
             self.tasks
                 .lock()
@@ -3275,7 +3228,7 @@ impl HostService {
     async fn submit(
         &self,
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
         answer: Option<serde_json::Value>,
     ) -> Response {
         let request = self
@@ -3337,28 +3290,25 @@ impl HostService {
     async fn pending_callout_index(
         &self,
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
     ) -> Result<Option<u32>, ApiError> {
         Ok(self
             .store
-            .list_pending_requests(exec_id)
+            .load_execution(exec_id)
             .await
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
-            .into_iter()
-            .find_map(|request| match request {
-                arena0_store::PendingRequest::Callout {
-                    pending_id: id,
-                    callout_index,
-                    ..
-                } if id == pending_id => Some(callout_index),
-                _ => None,
+            .and_then(|state| {
+                state
+                    .callout()
+                    .filter(|callout| callout.id == pending_id)
+                    .map(|callout| callout.callout_index)
             }))
     }
 
     async fn reclassify_submit_failure(
         &self,
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
         error: ApiError,
     ) -> ApiError {
         match self.pending_callout_index(exec_id, pending_id).await {
@@ -3448,23 +3398,15 @@ impl HostService {
                 .load_program(state.binding().program_hash())
                 .await
                 .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
-            let ensemble = arena0_protocol::Ensemble::from_peers(
-                state
-                    .binding()
-                    .activation()
-                    .tickets()
-                    .iter()
-                    .map(|ticket| ticket.data.signer)
-                    .collect(),
-            )
-            .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
+            let ensemble = state
+                .binding()
+                .ensemble()
+                .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
             let engine = Arc::clone(&self.engine);
-            let step = state.public().next_step();
+            let step = state.agreed_step();
             let shared = state.shared_state().clone();
             let projection = tokio::task::spawn_blocking(move || {
-                engine
-                    .load(&program)?
-                    .view(ViewCall::new(shared, ensemble, viewport))
+                engine.load(&program)?.view(&shared, &ensemble, viewport)
             })
             .await
             .map_err(|error| ApiError::new(ApiErrorCode::Internal, error.to_string()))?
@@ -3514,11 +3456,7 @@ impl HostService {
 
     /// Verify and persist a foreign receipt as an immutable artifact.
     async fn import_receipt(&self, receipt: ReceiptArtifact) -> Response {
-        let receipt_bytes = receipt
-            .encode()
-            .map_err(|error| ApiError::new(ApiErrorCode::Verification, error.to_string()))?;
-        verify_light(&receipt_bytes)
-            .map_err(|e| ApiError::new(ApiErrorCode::Verification, format!("light: {e:?}")))?;
+        // Deserialization authenticated the artifact.
         let receipt_id = receipt.receipt_id();
         self.store
             .import_receipt(receipt, unix_time_ms())
@@ -3547,72 +3485,10 @@ impl HostService {
             .ok_or_else(|| ApiError::new(ApiErrorCode::NotFound, "no such receipt or stop report"))
     }
 
-    /// Verify a receipt and return its evidence: light by default, full on request.
-    async fn verify(&self, receipt: ReceiptRef, full: bool) -> Response {
+    /// Verify a receipt and return its portable structural evidence.
+    async fn verify(&self, receipt: ReceiptRef) -> Response {
         let receipt = self.resolve_receipt(receipt).await?;
-        let receipt_bytes = receipt
-            .encode()
-            .map_err(|error| ApiError::new(ApiErrorCode::Verification, error.to_string()))?;
-        let light = verify_light(&receipt_bytes)
-            .map_err(|e| ApiError::new(ApiErrorCode::Verification, format!("light: {e:?}")))?;
-
-        if full {
-            let program = self
-                .catalog
-                .load_program(light.program_id)
-                .await
-                .map_err(|error| {
-                    ApiError::new(ApiErrorCode::Storage, format!("load program: {error}"))
-                })?;
-            let receipt_bytes = receipt_bytes.clone();
-            let full =
-                tokio::task::spawn_blocking(move || verify_full(program.bytes(), &receipt_bytes))
-                    .await
-                    .map_err(|error| {
-                        ApiError::new(ApiErrorCode::Internal, format!("join: {error}"))
-                    })?
-                    .map_err(|error| {
-                        ApiError::new(ApiErrorCode::Verification, format!("full: {error:?}"))
-                    })?;
-            let terminal = match full.terminal {
-                arena0_verify::VerifiedTerminal::Completed {
-                    outcome_borsh,
-                    outcome_json,
-                } => FullVerifiedTerminal::Completed {
-                    outcome_borsh,
-                    outcome_json: schema::decode_guest_json(
-                        outcome_json.as_bytes(),
-                        "verified outcome",
-                    )?,
-                },
-                arena0_verify::VerifiedTerminal::Stopped { cause } => {
-                    FullVerifiedTerminal::Stopped { cause }
-                }
-            };
-            return Ok(ResponseOk::Verified {
-                receipt_id: receipt.receipt_id(),
-                program_id: light.program_id,
-                session_id: light.session_id,
-                ensemble: light.ensemble,
-                steps: light.steps,
-                result: VerifiedResult::Full { terminal },
-            });
-        }
-
-        let terminal = match light.terminal {
-            VerifiedLightTerminal::Completed { outcome_borsh } => {
-                LightVerifiedTerminal::Completed { outcome_borsh }
-            }
-            VerifiedLightTerminal::Stopped { cause } => LightVerifiedTerminal::Stopped { cause },
-        };
-        Ok(ResponseOk::Verified {
-            receipt_id: receipt.receipt_id(),
-            program_id: light.program_id,
-            session_id: light.session_id,
-            ensemble: light.ensemble,
-            steps: light.steps,
-            result: VerifiedResult::Light { terminal },
-        })
+        Ok(ResponseOk::Verified(receipt.summary()))
     }
 }
 
@@ -3621,93 +3497,75 @@ fn project_exec_status_facts(
     request: ExecutionRequest,
     activation: Option<ActivationRecord>,
     state: Option<arena0_protocol::execution::ExecutionState>,
-    pending: Option<arena0_store::PendingRequest>,
     receipt_available: bool,
 ) -> anyhow::Result<ExecStatus> {
     let exec_id = request.execution_id();
     let program_id = request.program_hash();
     let negotiation_id = request.negotiation_id();
-    let pending_callout = pending.and_then(|request| match request {
-        arena0_store::PendingRequest::Callout {
-            pending_id,
-            callout_index,
-            expected_type,
-            ..
-        } => Some(PendingCalloutStatus {
-            pending_id,
-            callout_index,
-            expected_type,
-        }),
-        arena0_store::PendingRequest::Signature { .. } => None,
-    });
     let session_status = |state: &arena0_protocol::execution::ExecutionState| {
-        let activation = state.binding().activation();
+        let binding = state.binding();
         SessionStatus {
-            session_id: state.binding().session_id(),
-            step: state.public().next_step(),
-            peers: activation
-                .tickets()
-                .iter()
-                .map(|ticket| ticket.data.signer)
+            session_id: binding.session_id(),
+            step: state.agreed_step(),
+            peers: binding
+                .participants()
                 .filter(|peer| *peer != peer_id)
                 .collect(),
-            participants: activation.tickets().len(),
-            pending_callout: pending_callout.clone(),
+            participants: binding.activation().tickets().len(),
+            pending_callout: state.callout().map(|callout| PendingCalloutStatus {
+                pending_id: callout.id,
+                callout_index: callout.callout_index,
+            }),
             receipt_available,
         }
     };
 
-    let state = match state {
-        Some(state) => match state.status() {
-            ExecutionStatus::Activating => ExecStatusState::Activating {
-                session_id: Some(state.binding().session_id()),
-            },
-            ExecutionStatus::Active
-            | ExecutionStatus::Waiting { .. }
-            | ExecutionStatus::TerminalProof { .. } => ExecStatusState::Active {
-                session: session_status(&state),
-            },
-            ExecutionStatus::Completed { .. } => ExecStatusState::Completed {
-                session: session_status(&state),
-            },
-            ExecutionStatus::Stopped { cause }
-            | ExecutionStatus::StoppedPublished { cause, .. } => {
-                if cause.kind() == arena0_protocol::AbortKind::Abort {
-                    ExecStatusState::Aborted {
-                        session: session_status(&state),
-                    }
-                } else {
-                    ExecStatusState::Failed {
-                        session: Some(SessionProgress::Started {
-                            session: session_status(&state),
-                        }),
-                    }
-                }
-            }
-            ExecutionStatus::Incomplete { .. } => ExecStatusState::Failed {
-                session: Some(SessionProgress::Started {
-                    session: session_status(&state),
-                }),
-            },
-        },
-        None if request.failure().is_some() => ExecStatusState::Failed {
-            session: activation.as_ref().and_then(|record| {
-                record.is_committed().then(|| SessionProgress::Activated {
-                    session_id: record.session_id(),
-                })
-            }),
-        },
-        None if activation.is_some() => ExecStatusState::Activating {
-            // A prepared activation fixes a candidate hash but is not yet a
-            // formed session. Expose the SessionHash only after commit.
-            session_id: activation
-                .and_then(|record| record.is_committed().then(|| record.session_id())),
-        },
-        None => ExecStatusState::Negotiating {
+    let end = state
+        .as_ref()
+        .map(|state| arena0_api::ExecEndStatus::from(state.end_phase()))
+        .unwrap_or_default();
+    // A prepared activation fixes a candidate hash but is not yet a formed
+    // session. Expose the SessionHash only after commit.
+    let committed_session = activation
+        .as_ref()
+        .and_then(|record| record.is_committed().then(|| record.session_id()));
+    let lifecycle = project_lifecycle(
+        request.failure().is_some(),
+        activation.as_ref(),
+        state.as_ref(),
+    );
+    let state = match (lifecycle, state) {
+        (ExecLifecycle::Negotiating, _) => ExecStatusState::Negotiating {
             queue_position: None,
         },
+        (ExecLifecycle::Activating, state) => ExecStatusState::Activating {
+            session_id: state
+                .map(|state| state.binding().session_id())
+                .or(committed_session),
+        },
+        (ExecLifecycle::Waiting | ExecLifecycle::Active, Some(state)) => ExecStatusState::Active {
+            session: session_status(&state),
+        },
+        (ExecLifecycle::Completed, Some(state)) => ExecStatusState::Completed {
+            session: session_status(&state),
+        },
+        (ExecLifecycle::Aborted, Some(state)) => ExecStatusState::Aborted {
+            session: session_status(&state),
+        },
+        (ExecLifecycle::Failed, Some(state)) => ExecStatusState::Failed {
+            session: Some(SessionProgress::Started {
+                session: session_status(&state),
+            }),
+        },
+        (ExecLifecycle::Failed, None) => ExecStatusState::Failed {
+            session: committed_session.map(|session_id| SessionProgress::Activated { session_id }),
+        },
+        (lifecycle, None) => {
+            anyhow::bail!("{lifecycle:?} execution {exec_id} has no execution aggregate")
+        }
     };
     Ok(ExecStatus {
+        end,
         exec_id,
         negotiation_id,
         program_id,
@@ -3718,15 +3576,15 @@ fn project_exec_status_facts(
 fn empty_execution_inspection(
     status: ExecStatus,
     activation: Option<ActivationInspection>,
-    private_from: u64,
+    events_from: u64,
 ) -> ExecutionInspection {
     ExecutionInspection {
         status,
         activation,
-        private_from,
-        private: Vec::new(),
-        private_total: 0,
-        private_next: None,
+        events_from,
+        events: Vec::new(),
+        events_total: 0,
+        events_next: None,
     }
 }
 
@@ -3756,108 +3614,28 @@ fn project_activation_inspection(record: ActivationRecord) -> ActivationInspecti
     }
 }
 
-fn project_private_commit_summary(
-    summary: StorePrivateCommitSummary,
-) -> Result<ApiPrivateCommitSummary, ApiError> {
-    let input_payload_bytes = summary
-        .input_payload_bytes
-        .map(u64::try_from)
-        .transpose()
-        .map_err(|_| ApiError::new(ApiErrorCode::Internal, "private input size overflows u64"))?;
-    let effects = summary
-        .effects
-        .into_iter()
-        .map(|effect| {
-            let payload_bytes = effect
-                .payload_bytes
-                .map(u64::try_from)
-                .transpose()
-                .map_err(|_| {
-                    ApiError::new(ApiErrorCode::Internal, "private effect size overflows u64")
-                })?;
-            Ok(ApiPrivateEffectSummary {
-                kind: match effect.kind {
-                    arena0_store::PrivateEffectKind::Broadcast => ApiPrivateEffectKind::Broadcast,
-                    arena0_store::PrivateEffectKind::Callout => ApiPrivateEffectKind::Callout,
-                    arena0_store::PrivateEffectKind::SetTimer => ApiPrivateEffectKind::SetTimer,
-                    arena0_store::PrivateEffectKind::Sign => ApiPrivateEffectKind::Sign,
-                    arena0_store::PrivateEffectKind::RetryInput => ApiPrivateEffectKind::RetryInput,
-                },
-                payload_bytes,
-            })
-        })
-        .collect::<Result<Vec<_>, ApiError>>()?;
-    Ok(ApiPrivateCommitSummary {
-        sequence: summary.sequence,
-        public_position: summary.public_position,
-        event: match summary.event {
-            arena0_store::PrivateEventKind::InputReceived => ApiPrivateEventKind::InputReceived,
-            arena0_store::PrivateEventKind::TimerFired => ApiPrivateEventKind::TimerFired,
-            arena0_store::PrivateEventKind::TypedTimerFired => ApiPrivateEventKind::TypedTimerFired,
-            arena0_store::PrivateEventKind::Signed => ApiPrivateEventKind::Signed,
-            arena0_store::PrivateEventKind::React => ApiPrivateEventKind::React,
-        },
-        input_payload_bytes,
-        effects,
-        fuel_used: summary.fuel_used,
-    })
+fn project_event_record_summary(summary: StoreEventRecordSummary) -> ApiEventRecordSummary {
+    ApiEventRecordSummary {
+        event_position: summary.event_position,
+        agreed_steps: summary.agreed_steps,
+        event: summary.event,
+        input_payload_bytes: summary.input_payload_bytes,
+        effects: summary.effects,
+    }
 }
 
 fn receipt_list_entry(stored: arena0_store::StoredReceipt) -> arena0_api::ReceiptListEntry {
-    let provenance = match stored.provenance() {
-        arena0_store::ReceiptProvenance::Produced => arena0_api::ReceiptProvenance::Produced,
-        arena0_store::ReceiptProvenance::Imported => arena0_api::ReceiptProvenance::Imported,
-        arena0_store::ReceiptProvenance::Both => arena0_api::ReceiptProvenance::Both,
-    };
+    let provenance = stored.provenance();
     arena0_api::ReceiptListEntry {
         receipt_id: hex::encode(stored.receipt_id.as_bytes()),
         session_id: stored.receipt.body().header().session_hash(),
         kind: stored.receipt.kind(),
         program_id: stored.receipt.body().header().program_hash(),
-        completed: stored
-            .receipt
-            .body()
-            .header()
-            .terminal
-            .completed()
-            .is_some(),
+        completed: matches!(
+            stored.receipt.body().termination(),
+            arena0_protocol::ReceiptTermination::Completed
+        ),
         provenance,
-    }
-}
-
-/// Run a blocking store call off the async runtime, mapping errors to `ApiError`.
-async fn blocking<T, F, E>(f: F) -> Result<T, ApiError>
-where
-    F: FnOnce() -> Result<T, E> + Send + 'static,
-    E: Into<ApiError> + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| ApiError::new(ApiErrorCode::Internal, format!("join: {e}")))?
-        .map_err(Into::into)
-}
-
-impl From<KeystoreError> for ApiError {
-    fn from(error: KeystoreError) -> Self {
-        match error {
-            KeystoreError::NotFound { reference } => Self::new(
-                ApiErrorCode::NotFound,
-                format!("no identity matches {reference:?}"),
-            ),
-            KeystoreError::Ambiguous { reference, matches } => Self::new(
-                ApiErrorCode::Ambiguous,
-                format!(
-                    "identity reference '{reference}' is ambiguous: {matches} identities match"
-                ),
-            ),
-            KeystoreError::InvalidLabel(message) => Self::new(ApiErrorCode::BadRequest, message),
-            KeystoreError::ActiveIdentityRemoval => Self::new(
-                ApiErrorCode::BadRequest,
-                "cannot remove the active Host identity; rotate it through a lifecycle-aware operation",
-            ),
-            KeystoreError::Storage(error) => Self::new(ApiErrorCode::Storage, error.to_string()),
-        }
     }
 }
 
@@ -3936,14 +3714,20 @@ impl HostService {
                 return;
             }
         };
+        if entry
+            .lifecycle()
+            .await
+            .is_ok_and(ExecLifecycle::is_terminal)
+        {
+            return;
+        }
         let mut fetch_rx = self.runtime.register_fetch_handler(session_hash);
         let bootstrap = committed
             .activation()
-            .tickets()
-            .iter()
-            .map(|ticket| ticket.data.signer)
+            .prepared()
+            .signers()
             .collect::<Vec<_>>();
-        let topic = match self
+        let mut topic = match self
             .subscribe_negotiation(program_id, bootstrap.clone())
             .await
         {
@@ -3953,15 +3737,6 @@ impl HostService {
                 None
             }
         };
-        if entry
-            .lifecycle()
-            .await
-            .is_ok_and(ExecLifecycle::is_terminal)
-        {
-            self.runtime.unregister_fetch_handler(session_hash);
-            return;
-        }
-        let mut topic = topic;
         let mut cadence = tokio::time::interval(Duration::from_millis(RELAY_CADENCE_MS));
         loop {
             tokio::select! {
@@ -4064,29 +3839,13 @@ impl HostService {
 
 fn recovery_event_source(peer_id: PeerId, candidate: &RecoveryCandidate) -> EventSource {
     let request = candidate.request();
-    match (candidate.has_execution(), candidate.session_id()) {
-        (true, Some(session_hash)) => EventSource::Session {
-            peer_id,
-            exec_id: request.execution_id(),
-            program_id: request.program_hash(),
-            session_hash,
-        },
-        _ => match request.negotiation_id() {
-            Some(negotiation_id) => EventSource::Negotiation {
-                peer_id,
-                exec_id: request.execution_id(),
-                program_id: request.program_hash(),
-                negotiation_id,
-            },
-            // An open Join may fail before any offer is accepted, so no
-            // negotiation identity exists for its recovery event.
-            None => EventSource::Execution {
-                peer_id,
-                exec_id: request.execution_id(),
-                program_id: request.program_hash(),
-            },
-        },
-    }
+    EventSource::most_specific(
+        peer_id,
+        request.execution_id(),
+        request.program_hash(),
+        request.negotiation_id(),
+        candidate.session_id().filter(|_| candidate.has_execution()),
+    )
 }
 
 fn recovery_reason(reason: String) -> String {
@@ -4184,44 +3943,6 @@ async fn offer_is_usable_for_join(
         && deadline.is_none_or(|deadline| Instant::now() < deadline)
 }
 
-/// Wire negotiation's durable boundaries directly to the supplied execution
-/// writer. No daemon aggregate or callback-side state is retained.
-fn activation_callbacks() -> (
-    arena0_node::PrepareEffect,
-    arena0_node::PersistActivationEffect,
-) {
-    let prepare: arena0_node::PrepareEffect = Box::new(|store, prepared| {
-        Box::pin(async move {
-            match store.prepare_activation(prepared, unix_time_ms()).await {
-                Ok(
-                    arena0_store::PrepareActivationOutcome::Prepared(_)
-                    | arena0_store::PrepareActivationOutcome::AlreadyPrepared(_)
-                    | arena0_store::PrepareActivationOutcome::AlreadyCommitted(_),
-                ) => Ok(PrepareOutcome::Accepted),
-                Ok(arena0_store::PrepareActivationOutcome::Conflict { .. }) => {
-                    Ok(PrepareOutcome::Conflict)
-                }
-                Err(error) => Err(error.to_string()),
-            }
-        })
-    });
-    let persist_activation: arena0_node::PersistActivationEffect = Box::new(|store, activation| {
-        Box::pin(async move {
-            match store.commit_activation(activation, unix_time_ms()).await {
-                Ok(
-                    arena0_store::CommitActivationOutcome::Committed(_)
-                    | arena0_store::CommitActivationOutcome::AlreadyCommitted(_),
-                ) => Ok(DurableOutcome::Accepted),
-                Ok(arena0_store::CommitActivationOutcome::Conflict { .. }) => {
-                    Ok(DurableOutcome::Conflict)
-                }
-                Err(error) => Err(error.to_string()),
-            }
-        })
-    });
-    (prepare, persist_activation)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4229,8 +3950,9 @@ mod tests {
     use arena0_crypto::bls::BlsSecretKey;
     use arena0_crypto::{BlsSignature, SecretKey, key_binding_message};
     use arena0_program::{LocalStateBytes, SharedStateBytes};
-    use arena0_protocol::execution::{ExecutionInput, ExecutionState};
+    use arena0_protocol::execution::ExecutionState;
     use arena0_protocol::{AbortKind, Activation, ActivationData, PreparedActivation};
+    use arena0_test_engine::shared_test_engine;
     use arena0_transport::local::{LocalNetwork, LocalTransport};
 
     fn test_daemon() -> (
@@ -4242,21 +3964,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let keys = dir.path().join("keys");
         std::fs::create_dir_all(&keys).unwrap();
-        let keystore = Arc::new(Keystore::open(keys).unwrap());
-        let identity = keystore.new_identity(Some("host-01".into())).unwrap();
+        let keystore = Arc::new(Keystore::create(keys).unwrap());
+        let peer_id = keystore.peer_id();
 
         let store = arena0_store::Store::open(arena0_store::StoreConfig::new(
             dir.path().join("arena0.sqlite"),
-            identity.peer_id,
+            peer_id,
         ))
         .unwrap();
         let store_handle = store.handle().clone();
         let catalog = ProgramCatalog::new(store_handle.clone());
-        let engine = Arc::new(WasmtimeEngine::new().unwrap());
+        let engine = shared_test_engine();
 
         let network = LocalNetwork::new();
         let mut transports =
-            LocalTransport::create_network(&network, vec![identity.peer_id]).expect("test network");
+            LocalTransport::create_network(&network, vec![peer_id]).expect("test network");
         let daemon = HostService::start(HostServiceInit {
             name: "host-01".into(),
             transport: Arc::new(transports.remove(0)),
@@ -4267,7 +3989,7 @@ mod tests {
             startup: Arc::new(StartupTimeline::new(1, 0)),
         })
         .unwrap();
-        (dir, store, daemon, identity.peer_id)
+        (dir, store, daemon, peer_id)
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4284,26 +4006,30 @@ mod tests {
     }
 
     #[test]
-    fn private_inspection_projection_has_no_private_payload_fields() {
-        let summary = arena0_store::PrivateCommitSummary {
-            sequence: 4,
-            public_position: 3,
-            event: arena0_store::PrivateEventKind::InputReceived,
+    fn event_inspection_projection_has_no_payload_fields() {
+        let summary = arena0_store::EventRecordSummary {
+            event_position: 4,
+            agreed_steps: vec![3],
+            event: arena0_store::EventKind::InputReceived,
             input_payload_bytes: Some(2),
-            effects: vec![arena0_store::PrivateEffectSummary {
-                kind: arena0_store::PrivateEffectKind::Callout,
+            effects: vec![arena0_store::EffectSummary {
+                kind: arena0_store::EffectKind::Broadcast,
                 payload_bytes: Some(8),
             }],
-            fuel_used: 17,
         };
-        let projected = project_private_commit_summary(summary).expect("projection");
-        assert_eq!(projected.sequence, 4);
-        assert_eq!(projected.public_position, 3);
-        assert_eq!(projected.event, ApiPrivateEventKind::InputReceived);
+        let projected = project_event_record_summary(summary);
+        assert_eq!(projected.event_position, 4);
+        assert_eq!(projected.agreed_steps, vec![3]);
+        assert_eq!(projected.event, arena0_api::EventKind::InputReceived);
         assert_eq!(projected.input_payload_bytes, Some(2));
-        assert_eq!(projected.effects[0].kind, ApiPrivateEffectKind::Callout);
+        assert_eq!(projected.effects[0].kind, arena0_api::EffectKind::Broadcast);
         assert_eq!(projected.effects[0].payload_bytes, Some(8));
         let encoded = serde_json::to_value(projected).expect("projection JSON");
+        assert_eq!(encoded["event"], "input_received");
+        assert_eq!(
+            encoded["effects"],
+            serde_json::json!([{ "kind": "broadcast", "payload_bytes": 8 }])
+        );
         assert!(encoded.get("data").is_none());
         assert!(encoded.get("context").is_none());
         assert!(encoded.get("signature").is_none());
@@ -4394,16 +4120,13 @@ mod tests {
             reason: Some("filtered".into()),
             uptime_secs: 1,
         });
-        daemon.events.emit(HostEvent::Created {
-            source: EventSource::Execution {
-                peer_id: daemon.peer_id,
-                exec_id,
-                program_id: ProgramHash([0xA2; 32]),
-            },
-            negotiation_id: None,
-            queue_position: None,
-            origin: ExecCreationOrigin::Request,
-        });
+        daemon.emit_created(
+            exec_id,
+            ProgramHash([0xA2; 32]),
+            None,
+            None,
+            ExecCreationOrigin::Request,
+        );
 
         let received: EventFrame =
             tokio::time::timeout(Duration::from_secs(1), frame::read_frame(&mut client_read))
@@ -4797,8 +4520,8 @@ mod tests {
         match daemon
             .dispatch(HostRequest::ExecInspect {
                 exec_id,
-                private_from: Some(0),
-                private_limit: MAX_PRIVATE_INSPECTION_RECORDS as u16,
+                events_from: Some(0),
+                events_limit: MAX_EVENT_INSPECTION_RECORDS as u16,
             })
             .await
         {
@@ -4806,9 +4529,9 @@ mod tests {
                 assert_eq!(inspection.status.exec_id, exec_id);
                 assert_eq!(inspection.status.lifecycle(), ExecLifecycle::Failed);
                 assert!(inspection.activation.is_none());
-                assert!(inspection.private.is_empty());
-                assert_eq!(inspection.private_total, 0);
-                assert_eq!(inspection.private_next, None);
+                assert!(inspection.events.is_empty());
+                assert_eq!(inspection.events_total, 0);
+                assert_eq!(inspection.events_next, None);
             }
             other => panic!("expected exec.inspect, got {other:?}"),
         }
@@ -4816,8 +4539,8 @@ mod tests {
             daemon
                 .dispatch(HostRequest::ExecInspect {
                     exec_id,
-                    private_from: Some(0),
-                    private_limit: (MAX_PRIVATE_INSPECTION_RECORDS + 1) as u16,
+                    events_from: Some(0),
+                    events_limit: (MAX_EVENT_INSPECTION_RECORDS + 1) as u16,
                 })
                 .await,
             Err(ApiError {
@@ -4829,8 +4552,8 @@ mod tests {
             daemon
                 .dispatch(HostRequest::ExecInspect {
                     exec_id,
-                    private_from: Some(0),
-                    private_limit: 0,
+                    events_from: Some(0),
+                    events_limit: 0,
                 })
                 .await,
             Err(ApiError {
@@ -4912,18 +4635,67 @@ mod tests {
         daemon.stop().await;
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn recovery_fails_unrecoverable_committed_execution_durably() {
-        let (_dir, store, daemon, peer) = test_daemon();
-        let program_bytes = vec![1, 2, 3];
-        let (program_hash, _) = store
-            .handle()
-            .register_program(program_bytes, 1)
+    /// A committed two-party activation created by the test daemon's Host,
+    /// with the fixed BLS execution keys both participants signed with.
+    struct TwoPartyActivation {
+        other: PeerId,
+        producer_bls: BlsSecretKey,
+        other_bls: BlsSecretKey,
+        prepared: PreparedActivation,
+        activation: Activation,
+    }
+
+    /// Claim `execution_id` and durably record the creator's
+    /// request and `prepared`, as negotiation does before signing.
+    async fn record_prepared(
+        daemon: &HostService,
+        execution_id: ExecId,
+        prepared: PreparedActivation,
+    ) -> HostExecutionStore {
+        let offer = prepared.offer().data();
+        let (program_hash, params) = (offer.program_hash, offer.params.clone());
+        let admission =
+            ExecutionAdmission::create(offer.negotiation_id, offer.target_size).expect("admission");
+        let mut writer = daemon.runtime.claim_execution(execution_id).unwrap();
+        writer
+            .create_execution_request(program_hash, Some(params), admission, 1)
             .await
-            .expect("program");
-        let execution_id = ExecId([0xA4; 32]);
-        let negotiation_id = NegotiationId([0xA5; 32]);
+            .expect("request");
+        writer
+            .prepare_activation(prepared, 2)
+            .await
+            .expect("prepare");
+        writer
+    }
+
+    /// Commit `activation` and create its execution aggregate from the
+    /// initial state images.
+    async fn commit_execution(
+        writer: &mut HostExecutionStore,
+        activation: Activation,
+        producer: PeerId,
+        shared: SharedStateBytes,
+        local: LocalStateBytes,
+    ) {
+        writer
+            .commit_activation(activation.clone(), 3)
+            .await
+            .expect("commit");
+        writer
+            .create_execution(activation, producer, shared, local, 4)
+            .await
+            .expect("execution");
+    }
+
+    fn two_party_activation(
+        daemon: &HostService,
+        peer: PeerId,
+        program_hash: ProgramHash,
+        negotiation_id: NegotiationId,
+        initial_shared: &SharedStateBytes,
+    ) -> TwoPartyActivation {
         let other_keys = NodeKeys::from_secret(SecretKey::from_bytes([2; 32]));
+        let other = PeerId::from_ed25519(&other_keys.ed25519_public_key());
         let producer_bls = BlsSecretKey::from_seed(&[11; 32]).expect("producer bls");
         let other_bls = BlsSecretKey::from_seed(&[12; 32]).expect("other bls");
         let offer_data = OfferData::new(
@@ -4934,7 +4706,7 @@ mod tests {
             arena0_program::ExecutionProfile::current().hash(),
             JsonBytes::try_new(b"null".to_vec()).expect("params"),
             2,
-            StateHash::of(&[0]),
+            StateHash::of_shared(initial_shared),
             u64::MAX,
         )
         .expect("offer");
@@ -4983,28 +4755,347 @@ mod tests {
         let offer = Offer::new(offer_data, ticket_hashes).expect("offer");
         let prepared = PreparedActivation::new(offer, tickets).expect("prepared");
         let activation = Activation::new(prepared.clone(), aggregate).expect("activation");
-        let mut writer = daemon.runtime.claim_execution(execution_id).unwrap();
-        writer
-            .create_execution_request(
-                program_hash,
-                Some(JsonBytes::try_new(b"null".to_vec()).expect("params")),
-                ExecutionAdmission::create(negotiation_id, 2).expect("admission"),
-                1,
-            )
+        TwoPartyActivation {
+            other,
+            producer_bls,
+            other_bls,
+            prepared,
+            activation,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn certified_execution_is_active_until_its_receipt_is_published() {
+        use arena0_protocol::{Effect, Event, ParticipantStepSignature, TerminalOutcome};
+        use arena0_store::{Change, TransitionRecord};
+
+        let (_dir, store, daemon, peer) = test_daemon();
+        let (program_hash, _) = store
+            .handle()
+            .register_program(vec![1, 2, 3], 1)
             .await
-            .expect("request");
+            .expect("program");
+        let execution_id = ExecId([0xB4; 32]);
+        let negotiation_id = NegotiationId([0xB5; 32]);
+        let initial_shared = SharedStateBytes::try_new(vec![0]).expect("shared state");
+        let TwoPartyActivation {
+            other,
+            producer_bls,
+            other_bls,
+            prepared,
+            activation,
+        } = two_party_activation(&daemon, peer, program_hash, negotiation_id, &initial_shared);
+        let mut writer = record_prepared(&daemon, execution_id, prepared).await;
+        commit_execution(
+            &mut writer,
+            activation,
+            peer,
+            initial_shared,
+            LocalStateBytes::try_new(Vec::new()).expect("local state"),
+        )
+        .await;
+        drop(writer);
+
+        // Certify a session-start step that ends the session, leaving the
+        // receipt unpublished.
+        let mut writer = store.handle().claim_execution(execution_id).unwrap();
+        let mut state = writer.load_execution().await.unwrap().unwrap();
+        let mut next = state.clone();
+        next.activate().expect("activate");
         writer
-            .prepare_activation(prepared, 2)
+            .persist(TransitionRecord {
+                expected: state.version(),
+                next: next.clone(),
+                change: Change::State,
+                now_ms: 5,
+            })
             .await
-            .expect("prepare");
+            .expect("persist activation");
+        state = next;
+        let event = Event::SessionStarted {
+            ensemble: state.binding().ensemble().expect("ensemble"),
+        };
+        let effects = vec![Effect::SessionEnd {
+            outcome: Vec::new(),
+        }];
+        let mut next = state.clone();
+        next.apply_dispatch(
+            &event,
+            SharedStateBytes::try_new(vec![1]).expect("next shared"),
+            LocalStateBytes::try_new(Vec::new()).expect("local state"),
+            &effects,
+            Some(TerminalOutcome::new(Vec::new(), b"null".to_vec()).expect("outcome")),
+            None,
+            None,
+        )
+        .expect("dispatch");
+        writer
+            .persist(TransitionRecord {
+                expected: state.version(),
+                next: next.clone(),
+                change: Change::Dispatch {
+                    event,
+                    effects,
+                    timer_id: None,
+                },
+                now_ms: 5,
+            })
+            .await
+            .expect("persist proposal");
+        state = next;
+        let commitment = state.proposal_commitment().expect("proposal");
+        for (signer, key) in [(peer, &producer_bls), (other, &other_bls)] {
+            let mut next = state.clone();
+            let certified = next
+                .add_step_signature(ParticipantStepSignature::new(
+                    signer,
+                    commitment.step,
+                    key.sign(&commitment.signing_bytes()),
+                ))
+                .expect("step signature");
+            writer
+                .persist(TransitionRecord {
+                    expected: state.version(),
+                    next: next.clone(),
+                    change: Change::StepSignature { certified },
+                    now_ms: 6,
+                })
+                .await
+                .expect("persist signature");
+            state = next;
+        }
+        assert!(matches!(
+            state.status(),
+            arena0_protocol::ExecutionStatus::Certified { .. }
+        ));
+        drop(writer);
+
+        // The status projection and the active count agree: certification
+        // stays active until the receipt is published.
+        match daemon
+            .dispatch(HostRequest::ExecStatus {
+                exec_id: execution_id,
+            })
+            .await
+        {
+            Ok(ResponseOk::Status(status)) => {
+                assert_eq!(status.lifecycle(), ExecLifecycle::Active);
+            }
+            other => panic!("expected exec.status, got {other:?}"),
+        }
+        assert_eq!(
+            daemon
+                .active_execution_count()
+                .await
+                .expect("active execution count"),
+            1
+        );
+        daemon.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_wake_resumes_without_replaying_observations() {
+        use arena0_protocol::AbortOccurrence;
+        use arena0_store::{Change, TransitionRecord};
+
+        let (_dir, store, daemon, peer) = test_daemon();
+        let wasm =
+            std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "../../programs/target/wasm32-unknown-unknown/release/rock_paper_scissors.wasm",
+            ))
+            .expect("built rock_paper_scissors guest; run `just build-programs`");
+        let program = Program::try_from(wasm.clone()).expect("program");
+        let (program_hash, _) = store
+            .handle()
+            .register_program(wasm, 1)
+            .await
+            .expect("program");
+        let params = JsonBytes::try_new(b"null".to_vec()).expect("params");
+        let initialized = daemon
+            .engine
+            .load(&program)
+            .expect("load program")
+            .initialize(params.clone())
+            .expect("initialize program");
+        let execution_id = ExecId([0xC4; 32]);
+        let negotiation_id = NegotiationId([0xC5; 32]);
+        let TwoPartyActivation {
+            other,
+            prepared,
+            activation,
+            ..
+        } = two_party_activation(
+            &daemon,
+            peer,
+            program_hash,
+            negotiation_id,
+            &initialized.shared,
+        );
+        let mut writer = record_prepared(&daemon, execution_id, prepared).await;
+        commit_execution(
+            &mut writer,
+            activation,
+            peer,
+            initialized.shared,
+            initialized.local,
+        )
+        .await;
+        drop(writer);
+
+        // Stop, publish, and close the confirmation window with the other
+        // participant still unconfirmed: the state an end wake resumes.
+        async fn persist(
+            writer: &mut arena0_store::ExecutionStore,
+            state: &mut ExecutionState,
+            next: ExecutionState,
+            change: Change,
+        ) {
+            writer
+                .persist(TransitionRecord {
+                    expected: state.version(),
+                    next: next.clone(),
+                    change,
+                    now_ms: 5,
+                })
+                .await
+                .expect("persist transition");
+            *state = next;
+        }
+        let mut writer = store.handle().claim_execution(execution_id).unwrap();
+        let mut state = writer.load_execution().await.unwrap().unwrap();
+        let mut next = state.clone();
+        next.activate().expect("activate");
+        let unsigned = AbortOccurrence::unsigned(
+            next.binding().session_id(),
+            peer,
+            AbortKind::Abort,
+            0,
+            "operator stop".to_owned(),
+            next.step_cursor(),
+        )
+        .expect("abort occurrence");
+        let signature = daemon
+            .identity
+            .sign(&unsigned.signing_bytes().expect("abort bytes"));
+        next.stop(unsigned.with_signature(signature).expect("signed abort"))
+            .expect("stop");
+        persist(&mut writer, &mut state, next, Change::State).await;
+        let artifact = writer.assemble_receipt(&state).await.expect("receipt");
+        let mut next = state.clone();
+        next.publish_receipt(artifact.clone()).expect("publish");
+        persist(&mut writer, &mut state, next, Change::Publish { artifact }).await;
+        let mut next = state.clone();
+        next.expire_end().expect("expire end");
+        persist(&mut writer, &mut state, next, Change::State).await;
+        assert!(matches!(
+            state.end_phase(),
+            arena0_protocol::EndPhase::Ended { unconfirmed } if unconfirmed.contains(&other)
+        ));
+        drop(writer);
+
+        let replayed = |frame: &EventFrame| {
+            frame.exec_id == Some(execution_id)
+                && matches!(
+                    frame.data,
+                    EventData::Created { .. }
+                        | EventData::SessionStarted { .. }
+                        | EventData::SessionEnded { .. }
+                        | EventData::Terminated { .. }
+                )
+        };
+        let wake = |cause| {
+            let daemon = &daemon;
+            async move {
+                let candidate = daemon
+                    .store
+                    .end_wake_candidate(execution_id)
+                    .await
+                    .expect("load wake candidate")
+                    .expect("ended execution is a wake candidate");
+                let mut events = daemon.events.subscribe();
+                let tasks_before = daemon.tasks.lock().await.len();
+                daemon
+                    .resume_candidate(candidate, cause)
+                    .await
+                    .expect("resume");
+                let spawned_tasks = daemon.tasks.lock().await.len() - tasks_before;
+                assert!(daemon.execs.get(&execution_id).is_some(), "actor resumed");
+                let mut observed = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                    while let Ok(frame) = events.recv().await {
+                        if replayed(&frame) {
+                            observed.push(frame.data);
+                        }
+                    }
+                })
+                .await;
+                daemon.execs.stop().await;
+                (observed, spawned_tasks)
+            }
+        };
+
+        // A peer's wake only finishes end confirmation: no replayed
+        // observations and no session relay for the creator.
+        assert_eq!(wake(ResumeCause::EndWake).await, (Vec::new(), 0));
+        // Startup recovery reports the same execution to a new observer.
+        let (observed, spawned_tasks) = wake(ResumeCause::Startup).await;
+        assert_eq!(
+            spawned_tasks, 1,
+            "startup recovery starts the creator's relay"
+        );
+        assert!(
+            observed
+                .iter()
+                .any(|data| matches!(data, EventData::Created { .. })),
+            "{observed:?}"
+        );
+        assert!(
+            observed
+                .iter()
+                .any(|data| matches!(data, EventData::SessionEnded { .. })),
+            "{observed:?}"
+        );
+        daemon.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovery_fails_unrecoverable_committed_execution_durably() {
+        let (_dir, store, daemon, peer) = test_daemon();
+        let program_bytes = vec![1, 2, 3];
+        let (program_hash, _) = store
+            .handle()
+            .register_program(program_bytes, 1)
+            .await
+            .expect("program");
+        let execution_id = ExecId([0xA4; 32]);
+        let negotiation_id = NegotiationId([0xA5; 32]);
+        let initial_shared = SharedStateBytes::try_new(vec![0]).expect("shared state");
+        let TwoPartyActivation {
+            other,
+            prepared,
+            activation,
+            ..
+        } = two_party_activation(&daemon, peer, program_hash, negotiation_id, &initial_shared);
+        let mut writer = record_prepared(&daemon, execution_id, prepared).await;
+        let request = store
+            .handle()
+            .load_execution_request(execution_id)
+            .await
+            .expect("load prepared request")
+            .expect("prepared request exists");
         let prepared_record = store
             .handle()
             .load_activation(execution_id)
             .await
             .expect("load prepared activation")
             .expect("prepared activation exists");
-        assert_eq!(prepared_record.status(), ActivationRecordStatus::Prepared);
-        let session_id = prepared_record.session_id();
+        let prepared_status =
+            project_exec_status_facts(peer, request.clone(), Some(prepared_record), None, false)
+                .expect("project prepared status");
+        assert!(matches!(
+            prepared_status.state,
+            ExecStatusState::Activating { session_id: None }
+        ));
         writer
             .commit_activation(activation.clone(), 3)
             .await
@@ -5015,17 +5106,78 @@ mod tests {
             .await
             .expect("load committed activation")
             .expect("committed activation exists");
-        assert_eq!(committed_record.status(), ActivationRecordStatus::Committed);
-        assert_eq!(committed_record.session_id(), session_id);
+        let activation_inspection = project_activation_inspection(committed_record.clone());
         assert_eq!(
-            committed_record.prepared().offer().data().negotiation_id,
-            negotiation_id
+            activation_inspection.state,
+            ActivationInspectionState::Committed
         );
+        assert_eq!(
+            activation_inspection.negotiation_id, negotiation_id,
+            "inspection uses the offer's negotiation identity"
+        );
+        assert_eq!(
+            activation_inspection.session_id,
+            Some(activation.session_hash())
+        );
+        assert_eq!(activation_inspection.creator, peer);
+        assert_eq!(activation_inspection.target_size, 2);
+        assert_eq!(activation_inspection.participants.len(), 2);
+        assert_eq!(
+            activation_inspection
+                .participants
+                .iter()
+                .map(|participant| participant.peer_id)
+                .collect::<Vec<_>>(),
+            vec![peer, other]
+        );
+        let committed_status =
+            project_exec_status_facts(peer, request, Some(committed_record.clone()), None, false)
+                .expect("project committed status");
+        assert!(matches!(
+            committed_status.state,
+            ExecStatusState::Activating {
+                session_id: Some(id)
+            } if id == activation.session_hash()
+        ));
+
+        let failed_execution_id = ExecId([0xA6; 32]);
+        let mut failed_writer = daemon
+            .runtime
+            .claim_execution(failed_execution_id)
+            .expect("claim failed request");
+        failed_writer
+            .create_execution_request(
+                program_hash,
+                Some(JsonBytes::try_new(b"null".to_vec()).expect("params")),
+                ExecutionAdmission::create(negotiation_id, 2).expect("admission"),
+                4,
+            )
+            .await
+            .expect("failed request");
+        failed_writer
+            .record_execution_request_failure("recovery failed after commit")
+            .await
+            .expect("record failure");
+        let failed_request = store
+            .handle()
+            .load_execution_request(failed_execution_id)
+            .await
+            .expect("load failed request")
+            .expect("failed request exists");
+        let failed_status =
+            project_exec_status_facts(peer, failed_request, Some(committed_record), None, false)
+                .expect("project post-commit failure");
+        assert!(matches!(
+            failed_status.state,
+            ExecStatusState::Failed {
+                session: Some(SessionProgress::Activated { session_id })
+            } if session_id == activation.session_hash()
+        ));
         let state = ExecutionState::new(
             execution_id,
             activation.clone(),
             peer,
-            SharedStateBytes::try_new(vec![0]).expect("shared state"),
+            initial_shared,
             LocalStateBytes::try_new(Vec::new()).expect("local state"),
         )
         .expect("execution state");
@@ -5039,10 +5191,6 @@ mod tests {
             )
             .await
             .expect("execution");
-        writer
-            .apply_input(ExecutionInput::Activate, 5)
-            .await
-            .expect("activate");
         drop(writer);
 
         daemon.resume_durable().await.expect("recovery");
@@ -5060,25 +5208,6 @@ mod tests {
                 .terminal_cause()
                 .is_some_and(|cause| cause.kind() == AbortKind::Fail)
         );
-        let recovered_request = store
-            .handle()
-            .load_execution_request(execution_id)
-            .await
-            .expect("load recovered request")
-            .expect("recovered request exists");
-        assert_eq!(recovered_request.program_hash(), program_hash);
-        assert_eq!(recovered_request.negotiation_id(), Some(negotiation_id));
-        let recovered_activation = store
-            .handle()
-            .load_activation(execution_id)
-            .await
-            .expect("load recovered activation")
-            .expect("recovered activation exists");
-        assert_eq!(
-            recovered_activation.status(),
-            ActivationRecordStatus::Committed
-        );
-        assert_eq!(recovered_activation.session_id(), session_id);
         assert!(daemon.execs.get(&execution_id).is_none());
         daemon.stop().await;
     }

@@ -151,8 +151,9 @@ pub(crate) fn render_frame(
             participant.fmt_short()
         ),
         EventData::NegotiationPeers { lifecycle, peers } => format!(
-            "{} negotiation {lifecycle:?} ({} peers)",
+            "{} negotiation {} ({} peers)",
             short_exec(event),
+            crate::ui::lifecycle_label(*lifecycle),
             peers.len()
         ),
         EventData::NegotiationPrepared { participants }
@@ -193,7 +194,6 @@ pub(crate) fn render_frame(
             step,
             pre_state,
             post_state,
-            fuel_used,
             signers,
             participants,
         } => {
@@ -203,10 +203,9 @@ pub(crate) fn render_frame(
                 p.yellow("pending")
             };
             format!(
-                "step {step:<4} {}→{}   fuel {}   {}",
+                "step {step:<4} {}→{}   {}",
                 pre_state.fmt_short(),
                 post_state.fmt_short(),
-                fuel(*fuel_used),
                 mark
             )
         }
@@ -247,7 +246,7 @@ fn render_terminal(result: &SessionTerminal, p: Palette) -> String {
                 .unwrap_or_else(|| "(none)".into())
         ),
         SessionTerminal::Aborted { step, reason } => {
-            p.red(&format!("aborted at step {step}: {reason}"))
+            p.red(&format!("stopped at step {step}: {reason}"))
         }
     }
 }
@@ -257,17 +256,6 @@ fn program_label(id: &ProgramHash, names: &HashMap<ProgramHash, String>) -> Stri
         .get(id)
         .cloned()
         .unwrap_or_else(|| id.fmt_short().to_string())
-}
-
-/// Render fuel compactly (e.g. `2.1M`, `950k`, `120`).
-fn fuel(used: u64) -> String {
-    if used >= 1_000_000 {
-        format!("{:.1}M", used as f64 / 1_000_000.0)
-    } else if used >= 1_000 {
-        format!("{:.0}k", used as f64 / 1_000.0)
-    } else {
-        used.to_string()
-    }
 }
 
 async fn current_program(

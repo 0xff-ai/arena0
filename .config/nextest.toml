@@ -5,15 +5,15 @@
 # integration test fails the run instead of stalling it.
 slow-timeout = { period = "60s", terminate-after = 2 }
 
-# The integration suites each boot several daemon/node processes; a handful can
-# run at once on the 24-core raptor runner before the timing windows start to
-# blow (tuned on a 2-core hosted runner with max-threads = 1). Unit tests stay
-# fully parallel.
+# Integration binaries and daemon library tests boot real Hosts with SQLite,
+# transports, and worker threads. Share their concurrency budget: kind(test)
+# alone excludes the MCP and Host-open tests compiled into the library binary.
+# Other library tests remain fully parallel; operation deadlines stay unchanged.
 [test-groups]
 integration = { max-threads = 4 }
 
 [[profile.default.overrides]]
-filter = 'kind(test)'
+filter = 'kind(test) | package(arena0-daemon)'
 test-group = 'integration'
 
 # CI runs show every failure instead of stopping at the first one.

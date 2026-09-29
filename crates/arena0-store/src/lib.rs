@@ -1,91 +1,75 @@
 //! Authoritative per-Host SQLite persistence.
 //!
-//! [`Store`] owns one SQLite connection on one named blocking owner thread.
-//! [`StoreHandle`] is a cloneable, typed asynchronous capability for bounded
-//! registry and receipt-artifact operations plus read projections. The queue
-//! has both an item limit and a byte budget; a command cannot enter the owner
-//! queue until it has reserved its encoded byte cost.
+//! [`Store`] owns one SQLite connection behind a mutex. [`StoreHandle`]
+//! is a cloneable asynchronous capability for registry and receipt-artifact
+//! operations plus read projections. Operations run on the blocking pool and
+//! serialize access to the connection.
 //!
-//! The protocol reducer remains the sole owner of execution-state and commit
-//! plan construction.  This crate only validates, checks lifetime evidence,
-//! performs the SQLite transaction, and materializes the projections that are
-//! needed for recovery and scheduling.
+//! The store owns the SQLite transaction boundaries around flat event
+//! dispatches, shared proposals, signatures, terminal publication, and the
+//! recovery projections needed for scheduling. Protocol constructors remain
+//! authoritative for state and certificate validation.
 
-use arena0_protocol::PendingId;
-use std::collections::{HashMap, HashSet, VecDeque};
+use arena0_protocol::{Effect, Event};
+// Diagnostic kinds are protocol-owned so the local API projects them as is.
+pub use arena0_protocol::{EffectKind, EffectSummary, EventKind, ReceiptProvenance};
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use arena0_crypto::{BlsSignature, ExecutionSalt};
+use arena0_crypto::ExecutionSalt;
 use arena0_program::{JsonBytes, ProgramHash};
 use arena0_protocol::execution::{
-    CommitPlan, DurableEffect, ExecutionInput, ExecutionState, ExecutionVersion, GuestSignData,
-    OccurrenceConflict, OccurrenceDigest, OccurrenceEvidence, OccurrenceKey, OutboxId,
-    ParticipantStepSignature, ParticipantTerminalSignature, ReceiptArtifact, ReceiptId,
-    SharedDelta, TimerId, TimerMutation, TransitionOutcome,
+    ExecutionState, ExecutionStatus, ExecutionVersion, ReceiptArtifact, ReceiptId, TimerId,
 };
 use arena0_protocol::{
-    Activation, ExecFrame, ExecId, ExecLifecycle, ExecutionAdmission, LocalStateBytes, MessageId,
-    NegotiationTarget, PeerId, PreparedActivation, PrivateEffect, PrivateEvent, ProtocolError,
-    SessionHash, SharedStateBytes, StateHash, StepCommitment, TerminalCommitment,
-    WitnessCommitment,
+    Activation, ExecId, ExecLifecycle, ExecutionAdmission, LocalStateBytes, NegotiationTarget,
+    PeerId, PreparedActivation, ProtocolError, SessionHash, SharedStateBytes, TimerPayload,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
-use tokio::sync::{Semaphore, mpsc, oneshot};
 
 mod codec;
 mod database;
 mod lock;
 use codec::*;
-use database::owner_loop;
+use database::Database;
 use lock::{
     OwnerLock, acquire_process_lock, configure_connection, initialize_schema, prepare_database_file,
 };
 
-const SCHEMA_VERSION: u64 = 2;
-const ENVELOPE_VERSION: u16 = 1;
+const SCHEMA_VERSION: u64 = 7;
+const ENVELOPE_VERSION: u16 = 2;
 const ENVELOPE_MAGIC: [u8; 8] = *b"AR0STOR1";
-const ENVELOPE_DOMAIN: &[u8] = b"arena0/store-envelope/v1";
-const DEFAULT_QUEUE_CAPACITY: usize = 64;
-// Command costs include the encoded payload plus a bounded response/metadata
-// allowance. Keep the default at least as large as the largest legal program
-// registration plus that allowance so a valid maximal artifact is admissible.
-const MAX_COMMAND_OVERHEAD: usize = 1_024;
-const DEFAULT_QUEUE_BYTES: usize = arena0_program::PROGRAM_MAX_LEN as usize + MAX_COMMAND_OVERHEAD;
+const ENVELOPE_DOMAIN: &[u8] = b"arena0/store-envelope/v2";
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const DEFAULT_LEASE_DURATION_MS: u64 = 30_000;
-const DEFAULT_RETRY_DELAY_MS: u64 = 1_000;
 const MAX_ERROR_BYTES: usize = 4 * 1024;
 const MAX_ADMISSION_BYTES: usize = 4 * 1024;
-const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ACTIVATION_BYTES: usize = 16 * 1024 * 1024;
+// Timer rows store the complete `TimerPayload` (including the type name), not
+// just its value bytes. Keep the envelope bound large enough for both protocol
+// components plus their Borsh length prefixes.
+const MAX_TIMER_RECORD_BYTES: usize =
+    arena0_protocol::MAX_TIMER_PAYLOAD_BYTES + arena0_protocol::MAX_TERMINAL_REASON_BYTES + 16;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ENVELOPE_OVERHEAD: usize = 8 + 2 + 2 + 4 + 32;
-const EXECUTION_WORKING_SET_BYTES: usize = 64 * 1024 * 1024;
 const MAX_USER_AGENT_BYTES: usize = 256;
-const USER_AGENT_COMMAND_OVERHEAD: usize = 512;
 
-/// Maximum number of private commit summaries returned by one inspection page.
+/// Maximum number of local event summaries returned by one inspection page.
 /// The durable store may contain more records; callers use the returned cursor
 /// to request another bounded page.
-pub const MAX_PRIVATE_INSPECTION_RECORDS: usize = 256;
+pub const MAX_EVENT_INSPECTION_RECORDS: usize = 256;
 
 /// Configuration for one Host-owned SQLite database.
 #[derive(Debug, Clone)]
 pub struct StoreConfig {
     path: PathBuf,
     host_id: PeerId,
-    queue_capacity: usize,
-    queue_bytes: usize,
     busy_timeout: Duration,
-    lease_duration_ms: u64,
-    retry_delay_ms: u64,
 }
 
 impl StoreConfig {
@@ -95,82 +79,9 @@ impl StoreConfig {
         Self {
             path: path.into(),
             host_id,
-            queue_capacity: DEFAULT_QUEUE_CAPACITY,
-            queue_bytes: DEFAULT_QUEUE_BYTES,
             busy_timeout: DEFAULT_BUSY_TIMEOUT,
-            lease_duration_ms: DEFAULT_LEASE_DURATION_MS,
-            retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
         }
     }
-
-    /// Set the maximum number of queued commands.
-    #[must_use]
-    pub const fn with_queue_capacity(mut self, capacity: usize) -> Self {
-        self.queue_capacity = capacity;
-        self
-    }
-
-    /// Set the maximum encoded bytes retained by the command queue.
-    #[must_use]
-    pub const fn with_queue_bytes(mut self, bytes: usize) -> Self {
-        self.queue_bytes = bytes;
-        self
-    }
-
-    /// Set SQLite's busy timeout.
-    #[must_use]
-    pub const fn with_busy_timeout(mut self, timeout: Duration) -> Self {
-        self.busy_timeout = timeout;
-        self
-    }
-
-    /// Set the lease duration used by outbox reservations.
-    pub fn with_lease_duration(self, duration: Duration) -> Result<Self, StoreError> {
-        let millis = u64::try_from(duration.as_millis()).map_err(|_| {
-            StoreError::InvalidConfiguration("lease duration milliseconds must fit u64")
-        })?;
-        Ok(self.with_lease_duration_ms(millis))
-    }
-
-    /// Set the lease duration in milliseconds.
-    #[must_use]
-    pub const fn with_lease_duration_ms(mut self, duration_ms: u64) -> Self {
-        self.lease_duration_ms = duration_ms;
-        self
-    }
-
-    /// Set the fixed delay before a retried outbox item is ready.
-    #[must_use]
-    pub const fn with_retry_delay_ms(mut self, delay_ms: u64) -> Self {
-        self.retry_delay_ms = delay_ms;
-        self
-    }
-
-    fn validate(&self) -> Result<(), StoreError> {
-        if self.queue_capacity == 0 {
-            return Err(StoreError::InvalidConfiguration(
-                "queue capacity must be greater than zero",
-            ));
-        }
-        if self.queue_bytes == 0 {
-            return Err(StoreError::InvalidConfiguration(
-                "queue byte capacity must be greater than zero",
-            ));
-        }
-        if self.queue_bytes > u32::MAX as usize {
-            return Err(StoreError::InvalidConfiguration(
-                "queue byte capacity must fit a semaphore permit count",
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Summary of lease recovery performed while opening or reconciling a store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct RecoveryReport {
-    /// Number of expired outbox leases returned to `pending`.
-    pub expired_outbox_leases: u64,
 }
 
 /// Result of inserting one content-addressed Wasm program.
@@ -242,7 +153,7 @@ impl RecoveryCursor {
     }
 }
 
-/// One execution with unfinished protocol, proof, or outbox work and the
+/// One execution with unfinished protocol, proof, or final-frame delivery work and the
 /// bounded row metadata needed to resume it.
 ///
 /// The store builds this projection from the request, activation, execution,
@@ -452,15 +363,9 @@ pub enum StoreError {
     /// Another process currently owns this database.
     #[error("store database is already owned: {path}")]
     AlreadyOwned { path: PathBuf },
-    /// The owner thread or its connection has closed.
-    #[error("store owner is closed")]
+    /// The store connection has closed or is poisoned.
+    #[error("store is closed")]
     Closed,
-    /// A typed command reply was dropped.
-    #[error("store owner dropped the command reply")]
-    ReplyDropped,
-    /// The owner thread could not be joined.
-    #[error("store owner thread panicked")]
-    OwnerPanicked,
     /// The database does not use the exact schema understood by this crate.
     #[error("unsupported store schema version {0}")]
     UnsupportedSchema(u64),
@@ -489,85 +394,21 @@ pub enum StoreError {
     /// Execution creation requires a committed activation record.
     #[error("activation for execution {0} is not committed")]
     ActivationNotCommitted(ExecId),
-    /// A receipt was not found.
-    #[error("receipt {0:?} was not found")]
-    ReceiptNotFound(ReceiptId),
-    /// The requested outbox occurrence does not exist.
-    #[error("outbox occurrence {0:?} was not found")]
-    OutboxNotFound(OutboxId),
     /// The database contains malformed, tampered, or internally inconsistent data.
     #[error("store corruption: {0}")]
     Corruption(String),
     /// A protocol value failed its construction or validation invariant.
     #[error("protocol error: {0}")]
     Protocol(#[from] ProtocolError),
-    /// A command exceeds the configured byte budget.
-    #[error("store command requires {required} bytes, queue budget is {capacity}")]
-    CommandTooLarge { required: usize, capacity: usize },
+    /// An operation's payload exceeds its size bound.
+    #[error("store payload requires {required} bytes, limit is {capacity}")]
+    PayloadTooLarge { required: usize, capacity: usize },
     /// A store configuration is invalid.
     #[error("invalid store configuration: {0}")]
     InvalidConfiguration(&'static str),
     /// A local admission request does not authorize the proposed activation.
     #[error("invalid execution admission: {0}")]
     InvalidAdmission(String),
-    /// A frame could not be authenticated against its transport source.
-    #[error("inbound frame source is not authenticated: {0}")]
-    UnauthenticatedSource(String),
-    /// A frame was not durably accepted before an input tried to apply it.
-    #[error("inbound frame {0:?} was not durably accepted")]
-    InboxNotAccepted(InboxId),
-    /// An input does not correspond to the selected frame part.
-    #[error("input does not correspond to inbound frame {inbox_id:?} part {part_index}")]
-    InboxInputMismatch { inbox_id: InboxId, part_index: u32 },
-    /// The selected inbound message requires an explicit guest shared delta.
-    #[error("inbound message {0:?} requires explicit message resolution")]
-    InboxMessageNeedsResolution(InboxId),
-    /// The selected inbound frame is not a message and cannot use message resolution.
-    #[error("inbound frame {0:?} is not a message")]
-    InboxNotMessage(InboxId),
-    /// Receipt bodies must be derived from the store's authoritative rows.
-    #[error("receipt bodies must be assembled by the store")]
-    ReceiptBodyRequiresAssembly,
-}
-
-/// Derived provenance of a receipt artifact retained by this Host.
-///
-/// The store records import and local-production facts independently. This
-/// value is their total projection, so an artifact can retain both facts
-/// instead of one operation overwriting the other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReceiptProvenance {
-    /// The local Host produced this artifact.
-    Produced,
-    /// The artifact was imported from another Host.
-    Imported,
-    /// The artifact was imported and was also produced locally.
-    Both,
-}
-
-impl ReceiptProvenance {
-    fn from_facts(imported: bool, produced: bool) -> Result<Self, StoreError> {
-        match (imported, produced) {
-            (false, true) => Ok(Self::Produced),
-            (true, false) => Ok(Self::Imported),
-            (true, true) => Ok(Self::Both),
-            (false, false) => Err(StoreError::Corruption(
-                "receipt artifact has no provenance fact".into(),
-            )),
-        }
-    }
-
-    /// Whether this artifact came from another Host.
-    #[must_use]
-    pub const fn is_imported(self) -> bool {
-        matches!(self, Self::Imported | Self::Both)
-    }
-
-    /// Whether this Host produced this artifact.
-    #[must_use]
-    pub const fn is_produced(self) -> bool {
-        matches!(self, Self::Produced | Self::Both)
-    }
 }
 
 /// Result of importing one portable receipt artifact.
@@ -606,83 +447,56 @@ pub struct ActivationRecord {
     state: ActivationRecordState,
 }
 
-/// The event kind in one host-local private handler commit. Payloads remain
-/// private; this enum is the store's safe diagnostic projection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrivateEventKind {
-    InputReceived,
-    TimerFired,
-    TypedTimerFired,
-    Signed,
-    React,
-}
-
-/// One private effect's kind and bounded payload size. The store never returns
-/// the effect payload itself from inspection reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PrivateEffectSummary {
-    pub kind: PrivateEffectKind,
-    pub payload_bytes: Option<usize>,
-}
-
-/// The effect kind in one host-local private handler commit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrivateEffectKind {
-    Broadcast,
-    Callout,
-    SetTimer,
-    Sign,
-    RetryInput,
-}
-
-/// A safe projection of one durable private commit for local diagnostics.
-/// Sequence and public position are authoritative durable coordinates; input
-/// and effects contain only kinds and payload sizes, never raw private values.
+/// A safe projection of one durable event record for local diagnostics.
+/// Event position is an authoritative local coordinate. An event may produce
+/// more than one agreed step (an authored message stages a proposal after its
+/// local dispatch), so the relation is represented as a list rather than a
+/// misleading scalar. Payloads contain only kinds and sizes, never raw private
+/// values.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrivateCommitSummary {
-    pub sequence: u64,
-    pub public_position: u64,
-    pub event: PrivateEventKind,
-    pub input_payload_bytes: Option<usize>,
-    pub effects: Vec<PrivateEffectSummary>,
-    pub fuel_used: u64,
+pub struct EventRecordSummary {
+    pub event_position: u64,
+    pub agreed_steps: Vec<u64>,
+    pub event: EventKind,
+    pub input_payload_bytes: Option<u64>,
+    pub effects: Vec<EffectSummary>,
 }
 
-/// One bounded page of private commit summaries.
+/// One bounded page of local event summaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrivateInspectionPage {
+pub struct EventInspectionPage {
     from: u64,
-    summaries: Vec<PrivateCommitSummary>,
+    summaries: Vec<EventRecordSummary>,
     total: u64,
     next: Option<u64>,
 }
 
-impl PrivateInspectionPage {
-    /// Return the first private sequence represented by this page.
+impl EventInspectionPage {
+    /// Return the first event position represented by this page.
     #[must_use]
     pub const fn from(&self) -> u64 {
         self.from
     }
 
-    /// Borrow summaries in ascending private sequence order.
+    /// Borrow summaries in ascending event-position order.
     #[must_use]
-    pub fn summaries(&self) -> &[PrivateCommitSummary] {
+    pub fn summaries(&self) -> &[EventRecordSummary] {
         &self.summaries
     }
 
     /// Consume the page and return its summaries.
     #[must_use]
-    pub fn into_summaries(self) -> Vec<PrivateCommitSummary> {
+    pub fn into_summaries(self) -> Vec<EventRecordSummary> {
         self.summaries
     }
 
-    /// Return the durable number of private commits at read time.
+    /// Return the durable number of local event records at read time.
     #[must_use]
     pub const fn total(&self) -> u64 {
         self.total
     }
 
-    /// Return the next private sequence when another page remains.
+    /// Return the next event position when another page remains.
     #[must_use]
     pub const fn next(&self) -> Option<u64> {
         self.next
@@ -690,7 +504,7 @@ impl PrivateInspectionPage {
 
     pub(crate) const fn new(
         from: u64,
-        summaries: Vec<PrivateCommitSummary>,
+        summaries: Vec<EventRecordSummary>,
         total: u64,
         next: Option<u64>,
     ) -> Self {
@@ -703,55 +517,45 @@ impl PrivateInspectionPage {
     }
 }
 
-impl PrivateCommitSummary {
-    fn from_commit(commit: &arena0_protocol::PrivateCommit) -> Self {
-        let record = commit.record();
-        let (event, input_payload_bytes) = match &record.event {
-            PrivateEvent::InputReceived { data, .. } => {
-                (PrivateEventKind::InputReceived, Some(data.len()))
-            }
-            PrivateEvent::TimerFired => (PrivateEventKind::TimerFired, None),
-            PrivateEvent::TypedTimerFired { timer } => {
-                (PrivateEventKind::TypedTimerFired, Some(timer.data.len()))
-            }
-            PrivateEvent::Signed { signature, .. } => {
-                (PrivateEventKind::Signed, Some(signature.len()))
-            }
-            PrivateEvent::React => (PrivateEventKind::React, None),
+impl EventRecordSummary {
+    fn from_record(
+        event_position: u64,
+        agreed_steps: Vec<u64>,
+        event: &Event<Vec<u8>>,
+        effects: &[Effect],
+    ) -> Self {
+        // Payload lengths are bounded far below u64::MAX.
+        let bytes = |payload: &[u8]| Some(u64::try_from(payload.len()).unwrap_or(u64::MAX));
+        let (event_kind, input_payload_bytes) = match event {
+            Event::SessionStarted { .. } => (EventKind::SessionStarted, None),
+            Event::MessageReceived { msg, .. } => (EventKind::MessageReceived, bytes(msg)),
+            Event::InputReceived { data, .. } => (EventKind::InputReceived, bytes(data)),
+            Event::TimerFired { timer } => (EventKind::TimerFired, bytes(&timer.data)),
         };
-        let effects = record
-            .effects
+        let effects = effects
             .iter()
-            .map(|effect| match effect {
-                PrivateEffect::Broadcast { data } => PrivateEffectSummary {
-                    kind: PrivateEffectKind::Broadcast,
-                    payload_bytes: Some(data.len()),
-                },
-                PrivateEffect::Callout { context, .. } => PrivateEffectSummary {
-                    kind: PrivateEffectKind::Callout,
-                    payload_bytes: Some(context.len()),
-                },
-                PrivateEffect::SetTimer { timer, .. } => PrivateEffectSummary {
-                    kind: PrivateEffectKind::SetTimer,
-                    payload_bytes: timer.as_ref().map(|timer| timer.data.len()),
-                },
-                PrivateEffect::Sign { data, .. } => PrivateEffectSummary {
-                    kind: PrivateEffectKind::Sign,
-                    payload_bytes: Some(data.len()),
-                },
-                PrivateEffect::RetryInput { reason } => PrivateEffectSummary {
-                    kind: PrivateEffectKind::RetryInput,
-                    payload_bytes: Some(reason.len()),
-                },
+            .map(|effect| {
+                let (kind, payload) = match effect {
+                    Effect::SessionEnd { outcome } => (EffectKind::SessionEnd, outcome.as_slice()),
+                    Effect::SessionAbort { reason } => {
+                        (EffectKind::SessionAbort, reason.as_bytes())
+                    }
+                    Effect::Broadcast { data } => (EffectKind::Broadcast, data.as_slice()),
+                    Effect::SetTimer { timer, .. } => (EffectKind::SetTimer, timer.data.as_slice()),
+                    Effect::Fail { reason } => (EffectKind::Fail, reason.as_bytes()),
+                };
+                EffectSummary {
+                    kind,
+                    payload_bytes: bytes(payload),
+                }
             })
             .collect();
         Self {
-            sequence: record.seq,
-            public_position: record.after_position,
-            event,
+            event_position,
+            agreed_steps,
+            event: event_kind,
             input_payload_bytes,
             effects,
-            fuel_used: record.fuel_used,
         }
     }
 }
@@ -844,222 +648,42 @@ pub enum CommitActivationOutcome {
     },
 }
 
-/// Outcome of applying one validated execution input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CommittedSummary {
-    version: ExecutionVersion,
-    /// The public trace step certified by this commit, if the public cursor
-    /// advanced. A shared proposal and partial signature commit leave this
-    /// unset; only the complete N-of-N signature commit sets it.
-    public_step: Option<u64>,
-}
-
-impl CommittedSummary {
-    #[must_use]
-    pub const fn version(self) -> ExecutionVersion {
-        self.version
-    }
-
-    /// Return the public trace step that became durable, if any.
-    #[must_use]
-    pub const fn public_step(self) -> Option<u64> {
-        self.public_step
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ApplyOutcome {
-    /// The reducer-derived plan and all durable consequences committed.
-    Committed(CommittedSummary),
-    /// The exact occurrence was already durably applied.
-    AlreadyApplied,
-    /// The semantic occurrence slot was reused with a different input digest.
-    Conflict(OccurrenceConflict),
-    /// A compare-and-set found another committed version.
-    VersionMismatch {
-        expected: ExecutionVersion,
-        actual: ExecutionVersion,
-    },
-    /// The frame source was accepted but has already been applied.
-    InboxAlreadyApplied {
-        inbox_id: InboxId,
-        version: ExecutionVersion,
-    },
-    /// The frame was consumed without a reducer input.
-    InboxAlreadyConsumed { inbox_id: InboxId },
-}
-
-/// A typed result for accepting one authenticated inbound frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InboxAcceptOutcome {
-    /// The frame and source attribution were durably accepted.
-    Accepted,
-    /// The exact frame was already accepted or applied.
-    AlreadyAccepted,
-    /// The exact frame was already applied by the execution transaction.
-    AlreadyApplied,
-    /// The exact frame was already consumed without a reducer input.
-    AlreadyConsumed,
-    /// The frame id was reused with different durable evidence.
-    Conflict,
-}
-
-/// Result of explicitly rejecting any accepted inbound frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InboxRejectOutcome {
-    /// The frame was newly marked consumed.
-    Rejected,
-    /// The frame was already marked consumed.
-    AlreadyRejected,
-    /// The frame was already applied by a reducer transaction.
-    AlreadyApplied,
-}
-
-/// A source-labelled frame whose source is supplied by the authenticated
-/// transport.  Store validation additionally checks claimed message/abort
-/// identities before it records the frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AuthenticatedFrame {
-    source: PeerId,
-    frame: ExecFrame,
-}
-
-/// Store-domain identity of one authenticated inbound frame.
+/// One actor-computed transition and its atomic durable consequences.
 ///
-/// This is deliberately distinct from protocol [`arena0_protocol::execution::FrameId`] values used by
-/// durable effects.  The authenticated source is part of the identity, so
-/// identical frame bytes arriving over two authenticated routes cannot occupy
-/// one another's inbox slot.
-#[derive(
-    BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
-)]
-pub struct InboxId([u8; 32]);
-
-impl InboxId {
-    /// Construct an inbox identity from persisted bytes.
-    #[must_use]
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    /// Borrow the identity bytes.
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
+/// The execution's sole writer computes `next` with a protocol transition.
+/// `change` must describe that same transition, including its consumed timer. The store persists the result and side rows;
+/// it does not execute the protocol transition again.
+#[derive(Debug)]
+pub struct TransitionRecord {
+    /// Version from which the actor computed the transition.
+    pub expected: ExecutionVersion,
+    /// Complete resulting execution state.
+    pub next: ExecutionState,
+    /// Side rows to persist with the state.
+    pub change: Change,
+    /// Local persistence time in milliseconds.
+    pub now_ms: u64,
 }
 
-/// One accepted inbound frame awaiting its execution reducer input.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingInboxItem {
-    execution_id: ExecId,
-    inbox_id: InboxId,
-    source: PeerId,
-    frame: ExecFrame,
-}
-
-impl PendingInboxItem {
-    /// Return the owning execution.
-    #[must_use]
-    pub const fn execution_id(&self) -> ExecId {
-        self.execution_id
-    }
-
-    /// Return the authenticated inbox identity.
-    #[must_use]
-    pub const fn inbox_id(&self) -> InboxId {
-        self.inbox_id
-    }
-
-    /// Return the authenticated source peer.
-    #[must_use]
-    pub const fn source(&self) -> PeerId {
-        self.source
-    }
-
-    /// Borrow the canonical stored execution frame.
-    #[must_use]
-    pub const fn frame(&self) -> &ExecFrame {
-        &self.frame
-    }
-}
-
-/// Stable lease identity returned with one leased outbox item.
-#[derive(
-    BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
-)]
-pub struct LeaseId([u8; 32]);
-
-impl LeaseId {
-    /// Construct a lease identity from persisted bytes.
-    #[must_use]
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    /// Borrow the identity bytes.
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
-/// Current outbox delivery state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutboxStatus {
-    /// Available for delivery.
-    Pending,
-    /// Reserved by one delivery worker.
-    Leased,
-    /// Delivery was durably acknowledged.
-    Acknowledged,
-}
-
-/// One decoded outbox occurrence.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutboxItem {
-    /// Stable effect occurrence identity.
-    pub outbox_id: OutboxId,
-    /// Owning execution.
-    pub execution_id: ExecId,
-    /// Version that emitted the effect.
-    pub version: ExecutionVersion,
-    /// Position within that plan's effect list.
-    pub ordinal: u32,
-    /// Typed durable effect.
-    pub effect: DurableEffect,
-    /// Number of lease attempts so far; informational, never a dead-letter policy.
-    pub attempts: u32,
-    /// Current state.
-    pub status: OutboxStatus,
-    /// Earliest time at which delivery may begin.
-    pub available_at_ms: u64,
-}
-
-/// One outbox occurrence reserved by a lease.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeasedOutbox {
-    /// Leased occurrence data.
-    pub item: OutboxItem,
-    /// Lease identity required for completion or retry.
-    pub lease_id: LeaseId,
-    /// Lease expiry.
-    pub lease_until_ms: u64,
-}
-
-/// Typed result of an outbox delivery operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutboxDeliveryOutcome {
-    /// A lease was acknowledged.
-    Acknowledged,
-    /// The occurrence was already acknowledged.
-    AlreadyAcknowledged,
-    /// The lease did not own the occurrence.
-    LeaseMismatch,
-    /// The occurrence was not leased.
-    NotLeased,
-    /// A retry was durably scheduled.
-    Retried { available_at_ms: u64, attempts: u32 },
+/// Durable consequences of a protocol transition computed by the actor.
+#[derive(Debug)]
+pub enum Change {
+    /// Persist only the execution state: activation, an authenticated stop,
+    /// an end-confirmation phase, or dropping a rejected outgoing message
+    /// write no rows beyond it.
+    State,
+    /// Record an accepted guest dispatch and consume its durable source.
+    Dispatch {
+        event: Event<Vec<u8>>,
+        effects: Vec<Effect>,
+        timer_id: Option<TimerId>,
+    },
+    /// Record a signature, releasing a certified proposal when present.
+    StepSignature {
+        certified: Option<arena0_protocol::SharedProposal>,
+    },
+    /// Publish evidence assembled from durable rows.
+    Publish { artifact: ReceiptArtifact },
 }
 
 /// One active timer scheduling projection.
@@ -1069,8 +693,8 @@ pub struct ActiveTimer {
     pub timer_id: TimerId,
     /// Absolute due time.
     pub deadline_ms: u64,
-    /// Opaque timer payload.
-    pub payload: Vec<u8>,
+    /// Exact typed timer payload emitted by the program.
+    pub timer: TimerPayload,
     /// Version that armed the timer.
     pub armed_version: ExecutionVersion,
 }
@@ -1101,82 +725,34 @@ impl StoredReceipt {
     }
 }
 
-/// Durable agent-facing work that remains relevant to the current pending
-/// continuation after an actor restart.
-///
-/// Outbox rows are retained after acknowledgement, so the store can recover
-/// a request whose message was delivered immediately before a process crash.
-/// The projection includes the original callout context or the exact guest
-/// signing preimage; no daemon-side copy is needed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PendingRequest {
-    /// A typed JSON callout waiting for its agent answer.
-    Callout {
-        /// Durable outbox identity carrying the original request.
-        outbox_id: OutboxId,
-        /// Current delivery state of that outbox row.
-        status: OutboxStatus,
-        /// Pending continuation identity.
-        pending_id: PendingId,
-        /// Program-local callout variant.
-        callout_index: u32,
-        /// Exact guest-produced callout context bytes.
-        context: Vec<u8>,
-        /// Generated expected result type, when available.
-        expected_type: Option<String>,
-    },
-    /// A guest-produced signing request waiting for its signature.
-    Signature {
-        /// Durable outbox identity carrying the original request.
-        outbox_id: OutboxId,
-        /// Current delivery state of that outbox row.
-        status: OutboxStatus,
-        /// Pending continuation identity.
-        pending_id: PendingId,
-        /// Exact guest-selected signing preimage.
-        data: GuestSignData,
-    },
-}
-
-impl PendingRequest {
-    /// Return the durable outbox identity carrying this request.
-    #[must_use]
-    pub const fn outbox_id(&self) -> OutboxId {
-        match self {
-            Self::Callout { outbox_id, .. } | Self::Signature { outbox_id, .. } => *outbox_id,
-        }
-    }
-
-    /// Return the delivery state of the retained outbox row.
-    #[must_use]
-    pub const fn status(&self) -> OutboxStatus {
-        match self {
-            Self::Callout { status, .. } | Self::Signature { status, .. } => *status,
-        }
-    }
-
-    /// Return the pending continuation identity.
-    #[must_use]
-    pub const fn pending_id(&self) -> PendingId {
-        match self {
-            Self::Callout { pending_id, .. } | Self::Signature { pending_id, .. } => *pending_id,
-        }
-    }
-}
-
-/// Cloneable asynchronous capability for a single store owner.
+/// Cloneable asynchronous capability for one store connection.
 ///
 /// This handle owns bounded registry and receipt-artifact operations plus read
 /// projections.
 /// Execution mutations require an [`ExecutionStore`] claimed for the target
 /// execution, so cloning this handle cannot create a second live writer.
+///
+/// Operations run on the blocking pool and serialize on the connection mutex.
+/// Dropping an operation's future does not cancel work already submitted to
+/// that pool; a lost response must be treated as an unknown outcome.
 #[derive(Clone, Debug)]
 pub struct StoreHandle {
-    sender: mpsc::Sender<QueuedCommand>,
-    budget: Arc<Semaphore>,
-    queue_bytes: usize,
-    execution_claims: Arc<StdMutex<HashSet<ExecId>>>,
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    db: StdMutex<Option<Database>>,
+    execution_claims: StdMutex<HashSet<ExecId>>,
     host_id: PeerId,
+}
+
+impl std::fmt::Debug for Inner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Inner")
+            .field("host_id", &self.host_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Non-cloneable writer capability for one execution aggregate.
@@ -1191,9 +767,9 @@ pub struct StoreHandle {
 /// ```compile_fail
 /// fn shared_writer_cannot_mutate(
 ///     writer: &arena0_store::ExecutionStore,
-///     input: arena0_protocol::ExecutionInput,
+///     record: arena0_store::TransitionRecord,
 /// ) {
-///     let _future = writer.apply_input(input, 0);
+///     let _future = writer.persist(record);
 /// }
 /// ```
 ///
@@ -1216,11 +792,9 @@ pub struct ExecutionStore {
     execution_id: ExecId,
 }
 
-/// The sole owner of one SQLite connection and its blocking thread.
+/// The owner of one SQLite connection and its process lock.
 pub struct Store {
     handle: StoreHandle,
-    owner: Option<JoinHandle<()>>,
-    recovery: RecoveryReport,
 }
 
 /// A process reservation for one store database path.
@@ -1237,240 +811,8 @@ pub struct StoreReservation {
 
 impl std::fmt::Debug for Store {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("Store")
-            .field("recovery", &self.recovery)
-            .finish_non_exhaustive()
+        formatter.debug_struct("Store").finish_non_exhaustive()
     }
-}
-
-enum Command {
-    CreateExecutionRequest {
-        execution_id: ExecId,
-        program_hash: ProgramHash,
-        params: Option<JsonBytes>,
-        admission: ExecutionAdmission,
-        created_at_ms: u64,
-        reply: oneshot::Sender<Result<ExecutionRequestOutcome, StoreError>>,
-    },
-    BindJoinTarget {
-        execution_id: ExecId,
-        target: NegotiationTarget,
-        reply: oneshot::Sender<Result<AdmissionBindingOutcome, StoreError>>,
-    },
-    LoadExecutionRequest {
-        execution_id: ExecId,
-        reply: oneshot::Sender<Result<Option<ExecutionRequest>, StoreError>>,
-    },
-    ListExecutionRequests {
-        limit: usize,
-        reply: oneshot::Sender<Result<Vec<ExecutionRequest>, StoreError>>,
-    },
-    ListRecoveryCandidates {
-        cursor: RecoveryCursor,
-        limit: usize,
-        reply: oneshot::Sender<Result<RecoveryPage, StoreError>>,
-    },
-    RecordExecutionRequestFailure {
-        execution_id: ExecId,
-        reason: String,
-        reply: oneshot::Sender<Result<ExecutionRequestFailureOutcome, StoreError>>,
-    },
-    LoadOrCreateExecutionSalt {
-        execution_id: ExecId,
-        now_ms: u64,
-        reply: oneshot::Sender<Result<ExecutionSalt, StoreError>>,
-    },
-    RegisterProgram {
-        hash: ProgramHash,
-        wasm: Vec<u8>,
-        now_ms: u64,
-        reply: oneshot::Sender<Result<ProgramStoreOutcome, StoreError>>,
-    },
-    LoadProgram {
-        hash: ProgramHash,
-        reply: oneshot::Sender<Result<Option<StoredProgram>, StoreError>>,
-    },
-    ListPrograms {
-        limit: usize,
-        reply: oneshot::Sender<Result<Vec<ProgramHash>, StoreError>>,
-    },
-    RemoveProgram {
-        hash: ProgramHash,
-        now_ms: u64,
-        reply: oneshot::Sender<Result<ProgramRemoveOutcome, StoreError>>,
-    },
-    PrepareActivation {
-        execution_id: ExecId,
-        prepared: PreparedActivation,
-        now_ms: u64,
-        reply: oneshot::Sender<Result<PrepareActivationOutcome, StoreError>>,
-    },
-    CommitActivation {
-        execution_id: ExecId,
-        activation: Activation,
-        now_ms: u64,
-        reply: oneshot::Sender<Result<CommitActivationOutcome, StoreError>>,
-    },
-    LoadActivation {
-        execution_id: ExecId,
-        reply: oneshot::Sender<Result<Option<ActivationRecord>, StoreError>>,
-    },
-    CreateExecution {
-        execution_id: ExecId,
-        activation: Activation,
-        producer: PeerId,
-        shared_state: SharedStateBytes,
-        local_state: LocalStateBytes,
-        now_ms: u64,
-        reply: oneshot::Sender<Result<CreateExecutionOutcome, StoreError>>,
-    },
-    LoadExecution {
-        execution_id: ExecId,
-        reply: oneshot::Sender<Result<Option<ExecutionState>, StoreError>>,
-    },
-    LoadExecutionBySession {
-        session_id: SessionHash,
-        reply: oneshot::Sender<Result<Option<ExecutionState>, StoreError>>,
-    },
-    ListActivations {
-        limit: usize,
-        reply: oneshot::Sender<Result<Vec<ActivationRecord>, StoreError>>,
-    },
-    ListExecutions {
-        limit: usize,
-        reply: oneshot::Sender<Result<Vec<ExecutionState>, StoreError>>,
-    },
-    ApplyInput {
-        execution_id: ExecId,
-        input: Box<ExecutionInput>,
-        inbox: Option<InboxReference>,
-        now_ms: u64,
-        reply: oneshot::Sender<Result<ApplyOutcome, StoreError>>,
-    },
-    AcceptInbound {
-        execution_id: ExecId,
-        frame: Box<AuthenticatedFrame>,
-        now_ms: u64,
-        reply: oneshot::Sender<Result<InboxAcceptOutcome, StoreError>>,
-    },
-    ListPendingInbox {
-        execution_id: ExecId,
-        limit: usize,
-        reply: oneshot::Sender<Result<Vec<PendingInboxItem>, StoreError>>,
-    },
-    ListPendingRequests {
-        execution_id: ExecId,
-        reply: oneshot::Sender<Result<Vec<PendingRequest>, StoreError>>,
-    },
-    ReadTrace {
-        execution_id: ExecId,
-        from: u64,
-        to: u64,
-        reply: oneshot::Sender<Result<Vec<arena0_protocol::TraceEntry>, StoreError>>,
-    },
-    ReadPrivateSummaries {
-        execution_id: ExecId,
-        from: Option<u64>,
-        limit: usize,
-        reply: oneshot::Sender<Result<PrivateInspectionPage, StoreError>>,
-    },
-    ApplyInbound {
-        execution_id: ExecId,
-        inbox_id: InboxId,
-        now_ms: u64,
-        reply: oneshot::Sender<Result<ApplyOutcome, StoreError>>,
-    },
-    ApplyInboundMessage {
-        execution_id: ExecId,
-        inbox_id: InboxId,
-        delta: Box<SharedDelta>,
-        now_ms: u64,
-        reply: oneshot::Sender<Result<ApplyOutcome, StoreError>>,
-    },
-    RejectInbound {
-        execution_id: ExecId,
-        inbox_id: InboxId,
-        now_ms: u64,
-        reply: oneshot::Sender<Result<InboxRejectOutcome, StoreError>>,
-    },
-    LeaseOutbox {
-        execution_id: ExecId,
-        now_ms: u64,
-        reply: oneshot::Sender<Result<Option<LeasedOutbox>, StoreError>>,
-    },
-    AcknowledgeOutbox {
-        execution_id: ExecId,
-        outbox_id: OutboxId,
-        lease_id: LeaseId,
-        reply: oneshot::Sender<Result<OutboxDeliveryOutcome, StoreError>>,
-    },
-    RetryOutbox {
-        execution_id: ExecId,
-        outbox_id: OutboxId,
-        lease_id: LeaseId,
-        now_ms: u64,
-        reason: String,
-        reply: oneshot::Sender<Result<OutboxDeliveryOutcome, StoreError>>,
-    },
-    RecoverExpiredLeases {
-        execution_id: ExecId,
-        now_ms: u64,
-        reply: oneshot::Sender<Result<RecoveryReport, StoreError>>,
-    },
-    DueTimers {
-        execution_id: ExecId,
-        now_ms: u64,
-        limit: usize,
-        reply: oneshot::Sender<Result<Vec<ActiveTimer>, StoreError>>,
-    },
-    AssembleReceipt {
-        execution_id: ExecId,
-        now_ms: u64,
-        reply: oneshot::Sender<Result<ApplyOutcome, StoreError>>,
-    },
-    ImportReceipt {
-        receipt: Box<ReceiptArtifact>,
-        now_ms: u64,
-        reply: oneshot::Sender<Result<ReceiptImportOutcome, StoreError>>,
-    },
-    LoadReceipt {
-        session_id: SessionHash,
-        reply: oneshot::Sender<Result<Option<StoredReceipt>, StoreError>>,
-    },
-    LoadReceiptById {
-        receipt_id: ReceiptId,
-        reply: oneshot::Sender<Result<Option<StoredReceipt>, StoreError>>,
-    },
-    ListReceipts {
-        limit: usize,
-        reply: oneshot::Sender<Result<Vec<StoredReceipt>, StoreError>>,
-    },
-    LoadUserAgent {
-        reply: oneshot::Sender<Result<Option<String>, StoreError>>,
-    },
-    SetUserAgent {
-        value: String,
-        reply: oneshot::Sender<Result<(), StoreError>>,
-    },
-    Shutdown {
-        reply: oneshot::Sender<Result<(), StoreError>>,
-    },
-}
-
-/// The source and frame identity used to link an input application to an
-/// accepted inbox row.  It is kept private to prevent callers from changing
-/// source attribution between enqueue and apply.
-#[derive(Debug, Clone, Copy)]
-struct InboxReference {
-    inbox_id: InboxId,
-    source: PeerId,
-    complete_on_apply: bool,
-}
-
-struct QueuedCommand {
-    command: Command,
-    _budget: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl Store {
@@ -1484,69 +826,45 @@ impl Store {
         Ok(StoreReservation { path, lock })
     }
 
-    /// Open a database, acquire its process lock, initialize its schema, and start its
-    /// one blocking owner thread.
+    /// Open a database, acquire its process lock, and validate it.
     pub fn open(config: StoreConfig) -> Result<Self, StoreError> {
-        config.validate()?;
         Self::reserve(&config.path)?.open(config)
     }
 
     fn open_reserved(config: StoreConfig, lock: OwnerLock) -> Result<Self, StoreError> {
-        let (sender, receiver) = mpsc::channel(config.queue_capacity);
-        let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
-        let owner_config = config.clone();
-        let owner = thread::Builder::new()
-            .name(format!("arena0-store-{}", config.host_id.fmt_short()))
-            .spawn(move || owner_loop(owner_config, lock, receiver, ready_tx))
-            .map_err(StoreError::Io)?;
-
-        let recovery = match ready_rx.recv() {
-            Ok(Ok(recovery)) => recovery,
-            Ok(Err(error)) => {
-                let _ = owner.join();
-                return Err(error);
-            }
-            Err(_) => {
-                let _ = owner.join();
-                return Err(StoreError::OwnerPanicked);
-            }
-        };
+        let db = Database::open(&config, lock)?;
         let handle = StoreHandle {
-            sender,
-            budget: Arc::new(Semaphore::new(config.queue_bytes)),
-            queue_bytes: config.queue_bytes,
-            execution_claims: Arc::new(StdMutex::new(HashSet::new())),
-            host_id: config.host_id,
+            inner: Arc::new(Inner {
+                db: StdMutex::new(Some(db)),
+                execution_claims: StdMutex::new(HashSet::new()),
+                host_id: config.host_id,
+            }),
         };
-        Ok(Self {
-            handle,
-            owner: Some(owner),
-            recovery,
-        })
+        Ok(Self { handle })
     }
 
-    /// Borrow the cloneable command handle.
+    /// Borrow the cloneable store handle.
     #[must_use]
     pub const fn handle(&self) -> &StoreHandle {
         &self.handle
     }
 
-    /// Return recovery performed during open.
-    #[must_use]
-    pub const fn recovery_report(&self) -> RecoveryReport {
-        self.recovery
-    }
-
-    /// Ask the owner to finish and join its blocking thread.
-    pub async fn shutdown(mut self) -> Result<(), StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.handle.send(Command::Shutdown { reply }, 1).await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)??;
-        let owner = self.owner.take().ok_or(StoreError::OwnerPanicked)?;
-        tokio::task::spawn_blocking(move || owner.join().map_err(|_| StoreError::OwnerPanicked))
-            .await
-            .map_err(|_| StoreError::OwnerPanicked)??;
-        Ok(())
+    /// Close the connection and release the process lock.
+    ///
+    /// This waits for any operation holding the connection mutex. Submitted
+    /// operations that acquire the mutex after closure fail without running.
+    /// Calls through retained handles then return [`StoreError::Closed`].
+    pub async fn shutdown(self) -> Result<(), StoreError> {
+        let inner = Arc::clone(&self.handle.inner);
+        tokio::task::spawn_blocking(move || {
+            inner
+                .db
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+        })
+        .await
+        .map_err(|_| StoreError::Closed)
     }
 }
 
@@ -1558,7 +876,6 @@ impl StoreReservation {
     /// reservation alive.
     pub fn open(self, config: StoreConfig) -> Result<Store, StoreError> {
         let StoreReservation { path, lock } = self;
-        config.validate()?;
         if path.as_path() != config.path.as_path() {
             return Err(StoreError::InvalidConfiguration(
                 "store reservation path does not match store configuration path",
@@ -1570,18 +887,37 @@ impl StoreReservation {
 
 impl Drop for Store {
     fn drop(&mut self) {
-        if self.owner.is_some() {
-            let (reply, _response) = oneshot::channel();
-            let _ = self.handle.try_send(Command::Shutdown { reply }, 1);
-        }
+        self.handle
+            .inner
+            .db
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
     }
 }
 
 impl StoreHandle {
+    /// Read bounded reconstruction metadata for a dormant end handshake.
+    pub async fn end_wake_candidate(
+        &self,
+        execution_id: ExecId,
+    ) -> Result<Option<RecoveryCandidate>, StoreError> {
+        self.run(move |db| db.end_wake_candidate(execution_id))
+            .await
+    }
+    /// Read terminal routing metadata without decoding execution state or
+    /// memory images. The phase is independent of receipt publication.
+    pub async fn execution_end(
+        &self,
+        session_id: SessionHash,
+    ) -> Result<Option<(ExecId, arena0_protocol::EndPhase)>, StoreError> {
+        self.run(move |db| db.execution_end(session_id)).await
+    }
+
     /// Return the Host identity bound to this store.
     #[must_use]
-    pub const fn host_id(&self) -> PeerId {
-        self.host_id
+    pub fn host_id(&self) -> PeerId {
+        self.inner.host_id
     }
 
     /// Claim the sole live writer for one execution identity.
@@ -1591,6 +927,7 @@ impl StoreHandle {
     /// the claim and permits a later owner to resume the execution.
     pub fn claim_execution(&self, execution_id: ExecId) -> Result<ExecutionStore, StoreError> {
         let mut claims = self
+            .inner
             .execution_claims
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1608,16 +945,8 @@ impl StoreHandle {
         &self,
         execution_id: ExecId,
     ) -> Result<Option<ExecutionRequest>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::LoadExecutionRequest {
-                execution_id,
-                reply,
-            },
-            128,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.run(move |db| db.load_execution_request(execution_id))
+            .await
     }
 
     async fn bind_join_target(
@@ -1625,17 +954,8 @@ impl StoreHandle {
         execution_id: ExecId,
         target: NegotiationTarget,
     ) -> Result<AdmissionBindingOutcome, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::BindJoinTarget {
-                execution_id,
-                target,
-                reply,
-            },
-            256,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.run(move |db| db.bind_join_target(execution_id, target))
+            .await
     }
 
     /// List bounded admission roots in their durable creation order.
@@ -1643,13 +963,7 @@ impl StoreHandle {
         &self,
         limit: usize,
     ) -> Result<Vec<ExecutionRequest>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::ListExecutionRequests { limit, reply },
-            self.command_cost(256, limit, 512)?,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.run(move |db| db.list_execution_requests(limit)).await
     }
 
     /// List one ordered page of every durable request that can still make
@@ -1666,17 +980,8 @@ impl StoreHandle {
         cursor: RecoveryCursor,
         limit: usize,
     ) -> Result<RecoveryPage, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::ListRecoveryCandidates {
-                cursor,
-                limit,
-                reply,
-            },
-            self.command_cost(512, limit, 512)?,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.run(move |db| db.list_recovery_candidates(cursor, limit))
+            .await
     }
 
     /// Import one bounded Wasm program under its verified content address.
@@ -1689,25 +994,16 @@ impl StoreHandle {
             StoreError::InvalidConfiguration("program size bound does not fit usize")
         })?;
         if wasm.is_empty() || wasm.len() > max {
-            return Err(StoreError::CommandTooLarge {
+            return Err(StoreError::PayloadTooLarge {
                 required: wasm.len(),
                 capacity: max,
             });
         }
         let hash = ProgramHash::of(&wasm);
-        let cost = self.command_cost(wasm.len(), 1, 512)?;
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::RegisterProgram {
-                hash,
-                wasm,
-                now_ms,
-                reply,
-            },
-            cost,
-        )
-        .await?;
-        Ok((hash, response.await.map_err(|_| StoreError::ReplyDropped)??))
+        let outcome = self
+            .run(move |db| db.register_program(hash, wasm, now_ms))
+            .await?;
+        Ok((hash, outcome))
     }
 
     /// Load one exact content-addressed Wasm program.
@@ -1715,20 +1011,12 @@ impl StoreHandle {
         &self,
         hash: ProgramHash,
     ) -> Result<Option<StoredProgram>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(Command::LoadProgram { hash, reply }, 128).await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.run(move |db| db.load_program(hash)).await
     }
 
     /// List bounded content addresses for registry recovery.
     pub async fn list_programs(&self, limit: usize) -> Result<Vec<ProgramHash>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::ListPrograms { limit, reply },
-            self.command_cost(128, limit, 40)?,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.run(move |db| db.list_programs(limit)).await
     }
 
     /// Unregister a program from the active catalog while retaining its bytes
@@ -1738,17 +1026,7 @@ impl StoreHandle {
         hash: ProgramHash,
         now_ms: u64,
     ) -> Result<ProgramRemoveOutcome, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::RemoveProgram {
-                hash,
-                now_ms,
-                reply,
-            },
-            128,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.run(move |db| db.remove_program(hash, now_ms)).await
     }
 
     /// Load a permanent activation record.
@@ -1756,16 +1034,7 @@ impl StoreHandle {
         &self,
         execution_id: ExecId,
     ) -> Result<Option<ActivationRecord>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::LoadActivation {
-                execution_id,
-                reply,
-            },
-            64,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.run(move |db| db.load_activation(execution_id)).await
     }
 
     /// Load and validate one execution aggregate.
@@ -1773,99 +1042,23 @@ impl StoreHandle {
         &self,
         execution_id: ExecId,
     ) -> Result<Option<ExecutionState>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::LoadExecution {
-                execution_id,
-                reply,
-            },
-            64,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.run(move |db| db.load_execution(execution_id)).await
     }
 
-    /// Load the unique local execution bound to a session identity.
-    pub async fn load_execution_by_session(
-        &self,
-        session_id: SessionHash,
-    ) -> Result<Option<ExecutionState>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(Command::LoadExecutionBySession { session_id, reply }, 64)
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
-    }
-
-    /// List bounded permanent activation records for restart recovery.
-    pub async fn list_activations(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<ActivationRecord>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::ListActivations { limit, reply },
-            self.command_cost(128, limit, 256)?,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+    /// Whether an execution aggregate exists. Unlike [`Self::load_execution`],
+    /// this neither loads nor validates the aggregate.
+    pub async fn execution_exists(&self, execution_id: ExecId) -> Result<bool, StoreError> {
+        self.run(move |db| db.execution_exists(execution_id)).await
     }
 
     /// List bounded execution aggregates for restart recovery.
     pub async fn list_executions(&self, limit: usize) -> Result<Vec<ExecutionState>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::ListExecutions { limit, reply },
-            self.command_cost(128, limit, 1024)?,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
-    }
-
-    /// List accepted frames that still need resolution after a restart. The
-    /// returned frame is the canonical durable copy.
-    pub async fn list_pending_inbox(
-        &self,
-        execution_id: ExecId,
-        limit: usize,
-    ) -> Result<Vec<PendingInboxItem>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::ListPendingInbox {
-                execution_id,
-                limit,
-                reply,
-            },
-            self.command_cost(256, limit, 1_024)?,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
-    }
-
-    /// Load the exact pending agent request for one execution.
-    ///
-    /// This is a read projection and does not claim the execution writer. It
-    /// is available on the cloneable handle because the daemon's API and
-    /// supervisor observe an actor's durable continuation while the actor
-    /// owns the non-clone [`ExecutionStore`].
-    pub async fn list_pending_requests(
-        &self,
-        execution_id: ExecId,
-    ) -> Result<Vec<PendingRequest>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::ListPendingRequests {
-                execution_id,
-                reply,
-            },
-            512,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.run(move |db| db.list_executions(limit)).await
     }
 
     /// Read a bounded public trace range from the durable execution.
     ///
-    /// The owner validates the complete trace before selecting the requested
+    /// The store validates the complete trace before selecting the requested
     /// range. A malformed or gapped prefix therefore cannot become a
     /// plausible daemon event projection.
     pub async fn read_trace(
@@ -1874,55 +1067,33 @@ impl StoreHandle {
         from: u64,
         to: u64,
     ) -> Result<Vec<arena0_protocol::TraceEntry>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::ReadTrace {
-                execution_id,
-                from,
-                to,
-                reply,
-            },
-            self.command_cost(256, 1, 1_024)?,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.run(move |db| db.read_trace(execution_id, from, to))
+            .await
     }
 
-    /// Read a bounded projection of durable private handler commits.
+    /// Read a bounded projection of durable local event records.
     ///
-    /// The store validates the selected durable records and their coordinates.
-    /// Full-projection validation remains part of execution recovery. Returned
-    /// values contain only event/effect kinds, payload sizes, fuel, and durable
-    /// coordinates; raw private payloads and replacement state never cross
-    /// this capability boundary.
-    pub async fn read_private_summaries(
+    /// Returned values contain only event/effect kinds, payload sizes, and
+    /// durable coordinates; raw state and payloads never cross this capability
+    /// boundary.
+    pub async fn read_event_summaries(
         &self,
         execution_id: ExecId,
         from: Option<u64>,
         limit: usize,
-    ) -> Result<PrivateInspectionPage, StoreError> {
-        if limit > MAX_PRIVATE_INSPECTION_RECORDS {
+    ) -> Result<EventInspectionPage, StoreError> {
+        if limit > MAX_EVENT_INSPECTION_RECORDS {
             return Err(StoreError::InvalidConfiguration(
-                "private inspection limit exceeds the fixed bound",
+                "event inspection limit exceeds the fixed bound",
             ));
         }
         if limit == 0 {
             return Err(StoreError::InvalidConfiguration(
-                "private inspection limit must be non-zero",
+                "event inspection limit must be non-zero",
             ));
         }
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::ReadPrivateSummaries {
-                execution_id,
-                from,
-                limit,
-                reply,
-            },
-            self.command_cost(512, limit, 512)?,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.run(move |db| db.read_event_summaries(execution_id, from, limit))
+            .await
     }
 
     /// Import one validated portable receipt as foreign evidence.
@@ -1935,19 +1106,7 @@ impl StoreHandle {
         receipt: ReceiptArtifact,
         now_ms: u64,
     ) -> Result<ReceiptImportOutcome, StoreError> {
-        let encoded = receipt.encode()?;
-        let cost = self.command_cost(encoded.len(), 1, 512)?;
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::ImportReceipt {
-                receipt: Box::new(receipt),
-                now_ms,
-                reply,
-            },
-            cost,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.run(move |db| db.import_receipt(receipt, now_ms)).await
     }
 
     /// Load this Host's own publication for a session.
@@ -1955,10 +1114,7 @@ impl StoreHandle {
         &self,
         session_id: SessionHash,
     ) -> Result<Option<StoredReceipt>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(Command::LoadReceipt { session_id, reply }, 128)
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.run(move |db| db.load_receipt(session_id)).await
     }
 
     /// Load one receipt by its content-addressed identity.
@@ -1966,106 +1122,40 @@ impl StoreHandle {
         &self,
         receipt_id: ReceiptId,
     ) -> Result<Option<StoredReceipt>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(Command::LoadReceiptById { receipt_id, reply }, 128)
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.run(move |db| db.load_receipt_by_id(receipt_id)).await
     }
 
     /// List receipts in deterministic key order.
     pub async fn list_receipts(&self, limit: usize) -> Result<Vec<StoredReceipt>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(
-            Command::ListReceipts { limit, reply },
-            self.command_cost(256, limit, 1_024)?,
-        )
-        .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.run(move |db| db.list_receipts(limit)).await
     }
 
     /// Load the optional durable Host user agent.
     pub async fn load_user_agent(&self) -> Result<Option<String>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.send(Command::LoadUserAgent { reply }, 128).await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.run(move |db| db.load_user_agent()).await
     }
 
     /// Persist the Host user agent in the store metadata.
     pub async fn set_user_agent(&self, value: String) -> Result<(), StoreError> {
         validate_user_agent(&value)?;
-        let cost = self.command_cost(value.len(), 1, USER_AGENT_COMMAND_OVERHEAD)?;
-        let (reply, response) = oneshot::channel();
-        self.send(Command::SetUserAgent { value, reply }, cost)
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+        self.run(move |db| db.set_user_agent(value)).await
     }
 
-    async fn send(&self, command: Command, required: usize) -> Result<(), StoreError> {
-        let required = required.max(1);
-        if required > self.queue_bytes {
-            return Err(StoreError::CommandTooLarge {
-                required,
-                capacity: self.queue_bytes,
-            });
-        }
-        let permits = u32::try_from(required).map_err(|_| StoreError::CommandTooLarge {
-            required,
-            capacity: self.queue_bytes,
-        })?;
-        let budget = Arc::clone(&self.budget)
-            .acquire_many_owned(permits)
-            .await
-            .map_err(|_| StoreError::Closed)?;
-        self.sender
-            .send(QueuedCommand {
-                command,
-                _budget: budget,
-            })
-            .await
-            .map_err(|_| StoreError::Closed)
-    }
-
-    fn command_cost(
+    async fn run<T: Send + 'static>(
         &self,
-        base: usize,
-        count: usize,
-        per_item: usize,
-    ) -> Result<usize, StoreError> {
-        let items = count
-            .checked_mul(per_item)
-            .ok_or(StoreError::CommandTooLarge {
-                required: usize::MAX,
-                capacity: self.queue_bytes,
-            })?;
-        base.checked_add(items).ok_or(StoreError::CommandTooLarge {
-            required: usize::MAX,
-            capacity: self.queue_bytes,
+        f: impl FnOnce(&mut Database) -> Result<T, StoreError> + Send + 'static,
+    ) -> Result<T, StoreError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.db.lock().map_err(|_| StoreError::Closed)?;
+            let db = guard.as_mut().ok_or(StoreError::Closed)?;
+            if db.is_poisoned() {
+                return Err(StoreError::Closed);
+            }
+            f(db)
         })
-    }
-
-    fn try_send(&self, command: Command, required: usize) -> Result<(), StoreError> {
-        let required = required.max(1);
-        if required > self.queue_bytes {
-            return Err(StoreError::CommandTooLarge {
-                required,
-                capacity: self.queue_bytes,
-            });
-        }
-        let permits = u32::try_from(required).map_err(|_| StoreError::CommandTooLarge {
-            required,
-            capacity: self.queue_bytes,
-        })?;
-        let budget = self
-            .budget
-            .clone()
-            .try_acquire_many_owned(permits)
-            .map_err(|_| StoreError::Closed)?;
-        self.sender
-            .try_send(QueuedCommand {
-                command,
-                _budget: budget,
-            })
-            .map_err(|_| StoreError::Closed)
+        .await
+        .map_err(|_| StoreError::Closed)?
     }
 }
 
@@ -2073,6 +1163,7 @@ impl Drop for ExecutionStore {
     fn drop(&mut self) {
         let mut claims = self
             .handle
+            .inner
             .execution_claims
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2113,27 +1204,23 @@ impl ExecutionStore {
     ) -> Result<ExecutionRequestOutcome, StoreError> {
         let params_len = params.as_ref().map_or(0, JsonBytes::len);
         if params_len > arena0_protocol::MAX_PARAMS_LEN {
-            return Err(StoreError::CommandTooLarge {
+            return Err(StoreError::PayloadTooLarge {
                 required: params_len,
                 capacity: arena0_protocol::MAX_PARAMS_LEN,
             });
         }
-        let cost = self.handle.command_cost(params_len, 1, 512)?;
-        let (reply, response) = oneshot::channel();
+        let execution_id = self.execution_id;
         self.handle
-            .send(
-                Command::CreateExecutionRequest {
-                    execution_id: self.execution_id,
+            .run(move |db| {
+                db.create_execution_request(
+                    execution_id,
                     program_hash,
-                    params,
+                    params.map(JsonBytes::into_bytes),
                     admission,
                     created_at_ms,
-                    reply,
-                },
-                cost,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+                )
+            })
+            .await
     }
 
     /// Load this execution's durable admission root.
@@ -2147,18 +1234,10 @@ impl ExecutionStore {
         reason: impl Into<String>,
     ) -> Result<ExecutionRequestFailureOutcome, StoreError> {
         let reason = bounded_reason(reason.into())?;
-        let (reply, response) = oneshot::channel();
+        let execution_id = self.execution_id;
         self.handle
-            .send(
-                Command::RecordExecutionRequestFailure {
-                    execution_id: self.execution_id,
-                    reason,
-                    reply,
-                },
-                256,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .run(move |db| db.record_execution_request_failure(execution_id, reason))
+            .await
     }
 
     /// Load the per-execution local secret, creating it durably on first use.
@@ -2166,18 +1245,10 @@ impl ExecutionStore {
         &mut self,
         now_ms: u64,
     ) -> Result<ExecutionSalt, StoreError> {
-        let (reply, response) = oneshot::channel();
+        let execution_id = self.execution_id;
         self.handle
-            .send(
-                Command::LoadOrCreateExecutionSalt {
-                    execution_id: self.execution_id,
-                    now_ms,
-                    reply,
-                },
-                128,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .run(move |db| db.load_or_create_execution_salt(execution_id, now_ms))
+            .await
     }
 
     /// Prepare a validated activation under this execution's permanent key.
@@ -2189,22 +1260,10 @@ impl ExecutionStore {
         prepared.validate().map_err(|error| {
             StoreError::Corruption(format!("prepared activation validation failed: {error}"))
         })?;
-        let cost = self
-            .handle
-            .command_cost(encoded_len(&prepared, MAX_FRAME_BYTES)?, 1, 256)?;
-        let (reply, response) = oneshot::channel();
+        let execution_id = self.execution_id;
         self.handle
-            .send(
-                Command::PrepareActivation {
-                    execution_id: self.execution_id,
-                    prepared,
-                    now_ms,
-                    reply,
-                },
-                cost,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .run(move |db| db.prepare_activation(execution_id, prepared, now_ms))
+            .await
     }
 
     /// Compare-and-set this execution's prepared activation to its permanent
@@ -2217,22 +1276,10 @@ impl ExecutionStore {
         activation.validate().map_err(|error| {
             StoreError::Corruption(format!("activation validation failed: {error}"))
         })?;
-        let cost = self
-            .handle
-            .command_cost(encoded_len(&activation, MAX_FRAME_BYTES)?, 1, 256)?;
-        let (reply, response) = oneshot::channel();
+        let execution_id = self.execution_id;
         self.handle
-            .send(
-                Command::CommitActivation {
-                    execution_id: self.execution_id,
-                    activation,
-                    now_ms,
-                    reply,
-                },
-                cost,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .run(move |db| db.commit_activation(execution_id, activation, now_ms))
+            .await
     }
 
     /// Load this execution's permanent activation record.
@@ -2245,32 +1292,24 @@ impl ExecutionStore {
         self.handle.load_execution(self.execution_id).await
     }
 
-    /// List this execution's accepted frames that still need resolution.
-    pub async fn list_pending_inbox(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<PendingInboxItem>, StoreError> {
+    /// Timestamp of the last durable execution transition. The end handshake
+    /// uses it to preserve its inactivity window across actor recovery.
+    pub async fn execution_updated_at_ms(&self) -> Result<u64, StoreError> {
+        let execution_id = self.execution_id;
         self.handle
-            .list_pending_inbox(self.execution_id, limit)
-            .await
+            .run(move |db| db.execution_updated_at_ms(execution_id))
+            .await?
+            .ok_or(StoreError::ExecutionNotFound(execution_id))
     }
 
-    /// Load the current agent-facing request, including its original durable
-    /// payload. Acknowledged request outbox rows are retained specifically so
-    /// restart recovery can re-emit a request that was delivered before the
-    /// consumer submitted its answer.
-    pub async fn pending_requests(&self) -> Result<Vec<PendingRequest>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.handle
-            .send(
-                Command::ListPendingRequests {
-                    execution_id: self.execution_id,
-                    reply,
-                },
-                512,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+    /// Load one receipt by the content identity stored on this execution's
+    /// published terminal status. The caller supplies the identity so it can
+    /// check that the aggregate and immutable artifact remain bound together.
+    pub async fn load_receipt_by_id(
+        &self,
+        receipt_id: ReceiptId,
+    ) -> Result<Option<StoredReceipt>, StoreError> {
+        self.handle.load_receipt_by_id(receipt_id).await
     }
 
     /// Insert the initial execution aggregate from typed genesis inputs.
@@ -2287,253 +1326,43 @@ impl ExecutionStore {
         local_state: LocalStateBytes,
         now_ms: u64,
     ) -> Result<CreateExecutionOutcome, StoreError> {
-        let genesis = ExecutionState::new(
-            self.execution_id,
-            activation.clone(),
-            producer,
-            shared_state.clone(),
-            local_state.clone(),
-        )?;
-        let cost = self
-            .handle
-            .command_cost(state_bytes(&genesis)?.len(), 1, 512)?;
-        let (reply, response) = oneshot::channel();
+        let execution_id = self.execution_id;
         self.handle
-            .send(
-                Command::CreateExecution {
-                    execution_id: self.execution_id,
+            .run(move |db| {
+                db.create_execution(
+                    execution_id,
                     activation,
                     producer,
                     shared_state,
                     local_state,
                     now_ms,
-                    reply,
-                },
-                cost,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+                )
+            })
+            .await
     }
 
-    /// Derive and atomically apply one pure protocol input to this execution.
-    pub async fn apply_input(
-        &mut self,
-        input: ExecutionInput,
-        now_ms: u64,
-    ) -> Result<ApplyOutcome, StoreError> {
-        if matches!(&input, ExecutionInput::ReceiptBody(_)) {
-            return Err(StoreError::ReceiptBodyRequiresAssembly);
-        }
-        self.apply_input_inner(input, None, now_ms).await
-    }
-
-    async fn apply_input_inner(
-        &mut self,
-        input: ExecutionInput,
-        inbox: Option<InboxReference>,
-        now_ms: u64,
-    ) -> Result<ApplyOutcome, StoreError> {
-        let cost = self
-            .handle
-            .command_cost(input_bytes(&input)?.len(), 1, 1_024)?;
-        let (reply, response) = oneshot::channel();
+    /// Persist an actor-computed transition in one SQLite transaction.
+    /// A moved version is corruption, not a retry signal. On any error the
+    /// caller must reload committed state before making another transition:
+    /// task cancellation or a database error can leave the outcome unknown.
+    pub async fn persist(&mut self, record: TransitionRecord) -> Result<(), StoreError> {
+        let execution_id = self.execution_id;
         self.handle
-            .send(
-                Command::ApplyInput {
-                    execution_id: self.execution_id,
-                    input: Box::new(input),
-                    inbox,
-                    now_ms,
-                    reply,
-                },
-                cost,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .run(move |db| db.persist(execution_id, record))
+            .await
     }
 
-    /// Accept one frame whose source is the identity authenticated by the
-    /// transport. The returned outcome is the durable acknowledgement point.
-    pub async fn accept_inbound(
-        &mut self,
-        authenticated_source: PeerId,
-        frame: ExecFrame,
-        now_ms: u64,
-    ) -> Result<InboxAcceptOutcome, StoreError> {
-        let frame = AuthenticatedFrame {
-            source: authenticated_source,
-            frame,
-        };
-        let cost = self
-            .handle
-            .command_cost(frame_bytes(&frame)?.len(), 1, 512)?;
-        let (reply, response) = oneshot::channel();
+    /// Assemble portable evidence using the actor's committed state and durable
+    /// trace rows. The state must belong to this execution at its stored version.
+    pub async fn assemble_receipt(
+        &self,
+        state: &ExecutionState,
+    ) -> Result<ReceiptArtifact, StoreError> {
+        let execution_id = self.execution_id;
+        let state = state.clone();
         self.handle
-            .send(
-                Command::AcceptInbound {
-                    execution_id: self.execution_id,
-                    frame: Box::new(frame),
-                    now_ms,
-                    reply,
-                },
-                cost,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
-    }
-
-    /// Resolve an accepted signature, terminal signature, or abort frame.
-    pub async fn apply_inbound(
-        &mut self,
-        inbox_id: InboxId,
-        now_ms: u64,
-    ) -> Result<ApplyOutcome, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.handle
-            .send(
-                Command::ApplyInbound {
-                    execution_id: self.execution_id,
-                    inbox_id,
-                    now_ms,
-                    reply,
-                },
-                256,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
-    }
-
-    /// Resolve an accepted message with its guest-produced shared delta.
-    pub async fn apply_inbound_message(
-        &mut self,
-        inbox_id: InboxId,
-        delta: SharedDelta,
-        now_ms: u64,
-    ) -> Result<ApplyOutcome, StoreError> {
-        let input = ExecutionInput::ProposeShared(delta.clone());
-        let cost = self
-            .handle
-            .command_cost(input_bytes(&input)?.len(), 1, 1_024)?;
-        let (reply, response) = oneshot::channel();
-        self.handle
-            .send(
-                Command::ApplyInboundMessage {
-                    execution_id: self.execution_id,
-                    inbox_id,
-                    delta: Box::new(delta),
-                    now_ms,
-                    reply,
-                },
-                cost,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
-    }
-
-    /// Explicitly reject an accepted inbound frame that cannot become valid.
-    pub async fn reject_inbound(
-        &mut self,
-        inbox_id: InboxId,
-        now_ms: u64,
-    ) -> Result<InboxRejectOutcome, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.handle
-            .send(
-                Command::RejectInbound {
-                    execution_id: self.execution_id,
-                    inbox_id,
-                    now_ms,
-                    reply,
-                },
-                128,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
-    }
-
-    /// Lease the earliest ready outbox occurrence for this execution.
-    pub async fn lease_next_outbox(
-        &mut self,
-        now_ms: u64,
-    ) -> Result<Option<LeasedOutbox>, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.handle
-            .send(
-                Command::LeaseOutbox {
-                    execution_id: self.execution_id,
-                    now_ms,
-                    reply,
-                },
-                640,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
-    }
-
-    /// Acknowledge a leased outbox occurrence for this execution.
-    pub async fn acknowledge_outbox(
-        &mut self,
-        outbox_id: OutboxId,
-        lease_id: LeaseId,
-    ) -> Result<OutboxDeliveryOutcome, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.handle
-            .send(
-                Command::AcknowledgeOutbox {
-                    execution_id: self.execution_id,
-                    outbox_id,
-                    lease_id,
-                    reply,
-                },
-                256,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
-    }
-
-    /// Return a leased occurrence to pending with the configured delay.
-    pub async fn retry_outbox(
-        &mut self,
-        outbox_id: OutboxId,
-        lease_id: LeaseId,
-        now_ms: u64,
-        reason: impl Into<String>,
-    ) -> Result<OutboxDeliveryOutcome, StoreError> {
-        let reason = bounded_reason(reason.into())?;
-        let (reply, response) = oneshot::channel();
-        self.handle
-            .send(
-                Command::RetryOutbox {
-                    execution_id: self.execution_id,
-                    outbox_id,
-                    lease_id,
-                    now_ms,
-                    reason,
-                    reply,
-                },
-                512,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
-    }
-
-    /// Recover this execution's expired outbox leases.
-    pub async fn recover_expired_leases(
-        &mut self,
-        now_ms: u64,
-    ) -> Result<RecoveryReport, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.handle
-            .send(
-                Command::RecoverExpiredLeases {
-                    execution_id: self.execution_id,
-                    now_ms,
-                    reply,
-                },
-                128,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .run(move |db| db.assemble_receipt(execution_id, &state))
+            .await
     }
 
     /// List due active timers for this execution.
@@ -2542,36 +1371,10 @@ impl ExecutionStore {
         now_ms: u64,
         limit: usize,
     ) -> Result<Vec<ActiveTimer>, StoreError> {
-        let (reply, response) = oneshot::channel();
+        let execution_id = self.execution_id;
         self.handle
-            .send(
-                Command::DueTimers {
-                    execution_id: self.execution_id,
-                    now_ms,
-                    limit,
-                    reply,
-                },
-                self.handle.command_cost(256, limit, 256)?,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
-    }
-
-    /// Assemble the exact receipt body from authoritative rows and stage it
-    /// through the protocol reducer in one SQLite transaction.
-    pub async fn assemble_receipt(&mut self, now_ms: u64) -> Result<ApplyOutcome, StoreError> {
-        let (reply, response) = oneshot::channel();
-        self.handle
-            .send(
-                Command::AssembleReceipt {
-                    execution_id: self.execution_id,
-                    now_ms,
-                    reply,
-                },
-                512,
-            )
-            .await?;
-        response.await.map_err(|_| StoreError::ReplyDropped)?
+            .run(move |db| db.due_timers(execution_id, now_ms, limit))
+            .await
     }
 }
 

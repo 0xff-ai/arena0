@@ -1,5 +1,5 @@
-//! Step and terminal commitments: the byte-identical messages participants
-//! sign each step and at session completion, and the BLS aggregate agreements
+//! Step commitments: the byte-identical messages participants
+//! sign each agreed step, including the final step, and the BLS aggregate agreements
 //! recorded over them.
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -7,17 +7,12 @@ use serde::{Deserialize, Serialize};
 
 use arena0_crypto::{BlsPublicKey, BlsSignature};
 
-use crate::{OutcomeHash, SessionHash, StateHash};
+use crate::{SessionHash, StateHash};
 
 use super::entry::TraceEntry;
 
 /// Domain separation tag for the shared per-entry commitment participants sign.
-pub const STEP_COMMIT_DOMAIN: [u8; 24] = *b"arena0/step-commit/v2\0\0\0";
-
-/// Domain separation tag for the signed terminal boundary participants sign at
-/// session completion.
-pub const TERMINAL_DOMAIN: [u8; 24] = *b"arena0/terminal/v1\0\0\0\0\0\0";
-const _: () = assert!(TERMINAL_DOMAIN.len() == 24);
+pub const STEP_COMMIT_DOMAIN: [u8; 24] = *b"arena0/step-commit/v4\0\0\0";
 
 /// The chain link at the start of the public section: position 0 links to
 /// zeros. The activation boundary attestation is decoupled from trace positions,
@@ -41,8 +36,7 @@ pub struct StepSig {
 
 /// The shared per-entry message every participant signs. Byte-identical across
 /// participants and bound to the public entry itself: the canonical position,
-/// the entry content hash (event bytes, effects, deterministic fuel, and
-/// witness), the pre/post
+/// the entry content hash (normalized event and terminal effect), the pre/post
 /// shared state hashes, and the chain link to the previous position's
 /// commitment. Signatures are therefore never interchangeable tokens: a
 /// signature names exactly one entry at exactly one position in exactly one
@@ -69,6 +63,18 @@ pub struct StepCommitment {
 }
 
 impl StepCommitment {
+    /// Whether this commitment carries the current [`STEP_COMMIT_DOMAIN`].
+    #[must_use]
+    pub fn has_step_domain(&self) -> bool {
+        self.domain == STEP_COMMIT_DOMAIN
+    }
+
+    /// Whether this commitment is a current-domain commitment for `session_id`.
+    #[must_use]
+    pub fn is_bound_to(&self, session_id: SessionHash) -> bool {
+        self.has_step_domain() && self.session_id == session_id
+    }
+
     /// Build the commitment for one public entry, given the previous
     /// position's chain link ([`CHAIN_START`] at position 0).
     #[must_use]
@@ -96,67 +102,6 @@ impl StepCommitment {
     pub fn link_hash(&self) -> [u8; 32] {
         *blake3::hash(&self.signing_bytes()).as_bytes()
     }
-}
-
-/// The signed terminal boundary every participant co-signs at session completion.
-/// The end boundary paired with [`Activation`](crate::Activation): a full-bitmap aggregate over
-/// this message binds the final step, the final shared state, and the blake3 of the
-/// outcome bytes, so a truncated or relabeled terminal cannot pass. Byte-identical
-/// across participants (they agreed on the final state and outcome), so signatures
-/// aggregate the same way step commitments do.
-#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
-pub struct TerminalCommitment {
-    /// Domain separation tag ([`TERMINAL_DOMAIN`]).
-    pub domain: [u8; 24],
-    /// Session this terminal belongs to.
-    pub session_id: SessionHash,
-    /// Index of the final step (the entry carrying [`Effect::SessionEnd`](crate::Effect::SessionEnd)).
-    pub final_step: u64,
-    /// Shared state hash at completion (the final entry's `post_state`).
-    pub final_state: StateHash,
-    /// `blake3` of the borsh-encoded outcome bytes.
-    pub outcome_hash: OutcomeHash,
-}
-
-impl TerminalCommitment {
-    /// Build the terminal commitment for a completed session.
-    #[must_use]
-    pub fn new(
-        session_id: SessionHash,
-        final_step: u64,
-        final_state: StateHash,
-        outcome_hash: OutcomeHash,
-    ) -> Self {
-        Self {
-            domain: TERMINAL_DOMAIN,
-            session_id,
-            final_step,
-            final_state,
-            outcome_hash,
-        }
-    }
-
-    /// Canonical bytes participants sign (BLS hashes these to G1).
-    #[must_use]
-    pub fn signing_bytes(&self) -> Vec<u8> {
-        borsh::to_vec(self).expect("TerminalCommitment is always serializable")
-    }
-}
-
-/// The recorded terminal in a [`SessionHeader`](crate::SessionHeader): the completed session's final
-/// step, final state, outcome hash, and the full N-of-N aggregate over the
-/// [`TerminalCommitment`] that certifies them. Present iff the session completed
-/// (an [`Effect::SessionEnd`](crate::Effect::SessionEnd)).
-#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
-pub struct SessionTerminal {
-    /// Index of the final step.
-    pub final_step: u64,
-    /// Shared state hash at completion.
-    pub final_state: StateHash,
-    /// `blake3` of the borsh-encoded outcome bytes.
-    pub outcome_hash: OutcomeHash,
-    /// The N-of-N aggregate over the [`TerminalCommitment`], with a full bitmap.
-    pub agreement: AggregateAttestation,
 }
 
 /// A bitmap over committed participant indices (`ceil(N/8)` bytes), marking which
@@ -296,8 +241,8 @@ impl SignerSet {
 }
 
 /// The recorded agreement at one step: the BLS aggregate over the signing participants
-/// plus a bitmap of who signed. Computed and stored locally; never re-emitted to
-/// the network. Replaces the per-co-participant `Vec<Agreement>`.
+/// plus a bitmap of who signed. Certificate frames carry this same evidence
+/// so a peer can commit a staged step without collecting each signature again.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AggregateAttestation {
     /// Aggregate of the signers' `StepCommitment` signatures. The separate
@@ -416,18 +361,13 @@ mod tests {
         TraceEntry {
             trace_version: crate::TRACE_FORMAT_VERSION,
             step,
-            event: crate::PublicEvent::MessageReceived {
-                message_id: crate::MessageId([step as u8; 32]),
+            event: crate::StepEvent::Message {
                 from: crate::PeerId([1; 32]),
-                position: step,
-                pre_state: pre,
-                msg: Vec::new(),
+                data: Vec::new(),
             },
-            effects: Vec::new(),
             pre_state: pre,
             post_state: post,
-            fuel_used: 0,
-            witness: None,
+            terminal: None,
             agreement: AggregateAttestation::empty(),
         }
     }

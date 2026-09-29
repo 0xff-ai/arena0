@@ -2,18 +2,16 @@
 //!
 //! The node deliberately exposes commands and observations, not a mutable
 //! execution object. The private execution actor owns the only live guest and
-//! transport capabilities for one execution identity; protocol state is loaded
-//! from the store for each command.
+//! transport capabilities for one execution identity; protocol state remains in memory until restart or a failed persist.
 
-use arena0_protocol::PendingId;
+use arena0_protocol::CalloutId;
 use std::sync::Arc;
 
 use arena0_crypto::{ExecutionKey, ExecutionSalt, NodeKeys};
 use arena0_program::{JsonBytes, ProgramHash};
 use arena0_protocol::{
-    Activation, Ensemble, ExecId, ExecutionAdmission, ExecutionInput, FrameId, LocalStateBytes,
-    NegotiationTarget, PeerIdSource, PreparedActivation, ReceiptArtifact, SessionHash,
-    SharedStateBytes, View,
+    Activation, Ensemble, ExecId, ExecutionAdmission, LocalStateBytes, NegotiationTarget,
+    PreparedActivation, ReceiptArtifact, SessionHash, SharedStateBytes, View,
 };
 use arena0_sandbox::LoadedProgram;
 use arena0_store::{
@@ -27,18 +25,38 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 /// Failures returned by one execution actor.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum ExecError {
     /// No durable execution exists for the requested identity.
     #[error("execution {0} was not found")]
     NotFound(ExecId),
     /// An agent answer raced with another answer and no longer names the
-    /// durable callout continuation.
+    /// open callout.
     #[error("callout is no longer pending")]
     CalloutNotPending,
+    /// The guest rejected an agent answer and the callout stays open. The
+    /// contained message is safe to expose to the caller.
+    #[error("callout answer rejected: {0}")]
+    InputRejected(String),
+    /// A valid writer message was rejected or did not reproduce its post-state.
+    #[error("{0}")]
+    Diverged(String),
+    /// An agreed step's broadcasts would overflow this Host's outgoing queue.
+    /// The Host fails the session instead of signing an unrepresentable step.
+    #[error("outgoing queue overflow")]
+    OutgoingQueueOverflow,
+    /// The next agreed step would exceed the portable evidence budget.
+    #[error("receipt budget exhausted at step {step}")]
+    ReceiptBudgetExhausted { step: u64 },
+    /// A shared proposal is pending, so an input event was not consumed.
+    #[error("execution is waiting for shared agreement; input was not consumed")]
+    AgreementPending,
     /// Durable or guest state violates an execution invariant.
     #[error("invalid execution state: {0}")]
     InvalidState(String),
+    /// Verified certificate evidence contradicts the actor's local state.
+    #[error("execution delivery invariant failed: {0}")]
+    DeliveryInvariant(&'static str),
     /// An execution dependency or owned task is unavailable.
     #[error("execution resource unavailable: {0}")]
     Unavailable(String),
@@ -52,12 +70,21 @@ impl From<arena0_sandbox::SandboxError> for ExecError {
 
 impl From<arena0_protocol::ProtocolError> for ExecError {
     fn from(error: arena0_protocol::ProtocolError) -> Self {
+        if let arena0_protocol::ProtocolError::ReceiptBudgetExhausted { step } = error {
+            return Self::ReceiptBudgetExhausted { step };
+        }
         Self::InvalidState(error.to_string())
     }
 }
 
 impl From<StoreError> for ExecError {
     fn from(error: StoreError) -> Self {
+        if let StoreError::Protocol(arena0_protocol::ProtocolError::ReceiptBudgetExhausted {
+            step,
+        }) = error
+        {
+            return Self::ReceiptBudgetExhausted { step };
+        }
         Self::Unavailable(error.to_string())
     }
 }
@@ -72,12 +99,10 @@ impl From<arena0_transport::TransportError> for ExecError {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum ExecCommand {
-    /// Submit a validated JSON answer to a pending program callout.
+    /// Submit a validated JSON answer to the open program callout.
     SubmitInput {
-        /// The durable continuation identity being answered.
-        pending_id: PendingId,
-        /// The advertised callout variant being answered.
-        callout_index: u32,
+        /// The open callout identity being answered.
+        pending_id: CalloutId,
         /// Complete agent-facing JSON input.
         data: JsonBytes,
         /// Command result.
@@ -109,10 +134,6 @@ pub enum ExecCommand {
     /// Deliver one transport-authenticated frame after the stream reader has
     /// placed it on the actor's serialized command queue.
     Inbound { delivery: ExecDelivery },
-    /// A previously authenticated execution stream closed. The actor treats
-    /// this as a terminal transport failure rather than silently losing a
-    /// peer's durable delivery path.
-    InboundStreamClosed { peer: arena0_protocol::PeerId },
 }
 
 /// A stream handed from the Host accept router to one execution actor.
@@ -134,15 +155,12 @@ pub enum SessionMessage {
         session_id: SessionHash,
         ensemble: Ensemble,
     },
-    /// A durable callout is ready for an agent answer.
+    /// The committed open callout is ready for an agent answer.
     CalloutRequested {
-        pending_id: PendingId,
+        pending_id: CalloutId,
         callout_index: u32,
         context: Vec<u8>,
-        expected_type: Option<String>,
     },
-    /// A local notification became deliverable.
-    Notification { frame_id: FrameId, payload: Vec<u8> },
     /// A final receipt was durably published locally.
     ReceiptPublished { receipt: ReceiptArtifact },
     /// The execution reached a completed terminal boundary.
@@ -158,10 +176,9 @@ pub enum SessionMessage {
 
 /// All capabilities needed to construct one execution actor.
 ///
-/// The context is consumed by [`crate::Host::spawn`].  It contains no
-/// mutable protocol state: the SQLite [`ExecutionStore`] is the sole writer
-/// for that execution, while the actor owns only this loaded guest and its
-/// live external capabilities.
+/// The context is consumed by [`crate::Host::spawn`]. The actor loads and owns
+/// the execution state; the SQLite [`ExecutionStore`] persists each transition
+/// the actor hands it.
 pub struct ExecContext {
     /// Stable execution identity.
     pub(crate) exec_id: ExecId,
@@ -176,11 +193,13 @@ pub struct ExecContext {
     /// This key is consumed by the one actor for this execution. Keeping it
     /// non-cloneable makes the actor the sole live signing authority.
     pub(crate) execution_key: ExecutionKey,
+    /// Local confirmation window, measured from actor start or wake.
+    pub end_confirmation_window: std::time::Duration,
 }
 
 impl ExecContext {
     /// Collect the already-validated capabilities consumed by one execution
-    /// actor. Mutable protocol state remains owned by [`HostExecutionStore`].
+    /// actor.
     #[must_use]
     pub fn new(
         exec_id: ExecId,
@@ -195,6 +214,7 @@ impl ExecContext {
             params,
             activation,
             execution_key,
+            end_confirmation_window: std::time::Duration::from_secs(600),
         }
     }
 }
@@ -292,15 +312,6 @@ impl HostExecutionStore {
             .await
     }
 
-    /// Apply one protocol input to this execution.
-    pub async fn apply_input(
-        &mut self,
-        input: ExecutionInput,
-        now_ms: u64,
-    ) -> Result<arena0_store::ApplyOutcome, StoreError> {
-        self.store.apply_input(input, now_ms).await
-    }
-
     pub(crate) fn store_mut(&mut self) -> &mut ExecutionStore {
         &mut self.store
     }
@@ -338,12 +349,14 @@ impl std::fmt::Debug for ExecContext {
 /// That keeps an execution from being constructed with a store or transport
 /// unrelated to its Host.
 pub(crate) struct ActorContext {
+    pub(crate) end_confirmation_window: std::time::Duration,
     pub(crate) exec_id: ExecId,
     pub(crate) program: Arc<LoadedProgram>,
     pub(crate) params: JsonBytes,
     pub(crate) activation: Activation,
-    pub(crate) producer: arena0_protocol::PeerId,
-    pub(crate) execution_key: ExecutionKey,
+    /// Execution-scoped BLS signer shared by handle with per-dispatch guest
+    /// signers.
+    pub(crate) execution_key: Arc<ExecutionKey>,
     pub(crate) identity: Arc<NodeKeys>,
     pub(crate) store: ExecutionStore,
     pub(crate) transport: Arc<dyn Transport + Sync>,
@@ -356,14 +369,13 @@ impl ExecContext {
         store: ExecutionStore,
         transport: Arc<dyn Transport + Sync>,
     ) -> ActorContext {
-        let producer = identity.peer_id();
         ActorContext {
+            end_confirmation_window: self.end_confirmation_window,
             exec_id: self.exec_id,
             program: self.program,
             params: self.params,
             activation: self.activation,
-            producer,
-            execution_key: self.execution_key,
+            execution_key: Arc::new(self.execution_key),
             identity,
             store,
             transport,
@@ -386,10 +398,10 @@ pub struct SpawnedExec {
     pub cmd_tx: mpsc::Sender<ExecCommand>,
     /// Durable observations emitted by the actor.
     pub message_rx: mpsc::Receiver<SessionMessage>,
-    /// Stream handoff queue used by [`crate::Host`].
+    /// Stream handoff queue. The Host route holds only a weak sender, so this
+    /// handle decides when the queue closes.
     pub(crate) stream_tx: mpsc::Sender<InboundStreamPayload>,
     task: Option<ExecutionTask>,
-    forwarder: Option<JoinHandle<()>>,
     session_claim: Option<SessionStreamClaim>,
 }
 
@@ -445,18 +457,12 @@ impl SpawnedExec {
             message_rx,
             stream_tx,
             task: Some(task),
-            forwarder: None,
             session_claim: None,
         }
     }
 
     pub(crate) fn with_session_claim(mut self, claim: SessionStreamClaim) -> Self {
         self.session_claim = Some(claim);
-        self
-    }
-
-    pub(crate) fn with_forwarder(mut self, forwarder: JoinHandle<()>) -> Self {
-        self.forwarder = Some(forwarder);
         self
     }
 
@@ -475,11 +481,6 @@ impl SpawnedExec {
             let (replacement_streams, _) = mpsc::channel(1);
             let streams = std::mem::replace(&mut self.stream_tx, replacement_streams);
             drop(streams);
-
-            if let Some(forwarder) = self.forwarder.take() {
-                forwarder.abort();
-                let _ = forwarder.await;
-            }
 
             let ExecutionTask {
                 actor,
@@ -528,9 +529,6 @@ impl Drop for SpawnedExec {
         if let Some(task) = self.task.take() {
             task.actor.abort();
             task.streams.abort();
-        }
-        if let Some(forwarder) = self.forwarder.take() {
-            forwarder.abort();
         }
         drop(self.session_claim.take());
     }

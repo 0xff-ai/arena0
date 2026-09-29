@@ -4,11 +4,13 @@ mod capabilities;
 mod core;
 
 use arena0_crypto::SignScheme;
-use arena0_program::Capability;
-use arena0_protocol::Lifecycle;
+use arena0_program::abi::imports;
+use arena0_program::{Capability, StateMemoryKind};
+use arena0_protocol::Effect;
 use wasmtime::{Caller, Extern, Memory};
 
 use super::HostState;
+use crate::call::DispatchKind;
 
 pub(super) use capabilities::register_capability_imports;
 pub(super) use core::register_always_available;
@@ -20,7 +22,6 @@ pub(super) fn register_metadata_imports(
 ) -> Result<(), crate::SandboxError> {
     let capabilities = [
         Capability::Messaging,
-        Capability::Input,
         Capability::Timers,
         Capability::Sign {
             schemes: vec![SignScheme::Ed25519, SignScheme::Bls],
@@ -32,6 +33,8 @@ pub(super) fn register_metadata_imports(
 /// Arena0-specific operations on a Wasmtime host-function caller.
 pub(super) trait CallerExt {
     fn work_memory(&mut self) -> Result<Memory, wasmtime::Error>;
+    fn state_memory(&mut self, kind: u32) -> Result<Memory, wasmtime::Error>;
+    fn reject_state_io(&self, name: &str) -> Result<(), wasmtime::Error>;
     fn read_guest_bytes(
         &mut self,
         ptr: u32,
@@ -40,22 +43,37 @@ pub(super) trait CallerExt {
     ) -> Result<Vec<u8>, wasmtime::Error>;
     fn begin_import(&mut self, _name: &str) -> Result<(), wasmtime::Error>;
     fn reject_read_only(&self, name: &str) -> Result<(), wasmtime::Error>;
-    fn reject_non_local(&self, name: &str) -> Result<(), wasmtime::Error>;
-    fn reject_random_disallowed(&self, name: &str) -> Result<(), wasmtime::Error>;
-    fn reject_if_lifecycle_disallowed(
-        &self,
-        function_name: &str,
-        allowed: &[Lifecycle],
-    ) -> Result<(), wasmtime::Error>;
-    fn record_effect(&mut self, effect: arena0_protocol::Effect) -> Result<(), wasmtime::Error>;
+    fn record_effect(&mut self, effect: Effect) -> Result<(), wasmtime::Error>;
 }
 
 impl CallerExt for Caller<'_, HostState> {
     fn work_memory(&mut self) -> Result<Memory, wasmtime::Error> {
-        match self.get_export("memory") {
+        match self.get_export(arena0_program::abi::exports::WORK_MEMORY) {
             Some(Extern::Memory(memory)) => Ok(memory),
             _ => Err(wasmtime::Error::msg("memory not found in caller")),
         }
+    }
+
+    fn state_memory(&mut self, kind: u32) -> Result<Memory, wasmtime::Error> {
+        let name = match StateMemoryKind::try_from(kind)
+            .map_err(|error| wasmtime::Error::msg(error.to_string()))?
+        {
+            StateMemoryKind::Shared => arena0_program::abi::exports::SHARED_MEMORY,
+            StateMemoryKind::Local => arena0_program::abi::exports::LOCAL_MEMORY,
+        };
+        match self.get_export(name) {
+            Some(Extern::Memory(memory)) => Ok(memory),
+            _ => Err(wasmtime::Error::msg(format!("{name} memory not found"))),
+        }
+    }
+
+    fn reject_state_io(&self, name: &str) -> Result<(), wasmtime::Error> {
+        if !self.data().call_kind.allows_state_io() {
+            return Err(wasmtime::Error::msg(format!(
+                "{name}: state memory imports are unavailable to this call"
+            )));
+        }
+        Ok(())
     }
 
     fn read_guest_bytes(
@@ -98,69 +116,52 @@ impl CallerExt for Caller<'_, HostState> {
         Ok(())
     }
 
-    fn reject_non_local(&self, name: &str) -> Result<(), wasmtime::Error> {
-        self.reject_read_only(name)?;
-        if !self.data().call_kind.allows_local_effects() {
-            return Err(wasmtime::Error::msg(format!(
-                "{name}: import is unavailable to shared calls"
-            )));
-        }
-        Ok(())
-    }
-
-    fn reject_random_disallowed(&self, name: &str) -> Result<(), wasmtime::Error> {
-        self.reject_read_only(name)?;
-        if !self.data().call_kind.allows_random() {
-            return Err(wasmtime::Error::msg(format!(
-                "{name}: randomness is unavailable to shared calls"
-            )));
-        }
-        Ok(())
-    }
-
-    fn reject_if_lifecycle_disallowed(
-        &self,
-        function_name: &str,
-        allowed: &[Lifecycle],
-    ) -> Result<(), wasmtime::Error> {
-        let lifecycle = self.data().lifecycle;
-        if !allowed.contains(&lifecycle) {
-            return Err(wasmtime::Error::msg(format!(
-                "{function_name}: not allowed in {lifecycle:?} lifecycle"
-            )));
-        }
-        Ok(())
-    }
-
-    fn record_effect(&mut self, effect: arena0_protocol::Effect) -> Result<(), wasmtime::Error> {
-        if let arena0_protocol::Effect::Callout {
-            callout_index,
-            context,
-            ..
-        } = &effect
-        {
-            let schema = self
-                .data()
-                .callout_inputs
-                .get(*callout_index as usize)
-                .ok_or_else(|| wasmtime::Error::msg("unknown callout schema index"))?;
-            let value: serde_json::Value = serde_json::from_slice(context).map_err(|error| {
-                wasmtime::Error::msg(format!("callout context is not JSON: {error}"))
-            })?;
-            let validator = jsonschema::validator_for(schema.as_value()).map_err(|error| {
-                wasmtime::Error::msg(format!("invalid callout schema: {error}"))
-            })?;
-            validator.validate(&value).map_err(|error| {
-                wasmtime::Error::msg(format!("callout context schema validation failed: {error}"))
-            })?;
-        }
-        if !self.data().call_kind.allows_effect(&effect) {
+    fn record_effect(&mut self, effect: Effect) -> Result<(), wasmtime::Error> {
+        if !self.data().call_kind.allows_effects() {
             return Err(wasmtime::Error::msg(format!(
                 "effect {:?} is unavailable to {:?} calls",
                 effect,
                 self.data().call_kind
             )));
         }
+        let queue = &self.data().effect_queue;
+        if effect.is_lifecycle() {
+            if self.data().dispatch != DispatchKind::Agreed {
+                return Err(wasmtime::Error::msg(format!(
+                    "{}: a lifecycle effect is only available to agreed events",
+                    effect_name(&effect)
+                )));
+            }
+            if queue.iter().any(Effect::is_lifecycle) {
+                return Err(wasmtime::Error::msg(
+                    "at most one lifecycle effect is allowed per dispatch",
+                ));
+            }
+            if queue
+                .iter()
+                .any(|queued| matches!(queued, Effect::SetTimer { .. }))
+            {
+                return Err(wasmtime::Error::msg(
+                    "a lifecycle effect cannot be combined with SetTimer",
+                ));
+            }
+        } else if matches!(effect, Effect::SetTimer { .. })
+            && queue.iter().any(Effect::is_lifecycle)
+        {
+            return Err(wasmtime::Error::msg(
+                "SetTimer cannot be combined with a lifecycle effect",
+            ));
+        }
+        // Enforce every protocol effect limit at emission, including the exact
+        // canonical `Vec<Effect>` aggregate, so the dispatch path never has to
+        // reject an effect the guest already emitted.
+        arena0_protocol::execution::check_effect_budget(
+            self.data()
+                .effect_queue
+                .iter()
+                .chain(std::iter::once(&effect)),
+        )
+        .map_err(|error| wasmtime::Error::msg(format!("effect rejected: {error}")))?;
         let bytes = borsh::to_vec(&effect)
             .map_err(|error| wasmtime::Error::msg(format!("effect encoding failed: {error}")))?;
         let profile = self.data().profile.clone();
@@ -177,13 +178,18 @@ impl CallerExt for Caller<'_, HostState> {
     }
 }
 
+fn effect_name(effect: &Effect) -> &'static str {
+    match effect {
+        Effect::SessionEnd { .. } => imports::END_SESSION,
+        Effect::SessionAbort { .. } => imports::ABORT_SESSION,
+        Effect::Fail { .. } => imports::FAIL,
+        Effect::SetTimer { .. } => imports::SET_TIMER,
+        Effect::Broadcast { .. } => imports::BROADCAST,
+    }
+}
+
 /// Decode a u32 ABI discriminant to a [`SignScheme`].
 fn u32_to_sign_scheme(value: u32) -> Result<SignScheme, wasmtime::Error> {
-    match value {
-        0 => Ok(SignScheme::Ed25519),
-        1 => Ok(SignScheme::Bls),
-        _ => Err(wasmtime::Error::msg(format!(
-            "unknown sign scheme: {value}"
-        ))),
-    }
+    arena0_program::abi::sign_scheme::from_tag(value)
+        .ok_or_else(|| wasmtime::Error::msg(format!("unknown sign scheme: {value}")))
 }

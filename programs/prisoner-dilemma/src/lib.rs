@@ -2,8 +2,8 @@ use std::fmt::Write;
 
 use arena0::prelude::*;
 use arena0_primitives::commit_reveal::{
-    self, CommitReveal, CommitRevealLocal, CommitRevealLocalFieldExt, CommitRevealLocalState,
-    CommitRevealSharedFieldExt,
+    self, CommitReveal, CommitRevealAuthorExt, CommitRevealFieldExt, CommitRevealLocal,
+    CommitRevealLocalState, MyTurn,
 };
 
 #[arena0::data]
@@ -117,7 +117,7 @@ impl CommitRevealLocalState<Choice> for Local {
 
 impl Shared {
     /// Score the completed round in ABSOLUTE participant order so every node runs
-    /// the identical shared transition. `payoff(a, b).0` is `a`'s points, so
+    /// the identical state update. `payoff(a, b).0` is `a`'s points, so
     /// `payoff(p0, p1)` yields `(p0_points, p1_points)` directly.
     fn score_round(&mut self) {
         let Some(vals) = self.commit_reveal.values() else {
@@ -168,6 +168,7 @@ impl Shared {
 )]
 pub mod prisoner_dilemma {
     use super::*;
+    use arena0::ProgramTransition;
 
     type Shared = super::Shared;
     type Local = super::Local;
@@ -200,8 +201,7 @@ pub mod prisoner_dilemma {
         state.commit_reveal.expected_writer()
     }
 
-    fn view(ctx: &SharedContext, vp: &Viewport) -> View {
-        let state = ctx.shared();
+    fn view(state: &Shared, _ensemble: &Ensemble, vp: &Viewport) -> View {
         let current_round = if state.is_game_over() {
             state.total_rounds
         } else {
@@ -291,97 +291,91 @@ pub mod prisoner_dilemma {
         }
     }
 
-    /// Position-0 boundary: set the match length. Shared handler, so it issues no
-    /// callout and broadcasts nothing. The commit-reveal primitive starts from its
+    /// Position-0 boundary: set the match length. The session-start handler broadcasts nothing. The commit-reveal primitive starts from its
     /// `Default`.
-    fn on_session_started(ctx: &mut SharedContext) -> Result<Transition<Phase>, ProgramFault> {
-        ctx.mutate_shared(|s| s.total_rounds = 5);
+    fn on_session_started(
+        ctx: &mut Context<Shared, Local>,
+    ) -> Result<ProgramTransition<PrisonerDilemma>, ProgramFault> {
+        ctx.shared_mut().total_rounds = 5;
         Ok(Transition::To(Phase::Playing))
     }
 
-    /// Local decision hook: broadcast the owed reveal once every commit is in,
-    /// otherwise ask the agent for this round's move when one is still owed.
-    fn on_react(ctx: &mut Context) -> Result<(), ProgramFault> {
-        // Unique-writer rule: react only when this node is the participant
-        // whose action is next (first missing commit, then first missing
-        // reveal); an idle node never broadcasts a sibling candidate.
-        if ctx.shared().commit_reveal.expected_writer() != Some(ctx.me()) {
-            return Ok(());
-        }
-        if let Some(reveal) = ctx.commit_reveal().take_reveal() {
-            reveal.broadcast();
-            return Ok(());
-        }
-        if ctx.commit_reveal().needs_commit() {
-            let slot = ctx.me().index();
-            let req = ctx.shared().choice_request(slot);
-            ctx.effects().callout(req).dispatch();
-        }
-        Ok(())
+    fn callout(ctx: &CalloutContext<Shared, Local>) -> Option<Callout> {
+        (ctx.shared().commit_reveal.is_writer(ctx.me())
+            && ctx
+                .shared()
+                .commit_reveal
+                .needs_commit(&ctx.local().commit_reveal))
+        .then(|| ctx.shared().choice_request(ctx.me().index()).into())
     }
 
     fn on_message(
-        ctx: &mut SharedContext,
+        ctx: &mut Context<Shared, Local>,
         from: Participant,
         msg: Message,
-    ) -> Result<ApplyDecision<Phase>, ProtocolFault> {
+    ) -> MessageApply<PrisonerDilemma> {
         let Message::CommitReveal(cr_msg) = msg;
         // Unique-writer rule: only the expected writer may write here; any
         // other sender is a deterministic reject (no sibling candidates).
-        if ctx.shared().commit_reveal.expected_writer() != Some(from) {
+        if !ctx.shared().commit_reveal.is_writer(from) {
             return Ok(ApplyDecision::Reject);
         }
         if ctx.commit_reveal().handle(from, cr_msg).is_err() {
             return Ok(ApplyDecision::Reject);
         }
         if !ctx.shared().commit_reveal.is_complete() {
+            queue_setup_action(ctx);
             return Ok(ApplyDecision::Accept(Transition::Stay));
         }
 
-        let finished = ctx.mutate_shared(|s| {
-            s.score_round();
-            s.commit_reveal
-                .reset()
-                .expect("completed commit-reveal round can reset");
-            s.is_game_over()
-        });
+        let finished = apply_completed_round(ctx.shared_mut());
 
         if finished {
             return Ok(ApplyDecision::Accept(Transition::End));
         }
-        // The next round's callout is issued by `on_react` (needs_commit after reset).
+        // The reset state determines the next round's callout.
         Ok(ApplyDecision::Accept(Transition::Stay))
     }
 
-    fn on_input(ctx: &mut Context, input: Input) -> Result<(), InputFault> {
+    fn on_input(ctx: &mut LocalContext<Shared, Local>, input: Input) -> arena0::anyhow::Result<()> {
+        if !ctx.shared().commit_reveal.is_writer(ctx.me()) {
+            return Err(anyhow!("this participant does not own the next choice"));
+        }
         let Input::Choose(choice) = input;
-        ctx.commit_reveal().commit(choice)?.broadcast();
+        ctx.commit_reveal()
+            .commit(choice)?
+            .broadcast(&mut ctx.effects())?;
         Ok(())
     }
 
-    fn on_query(_ctx: &SharedContext, _: ()) {}
+    fn on_query(_shared: &Shared, _: ()) {}
+
+    /// Queue the owed reveal once every commit is in, when this node is the
+    /// expected writer.
+    fn queue_setup_action(ctx: &mut Context<Shared, Local>) {
+        if let Some(MyTurn::Reveal(reveal)) = ctx.commit_reveal().my_turn() {
+            reveal.broadcast(&mut ctx.effects());
+        }
+    }
+
+    /// Score a completed reveal round and either reset the protocol for the
+    /// next round or leave the final values visible for the terminal outcome.
+    fn apply_completed_round(state: &mut Shared) -> bool {
+        state.score_round();
+        let finished = state.is_game_over();
+        if !finished {
+            state
+                .commit_reveal
+                .reset()
+                .expect("completed commit-reveal round can reset");
+        }
+        finished
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arena0::testing::{ALICE, BOB, FaultStatus, Harness, Scenario, TestHarness};
-    use arena0::types::{ColorDepth, Slot};
-    use arena0_primitives::commit_reveal;
-
-    fn local_b() -> PeerId {
-        PeerId([1u8; 32])
-    }
-
-    fn slot(view: &View, slot: Slot) -> &str {
-        view.slots.get(&slot).map_or("", String::as_str)
-    }
-
-    fn assert_no_sgr(view: &View) {
-        for text in view.slots.values() {
-            assert!(!text.contains("\x1b["), "mono view contains SGR: {text:?}");
-        }
-    }
 
     #[test]
     fn choice_strings_are_stable() {
@@ -399,173 +393,6 @@ mod tests {
         ] {
             assert_eq!(payoff(mine, theirs), expected);
         }
-    }
-
-    // -- Session setup --
-
-    #[arena0::test(PrisonerDilemma, ())]
-    fn session_start_establishes_the_game_contract(h: ()) {
-        let fx = h.session_started(local_b());
-
-        assert!(matches!(fx.fault, FaultStatus::None));
-        assert_eq!(h.shared().total_rounds, 5);
-        assert_eq!(h.shared().phase(), Phase::Playing);
-        assert_eq!(h.shared().round, 0);
-        assert!(fx.has_callout());
-    }
-
-    // -- Input handling --
-
-    #[arena0::test(PrisonerDilemma, ())]
-    fn choice_input_sends_commit(h: ()) {
-        h.session_started(local_b());
-
-        let fx = h.input(Input::Choose(Choice::Cooperate));
-        assert!(matches!(fx.fault, FaultStatus::None));
-        assert!(fx.has_broadcast());
-
-        let msgs: Vec<Message> = fx.messages();
-        assert!(matches!(
-            msgs[0],
-            Message::CommitReveal(commit_reveal::Message::Commit(_))
-        ));
-    }
-
-    // -- Full game --
-
-    use arena0_primitives::commit_reveal::CommitReveal;
-
-    fn make_commit(choice: Choice) -> Message {
-        let proto = CommitReveal::<Choice>::default();
-        let mut local = CommitRevealLocal::default();
-        Message::CommitReveal(
-            proto
-                .commit_with_salt(&mut local, choice, [0u8; 32])
-                .expect("fresh commit"),
-        )
-    }
-
-    fn make_reveal(choice: Choice) -> Message {
-        Message::CommitReveal(commit_reveal::Message::Reveal {
-            value: choice,
-            salt: [0u8; 32],
-        })
-    }
-
-    /// Play one full round on a single native replica (the local node is
-    /// participant 0), hand-delivering every broadcast including self-delivery.
-    /// `mine` is the local choice, `theirs` the opponent's.
-    fn play_round(h: &mut TestHarness<PrisonerDilemma>, mine: Choice, theirs: Choice) {
-        let fx = h.resolve_callout::<callouts::Choose>(mine);
-        let my_commit = fx.messages::<Message>().remove(0);
-        h.message(h.peer_id(), my_commit);
-        let fx = h.message(local_b(), make_commit(theirs));
-        let my_reveal = fx.messages::<Message>().remove(0);
-        h.message(h.peer_id(), my_reveal);
-        h.message(local_b(), make_reveal(theirs));
-    }
-
-    fn assert_scenario_scores(name: &str, rounds: &[(Choice, Choice)], expected_scores: [u32; 2]) {
-        let mut scenario = Scenario::<PrisonerDilemma>::named(name);
-        for &(alice, bob) in rounds {
-            scenario = scenario
-                .input(ALICE, Input::Choose(alice))
-                .deliver_all()
-                .input(BOB, Input::Choose(bob))
-                .deliver_all();
-        }
-        let pair = scenario.run(());
-        pair.trace().assert_shared_aligned();
-        assert_eq!(pair.alice().shared().scores, expected_scores);
-        assert_eq!(pair.bob().shared().scores, expected_scores);
-        assert_eq!(
-            pair.alice().shared().round,
-            u8::try_from(rounds.len()).expect("test round count fits")
-        );
-        assert_eq!(pair.alice().shared().history.len(), rounds.len());
-    }
-
-    #[test]
-    fn payoff_scenarios_converge_across_replicas() {
-        for (name, rounds, scores) in [
-            (
-                "mutual cooperation",
-                [(Choice::Cooperate, Choice::Cooperate); 5],
-                [15, 15],
-            ),
-            (
-                "mutual defection",
-                [(Choice::Defect, Choice::Defect); 5],
-                [5, 5],
-            ),
-            (
-                "asymmetric choices",
-                [(Choice::Defect, Choice::Cooperate); 5],
-                [25, 0],
-            ),
-        ] {
-            assert_scenario_scores(name, &rounds, scores);
-        }
-    }
-
-    #[arena0::test(PrisonerDilemma, ())]
-    fn history_records_correct_choices(ha: ()) {
-        ha.session_started(local_b());
-
-        // Local (participant 0) cooperates, opponent defects.
-        play_round(&mut ha, Choice::Cooperate, Choice::Defect);
-
-        assert_eq!(ha.shared().history.len(), 1);
-        let round = &ha.shared().history[0];
-        assert_eq!(round[0], Choice::Cooperate);
-        assert_eq!(round[1], Choice::Defect);
-
-        assert_eq!(ha.shared().scores, [0, 5]);
-    }
-
-    #[arena0::test(PrisonerDilemma, ())]
-    fn view_renders_matrix_history_and_scores(ha: ()) {
-        ha.session_started(local_b());
-        play_round(&mut ha, Choice::Cooperate, Choice::Defect);
-
-        let view = ha.view(Viewport {
-            width: 80,
-            color: ColorDepth::Ansi16,
-        });
-        let state = slot(&view, Slot::State);
-        assert!(state.contains("Payoff matrix"));
-        assert!(state.contains("3/3"));
-        assert!(state.contains("0/5"));
-        assert!(state.contains("History"));
-        assert!(state.contains("C"));
-        assert!(state.contains("D"));
-        assert!(slot(&view, Slot::Agents).contains("P0"));
-        assert!(slot(&view, Slot::Agents).contains("P1"));
-        assert!(slot(&view, Slot::StatusBar).contains("round 2 of 5"));
-    }
-
-    #[arena0::test(PrisonerDilemma, ())]
-    fn view_mono_contains_no_sgr(h: ()) {
-        h.session_started(local_b());
-
-        let view = h.view(Viewport {
-            width: 80,
-            color: ColorDepth::Mono,
-        });
-        assert_no_sgr(&view);
-        assert!(slot(&view, Slot::State).contains("Payoff matrix"));
-    }
-
-    #[arena0::test(PrisonerDilemma, ())]
-    fn game_not_finished_before_five_rounds(ha: ()) {
-        ha.session_started(local_b());
-
-        for _ in 0..4 {
-            play_round(&mut ha, Choice::Cooperate, Choice::Cooperate);
-        }
-
-        assert_eq!(ha.shared().phase(), Phase::Playing);
-        assert_eq!(ha.shared().round, 4);
     }
 
     // -- Outcome projection --

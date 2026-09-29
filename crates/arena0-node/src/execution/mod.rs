@@ -2,34 +2,47 @@
 //!
 //! One private [`ExecutionActor`] owns the live guest and transport handles
 //! for an execution. The SQLite [`arena0_store::ExecutionStore`] remains the
-//! sole owner of durable protocol state; the sibling modules below organize
+//! persistence boundary for actor-computed state; the sibling modules below organize
 //! the actor by lifecycle and effect boundary.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
-use arena0_transport::SendHandle;
+use arena0_protocol::ExecutionVersion;
+use arena0_sandbox::ProgramInstance;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
+use tokio::time::Instant;
 
 use crate::context::{ActorContext, SessionMessage};
 use crate::unix_time_ms as now_ms;
 
 mod actor;
+mod delivery;
 mod guest;
-mod inbox;
-mod outbox;
 mod terminal;
 
 pub(crate) use actor::spawn_execution;
+pub(crate) use delivery::authenticates;
 pub(crate) use terminal::fail_execution;
 
 const COMMAND_CAPACITY: usize = 64;
 const STREAM_CAPACITY: usize = 64;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_TIMER_BATCH: usize = 16;
-const MAX_INBOX_BATCH: usize = 64;
-const MAX_CAS_RETRIES: usize = 8;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EndTimerPhase {
+    Ending,
+    Ended,
+}
+
+#[derive(Clone, Copy)]
+struct EndTimer {
+    version: ExecutionVersion,
+    phase: EndTimerPhase,
+    deadline: Instant,
+}
 
 /// Sole live owner of one loaded guest and its external capabilities.
 ///
@@ -37,42 +50,50 @@ const MAX_CAS_RETRIES: usize = 8;
 /// command and observation handles created by `spawn_execution`.
 struct ExecutionActor {
     context: ActorContext,
+    state: arena0_protocol::ExecutionState,
+    /// The sole live Wasm instance for this execution, entered only by the
+    /// serialized actor loop. `Some` means its rollback checkpoint holds exactly
+    /// `state`'s committed shared and local images; `None` means the next
+    /// `resident_mut` rebuilds it from `state`. Every transition that replaces
+    /// `state`'s images without `ProgramInstance::commit` calls
+    /// `reload_resident` right after persisting.
+    pub(super) instance: Option<ProgramInstance>,
     messages: mpsc::Sender<SessionMessage>,
-    send_streams: HashMap<arena0_protocol::PeerId, SendHandle>,
-    /// One remote effect may be waiting for the receiver's durable
-    /// responsibility acknowledgement.  It is kept outside the actor's
-    /// serialized command future so an inbound frame from that receiver can
-    /// still reach the actor and release the acknowledgement.
-    inflight_send: Option<InflightSend>,
+    send_lanes: HashMap<arena0_protocol::PeerId, delivery::SendLane>,
+    send_tasks: JoinSet<delivery::SendResult>,
+    /// Local clock for the current end-confirmation activity. The store's
+    /// `updated_at_ms` anchors an `Ending` timer after restart; an `Ended`
+    /// actor woken by peer traffic gets a fresh window to receive that peer.
+    end_timer: Option<EndTimer>,
     /// Whether this actor lifetime has delivered the durable session-start
     /// handoff to its observer. A restart may intentionally deliver it again;
     /// the durable public boundary remains the source of truth.
     session_started_emitted: bool,
+    /// Whether this actor lifetime has delivered the durable terminal
+    /// publication and lifecycle observation. Recovery intentionally emits
+    /// them again for a new observer; ticker progress must not duplicate them
+    /// within one actor lifetime.
+    terminal_emitted: bool,
+    /// Last open-callout identity announced to the observer. A restart starts
+    /// empty so the committed callout is announced once again.
+    announced_callout: Option<arena0_protocol::CalloutId>,
 }
 
-/// A leased remote outbox effect whose transport acknowledgement is being
-/// awaited concurrently with the actor command loop.
-///
-/// Dropping a Tokio join handle detaches its task.  Aborting in `Drop` keeps
-/// the send owned by this actor; the durable outbox lease then remains for
-/// recovery if the actor stops before the acknowledgement arrives.
-pub(super) struct InflightSend {
-    pub(super) destination: arena0_protocol::PeerId,
-    pub(super) outbox_id: arena0_protocol::OutboxId,
-    pub(super) lease_id: arena0_store::LeaseId,
-    pub(super) task: Option<JoinHandle<Result<(), arena0_transport::TransportError>>>,
-}
-
-impl Drop for InflightSend {
-    fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
+fn callout_requested(
+    pending_id: arena0_protocol::CalloutId,
+    callout_index: u32,
+    context: Vec<u8>,
+) -> SessionMessage {
+    SessionMessage::CalloutRequested {
+        pending_id,
+        callout_index,
+        context,
     }
 }
 
-pub(crate) fn truncate_reason(mut reason: String) -> String {
-    while reason.len() > arena0_protocol::MAX_TERMINAL_REASON_BYTES {
+/// Bound a human-readable reason to `limit` UTF-8 bytes at a scalar boundary.
+pub(crate) fn truncate_reason(mut reason: String, limit: usize) -> String {
+    while reason.len() > limit {
         // Popping whole scalar values keeps the cut at a UTF-8 boundary.
         // Calling `String::truncate` at the byte limit directly would panic
         // when the limit falls in the middle of a multibyte character.

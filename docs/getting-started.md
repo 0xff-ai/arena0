@@ -87,7 +87,7 @@ From a repository checkout, run the supplied Prisoner's Dilemma agents:
 arena0 run prisoner-dilemma \
   --agent host-01=./examples/agents/tit_for_tat.py \
   --agent host-02=./examples/agents/grim.py \
-  --replay --no-tui
+  --no-tui
 ```
 
 Each executable reads one callout as a JSON object on a line of standard input,
@@ -143,13 +143,15 @@ when its lifetime must be independent of a launch.
 Use the session identifier returned by a completed execution:
 
 ```console
-arena0 verify <session-id> --hosts host-01,host-02 --replay
+arena0 verify <session-id> --hosts host-01,host-02
 ```
 
 Name the execution's actual participant set. Without `--hosts`, verification
-uses the selected participant. Omit `--replay` for cryptographic verification
-without re-executing the program. Retained copies of the same canonical receipt
-have the same identifier; unilateral stop reports may differ.
+uses the selected participant. Verification is portable: it checks the
+activation, ordered trace, N-of-N signatures, shared state hashes, terminal
+evidence, and receipt identity without loading or executing the Wasm program.
+Retained copies of the same canonical receipt have the same identifier;
+unilateral stop reports may differ.
 
 Continue with [Architecture](architecture.md) for what the evidence establishes,
 or [Programming](programming.md) to define your own interaction.

@@ -12,17 +12,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arena0_api::{HostRequest, NextEvent, Request, Response, ResponseOk};
-use arena0_daemon::{Daemon, Keystore, McpConfig};
+use arena0_daemon::{Daemon, McpConfig};
 use arena0_home::{Home, HostName};
 use arena0_program::ProgramHash;
 use arena0_protocol::SessionHash;
-use arena0_store::{Store, StoreConfig};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 
 /// The required rock-paper-scissors guest artifact.
 pub fn rps_wasm() -> Vec<u8> {
     arena0_tests::wasm::program_wasm("rock_paper_scissors")
+}
+
+/// The required chess guest artifact.
+pub fn chess_wasm() -> Vec<u8> {
+    arena0_tests::wasm::program_wasm("chess")
 }
 
 /// The required cumulative-sum guest artifact.
@@ -101,9 +105,14 @@ pub async fn drive_script(
     script: &[serde_json::Value],
 ) -> SessionHash {
     let mut cursor = 0;
+    let mut answered = None;
     loop {
         match ok(call(target, &HostRequest::ExecNext { exec_id }).await) {
             ResponseOk::Next(NextEvent::Callout { pending_id, .. }) => {
+                if answered == Some(pending_id) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
                 let answer = if script.is_empty() {
                     serde_json::json!("Rock")
                 } else {
@@ -112,8 +121,7 @@ pub async fn drive_script(
                         .unwrap_or_else(|| panic!("script exhausted at callout {cursor}"))
                         .clone()
                 };
-                cursor += 1;
-                ok(call(
+                let result = call(
                     target,
                     &HostRequest::ExecSubmit {
                         exec_id,
@@ -121,7 +129,19 @@ pub async fn drive_script(
                         answer: Some(answer),
                     },
                 )
-                .await);
+                .await;
+                match result {
+                    Ok(ResponseOk::Ack) => {
+                        cursor += 1;
+                        answered = Some(pending_id);
+                    }
+                    Err(error)
+                        if matches!(error.code, arena0_api::ApiErrorCode::CalloutNotPending) =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    other => panic!("unexpected submit result: {other:?}"),
+                }
             }
             ResponseOk::Next(NextEvent::Completed { session_id, .. }) => return session_id,
             ResponseOk::Next(NextEvent::Failed { reason }) => {
@@ -188,28 +208,8 @@ pub struct DaemonHarness {
     pub program_id: ProgramHash,
 }
 
-/// Seed one durable Host namespace for a daemon started with bootstrap disabled.
-/// The daemon then reopens this identity and store without importing its seven
-/// built-in programs; each test imports only the guest artifact it exercises.
-async fn seed_host(home: &Home, name: &HostName) {
-    let state_dir = home.host(name).state_dir().to_owned();
-    let keys_dir = state_dir.join("keys");
-    std::fs::create_dir_all(&keys_dir).expect("Host state directories");
-    let keystore = Keystore::open(keys_dir).expect("Host keystore");
-    let identity = keystore
-        .new_identity(Some(name.to_string()))
-        .expect("Host identity");
-    let store = Store::open(StoreConfig::new(
-        state_dir.join("arena0.sqlite"),
-        identity.peer_id,
-    ))
-    .expect("Host store");
-    store.shutdown().await.expect("Host store shutdown");
-}
-
-/// Boot one daemon endpoint with two pre-seeded Hosts, import the requested
-/// program into both namespaces, and return the shared endpoint plus explicit
-/// Host targets.
+/// Boot one daemon endpoint with two Hosts, import the program into both
+/// namespaces, and return the shared endpoint plus explicit Host targets.
 pub async fn daemon(wasm: &[u8]) -> DaemonHarness {
     let home_dir = tempfile::tempdir().unwrap();
     let home = Home::from_root(home_dir.path().to_path_buf()).unwrap();
@@ -217,15 +217,13 @@ pub async fn daemon(wasm: &[u8]) -> DaemonHarness {
     let host_a = HostName::try_from("a").unwrap();
     let host_b = HostName::try_from("b").unwrap();
     let mcp = McpConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)), None).unwrap();
-    let engine = Arc::new(arena0_sandbox::WasmtimeEngine::new().expect("sandbox engine"));
-    seed_host(&home, &host_a).await;
-    seed_host(&home, &host_b).await;
+    let engine = arena0_test_engine::shared_test_engine();
     let supervisor = Daemon::start(
         vec![host_a.clone(), host_b.clone()],
         mcp,
         engine,
         home,
-        false,
+        true,
     )
     .await
     .unwrap_or_else(|error| panic!("start daemon supervisor: {error}"));

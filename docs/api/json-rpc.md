@@ -35,19 +35,16 @@ type Response = Result<ResponseOk, ApiError>;
 `ApiError` contains a stable category and a human-readable message. Categories
 are `NotFound`, `BadRequest`, `Ambiguous`, `Schema`, `Negotiation`,
 `Execution`, `Verification`, `Storage`, `Timeout`, `Internal`, and
-`CalloutNotPending`.
+`CalloutNotPending`, and `InputRejected`.
 
 ## Identity and custody
 
 | Method | Params | Success |
 |---|---|---|
-| `id.new` | `{label?}` | `Id` |
-| `id.list` | — | `IdList` |
-| `id.show` | `{id}` | `Id` |
-| `id.remove` | `{id}` | `Ack` |
+| `id.show` | — | `Id` |
 
-The active identity is the Host's durable protocol identity and cannot be
-removed through `id.remove`; rotation requires a lifecycle-aware operation.
+Each Host has exactly one identity, minted when the Host is created. A new
+identity means a new Host (`hosts.open`).
 
 Seeds never cross the socket. `IdInfo` contains public identity material only.
 
@@ -66,8 +63,8 @@ public metadata before it stores the exact Wasm bytes in the Host's SQLite
 catalog. The local transport does not fetch programs; every selected Host must
 have the same exact Wasm locally. `ProgramSummary.participants` declares
 supported counts. Fixed programs use `{"kind":"exact","count":2}`,
-while variable-size programs use `{"kind":"range","min":2,"max":64}`. The explicit
-ensemble size must fall within it.
+while variable-size programs use `{"kind":"range","min":2,"max":64}`. The
+requested participant count must fall within it.
 
 ## Execution
 
@@ -76,7 +73,7 @@ ensemble size must fall within it.
 | `exec.new` | `{exec_id, program, params?, ensemble}` | `ExecCreated` |
 | `exec.list` | — | `ExecList` |
 | `exec.status` | `{exec_id}` | `Status` |
-| `exec.inspect` | `{exec_id}` | `Inspection` |
+| `exec.inspect` | `{exec_id, events_from?, events_limit}` | `Inspection` |
 | `exec.await` | `{exec_id, until}` | `Awaited` |
 | `exec.next` | `{exec_id}` | `Next` |
 | `exec.submit` | `{exec_id, pending_id, answer?}` | `Ack` |
@@ -110,12 +107,20 @@ Once session progress exists, its `session` object also reports the public step,
 committed participants, pending callout summary, and whether this Host's
 receipt or stop report is durably available.
 
+The top-level `end` object reports local confirmation of the terminal result:
+`{"phase":"open","unconfirmed":[]}`, `{"phase":"ending","unconfirmed":["<peer-id>"]}`,
+or `{"phase":"ended","unconfirmed":[]}`. `ended` can retain unconfirmed
+peers when the confirmation window expires; receipt availability is independent
+of this phase.
+
 `exec.inspect` is a bounded, Host-local diagnostic projection for operator
 interfaces. It returns `exec.status`, durable activation facts, participant
-peer IDs and ticket commitments, and summaries of private handler crossings.
-It never returns private payloads, replacement local state, signatures, keys,
-parameters, outcomes, or callout context. Private summaries are the latest
-store-bounded window; `private_total` reveals when older summaries are omitted.
+peer IDs and ticket commitments, and summaries of event dispatch records.
+It never returns event payloads, replacement local state, signatures, keys,
+parameters, outcomes, or callout context. Event records are the latest
+store-bounded window. The response exposes the page through `events_from`,
+`events`, `events_total`, and `events_next`; `events_total` reveals when older
+records are omitted.
 Inspection data is local diagnostic evidence, not a protocol receipt or
 semantic system-event stream.
 
@@ -157,6 +162,23 @@ otherwise healthy execution. This category is also preserved for a stale
 answer already queued at the execution actor. Other validation, storage, and
 execution errors remain distinct.
 
+`pending_id` is the open callout's `CalloutId`. When an ID is kept, replaced,
+or consumed is specified once, in
+[execution and agreement](../protocol-architecture.md#10-execution-and-agreement)
+and [durable delivery](../protocol-architecture.md#durable-delivery). While an
+answered result is staged for agreement, the committed callout stays visible; a
+duplicate submission waits for agreement and then returns `CalloutNotPending`.
+`pending_callout` in `exec.status` contains only `pending_id` and
+`callout_index`.
+
+`exec.submit` returns `InputRejected` when the pending callout still belongs to
+the execution but the program rejects the answer. The response message carries
+the bounded program reason when one is available. The rejection does not change
+state, advance the event position, consume the `pending_id`, or emit
+`exec.session.callout_answered`; submit a corrected answer with the same
+`pending_id`. Invalid JSON or schema values are rejected at the API boundary
+with `Schema` before the program runs.
+
 `params`, callout answers, query values, and terminal projections are JSON.
 The daemon validates agent inputs against the program's public JSON Schema.
 Only generated guest code performs concrete DTO conversion to and from Borsh.
@@ -168,21 +190,24 @@ Only generated guest code performs concrete DTO conversion to and from Borsh.
 - `Failed { reason }`.
 
 `pending_id` is always a decimal JSON string, including in `exec.next`,
-`exec.status`, and `exec.submit`. It is an opaque continuation identity; keep
+`exec.status`, and `exec.submit`. It is an opaque callout identity; keep
 the string unchanged when submitting an answer. This avoids precision loss in
 JSON clients whose number type cannot represent every `u64` value.
 
-Signing requests never reach the client; the Host answers them with its
-custodied execution key.
+Guest signing never reaches the client; the Host signs synchronously with its
+custodied identity or execution key inside the local handler dispatch.
 
-The Host persists an authenticated inbound execution frame before it
-acknowledges transport responsibility. The execution actor resolves the frame
-through the reducer, which commits state, trace or private records, timers, and
-outbox effects in one SQLite transaction. Outbox delivery uses leases and
-retries, and expired leases are recovered when the store opens. A pending
-callout retains its `pending_id` and guest context across a restart, so
-`exec.next` can return the same callout again. Terminal proof collection is internal; the socket exposes the terminal result
-and the authenticated portable artifact.
+Peer delivery between Hosts is not part of this API; the protocol
+architecture specifies it under
+[durable delivery](../protocol-architecture.md#durable-delivery). A pending
+callout is stored with execution state and keeps its `pending_id` and guest
+context across restart, so `exec.next` can return the same callout again.
+
+Receipt publication exposes the terminal result and portable artifact to
+clients immediately. The `end` object in `exec.status` then tracks which remote
+participants have not yet confirmed the same conclusion; the `open`, `ending`,
+and `ended` phases and their confirmation rules are specified in
+[terminal evidence and publication](../protocol-architecture.md#terminal-evidence-and-publication).
 
 ## Receipts
 
@@ -191,7 +216,7 @@ and the authenticated portable artifact.
 | `receipt.get` | `{receipt}` | `Receipt` containing a `ReceiptArtifact` |
 | `receipt.import` | `{receipt}` | `ReceiptList` |
 | `receipt.list` | — | `ReceiptList` |
-| `receipt.verify` | `{receipt,full}` | `Verified` |
+| `receipt.verify` | `{receipt}` | `Verified` |
 
 `ReceiptRef` has three externally tagged JSON forms:
 
@@ -209,19 +234,19 @@ local production and import facts independently yield `Produced`, `Imported`, or
 `Both`. Each `Verified` response includes the exact verified `receipt_id`.
 
 The earlier `{key:{session_id,producer}}` API and producer-sealed JSON format are
-replaced by these references and artifacts. Receipt format and store schema are
-version 2; older evidence requires its matching older release.
+replaced by these references and artifacts. Older evidence and databases
+require their matching older release; the current format and schema versions
+are listed with the
+[preserved invariants](../protocol-architecture.md#14-preserved-invariants).
 
-Light verification returns cryptographically checked evidence without loading
-Wasm. Full verification is served by the daemon and replays the exact program.
-A completed JSON outcome is available only after full replay because the Host
-otherwise treats the receipt's Borsh outcome bytes as opaque.
-
-The `Verified` response carries a tier-specific `result`: `Light` contains a
-completed `outcome_borsh` or an exact `Stopped { cause }`, while `Full` contains
-both `outcome_borsh` and the replayed `outcome_json` for completion. Stopped
-results never carry an outcome field; `cause` preserves either authenticated
-unilateral evidence or a shared N-of-N stop commitment.
+`receipt.verify` performs [portable verification](../protocol-architecture.md#11-receipts-and-verification)
+only, without loading or executing Wasm. `Verified` carries the receipt summary:
+`receipt_id`, `program_id`, `session_id`, the ordered `ensemble`, `steps`,
+`terminal`, and `outcome_borsh`. `terminal` is the receipt's own termination,
+`"Completed"` or `{"Stopped":{"cause":...}}` with the exact stop cause. The
+Host keeps outcome Borsh bytes opaque, so a completion carries authenticated
+`outcome_borsh` bytes and a stop carries `null`. There is no program execution
+endpoint.
 
 ## Daemon lifecycle and Host information
 
@@ -272,7 +297,7 @@ an action failed or a client received no response. No arguments, answers, or
 result bodies appear.
 
 Activity is bounded and live-only. A lag record reports dropped observations;
-reconnecting cannot replay them. Frame order describes daemon observation,
+reconnecting starts at the current stream position. Frame order describes daemon observation,
 not multiparty protocol causality. Read current execution state and evidence
 through the ordinary Host methods after a gap. Adapter activity remains separate
 from semantic `EventFrame` values and durable receipt facts.

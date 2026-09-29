@@ -10,7 +10,7 @@
 
 use arena0_program::ProgramHash;
 use arena0_protocol::{
-    ColorDepth, ExecId, NegotiationTarget, PeerId, PendingId, ReceiptArtifact, SessionHash,
+    CalloutId, ColorDepth, ExecId, NegotiationTarget, ReceiptArtifact, SessionHash,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -48,15 +48,9 @@ pub enum HostRequest {
     #[serde(rename = "host.info")]
     Info,
     // Identity / custody (CLI only; never sent by the MCP server). Seeds never
-    // cross the socket: `id.new` returns only public material.
-    #[serde(rename = "id.new")]
-    IdNew { label: Option<String> },
-    #[serde(rename = "id.list")]
-    IdList,
+    // cross the socket: `id.show` returns only public material.
     #[serde(rename = "id.show")]
-    IdShow { id: IdRef },
-    #[serde(rename = "id.remove")]
-    IdRemove { id: IdRef },
+    IdShow,
 
     // Program catalog. `program` is a human handle, unique short-hash prefix, or
     // full 64-hex id, resolved to a `ProgramHash` daemon-side.
@@ -92,17 +86,17 @@ pub enum HostRequest {
     /// Read a bounded, host-local diagnostic projection of one execution.
     ///
     /// This is intentionally separate from `exec.status`: the projection may
-    /// include durable activation facts and local private-handler summaries,
+    /// include durable activation facts and local event-record summaries,
     /// while the status shape remains stable for ordinary callers.
     #[serde(rename = "exec.inspect")]
     ExecInspect {
         exec_id: ExecId,
-        /// First private handler sequence to include. `None` selects the latest
-        /// bounded window, which is appropriate for live inspection UIs.
-        private_from: Option<u64>,
-        /// Non-zero maximum number of private handler summaries to return. The
-        /// daemon enforces its fixed upper bound before reading the store.
-        private_limit: u16,
+        /// First event position to include. `None` selects the latest bounded
+        /// window, which is appropriate for live inspection UIs.
+        events_from: Option<u64>,
+        /// Non-zero maximum number of event summaries to return. The daemon
+        /// enforces its fixed upper bound before reading the store.
+        events_limit: u16,
     },
     #[serde(rename = "exec.await")]
     ExecAwait { exec_id: ExecId, until: AwaitState },
@@ -111,7 +105,7 @@ pub enum HostRequest {
     #[serde(rename = "exec.submit")]
     ExecSubmit {
         exec_id: ExecId,
-        pending_id: PendingId,
+        pending_id: CalloutId,
         /// The answer as JSON, validated against the pending callout's `output`
         /// schema.
         answer: Option<Value>,
@@ -153,7 +147,7 @@ pub enum HostRequest {
     #[serde(rename = "receipt.list")]
     ReceiptList,
     #[serde(rename = "receipt.verify")]
-    ReceiptVerify { receipt: ReceiptRef, full: bool },
+    ReceiptVerify { receipt: ReceiptRef },
 }
 
 /// The state `exec.await` blocks for: session established, or terminal.
@@ -174,13 +168,6 @@ pub enum EnsembleSpec {
     /// Join the first valid offer on the program topic, or one exact offer
     /// when `target` is supplied.
     Join { target: Option<NegotiationTarget> },
-}
-
-/// Reference an identity by `PeerId` or operator label.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum IdRef {
-    Peer(PeerId),
-    Label(String),
 }
 
 /// Select exact stored evidence, this Host's session publication, or an inline artifact.

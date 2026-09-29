@@ -17,7 +17,6 @@ arena0-sandbox = { path = "../arena0-sandbox" }
 arena0-transport = { path = "../arena0-transport" }
 arena0-node = { path = "../arena0-node" }
 arena0-store = { path = "../arena0-store" }
-arena0-verify = { path = "../arena0-verify", features = ["replay"] }
 
 rand = { workspace = true }
 tokio = { workspace = true }
@@ -38,6 +37,7 @@ zeroize = { workspace = true }
 fs2 = "0.4"
 
 [dev-dependencies]
+arena0-test-engine = { path = "../arena0-test-engine" }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
 rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }

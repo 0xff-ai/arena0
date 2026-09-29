@@ -47,7 +47,6 @@ pub(crate) enum RunStage {
     Activation,
     Execution,
     Verification,
-    Replay,
 }
 
 impl RunStage {
@@ -59,7 +58,6 @@ impl RunStage {
             Self::Activation => "activating session",
             Self::Execution => "waiting for execution",
             Self::Verification => "verifying Host receipts",
-            Self::Replay => "replaying Host receipts",
         }
     }
 

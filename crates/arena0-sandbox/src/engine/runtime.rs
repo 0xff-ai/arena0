@@ -1,132 +1,145 @@
-//! Fresh-instance execution operations for loaded programs.
+//! Resident dispatch and fresh projection operations for loaded programs.
 
+use crate::call::DispatchKind;
 use arena0_program::{
-    CallStatus, InitInput, LocalInput, LocalOutput, OutcomeInput, OutcomeOutput, QueryInput,
-    QueryOutput, SharedInput, SharedOutput, ViewInput, ViewOutput, WriterInput, WriterOutput, abi,
+    CallStatus, DispatchInput, DispatchOutput, InitInput, JsonBytes, LocalStateBytes, OutcomeInput,
+    OutcomeOutput, QueryInput, QueryOutput, SharedStateBytes, StateFrameError, ViewInput,
+    ViewOutput, WriterInput, WriterOutput, abi,
 };
-use arena0_protocol::Lifecycle;
+use arena0_protocol::{Committed, Ensemble};
 use borsh::{BorshDeserialize, BorshSerialize};
+use wasmtime::{Global, Instance, Memory, Store, StoreLimitsBuilder, Val};
 
 use super::memory::Guest;
-use super::{CallInstance, CallKind, InstanceConfig, instantiate_module, max_output};
-use crate::call::{
-    self, InitializeCall, LocalCall, OutcomeCall, QueryCall, SharedCall, ViewCall, WriterCall,
-};
+use super::{CallKind, InstanceConfig, instantiate_module, max_output};
+use crate::call::{DispatchCall, serialize};
+use crate::finalize::MUTABLE_GLOBAL_EXPORT_PREFIX;
 use crate::{
-    CallObservations, GuestOutcomeResult, GuestProjectionResult, GuestWriterResult,
-    InitializedState, LocalCallResult, SandboxError, SharedCallResult,
+    CallObservations, DispatchCallResult, GuestOutcomeResult, GuestProjectionResult,
+    GuestWriterResult, InitializedState, SandboxError,
 };
 
 impl super::LoadedProgram {
     /// Execute initialization in a fresh guest instance.
-    pub fn initialize(&self, call: InitializeCall) -> Result<InitializedState, SandboxError> {
-        let input = call.into_input()?;
+    pub fn initialize(&self, params: JsonBytes) -> Result<InitializedState, SandboxError> {
+        let input = InitInput::try_new(params.into_bytes())
+            .map_err(|error| SandboxError::input_limit(error.to_string()))?;
         let (output, observations) = self.invoke::<InitInput, arena0_program::InitializedState>(
             CallKind::Initialize,
-            Lifecycle::PreSession,
-            None,
+            DispatchKind::Local,
             abi::exports::INITIALIZE,
             input,
         )?;
         self.initialized_state(output, observations)
     }
 
-    /// Apply one shared/public event in a fresh guest instance.
-    pub fn apply_shared(&self, call: SharedCall) -> Result<SharedCallResult, SandboxError> {
-        let (shared, event, input_session, lifecycle) = match call {
-            SharedCall::SessionStarted { shared, ensemble } => (
-                shared,
-                arena0_protocol::Event::SessionStarted { ensemble },
-                None,
-                Lifecycle::PreSession,
-            ),
-            SharedCall::Event {
-                shared,
-                session,
-                event,
-            } => (
-                shared,
-                event.into_protocol(),
-                Some(session),
-                Lifecycle::Active,
-            ),
-        };
-        let event = call::serialize(&event)?;
-        let input = call::shared_input(shared.clone(), event, input_session)?;
-        self.validate_shared_state(&input.shared)?;
-        let (output, observations) = self.invoke::<SharedInput, SharedOutput>(
-            CallKind::Shared,
-            lifecycle,
-            None,
-            abi::exports::SHARED,
-            input,
+    /// Create the sole resident Wasm instance for one execution.
+    pub fn resident(
+        &self,
+        shared: SharedStateBytes,
+        local: LocalStateBytes,
+    ) -> Result<ProgramInstance, SandboxError> {
+        self.validate_state(&shared, &local)?;
+        let mut instance = instantiate_module(
+            &self.engine,
+            &self.module,
+            InstanceConfig {
+                metadata: &self.program.definition().metadata,
+                schema: &self.program.definition().schema,
+                profile: &self.profile,
+                call_kind: CallKind::Dispatch,
+                dispatch: DispatchKind::Local,
+            },
         )?;
-        if output.status == CallStatus::Rejected && !observations.is_empty_except_fuel() {
-            return Err(SandboxError::DispatchFailed(
-                "rejected shared call emitted observations".into(),
-            ));
+        let work = instance
+            .instance
+            .get_memory(&mut instance.store, abi::exports::WORK_MEMORY)
+            .ok_or_else(|| SandboxError::instantiation_failed("no work memory export"))?;
+        let shared_memory = instance
+            .instance
+            .get_memory(&mut instance.store, abi::exports::SHARED_MEMORY)
+            .ok_or_else(|| SandboxError::instantiation_failed("no shared memory export"))?;
+        let local_memory = instance
+            .instance
+            .get_memory(&mut instance.store, abi::exports::LOCAL_MEMORY)
+            .ok_or_else(|| SandboxError::instantiation_failed("no local memory export"))?;
+        let observed_work_bytes = work.data_size(&instance.store);
+        let max_work_bytes = self
+            .profile
+            .limits
+            .max_memory_bytes
+            .min(arena0_program::MAX_WASM_MEMORY_BYTES as u64);
+        let min_prepared = self.profile.limits.min_prepared_work_memory_bytes;
+        if u64::try_from(observed_work_bytes).unwrap_or(u64::MAX) < min_prepared {
+            return Err(SandboxError::instantiation_failed(format!(
+                "arena0_prepare established {observed_work_bytes} work-memory bytes; minimum is {min_prepared}"
+            )));
         }
-        if output.status == CallStatus::Rejected && output.shared.as_bytes() != shared.as_bytes() {
-            return Err(SandboxError::DispatchFailed(
-                "rejected shared call changed shared state".into(),
-            ));
+        if u64::try_from(observed_work_bytes).unwrap_or(u64::MAX) > max_work_bytes {
+            return Err(SandboxError::instantiation_failed(format!(
+                "arena0_prepare established {observed_work_bytes} work-memory bytes; maximum is {max_work_bytes}"
+            )));
         }
-        self.validate_shared_state(&output.shared)?;
-        Ok(SharedCallResult {
-            status: output.status,
-            shared: output.shared,
-            observations,
-        })
-    }
-
-    /// Apply one local/private event in a fresh guest instance.
-    pub fn apply_local(&self, call: LocalCall) -> Result<LocalCallResult, SandboxError> {
-        let (input, shared, random_replay) = call.into_input()?;
-        self.validate_state(&input.shared, &input.local)?;
-        let input_local = input.local.clone();
-        let (output, observations) = self.invoke::<LocalInput, LocalOutput>(
-            CallKind::Local,
-            Lifecycle::Active,
-            random_replay.as_ref().map(|replay| replay.as_slice()),
-            abi::exports::LOCAL,
-            input,
-        )?;
-        if output.status == CallStatus::Rejected {
-            if output.local.as_bytes() != input_local.as_bytes()
-                || !observations.is_empty_except_fuel()
+        instance.store.data_mut().limits = StoreLimitsBuilder::new()
+            .memory_size(observed_work_bytes)
+            .table_elements(self.profile.limits.max_table_elements as usize)
+            .instances(self.profile.limits.max_instances as usize)
+            .tables(self.profile.limits.max_tables as usize)
+            .memories(self.profile.limits.max_memories as usize)
+            .build();
+        let baseline_work = work.data(&instance.store).to_vec();
+        let mut globals = Vec::new();
+        for export in self.module.exports() {
+            if !export.name().starts_with(MUTABLE_GLOBAL_EXPORT_PREFIX)
+                || export.ty().global().is_none()
             {
-                return Err(SandboxError::DispatchFailed(
-                    "rejected local call changed state or emitted observations".into(),
-                ));
+                continue;
             }
-            return Ok(LocalCallResult {
-                status: output.status,
-                local: input_local,
-                observations,
-            });
+            let global = instance
+                .instance
+                .get_global(&mut instance.store, export.name())
+                .ok_or_else(|| SandboxError::MissingExport(export.name().into()))?;
+            let value = global.get(&mut instance.store);
+            globals.push((global, value));
         }
-        self.validate_state(&shared, &output.local)?;
-        Ok(LocalCallResult {
-            status: output.status,
-            local: output.local,
-            observations,
-        })
+        let mut resident = ProgramInstance {
+            store: instance.store,
+            instance: instance.instance,
+            profile: self.profile.clone(),
+            work,
+            shared_memory,
+            local_memory,
+            baseline_work,
+            globals,
+            shared_max_bytes: self
+                .state_max_bytes
+                .min(self.profile.limits.max_shared_state_bytes as usize),
+            committed_shared: SharedStateBytes::try_new(Vec::new())
+                .map_err(|error| SandboxError::dispatch_failed(error.to_string()))?,
+            committed_local: LocalStateBytes::try_new(Vec::new())
+                .map_err(|error| SandboxError::dispatch_failed(error.to_string()))?,
+        };
+        resident.restore_payloads(shared, local)?;
+        Ok(resident)
     }
 
-    /// Execute one read-only query in a fresh guest instance.
-    pub fn writer(&self, call: WriterCall) -> Result<GuestWriterResult, SandboxError> {
-        let participant_count = call.session.len();
-        let input = call.into_input();
-        self.validate_shared_state(&input.shared)?;
-        let (output, observations) = self.invoke::<WriterInput, WriterOutput>(
+    /// Execute the pure next-writer projection in a fresh guest instance.
+    pub fn writer(
+        &self,
+        shared: &SharedStateBytes,
+        session: &Ensemble<Committed>,
+    ) -> Result<GuestWriterResult, SandboxError> {
+        self.validate_shared_state(shared)?;
+        let participant_count = session.len();
+        let input = WriterInput {
+            shared: shared.clone(),
+        };
+        let (output, fuel_used) = self.project::<WriterInput, WriterOutput>(
             CallKind::Writer,
-            Lifecycle::Active,
-            None,
             abi::exports::WRITER,
+            "writer",
             input,
         )?;
-        let fuel_used = observations.fuel_used;
-        ensure_read_only(&observations, "writer")?;
         let writer = output.participant.map(arena0_protocol::Participant::new);
         if writer.is_some_and(|participant| participant.index() >= participant_count) {
             return Err(SandboxError::DispatchFailed(
@@ -136,32 +149,40 @@ impl super::LoadedProgram {
         Ok(GuestWriterResult { writer, fuel_used })
     }
 
-    /// Execute one read-only query in a fresh guest instance.
-    pub fn query(&self, call: QueryCall) -> Result<GuestProjectionResult, SandboxError> {
+    /// Execute one read-only query in a fresh guest instance. `query_index`
+    /// selects the advertised query schema.
+    pub fn query(
+        &self,
+        shared: &SharedStateBytes,
+        session: &Ensemble<Committed>,
+        query_index: u32,
+        query: JsonBytes,
+    ) -> Result<GuestProjectionResult, SandboxError> {
         let schema = self
             .program
             .definition()
             .schema
             .queries
-            .get(call.query_index as usize)
+            .get(query_index as usize)
             .ok_or_else(|| {
                 SandboxError::DeserializationFailed(format!(
-                    "query index {} is not advertised",
-                    call.query_index
+                    "query index {query_index} is not advertised",
                 ))
             })?;
-        let input = call.into_input()?;
-        self.validate_shared_state(&input.shared)?;
-        let query_index = input.query_index;
-        let (output, observations) = self.invoke::<QueryInput, QueryOutput>(
+        self.validate_shared_state(shared)?;
+        let input = QueryInput::try_new(
+            shared.clone(),
+            serialize(session)?,
+            query_index,
+            query.into_bytes(),
+        )
+        .map_err(|error| SandboxError::input_limit(error.to_string()))?;
+        let (output, fuel_used) = self.project::<QueryInput, QueryOutput>(
             CallKind::Query,
-            Lifecycle::Active,
-            None,
             abi::exports::QUERY,
+            "query",
             input,
         )?;
-        let fuel_used = observations.fuel_used;
-        ensure_read_only(&observations, "query")?;
         if output.query_index != query_index {
             return Err(SandboxError::DispatchFailed(
                 "query output index does not match input".into(),
@@ -176,34 +197,39 @@ impl super::LoadedProgram {
     }
 
     /// Execute one read-only viewport projection in a fresh guest instance.
-    pub fn view(&self, call: ViewCall) -> Result<GuestProjectionResult, SandboxError> {
-        let input = call.into_input()?;
-        self.validate_shared_state(&input.shared)?;
-        let (output, observations) = self.invoke::<ViewInput, ViewOutput>(
+    pub fn view(
+        &self,
+        shared: &SharedStateBytes,
+        session: &Ensemble<Committed>,
+        viewport: JsonBytes,
+    ) -> Result<GuestProjectionResult, SandboxError> {
+        self.validate_shared_state(shared)?;
+        let input = ViewInput::try_new(shared.clone(), serialize(session)?, viewport.into_bytes())
+            .map_err(|error| SandboxError::input_limit(error.to_string()))?;
+        let (output, fuel_used) = self.project::<ViewInput, ViewOutput>(
             CallKind::View,
-            Lifecycle::Active,
-            None,
             abi::exports::VIEW,
+            "view",
             input,
         )?;
-        let fuel_used = observations.fuel_used;
-        ensure_read_only(&observations, "view")?;
         projection_result(output.json, fuel_used, max_output(&self.profile), None)
     }
 
     /// Execute the pure terminal-outcome projection in a fresh guest instance.
-    pub fn outcome(&self, call: OutcomeCall) -> Result<GuestOutcomeResult, SandboxError> {
-        let input = call.into_input()?;
-        self.validate_shared_state(&input.shared)?;
-        let (output, observations) = self.invoke::<OutcomeInput, OutcomeOutput>(
+    pub fn outcome(
+        &self,
+        shared: &SharedStateBytes,
+        session: &Ensemble<Committed>,
+    ) -> Result<GuestOutcomeResult, SandboxError> {
+        self.validate_shared_state(shared)?;
+        let input = OutcomeInput::try_new(shared.clone(), serialize(session)?)
+            .map_err(|error| SandboxError::input_limit(error.to_string()))?;
+        let (output, fuel_used) = self.project::<OutcomeInput, OutcomeOutput>(
             CallKind::Outcome,
-            Lifecycle::Completed,
-            None,
             abi::exports::OUTCOME,
+            "outcome",
             input,
         )?;
-        let fuel_used = observations.fuel_used;
-        ensure_read_only(&observations, "outcome")?;
         outcome_result(
             output,
             fuel_used,
@@ -212,11 +238,29 @@ impl super::LoadedProgram {
         )
     }
 
+    /// Run one read-only projection in a fresh instance
+    /// and reject any guest effect. Callers validate the shared-state bound first.
+    fn project<I, O>(
+        &self,
+        kind: CallKind,
+        export: &str,
+        operation: &str,
+        input: I,
+    ) -> Result<(O, u64), SandboxError>
+    where
+        I: BorshSerialize,
+        O: BorshDeserialize,
+    {
+        let (output, observations) = self.invoke(kind, DispatchKind::Local, export, input)?;
+        let fuel_used = observations.fuel_used;
+        ensure_read_only(&observations, operation)?;
+        Ok((output, fuel_used))
+    }
+
     fn invoke<I, O>(
         &self,
         kind: CallKind,
-        lifecycle: Lifecycle,
-        random_replay: Option<&[Vec<u8>]>,
+        dispatch: DispatchKind,
         export: &str,
         input: I,
     ) -> Result<(O, CallObservations), SandboxError>
@@ -224,18 +268,7 @@ impl super::LoadedProgram {
         I: BorshSerialize,
         O: BorshDeserialize,
     {
-        let bytes = borsh::to_vec(&input)
-            .map_err(|error| SandboxError::SerializationFailed(error.to_string()))?;
-        if bytes.len() > self.profile.limits.max_call_envelope_bytes as usize {
-            return Err(SandboxError::InputLimitExceeded(format!(
-                "encoded call input is {} bytes; maximum is {}",
-                bytes.len(),
-                self.profile.limits.max_call_envelope_bytes
-            )));
-        }
-        let bytes_len = u32::try_from(bytes.len()).map_err(|_| {
-            SandboxError::InputLimitExceeded("call input length overflows u32".into())
-        })?;
+        let bytes = encode_envelope(&input, self.profile.limits.max_call_envelope_bytes)?;
         let mut instance = instantiate_module(
             &self.engine,
             &self.module,
@@ -244,54 +277,103 @@ impl super::LoadedProgram {
                 schema: &self.program.definition().schema,
                 profile: &self.profile,
                 call_kind: kind,
-                lifecycle,
-                random_replay,
+                dispatch,
             },
         )?;
-        let input_ptr = {
-            let mut guest = Guest::new(&mut instance.store, &instance.instance);
-            let ptr = guest.alloc(bytes_len)?;
-            guest.write_mem_charged(ptr, &bytes, self.profile.limits.max_host_bytes)?;
-            ptr
-        };
-        let returned = {
-            let mut guest = Guest::new(&mut instance.store, &instance.instance);
-            let returned = guest.call_pair_return(export, input_ptr, bytes_len);
-            guest.dealloc(input_ptr, bytes_len)?;
-            returned?
-        };
-        let fuel_used = self.profile.fuel.per_call.saturating_sub(
-            instance
-                .store
-                .get_fuel()
-                .unwrap_or(self.profile.fuel.per_call),
-        );
-        let output = self.decode_result::<O>(&mut instance, returned.0, returned.1)?;
+        let (output, fuel_used) = call_export(
+            &mut instance.store,
+            &instance.instance,
+            &self.profile,
+            export,
+            &bytes,
+        )?;
         let observations = instance.store.data_mut().finish_observations(fuel_used)?;
         Ok((output, observations))
     }
+}
 
-    fn decode_result<O: BorshDeserialize>(
-        &self,
-        instance: &mut CallInstance,
-        ptr: u32,
-        len: u32,
-    ) -> Result<O, SandboxError> {
-        if len as usize > self.profile.limits.max_call_envelope_bytes as usize {
-            return Err(SandboxError::OutputLimitExceeded {
-                size: len as u64,
-                max: self.profile.limits.max_call_envelope_bytes,
-            });
-        }
-        let bytes = {
-            let mut guest = Guest::new(&mut instance.store, &instance.instance);
-            let bytes = guest.read_mem_charged(ptr, len, self.profile.limits.max_host_bytes)?;
-            guest.dealloc(ptr, len)?;
-            bytes
-        };
-        borsh::from_slice(&bytes)
-            .map_err(|error| SandboxError::DeserializationFailed(error.to_string()))
+/// Encode one call envelope against the profile limit.
+///
+/// This is the single input-direction bound check shared by the fresh
+/// (`invoke`) and resident (`dispatch_input`) paths; the profile owns the
+/// limit.
+fn encode_envelope<T: BorshSerialize>(value: &T, max_bytes: u64) -> Result<Vec<u8>, SandboxError> {
+    let bytes = borsh::to_vec(value)
+        .map_err(|error| SandboxError::SerializationFailed(error.to_string()))?;
+    if bytes.len() > max_bytes as usize {
+        return Err(SandboxError::InputLimitExceeded(format!(
+            "encoded call input is {} bytes; maximum is {max_bytes}",
+            bytes.len(),
+        )));
     }
+    Ok(bytes)
+}
+
+/// Decode one call output against the profile limit.
+///
+/// This is the single output-direction bound check shared by the fresh
+/// (`decode_result`) and resident (`decode_resident_result`) paths.
+/// Run one guest export on an encoded call envelope: copy it into a guest
+/// allocation, call `export`, decode the returned envelope, then zero and
+/// release the input. Returns the output and the fuel the call used.
+fn call_export<O: BorshDeserialize>(
+    store: &mut Store<super::HostState>,
+    instance: &Instance,
+    profile: &arena0_program::ExecutionProfile,
+    export: &str,
+    bytes: &[u8],
+) -> Result<(O, u64), SandboxError> {
+    let bytes_len = u32::try_from(bytes.len())
+        .map_err(|_| SandboxError::InputLimitExceeded("call input length overflows u32".into()))?;
+    let max_host = profile.limits.max_host_bytes;
+    let (input_ptr, (output_ptr, output_len)) = {
+        let mut guest = Guest::new(store, instance);
+        let input_ptr = guest.alloc(bytes_len)?;
+        guest.write_mem_charged(input_ptr, bytes, max_host)?;
+        (
+            input_ptr,
+            guest.call_pair_return(export, input_ptr, bytes_len)?,
+        )
+    };
+    let output = decode_output(
+        store,
+        instance,
+        output_ptr,
+        output_len,
+        profile.limits.max_call_envelope_bytes,
+        max_host,
+    )?;
+    let mut guest = Guest::new(store, instance);
+    guest.zero_mem(input_ptr, bytes_len)?;
+    guest.dealloc(input_ptr, bytes_len)?;
+    let per_call = profile.fuel.per_call;
+    let fuel_used = per_call.saturating_sub(store.get_fuel().unwrap_or(per_call));
+    Ok((output, fuel_used))
+}
+
+fn decode_output<O: BorshDeserialize>(
+    store: &mut Store<super::HostState>,
+    instance: &Instance,
+    ptr: u32,
+    len: u32,
+    max_envelope: u64,
+    max_host: u64,
+) -> Result<O, SandboxError> {
+    if len as usize > max_envelope as usize {
+        return Err(SandboxError::OutputLimitExceeded {
+            size: len as u64,
+            max: max_envelope,
+        });
+    }
+    let bytes = {
+        let mut guest = Guest::new(store, instance);
+        let bytes = guest.read_mem_charged(ptr, len, max_host)?;
+        guest.zero_mem(ptr, len)?;
+        guest.dealloc(ptr, len)?;
+        bytes
+    };
+    borsh::from_slice(&bytes)
+        .map_err(|error| SandboxError::DeserializationFailed(error.to_string()))
 }
 
 fn projection_result(
@@ -348,6 +430,290 @@ fn ensure_read_only(observations: &CallObservations, operation: &str) -> Result<
     }
 }
 
+/// One actor-owned Wasm instance. This type is intentionally non-cloneable:
+/// the host must serialize dispatches through one owner and decide explicitly
+/// when candidate state becomes committed.
+pub struct ProgramInstance {
+    pub(crate) store: Store<super::HostState>,
+    pub(crate) instance: Instance,
+    profile: arena0_program::ExecutionProfile,
+    work: Memory,
+    shared_memory: Memory,
+    local_memory: Memory,
+    baseline_work: Vec<u8>,
+    globals: Vec<(Global, Val)>,
+    shared_max_bytes: usize,
+    committed_shared: SharedStateBytes,
+    committed_local: LocalStateBytes,
+}
+
+impl std::fmt::Debug for ProgramInstance {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProgramInstance")
+            .field("committed_shared_len", &self.committed_shared.len())
+            .field("committed_local_len", &self.committed_local.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProgramInstance {
+    /// Dispatch one event through the sole mutating guest export.
+    pub fn dispatch(&mut self, call: DispatchCall) -> Result<DispatchCallResult, SandboxError> {
+        let (input, dispatch, outgoing_len, signer) = call.into_input()?;
+        self.dispatch_input(input, dispatch, outgoing_len, signer)
+    }
+
+    /// Replace the resident state with durable committed payloads during actor
+    /// recovery. This also updates the rollback checkpoint.
+    pub fn restore_payloads(
+        &mut self,
+        shared: SharedStateBytes,
+        local: LocalStateBytes,
+    ) -> Result<(), SandboxError> {
+        self.validate_payloads(&shared, &local)?;
+        write_state_payload(&mut self.store, self.shared_memory, shared.as_bytes())?;
+        write_state_payload(&mut self.store, self.local_memory, local.as_bytes())?;
+        self.reset_work_and_globals()?;
+        self.committed_shared = shared;
+        self.committed_local = local;
+        Ok(())
+    }
+
+    /// Restore the last committed payloads after proposal freeze or a failed
+    /// durable operation.
+    pub fn restore_committed(&mut self) -> Result<(), SandboxError> {
+        // The checkpoint is already validated when it is installed. Borrowing
+        // it here avoids cloning each payload on every reject/failure path.
+        write_state_payload(
+            &mut self.store,
+            self.shared_memory,
+            self.committed_shared.as_bytes(),
+        )?;
+        write_state_payload(
+            &mut self.store,
+            self.local_memory,
+            self.committed_local.as_bytes(),
+        )?;
+        self.reset_work_and_globals()
+    }
+
+    /// Promote the currently resident state images to the rollback
+    /// checkpoint after the owning store transaction confirms commitment.
+    /// The caller already holds the accepted images; nothing is returned,
+    /// so commitment copies nothing back out.
+    pub fn commit(&mut self) -> Result<(), SandboxError> {
+        let (shared, local) = self.resident_payloads()?;
+        self.committed_shared = shared;
+        self.committed_local = local;
+        Ok(())
+    }
+
+    /// Return the last state images known to be committed by the owner.
+    #[must_use]
+    pub fn committed_payloads(&self) -> (&SharedStateBytes, &LocalStateBytes) {
+        (&self.committed_shared, &self.committed_local)
+    }
+
+    fn resident_payloads(&self) -> Result<(SharedStateBytes, LocalStateBytes), SandboxError> {
+        let shared_payload = canonical_state_payload(
+            &self.store,
+            self.shared_memory,
+            self.shared_max_bytes,
+            "shared",
+        )?;
+        let local_payload = canonical_state_payload(
+            &self.store,
+            self.local_memory,
+            self.profile.limits.max_local_state_bytes as usize,
+            "local",
+        )?;
+        let shared = SharedStateBytes::try_from_slice(shared_payload)
+            .map_err(|error| SandboxError::dispatch_failed(error.to_string()))?;
+        let local = LocalStateBytes::try_from_slice(local_payload)
+            .map_err(|error| SandboxError::dispatch_failed(error.to_string()))?;
+        Ok((shared, local))
+    }
+
+    fn rollback_error<T>(&mut self, error: SandboxError) -> Result<T, SandboxError> {
+        let _ = self.rollback_after_failure();
+        Err(error)
+    }
+
+    fn dispatch_input(
+        &mut self,
+        input: DispatchInput,
+        dispatch: DispatchKind,
+        outgoing_len: usize,
+        signer: Option<std::sync::Arc<dyn crate::GuestSigner>>,
+    ) -> Result<DispatchCallResult, SandboxError> {
+        let bytes = encode_envelope(&input, self.profile.limits.max_call_envelope_bytes)?;
+        if let Err(error) = self.reset_for_dispatch(dispatch, outgoing_len) {
+            return self.rollback_error(error);
+        }
+        // A signer is installed only for this dispatch; any rollback path
+        // clears it together with the rest of the per-call host state.
+        self.store.data_mut().signer.install(signer);
+        let (output, fuel_used) = call_export::<DispatchOutput>(
+            &mut self.store,
+            &self.instance,
+            &self.profile,
+            abi::exports::DISPATCH,
+            &bytes,
+        )
+        .or_else(|error| self.rollback_error(error))?;
+        if output.status == CallStatus::Accepted
+            && let Some(callout) = &output.callout
+            && let Err(error) =
+                super::validate_callout_context(&self.store.data().callout_inputs, callout)
+        {
+            return self.rollback_error(error);
+        }
+        // A rejected handler has no state or observation commit semantics.
+        // Restore before inspecting its candidate frames so malformed or
+        // oversized guest writes cannot turn a normal rejection into a
+        // sandbox error. Setup and dispatch observations are all provisional,
+        // including replayable random bytes.
+        if output.status == CallStatus::Rejected {
+            self.rollback_after_failure()?;
+            // A rejection carries no images: the caller keeps its committed
+            // state and nothing is cloned here.
+            return Ok(DispatchCallResult {
+                status: output.status,
+                reason: output.reason,
+                callout: None,
+                shared: None,
+                local: None,
+                observations: CallObservations {
+                    effects: Vec::new(),
+                    fuel_used,
+                    random_draws: Vec::new(),
+                    logs: Vec::new(),
+                },
+            });
+        }
+
+        let observations = self
+            .store
+            .data_mut()
+            .finish_observations(fuel_used)
+            .or_else(|error| self.rollback_error(error))?;
+
+        // The state-validation boundary borrows the fixed memories directly:
+        // one shared view supplies the payload copy and the local view
+        // supplies only its payload copy. The entry reset above is
+        // the sole successful work-memory/global reset boundary; failed calls
+        // use rollback below, while the next dispatch deterministically resets
+        // any successful call's temporary work state before re-entry.
+        let (shared, local) = self
+            .resident_payloads()
+            .or_else(|error| self.rollback_error(error))?;
+        Ok(DispatchCallResult {
+            status: output.status,
+            reason: output.reason,
+            callout: output.callout,
+            shared: Some(shared),
+            local: Some(local),
+            observations,
+        })
+    }
+
+    fn validate_payloads(
+        &self,
+        shared: &SharedStateBytes,
+        local: &LocalStateBytes,
+    ) -> Result<(), SandboxError> {
+        if shared.len() > self.shared_max_bytes {
+            return Err(SandboxError::MemoryLimitExceeded(shared.len() as u64));
+        }
+        if local.len() > self.profile.limits.max_local_state_bytes as usize {
+            return Err(SandboxError::MemoryLimitExceeded(local.len() as u64));
+        }
+        Ok(())
+    }
+
+    fn reset_for_dispatch(
+        &mut self,
+        dispatch: DispatchKind,
+        outgoing_len: usize,
+    ) -> Result<(), SandboxError> {
+        // Reset at entry so every guest call sees the same temporary-memory and
+        // mutable-global baseline, including when a prior accepted result was
+        // not yet committed by the owning store transaction.
+        let reset_result = self.reset_work_and_globals();
+        self.store
+            .data_mut()
+            .reset_for_dispatch(dispatch, outgoing_len);
+        reset_result?;
+        self.store
+            .set_fuel(self.profile.fuel.per_call)
+            .map_err(|error| SandboxError::dispatch_failed(error.to_string()))
+    }
+
+    fn reset_work_and_globals(&mut self) -> Result<(), SandboxError> {
+        if self.work.data_size(&self.store) != self.baseline_work.len() {
+            return Err(SandboxError::dispatch_failed(
+                "resident work memory size changed",
+            ));
+        }
+        self.work
+            .data_mut(&mut self.store)
+            .copy_from_slice(&self.baseline_work);
+        for (global, value) in &self.globals {
+            global
+                .set(&mut self.store, *value)
+                .map_err(|error| SandboxError::dispatch_failed(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn rollback_after_failure(&mut self) -> Result<(), SandboxError> {
+        let restore_result = self.restore_committed();
+        self.store
+            .data_mut()
+            .reset_for_dispatch(DispatchKind::Local, 0);
+        restore_result
+    }
+}
+
+/// Borrowed view of one validated fixed-width state memory.
+///
+/// The returned slice is the bounded payload range of the complete canonical
+/// image. It never owns guest memory and must not outlive the immutable
+/// store borrow used to create it.
+fn canonical_state_payload<'a>(
+    store: &'a Store<super::HostState>,
+    memory: Memory,
+    max_payload: usize,
+    label: &str,
+) -> Result<&'a [u8], SandboxError> {
+    arena0_program::canonical_state_payload(memory.data(store), max_payload).map_err(|error| {
+        match error {
+            StateFrameError::TooLarge { actual, .. } => {
+                SandboxError::MemoryLimitExceeded(actual as u64)
+            }
+            error => SandboxError::dispatch_failed(format!("{label} {error}")),
+        }
+    })
+}
+
+/// Overwrite a state memory with the canonical image of `payload`.
+fn write_state_payload(
+    store: &mut Store<super::HostState>,
+    memory: Memory,
+    payload: &[u8],
+) -> Result<(), SandboxError> {
+    let data = memory.data_mut(store);
+    if data.len() != arena0_program::CANONICAL_STATE_MEMORY_BYTES {
+        return Err(SandboxError::MemoryLimitExceeded(
+            arena0_program::CANONICAL_STATE_MEMORY_BYTES as u64,
+        ));
+    }
+    data.fill(0);
+    arena0_program::write_state_frame(data, 0, payload)
+        .map_err(|error| SandboxError::dispatch_failed(error.to_string()))
+}
+
 impl super::LoadedProgram {
     fn initialized_state(
         &self,
@@ -382,17 +748,15 @@ fn validate_json_schema(
 }
 
 #[cfg(test)]
-mod fresh_runtime_tests {
-    use std::sync::Arc;
-
+mod resident_runtime_tests {
     use super::*;
-    use crate::call::{LocalEvent, SharedEvent};
-    use crate::{LoadedProgram, Program, WasmtimeEngine};
+    use crate::{Program, test_support::shared_test_engine};
+
     use arena0_program::{
-        Capability, JsonBytes, JsonSchemaDocument, LocalStateBytes, ProgramDefinition,
-        ProgramMetadata, ProgramSchema, QuerySchema, SharedStateBytes, StateSchema,
+        Capability, JsonSchemaDocument, ProgramDefinition, ProgramMetadata, ProgramSchema,
+        StateSchema,
     };
-    use arena0_protocol::{Committed, Ensemble, MessageId, PeerId, StateHash};
+    use arena0_protocol::{Committed, Effect, Ensemble, Event, PeerId};
 
     fn unit_schema() -> JsonSchemaDocument {
         JsonSchemaDocument::new(serde_json::json!({
@@ -406,12 +770,12 @@ mod fresh_runtime_tests {
         let unit = unit_schema();
         ProgramDefinition {
             metadata: ProgramMetadata {
-                name: "fresh-fixture".into(),
+                name: "resident-fixture".into(),
                 version: "1".into(),
-                description: "fresh guest fixture".into(),
+                description: "resident dispatch fixture".into(),
                 author: None,
                 capabilities,
-                display_name: "Fresh fixture".into(),
+                display_name: "Resident fixture".into(),
                 participants: arena0_program::ParticipantCount::Exact { count: 2 },
             },
             schema: ProgramSchema {
@@ -422,12 +786,7 @@ mod fresh_runtime_tests {
                 callouts: Vec::new(),
                 messages: Vec::new(),
                 params: unit.clone(),
-                queries: vec![QuerySchema {
-                    name: "unit".into(),
-                    label: "Unit".into(),
-                    request: unit.clone(),
-                    response: unit.clone(),
-                }],
+                queries: Vec::new(),
                 outcome: unit,
             },
         }
@@ -441,532 +800,565 @@ mod fresh_runtime_tests {
             .join("")
     }
 
-    fn bounded(bytes: &[u8]) -> Vec<u8> {
-        let mut encoded = (bytes.len() as u32).to_le_bytes().to_vec();
-        encoded.extend_from_slice(bytes);
-        encoded
-    }
-
-    fn initialized(shared: &[u8], local: &[u8]) -> Vec<u8> {
-        [bounded(shared), bounded(local)].concat()
-    }
-
-    fn shared_output(shared: &[u8]) -> Vec<u8> {
-        [vec![0], bounded(shared)].concat()
-    }
-
-    fn local_output(local: &[u8]) -> Vec<u8> {
-        [vec![0], bounded(local)].concat()
-    }
-
-    fn query_output(index: u32, json: &[u8]) -> Vec<u8> {
-        [index.to_le_bytes().to_vec(), bounded(json)].concat()
-    }
-
-    fn projection_output(json: &[u8]) -> Vec<u8> {
-        bounded(json)
-    }
-
-    fn outcome_output(borsh: &[u8], json: &[u8]) -> Vec<u8> {
-        [bounded(borsh), bounded(json)].concat()
-    }
-
-    struct ModuleSpec<'a> {
-        initialize: &'a [u8],
-        shared: &'a [u8],
-        shared_second: &'a [u8],
-        local: &'a [u8],
-        query: &'a [u8],
-        view: &'a [u8],
-        outcome: &'a [u8],
-        shared_body: &'a str,
-        local_body: &'a str,
-        query_body: &'a str,
-        view_body: &'a str,
-        outcome_body: &'a str,
-        capabilities: Vec<Capability>,
-        imports: &'a str,
-    }
-
-    fn module(spec: ModuleSpec<'_>) -> Arc<LoadedProgram> {
-        let initialize_data = wat_data(spec.initialize);
-        let shared_data = wat_data(spec.shared);
-        let shared_second_data = wat_data(spec.shared_second);
-        let local_data = wat_data(spec.local);
-        let query_data = wat_data(spec.query);
-        let view_data = wat_data(spec.view);
-        let outcome_data = wat_data(spec.outcome);
-        let definition = definition(spec.capabilities);
-        let metadata = definition.encode().unwrap();
-        let metadata_data = wat_data(&metadata);
+    fn dispatch_module(body: &str, capabilities: Vec<Capability>, extra_imports: &str) -> Vec<u8> {
+        let definition = definition(capabilities);
+        let metadata_bytes = definition.encode().unwrap();
+        let metadata = wat_data(&metadata_bytes);
+        let output = wat_data(&[0, 0, 0]);
+        let initialize = wat_data(&[0; 8]);
         let wat = format!(
             r#"
             (module
-              {imports}
-              (memory (export "memory") 2)
-              (global (export "arena0_abi_version") i32 (i32.const 20))
-              (global $shared_counter (mut i32) (i32.const 0))
-              (data (i32.const 2048) "{initialize_data}")
-              (data (i32.const 3072) "{shared_second_data}")
-              (data (i32.const 4096) "{shared_data}")
-              (data (i32.const 6144) "{local_data}")
-              (data (i32.const 8192) "{query_data}")
-              (data (i32.const 10240) "{view_data}")
-              (data (i32.const 12288) "{outcome_data}")
-              (data (i32.const 16384) "{metadata_data}")
+              (import "arena0" "state_len" (func $state_len (param i32) (result i32)))
+              (import "arena0" "state_read" (func $state_read (param i32 i32 i32)))
+              (import "arena0" "state_write" (func $state_write (param i32 i32 i32)))
+              {extra_imports}
+              (memory (export "memory") 1)
+              (global (export "arena0_abi_version") i32 (i32.const 22))
+              (global $counter (mut i32) (i32.const 0))
+              (data (i32.const 1024) "sh")
+              (data (i32.const 1100) "effect")
+              (data (i32.const 3000) "{initialize}")
+              (data (i32.const 32768) "{output}")
+              (data (i32.const 40000) "{metadata}")
               (func $pack (param $ptr i32) (param $len i32) (result i64)
                 local.get $ptr
-                i64.extend_i32_s
+                i64.extend_i32_u
                 i64.const 32
                 i64.shl
                 local.get $len
-                i64.extend_i32_s
-                i64.const 4294967295
-                i64.and
+                i64.extend_i32_u
                 i64.or)
-              ;; Hostile fixture guard: 0xa5 is reserved for a local-state or
-              ;; peer-identity sentinel. Shared and projection exports trap if
-              ;; that byte is present in their input envelope.
-              (func $assert_no_private (param $ptr i32) (param $len i32)
-                (local $offset i32)
-                (block $done
-                  (loop $scan
-                    local.get $offset
-                    local.get $len
-                    i32.ge_u
-                    br_if $done
-                    local.get $ptr
-                    local.get $offset
-                    i32.add
-                    i32.load8_u
-                    i32.const 165
-                    i32.eq
-                    if
-                      unreachable
-                    end
-                    local.get $offset
-                    i32.const 1
-                    i32.add
-                    local.set $offset
-                    br $scan)))
-              (func $initialize (result i64)
-                i32.const 2048
-                i32.const {initialize_len}
-                call $pack)
-              (func $shared_default (result i64)
-                i32.const 4096
-                i32.const {shared_len}
-                call $pack)
-              (func $shared_second (result i64)
-                i32.const 3072
-                i32.const {shared_second_len}
-                call $pack)
-              (func $local_default (result i64)
-                i32.const 6144
-                i32.const {local_len}
-                call $pack)
-              (func $query_default (result i64)
-                i32.const 8192
-                i32.const {query_len}
-                call $pack)
-              (func $view_default (result i64)
-                i32.const 10240
-                i32.const {view_len}
-                call $pack)
-              (func $outcome_default (result i64)
-                i32.const 12288
-                i32.const {outcome_len}
-                call $pack)
-              (func $metadata (result i64)
-                i32.const 16384
-                i32.const {metadata_len}
-                call $pack)
-              (func (export "arena0_alloc") (param i32) (result i32) i32.const 1024)
+              (func (export "arena0_alloc") (param i32) (result i32) i32.const 1048576)
               (func (export "arena0_dealloc") (param i32 i32))
-              (func (export "arena0_initialize") (param $input_ptr i32) (param $input_len i32) (result i64)
-                local.get $input_ptr
-                local.get $input_len
-                call $assert_no_private
-                call $initialize)
-              (func (export "arena0_shared") (param $input_ptr i32) (param $input_len i32) (result i64)
-                local.get $input_ptr
-                local.get $input_len
-                call $assert_no_private
-                {shared_body})
-              (func (export "arena0_local") (param i32 i32) (result i64)
-                {local_body})
-              (func (export "arena0_writer") (param $input_ptr i32) (param $input_len i32) (result i64)
-                local.get $input_ptr
-                local.get $input_len
-                call $assert_no_private
-                i32.const 2112
-                i32.const 1
+              (func (export "arena0_prepare") (result i32)
+                i32.const 895
+                memory.grow
+                drop
+                i32.const 1)
+              (func (export "arena0_initialize") (param i32 i32) (result i64)
+                i32.const 3000
+                i32.const 8
                 call $pack)
-              (func (export "arena0_query") (param $input_ptr i32) (param $input_len i32) (result i64)
-                local.get $input_ptr
-                local.get $input_len
-                call $assert_no_private
-                {query_body})
-              (func (export "arena0_view") (param $input_ptr i32) (param $input_len i32) (result i64)
-                local.get $input_ptr
-                local.get $input_len
-                call $assert_no_private
-                {view_body})
-              (func (export "arena0_outcome") (param $input_ptr i32) (param $input_len i32) (result i64)
-                local.get $input_ptr
-                local.get $input_len
-                call $assert_no_private
-                {outcome_body})
+              (func (export "arena0_dispatch") (param i32 i32) (result i64)
+                {body})
+              (func (export "arena0_writer") (param i32 i32) (result i64) i64.const 0)
+              (func (export "arena0_query") (param i32 i32) (result i64) i64.const 0)
+              (func (export "arena0_view") (param i32 i32) (result i64) i64.const 0)
+              (func (export "arena0_outcome") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_metadata") (result i64)
-                call $metadata))
+                i32.const 40000
+                i32.const {metadata_len}
+                call $pack))
             "#,
-            initialize_data = initialize_data,
-            shared_data = shared_data,
-            shared_second_data = shared_second_data,
-            local_data = local_data,
-            query_data = query_data,
-            view_data = view_data,
-            outcome_data = outcome_data,
-            metadata_data = metadata_data,
-            initialize_len = spec.initialize.len(),
-            shared_len = spec.shared.len(),
-            shared_second_len = spec.shared_second.len(),
-            local_len = spec.local.len(),
-            query_len = spec.query.len(),
-            view_len = spec.view.len(),
-            outcome_len = spec.outcome.len(),
-            metadata_len = metadata.len(),
-            shared_body = spec.shared_body,
-            local_body = spec.local_body,
-            query_body = spec.query_body,
-            view_body = spec.view_body,
-            outcome_body = spec.outcome_body,
-            imports = spec.imports,
+            body = body,
+            extra_imports = extra_imports,
+            initialize = initialize,
+            output = output,
+            metadata = metadata,
+            metadata_len = metadata_bytes.len(),
         );
-        let binary = wat::parse_str(wat).unwrap();
-        let program = Program::embed(&binary, &definition).unwrap();
-        WasmtimeEngine::new().unwrap().load(&program).unwrap()
+        wat::parse_str(wat).unwrap()
     }
 
-    fn peers() -> (PeerId, Ensemble<Committed>) {
-        let local = PeerId([1; 32]);
-        let remote = PeerId([2; 32]);
-        let session = Ensemble::from_peers(vec![local, remote]).unwrap();
-        (local, session)
+    fn accepted_body() -> &'static str {
+        r#"
+          (local $next i32)
+          global.get $counter
+          i32.const 1
+          i32.add
+          local.tee $next
+          global.set $counter
+          i32.const 2000
+          local.get $next
+          i32.store8
+          i32.const 0
+          i32.const 1024
+          i32.const 2
+          call $state_write
+          i32.const 1
+          i32.const 2000
+          i32.const 1
+          call $state_write
+          i32.const 0
+          call $state_len
+          drop
+          i32.const 0
+          i32.const 2200
+          i32.const 2
+          call $state_read
+          i32.const 1100
+          i32.const 6
+          call $broadcast
+          drop
+          i32.const 32768
+          i32.const 3
+          call $pack
+        "#
     }
 
-    fn empty_state() -> (SharedStateBytes, LocalStateBytes) {
-        (
-            SharedStateBytes::try_new(Vec::new()).unwrap(),
-            LocalStateBytes::try_new(Vec::new()).unwrap(),
+    fn growth_after_prepare_body() -> &'static str {
+        r#"
+          i32.const 1
+          memory.grow
+          i32.const -1
+          i32.ne
+          if
+            unreachable
+          end
+          i32.const 32768
+          i32.const 3
+          call $pack
+        "#
+    }
+
+    fn oversized_shared_body() -> &'static str {
+        r#"
+          i32.const 0
+          i32.const 1024
+          i32.const 65
+          call $state_write
+          i32.const 1
+          i32.const 2000
+          i32.const 1
+          call $state_write
+          i32.const 32768
+          i32.const 3
+          call $pack
+        "#
+    }
+
+    fn rejected_body() -> &'static str {
+        r#"
+          i32.const 0
+          i32.const 1024
+          i32.const 2
+          call $state_write
+          i32.const 1
+          i32.const 1024
+          i32.const 2
+          call $state_write
+          i32.const 32768
+          i32.const 1
+          i32.store8
+          i32.const 32768
+          i32.const 3
+          call $pack
+        "#
+    }
+
+    fn rejected_with_observations_body() -> &'static str {
+        r#"
+          i32.const 0
+          i32.const 1024
+          i32.const 2
+          call $state_write
+          i32.const 1
+          i32.const 1024
+          i32.const 2
+          call $state_write
+          i32.const 1100
+          i32.const 6
+          call $broadcast
+          drop
+          i32.const 1
+          i32.const 1100
+          i32.const 6
+          call $log
+          i32.const 2200
+          i32.const 2
+          call $random
+          i32.const 5000
+          i32.const 7
+          i32.store8
+          i32.const 5000
+          i32.const 8
+          i32.store8 offset=1
+          i32.const 32768
+          i32.const 1
+          i32.store8
+          i32.const 32768
+          i32.const 3
+          call $pack
+        "#
+    }
+
+    fn call() -> DispatchCall {
+        let peer = PeerId([1; 32]);
+        let session = Ensemble::<Committed>::from_peers(vec![peer, PeerId([2; 32])]).unwrap();
+        DispatchCall::new(
+            peer,
+            session,
+            Event::TimerFired {
+                timer: arena0_protocol::TimerPayload::unit(),
+            },
         )
     }
 
-    fn message_event() -> SharedEvent {
-        SharedEvent::MessageReceived {
-            message_id: MessageId([3; 32]),
-            from: PeerId([2; 32]),
-            position: 0,
-            pre_state: StateHash([0; 32]),
-            msg: Vec::new(),
-        }
+    fn resident(body: &str, capabilities: Vec<Capability>, imports: &str) -> ProgramInstance {
+        let engine = shared_test_engine();
+        let raw = dispatch_module(body, capabilities, imports);
+        let program = engine.build_program(&raw).unwrap();
+        engine
+            .load(&program)
+            .unwrap()
+            .resident(
+                arena0_program::SharedStateBytes::try_new(Vec::new()).unwrap(),
+                arena0_program::LocalStateBytes::try_new(Vec::new()).unwrap(),
+            )
+            .unwrap()
     }
 
-    fn base_spec<'a>(
-        initialize: &'a [u8],
-        shared: &'a [u8],
-        local: &'a [u8],
-        query: &'a [u8],
-        view: &'a [u8],
-        outcome: &'a [u8],
-    ) -> ModuleSpec<'a> {
-        ModuleSpec {
-            initialize,
-            shared,
-            shared_second: shared,
-            local,
-            query,
-            view,
-            outcome,
-            shared_body: "call $shared_default",
-            local_body: "call $local_default",
-            query_body: "call $query_default",
-            view_body: "call $view_default",
-            outcome_body: "call $outcome_default",
-            capabilities: Vec::new(),
-            imports: "",
-        }
-    }
-
-    #[test]
-    fn fresh_shared_calls_do_not_carry_or_replace_local_state() {
-        let init = initialized(&[], &[9]);
-        let first_output = shared_output(&[1]);
-        let second_output = shared_output(&[2]);
-        let local_output = local_output(&[8]);
-        let query = query_output(0, b"null");
-        let view = projection_output(b"null");
-        let outcome = outcome_output(&[7], b"null");
-        let program = module(ModuleSpec {
-            initialize: &init,
-            shared: &first_output,
-            shared_second: &second_output,
-            local: &local_output,
-            query: &query,
-            view: &view,
-            outcome: &outcome,
-            shared_body: r#"
-                global.get $shared_counter
+    fn finalized_tail_program() -> Program {
+        let definition = definition(Vec::new());
+        let wat = r#"
+            (module
+              (memory (export "memory") 1 1024)
+              (memory (export "arena0_shared") 65 65)
+              (memory (export "arena0_local") 65 65)
+              (global (export "arena0_abi_version") i32 (i32.const 22))
+              (data (i32.const 32768) "\00\00\00")
+              (func $pack (param $ptr i32) (param $len i32) (result i64)
+                local.get $ptr
+                i64.extend_i32_u
+                i64.const 32
+                i64.shl
+                local.get $len
+                i64.extend_i32_u
+                i64.or)
+              (func (export "arena0_alloc") (param i32) (result i32) i32.const 1048576)
+              (func (export "arena0_dealloc") (param i32 i32))
+              (func (export "arena0_prepare") (result i32)
+                i32.const 895
+                memory.grow
+                drop
+                i32.const 1)
+              (func (export "arena0_initialize") (param i32 i32) (result i64) i64.const 0)
+              (func (export "arena0_dispatch") (param i32 i32) (result i64)
+                i32.const 100
                 i32.const 1
-                i32.add
-                global.set $shared_counter
-                global.get $shared_counter
-                i32.const 1
-                i32.eq
-                if (result i64)
-                  call $shared_default
-                else
-                  call $shared_second
-                end
-            "#,
-            local_body: "call $local_default",
-            query_body: "call $query_default",
-            view_body: "call $view_default",
-            outcome_body: "call $outcome_default",
-            capabilities: Vec::new(),
-            imports: "",
-        });
-        let (peer, session) = peers();
-        let (shared, local) = empty_state();
-        let initialized = program
-            .initialize(InitializeCall::new(
-                JsonBytes::try_new(b"null".to_vec()).unwrap(),
-            ))
-            .unwrap();
-        assert_eq!(initialized.local.as_bytes(), &[9]);
-        let first = program
-            .apply_shared(SharedCall::session_started(shared, session.clone()))
-            .unwrap();
-        assert_eq!(first.shared.as_bytes(), &[1]);
-        let local_result = program
-            .apply_local(LocalCall::new(
-                peer,
-                first.shared.clone(),
-                local,
-                session.clone(),
-                LocalEvent::React,
-            ))
-            .unwrap();
-        assert_eq!(local_result.local.as_bytes(), &[8]);
-        let second = program
-            .apply_shared(SharedCall::new(first.shared, session, message_event()))
-            .unwrap();
-        // A fresh instance starts its guest globals at their declared initial
-        // values for every call; state crosses the boundary only as bytes.
-        assert_eq!(second.shared.as_bytes(), &[1]);
-        // The local value is owned by the caller and remains the local result;
-        // SharedOutput has no field through which the guest could replace it.
-        assert_eq!(local_result.local.as_bytes(), &[8]);
-    }
-
-    #[test]
-    fn fresh_local_calls_cannot_replace_shared_state() {
-        let init = initialized(&[], &[]);
-        let shared_output = shared_output(&[]);
-        let local_output = local_output(&[4]);
-        let query = query_output(0, b"null");
-        let view = projection_output(b"null");
-        let outcome = outcome_output(&[7], b"null");
-        let program = module(base_spec(
-            &init,
-            &shared_output,
-            &local_output,
-            &query,
-            &view,
-            &outcome,
-        ));
-        let (peer, session) = peers();
-        let shared = SharedStateBytes::try_new(vec![5]).unwrap();
-        let result = program
-            .apply_local(LocalCall::new(
-                peer,
-                shared.clone(),
-                LocalStateBytes::try_new(Vec::new()).unwrap(),
-                session,
-                LocalEvent::React,
-            ))
-            .unwrap();
-        assert_eq!(result.local.as_bytes(), &[4]);
-        // The shared state remains owned by the caller; LocalOutput carries no
-        // shared field through which the guest could replace it.
-        assert_eq!(shared.as_bytes(), &[5]);
-    }
-
-    #[test]
-    fn read_only_exports_return_only_their_projection_values() {
-        let init = initialized(&[], &[]);
-        let shared = shared_output(&[]);
-        let local = local_output(&[]);
-        let query = query_output(0, b"null");
-        let view = projection_output(b"null");
-        let outcome = outcome_output(&[7, 8], b"null");
-        let program = module(base_spec(&init, &shared, &local, &query, &view, &outcome));
-        let (_, session) = peers();
-        let state = SharedStateBytes::try_new(vec![6]).unwrap();
-        let writer = program
-            .writer(WriterCall::new(state.clone(), session.clone()))
-            .unwrap();
-        assert_eq!(writer.writer, None);
-        let query_result = program
-            .query(QueryCall::new(
-                state.clone(),
-                session.clone(),
-                JsonBytes::try_new(b"null".to_vec()).unwrap(),
-                0,
-            ))
-            .unwrap();
-        assert_eq!(query_result.output.as_bytes(), b"null");
-        let view_result = program
-            .view(ViewCall::new(
-                state.clone(),
-                session.clone(),
-                JsonBytes::try_new(b"null".to_vec()).unwrap(),
-            ))
-            .unwrap();
-        assert_eq!(view_result.output.as_bytes(), b"null");
-        let outcome_result = program.outcome(OutcomeCall::new(state, session)).unwrap();
-        assert_eq!(outcome_result.borsh.as_bytes(), &[7, 8]);
-        assert_eq!(outcome_result.json.as_bytes(), b"null");
-    }
-
-    #[test]
-    fn malformed_and_oversized_guest_envelopes_are_rejected() {
-        let init = initialized(&[], &[]);
-        let malformed = vec![0xff];
-        let valid_shared = shared_output(&[]);
-        let valid_local = local_output(&[]);
-        let valid_query = query_output(0, b"null");
-        let valid_view = projection_output(b"null");
-        let valid_outcome = outcome_output(&[], b"null");
-        let program = module(base_spec(
-            &init,
-            &valid_shared,
-            &valid_local,
-            &malformed,
-            &valid_view,
-            &valid_outcome,
-        ));
-        let (_, session) = peers();
-        let error = program
-            .query(QueryCall::new(
-                SharedStateBytes::try_new(Vec::new()).unwrap(),
-                session.clone(),
-                JsonBytes::try_new(b"null".to_vec()).unwrap(),
-                0,
-            ))
-            .unwrap_err();
-        assert!(matches!(error, SandboxError::DeserializationFailed(_)));
-
-        let oversized = [0u8; 1];
-        let program = module(ModuleSpec {
-            initialize: &init,
-            shared: &valid_shared,
-            shared_second: &valid_shared,
-            local: &valid_local,
-            query: &valid_query,
-            view: &valid_view,
-            outcome: &valid_outcome,
-            shared_body: "i32.const 2048 i32.const 16777217 call $pack",
-            local_body: "call $local_default",
-            query_body: "call $query_default",
-            view_body: "call $view_default",
-            outcome_body: "call $outcome_default",
-            capabilities: Vec::new(),
-            imports: "",
-        });
-        let (peer, session) = peers();
-        let error = program
-            .apply_shared(SharedCall::new(
-                SharedStateBytes::try_new(oversized.to_vec()).unwrap(),
-                session,
-                message_event(),
-            ))
-            .unwrap_err();
-        assert!(matches!(error, SandboxError::OutputLimitExceeded { .. }));
-        let _ = peer;
-    }
-
-    #[test]
-    fn read_only_effect_attempt_traps_before_it_can_escape() {
-        let init = initialized(&[], &[]);
-        let shared = shared_output(&[]);
-        let local = local_output(&[]);
-        let query = query_output(0, b"null");
-        let view = projection_output(b"null");
-        let outcome = outcome_output(&[], b"null");
-        let log_import = r#"
-              (import "arena0" "log" (func $log (param i32 i32 i32)))
+                i32.store8 1
+                i32.const 32768
+                i32.const 3
+                call $pack)
+              (func (export "arena0_writer") (param i32 i32) (result i64) i64.const 0)
+              (func (export "arena0_query") (param i32 i32) (result i64) i64.const 0)
+              (func (export "arena0_view") (param i32 i32) (result i64) i64.const 0)
+              (func (export "arena0_outcome") (param i32 i32) (result i64) i64.const 0)
+              (func (export "arena0_metadata") (result i64) i64.const 0))
         "#;
-        let program = module(ModuleSpec {
-            initialize: &init,
-            shared: &shared,
-            shared_second: &shared,
-            local: &local,
-            query: &query,
-            view: &view,
-            outcome: &outcome,
-            shared_body: "call $shared_default",
-            local_body: "call $local_default",
-            query_body: "i32.const 0 i32.const 0 i32.const 0 call $log call $query_default",
-            view_body: "call $view_default",
-            outcome_body: "call $outcome_default",
-            capabilities: Vec::new(),
-            imports: log_import,
-        });
-        let (_, session) = peers();
-        let error = program
-            .query(QueryCall::new(
-                SharedStateBytes::try_new(Vec::new()).unwrap(),
-                session,
-                JsonBytes::try_new(b"null".to_vec()).unwrap(),
-                0,
-            ))
-            .unwrap_err();
-        assert!(matches!(error, SandboxError::DispatchFailed(_)));
+        Program::embed(&wat::parse_str(wat).unwrap(), &definition).unwrap()
+    }
+
+    fn finalized_allocator_failure_program(allocator_body: &str) -> Program {
+        let definition = definition(Vec::new());
+        let wat = format!(
+            r#"
+            (module
+              (memory (export "memory") 1 1024)
+              (memory (export "arena0_shared") 65 65)
+              (memory (export "arena0_local") 65 65)
+              (global (export "arena0_abi_version") i32 (i32.const 22))
+              (data (i32.const 32768) "\00")
+              (func (export "arena0_alloc") (param i32) (result i32)
+                {allocator_body})
+              (func (export "arena0_dealloc") (param i32 i32))
+              (func (export "arena0_prepare") (result i32)
+                i32.const 895
+                memory.grow
+                drop
+                i32.const 1)
+              (func (export "arena0_initialize") (param i32 i32) (result i64) i64.const 0)
+              (func (export "arena0_dispatch") (param i32 i32) (result i64) i64.const 0)
+              (func (export "arena0_writer") (param i32 i32) (result i64) i64.const 0)
+              (func (export "arena0_query") (param i32 i32) (result i64) i64.const 0)
+              (func (export "arena0_view") (param i32 i32) (result i64) i64.const 0)
+              (func (export "arena0_outcome") (param i32 i32) (result i64) i64.const 0)
+              (func (export "arena0_metadata") (result i64) i64.const 0))
+            "#,
+            allocator_body = allocator_body,
+        );
+        Program::embed(&wat::parse_str(&wat).unwrap(), &definition).unwrap()
+    }
+
+    fn allocator_failure_resident(allocator_body: &str) -> ProgramInstance {
+        let engine = shared_test_engine();
+        let program = finalized_allocator_failure_program(allocator_body);
+        engine
+            .load(&program)
+            .unwrap()
+            .resident(
+                arena0_program::SharedStateBytes::try_new(Vec::new()).unwrap(),
+                arena0_program::LocalStateBytes::try_new(Vec::new()).unwrap(),
+            )
+            .unwrap()
     }
 
     #[test]
-    fn guest_traps_are_reported_as_dispatch_failures() {
-        let init = initialized(&[], &[]);
-        let shared = shared_output(&[]);
-        let local = local_output(&[]);
-        let query = query_output(0, b"null");
-        let view = projection_output(b"null");
-        let outcome = outcome_output(&[], b"null");
-        let program = module(ModuleSpec {
-            initialize: &init,
-            shared: &shared,
-            shared_second: &shared,
-            local: &local,
-            query: &query,
-            view: &view,
-            outcome: &outcome,
-            shared_body: "unreachable",
-            local_body: "call $local_default",
-            query_body: "call $query_default",
-            view_body: "call $view_default",
-            outcome_body: "call $outcome_default",
-            capabilities: Vec::new(),
-            imports: "",
-        });
-        let (_, session) = peers();
-        let error = program
-            .apply_shared(SharedCall::new(
-                SharedStateBytes::try_new(Vec::new()).unwrap(),
-                session,
-                message_event(),
-            ))
-            .unwrap_err();
-        assert!(matches!(error, SandboxError::DispatchFailed(_)));
+    fn finalizer_produces_exact_idempotent_three_memory_artifact() {
+        let engine = shared_test_engine();
+        let raw = dispatch_module(
+            accepted_body(),
+            vec![Capability::Messaging],
+            r#"(import "arena0" "broadcast" (func $broadcast (param i32 i32) (result i32)))"#,
+        );
+        let program = engine.build_program(&raw).unwrap();
+        let shape = crate::finalize::inspect(program.bytes()).unwrap();
+        assert_eq!(shape.defined_memories.len(), 3);
+        assert_eq!(
+            shape.defined_memories,
+            vec![(1, Some(1024)), (65, Some(65)), (65, Some(65))]
+        );
+        assert_eq!(
+            shape
+                .exports
+                .get(arena0_program::abi::exports::SHARED_MEMORY),
+            Some(&(wasmparser::ExternalKind::Memory, 1))
+        );
+        assert_eq!(
+            shape
+                .exports
+                .get(arena0_program::abi::exports::LOCAL_MEMORY),
+            Some(&(wasmparser::ExternalKind::Memory, 2))
+        );
+        crate::finalize::validate_finalized_shape(program.bytes(), engine.profile()).unwrap();
+        let reparsed = engine.build_program(program.bytes()).unwrap();
+        assert_eq!(reparsed.bytes(), program.bytes());
+    }
+
+    #[test]
+    fn metadata_on_an_unfinalized_partial_artifact_is_rejected() {
+        let engine = shared_test_engine();
+        let raw = dispatch_module("i64.const 0", Vec::new(), "");
+        let definition = definition(Vec::new());
+        let partial = Program::embed(&raw, &definition).unwrap();
+        assert!(matches!(
+            engine.build_program(partial.bytes()),
+            Err(SandboxError::InvalidMetadata(message)) if message.contains("three-memory")
+        ));
+    }
+
+    #[test]
+    fn non_zero_canonical_state_tail_rejects_and_restores_both_payloads() {
+        let engine = shared_test_engine();
+        let program = finalized_tail_program();
+        let mut instance = engine
+            .load(&program)
+            .unwrap()
+            .resident(
+                arena0_program::SharedStateBytes::try_new(b"shared".to_vec()).unwrap(),
+                arena0_program::LocalStateBytes::try_new(b"local".to_vec()).unwrap(),
+            )
+            .unwrap();
+        let error = instance.dispatch(call()).unwrap_err();
+        assert!(
+            matches!(error, SandboxError::DispatchFailed(message) if message.contains("non-zero bytes"))
+        );
+        assert_eq!(instance.committed_payloads().0.as_bytes(), b"shared");
+        assert_eq!(instance.committed_payloads().1.as_bytes(), b"local");
+        let shared = canonical_state_payload(
+            &instance.store,
+            instance.shared_memory,
+            instance.shared_max_bytes,
+            "shared",
+        )
+        .unwrap();
+        assert_eq!(shared, b"shared");
+    }
+
+    #[test]
+    fn resident_dispatch_mutates_both_payloads_and_keeps_effects_host_owned() {
+        let mut instance = resident(
+            accepted_body(),
+            vec![Capability::Messaging],
+            r#"(import "arena0" "broadcast" (func $broadcast (param i32 i32) (result i32)))"#,
+        );
+        let first = instance.dispatch(call()).unwrap();
+        assert_eq!(first.status, arena0_program::CallStatus::Accepted);
+        assert_eq!(
+            first.shared.as_ref().expect("accepted shared").as_bytes(),
+            b"sh"
+        );
+        assert_eq!(
+            first.local.as_ref().expect("accepted local").as_bytes(),
+            &[1]
+        );
+        assert_eq!(
+            first.observations.effects,
+            vec![Effect::Broadcast {
+                data: b"effect".to_vec()
+            }]
+        );
+        let first_hash =
+            arena0_protocol::StateHash::of_shared(first.shared.as_ref().expect("accepted shared"));
+
+        let second = instance.dispatch(call()).unwrap();
+        assert_eq!(
+            second.shared.as_ref().expect("accepted shared").as_bytes(),
+            b"sh"
+        );
+        // The mutable guest global is restored before each dispatch.
+        assert_eq!(
+            second.local.as_ref().expect("accepted local").as_bytes(),
+            &[1]
+        );
+        assert_eq!(
+            arena0_protocol::StateHash::of_shared(second.shared.as_ref().expect("accepted shared")),
+            first_hash
+        );
+        let canonical_shared = arena0_program::canonical_state_image(b"sh").unwrap();
+        assert_eq!(
+            first_hash,
+            arena0_protocol::StateHash::of(&canonical_shared)
+        );
+    }
+
+    #[test]
+    fn resident_freezes_prepared_work_memory_before_dispatch() {
+        let mut instance = resident(growth_after_prepare_body(), Vec::new(), "");
+        let result = instance.dispatch(call()).unwrap();
+        assert_eq!(result.status, arena0_program::CallStatus::Accepted);
+    }
+
+    #[test]
+    fn resident_enforces_metadata_shared_limit_on_recovery_and_dispatch() {
+        let shared = arena0_program::SharedStateBytes::try_new(b"old".to_vec()).unwrap();
+        let local = arena0_program::LocalStateBytes::try_new(b"keep".to_vec()).unwrap();
+        let oversized = arena0_program::SharedStateBytes::try_new(vec![0; 65]).unwrap();
+        let mut instance = resident(oversized_shared_body(), Vec::new(), "");
+
+        assert!(matches!(
+            instance.restore_payloads(oversized, local.clone()),
+            Err(SandboxError::MemoryLimitExceeded(65))
+        ));
+        instance
+            .restore_payloads(shared.clone(), local.clone())
+            .unwrap();
+
+        assert!(matches!(
+            instance.dispatch(call()),
+            Err(SandboxError::MemoryLimitExceeded(65))
+        ));
+        instance.commit().unwrap();
+        assert_eq!(instance.committed_payloads(), (&shared, &local));
+    }
+
+    #[test]
+    fn resident_dispatch_rolls_back_both_states_for_reject_and_trap() {
+        let shared = arena0_program::SharedStateBytes::try_new(b"old".to_vec()).unwrap();
+        let local = arena0_program::LocalStateBytes::try_new(b"keep".to_vec()).unwrap();
+
+        let mut rejected = resident(rejected_body(), Vec::new(), "");
+        rejected
+            .restore_payloads(shared.clone(), local.clone())
+            .unwrap();
+        let result = rejected.dispatch(call()).unwrap();
+        assert_eq!(result.status, arena0_program::CallStatus::Rejected);
+        assert!(result.shared.is_none(), "rejection carries no shared image");
+        assert!(result.local.is_none(), "rejection carries no local image");
+
+        let mut trapped = resident("unreachable", Vec::new(), "");
+        trapped
+            .restore_payloads(shared.clone(), local.clone())
+            .unwrap();
+        assert!(trapped.dispatch(call()).is_err());
+        assert_eq!(trapped.committed_payloads().0.as_bytes(), b"old");
+        assert_eq!(trapped.committed_payloads().1.as_bytes(), b"keep");
+    }
+
+    #[test]
+    fn rejected_dispatch_discards_state_and_all_provisional_observations() {
+        let shared = arena0_program::SharedStateBytes::try_new(b"old".to_vec()).unwrap();
+        let local = arena0_program::LocalStateBytes::try_new(b"keep".to_vec()).unwrap();
+        let mut instance = resident(
+            rejected_with_observations_body(),
+            vec![Capability::Messaging],
+            r#"
+              (import "arena0" "broadcast" (func $broadcast (param i32 i32) (result i32)))
+              (import "arena0" "log" (func $log (param i32 i32 i32)))
+              (import "arena0" "random" (func $random (param i32 i32)))
+            "#,
+        );
+        instance
+            .restore_payloads(shared.clone(), local.clone())
+            .unwrap();
+
+        let result = instance.dispatch(call()).unwrap();
+
+        assert_eq!(result.status, arena0_program::CallStatus::Rejected);
+        assert!(result.shared.is_none(), "rejection carries no shared image");
+        assert!(result.local.is_none(), "rejection carries no local image");
+        assert!(result.observations.effects.is_empty());
+        assert!(result.observations.logs.is_empty());
+        assert!(result.observations.random_draws.is_empty());
+        assert_eq!(instance.committed_payloads(), (&shared, &local));
+    }
+
+    #[test]
+    fn allocator_mutation_trap_rolls_back_both_state_memories() {
+        let shared = arena0_program::SharedStateBytes::try_new(b"old".to_vec()).unwrap();
+        let local = arena0_program::LocalStateBytes::try_new(b"keep".to_vec()).unwrap();
+        let mut instance = allocator_failure_resident(
+            r#"
+              i32.const 100
+              i32.const 1
+              i32.store8 1
+              i32.const 200
+              i32.const 2
+              i32.store8 2
+              unreachable
+            "#,
+        );
+        instance
+            .restore_payloads(shared.clone(), local.clone())
+            .unwrap();
+
+        assert!(matches!(
+            instance.dispatch(call()),
+            Err(SandboxError::DispatchFailed(_))
+        ));
+        instance.commit().unwrap();
+        assert_eq!(instance.committed_payloads(), (&shared, &local));
+    }
+
+    #[test]
+    fn allocator_mutation_input_copy_failure_rolls_back_both_state_memories() {
+        let shared = arena0_program::SharedStateBytes::try_new(b"old".to_vec()).unwrap();
+        let local = arena0_program::LocalStateBytes::try_new(b"keep".to_vec()).unwrap();
+        let mut instance = allocator_failure_resident(
+            r#"
+              i32.const 100
+              i32.const 1
+              i32.store8 1
+              i32.const 200
+              i32.const 2
+              i32.store8 2
+              i32.const 67108863
+            "#,
+        );
+        instance
+            .restore_payloads(shared.clone(), local.clone())
+            .unwrap();
+
+        assert!(matches!(
+            instance.dispatch(call()),
+            Err(SandboxError::MemoryLimitExceeded(_))
+        ));
+        instance.commit().unwrap();
+        assert_eq!(instance.committed_payloads(), (&shared, &local));
+    }
+
+    #[test]
+    fn resident_recovery_replaces_the_rollback_checkpoint() {
+        let mut instance = resident("unreachable", Vec::new(), "");
+        let shared = arena0_program::SharedStateBytes::try_new(b"recovered".to_vec()).unwrap();
+        let local = arena0_program::LocalStateBytes::try_new(b"private".to_vec()).unwrap();
+        instance
+            .restore_payloads(shared.clone(), local.clone())
+            .unwrap();
+        assert_eq!(instance.committed_payloads(), (&shared, &local));
+        instance.restore_committed().unwrap();
+        assert_eq!(instance.committed_payloads().0.as_bytes(), b"recovered");
+        assert_eq!(instance.committed_payloads().1.as_bytes(), b"private");
     }
 }

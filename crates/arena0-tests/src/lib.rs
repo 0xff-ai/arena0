@@ -5,6 +5,4 @@
 pub mod arena;
 pub mod assert;
 pub mod fixtures;
-pub mod synthetic;
-pub mod tracing;
 pub mod wasm;

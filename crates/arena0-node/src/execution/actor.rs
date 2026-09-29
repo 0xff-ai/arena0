@@ -1,30 +1,31 @@
 //! Actor lifecycle, recovery, and serialized command dispatch.
 //!
 //! This module owns task startup and the actor loop. Guest transitions,
-//! inbox resolution, outbox delivery, and terminal boundaries live in their
+//! frame classification and delivery, and terminal boundaries live in their
 //! respective modules and extend the same private actor state owner.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arena0_protocol::{
-    Committed, Ensemble, ExecLifecycle, ExecutionInput, ExecutionState, PeerIdSource, PrivateCause,
-    PrivateEvent, ReceiptWork, TicketAction,
+    Committed, EndPhase, Ensemble, ExecLifecycle, ExecutionState, PeerIdSource, ReceiptWork,
+    TicketAction,
 };
-use arena0_sandbox::{InitializeCall, LocalEvent};
-use arena0_store::{ApplyOutcome, PendingRequest};
-use arena0_transport::{RecvHandle, TransportError};
+use arena0_sandbox::ProgramInstance;
+use arena0_store::{Change, TransitionRecord};
+use arena0_transport::RecvHandle;
 use tokio::sync::mpsc;
-use tokio::task::{JoinError, JoinSet};
+use tokio::task::JoinSet;
 use tokio::time::{Interval, MissedTickBehavior};
 
 use crate::Host;
-use crate::context::{
-    ActorContext, ExecCommand, ExecError, InboundStreamPayload, SessionMessage, SpawnedExec,
-};
+use crate::context::{ActorContext, ExecCommand, ExecError, InboundStreamPayload, SpawnedExec};
 
+use super::guest::SubmitInputError;
 use super::{
-    COMMAND_CAPACITY, ExecutionActor, InflightSend, PROGRESS_INTERVAL, STREAM_CAPACITY, now_ms,
+    COMMAND_CAPACITY, EndTimer, EndTimerPhase, ExecutionActor, PROGRESS_INTERVAL, STREAM_CAPACITY,
+    now_ms,
 };
 
 /// Spawn one actor and one concurrent reader supervisor.
@@ -34,14 +35,54 @@ pub(crate) fn spawn_execution(context: ActorContext, host: Arc<Host>) -> Spawned
     let (message_tx, message_rx) = mpsc::channel(COMMAND_CAPACITY);
     let (stream_tx, stream_rx) = mpsc::channel(STREAM_CAPACITY);
 
-    let actor = ExecutionActor {
-        context,
-        messages: message_tx,
-        send_streams: HashMap::new(),
-        inflight_send: None,
-        session_started_emitted: false,
-    };
-    let actor_task = tokio::spawn(actor.run(command_rx));
+    let actor_task = tokio::spawn(async move {
+        let mut context = context;
+        let (state, startup_error) = match ExecutionActor::ensure_execution(&mut context).await {
+            Ok(state) => (state, None),
+            Err(error) => {
+                // An existing execution still owns durable frame obligations.
+                // Keep the actor alive to publish and drain them on failure.
+                match context.store.load_execution().await {
+                    Ok(Some(state)) => (state, Some(error)),
+                    result => {
+                        let reason = super::truncate_reason(
+                            error.to_string(),
+                            arena0_protocol::MAX_TERMINAL_REASON_BYTES,
+                        );
+                        let recorded = match result {
+                            Ok(None) => context
+                                .store
+                                .record_execution_request_failure(reason.clone())
+                                .await
+                                .map(|_| ()),
+                            Err(error) => Err(error),
+                            Ok(Some(_)) => unreachable!(),
+                        };
+                        if let Err(error) = recorded {
+                            tracing::error!(exec_id = %context.exec_id, %error, "unable to record startup failure");
+                        }
+                        let _ = message_tx
+                            .send(crate::context::SessionMessage::Failed { reason })
+                            .await;
+                        return;
+                    }
+                }
+            }
+        };
+        let actor = ExecutionActor {
+            context,
+            state,
+            instance: None,
+            messages: message_tx,
+            send_lanes: HashMap::new(),
+            send_tasks: JoinSet::new(),
+            end_timer: None,
+            session_started_emitted: false,
+            terminal_emitted: false,
+            announced_callout: None,
+        };
+        actor.run(command_rx, startup_error).await;
+    });
     let stream_task = tokio::spawn(forward_streams(stream_rx, command_tx.clone()));
 
     SpawnedExec::new(
@@ -63,9 +104,10 @@ async fn forward_streams(
     let mut readers = JoinSet::new();
     loop {
         tokio::select! {
-            Some((peer, recv)) = streams.recv() => {
+            _ = commands.closed() => return,
+            Some((_peer, recv)) = streams.recv() => {
                 let commands = commands.clone();
-                readers.spawn(read_stream(peer, recv, commands));
+                readers.spawn(read_stream(recv, commands));
             }
             joined = readers.join_next(), if !readers.is_empty() => {
                 let _ = joined;
@@ -75,11 +117,7 @@ async fn forward_streams(
     }
 }
 
-async fn read_stream(
-    peer: arena0_protocol::PeerId,
-    recv: RecvHandle,
-    commands: mpsc::Sender<ExecCommand>,
-) {
+async fn read_stream(recv: RecvHandle, commands: mpsc::Sender<ExecCommand>) {
     loop {
         match recv.recv_exec().await {
             Ok(delivery) => {
@@ -91,12 +129,7 @@ async fn read_stream(
                     return;
                 }
             }
-            Err(_) => {
-                let _ = commands
-                    .send(ExecCommand::InboundStreamClosed { peer })
-                    .await;
-                return;
-            }
+            Err(_) => return,
         }
     }
 }
@@ -107,37 +140,49 @@ impl std::fmt::Debug for ExecutionActor {
             .debug_struct("ExecutionActor")
             .field("exec_id", &self.context.exec_id)
             .field("session", &self.context.activation.session_hash())
-            .field("producer", &self.context.producer)
+            .field("producer", &self.context.identity.peer_id())
             .finish_non_exhaustive()
     }
 }
 
 impl ExecutionActor {
-    async fn run(mut self, mut commands: mpsc::Receiver<ExecCommand>) {
-        if let Err(error) = self.recover().await {
-            self.fail_terminal(error).await;
+    async fn run(
+        mut self,
+        mut commands: mpsc::Receiver<ExecCommand>,
+        startup_error: Option<ExecError>,
+    ) {
+        let timer = self.sync_end_timer().await;
+        if !self.continue_after(timer).await {
+            return;
+        }
+        let recovered = match startup_error {
+            Some(error) => Err(error),
+            None => self.recover().await,
+        };
+        if !self.continue_after(recovered).await {
             return;
         }
 
         let mut ticker = progress_ticker();
         loop {
-            let has_inflight_send = self.inflight_send.is_some();
+            if self.end_run_finished() {
+                return;
+            }
             tokio::select! {
-                result = wait_for_inflight_send(&mut self.inflight_send), if has_inflight_send => {
-                    if let Err(error) = self.settle_inflight_send(result).await {
-                        self.fail_terminal(error).await;
-                        return;
-                    }
-                    if let Err(error) = self.progress().await {
-                        self.fail_terminal(error).await;
-                        return;
-                    }
+                Some(joined) = self.send_tasks.join_next(), if !self.send_tasks.is_empty() => {
+                    let result = match joined {
+                        Ok(result) => self.settle_send(result).await,
+                        Err(_) => Err(ExecError::DeliveryInvariant("send task failed")),
+                    };
+                    if !self.continue_after(result).await { return; }
+                    let progressed = self.progress().await;
+                    if !self.continue_after(progressed).await { return; }
                 }
                 command = commands.recv() => {
                     match command {
                         Some(command) => {
-                            if let Err(error) = self.handle(command).await {
-                                self.fail_terminal(error).await;
+                            let handled = self.handle(command).await;
+                            if !self.continue_after(handled).await {
                                 return;
                             }
                         }
@@ -150,8 +195,8 @@ impl ExecutionActor {
                     }
                 }
                 _ = ticker.tick() => {
-                    if let Err(error) = self.progress().await {
-                        self.fail_terminal(error).await;
+                    let progressed = self.progress().await;
+                    if !self.continue_after(progressed).await {
                         return;
                     }
                 }
@@ -159,21 +204,50 @@ impl ExecutionActor {
         }
     }
 
+    /// Keep one error boundary for recovery, commands, progress, and transport
+    /// settlement. A durably recorded terminal continues on the same actor
+    /// loop so inbound acknowledgements and delivery retries cannot deadlock.
+    async fn continue_after(&mut self, result: Result<(), ExecError>) -> bool {
+        match result {
+            Ok(()) => true,
+            Err(error @ ExecError::DeliveryInvariant(_)) => {
+                tracing::error!(exec_id = %self.context.exec_id, %error, "execution delivery stopped");
+                false
+            }
+            Err(error) => self.fail_terminal(error).await,
+        }
+    }
+
     async fn handle(&mut self, command: ExecCommand) -> Result<(), ExecError> {
         match command {
             ExecCommand::SubmitInput {
                 pending_id,
-                callout_index,
                 data,
                 reply,
             } => {
-                let result = self.submit_input(pending_id, callout_index, data).await;
-                let _ = reply.send(result);
-                Ok(())
+                let result = self.submit_input(pending_id, data).await;
+                match result {
+                    Ok(()) => {
+                        let _ = reply.send(Ok(()));
+                        Ok(())
+                    }
+                    Err(SubmitInputError::Expected(error)) => {
+                        let _ = reply.send(Err(error));
+                        Ok(())
+                    }
+                    Err(SubmitInputError::Fatal(error)) => {
+                        let _ = reply.send(Err(error.clone()));
+                        Err(error)
+                    }
+                }
             }
             ExecCommand::Terminate { reason, reply } => {
                 let result = self.terminate(reason).await;
                 let _ = reply.send(result);
+                // A stop request can legitimately lose to a locally signed
+                // shared proposal. Keep the proposal recoverable and let the
+                // normal progress path continue; this command's reply is the
+                // durable result boundary for that expected rejection.
                 Ok(())
             }
             ExecCommand::Query {
@@ -181,115 +255,57 @@ impl ExecutionActor {
                 query,
                 reply,
             } => {
-                let result = self.query(query_index, query).await;
+                let result = self.query(query_index, query);
                 let _ = reply.send(result);
                 Ok(())
             }
             ExecCommand::View { viewport, reply } => {
-                let result = self.view(viewport).await;
+                let result = self.view(viewport);
                 let _ = reply.send(result);
                 Ok(())
             }
             ExecCommand::Inbound { delivery } => self.inbound(delivery).await,
-            ExecCommand::InboundStreamClosed { peer } => {
-                if self.ensemble().peers().contains(&peer) {
-                    Err(ExecError::Unavailable(format!(
-                        "execution stream from {peer} closed"
-                    )))
-                } else {
-                    // A route keyed only by session identity may receive an
-                    // outsider stream. Its closure is not evidence about the
-                    // activated participants and cannot terminate this actor.
-                    Ok(())
-                }
-            }
         }
     }
 
     pub(super) async fn recover(&mut self) -> Result<(), ExecError> {
-        self.context.store.recover_expired_leases(now_ms()).await?;
-        self.ensure_execution().await?;
-
-        // An acknowledged callout may have reached the observer immediately
-        // before the actor crashed, leaving the durable continuation waiting
-        // for an answer while its outbox row is no longer pending. Capture
-        // that projection before the normal outbox drain; rows that are still
-        // pending/leased will be delivered by the drain itself. Signature
-        // requests never cross this boundary: the actor signs and resumes
-        // them as one leased outbox operation.
-        let replay_requests = self
-            .context
-            .store
-            .pending_requests()
-            .await?
-            .into_iter()
-            .filter(|request| matches!(request, PendingRequest::Callout { .. }))
-            .filter(|request| request.status() == arena0_store::OutboxStatus::Acknowledged)
-            .collect::<Vec<_>>();
-
-        let state = self.load_state().await?;
+        // Construct the resident only after the execution aggregate exists.
+        // Recovery always starts from the committed state images; a pending
+        // proposal remains durable evidence and is deliberately not installed
+        // as live guest state while signatures are outstanding.
+        self.restore_resident()?;
+        let state = &self.state;
 
         if state.status().lifecycle() == ExecLifecycle::Activating {
-            self.apply_input(ExecutionInput::Activate).await?;
+            let mut next = self.state.clone();
+            next.activate()?;
+            self.persist(next, Change::State).await?;
         }
 
-        self.progress().await?;
-        self.emit_recovered_pending_requests(&replay_requests).await
+        self.progress().await
     }
 
-    /// Re-emit an agent request whose durable outbox effect was acknowledged
-    /// before the previous actor lifetime could receive its answer.
-    async fn emit_recovered_pending_requests(
-        &self,
-        requests: &[PendingRequest],
-    ) -> Result<(), ExecError> {
-        for request in requests {
-            if let PendingRequest::Callout {
-                pending_id,
-                callout_index,
-                context,
-                expected_type,
-                ..
-            } = request
-            {
-                self.messages
-                    .send(SessionMessage::CalloutRequested {
-                        pending_id: *pending_id,
-                        callout_index: *callout_index,
-                        context: context.clone(),
-                        expected_type: expected_type.clone(),
-                    })
-                    .await
-                    .map_err(|_| ExecError::Unavailable("message receiver closed".into()))?;
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) async fn ensure_execution(&mut self) -> Result<(), ExecError> {
-        if self.context.identity.peer_id() != self.context.producer {
-            return Err(ExecError::InvalidState(
-                "actor identity and producer identity differ".into(),
-            ));
-        }
-        let request = self
-            .context
+    pub(super) async fn ensure_execution(
+        context: &mut ActorContext,
+    ) -> Result<ExecutionState, ExecError> {
+        let producer = context.identity.peer_id();
+        let request = context
             .store
             .load_execution_request()
             .await?
             .ok_or_else(|| {
                 ExecError::InvalidState("execution request is not durably recorded".into())
             })?;
-        if request.program_hash() != self.context.program.program().hash()
+        if request.program_hash() != context.program.program().hash()
             || request
                 .params()
-                .is_some_and(|params| params != &self.context.params)
+                .is_some_and(|params| params != &context.params)
         {
             return Err(ExecError::InvalidState(
                 "actor program or parameters differ from durable request".into(),
             ));
         }
-        let activation = self.context.store.load_activation().await?.ok_or_else(|| {
+        let activation = context.store.load_activation().await?.ok_or_else(|| {
             ExecError::InvalidState("execution activation is not durably committed".into())
         })?;
         let Some(durable_activation) = activation.activation() else {
@@ -297,7 +313,7 @@ impl ExecutionActor {
                 "execution activation is only prepared".into(),
             ));
         };
-        if durable_activation != &self.context.activation {
+        if durable_activation != &context.activation {
             return Err(ExecError::InvalidState(
                 "actor activation differs from durable activation".into(),
             ));
@@ -307,7 +323,7 @@ impl ExecutionActor {
                 .params()
                 .is_some_and(|params| durable_activation.offer().data().params != *params)
             || durable_activation.offer().data().execution_profile
-                != self.context.program.profile().hash()
+                != context.program.profile().hash()
         {
             return Err(ExecError::InvalidState(
                 "durable activation terms differ from the execution request or local profile"
@@ -317,7 +333,7 @@ impl ExecutionActor {
         let Some(local_ticket) = durable_activation
             .tickets()
             .iter()
-            .find(|ticket| ticket.data.signer == self.context.producer)
+            .find(|ticket| ticket.data.signer == producer)
         else {
             return Err(ExecError::InvalidState(
                 "durable activation has no ticket for the local producer".into(),
@@ -328,122 +344,273 @@ impl ExecutionActor {
                 "local producer ticket is not active".into(),
             ));
         };
-        if *execution_bls != self.context.execution_key.public_key() {
+        if *execution_bls != context.execution_key.public_key() {
             return Err(ExecError::InvalidState(
                 "execution signer does not match the local activation ticket".into(),
             ));
         }
-        if let Some(state) = self.context.store.load_execution().await? {
-            if state.producer() != self.context.producer
-                || state.binding().activation() != &self.context.activation
-            {
+        if let Some(state) = context.store.load_execution().await? {
+            if state.producer() != producer || state.binding().activation() != &context.activation {
                 return Err(ExecError::InvalidState(
                     "durable execution binding differs from actor context".into(),
                 ));
             }
-            return Ok(());
+            return Ok(state);
         }
-        let initialized = self
-            .context
-            .program
-            .initialize(InitializeCall::new(self.context.params.clone()))?;
-        self.context
+        let initialized = context.program.initialize(context.params.clone())?;
+        context
             .store
             .create_execution(
-                self.context.activation.clone(),
-                self.context.producer,
+                context.activation.clone(),
+                producer,
                 initialized.shared,
                 initialized.local,
                 now_ms(),
             )
             .await?;
-        Ok(())
-    }
-
-    pub(super) async fn progress(&mut self) -> Result<(), ExecError> {
-        let state = self.load_state().await?;
-        match state.status().receipt_work() {
-            ReceiptWork::NotTerminal | ReceiptWork::CollectSignatures => {}
-            ReceiptWork::Incomplete => return Ok(()),
-            ReceiptWork::Assemble | ReceiptWork::Published => {
-                super::terminal::finalize_receipt(&mut self.context.store).await?;
-                return self.drain_outbox().await;
-            }
-        }
-        self.ensure_session_started().await?;
-        self.resolve_pending_inbox().await?;
-        self.fire_due_timers().await?;
-
-        let state = self.load_state().await?;
-        match state.status().receipt_work() {
-            ReceiptWork::NotTerminal | ReceiptWork::CollectSignatures => {}
-            ReceiptWork::Incomplete => return Ok(()),
-            ReceiptWork::Assemble | ReceiptWork::Published => {
-                super::terminal::finalize_receipt(&mut self.context.store).await?;
-                return self.drain_outbox().await;
-            }
-        }
-        if state.pending_shared().is_some() {
-            self.ensure_step_signature().await?;
-        } else if state.terminal_pending() {
-            self.ensure_terminal_signature().await?;
-        } else if state.status().lifecycle() == ExecLifecycle::Active
-            && state.status().pending().is_none()
-            && state.public().next_step() > 0
-            && state.private().last_reaction_position() != Some(state.public().next_step())
-        {
-            self.run_local(
-                LocalEvent::React,
-                PrivateEvent::React,
-                PrivateCause::react(),
-            )
-            .await?;
-        }
-        self.drain_outbox().await
-    }
-
-    pub(super) async fn load_state(&self) -> Result<ExecutionState, ExecError> {
-        self.context
+        context
             .store
             .load_execution()
             .await?
-            .ok_or(ExecError::NotFound(self.context.exec_id))
+            .ok_or(ExecError::NotFound(context.exec_id))
     }
 
-    pub(super) async fn apply_input(
+    pub(super) async fn progress(&mut self) -> Result<(), ExecError> {
+        let mut drove_events = false;
+        let state = loop {
+            let state = &self.state;
+            match state.status().receipt_work() {
+                ReceiptWork::NotTerminal if drove_events => {
+                    break state;
+                }
+                ReceiptWork::NotTerminal => {
+                    self.ensure_session_started().await?;
+                    self.fire_due_timers().await?;
+                    drove_events = true;
+                }
+                ReceiptWork::Assemble | ReceiptWork::Published => {
+                    return self.progress_terminal_boundary().await;
+                }
+            }
+        };
+        if state.pending_shared().is_some() {
+            self.ensure_step_signature().await?;
+        } else if self.may_author()? {
+            self.author_next_message().await?;
+        }
+        self.announce_callout().await?;
+        self.deliver_frames()?;
+        Ok(())
+    }
+
+    /// Announce the committed open callout when its identity changes.
+    ///
+    /// The open callout is durable in the execution aggregate, so this is only
+    /// an observer-facing notification. A restart starts with no announcement
+    /// and therefore re-announces the current callout once.
+    async fn announce_callout(&mut self) -> Result<(), ExecError> {
+        let state = &self.state;
+        let Some(open) = state.callout() else {
+            return Ok(());
+        };
+        if self.announced_callout == Some(open.id) {
+            return Ok(());
+        }
+        let pending_id = open.id;
+        let callout_index = open.callout_index;
+        let context = open.context.clone();
+        self.messages
+            .send(super::callout_requested(pending_id, callout_index, context))
+            .await
+            .map_err(|_| ExecError::Unavailable("message receiver closed".into()))?;
+        self.announced_callout = Some(pending_id);
+        Ok(())
+    }
+
+    /// Publish the local result before waiting for remote acknowledgements.
+    /// End confirmation remains local protocol state, independent of the
+    /// receipt. A deadline ends this run while retaining any unconfirmed peers.
+    pub(super) async fn progress_terminal_boundary(&mut self) -> Result<(), ExecError> {
+        self.finalize_receipt().await?;
+        self.emit_published_terminal().await?;
+        if matches!(self.state.end_phase(), EndPhase::Ending { .. })
+            && self
+                .end_timer
+                .is_some_and(|timer| tokio::time::Instant::now() >= timer.deadline)
+        {
+            let mut next = self.state.clone();
+            next.expire_end()?;
+            self.persist(next, Change::State).await?;
+        }
+        if !self.end_run_finished() {
+            self.deliver_frames()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn end_run_finished(&self) -> bool {
+        matches!(self.state.status().receipt_work(), ReceiptWork::Published)
+            && matches!(self.state.end_phase(), EndPhase::Ended { unconfirmed } if unconfirmed.is_empty() || self.end_timer.is_some_and(|timer| tokio::time::Instant::now() >= timer.deadline))
+    }
+
+    /// Recompute after a durable transition or recovery. Ordinary progress
+    /// ticks and repeated sends cannot prolong a silent peer's window.
+    async fn sync_end_timer(&mut self) -> Result<(), ExecError> {
+        let version = self.state.version();
+        let window = self.context.end_confirmation_window;
+        match self.state.end_phase() {
+            EndPhase::Open => {
+                self.end_timer = None;
+            }
+            EndPhase::Ended { unconfirmed } if unconfirmed.is_empty() => {
+                self.end_timer = None;
+            }
+            EndPhase::Ending { .. } => {
+                if self.end_timer.is_some_and(|timer| {
+                    timer.version == version && timer.phase == EndTimerPhase::Ending
+                }) {
+                    return Ok(());
+                }
+                let deadline = if self
+                    .end_timer
+                    .is_some_and(|timer| timer.phase == EndTimerPhase::Ending)
+                {
+                    tokio::time::Instant::now() + window
+                } else {
+                    // A recovered actor must not receive a fresh full window.
+                    // Within this actor, Tokio's monotonic clock owns elapsed
+                    // time; the durable wall timestamp bridges restarts.
+                    let updated = self.context.store.execution_updated_at_ms().await?;
+                    let elapsed = Duration::from_millis(now_ms().saturating_sub(updated));
+                    tokio::time::Instant::now() + window.saturating_sub(elapsed)
+                };
+                self.end_timer = Some(EndTimer {
+                    version,
+                    phase: EndTimerPhase::Ending,
+                    deadline,
+                });
+            }
+            EndPhase::Ended { .. } => {
+                let deadline = match self.end_timer {
+                    Some(timer)
+                        if timer.version == version || timer.phase == EndTimerPhase::Ending =>
+                    {
+                        // `Ending -> Ended` expires the existing window. A
+                        // later wake starts a new one when no timer exists.
+                        timer.deadline
+                    }
+                    _ => tokio::time::Instant::now() + window,
+                };
+                self.end_timer = Some(EndTimer {
+                    version,
+                    phase: EndTimerPhase::Ended,
+                    deadline,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn persist(
         &mut self,
-        input: ExecutionInput,
-    ) -> Result<ApplyOutcome, ExecError> {
-        Ok(self.context.store.apply_input(input, now_ms()).await?)
+        next: ExecutionState,
+        change: Change,
+    ) -> Result<(), ExecError> {
+        let result =
+            persist_transition(&mut self.context.store, &mut self.state, next, change).await;
+        self.resync_on_error(result).await
+    }
+
+    /// After a failed durable write the store outcome is unknown: drop the
+    /// resident and reload the last durable state before any further
+    /// transition, then return the original error.
+    pub(super) async fn resync_on_error(
+        &mut self,
+        result: Result<(), ExecError>,
+    ) -> Result<(), ExecError> {
+        let Err(error) = result else {
+            return self.sync_end_timer().await;
+        };
+        self.instance = None;
+        self.state = self
+            .context
+            .store
+            .load_execution()
+            .await?
+            .ok_or(ExecError::NotFound(self.context.exec_id))?;
+        Err(error)
+    }
+
+    /// Construct or replace the execution-local resident from committed
+    /// durable images.  Replacing the instance is required after an unknown
+    /// store outcome; continuing with its candidate memory could duplicate a
+    /// committed effect.
+    pub(super) fn restore_resident(&mut self) -> Result<(), ExecError> {
+        let instance = self.context.program.resident(
+            self.state.shared_state().clone(),
+            self.state.local_state().clone(),
+        )?;
+        self.instance = Some(instance);
+        Ok(())
+    }
+
+    /// Reload the resident in place from `state`'s committed images after a
+    /// transition replaced them without a resident commit (certification).
+    /// A missing resident stays missing and is rebuilt on next use. On failure
+    /// the resident is dropped so the next use rebuilds it.
+    pub(super) fn reload_resident(&mut self) -> Result<(), ExecError> {
+        let Some(instance) = self.instance.as_mut() else {
+            return Ok(());
+        };
+        let reloaded = instance
+            .restore_payloads(
+                self.state.shared_state().clone(),
+                self.state.local_state().clone(),
+            )
+            .map_err(ExecError::from);
+        if reloaded.is_err() {
+            self.instance = None;
+        }
+        reloaded
+    }
+
+    pub(super) fn resident_mut(&mut self) -> Result<&mut ProgramInstance, ExecError> {
+        if self.instance.is_none() {
+            self.restore_resident()?;
+        }
+        Ok(self.instance.as_mut().expect("resident was just restored"))
     }
 
     pub(super) fn ensemble(&self) -> Ensemble<Committed> {
-        Ensemble::from_peers(
-            self.context
-                .activation
-                .tickets()
-                .iter()
-                .map(|ticket| ticket.data.signer)
-                .collect(),
-        )
-        .expect("validated activation has a committed ensemble")
+        self.state
+            .binding()
+            .ensemble()
+            .expect("validated activation has a committed ensemble")
     }
+}
+
+/// Persist `next` as the successor of `state`, advancing `state` only after
+/// the transition is durable.
+pub(super) async fn persist_transition(
+    store: &mut arena0_store::ExecutionStore,
+    state: &mut ExecutionState,
+    next: ExecutionState,
+    change: Change,
+) -> Result<(), ExecError> {
+    store
+        .persist(TransitionRecord {
+            expected: state.version(),
+            next: next.clone(),
+            change,
+            now_ms: now_ms(),
+        })
+        .await?;
+    *state = next;
+    Ok(())
 }
 
 fn progress_ticker() -> Interval {
     let mut ticker = tokio::time::interval(PROGRESS_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ticker
-}
-
-async fn wait_for_inflight_send(
-    inflight: &mut Option<InflightSend>,
-) -> Result<Result<(), TransportError>, JoinError> {
-    inflight
-        .as_mut()
-        .expect("in-flight send exists while selected")
-        .task
-        .as_mut()
-        .expect("in-flight send task exists while selected")
-        .await
 }

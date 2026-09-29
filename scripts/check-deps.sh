@@ -22,11 +22,11 @@ assert_direct() {
   fi
 }
 
-assert_direct arena0-cli arena0-client arena0-home arena0-verify
+assert_direct arena0-cli arena0-client arena0-home
 assert_direct arena0d arena0-daemon arena0-home
 assert_direct cargo-arena0 arena0-sandbox
 
-# Workspace-wide metadata unifies verifier features requested by other members.
+# Workspace-wide metadata unifies features requested by other members.
 # Cargo's package-scoped tree reflects the CLI's own normal dependency closure.
 tree=$(cargo tree --locked -p arena0-cli --edges normal --prefix none --format '{p}')
 for package in arena0-daemon arena0-node arena0-sandbox wasmtime; do

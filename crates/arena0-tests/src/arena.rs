@@ -6,24 +6,24 @@
 //! transport endpoint. There is no mutable sandbox or in-memory store mock in
 //! this test layer.
 use std::fmt::Write as _;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arena0_crypto::{ExecutionKey, ExecutionSalt, NodeKeys, SecretKey};
 use arena0_node::{
-    DurableOutcome, ExecCommand, Host, NegotiationAttempt, NegotiationEffects, NegotiationStart,
-    PrepareOutcome, SessionMessage, SpawnedExec,
+    ExecCommand, ExecError, Host, NegotiationAttempt, NegotiationEffects, NegotiationStart,
+    SessionMessage, SpawnedExec,
 };
 use arena0_node::{ExecContext, NegotiationBook};
 use arena0_program::JsonBytes;
 use arena0_protocol::{
     EventSource, ExecId, ExecutionAdmission, NegotiationEvent, NegotiationId, OfferData, PeerId,
-    PeerIdSource, ReceiptArtifact, SessionHash, SessionTermination, StateHash, TraceEntry,
+    PeerIdSource, ReceiptArtifact, SessionHash, SessionTermination, StateHash, TraceEntry, View,
+    Viewport,
 };
-use arena0_sandbox::{InitializeCall, Program, WasmtimeEngine};
-use arena0_store::{Store, StoreConfig, StoreHandle};
+use arena0_sandbox::Program;
+use arena0_store::{Store, StoreHandle};
+use arena0_test_engine::shared_test_engine;
 use arena0_transport::Transport;
 use arena0_transport::local::LocalTransport;
 use tempfile::TempDir;
@@ -50,6 +50,7 @@ pub enum ArenaProgress {
     SessionStarted,
     CertifiedStep { step: u64 },
     TerminalPublished,
+    ReceiptVerified { elapsed_us: u64, success: bool },
 }
 
 /// A monotonic, participant-scoped point in an [`Arena`] run.
@@ -90,7 +91,6 @@ fn record_session_progress(
         }
         SessionMessage::ReceiptPublished { .. } => Some(ArenaProgress::TerminalPublished),
         SessionMessage::CalloutRequested { .. }
-        | SessionMessage::Notification { .. }
         | SessionMessage::Completed { .. }
         | SessionMessage::Aborted { .. }
         | SessionMessage::Failed { .. } => None,
@@ -124,10 +124,17 @@ fn progress_summary(timeline: &[TimedProgress], participant_count: usize) -> Str
         let terminal = points.iter().find_map(|point| {
             matches!(&point.progress, ArenaProgress::TerminalPublished).then_some(point.elapsed_us)
         });
+        let verification = points.iter().find_map(|point| match &point.progress {
+            ArenaProgress::ReceiptVerified {
+                elapsed_us,
+                success,
+            } => Some((*elapsed_us, *success)),
+            _ => None,
+        });
         let (last_step, last_step_at) = certified.last().copied().unzip();
         let _ = write!(
             summary,
-            "p{participant}[neg@{negotiation:?} start@{started:?} steps={count} last={last_step:?}@{last_step_at:?} terminal@{terminal:?}] ",
+            "p{participant}[neg@{negotiation:?} start@{started:?} steps={count} last={last_step:?}@{last_step_at:?} terminal@{terminal:?} verified={verification:?}] ",
             count = certified.len(),
         );
     }
@@ -213,33 +220,20 @@ impl Arena {
         let program = Program::try_from(wasm.clone()).expect("program");
         let program_id = program.hash();
         let creator_params = self.params.clone();
-        let creator_program = WasmtimeEngine::new()
-            .expect("sandbox")
-            .load(&program)
-            .expect("load");
-        let initialized = creator_program
-            .initialize(InitializeCall::new(
-                JsonBytes::try_new(creator_params.clone()).expect("valid creator params"),
-            ))
+        // One shared load per run: every participant dispatches residents of
+        // the same compiled module through the process-wide test engine.
+        let loaded = shared_test_engine().load(&program).expect("load");
+        let initialized = loaded
+            .initialize(JsonBytes::try_new(creator_params.clone()).expect("valid creator params"))
             .expect("initialize program");
-        let initial_state = StateHash::of(initialized.shared.as_bytes());
+        let initial_state = StateHash::of_shared(&initialized.shared);
 
         // Every Host gets a real SQLite owner and a registry entry before the
         // negotiation driver is allowed to prepare activation evidence.
         let mut stores: Vec<(TempDir, Store)> = Vec::with_capacity(n);
         let mut host_specs = Vec::with_capacity(n);
         for node in &identities {
-            let directory = tempfile::tempdir().expect("store directory");
-            let store = Store::open(StoreConfig::new(
-                directory.path().join("arena0.sqlite"),
-                node.peer_id,
-            ))
-            .expect("open store");
-            store
-                .handle()
-                .register_program(wasm.clone(), unix_time_ms())
-                .await
-                .expect("register program");
+            let (directory, store) = crate::fixtures::seeded_store(node.peer_id, &wasm).await;
             host_specs.push((Arc::clone(&node.identity), store.handle().clone()));
             stores.push((directory, store));
         }
@@ -281,7 +275,7 @@ impl Arena {
         let negotiation_events =
             Arc::new(Mutex::new(Vec::<(EventSource, NegotiationEvent)>::new()));
         // Let every participant install its topic subscription before any
-        // drive emits the initial offer. LocalTransport has no replay for a
+        // drive emits the initial offer. LocalTransport has no duplicate delivery for a
         // fact published before a peer joins, so starting one drive ahead of
         // the rest can strand a participant in Gossiping indefinitely.
         let negotiation_barrier = Arc::new(Barrier::new(n));
@@ -296,16 +290,19 @@ impl Arena {
             let bootstrap = peer_ids
                 .iter()
                 .copied()
-                .filter(|peer| *peer != host.peer_id)
+                .filter(|peer| *peer != host.peer_id())
                 .collect::<Vec<_>>();
             let exec_id = exec_id_for(i);
             let transport = Arc::clone(&transports[i]);
             let task_creator_ticket = (i == 0).then(|| creator_ticket.clone());
-            let recompute_wasm = wasm.clone();
+            let recompute_loaded = Arc::clone(&loaded);
             let mut execution_store = host.claim_execution(exec_id).expect("execution claim");
             let admission = if i == 0 {
-                ExecutionAdmission::create(negotiation_id, n as u16)
-                    .expect("valid creator admission")
+                ExecutionAdmission::create(
+                    negotiation_id,
+                    u16::try_from(n).expect("participant count fits protocol"),
+                )
+                .expect("valid creator admission")
             } else {
                 ExecutionAdmission::join(identities[0].peer_id, negotiation_id)
             };
@@ -353,67 +350,15 @@ impl Arena {
                     supervision: None,
                     deadline: Some(deadline),
                 };
-                let prepare: arena0_node::PrepareEffect = Box::new(
-                    |store: &mut arena0_store::ExecutionStore,
-                     prepared|
-                     -> Pin<
-                        Box<dyn Future<Output = Result<PrepareOutcome, String>> + Send + '_>,
-                    > {
-                        Box::pin(async move {
-                            match store
-                                .prepare_activation(prepared, unix_time_ms())
-                                .await
-                                .map_err(|error| error.to_string())?
-                            {
-                                arena0_store::PrepareActivationOutcome::Prepared(_)
-                                | arena0_store::PrepareActivationOutcome::AlreadyPrepared(_)
-                                | arena0_store::PrepareActivationOutcome::AlreadyCommitted(_) => {
-                                    Ok(PrepareOutcome::Accepted)
-                                }
-                                arena0_store::PrepareActivationOutcome::Conflict { .. } => {
-                                    Ok(PrepareOutcome::Conflict)
-                                }
-                            }
-                        })
-                    },
-                );
-                let persist_activation: arena0_node::PersistActivationEffect = Box::new(
-                    |store: &mut arena0_store::ExecutionStore,
-                     activation|
-                     -> Pin<
-                        Box<dyn Future<Output = Result<DurableOutcome, String>> + Send + '_>,
-                    > {
-                        Box::pin(async move {
-                            match store
-                                .commit_activation(activation, unix_time_ms())
-                                .await
-                                .map_err(|error| error.to_string())?
-                            {
-                                arena0_store::CommitActivationOutcome::Committed(_)
-                                | arena0_store::CommitActivationOutcome::AlreadyCommitted(_) => {
-                                    Ok(DurableOutcome::Accepted)
-                                }
-                                arena0_store::CommitActivationOutcome::Conflict { .. } => {
-                                    Ok(DurableOutcome::Conflict)
-                                }
-                            }
-                        })
-                    },
-                );
+                let (prepare, persist_activation) = arena0_node::store_activation_effects();
                 let recompute_initial_state = Box::new(move |params: &[u8]| {
-                    let program = Program::try_from(recompute_wasm.clone())
-                        .map_err(|error| error.to_string())?;
-                    let loaded = WasmtimeEngine::new()
-                        .map_err(|error| error.to_string())?
-                        .load(&program)
-                        .map_err(|error| error.to_string())?;
-                    let initialized = loaded
-                        .initialize(InitializeCall::new(
+                    let initialized = recompute_loaded
+                        .initialize(
                             JsonBytes::try_new(params.to_vec())
                                 .map_err(|error| error.to_string())?,
-                        ))
+                        )
                         .map_err(|error| error.to_string())?;
-                    Ok(StateHash::of(initialized.shared.as_bytes()))
+                    Ok(StateHash::of_shared(&initialized.shared))
                 });
                 let effects = NegotiationEffects {
                     prepare,
@@ -476,11 +421,7 @@ impl Arena {
         for (i, ((directory, store), host)) in stores.into_iter().zip(hosts.iter()).enumerate() {
             let node = &identities[i];
             let node_params = creator_params.clone();
-            let program = Program::try_from(wasm.clone()).expect("program");
-            let loaded = WasmtimeEngine::new()
-                .expect("sandbox creation")
-                .load(&program)
-                .expect("load program");
+            let loaded = Arc::clone(&loaded);
             let exec_id = exec_id_for(i);
             let execution_key = host
                 .execution_key(&execution_salt_for(i), &exec_id, &negotiation_id)
@@ -609,6 +550,76 @@ impl Run {
         }
     }
 
+    /// Wait until `participant` has an open callout and return it without
+    /// answering it. A later `expect_input(participant)` answers the same callout.
+    pub async fn callout(&mut self, participant: usize) -> ObservedCallout {
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        loop {
+            self.drain_events();
+            let handle = &mut self.participants[participant];
+            if let Some(observed) = handle.events.iter().rev().find_map(|event| match event {
+                SessionMessage::CalloutRequested {
+                    callout_index,
+                    context,
+                    ..
+                } => Some(ObservedCallout {
+                    callout_index: *callout_index,
+                    context: serde_json::from_slice(context).expect("callout context is JSON"),
+                }),
+                _ => None,
+            }) {
+                return observed;
+            }
+            if let Some(termination) = &handle.termination {
+                panic!(
+                    "participant {participant}: expected CalloutRequested, got termination: {termination:?}"
+                );
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let participant_events = handle.events.clone();
+                let mut states = Vec::with_capacity(self.participants.len());
+                for participant in &self.participants {
+                    states.push(
+                        participant
+                            .store_handle
+                            .load_execution(participant.exec_id)
+                            .await
+                            .expect("execution state"),
+                    );
+                }
+                let progress = self.progress_summary();
+                panic!(
+                    "participant {participant}: timeout waiting for CalloutRequested; progress: {progress}; events: {:?}; states: {states:?}",
+                    participant_events,
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Render one view on `participant` through its execution actor
+    /// (`ExecCommand::View`).
+    pub async fn view(&mut self, participant: usize, viewport: Viewport) -> View {
+        let json =
+            JsonBytes::try_new(serde_json::to_vec(&viewport).expect("viewport encodes as JSON"))
+                .expect("viewport must be valid JSON");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.participants[participant]
+            .spawned
+            .cmd_tx
+            .send(ExecCommand::View {
+                viewport: json,
+                reply: tx,
+            })
+            .await
+            .expect("execution gone");
+        match rx.await {
+            Ok(Ok((_, view))) => view,
+            Ok(Err(error)) => panic!("participant {participant}: view failed: {error}"),
+            Err(_) => panic!("participant {participant}: execution gone"),
+        }
+    }
+
     async fn wait_for_all_terminal(&mut self, timeout_action: &str) -> Vec<SessionTermination> {
         let deadline = tokio::time::Instant::now() + self.timeout;
         while self
@@ -631,47 +642,6 @@ impl Run {
                         .load_execution(participant.exec_id)
                         .await
                         .expect("execution state query");
-                    let inbox = match loaded_state.as_ref() {
-                        Some(_) => participant
-                            .store_handle
-                            .list_pending_inbox(participant.exec_id, 64)
-                            .await
-                            .map(|items| {
-                                items
-                                    .iter()
-                                    .map(|item| {
-                                        let source = self
-                                            .participants
-                                            .iter()
-                                            .position(|candidate| {
-                                                candidate.peer_id == item.source()
-                                            })
-                                            .map_or_else(
-                                                || item.source().to_string(),
-                                                |index| format!("p{index}"),
-                                            );
-                                        let frame = match item.frame() {
-                                            arena0_protocol::ExecFrame::Message { seq, .. } => {
-                                                format!("message@{seq}")
-                                            }
-                                            arena0_protocol::ExecFrame::StepSignature {
-                                                commitment,
-                                                ..
-                                            } => {
-                                                format!("step-signature@{}", commitment.step)
-                                            }
-                                            arena0_protocol::ExecFrame::End { .. } => "end".into(),
-                                            arena0_protocol::ExecFrame::Abort { .. } => {
-                                                "abort".into()
-                                            }
-                                        };
-                                        format!("{source}:{frame}")
-                                    })
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_else(|error| vec![format!("error:{error}")]),
-                        None => vec!["execution-missing".into()],
-                    };
                     let state = loaded_state.as_ref().map(|state| {
                         let signatures = state
                             .pending_shared()
@@ -694,15 +664,13 @@ impl Run {
                             })
                             .unwrap_or_default();
                         format!(
-                            "lifecycle={:?} version={} step={} private={} reacted={:?} proposal_step={:?} shared_signatures={signatures:?} terminal_pending={} timers={}",
+                            "lifecycle={:?} version={} step={} event_position={} outgoing={} proposal_step={:?} shared_signatures={signatures:?}",
                             state.lifecycle(),
                             state.version(),
-                            state.public().next_step(),
-                            state.private().next_record(),
-                            state.private().last_reaction_position(),
-                            state.pending_shared().map(|proposal| proposal.commitment().step),
-                            state.terminal_pending(),
-                            state.active_timers().count(),
+                            state.agreed_step(),
+                            state.event_position(),
+                            state.outgoing().len(),
+                            state.pending_shared().map(|_| state.proposal_commitment().expect("staged commitment").step),
                         )
                     });
                     let trace = match loaded_state.as_ref() {
@@ -721,7 +689,7 @@ impl Run {
                         None => "execution-missing".into(),
                     };
                     diagnostics.push(format!(
-                        "node {i} state={state:?} trace={trace:?} inbox={inbox:?} events={}",
+                        "node {i} state={state:?} trace={trace:?} events={}",
                         participant.events.len(),
                     ));
                 }
@@ -754,6 +722,39 @@ impl Run {
                 _ => unreachable!(),
             })
             .collect()
+    }
+
+    /// Wait for every participant to complete, then check that they agree:
+    /// one session, one outcome, and for each participant a verified
+    /// completed receipt carrying that outcome. Returns the verified receipt
+    /// summaries in participant order.
+    pub async fn expect_agreed_completion(&mut self) -> Vec<arena0_protocol::ReceiptSummary> {
+        let outcomes = self.expect_completed_all().await;
+        for i in 1..self.node_count() {
+            assert_eq!(
+                self.session_hash(i),
+                self.session_hash(0),
+                "participant {i} confirmed a different session"
+            );
+            assert_eq!(
+                outcomes[i], outcomes[0],
+                "participant {i} derived a different outcome"
+            );
+        }
+        let verified = self.verify_all().expect("every receipt verifies");
+        for (i, (summary, outcome)) in verified.iter().zip(&outcomes).enumerate() {
+            assert_eq!(
+                summary.terminal,
+                arena0_protocol::ReceiptTermination::Completed,
+                "participant {i}: expected a completed receipt"
+            );
+            assert_eq!(
+                summary.outcome_borsh.as_ref(),
+                Some(outcome),
+                "participant {i}: receipt outcome differs from the completion"
+            );
+        }
+        verified
     }
 
     /// Wait until every node reaches a terminal state without asserting success.
@@ -812,7 +813,7 @@ impl Run {
             .filter(|receipt| {
                 matches!(
                     receipt.body().termination(),
-                    arena0_protocol::ReceiptTermination::Completed { .. }
+                    arena0_protocol::ReceiptTermination::Completed
                 )
             })
             .map(|receipt| receipt.body().outcome().to_vec())
@@ -840,27 +841,64 @@ impl Run {
         self.receipt(i).encode().expect("encode receipt")
     }
 
-    /// Assert every participant retains the same canonical artifact bytes and
-    /// content identity, returning participant zero's artifact and its bytes
-    /// for the single replay performed by a program integration test.
-    pub fn assert_canonical_receipt_equality(&self) -> (ReceiptArtifact, Vec<u8>) {
-        let canonical = self.receipt(0);
-        let canonical_bytes = self.receipt_bytes(0);
-        let canonical_id = canonical.receipt_id();
-        for participant in 1..self.node_count() {
-            let receipt = self.receipt(participant);
-            assert_eq!(
-                self.receipt_bytes(participant),
-                canonical_bytes,
-                "participant {participant} must retain the canonical receipt bytes"
-            );
-            assert_eq!(
-                receipt.receipt_id(),
-                canonical_id,
-                "participant {participant} must retain the canonical receipt id"
-            );
-        }
-        (canonical, canonical_bytes)
+    /// Verify every participant's complete durable receipt, returning the
+    /// authenticated proof evidence in participant order.
+    pub fn verify_all(&self) -> Result<Vec<arena0_protocol::ReceiptSummary>, String> {
+        let jobs = (0..self.node_count())
+            .map(|i| {
+                let receipt = self.participants[i]
+                    .receipt
+                    .as_ref()
+                    .ok_or_else(|| format!("node {i}: missing receipt"))?;
+                let bytes = receipt
+                    .encode()
+                    .map_err(|error| format!("node {i}: {error}"))?;
+                Ok((i, bytes, self.session_hash(i)))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        std::thread::scope(|scope| {
+            let mut verifications = Vec::with_capacity(jobs.len());
+            for (i, bytes, expected_session) in jobs {
+                let timeline = Arc::clone(&self.timeline);
+                let timeline_started = self.timeline_started;
+                verifications.push(scope.spawn(move || {
+                    let verification_started = Instant::now();
+                    let result = arena0_protocol::ReceiptArtifact::decode(&bytes)
+                        .map(|receipt| receipt.summary())
+                        .map_err(|error| format!("node {i}: {error:?}"))
+                        .and_then(|verified| {
+                            if verified.session_id != expected_session {
+                                return Err(format!(
+                                    "node {i}: verifier returned session {}, expected {}",
+                                    verified.session_id, expected_session
+                                ));
+                            }
+                            Ok(verified)
+                        });
+                    let verification_elapsed_us =
+                        u64::try_from(verification_started.elapsed().as_micros())
+                            .unwrap_or(u64::MAX);
+                    record_progress(
+                        &timeline,
+                        timeline_started,
+                        i,
+                        ArenaProgress::ReceiptVerified {
+                            elapsed_us: verification_elapsed_us,
+                            success: result.is_ok(),
+                        },
+                    );
+                    result
+                }));
+            }
+            verifications
+                .into_iter()
+                .map(|verification| {
+                    verification
+                        .join()
+                        .map_err(|_| "receipt verification worker panicked".to_owned())?
+                })
+                .collect()
+        })
     }
 
     fn drain_events(&mut self) {
@@ -891,6 +929,13 @@ impl Run {
     }
 }
 
+/// One open callout on a participant, as the Host reported it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObservedCallout {
+    pub callout_index: u32,
+    pub context: serde_json::Value,
+}
+
 #[allow(missing_debug_implementations)]
 pub struct Expect<'a> {
     run: &'a mut Run,
@@ -900,40 +945,61 @@ pub struct Expect<'a> {
 impl Expect<'_> {
     /// Respond to the expected callout with validated agent-facing JSON bytes.
     pub async fn respond_bytes(self, data: Vec<u8>) {
+        let mut this = self;
+        if let Err(error) = this.submit(data).await {
+            panic!("participant {}: input rejected: {error}", this.participant);
+        }
+        this.run.participants[this.participant]
+            .events
+            .retain(|event| !matches!(event, SessionMessage::CalloutRequested { .. }));
+    }
+
+    /// Answer the open callout with bytes the program must reject. Return the
+    /// program's rejection reason, or panic if the answer was accepted. The
+    /// callout stays open, so a later `respond_bytes` answers it.
+    pub async fn respond_rejected(self, data: Vec<u8>) -> String {
+        let mut this = self;
+        match this.submit(data).await {
+            Err(ExecError::InputRejected(reason)) => reason,
+            Ok(()) => panic!(
+                "participant {}: callout answer was accepted, expected a rejection",
+                this.participant
+            ),
+            Err(error) => panic!(
+                "participant {}: expected an input rejection, got: {error}",
+                this.participant
+            ),
+        }
+    }
+
+    async fn submit(&mut self, data: Vec<u8>) -> Result<(), ExecError> {
         let json = JsonBytes::try_new(data).expect("callout response must be valid JSON");
         let deadline = tokio::time::Instant::now() + self.run.timeout;
         loop {
             self.run.drain_events();
             let participant = &mut self.run.participants[self.participant];
-            let pending = participant.events.iter().find_map(|event| match event {
-                SessionMessage::CalloutRequested {
-                    pending_id,
-                    callout_index,
-                    ..
-                } => Some((*pending_id, *callout_index)),
-                _ => None,
-            });
-            if let Some((pending_id, callout_index)) = pending {
-                participant
-                    .events
-                    .retain(|event| !matches!(event, SessionMessage::CalloutRequested { .. }));
+            let pending = participant
+                .events
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    SessionMessage::CalloutRequested { pending_id, .. } => Some(*pending_id),
+                    _ => None,
+                });
+            if let Some(pending_id) = pending {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 participant
                     .spawned
                     .cmd_tx
                     .send(ExecCommand::SubmitInput {
                         pending_id,
-                        callout_index,
                         data: json.clone(),
                         reply: tx,
                     })
                     .await
                     .expect("execution gone");
                 match rx.await {
-                    Ok(Ok(())) => return,
-                    Ok(Err(error)) => {
-                        panic!("participant {}: input rejected: {error}", self.participant)
-                    }
+                    Ok(result) => return result,
                     Err(_) => panic!("participant {}: execution gone", self.participant),
                 }
             }
@@ -946,7 +1012,6 @@ impl Expect<'_> {
             if tokio::time::Instant::now() >= deadline {
                 let participant_events = participant.events.clone();
                 let mut states = Vec::with_capacity(self.run.participants.len());
-                let mut inboxes = Vec::with_capacity(self.run.participants.len());
                 for participant in &self.run.participants {
                     states.push(
                         participant
@@ -955,17 +1020,10 @@ impl Expect<'_> {
                             .await
                             .expect("execution state"),
                     );
-                    inboxes.push(
-                        participant
-                            .store_handle
-                            .list_pending_inbox(participant.exec_id, 64)
-                            .await
-                            .expect("pending inbox"),
-                    );
                 }
                 let progress = self.run.progress_summary();
                 panic!(
-                    "participant {}: timeout waiting for CalloutRequested; progress: {progress}; events: {:?}; states: {states:?}; pending inboxes: {inboxes:?}",
+                    "participant {}: timeout waiting for CalloutRequested; progress: {progress}; events: {:?}; states: {states:?}",
                     self.participant, participant_events,
                 );
             }

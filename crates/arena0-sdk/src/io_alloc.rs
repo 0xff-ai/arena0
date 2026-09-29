@@ -1,69 +1,89 @@
-//! Dedicated bump allocator for host I/O buffers.
-//! Decoupled from the guest's general-purpose allocator so the ABI
-//! is agnostic to allocator choice (dlmalloc, wee_alloc, etc.).
+//! Allocator entry points for the resident guest ABI.
+//!
+//! ABI buffers use the guest's normal allocator with one fixed layout. The
+//! host still owns the pointer/length lifetime: it allocates an input envelope,
+//! calls one export, then deallocates the envelope. Generated handlers use the
+//! same allocator for ordinary `Vec`, Borsh, and Serde temporaries.
 
-/// The host may pass one complete bounded call envelope through the guest I/O
-/// allocator. Keep this capacity tied to the ABI envelope limit.
-const IO_ARENA_SIZE: usize = crate::MAX_CALL_ENVELOPE_BYTES as usize;
+use core::alloc::Layout;
 
-#[repr(C, align(8))]
-struct IoArena {
-    buf: [u8; IO_ARENA_SIZE],
+const ABI_ALLOC_ALIGN: usize = 8;
+
+fn abi_layout(len: usize) -> Option<Layout> {
+    Layout::from_size_align(len, ABI_ALLOC_ALIGN).ok()
 }
 
-static mut IO_ARENA: IoArena = IoArena {
-    buf: [0u8; IO_ARENA_SIZE],
-};
-
-// SAFETY: Wasm is single-threaded; no concurrent access.
-static mut IO_BUMP_OFFSET: usize = 0;
-
-/// Allocate `len` bytes from the I/O arena.
+/// Allocate a host ABI buffer from the guest's normal allocator.
 ///
-/// Returns a pointer into the static buffer. The host writes event data
-/// here before calling a semantic guest export, then calls `arena0_dealloc`
-/// to release it.
-///
-/// # Panics
-/// Panics if `len` exceeds remaining arena capacity.
+/// A null pointer signals an invalid length or allocation failure. Returning a
+/// fallible result through the C ABI lets the host report the failure without
+/// trapping before it can restore its resident instance.
 pub fn io_alloc(len: usize) -> *mut u8 {
-    // SAFETY: single-threaded wasm; we use raw pointer reads/writes to avoid
-    // creating references to mutable statics (forbidden in edition 2024).
-    unsafe {
-        let offset = core::ptr::read(core::ptr::addr_of!(IO_BUMP_OFFSET));
-        let aligned = offset
-            .checked_add(7)
-            .map(|value| value & !7)
-            .expect("I/O arena alignment overflow");
-        let new_offset = aligned
-            .checked_add(len)
-            .expect("I/O arena allocation length overflow");
-        assert!(
-            new_offset <= IO_ARENA_SIZE,
-            "I/O arena overflow: requested {len} bytes at offset {aligned}, arena size {IO_ARENA_SIZE}"
-        );
-        core::ptr::write(core::ptr::addr_of_mut!(IO_BUMP_OFFSET), new_offset);
-        core::ptr::addr_of_mut!((*core::ptr::addr_of_mut!(IO_ARENA)).buf)
-            .cast::<u8>()
-            .add(aligned)
+    if len == 0 {
+        return core::ptr::null_mut();
     }
+    let Some(layout) = abi_layout(len) else {
+        return core::ptr::null_mut();
+    };
+    // SAFETY: `layout` is valid and the returned allocation is released by
+    // `io_dealloc` with the same fixed alignment and caller-supplied length.
+    unsafe { std::alloc::alloc(layout) }
 }
 
-/// Release bytes back to the I/O arena. Resets the bump pointer
-/// to the start of this allocation. Since the host does exactly
-/// one alloc + one dealloc per dispatch, this effectively resets
-/// the arena each time.
-pub fn io_dealloc(ptr: *mut u8, _len: usize) {
-    // SAFETY: single-threaded wasm; raw pointer arithmetic avoids creating
-    // references to mutable statics (forbidden in edition 2024).
+/// Release a host ABI buffer allocated by [`io_alloc`].
+///
+/// # Safety
+///
+/// `ptr` must have been returned by [`io_alloc`] for the same non-zero `len`,
+/// and it must not have been released already.
+pub unsafe fn io_dealloc(ptr: *mut u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    let Some(layout) = abi_layout(len) else {
+        return;
+    };
+    // SAFETY: upheld by this function's caller contract.
+    unsafe { std::alloc::dealloc(ptr, layout) };
+}
+
+/// Allocate and release the resident temporary-work reserve.
+///
+/// A runtime calls this once before it captures the resident baseline. The
+/// normal wasm allocator grows the work memory while satisfying the reserve;
+/// after this succeeds, the runtime freezes the observed work-memory size and
+/// rejects any later growth. The reserve is deliberately separate from the
+/// ABI input allocation so generated temporary `Vec` values are covered by
+/// the same measured baseline.
+#[must_use]
+pub fn prepare_allocator() -> bool {
+    let Some(layout) = abi_layout(crate::RESIDENT_ALLOCATOR_RESERVE_BYTES) else {
+        return false;
+    };
+    // SAFETY: `layout` is valid and the allocation contains at least one byte.
+    // Touch both ends so an optimizing allocator/compiler cannot treat the
+    // reserve as dead before the runtime observes the grown linear memory.
+    let ptr = unsafe { std::alloc::alloc(layout) };
+    if ptr.is_null() {
+        return false;
+    }
     unsafe {
-        let base = core::ptr::addr_of!((*core::ptr::addr_of!(IO_ARENA)).buf) as usize;
-        let ptr_addr = ptr as usize;
-        assert!(
-            ptr_addr >= base && ptr_addr <= base + IO_ARENA_SIZE,
-            "io_dealloc: pointer outside I/O arena"
-        );
-        let offset = ptr_addr - base;
-        core::ptr::write(core::ptr::addr_of_mut!(IO_BUMP_OFFSET), offset);
+        core::ptr::write_volatile(ptr, 0);
+        core::ptr::write_volatile(ptr.add(layout.size() - 1), 0);
+    }
+    unsafe { std::alloc::dealloc(ptr, layout) };
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_length_abi_allocation_is_a_null_noop() {
+        let ptr = io_alloc(0);
+        assert!(ptr.is_null());
+        // SAFETY: null is explicitly accepted and no allocation is released.
+        unsafe { io_dealloc(ptr, 0) };
     }
 }

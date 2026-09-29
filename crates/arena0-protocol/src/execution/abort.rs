@@ -1,14 +1,13 @@
 //! Signed, portable abort and failure occurrences.
 
 use arena0_crypto::{Ed25519Signature, SignScheme};
+use arena0_program::bounded;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 use crate::{PeerId, SessionHash};
 
-use super::{
-    MAX_TERMINAL_REASON_BYTES, OccurrenceDigest, ProtocolError, PublicCursor, ensure_payload,
-};
+use super::{MAX_TERMINAL_REASON_BYTES, ProtocolError, StepCursor, ensure_payload};
 
 /// Domain separator for the signed abort occurrence preimage.
 pub const ABORT_OCCURRENCE_DOMAIN: [u8; 24] = *b"arena0/abort-occurrence\0";
@@ -18,30 +17,29 @@ pub const ABORT_OCCURRENCE_VERSION: u16 = 1;
 
 /// The terminal meaning authenticated by an [`AbortOccurrence`].
 ///
-/// The explicit tags are part of the version-1 wire and proof contract.
+/// The explicit tags are part of the version-1 wire and proof contract, and
+/// are the single definition used by both the Borsh and JSON encodings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum AbortKind {
     /// Explicitly stop the execution without classifying it as a failure.
-    Abort,
+    Abort = 0x00,
     /// Classify the execution as failed.
-    Fail,
+    Fail = 0x01,
 }
 
 impl AbortKind {
     /// Stable version-1 tag.
     #[must_use]
     pub const fn tag(self) -> u8 {
-        match self {
-            Self::Abort => 0x00,
-            Self::Fail => 0x01,
-        }
+        self as u8
     }
 
     /// Decode a stable version-1 tag.
     pub fn from_tag(tag: u8) -> Result<Self, borsh::io::Error> {
         match tag {
-            0x00 => Ok(Self::Abort),
-            0x01 => Ok(Self::Fail),
+            tag if tag == Self::Abort.tag() => Ok(Self::Abort),
+            tag if tag == Self::Fail.tag() => Ok(Self::Fail),
             tag => Err(borsh::io::Error::new(
                 borsh::io::ErrorKind::InvalidData,
                 format!("unknown abort kind tag {tag}"),
@@ -78,11 +76,13 @@ impl<'de> Deserialize<'de> for AbortKind {
 /// A portable, signed abort/failure occurrence.
 ///
 /// The signature covers every field except itself, including the session,
-/// sender, terminal kind/code/reason, and exact public chain coordinate.  A
-/// stream generation is intentionally absent: Phase 1 has no independent
-/// portable stream-generation authority, so inventing one would weaken the
-/// contract rather than bind it.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+/// sender, terminal kind/code/reason, and exact agreed chain coordinate.
+///
+/// Both decoders validate the shape: Borsh through its reader below, serde
+/// through the derived field layout (`remote = "Self"`) wrapped in the same
+/// check.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, BorshSerialize)]
+#[serde(remote = "Self")]
 pub struct AbortOccurrence {
     domain: [u8; 24],
     version: u16,
@@ -90,71 +90,45 @@ pub struct AbortOccurrence {
     sender: PeerId,
     kind: AbortKind,
     code: u32,
+    #[borsh(serialize_with = "bounded::write_string::<MAX_TERMINAL_REASON_BYTES>")]
     reason: String,
-    coordinate: PublicCursor,
+    coordinate: StepCursor,
     signature: Ed25519Signature,
 }
 
-impl BorshSerialize for AbortOccurrence {
-    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> borsh::io::Result<()> {
-        if self.reason.len() > MAX_TERMINAL_REASON_BYTES {
-            return Err(borsh::io::Error::new(
-                borsh::io::ErrorKind::InvalidInput,
-                "abort reason exceeds bound",
-            ));
-        }
-        BorshSerialize::serialize(&self.domain, writer)?;
-        BorshSerialize::serialize(&self.version, writer)?;
-        BorshSerialize::serialize(&self.session_id, writer)?;
-        BorshSerialize::serialize(&self.sender, writer)?;
-        BorshSerialize::serialize(&self.kind, writer)?;
-        BorshSerialize::serialize(&self.code, writer)?;
-        let length = u32::try_from(self.reason.len()).map_err(|_| {
-            borsh::io::Error::new(borsh::io::ErrorKind::InvalidInput, "abort reason too long")
-        })?;
-        BorshSerialize::serialize(&length, writer)?;
-        writer.write_all(self.reason.as_bytes())?;
-        BorshSerialize::serialize(&self.coordinate, writer)?;
-        BorshSerialize::serialize(&self.signature, writer)
-    }
-}
-
+// Reads the derived field layout, then rejects an invalid shape.
 impl BorshDeserialize for AbortOccurrence {
     fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
-        let domain = <[u8; 24]>::deserialize_reader(reader)?;
-        let version = u16::deserialize_reader(reader)?;
-        let session_id = SessionHash::deserialize_reader(reader)?;
-        let sender = PeerId::deserialize_reader(reader)?;
-        let kind = AbortKind::deserialize_reader(reader)?;
-        let code = u32::deserialize_reader(reader)?;
-        let length = u32::deserialize_reader(reader)? as usize;
-        if length > MAX_TERMINAL_REASON_BYTES {
-            return Err(borsh::io::Error::new(
-                borsh::io::ErrorKind::InvalidData,
-                "abort reason exceeds bound",
-            ));
-        }
-        let mut reason_bytes = vec![0; length];
-        reader.read_exact(&mut reason_bytes)?;
-        let reason = String::from_utf8(reason_bytes).map_err(|error| {
-            borsh::io::Error::new(borsh::io::ErrorKind::InvalidData, error.to_string())
-        })?;
-        let coordinate = PublicCursor::deserialize_reader(reader)?;
-        let signature = Ed25519Signature::deserialize_reader(reader)?;
         let occurrence = Self {
-            domain,
-            version,
-            session_id,
-            sender,
-            kind,
-            code,
-            reason,
-            coordinate,
-            signature,
+            domain: BorshDeserialize::deserialize_reader(reader)?,
+            version: BorshDeserialize::deserialize_reader(reader)?,
+            session_id: BorshDeserialize::deserialize_reader(reader)?,
+            sender: BorshDeserialize::deserialize_reader(reader)?,
+            kind: BorshDeserialize::deserialize_reader(reader)?,
+            code: BorshDeserialize::deserialize_reader(reader)?,
+            reason: bounded::read_string::<MAX_TERMINAL_REASON_BYTES>(reader)?,
+            coordinate: BorshDeserialize::deserialize_reader(reader)?,
+            signature: BorshDeserialize::deserialize_reader(reader)?,
         };
         occurrence.validate_shape().map_err(|error| {
             borsh::io::Error::new(borsh::io::ErrorKind::InvalidData, error.to_string())
         })?;
+        Ok(occurrence)
+    }
+}
+
+impl Serialize for AbortOccurrence {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AbortOccurrence {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let occurrence = Self::deserialize(deserializer)?;
+        occurrence
+            .validate_shape()
+            .map_err(serde::de::Error::custom)?;
         Ok(occurrence)
     }
 }
@@ -168,11 +142,11 @@ struct AbortSigningPayload<'a> {
     kind: AbortKind,
     code: u32,
     reason: &'a str,
-    coordinate: &'a PublicCursor,
+    coordinate: &'a StepCursor,
 }
 
 impl AbortOccurrence {
-    /// Construct one signed occurrence.  The reducer additionally checks that
+    /// Construct one signed occurrence. The actor additionally checks that
     /// `sender` is an activation participant before accepting it.
     pub fn new(
         session_id: SessionHash,
@@ -180,7 +154,7 @@ impl AbortOccurrence {
         kind: AbortKind,
         code: u32,
         reason: impl Into<String>,
-        coordinate: PublicCursor,
+        coordinate: StepCursor,
         signature: Ed25519Signature,
     ) -> Result<Self, ProtocolError> {
         let occurrence = Self {
@@ -207,7 +181,7 @@ impl AbortOccurrence {
         kind: AbortKind,
         code: u32,
         reason: impl Into<String>,
-        coordinate: PublicCursor,
+        coordinate: StepCursor,
     ) -> Result<Self, ProtocolError> {
         Self::new(
             session_id,
@@ -257,9 +231,9 @@ impl AbortOccurrence {
         &self.reason
     }
 
-    /// Borrow the exact public chain coordinate.
+    /// Borrow the exact agreed chain coordinate.
     #[must_use]
-    pub const fn coordinate(&self) -> &PublicCursor {
+    pub const fn coordinate(&self) -> &StepCursor {
         &self.coordinate
     }
 
@@ -284,12 +258,6 @@ impl AbortOccurrence {
         .map_err(|error| ProtocolError::Serialization(error.to_string()))
     }
 
-    /// Return a stable digest of the signed semantic content (excluding the
-    /// signature bytes themselves).
-    pub fn digest(&self) -> Result<OccurrenceDigest, ProtocolError> {
-        Ok(OccurrenceDigest::of(&self.signing_bytes()?))
-    }
-
     /// Verify the Ed25519 signature against the sender's public identity key.
     pub fn verify_signature(&self) -> Result<bool, ProtocolError> {
         let bytes = self.signing_bytes()?;
@@ -303,7 +271,7 @@ impl AbortOccurrence {
     }
 
     /// Validate shape and the session/coordinate binding.  Membership is
-    /// checked by the execution reducer because it belongs to activation.
+    /// checked by the execution actor because it belongs to activation.
     pub fn validate_for_session(&self, session: SessionHash) -> Result<(), ProtocolError> {
         self.validate_shape()?;
         if self.session_id != session {
@@ -331,5 +299,58 @@ impl AbortOccurrence {
             self.reason.len(),
             MAX_TERMINAL_REASON_BYTES,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arena0_crypto::Ed25519Signature;
+
+    fn occurrence() -> AbortOccurrence {
+        AbortOccurrence::new(
+            SessionHash([1; 32]),
+            PeerId([2; 32]),
+            AbortKind::Abort,
+            0,
+            "stop",
+            StepCursor::new(0, crate::StateHash([3; 32]), crate::CHAIN_START),
+            Ed25519Signature([0; 64]),
+        )
+        .expect("valid abort occurrence")
+    }
+
+    #[test]
+    fn abort_occurrence_round_trips() {
+        let value = occurrence();
+        assert_eq!(
+            borsh::from_slice::<AbortOccurrence>(&borsh::to_vec(&value).unwrap()).unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    fn serde_decode_validates_the_shape_like_borsh() {
+        let value = occurrence();
+        let json = serde_json::to_value(&value).unwrap();
+        assert_eq!(
+            serde_json::from_value::<AbortOccurrence>(json.clone()).unwrap(),
+            value
+        );
+        for (field, invalid) in [
+            ("version", serde_json::json!(0)),
+            ("sender", serde_json::to_value(PeerId([0; 32])).unwrap()),
+            (
+                "reason",
+                serde_json::json!("x".repeat(MAX_TERMINAL_REASON_BYTES + 1)),
+            ),
+        ] {
+            let mut tampered = json.clone();
+            tampered[field] = invalid;
+            assert!(
+                serde_json::from_value::<AbortOccurrence>(tampered).is_err(),
+                "serde accepted an invalid {field}"
+            );
+        }
     }
 }

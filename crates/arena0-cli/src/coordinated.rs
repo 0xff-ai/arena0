@@ -17,11 +17,12 @@ use anyhow::{Context, anyhow, bail};
 use arena0_client::answer;
 use arena0_client::api::{
     ApiErrorCode, AwaitState, EnsembleSpec, EventData, EventFilter, HostRequest, NextEvent,
-    ProgramDetail, ProgramSummary, ReceiptRef, Request, ResponseOk, VerifiedResult,
+    ProgramDetail, ProgramSummary, ReceiptRef, ReceiptSummary, ReceiptTermination, Request,
+    ResponseOk,
 };
 use arena0_client::proto::{DaemonClient, Subscription};
 use arena0_client::protocol::{
-    AbortKind, ColorDepth, ExecId, ExecLifecycle, PeerId, PendingId, ProgramHash, SessionHash,
+    AbortKind, CalloutId, ColorDepth, ExecId, ExecLifecycle, PeerId, ProgramHash, SessionHash,
     StopCause, View,
 };
 use arena0_home::HostName;
@@ -32,8 +33,8 @@ use tokio::task::JoinSet;
 use crate::agent::{DEFAULT_RESPONSE_TIMEOUT, ExecutableAgent};
 use crate::progress::{RunProgress, RunStage, RunTerminalState};
 use crate::tui::{
-    PRIVATE_INSPECTION_LIMIT, RunUpdate, TuiCalloutRequest, TuiConfig, TuiDriver, TuiHandle,
-    TuiHost, TuiSession,
+    EVENT_INSPECTION_LIMIT, RunUpdate, TuiCalloutRequest, TuiConfig, TuiDriver, TuiHandle, TuiHost,
+    TuiSession,
 };
 
 const RECEIPT_RETRY_ATTEMPTS: usize = 20;
@@ -177,7 +178,6 @@ pub(crate) struct CoordinatedRunArgs {
     pub(crate) program: String,
     pub(crate) params: Option<Value>,
     pub(crate) bindings: Vec<DriverBinding>,
-    pub(crate) replay: bool,
     pub(crate) use_tui: bool,
 }
 
@@ -239,34 +239,18 @@ impl AggregateTerminal {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct HostEvidence {
     pub(crate) peer_id: PeerId,
-    pub(crate) receipt_id: arena0_client::protocol::ReceiptId,
-    pub(crate) program_id: ProgramHash,
-    pub(crate) session_id: SessionHash,
-    pub(crate) ensemble: Vec<PeerId>,
-    pub(crate) steps: u64,
-    pub(crate) result: VerifiedResult,
-}
-
-/// Shared facts recovered from every Host receipt.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct EvidenceAgreement {
-    pub(crate) receipt_id: arena0_client::protocol::ReceiptId,
-    pub(crate) program_id: ProgramHash,
-    pub(crate) session_id: SessionHash,
-    pub(crate) ensemble: Vec<PeerId>,
-    pub(crate) steps: u64,
-    pub(crate) result: VerifiedResult,
+    pub(crate) summary: ReceiptSummary,
 }
 
 /// One result document for the CLI to render.  It contains no receipt body and
-/// no private driver data.
+/// no driver-local data.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AggregateResult {
-    pub(crate) receipt_id: arena0_client::protocol::ReceiptId,
-    pub(crate) program_id: ProgramHash,
-    pub(crate) session_id: SessionHash,
-    pub(crate) participants: Vec<PeerId>,
-    pub(crate) steps: u64,
+    /// The receipt summary every Host's evidence agrees on; its program and
+    /// session match the selected program and activated session.
+    pub(crate) summary: ReceiptSummary,
+    /// The terminal bound to the verified summary, with the completion's
+    /// JSON outcome.
     pub(crate) terminal: AggregateTerminal,
     pub(crate) verification: VerificationSummary,
     pub(crate) receipts: Vec<HostEvidence>,
@@ -275,30 +259,8 @@ pub(crate) struct AggregateResult {
 /// Aggregate verification facts suitable for human or JSON presentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VerificationSummary {
-    pub(crate) tier: VerificationTier,
     pub(crate) all_verified: bool,
     pub(crate) shared_evidence_agrees: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VerificationTier {
-    Light,
-    Full,
-}
-
-impl VerificationTier {
-    #[must_use]
-    pub(crate) const fn is_full(self) -> bool {
-        matches!(self, Self::Full)
-    }
-
-    #[must_use]
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Light => "light",
-            Self::Full => "full",
-        }
-    }
 }
 
 /// One Host's daemon identity and execution binding.
@@ -506,13 +468,14 @@ impl Coordinator {
             None
         };
         let tui_handle = tui.as_ref().map(TuiSession::handle);
+        // One short-lived value per run; boxing the result buys nothing.
+        #[allow(clippy::large_enum_variant)]
         enum RunOutcome {
             Finished(anyhow::Result<AggregateResult>),
             Cancelled(anyhow::Result<String>),
         }
         let mut operation = Box::pin(coordinator.complete(
             program_id,
-            request.replay,
             cancel.clone(),
             cancelled,
             tui_handle,
@@ -603,7 +566,6 @@ impl Coordinator {
     async fn complete(
         &self,
         program_id: ProgramHash,
-        replay: bool,
         cancel: watch::Sender<bool>,
         cancelled: watch::Receiver<bool>,
         tui: Option<TuiHandle>,
@@ -611,7 +573,7 @@ impl Coordinator {
     ) -> anyhow::Result<AggregateResult> {
         let Some(tui_handle) = tui.clone() else {
             return self
-                .complete_inner(program_id, replay, cancel, cancelled, None)
+                .complete_inner(program_id, cancel, cancelled, None)
                 .await;
         };
         if tui_subscriptions.len() != self.participants.len() {
@@ -631,7 +593,6 @@ impl Coordinator {
         let (stop_observer, observer_stopped) = watch::channel(false);
         let operation = self.complete_inner(
             program_id,
-            replay,
             cancel,
             cancelled.clone(),
             Some(tui_handle.clone()),
@@ -661,7 +622,6 @@ impl Coordinator {
     async fn complete_inner(
         &self,
         program_id: ProgramHash,
-        replay: bool,
         cancel: watch::Sender<bool>,
         mut cancelled: watch::Receiver<bool>,
         tui: Option<TuiHandle>,
@@ -721,31 +681,17 @@ impl Coordinator {
             );
         }
 
-        let tier = if replay {
-            VerificationTier::Full
-        } else {
-            VerificationTier::Light
-        };
         let started = Instant::now();
-        let receipt_stage = if tier.is_full() {
-            RunStage::Replay
-        } else {
-            RunStage::Verification
-        };
         let verified = self
             .progress
             .during(
-                receipt_stage,
+                RunStage::Verification,
                 self.participants.len(),
-                self.verify_receipts(session_id, tier, tui.clone()),
+                self.verify_receipts(session_id, tui.clone()),
             )
             .await;
         record_stage(
-            if tier.is_full() {
-                "replay_receipts"
-            } else {
-                "verify_receipts"
-            },
+            "verify_receipts",
             started,
             self.participants.len(),
             verified.is_ok(),
@@ -776,17 +722,21 @@ impl Coordinator {
                 self.participants.len()
             );
         }
-        let terminal = bind_verified_terminal(terminal, &agreement.result)?;
+        let selected_peers = self
+            .participants
+            .iter()
+            .map(|participant| participant.peer_id)
+            .collect::<HashSet<_>>();
+        let admitted_peers = agreement.ensemble.iter().copied().collect::<HashSet<_>>();
+        if admitted_peers != selected_peers {
+            bail!("receipt ensemble differs from the selected Hosts");
+        }
+        let terminal = bind_verified_terminal(terminal, &agreement.terminal)?;
 
         Ok(AggregateResult {
-            receipt_id: agreement.receipt_id,
-            program_id,
-            session_id,
-            participants: agreement.ensemble,
-            steps: agreement.steps,
+            summary: agreement,
             terminal,
             verification: VerificationSummary {
-                tier,
                 all_verified: true,
                 shared_evidence_agrees: true,
             },
@@ -852,7 +802,6 @@ impl Coordinator {
     async fn verify_receipts(
         &self,
         session_id: SessionHash,
-        tier: VerificationTier,
         tui: Option<TuiHandle>,
     ) -> anyhow::Result<Vec<HostEvidence>> {
         let mut jobs = JoinSet::new();
@@ -861,7 +810,7 @@ impl Coordinator {
             let peer_id = participant.peer_id;
             let host = participant.host.clone();
             jobs.spawn(async move {
-                verify_one_receipt(host.clone(), client, session_id, peer_id, tier)
+                verify_one_receipt(host.clone(), client, session_id, peer_id)
                     .await
                     .map(|evidence| (host, peer_id, evidence))
             });
@@ -875,16 +824,11 @@ impl Coordinator {
                 joined.context("coordinated receipt verification task failed to join")??;
             verified += 1;
             if let Some(tui) = &tui {
-                tui.update(RunUpdate::ReceiptVerified {
-                    host,
-                    peer_id,
-                    tier: tier.as_str(),
-                })
-                .await?;
+                tui.update(RunUpdate::ReceiptVerified { host, peer_id })
+                    .await?;
                 tui.update(RunUpdate::VerificationProgress {
                     verified,
                     total: self.participants.len(),
-                    tier: tier.as_str(),
                 })
                 .await?;
             }
@@ -1512,6 +1456,7 @@ async fn drive_loop(
     tui: Option<TuiHandle>,
     progress: &RunProgress,
 ) -> anyhow::Result<HostTerminal> {
+    let mut answered = None;
     loop {
         let request = HostRequest::ExecNext { exec_id };
         let next = tokio::select! {
@@ -1530,53 +1475,85 @@ async fn drive_loop(
                 context,
                 ..
             }) => {
-                let answer = driver.answer(
-                    DriverAnswerContext {
-                        host,
-                        client,
-                        exec_id,
-                    },
-                    pending_id,
-                    callout_index,
-                    Callout {
-                        name: &name,
-                        prompt: &prompt,
-                        context: &context,
-                        schema: schema.as_value(),
-                    },
-                    progress,
-                );
-                tokio::pin!(answer);
-                let answer = tokio::select! {
-                    answer = &mut answer => answer?,
-                    () = wait_for_cancel(cancelled) => {
-                        bail!("coordinated run cancelled while waiting for driver {exec_id}")
+                if answered == Some(pending_id) {
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_millis(25)) => {}
+                        () = wait_for_cancel(cancelled) => {
+                            bail!("coordinated run cancelled while awaiting agreement for {exec_id}")
+                        }
                     }
-                };
-                let submit = async {
-                    match client
-                        .call_host_raw(
-                            host,
-                            &HostRequest::ExecSubmit {
+                    continue;
+                }
+                let mut rejection = None;
+                loop {
+                    let answer = {
+                        let answer = driver.answer(
+                            DriverAnswerContext {
+                                host,
+                                client,
                                 exec_id,
-                                pending_id,
-                                answer: Some(answer),
                             },
-                        )
-                        .await?
-                    {
-                        Ok(ResponseOk::Ack) => Ok(()),
-                        Err(error) if error.code == ApiErrorCode::CalloutNotPending => Ok(()),
-                        Err(error) => Err(error.into()),
-                        other => bail!("unexpected exec.submit response: {other:?}"),
-                    }
-                };
-                tokio::select! {
-                    result = submit => result?,
-                    () = wait_for_cancel(cancelled) => {
-                        bail!("coordinated run cancelled while submitting driver answer for {exec_id}")
+                            pending_id,
+                            callout_index,
+                            Callout {
+                                name: &name,
+                                prompt: &prompt,
+                                context: &context,
+                                schema: schema.as_value(),
+                            },
+                            rejection.take(),
+                            progress,
+                        );
+                        tokio::pin!(answer);
+                        tokio::select! {
+                            answer = &mut answer => answer?,
+                            () = wait_for_cancel(cancelled) => {
+                                bail!("coordinated run cancelled while waiting for driver {exec_id}")
+                            }
+                        }
+                    };
+                    let submit = async {
+                        match client
+                            .call_host_raw(
+                                host,
+                                &HostRequest::ExecSubmit {
+                                    exec_id,
+                                    pending_id,
+                                    answer: Some(answer),
+                                },
+                            )
+                            .await?
+                        {
+                            Ok(ResponseOk::Ack) => Ok(None),
+                            Err(error) if error.code == ApiErrorCode::CalloutNotPending => Ok(None),
+                            Err(error) if error.code == ApiErrorCode::InputRejected => {
+                                Ok(Some(error))
+                            }
+                            Err(error) => Err(error.into()),
+                            other => bail!("unexpected exec.submit response: {other:?}"),
+                        }
+                    };
+                    let rejected = tokio::select! {
+                        result = submit => result?,
+                        () = wait_for_cancel(cancelled) => {
+                            bail!("coordinated run cancelled while submitting driver answer for {exec_id}")
+                        }
+                    };
+                    match rejected {
+                        None => {
+                            if let ActiveDriver::Human(Some(tui)) = driver {
+                                tui.answer_accepted(host.clone(), exec_id, pending_id)
+                                    .await?;
+                            }
+                            break;
+                        }
+                        Some(error) if matches!(driver, ActiveDriver::Human(_)) => {
+                            rejection = Some(error.message);
+                        }
+                        Some(error) => return Err(error.into()),
                     }
                 }
+                answered = Some(pending_id);
             }
             ResponseOk::Next(NextEvent::Completed {
                 session_id,
@@ -1766,15 +1743,15 @@ async fn refresh_tui_inspection(
     host: &HostName,
     client: &DaemonClient,
     exec_id: ExecId,
-    private_from: Option<u64>,
+    events_from: Option<u64>,
 ) -> anyhow::Result<()> {
     match client
         .call_host(
             host,
             &HostRequest::ExecInspect {
                 exec_id,
-                private_from,
-                private_limit: PRIVATE_INSPECTION_LIMIT,
+                events_from,
+                events_limit: EVENT_INSPECTION_LIMIT,
             },
         )
         .await
@@ -1896,27 +1873,36 @@ impl ActiveDriver {
     async fn answer(
         &mut self,
         scope: DriverAnswerContext<'_>,
-        pending_id: PendingId,
+        pending_id: CalloutId,
         callout_index: u32,
         callout: Callout<'_>,
+        rejection: Option<String>,
         progress: &RunProgress,
     ) -> anyhow::Result<Value> {
         match self {
             Self::Human(Some(tui)) => {
-                tui.answer(TuiCalloutRequest {
-                    host: scope.host.clone(),
-                    exec_id: scope.exec_id,
-                    pending_id,
-                    callout_index,
-                    name: callout.name.to_owned(),
-                    prompt: callout.prompt.to_owned(),
-                    context: callout.context.clone(),
-                    schema: callout.schema.clone(),
-                })
-                .await
+                if let Some(reason) = rejection {
+                    tui.retry_answer(scope.host.clone(), scope.exec_id, pending_id, reason)
+                        .await
+                } else {
+                    tui.answer(TuiCalloutRequest {
+                        host: scope.host.clone(),
+                        exec_id: scope.exec_id,
+                        pending_id,
+                        callout_index,
+                        name: callout.name.to_owned(),
+                        prompt: callout.prompt.to_owned(),
+                        context: callout.context.clone(),
+                        schema: callout.schema.clone(),
+                    })
+                    .await
+                }
             }
             Self::Human(None) => {
                 progress.suspend_for_callout();
+                if let Some(reason) = rejection {
+                    eprintln!("program rejected answer: {reason}");
+                }
                 let answer = prompt_human(
                     scope.host,
                     scope.client,
@@ -2074,7 +2060,6 @@ async fn verify_one_receipt(
     client: DaemonClient,
     session_id: SessionHash,
     peer_id: PeerId,
-    tier: VerificationTier,
 ) -> anyhow::Result<HostEvidence> {
     let mut last_error = None;
     for attempt in 0..RECEIPT_RETRY_ATTEMPTS {
@@ -2083,28 +2068,12 @@ async fn verify_one_receipt(
                 &host,
                 &HostRequest::ReceiptVerify {
                     receipt: ReceiptRef::Produced(session_id),
-                    full: tier.is_full(),
                 },
             )
             .await?
         {
-            Ok(ResponseOk::Verified {
-                receipt_id,
-                program_id,
-                session_id,
-                ensemble,
-                steps,
-                result,
-            }) => {
-                return Ok(HostEvidence {
-                    receipt_id,
-                    peer_id,
-                    program_id,
-                    session_id,
-                    ensemble,
-                    steps,
-                    result,
-                });
+            Ok(ResponseOk::Verified(summary)) => {
+                return Ok(HostEvidence { peer_id, summary });
             }
             Ok(other) => bail!("unexpected receipt.verify response: {other:?}"),
             Err(error) if error.code == ApiErrorCode::NotFound => {
@@ -2171,11 +2140,11 @@ fn compare_terminals(terminals: &[HostTerminal]) -> anyhow::Result<TerminalConse
 
 /// Compare the facts every Host receipt claims.  This is intentionally a
 /// pure function so disagreement remains easy to test without a daemon.
-pub(crate) fn compare_evidence(receipts: &[HostEvidence]) -> anyhow::Result<EvidenceAgreement> {
-    let Some(first) = receipts.first() else {
+pub(crate) fn compare_evidence(receipts: &[HostEvidence]) -> anyhow::Result<ReceiptSummary> {
+    let Some(first) = receipts.first().map(|receipt| &receipt.summary) else {
         bail!("no Host receipts were verified");
     };
-    for receipt in &receipts[1..] {
+    for receipt in receipts[1..].iter().map(|receipt| &receipt.summary) {
         if receipt.receipt_id != first.receipt_id {
             bail!("Hosts retained different receipt artifacts");
         }
@@ -2191,53 +2160,24 @@ pub(crate) fn compare_evidence(receipts: &[HostEvidence]) -> anyhow::Result<Evid
         if receipt.steps != first.steps {
             bail!("Host receipts disagree on step count");
         }
-        if receipt.result != first.result {
+        if receipt.terminal != first.terminal || receipt.outcome_borsh != first.outcome_borsh {
             bail!("Host receipts disagree on terminal result");
         }
     }
-    Ok(EvidenceAgreement {
-        receipt_id: first.receipt_id,
-        program_id: first.program_id,
-        session_id: first.session_id,
-        ensemble: first.ensemble.clone(),
-        steps: first.steps,
-        result: first.result.clone(),
-    })
+    Ok(first.clone())
 }
 
 fn bind_verified_terminal(
     live: TerminalConsensus,
-    verified: &VerifiedResult,
+    verified: &ReceiptTermination,
 ) -> anyhow::Result<AggregateTerminal> {
     match (live, verified) {
-        (
-            TerminalConsensus::Completed { outcome: live, .. },
-            VerifiedResult::Full {
-                terminal: arena0_client::api::FullVerifiedTerminal::Completed { outcome_json, .. },
-            },
-        ) => {
-            if live.as_ref() != Some(outcome_json) {
-                bail!("live terminal outcome disagrees with fully replayed receipt outcome");
-            }
-            Ok(AggregateTerminal::Completed {
-                outcome: Some(outcome_json.clone()),
-            })
+        (TerminalConsensus::Completed { outcome, .. }, ReceiptTermination::Completed) => {
+            Ok(AggregateTerminal::Completed { outcome })
         }
-        (
-            TerminalConsensus::Completed { outcome, .. },
-            VerifiedResult::Light {
-                terminal: arena0_client::api::LightVerifiedTerminal::Completed { .. },
-            },
-        ) => Ok(AggregateTerminal::Completed { outcome }),
-        (
-            TerminalConsensus::Stopped,
-            VerifiedResult::Light {
-                terminal: arena0_client::api::LightVerifiedTerminal::Stopped { cause },
-            }
-            | VerifiedResult::Full {
-                terminal: arena0_client::api::FullVerifiedTerminal::Stopped { cause },
-            },
-        ) => Ok(classify_stop(cause)),
+        (TerminalConsensus::Stopped, ReceiptTermination::Stopped { cause }) => {
+            Ok(classify_stop(cause))
+        }
         (TerminalConsensus::Completed { .. }, _) => {
             bail!("live completion disagrees with stopped receipt evidence")
         }
@@ -2382,9 +2322,7 @@ fn first_allowed_value(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arena0_client::api::{
-        ApiError, ExecStatus, ExecStatusState, LightVerifiedTerminal, Response, SessionStatus,
-    };
+    use arena0_client::api::{ApiError, ExecStatus, ExecStatusState, Response, SessionStatus};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
@@ -2733,7 +2671,7 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         let exec_id = ExecId([0x81; 32]);
         let session_id = SessionHash([0x82; 32]);
-        let pending_id = PendingId::new(17);
+        let pending_id = CalloutId::new(17);
         let server = tokio::spawn(serve_script(
             listener,
             host("host-01"),
@@ -2786,6 +2724,192 @@ mod tests {
         assert!(
             matches!(requests.as_slice(), [HostRequest::ExecNext { .. }, HostRequest::ExecSubmit { pending_id: id, .. }, HostRequest::ExecNext { .. }] if *id == pending_id)
         );
+    }
+
+    #[tokio::test]
+    async fn human_driver_retries_a_program_rejection_for_the_same_callout() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("input-rejected.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let host = host("host-01");
+        let exec_id = ExecId([0x91; 32]);
+        let session_id = SessionHash([0x92; 32]);
+        let pending_id = CalloutId::new(21);
+        let server = tokio::spawn(serve_script(
+            listener,
+            host.clone(),
+            vec![
+                Ok(ResponseOk::Next(NextEvent::Callout {
+                    pending_id,
+                    callout_index: 0,
+                    name: "Move".into(),
+                    prompt: "Choose a move".into(),
+                    schema: arena0_client::program::JsonSchemaDocument::new(schema(
+                        json!({"type":"string"}),
+                    ))
+                    .unwrap(),
+                    context: Value::Null,
+                })),
+                Err(ApiError::new(ApiErrorCode::InputRejected, "illegal move")),
+                Ok(ResponseOk::Ack),
+                Ok(ResponseOk::Next(NextEvent::Completed {
+                    session_id,
+                    outcome: None,
+                })),
+            ],
+        ));
+        let (tui, mut updates, _pages) = TuiHandle::test_channel();
+        let (cancel, mut cancelled) = watch::channel(false);
+        let run = tokio::spawn(async move {
+            let _cancel = cancel;
+            let client = DaemonClient::new(socket);
+            let mut driver = ActiveDriver::start(DriverSpec::Human, Some(tui)).unwrap();
+            let progress = test_progress();
+            drive_loop(
+                &host,
+                &client,
+                exec_id,
+                &mut driver,
+                &mut cancelled,
+                None,
+                &progress,
+            )
+            .await
+        });
+
+        let first = tokio::time::timeout(Duration::from_secs(3), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let RunUpdate::Callout {
+            reply,
+            pending_id: id,
+            ..
+        } = first
+        else {
+            panic!("expected first callout");
+        };
+        assert_eq!(id, pending_id);
+        reply.send(json!("illegal move")).unwrap();
+
+        let retry = tokio::time::timeout(Duration::from_secs(3), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let RunUpdate::CalloutRejected {
+            reply,
+            reason,
+            pending_id: id,
+            ..
+        } = retry
+        else {
+            panic!("expected rejected callout");
+        };
+        assert_eq!(id, pending_id);
+        assert_eq!(reason, "illegal move");
+        reply.send(json!("legal move")).unwrap();
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(3), updates.recv())
+                .await
+                .unwrap(),
+            Some(RunUpdate::CalloutAccepted { pending_id: id, .. }) if id == pending_id
+        ));
+        let terminal = tokio::time::timeout(Duration::from_secs(3), run)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            terminal,
+            HostTerminal::Completed {
+                session_id,
+                outcome: None
+            }
+        );
+        let requests = server.await.unwrap();
+        assert!(matches!(
+            requests.as_slice(),
+            [HostRequest::ExecNext { .. },
+             HostRequest::ExecSubmit { pending_id: first, answer: Some(first_answer), .. },
+             HostRequest::ExecSubmit { pending_id: second, answer: Some(second_answer), .. },
+             HostRequest::ExecNext { .. }]
+             if *first == pending_id && *second == pending_id
+                && first_answer == &json!("illegal move")
+                && second_answer == &json!("legal move")
+        ));
+    }
+
+    #[tokio::test]
+    async fn driver_answers_same_question_with_new_id_and_suppresses_answered_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("answer-agreement.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let exec_id = ExecId([0x83; 32]);
+        let session_id = SessionHash([0x84; 32]);
+        let pending_id = CalloutId::new(18);
+        let callout = ResponseOk::Next(NextEvent::Callout {
+            pending_id,
+            callout_index: 0,
+            name: "Decide".into(),
+            prompt: "Choose".into(),
+            schema: arena0_client::program::JsonSchemaDocument::new(schema(
+                json!({"type":"string", "enum":["yes"]}),
+            ))
+            .unwrap(),
+            context: Value::Null,
+        });
+        let next_id = CalloutId::new(19);
+        let mut reasked = callout.clone();
+        if let ResponseOk::Next(NextEvent::Callout { pending_id, .. }) = &mut reasked {
+            *pending_id = next_id;
+        }
+        let server = tokio::spawn(serve_script(
+            listener,
+            host("host-01"),
+            vec![
+                Ok(callout.clone()),
+                Ok(ResponseOk::Ack),
+                Ok(callout),
+                Ok(reasked),
+                Ok(ResponseOk::Ack),
+                Ok(ResponseOk::Next(NextEvent::Completed {
+                    session_id,
+                    outcome: None,
+                })),
+            ],
+        ));
+        let (_cancel, cancelled) = watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            drive_to_terminal(
+                host("host-01"),
+                DaemonClient::new(socket),
+                exec_id,
+                DriverSpec::Builtin("first-allowed".into()),
+                cancelled,
+                None,
+                test_progress(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            result,
+            HostTerminal::Completed {
+                session_id,
+                outcome: None
+            }
+        );
+        let requests = server.await.unwrap();
+        assert!(matches!(requests.as_slice(), [
+            HostRequest::ExecNext { .. },
+            HostRequest::ExecSubmit { pending_id: first, answer: first_answer, .. },
+            HostRequest::ExecNext { .. }, HostRequest::ExecNext { .. },
+            HostRequest::ExecSubmit { pending_id: second, answer: second_answer, .. },
+            HostRequest::ExecNext { .. },
+        ] if *first == pending_id && *second == next_id && first_answer == second_answer));
     }
 
     #[tokio::test]
@@ -2911,6 +3035,7 @@ mod tests {
         peer: PeerId,
     ) -> Response {
         Ok(ResponseOk::Status(ExecStatus {
+            end: Default::default(),
             exec_id: ExecId([0; 32]),
             negotiation_id: Some(arena0_client::protocol::NegotiationId([0x42; 32])),
             program_id,
@@ -2927,7 +3052,7 @@ mod tests {
         }))
     }
 
-    async fn run_scripted_coordinator(replay: bool) -> Vec<crate::progress::RunProgressState> {
+    async fn run_scripted_coordinator() -> Vec<crate::progress::RunProgressState> {
         let directory = tempfile::tempdir().expect("socket directory");
         let program_id = ProgramHash([0x31; 32]);
         let session_id = SessionHash([0x32; 32]);
@@ -2940,20 +3065,6 @@ mod tests {
         let mut connections = Vec::new();
 
         for (index, name) in ["first", "second"].into_iter().enumerate() {
-            let terminal = if replay {
-                VerifiedResult::Full {
-                    terminal: arena0_client::api::FullVerifiedTerminal::Completed {
-                        outcome_borsh: vec![1],
-                        outcome_json: json!({"winner": "none"}),
-                    },
-                }
-            } else {
-                VerifiedResult::Light {
-                    terminal: LightVerifiedTerminal::Completed {
-                        outcome_borsh: vec![1],
-                    },
-                }
-            };
             let responses = vec![
                 host_info_response(name, peers[index]),
                 program_response(program_id),
@@ -2968,14 +3079,15 @@ mod tests {
                     session_id,
                     outcome: Some(json!({"winner": "none"})),
                 })),
-                Ok(ResponseOk::Verified {
+                Ok(ResponseOk::Verified(ReceiptSummary {
                     receipt_id: arena0_client::protocol::ReceiptId::from_bytes([9; 32]),
                     program_id,
                     session_id,
                     ensemble: peers.to_vec(),
                     steps: 3,
-                    result: terminal,
-                }),
+                    terminal: ReceiptTermination::Completed,
+                    outcome_borsh: Some(vec![1]),
+                })),
             ];
             scripts.push((host(name), responses));
             connections.push(HostConnection {
@@ -3054,21 +3166,11 @@ mod tests {
             .expect("scripted execution");
         assert_eq!(terminals.len(), 2);
 
-        let tier = if replay {
-            VerificationTier::Full
-        } else {
-            VerificationTier::Light
-        };
-        let receipt_stage = if replay {
-            RunStage::Replay
-        } else {
-            RunStage::Verification
-        };
         let receipts = progress
             .during(
-                receipt_stage,
+                RunStage::Verification,
                 coordinator.participants.len(),
-                coordinator.verify_receipts(session_id, tier, None),
+                coordinator.verify_receipts(session_id, None),
             )
             .await
             .expect("scripted receipt verification");
@@ -3096,38 +3198,36 @@ mod tests {
 
     #[tokio::test]
     async fn coordinated_work_reports_real_typed_stages_and_exact_receipt_counts() {
-        for (replay, receipt_stage) in [(false, RunStage::Verification), (true, RunStage::Replay)] {
-            let observations = run_scripted_coordinator(replay).await;
-            for stage in [
-                RunStage::Connecting,
-                RunStage::ProgramResolution,
-                RunStage::Negotiation,
-                RunStage::Activation,
-                receipt_stage,
-            ] {
-                assert!(
-                    observations.contains(&crate::progress::RunProgressState::Active {
-                        stage,
-                        amount: crate::progress::ProgressAmount::Known {
-                            completed: 2,
-                            total: 2,
-                        },
-                    })
-                );
-            }
+        let observations = run_scripted_coordinator().await;
+        for stage in [
+            RunStage::Connecting,
+            RunStage::ProgramResolution,
+            RunStage::Negotiation,
+            RunStage::Activation,
+            RunStage::Verification,
+        ] {
             assert!(
                 observations.contains(&crate::progress::RunProgressState::Active {
-                    stage: RunStage::Execution,
-                    amount: crate::progress::ProgressAmount::Indeterminate,
+                    stage,
+                    amount: crate::progress::ProgressAmount::Known {
+                        completed: 2,
+                        total: 2,
+                    },
                 })
             );
-            assert_eq!(
-                observations.last(),
-                Some(&crate::progress::RunProgressState::Terminal(
-                    RunTerminalState::Succeeded
-                ))
-            );
         }
+        assert!(
+            observations.contains(&crate::progress::RunProgressState::Active {
+                stage: RunStage::Execution,
+                amount: crate::progress::ProgressAmount::Indeterminate,
+            })
+        );
+        assert_eq!(
+            observations.last(),
+            Some(&crate::progress::RunProgressState::Terminal(
+                RunTerminalState::Succeeded
+            ))
+        );
     }
 
     #[tokio::test]
@@ -3528,36 +3628,25 @@ mod tests {
         let session_id = SessionHash([3; 32]);
         let program_id = ProgramHash([4; 32]);
         let ensemble = vec![peer_a, peer_b];
-        let result = VerifiedResult::Light {
-            terminal: arena0_client::api::LightVerifiedTerminal::Completed {
-                outcome_borsh: vec![1],
-            },
+        let first = ReceiptSummary {
+            receipt_id: arena0_client::protocol::ReceiptId::from_bytes([9; 32]),
+            program_id,
+            session_id,
+            ensemble,
+            steps: 1,
+            terminal: ReceiptTermination::Completed,
+            outcome_borsh: Some(vec![1]),
         };
-        let mut second = result.clone();
-        if let VerifiedResult::Light {
-            terminal: arena0_client::api::LightVerifiedTerminal::Completed { outcome_borsh },
-        } = &mut second
-        {
-            outcome_borsh.push(2);
-        }
+        let mut second = first.clone();
+        second.outcome_borsh = Some(vec![1, 2]);
         let receipts = vec![
             HostEvidence {
-                receipt_id: arena0_client::protocol::ReceiptId::from_bytes([9; 32]),
                 peer_id: peer_a,
-                program_id,
-                session_id,
-                ensemble: ensemble.clone(),
-                steps: 1,
-                result,
+                summary: first,
             },
             HostEvidence {
-                receipt_id: arena0_client::protocol::ReceiptId::from_bytes([9; 32]),
                 peer_id: peer_b,
-                program_id,
-                session_id,
-                ensemble,
-                steps: 1,
-                result: second,
+                summary: second,
             },
         ];
         assert!(
@@ -3572,21 +3661,20 @@ mod tests {
     fn matching_outcomes_do_not_hide_different_receipt_ids() {
         let first = HostEvidence {
             peer_id: PeerId([1; 32]),
-            receipt_id: arena0_client::protocol::ReceiptId::from_bytes([3; 32]),
-            program_id: ProgramHash([4; 32]),
-            session_id: SessionHash([5; 32]),
-            ensemble: vec![PeerId([1; 32]), PeerId([2; 32])],
-            steps: 1,
-            result: VerifiedResult::Light {
-                terminal: LightVerifiedTerminal::Completed {
-                    outcome_borsh: vec![7],
-                },
+            summary: ReceiptSummary {
+                receipt_id: arena0_client::protocol::ReceiptId::from_bytes([3; 32]),
+                program_id: ProgramHash([4; 32]),
+                session_id: SessionHash([5; 32]),
+                ensemble: vec![PeerId([1; 32]), PeerId([2; 32])],
+                steps: 1,
+                terminal: ReceiptTermination::Completed,
+                outcome_borsh: Some(vec![7]),
             },
         };
         let mut second = first.clone();
         second.peer_id = PeerId([2; 32]);
         assert!(compare_evidence(&[first.clone(), second.clone()]).is_ok());
-        second.receipt_id = arena0_client::protocol::ReceiptId::from_bytes([6; 32]);
+        second.summary.receipt_id = arena0_client::protocol::ReceiptId::from_bytes([6; 32]);
         assert!(
             compare_evidence(&[first, second])
                 .unwrap_err()
@@ -3596,34 +3684,17 @@ mod tests {
     }
 
     #[test]
-    fn full_replay_outcome_must_match_the_live_terminal() {
-        let verified = VerifiedResult::Full {
-            terminal: arena0_client::api::FullVerifiedTerminal::Completed {
-                outcome_borsh: vec![1],
-                outcome_json: json!({"winner": 1}),
-            },
-        };
+    fn verification_keeps_live_terminal_outcome() {
+        let verified = ReceiptTermination::Completed;
         let live = || TerminalConsensus::Completed {
             session_id: SessionHash([7; 32]),
-            outcome: Some(json!({"winner": 1})),
+            outcome: Some(json!({"winner": 2})),
         };
         assert_eq!(
-            bind_verified_terminal(live(), &verified).expect("matching replay outcome"),
+            bind_verified_terminal(live(), &verified).expect("live outcome"),
             AggregateTerminal::Completed {
-                outcome: Some(json!({"winner": 1}))
+                outcome: Some(json!({"winner": 2}))
             }
-        );
-        assert!(
-            bind_verified_terminal(
-                TerminalConsensus::Completed {
-                    session_id: SessionHash([7; 32]),
-                    outcome: Some(json!({"winner": 2})),
-                },
-                &verified,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("disagrees")
         );
     }
 
@@ -3631,21 +3702,19 @@ mod tests {
     fn authenticated_stop_is_classified_only_from_verified_evidence() {
         use arena0_client::protocol::{CHAIN_START, STEP_COMMIT_DOMAIN, StateHash, StepCommitment};
 
-        let stopped = VerifiedResult::Light {
-            terminal: arena0_client::api::LightVerifiedTerminal::Stopped {
-                cause: StopCause::Shared {
-                    kind: AbortKind::Abort,
-                    commitment: StepCommitment {
-                        domain: STEP_COMMIT_DOMAIN,
-                        session_id: SessionHash([8; 32]),
-                        step: 2,
-                        entry_hash: [9; 32],
-                        pre_state: StateHash([10; 32]),
-                        post_state: StateHash([11; 32]),
-                        link: CHAIN_START,
-                    },
-                    reason: "operator stopped".to_owned(),
+        let stopped = ReceiptTermination::Stopped {
+            cause: StopCause::Shared {
+                kind: AbortKind::Abort,
+                commitment: StepCommitment {
+                    domain: STEP_COMMIT_DOMAIN,
+                    session_id: SessionHash([8; 32]),
+                    step: 2,
+                    entry_hash: [9; 32],
+                    pre_state: StateHash([10; 32]),
+                    post_state: StateHash([11; 32]),
+                    link: CHAIN_START,
                 },
+                reason: "operator stopped".to_owned(),
             },
         };
         assert_eq!(

@@ -7,28 +7,27 @@
 //! **Phase shape**: commit-reveal is two ordered collect rounds. Every participant broadcasts exactly one
 //! `Commit`, applied in participant-index order, then exactly one `Reveal`.
 //!
-//! **Handler discipline**:
-//! [`handle`](crate::commit_reveal::CommitReveal::handle) is the shared-event
-//! side. It runs identically on every node (the sender included) at the same
-//! public position, keyed by the authenticated sender, and mutates only the
-//! shared-visible fields.
+//! **Dispatch discipline**:
+//! [`handle`](crate::commit_reveal::CommitReveal::handle) applies an
+//! authenticated message to shared state during the current dispatch.
 //! [`commit_with_salt`](crate::commit_reveal::CommitReveal::commit_with_salt)
-//! and [`take_reveal`](crate::commit_reveal::CommitReveal::take_reveal) are
-//! local decision code: they read shared state, stash the secret value and salt
-//! in a [`crate::commit_reveal::CommitRevealLocal`] companion value, and produce the message to
-//! broadcast; shared state moves only when that message applies.
+//! and [`take_reveal`](crate::commit_reveal::CommitReveal::take_reveal) update
+//! only the participant-local companion and return a message to broadcast.
+//! Shared state changes when that message is applied through `handle` in
+//! `on_message`, which the author runs for its own message exactly as every
+//! receiver does.
 //!
 //! Program usage:
 //! ```ignore
-//! // local (on_input): stash the secret and broadcast the commit
-//! ctx.commitments().commit(value)?.broadcast_via(Message::CommitReveal);
-//! // local (on_react): once all commits are in, broadcast the reveal
-//! if let Some(reveal) = ctx.commitments().take_reveal() {
-//!     reveal.broadcast_via(Message::CommitReveal);
+//! // on_input: stash the secret locally and broadcast the commit
+//! ctx.commit_reveal().commit(value)?.broadcast(&mut ctx.effects())?;
+//! // on this node's turn, broadcast the reveal once all commits are in
+//! if let Some(MyTurn::Reveal(reveal)) = ctx.commit_reveal().my_turn() {
+//!     reveal.broadcast(&mut ctx.effects());
 //! }
-//! // shared (on_message): apply the round for the authenticated sender
-//! ctx.commitments().handle(from, msg)?;
-//! if ctx.shared().commitments.is_complete() {
+//! // an incoming message applies the round for the authenticated sender
+//! ctx.commit_reveal().handle(from, msg)?;
+//! if ctx.shared().commit_reveal.is_complete() {
 //!     // score, then return Transition::End or Transition::To(...)
 //! }
 //! ```
@@ -41,6 +40,16 @@ use borsh::BorshSerialize;
 pub enum Message<T> {
     Commit([u8; 32]),
     Reveal { value: T, salt: [u8; 32] },
+}
+
+/// What this node owes on its turn as the expected writer; see
+/// [`CommitRevealAuthorExt::my_turn`].
+#[derive(Debug)]
+pub enum MyTurn<O> {
+    /// The reveal to broadcast, taken from the local stash.
+    Reveal(O),
+    /// This node still owes its commit; the program picks the value.
+    Commit,
 }
 
 /// Protocol phase, tracked in shared state.
@@ -57,7 +66,7 @@ pub enum Phase {
 /// Participant-local companion state for [`CommitReveal`].
 ///
 /// A program embeds this value in its `Program::Local` DTO. Its fields are
-/// serialized at every local fresh-call boundary and never enter the shared
+/// serialized at every dispatch boundary and never enter the shared
 /// state commitment.
 #[arena0::local]
 #[derive(Clone, Default)]
@@ -129,8 +138,8 @@ pub enum Error {
 ///
 /// Programs with more than one local field implement this trait by returning
 /// the `CommitRevealLocal<T>` member used by their commit-reveal instance. The
-/// primitive extension then keeps shared protocol state and local stash state
-/// separate at the context boundary.
+/// primitive extension updates the local stash through the enclosing context
+/// while shared protocol state remains in the primitive field.
 pub trait CommitRevealLocalState<T> {
     /// Borrow this program's local commit-reveal stash.
     fn commit_reveal_local(&self) -> &CommitRevealLocal<T>;
@@ -149,18 +158,18 @@ impl<T> CommitRevealLocalState<T> for CommitRevealLocal<T> {
     }
 }
 
-/// Local context-field operations for `CommitReveal` primitives.
+/// Author-side operations for `CommitReveal` primitives.
 ///
 /// `#[arena0::state]` generates field-named accessors such as
-/// `ctx.commit_reveal()`. These operations inspect shared protocol state,
-/// update the caller's `Program::Local` stash, and return detached outputs that
-/// can be broadcast with `.broadcast()` (or `.broadcast_via(...)`).
-pub trait CommitRevealLocalFieldExt<T, Route = RawPrimitiveRoute> {
+/// `ctx.commit_reveal()`. These operations read shared state, update the
+/// participant-local opening, and return a detached output; they never mutate
+/// shared state, so they are available from both agreed and local handlers.
+pub trait CommitRevealAuthorExt<T, Route = RawPrimitiveRoute> {
     /// Whether this node still owes its commit for the current round.
     fn needs_commit(self) -> bool;
 
     /// Commit a local value with a host-generated salt and return the commit
-    /// message to broadcast. Local decision code only.
+    /// message to broadcast.
     fn commit(self, value: T) -> Result<PrimitiveOutput<Message<T>, Route>, Error>;
 
     /// Commit a local value with an explicit salt.
@@ -174,27 +183,35 @@ pub trait CommitRevealLocalFieldExt<T, Route = RawPrimitiveRoute> {
     ) -> Result<PrimitiveOutput<Message<T>, Route>, Error>;
 
     /// Take the reveal message owed this round, once every commitment is in.
-    /// Local decision code; returns `None` until the reveal is due and at most
-    /// once per round.
+    /// Returns `None` until the reveal is due and at most once per round.
     fn take_reveal(self) -> Option<PrimitiveOutput<Message<T>, Route>>;
+
+    /// What this node owes when it is the expected writer: its reveal once
+    /// due (taken as by [`take_reveal`](Self::take_reveal)), else its commit
+    /// if still owed. `None` when another participant writes next or nothing
+    /// is owed.
+    fn my_turn(self) -> Option<MyTurn<PrimitiveOutput<Message<T>, Route>>>;
 }
 
-/// Shared context-field operations for `CommitReveal` primitives.
+/// Handle-side operations for `CommitReveal` primitives.
 ///
-/// Shared handlers apply authenticated messages at the canonical public
-/// position. This handle exposes only the shared mutation operation.
-pub trait CommitRevealSharedFieldExt<T, Route = RawPrimitiveRoute> {
+/// [`handle`](Self::handle) mutates shared state and is available only from an
+/// agreed handler's mutable primitive field.
+pub trait CommitRevealFieldExt<T, Route = RawPrimitiveRoute>:
+    CommitRevealAuthorExt<T, Route>
+{
     /// Apply a commit-reveal message from the authenticated sender. Every node
-    /// runs this operation at the same public position.
+    /// runs this operation at the same agreed position.
     fn handle(self, from: Participant, msg: Message<T>) -> Result<(), Error>;
 }
 
-impl<Shared, Local, T, Route> CommitRevealLocalFieldExt<T, Route>
-    for LocalPrimitiveField<'_, Shared, Local, CommitReveal<T>, Route>
+impl<Shared, Local, T, Route, Mode> CommitRevealAuthorExt<T, Route>
+    for PrimitiveField<'_, Shared, Local, CommitReveal<T>, Route, Mode>
 where
     Shared: Primitive,
     Local: CommitRevealLocalState<T>,
     T: BorshSerialize + Clone,
+    Mode: arena0::EffectMode,
 {
     fn needs_commit(mut self) -> bool {
         self.with_shared_local(|cr, local| cr.needs_commit(local.commit_reveal_local()))
@@ -202,7 +219,7 @@ where
 
     fn commit(mut self, value: T) -> Result<PrimitiveOutput<Message<T>, Route>, Error> {
         let salt = self.random_bytes();
-        self.commit_with_salt(value, salt)
+        <Self as CommitRevealAuthorExt<T, Route>>::commit_with_salt(self, value, salt)
     }
 
     fn commit_with_salt(
@@ -210,6 +227,9 @@ where
         value: T,
         salt: [u8; 32],
     ) -> Result<PrimitiveOutput<Message<T>, Route>, Error> {
+        // The author stashes its opening locally and queues the commit. Shared
+        // state changes only when the author's own message is applied through
+        // `handle`, exactly as every receiver applies it.
         let commit = self.with_shared_local(|cr, local| {
             cr.commit_with_salt(local.commit_reveal_local_mut(), value, salt)
         })?;
@@ -217,16 +237,38 @@ where
     }
 
     fn take_reveal(mut self) -> Option<PrimitiveOutput<Message<T>, Route>> {
+        // The reveal is taken from local state and queued; shared state changes
+        // when the author's own message is applied through `handle`.
         let reveal =
             self.with_shared_local(|cr, local| cr.take_reveal(local.commit_reveal_local_mut()))?;
         Some(self.output(reveal))
     }
+
+    fn my_turn(mut self) -> Option<MyTurn<PrimitiveOutput<Message<T>, Route>>> {
+        let me = self.me();
+        let turn = self.with_shared_local(|cr, local| {
+            if !cr.is_writer(me) {
+                return None;
+            }
+            let local = local.commit_reveal_local_mut();
+            if let Some(reveal) = cr.take_reveal(local) {
+                Some(MyTurn::Reveal(reveal))
+            } else {
+                cr.needs_commit(local).then_some(MyTurn::Commit)
+            }
+        })?;
+        Some(match turn {
+            MyTurn::Reveal(reveal) => MyTurn::Reveal(self.output(reveal)),
+            MyTurn::Commit => MyTurn::Commit,
+        })
+    }
 }
 
-impl<Shared, T, Route> CommitRevealSharedFieldExt<T, Route>
-    for SharedPrimitiveField<'_, Shared, CommitReveal<T>, Route>
+impl<Shared, Local, T, Route> CommitRevealFieldExt<T, Route>
+    for PrimitiveField<'_, Shared, Local, CommitReveal<T>, Route, arena0::AgreedMode>
 where
     Shared: Primitive,
+    Local: CommitRevealLocalState<T>,
     T: BorshSerialize + Clone,
 {
     fn handle(mut self, from: Participant, msg: Message<T>) -> Result<(), Error> {
@@ -274,6 +316,12 @@ impl<T> CommitReveal<T> {
         };
         slot.and_then(|index| Participant::try_from(index).ok())
     }
+
+    /// Whether `participant` is the [`expected_writer`](Self::expected_writer).
+    #[must_use]
+    pub fn is_writer(&self, participant: Participant) -> bool {
+        self.expected_writer() == Some(participant)
+    }
     /// Reset for a new round. Shared-handler code: bumps the shared round
     /// counter so each node's local stash keys itself to the fresh round.
     pub fn reset(&mut self) -> Result<(), Error> {
@@ -307,8 +355,8 @@ impl<T> CommitReveal<T> {
     /// Whether the supplied local stash still owes its commit for the current
     /// round.
     ///
-    /// Local decision code should normally call the matching method on its
-    /// `CommitRevealLocalFieldExt` handle, which supplies the program-local DTO.
+    /// Callers can use the matching method on a `CommitRevealFieldExt` handle,
+    /// which supplies the program-local DTO through the enclosing context.
     pub fn needs_commit(&self, local: &CommitRevealLocal<T>) -> bool {
         self.phase == Phase::Idle && local.committed_round != Some(self.round)
     }
@@ -328,9 +376,8 @@ impl<T> CommitReveal<T> {
     }
 
     /// Stash a value and salt in the supplied local DTO and return the Commit
-    /// message to broadcast. Local decision code: does NOT mutate
-    /// shared-visible state; this node's hash lands in shared state when its
-    /// own broadcast applies through [`handle`](Self::handle).
+    /// message to broadcast. The author's shared state changes only when its
+    /// own Commit message is applied through [`Self::handle`].
     pub fn commit_with_salt(
         &self,
         local: &mut CommitRevealLocal<T>,
@@ -350,13 +397,13 @@ impl<T> CommitReveal<T> {
         Ok(Message::Commit(hash))
     }
 
-    /// Apply a message from the authenticated sender. The shared-event side:
-    /// pure over shared state plus the event, identical on every node.
+    /// Apply a message from the authenticated sender. The operation is pure
+    /// over shared state plus the event, and therefore identical on every node.
     ///
     /// A `Commit` outside the commit round, a second message from the same
     /// participant inside a round, or a reveal that fails its commitment hash
-    /// is a protocol violation surfaced as `Err` (the program's shared handler
-    /// propagates it, aborting identically on every node).
+    /// is a protocol violation surfaced as `Err` (the enclosing program
+    /// handler propagates it, aborting identically on every node).
     pub fn handle(&mut self, from: Participant, msg: Message<T>) -> Result<(), Error>
     where
         T: BorshSerialize,
@@ -401,7 +448,7 @@ impl<T> CommitReveal<T> {
 
     /// Take the reveal owed for the current round: `Some` exactly once, when
     /// every commitment has been applied and this node committed this round.
-    /// Local decision code (reads and writes the supplied local stash only).
+    /// Reads and writes the supplied local stash.
     pub fn take_reveal(&self, local: &mut CommitRevealLocal<T>) -> Option<Message<T>>
     where
         T: Clone,
@@ -489,8 +536,8 @@ mod tests {
     const P1: Participant = Participant::new(1);
     const P2: Participant = Participant::new(2);
 
-    /// Apply the same shared event to both replicas, as the runtime does at
-    /// one canonical position, and assert the shared bytes stay identical.
+    /// Apply the same commit-reveal event to both replicas, as the runtime does
+    /// at one canonical position, and assert their serialized values match.
     fn apply_both(
         a: &mut CommitReveal<u32>,
         b: &mut CommitReveal<u32>,
@@ -511,13 +558,15 @@ mod tests {
         let mut a_local = CommitRevealLocal::default();
         let mut b_local = CommitRevealLocal::default();
 
-        // Local decision code on each node: stash and produce the commit.
+        // Each node stashes its value and produces the commit in one context.
         let a_commit = a.commit_with_salt(&mut a_local, 42, [0xAA; 32]).unwrap();
         let b_commit = b.commit_with_salt(&mut b_local, 99, [0xBB; 32]).unwrap();
 
         // Canonical order: P0's commit then P1's, applied by both replicas.
+        assert!(a.is_writer(P0) && !a.is_writer(P1));
         apply_both(&mut a, &mut b, P0, &a_commit);
         assert_eq!(a.phase(), Phase::Idle);
+        assert!(a.is_writer(P1) && !a.is_writer(P0));
         apply_both(&mut a, &mut b, P1, &b_commit);
         assert_eq!(a.phase(), Phase::Revealing);
 

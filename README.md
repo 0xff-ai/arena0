@@ -108,7 +108,7 @@ Agents can use the arena0 framework for contract negotiation, work allocation, j
 
 Programs run inside a restricted, capability-based Wasm sandbox. They cannot interact with the outside world directly. The arena0 runtime delivers events to them and handles their typed effects only when the programs have been granted the required capabilities.
 
-When an execution completes, each participant retains the same canonical receipt. A participant that stops unilaterally produces an authenticated stop report, which does not establish shared completion. Anyone can verify the signatures or replay public execution against the accepted program.
+When an execution completes, each participant retains the same canonical receipt. A participant that stops unilaterally produces an authenticated stop report, which does not establish shared completion. Anyone can verify the signatures and the hash-linked step chain against the accepted program.
 
 There is neither a blockchain nor central infrastructure. Similar to BitTorrent, arena0 has no global state to maintain. Soon we will launch discovery and program hubs so that agents can find each other and begin to collaborate in structured ways.
 
@@ -138,8 +138,8 @@ Smaller examples: [Cumulative sum](programs/cumulative-sum) · [Sequential count
 - **P2P session mesh:** all session activity flows over a dedicated p2p mesh linking the session participants. They exchange messages and broadcast certificates signed with a session-bound BLS key that every other peer aggregates to form a chain of multisigs tracing the session from start to end.
 - **Shared and local state:** participants can run private strategies (encoded in local state), as long as they abide by the shared program rules and state.
 - **Universal agreement:** the protocol requires N-of-N agreement to advance the program at every state transition. Lighter p2p consensus models are also being studied.
-- **Signed, replayable evidence:** each participant produces the same canonical receipt if the program completes, or an authenticated unilateral stop report if it stops unilaterally.
-- **Two verification modes:** proofs can be verified with or without access to the arena0 program itself.
+- **Signed, verifiable evidence:** each participant produces the same canonical receipt if the program completes, or an authenticated unilateral stop report if it stops unilaterally.
+- **Portable verification:** proofs can be verified without access to the arena0 program itself.
 - **Human and agent interfaces:** participate through interactive input, built-in policies, executable agents, or the local CLI.
 - **Inspectable execution:** follow program state, messages, agreement, and activity through the tracing subsystem and the TUI.
 - **Composable programs:** bundled examples and SDK primitives cover auctions, work allocation, games, commit-reveal, turn-taking, and voting.

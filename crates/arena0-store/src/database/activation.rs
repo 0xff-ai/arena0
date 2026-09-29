@@ -1,7 +1,7 @@
 use super::*;
 
 impl Database {
-    pub(super) fn prepare_activation(
+    pub(crate) fn prepare_activation(
         &mut self,
         execution_id: ExecId,
         prepared: PreparedActivation,
@@ -10,12 +10,9 @@ impl Database {
         prepared.validate().map_err(|error| {
             StoreError::Corruption(format!("activation validation failed: {error}"))
         })?;
-        self.begin()?;
-        let result = self.prepare_activation_in_transaction(execution_id, prepared, now_ms);
-        match result {
-            Ok(outcome) => self.commit_result(outcome),
-            Err(error) => self.rollback_result(error),
-        }
+        self.transaction(|store| {
+            store.prepare_activation_in_transaction(execution_id, prepared, now_ms)
+        })
     }
 
     pub(super) fn prepare_activation_in_transaction(
@@ -66,7 +63,7 @@ impl Database {
         })
     }
 
-    pub(crate) fn ensure_program_registered(
+    pub(super) fn ensure_program_registered(
         &mut self,
         hash: ProgramHash,
     ) -> Result<(), StoreError> {
@@ -86,7 +83,7 @@ impl Database {
         Ok(())
     }
 
-    pub(super) fn commit_activation(
+    pub(crate) fn commit_activation(
         &mut self,
         execution_id: ExecId,
         activation: Activation,
@@ -95,12 +92,9 @@ impl Database {
         activation.validate().map_err(|error| {
             StoreError::Corruption(format!("activation validation failed: {error}"))
         })?;
-        self.begin()?;
-        let result = self.commit_activation_in_transaction(execution_id, activation, now_ms);
-        match result {
-            Ok(outcome) => self.commit_result(outcome),
-            Err(error) => self.rollback_result(error),
-        }
+        self.transaction(|store| {
+            store.commit_activation_in_transaction(execution_id, activation, now_ms)
+        })
     }
 
     pub(super) fn commit_activation_in_transaction(
@@ -161,7 +155,7 @@ impl Database {
         Ok(CommitActivationOutcome::Committed(Box::new(incoming)))
     }
 
-    pub(super) fn load_activation(
+    pub(crate) fn load_activation(
         &mut self,
         execution_id: ExecId,
     ) -> Result<Option<ActivationRecord>, StoreError> {
@@ -192,7 +186,7 @@ impl Database {
             let payload = open_envelope(
                 EnvelopeKind::PreparedActivation,
                 &prepared_bytes,
-                MAX_FRAME_BYTES,
+                MAX_ACTIVATION_BYTES,
             )?;
             let prepared: PreparedActivation = decode_borsh(&payload, "prepared activation")?;
             prepared
@@ -212,7 +206,8 @@ impl Database {
             }
             let committed = committed_bytes
                 .map(|bytes| {
-                    let payload = open_envelope(EnvelopeKind::Activation, &bytes, MAX_FRAME_BYTES)?;
+                    let payload =
+                        open_envelope(EnvelopeKind::Activation, &bytes, MAX_ACTIVATION_BYTES)?;
                     let activation: Activation = decode_borsh(&payload, "activation")?;
                     activation
                         .validate()
@@ -338,8 +333,8 @@ impl Database {
                 .ok_or_else(|| {
                     StoreError::Corruption("activation conflict has no owning activation".into())
                 })?;
-            let existing = open_envelope(kind, &existing, MAX_FRAME_BYTES)?;
-            let incoming = open_envelope(kind, &incoming, MAX_FRAME_BYTES)?;
+            let existing = open_envelope(kind, &existing, MAX_ACTIVATION_BYTES)?;
+            let incoming = open_envelope(kind, &incoming, MAX_ACTIVATION_BYTES)?;
             match kind {
                 EnvelopeKind::PreparedActivation => {
                     let existing: PreparedActivation =

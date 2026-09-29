@@ -2,9 +2,9 @@ use arena0_crypto::BlsPublicKey;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
-use crate::PeerId;
 use crate::SessionHash;
 use crate::negotiation::Activation;
+use crate::{Committed, Ensemble, EnsembleError, PeerId};
 use arena0_program::{ExecutionProfileHash, ProgramHash};
 
 use super::ProtocolError;
@@ -69,15 +69,49 @@ impl ExecutionBinding {
         Ok(keys)
     }
 
+    /// Participant execution keys in participant order, the order signer
+    /// bitmaps index.
+    pub(crate) fn participant_bls_keys(&self) -> Result<Vec<BlsPublicKey>, ProtocolError> {
+        Ok(self
+            .participant_keys()?
+            .into_iter()
+            .map(|(_, key)| key)
+            .collect())
+    }
+
     pub(crate) fn participant_key(
         &self,
         participant: &PeerId,
     ) -> Result<BlsPublicKey, ProtocolError> {
-        self.participant_keys()?
-            .into_iter()
-            .find_map(|(peer, key)| (peer == *participant).then_some(key))
+        // A direct scan: this runs once per signature and must not rebuild
+        // and sort the whole key list.
+        let ticket = self
+            .activation
+            .tickets()
+            .iter()
+            .find(|ticket| ticket.data.signer == *participant)
             .ok_or(ProtocolError::UnknownParticipant {
                 participant: *participant,
-            })
+            })?;
+        match &ticket.data.action {
+            crate::TicketAction::Active { execution_bls, .. } => Ok(*execution_bls),
+            crate::TicketAction::Withdrawn => Err(ProtocolError::BindingMismatch),
+        }
+    }
+
+    /// Participant identities in canonical activation order.
+    pub fn participants(&self) -> impl Iterator<Item = PeerId> + '_ {
+        self.activation.prepared().signers()
+    }
+
+    /// Whether `peer` holds a ticket in the activated ensemble.
+    #[must_use]
+    pub fn is_participant(&self, peer: PeerId) -> bool {
+        self.participants().any(|participant| participant == peer)
+    }
+
+    /// The committed ensemble the guest observes, in `PeerId` order.
+    pub fn ensemble(&self) -> Result<Ensemble<Committed>, EnsembleError> {
+        Ensemble::from_peers(self.participants().collect())
     }
 }

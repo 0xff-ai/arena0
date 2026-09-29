@@ -32,7 +32,7 @@ pub use support::{
     DurableOutcome, FETCH_TIMEOUT, LocalTicketWithdrawal, NegotiationAttempt,
     NegotiationDriveError, NegotiationEffects, NegotiationStart, NegotiationSupervision,
     PersistActivationEffect, PrepareEffect, PrepareOutcome, RecomputeInitialStateEffect,
-    serve_fetch_evidence, unix_time_ms,
+    serve_fetch_evidence, store_activation_effects, unix_time_ms,
 };
 
 /// At most 64 peers in one book, matching

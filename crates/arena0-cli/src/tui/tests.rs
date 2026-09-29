@@ -1,6 +1,7 @@
 use super::*;
 use arena0_client::api::{
-    ExecStatusState, HostInfo, PrivateEffectSummary, PrivateEventKind, SessionStatus,
+    EffectKind, EffectSummary, EventKind, EventRecordSummary, ExecStatusState, HostInfo,
+    SessionStatus,
 };
 use std::time::Duration;
 
@@ -37,6 +38,7 @@ fn event_host(id: &str) -> HostInfo {
 
 fn active_status() -> ExecStatus {
     ExecStatus {
+        end: Default::default(),
         exec_id: arena0_client::protocol::ExecId([0x11; 32]),
         negotiation_id: Some(arena0_client::protocol::NegotiationId([0x22; 32])),
         program_id: arena0_client::protocol::ProgramHash([0x33; 32]),
@@ -97,26 +99,25 @@ fn negotiation_progress_uses_only_the_selected_host_events() {
     assert_eq!(negotiation::latest_ticket_progress(&state), Some((0, 2)));
 }
 
-fn inspection(host_number: u8, sequence: u64) -> ExecutionInspection {
+fn inspection(host_number: u8, event_position: u64) -> ExecutionInspection {
     let mut status = active_status();
     status.exec_id = arena0_client::protocol::ExecId([host_number; 32]);
     ExecutionInspection {
         status,
         activation: None,
-        private_from: 0,
-        private: vec![PrivateCommitSummary {
-            sequence,
-            public_position: 2,
-            event: PrivateEventKind::InputReceived,
+        events_from: 0,
+        events: vec![EventRecordSummary {
+            event_position,
+            agreed_steps: vec![2],
+            event: EventKind::InputReceived,
             input_payload_bytes: Some(12),
-            effects: vec![PrivateEffectSummary {
-                kind: PrivateEffectKind::Broadcast,
+            effects: vec![EffectSummary {
+                kind: EffectKind::Broadcast,
                 payload_bytes: Some(8),
             }],
-            fuel_used: 7,
         }],
-        private_total: 1,
-        private_next: None,
+        events_total: 1,
+        events_next: None,
     }
 }
 
@@ -256,7 +257,7 @@ fn input_keys_submit_json_and_escape_clears() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "Choose".to_owned(),
         prompt: "Choose".to_owned(),
@@ -284,7 +285,7 @@ fn invalid_tui_answer_keeps_the_callout_until_valid_input() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "Choose".to_owned(),
         prompt: "Cooperate or defect".to_owned(),
@@ -301,12 +302,77 @@ fn invalid_tui_answer_keeps_the_callout_until_valid_input() {
 
     state.set_answer_text("Cooperate");
     state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert!(state.callouts.is_empty());
-    assert_eq!(state.focus, Focus::Workspace);
+    assert!(!state.callouts.is_empty());
+    assert!(state.callouts.selected().unwrap().submitting);
     assert_eq!(
         answer.blocking_recv().unwrap(),
         serde_json::json!("Cooperate")
     );
+    state.apply(RunUpdate::CalloutAccepted {
+        host: first_host(),
+        exec_id: active_status().exec_id,
+        pending_id: CalloutId::new(1),
+    });
+    assert!(state.callouts.is_empty());
+    assert_eq!(state.focus, Focus::Workspace);
+}
+
+#[test]
+fn program_rejection_keeps_the_tui_draft_for_the_same_callout() {
+    let mut state = ScreenState::new(config());
+    let host = first_host();
+    let exec_id = active_status().exec_id;
+    let pending_id = CalloutId::new(1);
+    let (reply, first_answer) = oneshot::channel();
+    state.apply(RunUpdate::Callout {
+        host: host.clone(),
+        exec_id,
+        pending_id,
+        callout_index: 1,
+        name: "Move".to_owned(),
+        prompt: "Choose a move".to_owned(),
+        context: Value::Null,
+        schema: serde_json::json!({"type": "string"}),
+        reply,
+    });
+    state.set_answer_text("illegal move");
+    state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        first_answer.blocking_recv().unwrap(),
+        serde_json::json!("illegal move")
+    );
+
+    let (reply, second_answer) = oneshot::channel();
+    state.apply(RunUpdate::CalloutRejected {
+        host: host.clone(),
+        exec_id,
+        pending_id,
+        reason: "illegal move".to_owned(),
+        reply,
+    });
+    assert_eq!(state.answer_text(), "illegal move");
+    assert_eq!(
+        state
+            .callouts
+            .selected()
+            .unwrap()
+            .submission_error
+            .as_deref(),
+        Some("illegal move")
+    );
+    assert!(!state.callouts.selected().unwrap().submitting);
+    state.set_answer_text("legal move");
+    state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        second_answer.blocking_recv().unwrap(),
+        serde_json::json!("legal move")
+    );
+    state.apply(RunUpdate::CalloutAccepted {
+        host,
+        exec_id,
+        pending_id,
+    });
+    assert!(state.callouts.is_empty());
 }
 
 #[test]
@@ -329,7 +395,7 @@ fn duplicate_callout_key_does_not_replace_pending_reply() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "first".to_owned(),
         prompt: "first".to_owned(),
@@ -341,7 +407,7 @@ fn duplicate_callout_key_does_not_replace_pending_reply() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "second".to_owned(),
         prompt: "second".to_owned(),
@@ -366,7 +432,7 @@ fn host_callouts_keep_independent_textarea_drafts_and_reply_routes() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "first".to_owned(),
         prompt: "first".to_owned(),
@@ -379,7 +445,7 @@ fn host_callouts_keep_independent_textarea_drafts_and_reply_routes() {
     state.apply(RunUpdate::Callout {
         host: second_host.clone(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(2),
+        pending_id: CalloutId::new(2),
         callout_index: 1,
         name: "second".to_owned(),
         prompt: "second".to_owned(),
@@ -474,7 +540,7 @@ fn pending_answer_can_be_left_and_reentered() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "Choose".to_owned(),
         prompt: "Choose".to_owned(),
@@ -499,7 +565,7 @@ fn tab_moves_focus_inside_the_current_view_only() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "Choose".to_owned(),
         prompt: "Choose".to_owned(),
@@ -535,7 +601,7 @@ fn composer_shortcut_then_backtab_returns_to_visible_records() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "Choose".to_owned(),
         prompt: "Choose".to_owned(),
@@ -570,7 +636,7 @@ fn arrivals_preserve_callout_order_and_submission_selects_the_oldest() {
         state.apply(RunUpdate::Callout {
             host: HostName::for_local_index(index),
             exec_id: active_status().exec_id,
-            pending_id: PendingId::new(1),
+            pending_id: CalloutId::new(1),
             callout_index: 1,
             name: "Choose".to_owned(),
             prompt: "Choose".to_owned(),
@@ -596,6 +662,11 @@ fn arrivals_preserve_callout_order_and_submission_selects_the_oldest() {
     );
     assert!(answers[0].try_recv().is_err());
     assert!(answers[1].try_recv().is_err());
+    state.apply(RunUpdate::CalloutAccepted {
+        host: HostName::for_local_index(2),
+        exec_id: active_status().exec_id,
+        pending_id: CalloutId::new(1),
+    });
     assert_eq!(state.callouts.position(), 1);
     assert_eq!(state.answer_text(), "first draft");
     state.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
@@ -875,7 +946,7 @@ fn compare_scope_keeps_distinct_hosts_and_reconciles_hidden_events() {
 }
 
 #[test]
-fn private_crossings_are_aggregated_by_host_without_payloads() {
+fn event_records_are_aggregated_by_host_without_payloads() {
     let mut state = ScreenState::new(config());
     state.apply(RunUpdate::Inspection {
         host: "host-01".parse().expect("valid Host name"),
@@ -891,7 +962,7 @@ fn private_crossings_are_aggregated_by_host_without_payloads() {
         state
             .inspections
             .values()
-            .map(|inspection| inspection.private.len())
+            .map(|inspection| inspection.events.len())
             .sum::<usize>(),
         2
     );
@@ -899,20 +970,20 @@ fn private_crossings_are_aggregated_by_host_without_payloads() {
         state
             .inspections
             .values()
-            .map(|inspection| inspection.private_total)
+            .map(|inspection| inspection.events_total)
             .sum::<u64>(),
         2
     );
 }
 
 #[test]
-fn wasm_page_keys_request_the_selected_hosts_adjacent_private_page() {
+fn wasm_page_keys_request_the_selected_hosts_adjacent_event_page() {
     let host = first_host();
     let mut state = ScreenState::new(config());
     let mut page = inspection(1, 300);
-    page.private_from = 256;
-    page.private_total = 700;
-    page.private_next = Some(512);
+    page.events_from = 256;
+    page.events_total = 700;
+    page.events_next = Some(512);
     state.apply(RunUpdate::Inspection {
         host: host.clone(),
         inspection: Box::new(page),
@@ -921,8 +992,8 @@ fn wasm_page_keys_request_the_selected_hosts_adjacent_private_page() {
 
     state.on_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE));
     assert_eq!(
-        state.private_page_request.take(),
-        Some(PrivatePageRequest {
+        state.event_page_request.take(),
+        Some(EventPageRequest {
             host: host.clone(),
             from: Some(0),
         })
@@ -930,8 +1001,8 @@ fn wasm_page_keys_request_the_selected_hosts_adjacent_private_page() {
 
     state.on_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE));
     assert_eq!(
-        state.private_page_request.take(),
-        Some(PrivatePageRequest {
+        state.event_page_request.take(),
+        Some(EventPageRequest {
             host,
             from: Some(512),
         })
@@ -939,11 +1010,7 @@ fn wasm_page_keys_request_the_selected_hosts_adjacent_private_page() {
 }
 
 #[test]
-fn private_crossings_use_the_preceding_public_step_without_inventing_one() {
-    assert_eq!(wasm::private_parent_step(0), None);
-    assert_eq!(wasm::private_parent_step(1), Some(0));
-    assert_eq!(wasm::private_parent_step(2), Some(1));
-
+fn event_records_use_host_local_event_positions() {
     let mut state = ScreenState::new(config());
     state.apply(RunUpdate::Inspection {
         host: "host-01".parse().expect("valid Host name"),
@@ -952,13 +1019,10 @@ fn private_crossings_use_the_preceding_public_step_without_inventing_one() {
 
     assert_eq!(
         wasm::keys(&state),
-        vec![
-            CrossingKey::Boundary { after_position: 2 },
-            CrossingKey::Private {
-                host: "host-01".parse().expect("valid Host name"),
-                sequence: 3,
-            },
-        ]
+        vec![CrossingKey::Event {
+            host: "host-01".parse().expect("valid Host name"),
+            event_position: 3,
+        },]
     );
     assert!(!wasm::keys(&state).contains(&CrossingKey::Public { step: 2 }));
 }
@@ -971,7 +1035,7 @@ fn composer_height_tracks_wrapped_semantic_rows_and_editor_lines() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "Choose".to_owned(),
         prompt: "x".repeat(300),
@@ -1043,7 +1107,7 @@ fn insert_mode_keeps_printable_controls_and_supports_editing() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "Choose".to_owned(),
         prompt: "value".to_owned(),
@@ -1075,21 +1139,18 @@ fn receipt_evidence_is_host_owned_and_progress_is_aggregate() {
     state.apply(RunUpdate::ReceiptVerified {
         host: first_host(),
         peer_id: PeerId([1; 32]),
-        tier: "peer_id",
     });
     state.apply(RunUpdate::ReceiptVerified {
         host: "host-02".parse().expect("valid Host name"),
         peer_id: PeerId([2; 32]),
-        tier: "peer_id",
     });
     state.apply(RunUpdate::VerificationProgress {
         verified: 2,
         total: 2,
-        tier: "aggregate",
     });
     assert_eq!(state.receipts.len(), 2);
     assert_eq!(state.receipts[0].host, first_host());
-    assert_eq!(state.verification_progress, Some((2, 2, "aggregate")));
+    assert_eq!(state.verification_progress, Some((2, 2)));
 }
 
 #[test]
@@ -1346,7 +1407,7 @@ fn monitor_a_opens_only_the_selected_execution_callout() {
         state.apply(RunUpdate::Monitor(MonitorUpdate::Callout {
             host: host.clone(),
             exec_id,
-            pending_id: PendingId::new(exec_id.0[0] as u64),
+            pending_id: CalloutId::new(exec_id.0[0] as u64),
             callout_index: 1,
             name: "Choose".to_owned(),
             prompt: "choose".to_owned(),
@@ -1548,18 +1609,13 @@ fn monitor_trace_detail_decodes_messages_and_scrolls_inspector() {
         .map(|step| TraceEntry {
             trace_version: arena0_client::protocol::TRACE_FORMAT_VERSION,
             step,
-            event: PublicEvent::MessageReceived {
-                message_id: arena0_client::protocol::MessageId([step as u8; 32]),
+            event: TraceEvent::Message {
                 from: PeerId([1; 32]),
-                position: step,
-                pre_state: arena0_client::protocol::StateHash([step as u8; 32]),
-                msg: (step as u32).to_le_bytes().to_vec(),
+                data: (step as u32).to_le_bytes().to_vec(),
             },
-            effects: Vec::new(),
             pre_state: arena0_client::protocol::StateHash([step as u8; 32]),
             post_state: arena0_client::protocol::StateHash([(step + 1) as u8; 32]),
-            fuel_used: 1,
-            witness: None,
+            terminal: None,
             agreement: arena0_client::protocol::AggregateAttestation::empty(),
         })
         .collect();
@@ -1596,7 +1652,7 @@ fn monitor_trace_detail_decodes_messages_and_scrolls_inspector() {
         state
             .monitor_projection()
             .expect("projection")
-            .selected_public_position,
+            .selected_step,
         Some(1)
     );
     state.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1622,7 +1678,7 @@ fn monitor_submission_routes_to_exact_callout_and_closes_selected_composer() {
         state.apply(RunUpdate::Monitor(MonitorUpdate::Callout {
             host: host.clone(),
             exec_id: ExecId([byte; 32]),
-            pending_id: PendingId::new(u64::from(byte)),
+            pending_id: CalloutId::new(u64::from(byte)),
             callout_index: 1,
             name: format!("Choice-{byte}"),
             prompt: "choose".to_owned(),
@@ -1634,14 +1690,14 @@ fn monitor_submission_routes_to_exact_callout_and_closes_selected_composer() {
     state.apply(RunUpdate::Monitor(MonitorUpdate::Submission {
         host: host.clone(),
         exec_id: ExecId([2; 32]),
-        pending_id: PendingId::new(2),
+        pending_id: CalloutId::new(2),
         result: MonitorSubmission::Rejected("\u{1b}[31mtransport\u{1b}[0m".to_owned()),
     }));
     assert_eq!(state.focus, Focus::Composer);
     assert_eq!(
         state
             .callouts
-            .get_mut(&host, ExecId([2; 32]), PendingId::new(2))
+            .get_mut(&host, ExecId([2; 32]), CalloutId::new(2))
             .expect("retained callout")
             .submission_error
             .as_deref(),
@@ -1650,7 +1706,7 @@ fn monitor_submission_routes_to_exact_callout_and_closes_selected_composer() {
     state.apply(RunUpdate::Monitor(MonitorUpdate::Submission {
         host,
         exec_id: ExecId([1; 32]),
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         result: MonitorSubmission::Accepted,
     }));
     assert_eq!(state.focus, Focus::Hosts);
@@ -1669,7 +1725,7 @@ fn monitor_submission_routes_to_exact_callout_and_closes_selected_composer() {
 async fn tui_session_join_can_be_cancelled_and_retried() {
     let (updates, _receiver) = mpsc::channel(1);
     let (_width, width_receiver) = watch::channel(80);
-    let (_private_page, private_receiver) = watch::channel(None);
+    let (_event_page, event_receiver) = watch::channel(None);
     let (done_sender, done_receiver) = oneshot::channel();
     let task = tokio::spawn(async move {
         let _ = done_receiver.await;
@@ -1679,7 +1735,7 @@ async fn tui_session_join_can_be_cancelled_and_retried() {
         handle: TuiHandle {
             updates,
             width: width_receiver,
-            private_page: private_receiver,
+            event_page: event_receiver,
         },
         task: Some(task),
     };
@@ -1701,7 +1757,7 @@ fn arrows_edit_the_answer_and_numbers_remain_text_while_typing() {
     state.apply(RunUpdate::Callout {
         host: first_host(),
         exec_id: active_status().exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "Choose".into(),
         prompt: "Choose".into(),
@@ -1783,7 +1839,7 @@ fn monitor_tab_reaches_the_answer_pane_and_returns_in_order() {
     state.apply(RunUpdate::Monitor(MonitorUpdate::Callout {
         host: first_host(),
         exec_id,
-        pending_id: PendingId::new(1),
+        pending_id: CalloutId::new(1),
         callout_index: 1,
         name: "Choose".into(),
         prompt: "Choose".into(),
@@ -1804,4 +1860,24 @@ fn monitor_tab_reaches_the_answer_pane_and_returns_in_order() {
     state.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
     assert_eq!(state.focus, Focus::Workspace);
     assert_eq!(state.page.pane(), OverviewPane::SystemEvents);
+}
+
+#[test]
+fn trace_label_shows_the_derived_message_id() {
+    let session = SessionHash([0x44; 32]);
+    let entry = TraceEntry {
+        trace_version: arena0_client::protocol::TRACE_FORMAT_VERSION,
+        step: 1,
+        event: TraceEvent::Message {
+            from: PeerId([1; 32]),
+            data: vec![2],
+        },
+        pre_state: arena0_client::protocol::StateHash([0x11; 32]),
+        post_state: arena0_client::protocol::StateHash([0x22; 32]),
+        terminal: None,
+        agreement: arena0_client::protocol::AggregateAttestation::empty(),
+    };
+    let label = super::trace::trace_event_label(&entry, Some(session));
+    let id = entry.message_id(session).expect("message identity");
+    assert!(label.contains(&id.fmt_short().to_string()), "{label}");
 }

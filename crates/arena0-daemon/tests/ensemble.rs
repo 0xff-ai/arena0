@@ -3,23 +3,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arena0_api::{ApiErrorCode, EnsembleSpec, HostRequest, Request, Response, ResponseOk};
-use arena0_daemon::{Daemon, Keystore, McpConfig};
-use arena0_home::{Home, HostName};
+use arena0_daemon::{Daemon, McpConfig};
 use arena0_program::ParticipantCount;
-use arena0_store::{Store, StoreConfig};
 use tempfile::TempDir;
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::time::{sleep, timeout};
-
-const ROCK_PAPER_SCISSORS_WASM: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../programs/target/wasm32-unknown-unknown/release/rock_paper_scissors.wasm"
-));
-const CUMULATIVE_SUM_WASM: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../programs/target/wasm32-unknown-unknown/release/cumulative_sum.wasm"
-));
 
 async fn call(socket: &Path, request: &Request) -> Response {
     let stream = UnixStream::connect(socket)
@@ -56,23 +45,6 @@ async fn wait_for_socket(socket: &Path) {
     .expect("ensemble daemon socket should become ready");
 }
 
-async fn seed_host(home: &Home, name: &str) {
-    let name = name.parse::<HostName>().expect("Host name");
-    let location = home.host(&name);
-    let state_dir = location.state_dir();
-    std::fs::create_dir_all(state_dir.join("keys")).expect("Host state directories");
-    let keystore = Keystore::open(state_dir.join("keys")).expect("Host keystore");
-    let identity = keystore
-        .new_identity(Some(name.to_string()))
-        .expect("Host identity");
-    let store = Store::open(StoreConfig::new(
-        state_dir.join("arena0.sqlite"),
-        identity.peer_id,
-    ))
-    .expect("Host store");
-    store.shutdown().await.expect("Host store shutdown");
-}
-
 async fn start(
     names: &[&str],
 ) -> (
@@ -81,16 +53,13 @@ async fn start(
     tokio::task::JoinHandle<anyhow::Result<()>>,
 ) {
     let home_dir = TempDir::new().expect("temporary daemon home");
-    let home = Home::from_root(home_dir.path().to_path_buf()).unwrap();
-    for name in names {
-        seed_host(&home, name).await;
-    }
+    let home = arena0_home::Home::from_root(home_dir.path().to_path_buf()).unwrap();
     let daemon = Daemon::start(
         names.iter().map(|name| name.parse().unwrap()).collect(),
         McpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap(),
-        Arc::new(arena0_sandbox::WasmtimeEngine::new().expect("sandbox engine")),
+        arena0_test_engine::shared_test_engine(),
         home,
-        false,
+        true,
     )
     .await
     .expect("start ensemble");
@@ -113,53 +82,98 @@ async fn stop(
     assert!(!socket.exists());
 }
 
-async fn import_program(
-    socket: &Path,
-    host_name: &str,
-    wasm: &[u8],
-) -> Box<arena0_api::ProgramDetail> {
-    match call(
-        socket,
-        &host(
-            host_name,
-            HostRequest::ProgramImport {
-                wasm: wasm.to_vec(),
-            },
-        ),
-    )
-    .await
-    {
-        Ok(ResponseOk::Program(program)) => program,
-        response => panic!("unexpected program import response: {response:?}"),
+#[tokio::test]
+async fn routes_two_hosts_through_one_socket() {
+    let (home, daemon, serving) = start(&["a", "b"]).await;
+    let socket = home.path().join("arena0.sock");
+
+    let response = call(&socket, &Request::HostsList).await;
+    let hosts = match response {
+        Ok(ResponseOk::Hosts(hosts)) => hosts,
+        response => panic!("unexpected hosts.list response: {response:?}"),
+    };
+    assert_eq!(hosts.len(), 2);
+    assert_eq!(hosts[0].host.id, "a");
+    assert_eq!(hosts[1].host.id, "b");
+    assert_ne!(hosts[0].host.peer_id, hosts[1].host.peer_id);
+
+    for name in ["a", "b"] {
+        let response = call(&socket, &host(name, HostRequest::Info)).await;
+        assert!(
+            matches!(response, Ok(ResponseOk::HostStatus(_))),
+            "{response:?}"
+        );
     }
+    let unknown = call(&socket, &host("missing", HostRequest::Info)).await;
+    assert_eq!(
+        unknown.expect_err("unknown Host must be rejected").code,
+        ApiErrorCode::NotFound
+    );
+
+    stop(home, daemon, serving).await;
 }
 
 #[tokio::test]
-async fn variable_size_program_accepts_supported_participant_count() {
-    let (home, daemon, serving) = start(&["host-01"]).await;
+async fn id_show_returns_the_host_identity() {
+    let (home, daemon, serving) = start(&["a", "b"]).await;
     let socket = home.path().join("arena0.sock");
-    let target = "host-01";
-    import_program(&socket, target, ROCK_PAPER_SCISSORS_WASM).await;
-    let cumulative_hash = import_program(&socket, target, CUMULATIVE_SUM_WASM)
-        .await
-        .summary
-        .program_hash;
-    let cumulative_detail = match call(
+    let info = call(&socket, &host("a", HostRequest::Info)).await;
+    let status = match info {
+        Ok(ResponseOk::HostStatus(status)) => status,
+        info => panic!("unexpected Host info response: {info:?}"),
+    };
+    let id = match call(&socket, &host("a", HostRequest::IdShow)).await {
+        Ok(ResponseOk::Id(id)) => id,
+        response => panic!("unexpected id.show response: {response:?}"),
+    };
+    assert_eq!(id.peer_id, status.host.peer_id);
+    assert_eq!(id.transport_key, status.transport_key);
+    assert_ne!(
+        id.peer_id,
+        match call(&socket, &host("b", HostRequest::IdShow)).await {
+            Ok(ResponseOk::Id(id)) => id.peer_id,
+            response => panic!("unexpected id.show response: {response:?}"),
+        }
+    );
+    stop(home, daemon, serving).await;
+}
+
+#[tokio::test]
+async fn shared_unix_api_classifies_program_input_errors() {
+    let (home, daemon, serving) = start(&["host-01", "host-02"]).await;
+    let socket = home.path().join("arena0.sock");
+    let invalid_program = call(
         &socket,
         &host(
-            target,
-            HostRequest::ProgramGet {
-                program: cumulative_hash.to_string(),
+            "host-01",
+            HostRequest::ProgramImport {
+                wasm: b"Cargo.toml".to_vec(),
             },
         ),
     )
     .await
-    {
-        Ok(ResponseOk::Program(program)) => program,
-        response => panic!("unexpected cumulative-sum detail response: {response:?}"),
+    .expect_err("invalid Wasm should be typed");
+    assert_eq!(invalid_program.code, ApiErrorCode::BadRequest);
+
+    stop(home, daemon, serving).await;
+}
+
+#[tokio::test]
+async fn variable_size_program_accepts_supported_creator_count() {
+    let (home, daemon, serving) = start(&["host-01", "host-02", "host-03"]).await;
+    let socket = home.path().join("arena0.sock");
+    let response = call(&socket, &host("host-01", HostRequest::ProgramList)).await;
+    let programs = match response {
+        Ok(ResponseOk::ProgramList(programs)) => programs,
+        response => panic!("unexpected program response: {response:?}"),
     };
+    assert_eq!(programs.len(), 7);
+    let cumulative = programs
+        .iter()
+        .find(|program| program.name == "cumulative-sum")
+        .expect("bundled cumulative-sum program");
     assert_eq!(
-        cumulative_detail.summary.participants,
+        cumulative.participants,
         ParticipantCount::Range { min: 2, max: 64 }
     );
 

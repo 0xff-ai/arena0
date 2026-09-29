@@ -5,7 +5,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 builder=${ARENA0_CARGO_BIN:?set ARENA0_CARGO_BIN to the release cargo-arena0 executable}
 version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' "$repo_root/Cargo.toml")
 example="$repo_root/examples/minimal-program"
-if ! grep -Fqx "arena0-sdk = \"=$version\"" "$example/Cargo.toml"; then
+if ! grep -Fq "arena0-sdk = { version = \"=$version\"" "$example/Cargo.toml"; then
   echo "minimal-program must pin arena0-sdk to the exact workspace release $version" >&2
   exit 1
 fi
@@ -13,9 +13,11 @@ fi
 smoke_root=$(mktemp -d "${TMPDIR:-/tmp}/arena0-registry-example.XXXXXX")
 trap 'rm -rf -- "$smoke_root"' EXIT
 mkdir -p "$smoke_root/minimal-program/src"
-for file in Cargo.toml README.md rust-toolchain.toml src/lib.rs; do
+for file in README.md rust-toolchain.toml src/lib.rs; do
   cp "$example/$file" "$smoke_root/minimal-program/$file"
 done
+# Drop the checkout-only `path` keys, as the npm package does.
+sed -E 's/, path = "[^"]*"//' "$example/Cargo.toml" >"$smoke_root/minimal-program/Cargo.toml"
 
 (
   cd "$smoke_root/minimal-program"

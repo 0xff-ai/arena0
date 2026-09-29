@@ -1,4 +1,4 @@
-//! Direct executable-agent driver for the private CLI coordination layer.
+//! Direct executable-agent driver for the CLI coordination layer.
 //!
 //! The process boundary is intentionally small: arena0 sends one JSON callout
 //! object per line and the executable sends one JSON value per line.  The
@@ -327,7 +327,7 @@ impl ExecutableAgent {
                 let mut line = Vec::with_capacity(newline);
                 for _ in 0..=newline {
                     // The position came from the queue, so this cannot be
-                    // absent unless another owner mutates the private queue.
+                    // absent unless another owner mutates the buffered queue.
                     line.push(
                         self.stdout_pending
                             .pop_front()

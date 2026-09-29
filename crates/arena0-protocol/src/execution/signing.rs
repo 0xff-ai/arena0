@@ -1,62 +1,67 @@
-//! Kernel-owned signing contracts for guest `Sign` effects.
+//! Kernel-owned signing contracts for synchronous guest signing requests.
 
 use arena0_crypto::SignScheme;
 use arena0_program::ProgramHash;
+use arena0_program::bounded;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::io;
 
-use crate::bounded::read_bytes;
 use crate::{ExecId, SessionHash};
 
 use super::{MAX_EFFECT_PAYLOAD_BYTES, ProtocolError, ensure_payload};
 
-/// Versioned, execution-bound preimage presented to a local signer for a guest
-/// `Effect::Sign`. The guest payload is data inside this contract, never the
-/// protocol message itself, so it cannot be used as a signing oracle for step,
-/// terminal, activation, or receipt commitments.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+/// Versioned, execution-bound preimage presented to a local signer for one
+/// guest signing call. The guest payload is data inside this contract, never
+/// the protocol message itself, so it cannot be used as a signing oracle for
+/// step, activation, or receipt commitments.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, BorshSerialize)]
 pub struct GuestSignData {
     domain: [u8; 24],
     version: u16,
     session_id: SessionHash,
     program_hash: ProgramHash,
     execution_id: ExecId,
-    private_sequence: u64,
-    effect_index: u32,
+    event_position: u64,
+    call_index: u32,
     scheme: SignScheme,
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_EFFECT_PAYLOAD_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_EFFECT_PAYLOAD_BYTES>"
+    )]
     payload: Vec<u8>,
 }
 
-impl BorshSerialize for GuestSignData {
-    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        BorshSerialize::serialize(&self.domain, writer)?;
-        BorshSerialize::serialize(&self.version, writer)?;
-        BorshSerialize::serialize(&self.session_id, writer)?;
-        BorshSerialize::serialize(&self.program_hash, writer)?;
-        BorshSerialize::serialize(&self.execution_id, writer)?;
-        BorshSerialize::serialize(&self.private_sequence, writer)?;
-        BorshSerialize::serialize(&self.effect_index, writer)?;
-        BorshSerialize::serialize(&self.scheme, writer)?;
-        let length = u32::try_from(self.payload.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "signing payload too long"))?;
-        BorshSerialize::serialize(&length, writer)?;
-        writer.write_all(&self.payload)
-    }
+#[derive(BorshDeserialize)]
+struct GuestSignDataRaw {
+    domain: [u8; 24],
+    version: u16,
+    session_id: SessionHash,
+    program_hash: ProgramHash,
+    execution_id: ExecId,
+    event_position: u64,
+    call_index: u32,
+    scheme: SignScheme,
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_EFFECT_PAYLOAD_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_EFFECT_PAYLOAD_BYTES>"
+    )]
+    payload: Vec<u8>,
 }
 
 impl BorshDeserialize for GuestSignData {
     fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> io::Result<Self> {
+        let raw = GuestSignDataRaw::deserialize_reader(reader)?;
         let data = Self {
-            domain: <[u8; 24]>::deserialize_reader(reader)?,
-            version: u16::deserialize_reader(reader)?,
-            session_id: crate::SessionHash::deserialize_reader(reader)?,
-            program_hash: ProgramHash::deserialize_reader(reader)?,
-            execution_id: crate::ExecId::deserialize_reader(reader)?,
-            private_sequence: u64::deserialize_reader(reader)?,
-            effect_index: u32::deserialize_reader(reader)?,
-            scheme: SignScheme::deserialize_reader(reader)?,
-            payload: read_bytes(reader, MAX_EFFECT_PAYLOAD_BYTES, "signing payload")?,
+            domain: raw.domain,
+            version: raw.version,
+            session_id: raw.session_id,
+            program_hash: raw.program_hash,
+            execution_id: raw.execution_id,
+            event_position: raw.event_position,
+            call_index: raw.call_index,
+            scheme: raw.scheme,
+            payload: raw.payload,
         };
         data.validate()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
@@ -66,16 +71,16 @@ impl BorshDeserialize for GuestSignData {
 
 impl GuestSignData {
     /// Domain separation tag for guest-owned signing requests.
-    pub const DOMAIN: [u8; 24] = *b"arena0/guest-sign/v1\0\0\0\0";
+    pub const DOMAIN: [u8; 24] = *b"arena0/guest-sign/v3\0\0\0\0";
     /// Version of the guest signing request contract.
-    pub const VERSION: u16 = 1;
+    pub const VERSION: u16 = 3;
 
-    pub(crate) fn new(
+    pub fn new(
         session_id: SessionHash,
         program_hash: ProgramHash,
         execution_id: ExecId,
-        private_sequence: u64,
-        effect_index: u32,
+        event_position: u64,
+        call_index: u32,
         scheme: SignScheme,
         payload: Vec<u8>,
     ) -> Result<Self, ProtocolError> {
@@ -85,8 +90,8 @@ impl GuestSignData {
             session_id,
             program_hash,
             execution_id,
-            private_sequence,
-            effect_index,
+            event_position,
+            call_index,
             scheme,
             payload,
         };
@@ -112,16 +117,16 @@ impl GuestSignData {
         self.execution_id
     }
 
-    /// Return the private coordinate bound into the signing request.
+    /// Return the event position bound into the signing request.
     #[must_use]
-    pub const fn private_sequence(&self) -> u64 {
-        self.private_sequence
+    pub const fn event_position(&self) -> u64 {
+        self.event_position
     }
 
-    /// Return the guest effect ordinal bound into the signing request.
+    /// Return the sign call ordinal within its dispatch.
     #[must_use]
-    pub const fn effect_index(&self) -> u32 {
-        self.effect_index
+    pub const fn call_index(&self) -> u32 {
+        self.call_index
     }
 
     /// Return the requested signing scheme.
