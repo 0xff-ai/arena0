@@ -101,12 +101,12 @@ fi
 
 commands=()
 case $scope in
-    cli) commands=(just check-cli test-cli) ;;
-    # `test-ui` joins this route once the recipe exists.
-    ui) commands=(just check-ui) ;;
+    # arena0-web belongs to cli; its wire types and gateway feed the browser.
+    cli) commands=(just check-cli test-cli check-ui test-ui) ;;
+    ui) commands=(just check-ui test-ui) ;;
     daemon) commands=(just check-daemon test-daemon) ;;
     programs) commands=(just check-programs test-programs) ;;
-    full) commands=(just build-programs check test doc) ;;
+    full) commands=(just build-programs check test doc check-ui test-ui) ;;
 esac
 
 check_untracked() {

@@ -30,6 +30,12 @@ check-ui:
     cargo run --quiet --locked -p arena0-web --example export_ts | diff -u ui/src/sync/protocol.gen.ts -
     cd ui && pnpm biome check . && pnpm tsc -b
 
+# Live browser suites (gallery, shell, and the app against the real binary
+# with the UI it embeds). Evidence lands in ui/e2e/artifacts/.
+test-ui: build-programs build-ui
+    cargo build --locked -p arena0-cli -p arena0d
+    cd ui && ARENA0_E2E_EMBEDDED=1 pnpm playwright test
+
 # Gateway on :7357 for `pnpm dev` (http://127.0.0.1:5173/#token=...).
 ui-dev:
     cargo run -p arena0-cli -- ui --no-open --port 7357 --dev-origin http://127.0.0.1:5173
@@ -37,7 +43,7 @@ ui-dev:
 # Run host and program tests (programs wasm first so integration tests do not skip).
 # The doctest line covers the crate doc-tests (incl. the arena0-sdk compile_fail
 # doctest), which `cargo nextest run` does not run by default.
-test: build-programs test-release-scripts
+test: build-programs build-ui test-release-scripts
     cargo nextest run --workspace
     cargo test --doc -p arena0-primitives -p arena0-sdk
     cargo nextest run --manifest-path programs/Cargo.toml
@@ -94,7 +100,7 @@ audit:
     cargo audit --file programs/Cargo.lock
 
 # All local gates for a release-facing change.
-release-check: audit check test doc build-release
+release-check: audit check check-ui test doc test-ui build-release
 
 # Start the default two-Host local Ensemble.
 dev: build-programs
