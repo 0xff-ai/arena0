@@ -1,13 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { sessionKey, useRows } from "~/model";
-import {
-  type ExecRef,
-  type ProgramRow,
-  type Seat,
-  useCall,
-  useCollections,
-  useHello,
-} from "~/sync";
+import { type ExecRef, type ProgramRow, type Seat, useCall, useCollections } from "~/sync";
 import {
   Button,
   FieldError,
@@ -16,26 +9,21 @@ import {
   SchemaForm,
   Segmented,
   Select,
-  TextField,
   validate,
 } from "~/ui";
 import { AddHostButton } from "../actions/imports";
 import { useComposer } from "../composer/store";
 import { useOpenDoc } from "../nav";
 
-type DriverKind = Seat["driver"]["kind"];
+type DriverKind = Seat["driver"];
 
 interface SeatDraft {
   host: string | null;
   kind: DriverKind;
-  strategy: string | null;
-  path: string;
 }
 
 const DRIVERS: { id: DriverKind; label: string }[] = [
   { id: "you", label: "You" },
-  { id: "builtin", label: "Strategy" },
-  { id: "executable", label: "Executable" },
   { id: "external", label: "External" },
 ];
 
@@ -52,7 +40,6 @@ const isNullSchema = (schema: JsonLike): boolean =>
 export function LaunchForm(props: { program: ProgramRow }) {
   const { program } = props;
   const collections = useCollections();
-  const hello = useHello();
   const hosts = useRows(collections.hosts);
   const executions = useRows(collections.executions);
   const callouts = useRows(collections.callouts);
@@ -60,7 +47,6 @@ export function LaunchForm(props: { program: ProgramRow }) {
   const composer = useComposer();
   const launch = useCall("launch");
 
-  const strategies = hello?.strategies ?? [];
   // A seat needs a Host that holds the program.
   const capable = hosts.filter((host) => program.hosts.includes(host.id));
 
@@ -73,9 +59,7 @@ export function LaunchForm(props: { program: ProgramRow }) {
 
   const seatAt = (index: number): SeatDraft => ({
     host: capable[index]?.id ?? null,
-    kind: index === 0 ? "you" : strategies.length > 0 ? "builtin" : "you",
-    strategy: strategies[0]?.name ?? null,
-    path: "",
+    kind: index === 0 ? "you" : "external",
     ...seatDrafts[index],
   });
   const seats = Array.from({ length: Number.isFinite(count) ? Math.max(0, count) : 0 }, (_, i) =>
@@ -104,12 +88,6 @@ export function LaunchForm(props: { program: ProgramRow }) {
   if (seats.some((seat) => seat.host === null) || new Set(chosen).size !== chosen.length) {
     problems.push("Every seat needs its own Host.");
   }
-  if (seats.some((seat) => seat.kind === "executable" && seat.path.trim() === "")) {
-    problems.push("An executable seat needs a path.");
-  }
-  if (seats.some((seat) => seat.kind === "builtin" && seat.strategy === null)) {
-    problems.push("A strategy seat needs a strategy.");
-  }
   const invalid = problems.length > 0 || paramIssues.length > 0;
 
   function start() {
@@ -124,18 +102,7 @@ export function LaunchForm(props: { program: ProgramRow }) {
     }
     const wire: Seat[] = seats.flatMap<Seat>((seat) => {
       if (seat.host === null) return [];
-      switch (seat.kind) {
-        case "you":
-          return [{ host: seat.host, driver: { kind: "you" } }];
-        case "builtin":
-          return seat.strategy === null
-            ? []
-            : [{ host: seat.host, driver: { kind: "builtin", strategy: seat.strategy } }];
-        case "executable":
-          return [{ host: seat.host, driver: { kind: "executable", path: seat.path.trim() } }];
-        case "external":
-          return [{ host: seat.host, driver: { kind: "external" } }];
-      }
+      return [{ host: seat.host, driver: seat.kind }];
     });
     launch.mutate(
       { program: program.hash, params: body, seats: wire },
@@ -206,11 +173,6 @@ export function LaunchForm(props: { program: ProgramRow }) {
                 label: host.id,
                 detail: host.user_agent ?? undefined,
               }))}
-              strategies={strategies.map((s) => ({
-                id: s.name,
-                label: s.name,
-                detail: s.description,
-              }))}
               onChange={(change) => edit(index, change)}
             />
           ))}
@@ -239,7 +201,6 @@ function SeatRow(props: {
   index: number;
   seat: SeatDraft;
   hosts: { id: string; label: string; detail?: string }[];
-  strategies: { id: string; label: string; detail?: string }[];
   onChange: (change: Partial<SeatDraft>) => void;
 }) {
   const { index, seat } = props;
@@ -260,28 +221,11 @@ function SeatRow(props: {
         value={seat.kind}
         onChange={(kind) => props.onChange({ kind })}
       />
-      {seat.kind === "builtin" ? (
-        <Select
-          placeholder={`Strategy for seat ${n}`}
-          items={props.strategies}
-          value={seat.strategy}
-          onChange={(strategy) => props.onChange({ strategy })}
-        />
-      ) : seat.kind === "executable" ? (
-        <TextField
-          aria-label={`Executable path for seat ${n}`}
-          placeholder="/path/to/agent"
-          mono
-          value={seat.path}
-          onChange={(path) => props.onChange({ path })}
-        />
-      ) : (
-        <span className="text-sm text-subtle">
-          {seat.kind === "you"
-            ? "You answer this seat's callouts"
-            : "An agent connects to this Host over MCP"}
-        </span>
-      )}
+      <span className="text-sm text-subtle">
+        {seat.kind === "you"
+          ? "You answer this seat's callouts"
+          : "An agent connects to this Host over MCP"}
+      </span>
     </>
   );
 }

@@ -23,7 +23,7 @@ export default defineConfig({
     {
       // Live suites: each worker runs a real `arena0 ui` (see e2e/harness.ts).
       name: "app",
-      testMatch: /app\/.*\.spec\.ts/,
+      testMatch: /e2e\/app\/[^/]+\.spec\.ts/,
       timeout: 120_000,
     },
   ],

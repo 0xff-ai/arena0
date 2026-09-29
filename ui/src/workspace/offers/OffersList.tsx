@@ -1,5 +1,5 @@
 import { fmtAgo, useNow, useRows } from "~/model";
-import { GatewayError, type OfferRow, useCall, useCollections } from "~/sync";
+import { DaemonError, type OfferRow, useCall, useCollections } from "~/sync";
 import {
   type Column,
   DataTable,
@@ -24,7 +24,7 @@ export function OffersList() {
   const join = useCall("join");
 
   const hostOfPeer = (peer: string) => hosts.find((host) => host.peer_id === peer)?.id;
-  const sorted = [...offers].sort((a, b) => b.last_seen_ms - a.last_seen_ms);
+  const sorted = [...offers].sort((a, b) => b.first_seen_ms - a.first_seen_ms);
 
   const joinFrom = (offer: OfferRow, host: string) =>
     join.mutate(
@@ -36,7 +36,7 @@ export function OffersList() {
       },
       {
         onSuccess: () => toasts.show({ tone: "ok", title: `Joined from ${host}` }),
-        onError: (error: GatewayError) =>
+        onError: (error: DaemonError) =>
           toasts.show({ tone: "bad", title: `Could not join from ${host}`, body: error.message }),
       },
     );
@@ -64,12 +64,12 @@ export function OffersList() {
       },
     },
     {
-      id: "seq",
-      title: "Offer seq",
+      id: "participants",
+      title: "Participants",
       width: 80,
       minWidth: 80,
       align: "end",
-      render: (offer) => <span className="font-mono text-xs tabular">{offer.offer_seq}</span>,
+      render: (offer) => <span className="font-mono text-xs tabular">{offer.target_size}</span>,
     },
     {
       id: "seen-by",
@@ -79,6 +79,20 @@ export function OffersList() {
       render: (offer) => <span className="truncate">{offer.seen_by.join(", ")}</span>,
     },
     {
+      id: "deadline",
+      title: "Deadline",
+      width: 96,
+      minWidth: 96,
+      align: "end",
+      render: (offer) => (
+        <span className="font-mono text-xs text-subtle">
+          {offer.deadline_ms > now
+            ? `in ${Math.ceil((offer.deadline_ms - now) / 1000)}s`
+            : fmtAgo(offer.deadline_ms, now)}
+        </span>
+      ),
+    },
+    {
       id: "first",
       title: "First seen",
       width: 96,
@@ -86,16 +100,6 @@ export function OffersList() {
       align: "end",
       render: (offer) => (
         <span className="font-mono text-xs text-subtle">{fmtAgo(offer.first_seen_ms, now)}</span>
-      ),
-    },
-    {
-      id: "last",
-      title: "Last seen",
-      width: 96,
-      minWidth: 96,
-      align: "end",
-      render: (offer) => (
-        <span className="font-mono text-xs text-subtle">{fmtAgo(offer.last_seen_ms, now)}</span>
       ),
     },
     {
@@ -139,7 +143,7 @@ export function OffersList() {
           label="Offers"
           columns={columns}
           rows={sorted}
-          getKey={(offer) => offer.negotiation_id}
+          getKey={(offer) => offer.key}
           rowHeight={ROW_HEIGHT}
           empty={
             <EmptyState

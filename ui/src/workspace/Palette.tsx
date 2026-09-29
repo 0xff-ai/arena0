@@ -1,8 +1,7 @@
 import { useRouter } from "@tanstack/react-router";
-import { useState } from "react";
 import { shortHash, useRows, useTheme } from "~/model";
-import { useCall, useCollections } from "~/sync";
-import { CommandPalette, ConfirmDialog, Icons, type PaletteItem, toasts } from "~/ui";
+import { useCollections } from "~/sync";
+import { CommandPalette, Icons, type PaletteItem } from "~/ui";
 import { shortSessionKey } from "./common/SessionLabel";
 import { programHref, useOpenDoc } from "./nav";
 import {
@@ -27,8 +26,6 @@ export function Palette() {
   const { all: sessions, flags } = useProblems();
   const [theme, setTheme] = useTheme();
   const [, setSignalsTab] = useSignalsTab();
-  const [confirmStop, setConfirmStop] = useState(false);
-  const stop = useCall("daemon_stop");
 
   const go = (path: string) => () => router.history.push(path);
   const goSignals = (tab: "needs" | "problems" | "activity") => () => setSignalsTab(tab);
@@ -174,12 +171,6 @@ export function Palette() {
                 kbd: "Mod+.",
                 onAction: toggleInspector,
               },
-              {
-                id: "act:stop",
-                label: "Stop daemon",
-                icon: Icons.stop,
-                onAction: () => setConfirmStop(true),
-              },
             ],
           },
         ];
@@ -191,20 +182,6 @@ export function Palette() {
         onOpenChange={(open) => (open ? openPalette(mode ?? "all") : closePalette())}
         groups={groups.filter((group) => group.items.length > 0)}
         placeholder={mode === "programs" ? "Choose a program for the new session…" : undefined}
-      />
-      <ConfirmDialog
-        title="Stop daemon"
-        body="arena0d stops, and this page loses its connection until it is started again."
-        confirmLabel="Stop daemon"
-        danger
-        isOpen={confirmStop}
-        onOpenChange={setConfirmStop}
-        onConfirm={() =>
-          stop.mutate(null, {
-            onError: (error) =>
-              toasts.show({ tone: "bad", title: "Could not stop the daemon", body: error.message }),
-          })
-        }
       />
     </>
   );

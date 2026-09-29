@@ -25,3 +25,47 @@ test("the shell syncs Hosts, programs and a completed session", async ({ page, a
     expect(problems()).toEqual([]);
   });
 });
+
+test("reconnecting reloads missed sessions and preserves observed activity", async ({
+  page,
+  arena,
+}) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await openApp(page, arena, "/sessions");
+  await seed.completed(arena, "rock-paper-scissors");
+  const listing: { executions: unknown[] } = JSON.parse(
+    await arena.cli(["--json", "--host", "host-01", "exec", "list"]),
+  );
+  const count = listing.executions.length;
+  await expect(page.getByRole("tab", { name: new RegExp(`Sessions\\s*${count}$`) })).toBeVisible();
+  const signals = page.getByRole("region", { name: "Signals" });
+  await signals.getByRole("tab", { name: /^Activity/ }).click();
+  const activity = signals.getByRole("grid", { name: "Activity" });
+  // Activity is virtualized newest-first, so retain an observed terminal row
+  // that is visible without scrolling back to the execution's creation.
+  const completed = activity.getByRole("row").filter({ hasText: "session completed" }).first();
+  await expect(completed).toBeVisible();
+  const observed = (await completed.textContent())!;
+
+  await evidence.check("a dropped connection keeps the workspace visible", async () => {
+    await page.context().setOffline(true);
+    await expect(page.getByTestId("connection")).toHaveText(/offline|connecting/);
+    await expect(page.getByRole("button", { name: "Find", exact: true })).toBeVisible();
+  });
+  // The daemon keeps running while the browser is disconnected.
+  await seed.completed(arena, "rock-paper-scissors");
+  await page.context().setOffline(false);
+  await evidence.check(
+    "reconnect resets rows to include work completed while offline",
+    async () => {
+      await expect(page.getByTestId("connection")).toHaveText(/live/, { timeout: 30_000 });
+      await expect(
+        page.getByRole("tab", { name: new RegExp(`Sessions\\s*${count + 1}$`) }),
+      ).toBeVisible();
+      await expect(activity).toContainText(observed);
+      expect(errors).toEqual([]);
+    },
+  );
+  await evidence.shots(page, "reconnected");
+});

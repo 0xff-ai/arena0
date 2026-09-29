@@ -1,5 +1,5 @@
 import { type Collection, createCollection } from "@tanstack/db";
-import type { Gateway } from "./gateway";
+import type { Daemon } from "./daemon";
 import type {
   ActivityRow,
   BlobRow,
@@ -13,7 +13,7 @@ import type {
   RowOf,
   RowOp,
   StepRow,
-} from "./protocol";
+} from "./rows";
 
 export interface Collections {
   hosts: Collection<HostRow, string>;
@@ -28,42 +28,40 @@ export interface Collections {
 }
 
 /**
- * Builds one replica collection per gateway collection. Call once per gateway:
- * each collection subscribes to `gateway.onRows` for as long as the gateway
- * lives.
+ * Builds one TanStack collection per browser row model. Call once per Daemon
+ * connection object: each collection keeps its subscription across reconnects.
  */
-export function createCollections(gateway: Gateway): Collections {
+export function createCollections(daemon: Daemon): Collections {
   return {
-    hosts: replica(gateway, "hosts", (row) => row.id),
-    executions: replica(gateway, "executions", (row) => row.key),
-    steps: replica(gateway, "steps", (row) => row.key),
-    callouts: replica(gateway, "callouts", (row) => row.key),
-    programs: replica(gateway, "programs", (row) => row.hash),
-    receipts: replica(gateway, "receipts", (row) => row.key),
-    offers: replica(gateway, "offers", (row) => row.negotiation_id),
-    activity: replica(gateway, "activity", (row) => row.key),
-    blobs: replica(gateway, "blobs", (row) => row.key),
+    hosts: replica(daemon, "hosts", (row) => row.id),
+    executions: replica(daemon, "executions", (row) => row.key),
+    steps: replica(daemon, "steps", (row) => row.key),
+    callouts: replica(daemon, "callouts", (row) => row.key),
+    programs: replica(daemon, "programs", (row) => row.hash),
+    receipts: replica(daemon, "receipts", (row) => row.key),
+    offers: replica(daemon, "offers", (row) => row.key),
+    activity: replica(daemon, "activity", (row) => row.key),
+    blobs: replica(daemon, "blobs", (row) => row.key),
   };
 }
 
 function replica<C extends CollectionName>(
-  gateway: Gateway,
+  daemon: Daemon,
   name: C,
   getKey: (row: RowOf<C>) => string,
 ): Collection<RowOf<C>, string> {
   return createCollection<RowOf<C>, string>({
     id: `arena0:${name}`,
     getKey,
-    // The collection is the only copy of the replica: the gateway sends its
-    // rows once per connection, so a collection that was garbage collected
-    // and restarted would come back empty.
+    // Workspace navigation must preserve the collection's subscription and
+    // readiness state; all documents share these page-lifetime collections.
     gcTime: 0,
     startSync: true,
     sync: {
       rowUpdateMode: "full",
       sync: ({ collection, begin, write, commit, truncate, markReady }) => {
         let ready = false;
-        return gateway.onRows((reset, batch) => {
+        return daemon.onRows((reset, batch) => {
           if (batch.collection !== name) return;
           // `name` selects the batch member, which TypeScript cannot follow through the generic.
           const ops = batch.ops as ReadonlyArray<RowOp<RowOf<C>>>;

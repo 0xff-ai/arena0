@@ -2,7 +2,7 @@ import { useRouter } from "@tanstack/react-router";
 import { useState } from "react";
 import { hostRoute } from "~/app/router";
 import { fmtAgo, fmtBytes, shortHash, useHostCounts, useNow, useRows } from "~/model";
-import { type BlobRow, useCall, useCollections } from "~/sync";
+import { type BlobRow, blobUrl, useCall, useCollections } from "~/sync";
 import {
   Badge,
   Button,
@@ -14,8 +14,6 @@ import {
   HashChip,
   Icons,
   KeyValue,
-  Select,
-  TextField,
   toasts,
 } from "~/ui";
 import { DocPage, DocSection } from "../common/DocLayout";
@@ -113,7 +111,6 @@ export function HostDoc() {
 
 function Blobs(props: { host: string; blobs: BlobRow[] }) {
   const [importing, setImporting] = useState(false);
-  const [exporting, setExporting] = useState(false);
   const columns: Column<BlobRow>[] = [
     {
       id: "hash",
@@ -130,13 +127,13 @@ function Blobs(props: { host: string; blobs: BlobRow[] }) {
       render: (blob) => <span className="font-mono tabular">{fmtBytes(blob.length)}</span>,
     },
     {
-      id: "path",
-      title: "Path",
+      id: "download",
+      title: "Download",
       width: "1fr",
       render: (blob) => (
-        <span className="truncate font-mono text-xs text-muted" title={blob.path}>
-          {blob.path}
-        </span>
+        <a href={blobUrl(props.host, blob.hash)} download className="text-accent">
+          Download
+        </a>
       ),
     },
   ];
@@ -146,20 +143,12 @@ function Blobs(props: { host: string; blobs: BlobRow[] }) {
         <Button size="sm" icon={Icons.upload} onPress={() => setImporting(true)}>
           Import blob
         </Button>
-        <Button
-          size="sm"
-          icon={Icons.download}
-          isDisabled={props.blobs.length === 0}
-          onPress={() => setExporting(true)}
-        >
-          Export blob
-        </Button>
       </div>
       {props.blobs.length === 0 ? (
         <EmptyState
           icon={Icons.blob}
           title={`No blobs on ${props.host}`}
-          body="A blob is a file this Host links by hash, so a program can refer to it. Import one by its path on this machine."
+          body="A blob is a file this Host links by hash, so a program can refer to it. Choose a file to upload it to this Host."
         />
       ) : (
         <div
@@ -176,12 +165,6 @@ function Blobs(props: { host: string; blobs: BlobRow[] }) {
         </div>
       )}
       <ImportDialog host={props.host} isOpen={importing} onOpenChange={setImporting} />
-      <ExportDialog
-        host={props.host}
-        blobs={props.blobs}
-        isOpen={exporting}
-        onOpenChange={setExporting}
-      />
     </DocSection>
   );
 }
@@ -191,11 +174,12 @@ function ImportDialog(props: {
   isOpen: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const [path, setPath] = useState("");
+  const [file, setFile] = useState<File | null>(null);
   const call = useCall("blob_import");
-  const submit = () =>
+  const submit = () => {
+    if (file === null) return;
     call.mutate(
-      { host: props.host, path: path.trim() },
+      { host: props.host, file },
       {
         onSuccess: (reply) => {
           toasts.show({
@@ -204,104 +188,27 @@ function ImportDialog(props: {
             body: `${shortHash(reply.hash)} · ${fmtBytes(reply.length)}`,
           });
           props.onOpenChange(false);
-          setPath("");
-        },
-      },
-    );
-  return (
-    <Dialog
-      title={`Import a blob into ${props.host}`}
-      isOpen={props.isOpen}
-      onOpenChange={props.onOpenChange}
-      footer={
-        <Button
-          variant="primary"
-          isDisabled={path.trim() === "" || call.isPending}
-          onPress={submit}
-        >
-          Import
-        </Button>
-      }
-    >
-      <div className="flex flex-col gap-2">
-        <TextField
-          label="File path"
-          description="A file on the machine that runs arena0d. The Host links it; it is not copied."
-          mono
-          autoFocus
-          value={path}
-          onChange={setPath}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && path.trim() !== "") submit();
-          }}
-        />
-        {call.error && <FieldError>{call.error.message}</FieldError>}
-      </div>
-    </Dialog>
-  );
-}
-
-function ExportDialog(props: {
-  host: string;
-  blobs: BlobRow[];
-  isOpen: boolean;
-  onOpenChange: (open: boolean) => void;
-}) {
-  const [hash, setHash] = useState<string | null>(null);
-  const [path, setPath] = useState("");
-  const call = useCall("blob_export");
-  const chosen = hash ?? props.blobs[0]?.hash ?? null;
-  const submit = () => {
-    if (chosen === null) return;
-    call.mutate(
-      { host: props.host, hash: chosen, path: path.trim() },
-      {
-        onSuccess: (reply) => {
-          toasts.show({
-            tone: "ok",
-            title: "Blob exported",
-            body: `${fmtBytes(reply.length)} written to ${path.trim()}`,
-          });
-          props.onOpenChange(false);
+          setFile(null);
         },
       },
     );
   };
   return (
     <Dialog
-      title={`Export a blob from ${props.host}`}
+      title={`Import a blob into ${props.host}`}
       isOpen={props.isOpen}
       onOpenChange={props.onOpenChange}
       footer={
-        <Button
-          variant="primary"
-          isDisabled={chosen === null || path.trim() === "" || call.isPending}
-          onPress={submit}
-        >
-          Export
+        <Button variant="primary" isDisabled={file === null || call.isPending} onPress={submit}>
+          Import
         </Button>
       }
     >
-      <div className="flex flex-col gap-3">
-        <Select
-          label="Blob"
-          items={props.blobs.map((blob) => ({
-            id: blob.hash,
-            label: shortHash(blob.hash, 12),
-            detail: fmtBytes(blob.length),
-          }))}
-          value={chosen}
-          onChange={setHash}
-        />
-        <TextField
-          label="Destination path"
-          description="Written on the machine that runs arena0d."
-          mono
-          value={path}
-          onChange={setPath}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && path.trim() !== "") submit();
-          }}
+      <div className="flex flex-col gap-2">
+        <input
+          aria-label="File"
+          type="file"
+          onChange={(event) => setFile(event.target.files?.item(0) ?? null)}
         />
         {call.error && <FieldError>{call.error.message}</FieldError>}
       </div>

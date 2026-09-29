@@ -11,7 +11,7 @@ import {
   useSession,
   useSessions,
 } from "~/model";
-import { type GatewayError, useCall, useCollections } from "~/sync";
+import { type DaemonError, useCall, useCollections } from "~/sync";
 import {
   Button,
   ConfirmDialog,
@@ -172,7 +172,7 @@ function Actions(props: { session: Session }) {
       op.mutate(
         { host: execution.host, exec_id: execution.exec_id },
         {
-          onError: (error: GatewayError) =>
+          onError: (error: DaemonError) =>
             toasts.show({
               tone: "bad",
               title: `${verb} failed on ${execution.host}`,

@@ -1,6 +1,6 @@
 import { useQueries } from "@tanstack/react-query";
 import type { Session } from "~/model";
-import { type RecordRow, useConnection, useGateway } from "~/sync";
+import { ops, type RecordRow, useConnection } from "~/sync";
 
 /** Records per Host the "Local events" view asks for: the latest page the daemon serves. */
 const LIMIT = 200;
@@ -11,7 +11,6 @@ const LIMIT = 200;
  * (the number of Hosts varies between renders).
  */
 export function useRecords(session: Session, enabled: boolean): Map<string, RecordRow[]> {
-  const gateway = useGateway();
   const live = useConnection().status === "live";
   const results = useQueries({
     queries: session.executions.map((execution) => {
@@ -19,7 +18,7 @@ export function useRecords(session: Session, enabled: boolean): Map<string, Reco
       return {
         // The step count in the key makes a new step a new read.
         queryKey: ["arena0", "records", args, execution.latest_step],
-        queryFn: () => gateway.call("records", args),
+        queryFn: () => ops.records(args),
         enabled: enabled && live,
       };
     }),

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { FileTrigger } from "react-aria-components";
 import { shortHash, useRows } from "~/model";
-import { GatewayError, type JsonValue, useCall, useCollections } from "~/sync";
+import { DaemonError, type JsonValue, useCall, useCollections } from "~/sync";
 import { Button, Dialog, IconButton, Icons, Select, TextField, toasts } from "~/ui";
 
 // Import and Host actions shared by the Explorer headers (compact) and the
@@ -10,16 +10,7 @@ import { Button, Dialog, IconButton, Icons, Select, TextField, toasts } from "~/
 const DEFAULT_USER_AGENT = "arena0-ui";
 
 function errorText(error: unknown): string {
-  return error instanceof GatewayError || error instanceof Error ? error.message : String(error);
-}
-
-/** The base64 the gateway expects; chunked so a large program never overflows the argument list. */
-function toBase64(bytes: Uint8Array): string {
-  let binary = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  }
-  return btoa(binary);
+  return error instanceof DaemonError || error instanceof Error ? error.message : String(error);
 }
 
 function PickerButton(props: { compact?: boolean; label: string; isDisabled?: boolean }) {
@@ -47,12 +38,11 @@ export function ImportProgramButton(props: { compact?: boolean }) {
     if (!file) return;
     setBusy(true);
     try {
-      const wasm = toBase64(new Uint8Array(await file.arrayBuffer()));
       for (const host of hosts) {
         try {
           const imported = await importProgram.mutateAsync({
             hosts: [host.id],
-            wasm_base64: wasm,
+            file,
           });
           toasts.show({
             tone: "ok",

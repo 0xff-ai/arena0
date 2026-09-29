@@ -1,4 +1,4 @@
-// Live end-to-end harness: one real daemon and gateway per Playwright worker.
+// Live end-to-end harness: one real daemon per Playwright worker.
 //
 // `arena0 ui` runs against a fresh ARENA0_HOME with its default two Hosts and
 // the bundled programs. Tests seed state through the real CLI (`arena0 run`,
@@ -6,9 +6,8 @@
 // faked. The binary comes from ARENA0_BIN, else ../target/debug/arena0.
 //
 // The page comes from one of two places:
-// - default: a Vite dev server per worker, proxying /ws to that worker's
-//   gateway (`--dev-origin`), so suites test the current source without
-//   rebuilding the binary;
+// - default: a Vite dev server per worker, proxying HTTP to that worker's
+//   daemon, so suites test the current source without rebuilding the binary;
 // - ARENA0_E2E_EMBEDDED=1: the UI embedded in the binary, as users get it
 //   (`just test-ui` builds the UI and the binary first).
 
@@ -24,12 +23,14 @@ export { expect };
 const UI_DIR = resolve(import.meta.dirname, "..");
 const BIN = process.env.ARENA0_BIN ?? resolve(UI_DIR, "../target/debug/arena0");
 const ARTIFACTS = resolve(import.meta.dirname, "artifacts");
+const FIRST = resolve(UI_DIR, "../examples/agents/first_allowed.py");
+const CHESS = resolve(UI_DIR, "e2e/agents/first_legal_move.py");
 const EMBEDDED = process.env.ARENA0_E2E_EMBEDDED === "1";
 /** crates/arena0-daemon/src/exec_manager.rs `NEGOTIATION_TIMEOUT`. */
 const NEGOTIATION_TIMEOUT_MS = 30_000;
 
 export interface Arena {
-  /** The page URL, token in the fragment. */
+  /** The page URL served by the daemon or the dev server. */
   url: string;
   home: string;
   /** Run the CLI against this daemon; resolves with stdout, rejects on a non-zero exit. */
@@ -78,41 +79,37 @@ async function waitForHttp(url: string): Promise<void> {
 
 async function startArena(): Promise<{ arena: Arena; stop(): Promise<void> }> {
   const home = mkdtempSync(join(tmpdir(), "arena0-e2e-"));
-  const env = { ...process.env, ARENA0_HOME: home };
+  // A worker owns a fresh two-Host daemon. Do not inherit the coding agent's
+  // selected Host namespace into CLI calls that intentionally use the default.
+  const env: NodeJS.ProcessEnv = { ...process.env, ARENA0_HOME: home };
+  delete env.ARENA0_CONTEXT;
+  delete env.CODEX_THREAD_ID;
+  delete env.ARENA0_SOCKET;
   const background: ChildProcess[] = [];
   const devPort = EMBEDDED ? null : await freePort();
   const devOrigin = devPort === null ? null : `http://127.0.0.1:${devPort}`;
-  const ui = spawn(
-    BIN,
-    [
-      "--json",
-      "ui",
-      "--no-open",
-      "--port",
-      "0",
-      ...(devOrigin === null ? [] : ["--dev-origin", devOrigin]),
-    ],
-    { env, stdio: ["ignore", "pipe", "inherit"] },
-  );
+  const ui = spawn(BIN, ["--json", "ui", "--no-open"], {
+    env,
+    stdio: ["ignore", "pipe", "inherit"],
+  });
   const uiExited = new Promise<void>((done) => ui.once("exit", () => done()));
-  const { url: gatewayUrl } = await firstJsonLine(ui, "arena0 ui");
+  const { url: daemonUrl } = await firstJsonLine(ui, "arena0 ui");
 
-  let url = gatewayUrl;
+  let url = daemonUrl;
   if (devOrigin !== null) {
-    const gateway = new URL(gatewayUrl);
     const vite = spawn("pnpm", ["vite", "--port", String(devPort), "--strictPort"], {
       cwd: UI_DIR,
-      env: { ...process.env, ARENA0_GATEWAY: gateway.host },
+      env: { ...process.env, ARENA0_DAEMON_URL: daemonUrl.replace(/\/$/, "") },
       stdio: "ignore",
     });
     background.push(vite);
     await waitForHttp(`${devOrigin}/`);
-    url = `${devOrigin}/${gateway.hash}`;
+    url = `${devOrigin}/`;
   }
 
   const stop = async () => {
     for (const child of background) child.kill("SIGINT");
-    // SIGINT is the gateway's Ctrl-C: it closes sockets and stops the daemon it started.
+    // The UI command stops the daemon it started when it receives Ctrl-C.
     ui.kill("SIGINT");
     await uiExited;
     rmSync(home, { recursive: true, force: true });
@@ -195,35 +192,38 @@ export function watchConsole(page: Page): () => string[] {
 export async function openApp(page: Page, arena: Arena, path = "/"): Promise<void> {
   const base = new URL(arena.url);
   const url = new URL(path, base);
-  // The token travels in the fragment; keep it.
-  url.hash = base.hash;
   await page.goto(url.toString());
   await expect(page.getByTestId("connection")).toHaveText(/live/, { timeout: 30_000 });
 }
 
 /** Seeds through the real CLI. Program names are the bundled catalog names. */
 export const seed = {
-  /** Run a program to completion with built-in strategies on both Hosts. */
+  /** Run a program to completion with executable agents on both Hosts. */
   async completed(arena: Arena, program: string): Promise<void> {
     await arena.cli([
       "--json",
       "run",
       program,
-      "--builtin",
-      "host-01=first-allowed",
-      "--builtin",
-      "host-02=first-allowed",
+      "--agent",
+      `host-01=${FIRST}`,
+      "--agent",
+      `host-02=${FIRST}`,
     ]);
   },
   /**
    * Start a session where host-01 plays the program's bundled example policy
    * and host-02 is left to the user, and resolve once host-02 has an open
-   * callout for the page to answer. `sample`, not `first-allowed`: which
-   * participant moves first varies per session, and `first-allowed` only
-   * answers enum callouts (chess moves are free-form).
+   * callout for the page to answer. Chess uses a legal-move agent because
+   * its answers are free-form; the other programs use their first enum value.
    */
   async awaitingYou(arena: Arena, program: string): Promise<{ execId: string }> {
-    arena.spawn(["--json", "launch", program, "--builtin", "host-01=sample"]);
+    arena.spawn([
+      "--json",
+      "launch",
+      program,
+      "--agent",
+      `host-01=${program === "chess" ? CHESS : FIRST}`,
+    ]);
     // Negotiation alone may take up to the daemon's 30 s negotiation timeout.
     const deadline = Date.now() + NEGOTIATION_TIMEOUT_MS + 15_000;
     while (Date.now() < deadline) {
@@ -242,6 +242,32 @@ export const seed = {
     throw new Error(`host-02 has no open ${program} callout after the negotiation deadline`);
   },
 };
+
+/** Answer each callout through exec next / exec submit with its first enum
+ * value until the daemon reports Completed or Failed. */
+export async function playFirstAllowed(arena: Arena, host: string, execId: string): Promise<void> {
+  for (;;) {
+    const next: {
+      Callout?: { pending_id: string; schema: { enum: unknown[] } };
+      Completed?: unknown;
+      Failed?: unknown;
+    } = JSON.parse(await arena.cli(["--json", "--host", host, "exec", "next", execId]));
+    if ("Completed" in next || "Failed" in next) return;
+    const callout = next.Callout!;
+    await arena.cli([
+      "--json",
+      "--host",
+      host,
+      "exec",
+      "submit",
+      execId,
+      "--pending-id",
+      callout.pending_id,
+      "--answer",
+      JSON.stringify(callout.schema.enum[0]),
+    ]);
+  }
+}
 
 /** Evidence for one suite: screenshots in both themes and the checks that passed. */
 export class Evidence {

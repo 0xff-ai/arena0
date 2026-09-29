@@ -326,12 +326,11 @@ function HostInspector(props: { id: string }) {
             empty={<span className="px-2 text-sm text-subtle">No blobs.</span>}
           >
             {(blob) => (
-              <span className="flex min-w-0 items-center gap-2" title={blob.path}>
+              <span className="flex min-w-0 items-center gap-2">
                 <HashChip hash={blob.hash} />
                 <span className="font-mono text-xs text-muted tabular">
                   {fmtBytes(blob.length)}
                 </span>
-                <span className="min-w-0 truncate font-mono text-xs text-subtle">{blob.path}</span>
               </span>
             )}
           </List>

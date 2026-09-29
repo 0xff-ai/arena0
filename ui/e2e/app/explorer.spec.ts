@@ -25,7 +25,7 @@ test("explorer, signals and timeline follow the live daemon", async ({ page, are
   const programs = explorer.getByRole("treegrid", { name: "Programs" });
   const receipts = explorer.getByRole("treegrid", { name: "Receipts" });
   const needs = signals.getByRole("grid", { name: "Needs input" });
-  // host-01 plays a strategy, so its callouts come and go; host-02's stay open.
+  // host-01 runs an agent, so its callouts come and go; host-02's stay open.
   const chessCallout = needs
     .getByRole("row")
     .filter({ hasText: "Chess" })

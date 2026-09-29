@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { fmtDuration, useNow, useRows, useSeats, useSessions } from "~/model";
-import { type CalloutRow, GatewayError, OUTCOME_UNKNOWN, useCall, useCollections } from "~/sync";
+import { type CalloutRow, DaemonError, OUTCOME_UNKNOWN, useCall, useCollections } from "~/sync";
 import {
   Button,
   FieldError,
@@ -30,8 +30,8 @@ export function ComposerDock() {
 
 /**
  * editing: the form is live. submitting: the call is in flight. accepted: the
- * daemon took the answer; agreement is pending. unknown: the socket closed
- * before the reply, so the answer may or may not have been applied. elsewhere:
+ * daemon took the answer; agreement is pending. unknown: the HTTP reply was
+ * lost, so the answer may or may not have been applied. elsewhere:
  * the callout is no longer pending.
  */
 type Phase = "editing" | "submitting" | "accepted" | "unknown" | "elsewhere";
@@ -135,12 +135,12 @@ function Composer(props: { calloutKey: string }) {
       {
         onSuccess: () => setPhase("accepted"),
         onError: (error) => {
-          if (error instanceof GatewayError && error.code === "callout_not_pending") {
+          if (error instanceof DaemonError && error.code === "CalloutNotPending") {
             draftStore.clear(calloutKey);
             setPhase("elsewhere");
           } else if (
-            error instanceof GatewayError &&
-            error.code === "gateway" &&
+            error instanceof DaemonError &&
+            error.code === "transport" &&
             error.message === OUTCOME_UNKNOWN
           ) {
             setPhase("unknown");

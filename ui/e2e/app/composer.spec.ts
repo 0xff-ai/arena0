@@ -1,8 +1,17 @@
 // Live composer, launch form and program, Host and receipt documents against a
 // real `arena0 ui`. Evidence goes to e2e/artifacts/app-composer/.
 import { readFileSync } from "node:fs";
+import { createServer } from "node:http";
 import type { Locator, Page } from "@playwright/test";
-import { type Arena, Evidence, expect, openApp, test, watchConsole } from "../harness";
+import {
+  type Arena,
+  Evidence,
+  expect,
+  openApp,
+  playFirstAllowed,
+  test,
+  watchConsole,
+} from "../harness";
 
 const evidence = new Evidence("app-composer");
 test.use({ suite: "app-composer" });
@@ -22,39 +31,69 @@ async function programHash(arena: Arena, name: string): Promise<string> {
 }
 
 /**
- * Delay the gateway's row updates on demand. The composer shows "Accepted"
- * between the daemon taking an answer and the callout row going away, which
- * on a local daemon is a few milliseconds; holding the rows makes that state
- * observable. Replies still pass, so the answer itself is the real call.
+ * Hold real SSE frames and read replies while a mutation still passes. This
+ * makes the brief Accepted state observable without changing application state
+ * or substituting daemon responses. Closing the page aborts the relay.
  */
-async function rowsHold(page: Page): Promise<{ hold(): void; release(): void }> {
-  let held: string[] | null = null;
-  let toPage: ((frame: string) => void) | null = null;
-  await page.routeWebSocket(/\/ws$/, (ws) => {
-    const server = ws.connectToServer();
-    toPage = (frame) => ws.send(frame);
-    ws.onMessage((frame) => server.send(frame));
-    server.onMessage((frame) => {
-      if (held !== null && typeof frame === "string" && frame.startsWith('{"t":"rows"')) {
-        held.push(frame);
-      } else ws.send(frame);
+async function rowsHold(page: Page, arena: Arena): Promise<{ hold(): void; release(): void }> {
+  let held: (() => void)[] | null = null;
+  const abort = new AbortController();
+  const relay = createServer(async (_request, response) => {
+    response.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Access-Control-Allow-Origin": "*",
     });
+    response.flushHeaders();
+    try {
+      const upstream = await fetch(new URL("/events", arena.url), { signal: abort.signal });
+      for await (const bytes of upstream.body!) {
+        const send = () => {
+          response.write(bytes);
+        };
+        if (held) held.push(send);
+        else send();
+      }
+    } catch (error) {
+      if (!abort.signal.aborted) response.destroy(error as Error);
+    } finally {
+      response.end();
+    }
+  });
+  await new Promise<void>((resolve) => relay.listen(0, "127.0.0.1", resolve));
+  const address = relay.address();
+  if (address === null || typeof address === "string") throw new Error("SSE relay did not bind");
+  page.on("close", () => {
+    abort.abort();
+    relay.closeAllConnections();
+    relay.close();
+  });
+  await page.route("**/events", (route) =>
+    route.continue({ url: `http://127.0.0.1:${address.port}/events` }),
+  );
+  await page.route("**/rpc", async (route) => {
+    const request = route.request().postDataJSON();
+    const reply = await route.fetch();
+    const method = request.params?.request?.method ?? request.method;
+    if (held && ["exec.status", "exec.list", "exec.trace", "receipt.list"].includes(method)) {
+      await new Promise<void>((resolve) => held!.push(resolve));
+    }
+    await route.fulfill({ response: reply });
   });
   return {
     hold: () => {
       held = [];
     },
     release: () => {
-      const frames = held ?? [];
+      const pending = held ?? [];
       held = null;
-      for (const frame of frames) toPage?.(frame);
+      for (const send of pending) send();
     },
   };
 }
 
 const composerOf = (page: Page): Locator => page.getByRole("region", { name: "Composer" });
 
-// An empty Needs input list is itself a row ("Nothing needs you"), so pick host-01's callout row (host-02 plays a strategy that answers its own callouts).
+// An empty Needs input list is itself a row ("Nothing needs you"), so pick host-01's callout row (host-02 runs an agent that answers its own callouts).
 const needsRow = (page: Page): Locator =>
   page
     .getByRole("grid", { name: "Needs input" })
@@ -74,68 +113,91 @@ test("launch a session from its program, answer through the composer until it co
   arena,
 }) => {
   const problems = watchConsole(page);
-  const rows = await rowsHold(page);
-  const hash = await programHash(arena, "rock-paper-scissors");
-  // `openApp` sets the URL's pathname, which would escape a query string.
-  await openApp(page, arena, `/programs/${hash}`);
-  await page.getByRole("main").getByRole("button", { name: "New session" }).click();
-  await expect(page).toHaveURL(/launch=true/);
+  const rows = await rowsHold(page, arena);
+  try {
+    const hash = await programHash(arena, "rock-paper-scissors");
+    // `openApp` sets the URL's pathname, which would escape a query string.
+    await openApp(page, arena, `/programs/${hash}`);
+    await page.getByRole("main").getByRole("button", { name: "New session" }).click();
+    await expect(page).toHaveURL(/launch=true/);
 
-  await evidence.check("the launch form offers two participants and two Host seats", async () => {
-    await expect(page.getByRole("textbox", { name: "Participants" })).toHaveValue("2");
-    await expect(page.getByRole("button", { name: /Host for seat 1/ })).toContainText("host-01");
-    await expect(page.getByRole("button", { name: /Host for seat 2/ })).toContainText("host-02");
-  });
+    await evidence.check("the launch form offers two participants and two Host seats", async () => {
+      await expect(page.getByRole("textbox", { name: "Participants" })).toHaveValue("2");
+      await expect(page.getByRole("button", { name: /Host for seat 1/ })).toContainText("host-01");
+      await expect(page.getByRole("button", { name: /Host for seat 2/ })).toContainText("host-02");
+    });
 
-  const seat1 = page.getByRole("radiogroup", { name: "Driver for seat 1" });
-  const seat2 = page.getByRole("radiogroup", { name: "Driver for seat 2" });
-  await seat1.getByRole("radio", { name: "You" }).click();
-  await seat2.getByRole("radio", { name: "Strategy" }).click();
-  await page.getByRole("button", { name: /Strategy for seat 2/ }).click();
-  await page.getByRole("option", { name: /first-allowed/ }).click();
-  await evidence.shots(page, "launch-form");
+    const seat1 = page.getByRole("radiogroup", { name: "Driver for seat 1" });
+    const seat2 = page.getByRole("radiogroup", { name: "Driver for seat 2" });
+    await seat1.getByRole("radio", { name: "You" }).click();
+    await seat2.getByRole("radio", { name: "External" }).click();
+    await evidence.shots(page, "launch-form");
 
-  await page.getByRole("button", { name: "Launch" }).click();
-  await evidence.check("Launch opens the new session and the composer for host-01", async () => {
-    await expect(page).toHaveURL(/\/s\//);
-    await expect(composerOf(page)).toBeVisible();
-    await expect(composerOf(page)).toContainText("host-01");
-  });
-  await evidence.shots(page, "composer-open");
+    // Either Host can act first; start the external seat before waiting for ours.
+    const joined = page.waitForResponse((response) => {
+      if (!response.url().endsWith("/rpc")) return false;
+      const request = response.request().postDataJSON();
+      return (
+        request.method === "host.call" &&
+        request.params.host === "host-02" &&
+        request.params.request.method === "exec.new"
+      );
+    });
+    await page.getByRole("button", { name: "Launch" }).click();
+    expect((await joined).ok()).toBe(true);
+    const listing: { executions: { exec_id: string; program_id: string }[] } = JSON.parse(
+      await arena.cli(["--json", "--host", "host-02", "exec", "list"]),
+    );
+    const external = listing.executions.find((execution) => execution.program_id === hash)!;
+    const playing = playFirstAllowed(arena, "host-02", external.exec_id);
+    // Retain the promise for the completion assertion without an unhandled rejection.
+    void playing.catch(() => {});
+    await evidence.check("Launch opens the new session and the composer for host-01", async () => {
+      await expect(page).toHaveURL(/\/s\//);
+      await expect(composerOf(page)).toBeVisible();
+      await expect(composerOf(page)).toContainText("host-01");
+    });
+    await evidence.shots(page, "composer-open");
 
-  const receipts = page.getByRole("tab", { name: /Receipts\s*2/ });
-  let answers = 0;
-  await evidence.check("answering through the composer accepts, closes and toasts", async () => {
-    for (;;) {
-      await expect(composerOf(page).or(receipts)).toBeVisible({ timeout: 30_000 });
-      if (await receipts.isVisible()) break;
-      await composerOf(page).getByRole("radio").first().click();
-      if (answers === 0) rows.hold();
-      await composerOf(page)
-        .getByRole("button", { name: /Submit/ })
-        .click();
-      if (answers === 0) {
-        await expect(composerOf(page)).toContainText("Accepted — waiting for agreement");
-        await evidence.shots(page, "accepted");
-        rows.release();
+    const receipts = page.getByRole("tab", { name: /Receipts\s*2/ });
+    let answers = 0;
+    await evidence.check("answering through the composer accepts, closes and toasts", async () => {
+      for (;;) {
+        await expect(composerOf(page).or(receipts)).toBeVisible({ timeout: 30_000 });
+        if (await receipts.isVisible()) break;
+        await composerOf(page).getByRole("radio").first().click();
+        if (answers === 0) rows.hold();
+        await composerOf(page)
+          .getByRole("button", { name: /Submit/ })
+          .click();
+        if (answers === 0) {
+          await expect(composerOf(page)).toContainText("Accepted — waiting for agreement");
+          await evidence.shots(page, "accepted");
+          rows.release();
+        }
+        await expect(composerOf(page)).toBeHidden();
+        // Toasts stay for several rounds, so only the first one is unambiguous.
+        if (answers === 0) await expect(page.getByText(/Answered · step \d+/)).toBeVisible();
+        answers += 1;
+        // The next round's callout appears in Needs input; open it like a user would.
+        // The last round is followed by the end handshake with the other Host, which takes seconds.
+        await expect(needsRow(page).or(receipts)).toBeVisible({ timeout: 30_000 });
+        if (await receipts.isVisible()) break;
+        await openFirstCallout(page);
       }
-      await expect(composerOf(page)).toBeHidden();
-      // Toasts stay for several rounds, so only the first one is unambiguous.
-      if (answers === 0) await expect(page.getByText(/Answered · step \d+/)).toBeVisible();
-      answers += 1;
-      // The next round's callout appears in Needs input; open it like a user would.
-      // The last round is followed by the end handshake with the other Host, which takes seconds.
-      await expect(needsRow(page).or(receipts)).toBeVisible({ timeout: 30_000 });
-      if (await receipts.isVisible()) break;
-      await openFirstCallout(page);
-    }
-  });
-  await evidence.check("the session completed after several answers", async () => {
-    expect(answers).toBeGreaterThan(1);
-  });
-  await evidence.check("no console errors or warnings", async () => {
-    expect(problems()).toEqual([]);
-  });
+    });
+    await playing;
+    await evidence.check("the session completed after several answers", async () => {
+      expect(answers).toBeGreaterThan(1);
+    });
+    await evidence.check("no console errors or warnings", async () => {
+      expect(problems()).toEqual([]);
+    });
+  } finally {
+    // Drain intercepted reads before Playwright ends this test's page context.
+    rows.release();
+    await page.unrouteAll({ behavior: "wait" });
+  }
 });
 
 test("the receipt document summarises, verifies and exports the completed session", async ({
@@ -191,8 +253,8 @@ test("an invalid answer is blocked and a draft survives switching tabs", async (
   arena,
 }) => {
   const problems = watchConsole(page);
-  // No Host is bound to a strategy, so the offer callouts stay open for the page.
-  // (A strategy answering a WorkerOffer makes the program abort the session.)
+  // No Host is bound to a agent, so the offer callouts stay open for the page.
+  // (A agent answering a WorkerOffer makes the program abort the session.)
   arena.spawn([
     "--json",
     "launch",
@@ -268,6 +330,30 @@ test("the Host document shows identity, programs and an empty blob table", async
     await expect(main.getByText("No blobs on host-01")).toBeVisible();
   });
   await evidence.shots(page, "host-doc");
+  await evidence.check("blob upload appears immediately with a daemon download link", async () => {
+    const contents = Buffer.from("browser blob upload");
+    await main.getByRole("button", { name: "Import blob" }).click();
+    const dialog = page.getByRole("dialog", { name: "Import a blob into host-01" });
+    await dialog.getByLabel("File", { exact: true }).setInputFiles({
+      name: "browser-blob.txt",
+      mimeType: "application/octet-stream",
+      buffer: contents,
+    });
+    await dialog.getByRole("button", { name: "Import", exact: true }).click();
+    await expect(dialog).toBeHidden();
+    const listing: { hash: string; length: number }[] = JSON.parse(
+      await arena.cli(["--json", "--host", "host-01", "blob", "list"]),
+    );
+    const blob = listing[0]!;
+    expect(blob.length).toBe(contents.length);
+    const link = main.getByRole("link", { name: "Download", exact: true });
+    await expect(link).toHaveAttribute("href", `/hosts/host-01/blobs/${blob.hash}`);
+    const downloading = page.waitForEvent("download");
+    await link.click();
+    const downloaded = await downloading;
+    expect(readFileSync((await downloaded.path())!)).toEqual(contents);
+  });
+  await evidence.shots(page, "blob-download");
   await evidence.check("no console errors or warnings", async () => {
     expect(problems()).toEqual([]);
   });

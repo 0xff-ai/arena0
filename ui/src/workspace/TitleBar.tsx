@@ -1,6 +1,6 @@
 import { CheckboxGroup, Dialog, DialogTrigger } from "react-aria-components";
 import { useRows, useSeats, useTheme } from "~/model";
-import { useCollections, useConnection, useHello } from "~/sync";
+import { useCollections, useConnection, useDaemonInfo } from "~/sync";
 import { Button, Checkbox, Dot, IconButton, Icons, Kbd, Popover, type Tone } from "~/ui";
 import { openPalette } from "./shell";
 
@@ -14,7 +14,7 @@ export const connectionTone: Record<string, Tone> = {
 };
 
 export function TitleBar() {
-  const hello = useHello();
+  const hello = useDaemonInfo();
   const connection = useConnection();
   const [theme, setTheme] = useTheme();
   const hosts = useRows(useCollections().hosts);
@@ -26,7 +26,7 @@ export function TitleBar() {
         <span aria-hidden>▣</span>
         arena0
       </span>
-      {hello && <span className="font-mono text-xs text-subtle">{hello.daemon.version}</span>}
+      {hello && <span className="font-mono text-xs text-subtle">{hello.version}</span>}
 
       <Button
         onPress={() => openPalette("all")}

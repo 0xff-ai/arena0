@@ -1,6 +1,6 @@
 import { Button } from "react-aria-components";
 import { shortHash, useRows, useSeats, useSessions } from "~/model";
-import { useCollections, useConnection, useHello } from "~/sync";
+import { useCollections, useConnection, useDaemonInfo } from "~/sync";
 import { Dot, Icons } from "~/ui";
 import { shortSessionKey } from "./common/SessionLabel";
 import { useSelection } from "./selection";
@@ -12,7 +12,7 @@ const quietButton =
 
 export function StatusBar() {
   const collections = useCollections();
-  const hello = useHello();
+  const hello = useDaemonInfo();
   const connection = useConnection();
   const hosts = useRows(collections.hosts);
   const callouts = useRows(collections.callouts);
@@ -69,7 +69,14 @@ export function StatusBar() {
           ? `offline · reconnecting${connection.attempt > 0 ? `, attempt ${connection.attempt}` : ""}`
           : connection.status}
       </span>
-      {hello && <span className="font-mono text-subtle">arena0d {hello.daemon.version}</span>}
+      {hello && (
+        <span
+          className="font-mono text-subtle"
+          title={`Uptime at connection: ${hello.uptime_secs}s`}
+        >
+          arena0d {hello.version}
+        </span>
+      )}
     </footer>
   );
 }

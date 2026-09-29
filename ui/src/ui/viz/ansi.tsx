@@ -71,7 +71,7 @@ const PLAIN: Style = {
 //   -    DCS, SOS, PM and APC strings
 //   -    any other escape (charset selection, RIS, ...)
 //   -    C0 controls except tab and newline, DEL, and the C1 range
-const TOKEN = new RegExp(
+const ANSI_SEQUENCE = new RegExp(
   [
     "\\u001b\\[([0-?]*)[ -/]*([@-~])",
     "\\u001b\\[[0-?]*[ -/]*",
@@ -185,7 +185,7 @@ function parse(text: string): Run[] {
   const runs: Run[] = [];
   let style = PLAIN;
   let cursor = 0;
-  for (const match of text.matchAll(TOKEN)) {
+  for (const match of text.matchAll(ANSI_SEQUENCE)) {
     if (match.index > cursor) runs.push(toRun(text.slice(cursor, match.index), style));
     cursor = match.index + match[0].length;
     const [, params, final] = match;

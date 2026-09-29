@@ -99,7 +99,7 @@ export const fade = "transition-opacity duration-120 entering:opacity-0 exiting:
 
 /**
  * The dimmed layer behind modal overlays, top-anchored at 12vh. It washes the
- * page toward the editor colour: there is no black token, and this reads the
+ * page toward the editor colour: there is no black palette entry, and this reads the
  * same in both themes.
  */
 export const scrim = `fixed inset-0 z-40 flex items-start justify-center bg-editor/60 pt-[12vh] ${fade}`;
