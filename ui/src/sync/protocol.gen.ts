@@ -73,8 +73,9 @@ export type EndPhase = "open" | "ending" | "ended";
 
 export type ActivationRow = { state: ActivationState, offer_hash: string, creator: string, target_size: number, initial_state: string, 
 /**
- * All selected participants in canonical activation order. Index `i` is
- * participant `P{i}` everywhere in the UI.
+ * All selected participants in participant order (sorted peer ids, as
+ * the committed ensemble orders them). Index `i` is participant `P{i}`
+ * everywhere in the UI, matching step signers and view cells.
  */
 participants: Array<ActivationParticipantRow>, 
 /**

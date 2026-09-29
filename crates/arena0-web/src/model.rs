@@ -106,8 +106,9 @@ pub struct ActivationRow {
     pub creator: String,
     pub target_size: u16,
     pub initial_state: String,
-    /// All selected participants in canonical activation order. Index `i` is
-    /// participant `P{i}` everywhere in the UI.
+    /// All selected participants in participant order (sorted peer ids, as
+    /// the committed ensemble orders them). Index `i` is participant `P{i}`
+    /// everywhere in the UI, matching step signers and view cells.
     pub participants: Vec<ActivationParticipantRow>,
     /// Offer params as JSON.
     pub params: Value,

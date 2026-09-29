@@ -113,14 +113,20 @@ pub(super) fn activation_row(activation: &ActivationInspection) -> ActivationRow
         creator: activation.creator.to_string(),
         target_size: activation.target_size,
         initial_state: activation.initial_state.to_string(),
-        participants: activation
-            .participants
-            .iter()
-            .map(|participant| ActivationParticipantRow {
-                peer_id: participant.peer_id.to_string(),
-                ticket_hash: participant.ticket_hash.to_string(),
-            })
-            .collect(),
+        participants: {
+            // The daemon lists tickets in activation order; participant
+            // indexes follow the committed ensemble, which sorts peer ids
+            // (`Ensemble::from_peers`). Reorder so index i is participant i.
+            let mut participants: Vec<_> = activation.participants.iter().collect();
+            participants.sort_by_key(|participant| participant.peer_id);
+            participants
+                .into_iter()
+                .map(|participant| ActivationParticipantRow {
+                    peer_id: participant.peer_id.to_string(),
+                    ticket_hash: participant.ticket_hash.to_string(),
+                })
+                .collect()
+        },
         params: activation.params.clone(),
     }
 }
