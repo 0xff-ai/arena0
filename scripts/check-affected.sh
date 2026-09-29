@@ -42,7 +42,7 @@ classify_paths() {
                 owner=full ;;
             README.md|SECURITY.md|LICENSE|LICENSE-*|docs/*.md|docs/*.svg|docs/*.png|docs/*.jpg|docs/*.jpeg|docs/*.gif)
                 owner=docs ;;
-            crates/arena0-cli/*|crates/arena0-web/*) owner=cli ;;
+            crates/arena0-cli/*) owner=cli ;;
             ui/*) owner=ui ;;
             crates/arena0-daemon/*|crates/arena0d/*) owner=daemon ;;
             programs/*) owner=programs ;;
@@ -101,7 +101,6 @@ fi
 
 commands=()
 case $scope in
-    # arena0-web belongs to cli; its wire types and gateway feed the browser.
     cli) commands=(just check-cli test-cli check-ui test-ui) ;;
     ui) commands=(just check-ui test-ui) ;;
     daemon) commands=(just check-daemon test-daemon) ;;

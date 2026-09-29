@@ -46,8 +46,13 @@ fn human_seat_is_answered_from_piped_stdin_and_the_receipt_is_printed() {
             "rock-paper-scissors",
             "--human",
             "host-01",
-            "--builtin",
-            "host-02=first-allowed",
+            "--agent",
+            &format!(
+                "host-02={}",
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../examples/agents/first_allowed.py")
+                    .display()
+            ),
         ])
         .env("ARENA0_HOME", home.path())
         .env_remove("ARENA0_SOCKET")
@@ -61,7 +66,7 @@ fn human_seat_is_answered_from_piped_stdin_and_the_receipt_is_printed() {
         .expect("spawn arena0 run");
 
     // One JSON answer per line, one per round of the three-round program.
-    // The built-in opponent always plays the first allowed move, Rock.
+    // The executable opponent always plays the first allowed move, Rock.
     let mut stdin = child.stdin.take().expect("piped stdin");
     stdin
         .write_all(b"\"Paper\"\n\"Paper\"\n\"Paper\"\n")

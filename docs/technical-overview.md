@@ -26,7 +26,7 @@ implementation names are used below to explain ownership and local topology.
 Phase 1 runs an `Ensemble` of independent logical Hosts in one `arena0d` process. The daemon owns the shared Unix API endpoint. Each Host has its own identity, program catalog, SQLite store, execution actors, and receipts. `LocalTransport` connects the Hosts through bounded in-process channels and the real protocol codec.
 
 ```text
-browser <-> arena0-web gateway <-> arena0d Unix socket <-> Ensemble
+browser <-> arena0d loopback HTTP server <-> Ensemble
                                         ^                   |
 human or agent <-> arena0 CLI -----------+                   +-- Host A
                                                             |   +-- SQLite store
@@ -59,7 +59,7 @@ The workspace manifests own dependency selection and exact versions. The table b
 | Execution agreement | BLS12-381 MinSig through `blst` | Per-execution keys and N-of-N aggregate agreements |
 | Local Host API | Length-prefixed JSON over one daemon Unix socket | Explicit routing to independent Hosts |
 | Observability | `tracing` and `tracing-subscriber` | Redacted semantic events and opt-in performance records |
-| CLI | Clap | Commands, terminal callout prompts, and browser gateway lifecycle |
+| CLI | Clap | Commands, terminal callout prompts, and browser opening and daemon lifecycle |
 | Browser workspace | React and TanStack DB | UI and a keyed replica of daemon facts |
 | Build orchestration | Cargo and `just` | Program builds, workspace builds, tests, checks, docs, audits, and release artifacts |
 
@@ -88,7 +88,7 @@ guest authoring and Host runtime
     arena0-node
 
 applications
-    arena0-home + arena0-api + arena0-client + arena0-daemon + arena0-web
+    arena0-home + arena0-api + arena0-client + arena0-daemon
     arena0 + arena0d + cargo-arena0
     ui/ (React workspace)
 ```
@@ -100,7 +100,7 @@ Protocol crates do not depend on Tokio, SQLite, Wasmtime, a transport implementa
 The three executables retain narrow dependency closures:
 
 ```text
-arena0       -> arena0-home + arena0-client + arena0-web
+arena0       -> arena0-home + arena0-client
 arena0d      -> arena0-home + arena0-daemon
 cargo-arena0 -> arena0-sandbox
 ```
@@ -110,18 +110,14 @@ sandbox dependencies in the CLI's normal dependency graph. The sandbox's
 `engine_version` integration test checks that its resolved Wasmtime version
 matches the engine identity recorded in the execution profile.
 
-`arena0-web` is the loopback gateway between the browser and the daemon's Unix
-socket. It places a per-launch token in the page URL fragment; the browser
-offers it as a WebSocket subprotocol. Upgrades require exact `Host` and `Origin`
-matches (with an explicitly configured development origin allowed). The gateway
-serves assets with a Content Security Policy (CSP) and sends no CORS headers.
-It replicates daemon facts as keyed rows: `hello`, a reset for each collection,
-`ready`, then row deltas. Browser calls map to daemon requests; the gateway does
-not own durable execution state.
+The daemon serves the web UI, `/rpc`, `/events`, and uploads on its loopback
+HTTP server. The browser uses the same daemon API and observes daemon events;
+presentation does not own durable execution state. See [HTTP API](api/http.md)
+for the endpoints and their access rules.
 
 `ui/` contains the React workspace and its TanStack DB replica. The build script
-`crates/arena0-web/build.rs` embeds `ui/dist` at Rust build time; build the UI
-before compiling a binary that must serve it.
+`crates/arena0-daemon/build.rs` embeds `ui/dist` at Rust build time; build the UI
+before compiling a daemon that must serve it.
 
 ## Responsibility and state ownership
 

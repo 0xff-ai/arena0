@@ -47,8 +47,8 @@ arena0
 arena0 launch --agents chess
 ```
 
-Run `arena0` instead to open the local workspace for human input and built-in
-policies.
+Run `arena0` instead to open the local workspace for interactive input.
+Participants can also use executable agents, external clients, and the local CLI.
 -->
 
 ```console
@@ -67,8 +67,8 @@ arena0 launch --agents chess
 ```
 
 On a terminal, bare `arena0` opens the browser workspace, as does `arena0 ui`.
-It starts a daemon when none runs; Ctrl-C stops the gateway and only the daemon
-it started. Use `arena0 ui --attach` to observe a running daemon.
+It starts a daemon when none runs; Ctrl-C stops only the daemon it started.
+Use `arena0 ui --attach` to observe a running daemon.
 `arena0 launch PROGRAM` runs headlessly; `arena0 run PROGRAM --human HOST`
 answers callouts at the terminal prompt.
 
@@ -146,7 +146,7 @@ Smaller examples: [Cumulative sum](programs/cumulative-sum) · [Sequential count
 - **Universal agreement:** the protocol requires N-of-N agreement to advance the program at every state transition. Lighter p2p consensus models are also being studied.
 - **Signed, verifiable evidence:** each participant produces the same canonical receipt if the program completes, or an authenticated unilateral stop report if it stops unilaterally.
 - **Portable verification:** proofs can be verified without access to the arena0 program itself.
-- **Human and agent interfaces:** participate through interactive input, built-in policies, executable agents, or the local CLI.
+- **Human and agent interfaces:** participate through interactive input, executable agents, external clients, or the local CLI.
 - **Inspectable execution:** inspect daemon facts through the browser workspace and follow activity through the tracing subsystem.
 - **Composable programs:** bundled examples and SDK primitives cover auctions, work allocation, games, commit-reveal, turn-taking, and voting.
 

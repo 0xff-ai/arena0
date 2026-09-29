@@ -889,7 +889,7 @@ browser workspace; `arena0 run` provides the explicit scriptable grammar, with
 installed `arena0d` child for the selected local Hosts and stop only that
 owned child when the command ends. The child still owns every Host, store,
 transport, sandbox, and runtime resource. The CLI owns only child-process
-supervision, the browser gateway, and typed socket clients. It reuses the shared
+supervision, browser opening, and typed socket clients. It reuses the shared
 endpoint and opens missing selected Hosts through the daemon's existing provisioning operation.
 It never stops a borrowed service.
 
@@ -905,13 +905,13 @@ before coordinated admission. It supervises configured local drivers; unbound Ho
 clients. `arena0 launch --agents PROGRAM` opens a two-participant program and harness
 selector, creates a private temporary home, and runs distinct Codex contexts in
 the current pane and a new right pane. The creator and open joiner use the same
-program-topic discovery as other agent clients. `arena0 ui --attach` serves the
-browser workspace through a loopback gateway connected to the shared daemon
-socket and observes the complete daemon Ensemble. Ctrl-C stops that gateway
-without stopping the borrowed daemon or its executions. Executions are keyed
+program-topic discovery as other agent clients. `arena0 ui --attach` opens the
+browser workspace served by the daemon’s loopback HTTP server and observes the
+complete daemon Ensemble. Ctrl-C closes the command without stopping the
+borrowed daemon or its executions. Executions are keyed
 by Host and local execution ID; negotiation and session identities group multiparty views.
 
-The browser gateway may submit one answer for the open callout through the ordinary
+The browser may submit one answer for the open callout through the ordinary
 `exec.submit` operation. The answer must name the exact open `CalloutId`;
 reading a callout grants no ownership or reservation. The execution actor
 serializes competing answers. A stale or losing submission reports
@@ -921,10 +921,10 @@ and a program rejection or input-handler trap returns `InputRejected` without
 ending the session. A lost submission response is an unknown outcome and must
 not trigger automatic resubmission.
 
-The browser gateway replicates typed daemon facts and maps browser calls to
-daemon requests. Each Host remains an independent protocol actor; presentation
+The daemon HTTP interface exposes typed daemon facts and accepts browser
+requests. Each Host remains an independent protocol actor; presentation
 does not own protocol or durable state. `arena0 ui` starts a daemon when none
-runs, and Ctrl-C stops the gateway and only the daemon it started. Bare `arena0`
+runs, and Ctrl-C stops only the daemon it started. Bare `arena0`
 prints help when any standard stream is not a terminal; explicit `arena0 ui`
 opens the browser workspace without that terminal requirement.
 The global `--tmp` option scopes these client paths to one private temporary

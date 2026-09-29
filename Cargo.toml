@@ -19,7 +19,6 @@ members = [
     "crates/arena0-tests",
     "crates/arena0-daemon",
     "crates/arena0d",
-    "crates/arena0-web",
     "crates/arena0-cli",
     "crates/cargo-arena0",
 ]

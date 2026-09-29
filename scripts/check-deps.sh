@@ -22,8 +22,7 @@ assert_direct() {
   fi
 }
 
-assert_direct arena0-cli arena0-client arena0-home arena0-web
-assert_direct arena0-web arena0-api arena0-client arena0-home arena0-program arena0-protocol
+assert_direct arena0-cli arena0-client arena0-home
 assert_direct arena0d arena0-daemon arena0-home
 assert_direct cargo-arena0 arena0-sandbox
 

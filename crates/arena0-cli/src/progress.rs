@@ -18,7 +18,6 @@ const ANIMATION_DELAY: Duration = Duration::from_millis(200);
 pub(crate) enum ProgressMode {
     Interactive,
     Plain,
-    Hidden,
 }
 
 impl ProgressMode {
@@ -173,16 +172,6 @@ impl RunProgress {
         }
     }
 
-    /// Progress that draws and prints nothing, for callers that report
-    /// through another surface.
-    #[must_use]
-    pub(crate) fn hidden() -> Self {
-        Self::new(
-            ProgressMode::Hidden,
-            Palette::for_mode(crate::ui::Mode::Json),
-        )
-    }
-
     pub(crate) async fn during<F>(&self, stage: RunStage, total: usize, future: F) -> F::Output
     where
         F: Future,
@@ -254,7 +243,7 @@ impl RunProgress {
         inner.record_observation();
         if inner.mode == ProgressMode::Plain {
             eprintln!("{}", RunStage::Execution.label());
-        } else if inner.mode == ProgressMode::Interactive && inner.animation_ready {
+        } else if inner.animation_ready {
             inner.show_bar();
         }
     }
@@ -353,7 +342,7 @@ mod tests {
 
     #[tokio::test]
     async fn typed_state_distinguishes_counts_waiting_callout_and_terminal_results() {
-        let progress = RunProgress::new(ProgressMode::Hidden, Palette::plain());
+        let progress = RunProgress::new(ProgressMode::Plain, Palette::plain());
 
         progress
             .during(RunStage::Connecting, 2, async {
@@ -388,7 +377,7 @@ mod tests {
         );
 
         for terminal in [RunTerminalState::Failed, RunTerminalState::Cancelled] {
-            let progress = RunProgress::new(ProgressMode::Hidden, Palette::plain());
+            let progress = RunProgress::new(ProgressMode::Plain, Palette::plain());
             progress
                 .during(RunStage::Execution, 0, std::future::ready(()))
                 .await;
@@ -402,7 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_is_absorbing_while_active_work_drains() {
-        let progress = RunProgress::new(ProgressMode::Hidden, Palette::plain());
+        let progress = RunProgress::new(ProgressMode::Plain, Palette::plain());
         let worker_progress = progress.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (drain_tx, drain_rx) = tokio::sync::oneshot::channel();

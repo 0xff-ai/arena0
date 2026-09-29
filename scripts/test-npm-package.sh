@@ -126,7 +126,7 @@ if [[ ! -S "$smoke_root/home/arena0.sock" ]]; then
 fi
 env -u ARENA0_CONTEXT -u CODEX_THREAD_ID -u ARENA0_SOCKET -u ARENA0_HOST \
   ARENA0_HOME="$smoke_root/home" "$bin_dir/arena0" --json run rock-paper-scissors \
-  --builtin host-01=sample --builtin host-02=sample \
+  --agent host-01="$repo_root/examples/agents/first_allowed.py" --agent host-02="$repo_root/examples/agents/first_allowed.py" \
   > "$smoke_root/interaction.json"
 node - "$smoke_root/interaction.json" <<'JS'
 const assert = require('node:assert/strict');

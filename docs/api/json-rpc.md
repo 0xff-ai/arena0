@@ -120,7 +120,7 @@ and `arena0 exec create PROGRAM --blob HASH` (repeatable).
 
 | Method | Params | Success |
 |---|---|---|
-| `exec.new` | `{exec_id, program, params?, ensemble, blobs?, strategy?}` | `ExecCreated` |
+| `exec.new` | `{exec_id, program, params?, ensemble, blobs?}` | `ExecCreated` |
 | `exec.list` | — | `ExecList` |
 | `exec.status` | `{exec_id}` | `Status` |
 | `exec.inspect` | `{exec_id, events_from?, events_limit}` | `Inspection` |
@@ -311,14 +311,6 @@ duplicate submission waits for agreement and then returns `CalloutNotPending`.
 Names, prompts, and answer schemas come from the program schema; context is
 guest-produced JSON for the local participant.
 
-An optional `strategy` in `exec.new` selects a daemon-owned built-in policy.
-Exact names are `first-allowed` and `sample`; unknown names fail with `BadRequest`
-before storing a request. Callers must not submit answers for these executions.
-The choice is durable and part of the request identity; recovery resumes it for
-non-terminal executions. A policy that cannot answer terminates with
-`built-in strategy '<strategy>' could not answer '<callout name>'`, without
-including the answer, context, or rejection text.
-
 `exec.submit` returns `InputRejected` when the pending callout still belongs to
 the execution but the program rejects the answer. The response message carries
 the bounded program reason when one is available. The rejection does not change
@@ -401,15 +393,10 @@ endpoint.
 | Method | Scope | Params | Success |
 |---|---|---|---|
 | `daemon.info` | Daemon | — | `DaemonInfo` |
-| `strategy.list` | Daemon | — | `StrategyList`, containing `{name, description}` entries |
 | `hosts.list` | Daemon | — | `Hosts`, containing `HostStatus` entries |
 | `hosts.open` | Daemon | `{id?,user_agent}` | `HostOpened`, containing `HostInfo` |
 | `daemon.stop` | Daemon | — | `Ack` |
 | `activity.subscribe` | Daemon | — | `ActivitySubscribed`, then `ActivityFrame` stream |
-
-`{"method":"strategy.list"}` takes no params or Host target. `first-allowed`
-answers with the first value the callout's schema allows. `sample` plays the
-bundled example policy for the program, falling back to the first allowed value.
 | `host.info` | Host | — | `HostStatus` |
 | `events.subscribe` | Host | `{filter}` | `Subscribed`, then `EventFrame` stream |
 

@@ -17,7 +17,7 @@ build-release: build-programs build-ui
 build-linux-release: build-ui
     ./scripts/build-linux-release.sh
 
-# Build the web UI into ui/dist (embedded by arena0-web at compile time).
+# Build the web UI into ui/dist (embedded by arena0-daemon at compile time).
 build-ui:
     cd ui && pnpm install --frozen-lockfile && pnpm build
 
@@ -36,9 +36,9 @@ test-ui: build-programs build-ui
     cargo build --locked -p arena0-cli -p arena0d
     cd ui && ARENA0_E2E_EMBEDDED=1 pnpm playwright test
 
-# Gateway on :7357 for `pnpm dev` (http://127.0.0.1:5173/#token=...).
+# Print the daemon HTTP URL for the browser workspace.
 ui-dev:
-    cargo run -p arena0-cli -- ui --no-open --port 7357 --dev-origin http://127.0.0.1:5173
+    cargo run -p arena0-cli -- ui --no-open
 
 # Run host and program tests (programs wasm first so integration tests do not skip).
 # The doctest line covers the crate doc-tests (incl. the arena0-sdk compile_fail

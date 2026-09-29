@@ -88,7 +88,7 @@ impl Ctx {
 #[command(
     name = "arena0",
     about = "Run local Hosts, inspect executions, and verify receipts",
-    after_help = "Examples:\n  arena0\n  arena0 launch rock-paper-scissors --hosts host-01,host-02\n  arena0 ui --attach\n  arena0 run rock-paper-scissors --human host-01 --builtin host-02=sample\n  arena0 serve\n  arena0 verify receipt.json\n\nOn a terminal, bare `arena0` opens the browser workspace, like `arena0 ui`. `arena0 launch PROGRAM` starts a headless emulation; `arena0 ui --attach` attaches to its daemon. `arena0 serve` keeps Hosts running independently for CLI and API clients.",
+    after_help = "Examples:\n  arena0\n  arena0 launch rock-paper-scissors --hosts host-01,host-02\n  arena0 ui --attach\n  arena0 run rock-paper-scissors --human host-01 --agent host-02=./examples/agents/first_allowed.py\n  arena0 serve\n  arena0 verify receipt.json\n\nOn a terminal, bare `arena0` opens the browser workspace, like `arena0 ui`. `arena0 launch PROGRAM` starts a headless emulation; `arena0 ui --attach` attaches to its daemon. `arena0 serve` keeps Hosts running independently for CLI and API clients.",
     version
 )]
 struct Cli {
@@ -143,7 +143,7 @@ enum Command {
         /// Launch two Codex Participants in the current pane and a new right pane.
         #[arg(
             long,
-            conflicts_with_all = ["hosts", "builtin", "agent", "param"]
+            conflicts_with_all = ["hosts", "agent", "param"]
         )]
         agents: bool,
         /// Program name, id, or Wasm path.
@@ -151,9 +151,6 @@ enum Command {
         /// Participating Hosts (default: host-01,host-02). Unbound Hosts use external clients.
         #[arg(long, value_delimiter = ',', value_name = "NAME")]
         hosts: Vec<HostName>,
-        /// Bind a deterministic strategy as HOST=STRATEGY.
-        #[arg(long, value_name = "HOST=STRATEGY")]
-        builtin: Vec<String>,
         /// Bind an executable JSONL agent as HOST=EXECUTABLE.
         #[arg(long, value_name = "HOST=EXECUTABLE")]
         agent: Vec<String>,
@@ -204,9 +201,6 @@ enum Command {
         /// Answer this Host's callouts at the terminal prompt.
         #[arg(long, value_name = "HOST")]
         human: Vec<HostName>,
-        /// Bind a deterministic built-in strategy as HOST=STRATEGY.
-        #[arg(long, value_name = "HOST=STRATEGY")]
-        builtin: Vec<String>,
         /// Bind an executable JSONL agent as HOST=EXECUTABLE.
         #[arg(long, value_name = "HOST=EXECUTABLE")]
         agent: Vec<String>,
@@ -580,14 +574,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             agents: false,
             program,
             hosts,
-            builtin,
             agent,
             param,
         } => {
             if socket.is_some() || host.is_some() {
                 bail!("--socket and --host do not apply to `arena0 launch`; use --hosts");
             }
-            let bindings = launch_bindings(hosts, builtin, agent)?;
+            let bindings = launch_bindings(hosts, agent)?;
             if bindings.len() < 2 {
                 bail!("an emulation requires at least two distinct Hosts");
             }
@@ -646,7 +639,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Run {
             program,
             human,
-            builtin,
             agent,
             param,
         } => {
@@ -658,7 +650,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 CoordinatedCliArgs {
                     program,
                     humans: human,
-                    builtins: builtin,
                     agents: agent,
                     params: param,
                 },
@@ -748,20 +739,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 struct CoordinatedCliArgs {
     program: String,
     humans: Vec<HostName>,
-    builtins: Vec<String>,
     agents: Vec<String>,
     params: Vec<String>,
 }
 
 fn launch_bindings(
     mut hosts: Vec<HostName>,
-    builtins: Vec<String>,
     agents: Vec<String>,
 ) -> anyhow::Result<Vec<coordinated::DriverBinding>> {
-    let bindings = builtins
+    let bindings = agents
         .iter()
-        .map(|value| parse_builtin_binding(value))
-        .chain(agents.iter().map(|value| parse_agent_binding(value)))
+        .map(|value| parse_agent_binding(value))
         .collect::<anyhow::Result<Vec<_>>>()?;
     if hosts.is_empty() {
         hosts = local_daemon::host_names(2);
@@ -827,19 +815,15 @@ async fn ui_command(
 
 async fn coordinated_run(mode: Mode, args: CoordinatedCliArgs) -> anyhow::Result<()> {
     if mode.is_json() && !args.humans.is_empty() {
-        bail!("--human cannot be used with --json; bind every Host to --builtin or --agent");
+        bail!("--human cannot be used with --json; bind every Host to --agent");
     }
 
-    let mut bindings =
-        Vec::with_capacity(args.builtins.len() + args.agents.len() + args.humans.len());
+    let mut bindings = Vec::with_capacity(args.agents.len() + args.humans.len());
     for host in args.humans {
         bindings.push(coordinated::DriverBinding::new(
             host,
             coordinated::DriverSpec::Human,
         ));
-    }
-    for binding in args.builtins {
-        bindings.push(parse_builtin_binding(&binding)?);
     }
     for binding in args.agents {
         bindings.push(parse_agent_binding(&binding)?);
@@ -874,22 +858,6 @@ async fn run_agent_launch(
         bail!("--socket, --host, and --json do not apply to `arena0 launch --agents`");
     }
     agent_launch::run(&program).await
-}
-
-fn parse_builtin_binding(value: &str) -> anyhow::Result<coordinated::DriverBinding> {
-    let (host, strategy) = value
-        .split_once('=')
-        .ok_or_else(|| anyhow!("--builtin must be HOST=STRATEGY, got '{value}'"))?;
-    if strategy.is_empty() {
-        bail!("--builtin has an empty strategy: '{value}'");
-    }
-    let host = host
-        .parse::<HostName>()
-        .with_context(|| format!("invalid Host name in --builtin '{value}'"))?;
-    Ok(coordinated::DriverBinding::new(
-        host,
-        coordinated::DriverSpec::Builtin(strategy.to_owned()),
-    ))
 }
 
 async fn run_with_bindings(
@@ -1870,7 +1838,7 @@ mod tests {
         let hosts = ["alpha", "beta", "gamma", "delta"]
             .map(|name| name.parse().unwrap())
             .to_vec();
-        let bindings = launch_bindings(hosts, vec!["beta=sample".into()], vec![]).unwrap();
+        let bindings = launch_bindings(hosts, vec!["beta=./agent.py".into()]).unwrap();
         assert_eq!(bindings.len(), 4);
         assert_eq!(
             bindings
@@ -1879,7 +1847,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["alpha", "beta", "gamma", "delta"]
         );
-        let defaults = launch_bindings(vec![], vec!["host-01=sample".into()], vec![]).unwrap();
+        let defaults = launch_bindings(vec![], vec!["host-01=./agent.py".into()]).unwrap();
         assert_eq!(defaults.len(), 2);
         assert_eq!(defaults[1].driver, coordinated::DriverSpec::External);
         assert_eq!(
@@ -1892,8 +1860,7 @@ mod tests {
         assert!(
             launch_bindings(
                 vec!["alpha".parse().unwrap(), "beta".parse().unwrap()],
-                vec!["other=sample".into()],
-                vec![]
+                vec!["other=./agent.py".into()]
             )
             .is_err()
         );
@@ -1983,8 +1950,8 @@ mod tests {
                 "program",
                 "--human",
                 "host-01",
-                "--builtin",
-                "host-02=first-allowed",
+                "--agent",
+                "host-02=./agent.py",
             ])
             .is_ok()
         );
@@ -2002,18 +1969,8 @@ mod tests {
 
     #[test]
     fn driver_bindings_require_a_host_and_driver() {
-        for (valid, missing_separator, missing_driver) in [
-            ("host-02=first-allowed", "host-02", "host-02="),
-            ("host-02=./agent.py", "host-02", "host-02="),
-        ] {
-            let parse = if valid.ends_with("agent.py") {
-                parse_agent_binding
-            } else {
-                parse_builtin_binding
-            };
-            assert!(parse(valid).is_ok());
-            assert!(parse(missing_separator).is_err());
-            assert!(parse(missing_driver).is_err());
-        }
+        assert!(parse_agent_binding("host-02=./agent.py").is_ok());
+        assert!(parse_agent_binding("host-02").is_err());
+        assert!(parse_agent_binding("host-02=").is_err());
     }
 }

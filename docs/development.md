@@ -72,9 +72,9 @@ Use Node 22 or newer and enable Corepack (`corepack enable`) to select the pnpm
 version pinned in `ui/package.json`.
 
 - `just build-ui` installs locked dependencies and builds `ui/dist`, which
-  `crates/arena0-web/build.rs` embeds when the Rust executable is built.
+  `crates/arena0-daemon/build.rs` embeds when the Rust executable is built.
 - `just ui-types` regenerates `ui/src/sync/protocol.gen.ts`; run it after changing
-  `crates/arena0-web/src/model.rs` or `crates/arena0-web/src/protocol.rs`.
+  the daemon’s browser API types.
 - `just check-ui` checks generated type freshness, lint, and TypeScript types.
 - `just test-ui` builds the required binaries and runs the live Playwright
   suites with `ARENA0_E2E_EMBEDDED=1`. Evidence goes to `ui/e2e/artifacts/`.
@@ -82,10 +82,9 @@ version pinned in `ui/package.json`.
   `ARENA0_E2E_EMBEDDED=1` to exercise the embedded build instead. The suites use
   `/usr/bin/google-chrome`.
 
-For development, run `just ui-dev` for the gateway and, in a second terminal,
-run `cd ui && pnpm dev`. Open `http://127.0.0.1:5173/` with the `#token=...`
-fragment from the gateway's printed URL. The component gallery is available at
-`http://127.0.0.1:5173/gallery` on the dev server.
+For development, build the UI with `just build-ui`, then run `just ui-dev`
+and open the daemon's printed URL. For the component gallery, run
+`cd ui && pnpm dev` and open `http://127.0.0.1:5173/gallery`.
 
 ## CI policy
 

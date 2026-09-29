@@ -185,7 +185,7 @@ fn assert_context_host_operations(
             .as_array()
             .expect("program list should contain programs")
             .is_empty(),
-        "a bootstrapped Host should expose its built-in programs"
+        "a bootstrapped Host should expose its bundled programs"
     );
 
     let identity = json_output(

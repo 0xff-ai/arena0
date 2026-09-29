@@ -1,8 +1,10 @@
 # Getting started with arena0
 
 Run a program, provide participant inputs, and verify the execution. The current
-release runs all participants locally. You can use a human interface, built-in
-policies, executable agents, or the local CLI.
+release runs all participants locally. You can use interactive input, executable
+agents, external clients, or the local CLI. For example,
+`--agent host-02=./examples/agents/first_allowed.py` binds an
+agent that answers with the first allowed value.
 
 ## Install and open the workspace
 
@@ -11,9 +13,10 @@ npm install --global @0xff-ai/arena0
 arena0
 ```
 
-`arena0 ui` opens the browser workspace, where you launch sessions, answer callouts and verify receipts.
+`arena0 ui` prints the daemon's URL and opens the browser workspace, where you
+launch sessions, answer callouts and verify receipts.
 Bare `arena0` on a terminal opens the same workspace. It starts the daemon when
-none runs; Ctrl-C stops the gateway and only the daemon it started.
+none runs; Ctrl-C stops only the daemon it started.
 Use `arena0 --tmp` for a disposable workspace that does not retain
 identities, executions, or receipts after it closes.
 
@@ -43,8 +46,8 @@ prints help when its standard streams are not terminals.
 - **Composer**: opens under the document to answer a callout with a form
   generated from the program's input schema. Press Mod+Enter to submit.
 - **Program document**: the program's schemas, callouts and phases. New
-  session opens a launch form where each participant is you, a built-in
-  strategy, an executable, or an external client.
+  session opens a launch form where each participant is You or an external client.
+  Executable agents are configured through `arena0 run --agent`.
 
 Press Mod+K for the command palette. Seats (title bar) choose which callouts
 you answer here; they are not an access boundary.
@@ -52,10 +55,11 @@ you answer here; they are not an access boundary.
 ## Answer at the terminal
 
 Use `arena0 run PROGRAM --human HOST` to answer that participant's callouts at
-the terminal prompt. For example, play against a built-in policy:
+the terminal prompt. For example, play against an agent that answers with the
+first allowed value:
 
 ```console
-arena0 run rock-paper-scissors --human host-01 --builtin host-02=sample
+arena0 run rock-paper-scissors --human host-01 --agent host-02=./examples/agents/first_allowed.py
 ```
 
 Each answer enters through the program's input contract.
@@ -162,7 +166,7 @@ clients or the browser workspace. Answering a pending callout does not
 reserve the input while an agent is working. If another client answers first,
 fetch the next decision point rather than resubmitting the stale answer.
 
-Ctrl-C in `arena0 ui --attach` stops its gateway and leaves the daemon and
+Ctrl-C in `arena0 ui --attach` closes the command and leaves the daemon and
 execution running. A launch stops only the service it started.
 Start a service with the required participant set first
 when its lifetime must be independent of a launch.

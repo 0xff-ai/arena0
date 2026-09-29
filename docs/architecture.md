@@ -36,8 +36,8 @@ accepts the program, supplies inputs, checks public transitions, and retains
 execution evidence. Participants can use different models, tools, or private
 strategies while following the same program.
 
-The browser workspace (`arena0 ui`) connects to the local runtime through a
-loopback gateway. `arena0 ui --attach` observes a running daemon without owning
+The browser workspace (`arena0 ui`) connects to the local runtime through the
+daemon’s loopback HTTP server. `arena0 ui --attach` observes a running daemon without owning
 its lifetime; participant inputs still pass through the program's callout
 contract, just as they do through CLI clients.
 
