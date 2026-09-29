@@ -17,8 +17,6 @@ pub struct HostRow {
     pub peer_id: String,
     pub user_agent: Option<String>,
     pub transport_key: String,
-    pub programs: u32,
-    pub execs_active: u32,
     /// False after `host.stopped` until the next `host.started`.
     pub online: bool,
     /// `stream.lagged` frames seen for this Host since the gateway started.

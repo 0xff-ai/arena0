@@ -11,6 +11,7 @@ import {
   Toggle,
   Toolbar,
   ToolbarSeparator,
+  useElementSize,
 } from "~/ui";
 import type { UpdateSearch } from "./update";
 import { ViewBlocks } from "./ViewBlocks";
@@ -28,19 +29,6 @@ const SIDE_BY_SIDE_PX = 900;
 const PAD_PX = 24;
 const LINE_PX = 20;
 const NO_COMPARISON = "none";
-
-function useElementWidth(): [React.RefObject<HTMLDivElement | null>, number] {
-  const ref = useRef<HTMLDivElement | null>(null);
-  const [width, setWidth] = useState(0);
-  useEffect(() => {
-    const element = ref.current;
-    if (element === null) return;
-    const observer = new ResizeObserver(([entry]) => setWidth(entry?.contentRect.width ?? 0));
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, []);
-  return [ref, width];
-}
 
 /** The width of one monospace cell at the pane's font, measured from ten glyphs. */
 function useCellWidth(): [React.RefObject<HTMLSpanElement | null>, number] {
@@ -152,7 +140,7 @@ export function ViewPane(props: {
   const host = props.host ?? first?.host;
   const compare = props.compare !== undefined && props.compare !== host ? props.compare : undefined;
   const [mode, setMode] = useState<Mode>("both");
-  const [bodyRef, bodyWidth] = useElementWidth();
+  const [bodyRef, { width: bodyWidth }] = useElementSize<HTMLDivElement>();
   const [probeRef, cellWidth] = useCellWidth();
 
   const latest = session.latestStep;

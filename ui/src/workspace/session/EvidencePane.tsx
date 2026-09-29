@@ -1,17 +1,8 @@
 import type { Session } from "~/model";
 import { type ReceiptRow, useCall } from "~/sync";
 import { Badge, Button, HashChip, Icons } from "~/ui";
+import { downloadJson } from "../common/download";
 import { VerifyCard } from "../evidence/VerifyCard";
-
-/** Starts a browser download of `text`; the object URL lives only until the click is handled. */
-function download(name: string, text: string) {
-  const url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = name;
-  link.click();
-  URL.revokeObjectURL(url);
-}
 
 function ExportButton(props: { receipt: ReceiptRow }) {
   const fetch = useCall("receipt");
@@ -24,11 +15,7 @@ function ExportButton(props: { receipt: ReceiptRow }) {
         fetch.mutate(
           { host: props.receipt.host, receipt_id: props.receipt.receipt_id },
           {
-            onSuccess: (artifact) =>
-              download(
-                `${props.receipt.receipt_id}.json`,
-                `${JSON.stringify(artifact, null, 2)}\n`,
-              ),
+            onSuccess: (artifact) => downloadJson(props.receipt.receipt_id, artifact),
           },
         )
       }

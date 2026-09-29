@@ -33,8 +33,6 @@ pub(super) fn host_row(
         peer_id: status.host.peer_id.to_string(),
         user_agent: status.host.user_agent.clone(),
         transport_key: hex::encode(status.transport_key.0),
-        programs: u32::try_from(status.programs).unwrap_or(u32::MAX),
-        execs_active: u32::try_from(status.execs_active).unwrap_or(u32::MAX),
         online,
         gaps,
         last_gap_ms,

@@ -1,8 +1,8 @@
 import { useNavigate, useSearch } from "@tanstack/react-router";
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { fmtClock, useNow, useRows, useSessions } from "~/model";
 import { useCollections } from "~/sync";
-import { Button, Segmented, type TimeBucket, TimelineChart } from "~/ui";
+import { Button, Segmented, type TimeBucket, TimelineChart, useElementSize } from "~/ui";
 
 type Range = "15m" | "1h" | "6h" | "24h";
 
@@ -14,23 +14,6 @@ const RANGE_MS: Record<Range, number> = {
 };
 const BUCKETS = 60;
 
-/** The chart is drawn in pixels, so it needs the body's height; the panel owns it. */
-function useHeight() {
-  const ref = useRef<HTMLDivElement>(null);
-  const [height, setHeight] = useState(0);
-  useEffect(() => {
-    const element = ref.current;
-    if (!element) return;
-    setHeight(Math.floor(element.getBoundingClientRect().height));
-    const observer = new ResizeObserver((entries) => {
-      for (const entry of entries) setHeight(Math.floor(entry.contentRect.height));
-    });
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, []);
-  return [ref, height] as const;
-}
-
 export function Timeline() {
   const collections = useCollections();
   const steps = useRows(collections.steps);
@@ -39,7 +22,7 @@ export function Timeline() {
   const { sessions } = useSessions();
   const now = useNow(5000);
   const [range, setRange] = useState<Range>("1h");
-  const [bodyRef, height] = useHeight();
+  const [bodyRef, { height }] = useElementSize<HTMLDivElement>();
   const navigate = useNavigate();
   // The brush is the sessions list's own filter, so it is only visible while that list is shown.
   const search = useSearch({ from: "/sessions", shouldThrow: false });

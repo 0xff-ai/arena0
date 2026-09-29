@@ -115,3 +115,32 @@ function useCollectionsReady(collections: Collections): boolean {
     () => Object.values(collections).every((collection) => collection.isReady()),
   );
 }
+
+/**
+ * Per Host: programs in its catalog, and executions that have not ended.
+ * Derived from the replicated rows, which the daemon keeps current; the
+ * daemon's own Host counters are a snapshot and are not replicated.
+ */
+export function useHostCounts(): Map<string, { programs: number; live: number }> {
+  const collections = useCollections();
+  const programs = useRows(collections.programs);
+  const executions = useRows(collections.executions);
+  const counts = new Map<string, { programs: number; live: number }>();
+  const entry = (host: string) => {
+    let found = counts.get(host);
+    if (found === undefined) {
+      found = { programs: 0, live: 0 };
+      counts.set(host, found);
+    }
+    return found;
+  };
+  for (const program of programs) for (const host of program.hosts) entry(host).programs += 1;
+  for (const execution of executions) {
+    const ended =
+      execution.lifecycle === "completed" ||
+      execution.lifecycle === "failed" ||
+      execution.lifecycle === "aborted";
+    if (!ended) entry(execution.host).live += 1;
+  }
+  return counts;
+}

@@ -13,11 +13,11 @@ import {
   JsonView,
   KeyValue,
 } from "~/ui";
+import { DocPage, DocSection } from "../common/DocLayout";
 import { SessionLabel } from "../common/SessionLabel";
 import { StateWord } from "../common/StateWord";
 import { programHref, useOpenDoc } from "../nav";
 import { useSelection } from "../selection";
-import { DocPage, DocSection } from "./DocLayout";
 import { LaunchForm } from "./LaunchForm";
 
 export function ProgramDoc() {

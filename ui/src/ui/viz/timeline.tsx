@@ -1,4 +1,5 @@
-import { type PointerEvent, useEffect, useRef, useState } from "react";
+import { type PointerEvent, useState } from "react";
+import { useElementSize } from "../size";
 
 export interface TimeBucket {
   t: number;
@@ -20,23 +21,6 @@ function formatClock(t: number, spanMs: number): string {
   }).format(t);
 }
 
-/** Tracks an element's content width; the chart draws in pixels so text stays undistorted. */
-function useWidth() {
-  const ref = useRef<SVGSVGElement>(null);
-  const [width, setWidth] = useState(0);
-  useEffect(() => {
-    const element = ref.current;
-    if (!element) return;
-    setWidth(Math.floor(element.getBoundingClientRect().width));
-    const observer = new ResizeObserver((entries) => {
-      for (const entry of entries) setWidth(Math.floor(entry.contentRect.width));
-    });
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, []);
-  return [ref, width] as const;
-}
-
 /**
  * Mirrored bars around a centre line: `up` above (with its `bad` part in the
  * failure colour) and `down` below, each half scaled to its own maximum since
@@ -54,7 +38,7 @@ export function TimelineChart(props: {
   downLabel: string;
 }) {
   const { buckets, from, to, height } = props;
-  const [ref, width] = useWidth();
+  const [ref, { width }] = useElementSize<SVGSVGElement>();
   // Pixel positions of an in-progress drag, relative to the chart's left edge.
   const [drag, setDrag] = useState<{ anchor: number; current: number } | null>(null);
 

@@ -1,7 +1,15 @@
 import { useNavigate } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 import { Button } from "react-aria-components";
-import { fmtAgo, type Session, shortHash, useNow, useRows, useSessions } from "~/model";
+import {
+  fmtAgo,
+  type Session,
+  shortHash,
+  useHostCounts,
+  useNow,
+  useRows,
+  useSessions,
+} from "~/model";
 import { type HostRow, type ReceiptRow, useCollections } from "~/sync";
 import { Badge, IconButton, Icons, Section, Sparkline, Tooltip, Tree, type TreeNode } from "~/ui";
 import { AddHostButton, ImportProgramButton, ImportReceiptButton } from "../actions/imports";
@@ -33,7 +41,6 @@ export function Explorer() {
   const programs = useRows(collections.programs);
   const receipts = useRows(collections.receipts);
   const steps = useRows(collections.steps);
-  const executions = useRows(collections.executions);
   const { sessions } = useSessions();
   const now = useNow(30_000);
   const [selection, select] = useSelection();
@@ -46,13 +53,7 @@ export function Explorer() {
       liveByProgram.set(session.programHash, (liveByProgram.get(session.programHash) ?? 0) + 1);
     }
   }
-  // `HostRow.execs_active` is a snapshot from the last Host event, so live counts come from the executions.
-  const liveByHost = new Map<string, number>();
-  for (const execution of executions) {
-    if (execution.lifecycle === "completed" || execution.lifecycle === "failed") continue;
-    if (execution.lifecycle === "aborted") continue;
-    liveByHost.set(execution.host, (liveByHost.get(execution.host) ?? 0) + 1);
-  }
+  const hostCounts = useHostCounts();
   const programName = new Map(programs.map((program) => [program.hash, program.display_name]));
 
   // Steps per 5 minutes over the last hour, oldest bucket first.
@@ -78,7 +79,12 @@ export function Explorer() {
       ),
       title: host.id,
       trailing: (
-        <HostTrailing host={host} live={liveByHost.get(host.id) ?? 0} spark={spark} now={now} />
+        <HostTrailing
+          host={host}
+          live={hostCounts.get(host.id)?.live ?? 0}
+          spark={spark}
+          now={now}
+        />
       ),
     };
   });

@@ -6,6 +6,7 @@ import {
   fmtDuration,
   type Session,
   shortHash,
+  useHostCounts,
   useNow,
   useRows,
   useSeats,
@@ -280,6 +281,7 @@ function StepInspector(props: { sessionKey: string; step: number; host: string |
 }
 
 function HostInspector(props: { id: string }) {
+  const hostCounts = useHostCounts();
   const collections = useCollections();
   const host = useRows(collections.hosts).find((row) => row.id === props.id);
   const blobs = useRows(collections.blobs).filter((blob) => blob.host === props.id);
@@ -302,8 +304,8 @@ function HostInspector(props: { id: string }) {
                 </Badge>
               ),
             },
-            { k: "programs", v: String(host.programs), mono: true },
-            { k: "active executions", v: String(host.execs_active), mono: true },
+            { k: "programs", v: String(hostCounts.get(host.id)?.programs ?? 0), mono: true },
+            { k: "active executions", v: String(hostCounts.get(host.id)?.live ?? 0), mono: true },
             {
               k: "gaps",
               v:

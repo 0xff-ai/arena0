@@ -1,5 +1,5 @@
 import { useNavigate } from "@tanstack/react-router";
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { sessionsRoute } from "~/app/router";
 import {
   fmtClock,
@@ -29,13 +29,13 @@ import {
   Segmented,
   type Tone,
   Toolbar,
+  useElementSize,
 } from "~/ui";
 import { FlagHint } from "../common/FlagHint";
 import { SessionLabel } from "../common/SessionLabel";
 import { useOpenDoc } from "../nav";
 import { useSelection } from "../selection";
 import { sessionStrip } from "./strip";
-import { useWidth } from "./useWidth";
 
 const DAY_MS = 24 * 3600 * 1000;
 const ROW_HEIGHT = 26;
@@ -95,8 +95,7 @@ export function SessionsList() {
   const [selection, select] = useSelection();
   const openDoc = useOpenDoc();
 
-  const box = useRef<HTMLDivElement>(null);
-  const width = useWidth(box);
+  const [box, { width }] = useElementSize<HTMLDivElement>();
   const [text, setText] = useState(search.q ?? "");
 
   const state = search.state ?? "live";

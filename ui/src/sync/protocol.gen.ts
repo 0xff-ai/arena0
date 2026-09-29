@@ -6,7 +6,7 @@ export type HostRow = {
 /**
  * Local namespace such as `host-01`.
  */
-id: string, peer_id: string, user_agent: string | null, transport_key: string, programs: number, execs_active: number, 
+id: string, peer_id: string, user_agent: string | null, transport_key: string, 
 /**
  * False after `host.stopped` until the next `host.started`.
  */

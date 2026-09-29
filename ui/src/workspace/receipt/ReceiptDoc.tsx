@@ -3,20 +3,9 @@ import { receiptRoute } from "~/app/router";
 import { shortHash, useRows } from "~/model";
 import { useCollections, useRead } from "~/sync";
 import { Badge, Button, EmptyState, FieldError, HashChip, Icons, JsonView, KeyValue } from "~/ui";
+import { DocPage, DocSection } from "../common/DocLayout";
+import { downloadJson } from "../common/download";
 import { VerifyCard } from "../evidence/VerifyCard";
-import { DocPage, DocSection } from "../program/DocLayout";
-
-/** Saves `artifact` as `<name>.json` through the browser's download. */
-function download(name: string, artifact: unknown) {
-  const url = URL.createObjectURL(
-    new Blob([JSON.stringify(artifact, null, 2)], { type: "application/json" }),
-  );
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `${name}.json`;
-  link.click();
-  URL.revokeObjectURL(url);
-}
 
 export function ReceiptDoc() {
   const { host, id } = receiptRoute.useParams();
@@ -59,7 +48,9 @@ export function ReceiptDoc() {
         <Button
           icon={Icons.download}
           isDisabled={artifact.data === undefined}
-          onPress={() => artifact.data !== undefined && download(receipt.receipt_id, artifact.data)}
+          onPress={() =>
+            artifact.data !== undefined && downloadJson(receipt.receipt_id, artifact.data)
+          }
         >
           Export
         </Button>

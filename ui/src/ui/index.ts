@@ -15,6 +15,7 @@ export * from "./palette";
 export * from "./panel";
 export * from "./popover";
 export * from "./section";
+export * from "./size";
 export * from "./slider";
 export * from "./status";
 export * from "./table";

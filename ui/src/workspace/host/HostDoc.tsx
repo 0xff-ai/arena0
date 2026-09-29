@@ -1,7 +1,7 @@
 import { useRouter } from "@tanstack/react-router";
 import { useState } from "react";
 import { hostRoute } from "~/app/router";
-import { fmtAgo, fmtBytes, shortHash, useNow, useRows } from "~/model";
+import { fmtAgo, fmtBytes, shortHash, useHostCounts, useNow, useRows } from "~/model";
 import { type BlobRow, useCall, useCollections } from "~/sync";
 import {
   Badge,
@@ -18,10 +18,11 @@ import {
   TextField,
   toasts,
 } from "~/ui";
+import { DocPage, DocSection } from "../common/DocLayout";
 import { useOpenDoc } from "../nav";
-import { DocPage, DocSection } from "../program/DocLayout";
 
 export function HostDoc() {
+  const hostCounts = useHostCounts();
   const { id } = hostRoute.useParams();
   const router = useRouter();
   const collections = useCollections();
@@ -71,8 +72,8 @@ export function HostDoc() {
           { k: "peer id", v: <HashChip hash={host.peer_id} chars={12} /> },
           { k: "user agent", v: host.user_agent ?? "none", title: host.user_agent ?? undefined },
           { k: "transport key", v: <HashChip hash={host.transport_key} chars={12} /> },
-          { k: "programs", v: String(host.programs), mono: true },
-          { k: "active sessions", v: String(host.execs_active), mono: true },
+          { k: "programs", v: String(hostCounts.get(host.id)?.programs ?? 0), mono: true },
+          { k: "active sessions", v: String(hostCounts.get(host.id)?.live ?? 0), mono: true },
           {
             k: "event gaps",
             v:
