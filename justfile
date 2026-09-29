@@ -10,12 +10,29 @@ build: build-programs
     cargo build
 
 # Build the optimized public executables.
-build-release: build-programs
+build-release: build-programs build-ui
     cargo build --profile optimized-release -p arena0-cli -p arena0d -p cargo-arena0
 
 # Portable Linux artifacts from any supported Linux x64 build host.
-build-linux-release:
+build-linux-release: build-ui
     ./scripts/build-linux-release.sh
+
+# Build the web UI into ui/dist (embedded by arena0-web at compile time).
+build-ui:
+    cd ui && pnpm install --frozen-lockfile && pnpm build
+
+# Regenerate the browser's wire types from crates/arena0-web.
+ui-types:
+    cargo run --quiet --locked -p arena0-web --example export_ts > ui/src/sync/protocol.gen.ts
+
+# Types fresh, lint, typecheck.
+check-ui:
+    cargo run --quiet --locked -p arena0-web --example export_ts | diff -u ui/src/sync/protocol.gen.ts -
+    cd ui && pnpm biome check . && pnpm tsc -b
+
+# Gateway on :7357 for `pnpm dev` (http://127.0.0.1:5173/#token=...).
+ui-dev:
+    cargo run -p arena0-cli -- ui --no-open --port 7357 --dev-origin http://127.0.0.1:5173
 
 # Run host and program tests (programs wasm first so integration tests do not skip).
 # The doctest line covers the crate doc-tests (incl. the arena0-sdk compile_fail
@@ -31,7 +48,7 @@ check-affected base="HEAD" head="":
     ./scripts/check-affected.sh {{quote(base)}} {{quote(head)}}
 
 # CLI subprocess tests need the real sibling daemon executable.
-test-cli: build-programs
+test-cli: build-programs build-ui
     cargo build --locked -p arena0d
     cargo nextest run --locked -p arena0-cli
 

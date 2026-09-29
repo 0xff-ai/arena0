@@ -173,12 +173,15 @@ impl ValidatedBindings {
 }
 
 /// Inputs to one coordinated local run.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct CoordinatedRunArgs {
     pub(crate) program: String,
     pub(crate) params: Option<Value>,
     pub(crate) bindings: Vec<DriverBinding>,
     pub(crate) use_tui: bool,
+    /// Receives each seat's Host and execution once, after every seat's
+    /// execution exists. Dropped unsent when the run ends before that.
+    pub(crate) created: Option<tokio::sync::oneshot::Sender<Vec<(HostName, ExecId)>>>,
 }
 
 /// The terminal projection returned by one Host's `exec.next` stream.
@@ -316,7 +319,7 @@ impl Coordinator {
     }
 
     async fn run_with_signal(
-        request: CoordinatedRunArgs,
+        mut request: CoordinatedRunArgs,
         mut signal_received: watch::Receiver<Option<String>>,
         progress: RunProgress,
     ) -> anyhow::Result<AggregateResult> {
@@ -424,6 +427,15 @@ impl Coordinator {
             progress.terminal(RunTerminalState::Cancelled);
         }
         let participants = created?;
+        if let Some(created) = request.created.take() {
+            // The receiver may have given up; the run still owns its executions.
+            let _ = created.send(
+                participants
+                    .iter()
+                    .map(|participant| (participant.host.clone(), participant.exec_id))
+                    .collect(),
+            );
+        }
         let coordinator = Self {
             participants,
             progress,

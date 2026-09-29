@@ -10,7 +10,7 @@ Check changes from BASE (default HEAD), including local untracked files.
 With HEAD, check only the committed BASE..HEAD range.
 
   --plan   Print the selected commands without running checks.
-  --scope  Print docs, cli, daemon, programs, or full for CI.
+  --scope  Print docs, cli, daemon, programs, ui, or full for CI.
   --help   Show this help.
 
 Shared, mixed code owners, unknown, empty, or unavailable changes select the full gate.
@@ -42,7 +42,8 @@ classify_paths() {
                 owner=full ;;
             README.md|SECURITY.md|LICENSE|LICENSE-*|docs/*.md|docs/*.svg|docs/*.png|docs/*.jpg|docs/*.jpeg|docs/*.gif)
                 owner=docs ;;
-            crates/arena0-cli/*) owner=cli ;;
+            crates/arena0-cli/*|crates/arena0-web/*) owner=cli ;;
+            ui/*) owner=ui ;;
             crates/arena0-daemon/*|crates/arena0d/*) owner=daemon ;;
             programs/*) owner=programs ;;
             *) owner=full ;;
@@ -101,6 +102,8 @@ fi
 commands=()
 case $scope in
     cli) commands=(just check-cli test-cli) ;;
+    # `test-ui` joins this route once the recipe exists.
+    ui) commands=(just check-ui) ;;
     daemon) commands=(just check-daemon test-daemon) ;;
     programs) commands=(just check-programs test-programs) ;;
     full) commands=(just build-programs check test doc) ;;

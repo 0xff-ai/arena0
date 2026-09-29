@@ -23,6 +23,7 @@ mod tui;
 mod ui;
 mod verify;
 mod watch;
+mod web;
 mod workspace;
 
 use arena0_client::api::Request;
@@ -164,6 +165,8 @@ enum Command {
         #[arg(long, value_name = "KEY=VALUE")]
         param: Vec<String>,
     },
+    /// Open the browser workspace.
+    Ui(web::UiArgs),
     /// Observe the local daemon and optionally answer individual callouts.
     Monitor(monitor::MonitorArgs),
     /// Show daemon status and its Hosts; --host narrows the report.
@@ -775,6 +778,28 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let result = run_with_connected_bindings(mode, program, params, bindings, true).await;
             return finish_with_daemon(result, daemon).await;
         }
+        Command::Ui(args) => {
+            if host.is_some() {
+                bail!("--host does not apply to `arena0 ui`");
+            }
+            if socket.is_some() && !args.attach {
+                bail!("--socket applies to `arena0 ui` only with --attach");
+            }
+            if tmp && args.attach {
+                bail!("--tmp does not apply to `arena0 ui --attach`");
+            }
+            let client = match socket {
+                Some(socket) => DaemonClient::new(socket),
+                None => DaemonClient::from_env()?,
+            };
+            let ctx = Ctx {
+                client,
+                host: HostName::default(),
+                mode,
+                palette: Palette::for_mode(mode),
+            };
+            return web::run(&ctx, args).await;
+        }
         Command::Monitor(mut args) => {
             if json || tmp {
                 bail!("--json and --tmp do not apply to `arena0 monitor`");
@@ -892,8 +917,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Receipt { command } => receipt(&ctx, command).await,
         Command::Verify { target, .. } => verify::verify(&ctx, target).await,
         Command::Run { .. } => unreachable!("coordinated run returned before client construction"),
-        Command::Launch { .. } | Command::Monitor(_) => {
-            unreachable!("launch/monitor returned before client construction")
+        Command::Launch { .. } | Command::Monitor(_) | Command::Ui(_) => {
+            unreachable!("launch/monitor/ui returned before client construction")
         }
     }
 }
@@ -1072,6 +1097,7 @@ async fn run_with_connected_bindings(
             params,
             bindings,
             use_tui,
+            created: None,
         },
         progress,
     )

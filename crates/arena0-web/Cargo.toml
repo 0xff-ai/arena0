@@ -8,9 +8,20 @@ description = "arena0's browser workspace: the embedded web UI and its loopback 
 publish.workspace = true
 
 [dependencies]
+arena0-api = { path = "../arena0-api" }
 arena0-client = { path = "../arena0-client" }
+arena0-program = { path = "../arena0-program" }
+arena0-protocol = { path = "../arena0-protocol" }
 
 anyhow = { workspace = true }
+axum = { workspace = true, features = ["ws"] }
+base64 = "0.22"
+futures = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+subtle = "2"
+tokio = { workspace = true }
+tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 ts-rs = { version = "12.0.1", features = ["serde-json-impl"] }

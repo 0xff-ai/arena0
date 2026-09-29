@@ -180,6 +180,16 @@ impl RunProgress {
         }
     }
 
+    /// Progress that draws and prints nothing, for callers that report
+    /// through another surface.
+    #[must_use]
+    pub(crate) fn hidden() -> Self {
+        Self::new(
+            ProgressMode::Hidden,
+            Palette::for_mode(crate::ui::Mode::Json),
+        )
+    }
+
     pub(crate) async fn during<F>(&self, stage: RunStage, total: usize, future: F) -> F::Output
     where
         F: Future,

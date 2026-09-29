@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 arena0-client = { path = "../arena0-client" }
 arena0-home = { path = "../arena0-home" }
+arena0-web = { path = "../arena0-web" }
 
 clap = { workspace = true }
 crossterm = { workspace = true }
@@ -36,6 +37,7 @@ rand = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+tokio-tungstenite = "0.29.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
