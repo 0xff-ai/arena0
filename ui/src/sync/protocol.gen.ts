@@ -23,9 +23,12 @@ export type ExecutionRow = { key: string, host: string, exec_id: string,
  */
 program: string, lifecycle: Lifecycle, negotiation_id: string | null, session_id: string | null, queue_position: number | null, 
 /**
- * Latest agreed step once the session started.
+ * Index of the latest agreed step (steps are numbered from 0, like
+ * `StepRow.step`); `None` until step 0 is certified. The daemon's
+ * `SessionStatus.step` counts agreed steps, so this is that count minus
+ * one.
  */
-step: number | null, 
+latest_step: number | null, 
 /**
  * Committed ensemble size.
  */

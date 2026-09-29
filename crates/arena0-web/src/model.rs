@@ -39,8 +39,11 @@ pub struct ExecutionRow {
     pub negotiation_id: Option<String>,
     pub session_id: Option<String>,
     pub queue_position: Option<u32>,
-    /// Latest agreed step once the session started.
-    pub step: Option<u64>,
+    /// Index of the latest agreed step (steps are numbered from 0, like
+    /// `StepRow.step`); `None` until step 0 is certified. The daemon's
+    /// `SessionStatus.step` counts agreed steps, so this is that count minus
+    /// one.
+    pub latest_step: Option<u64>,
     /// Committed ensemble size.
     pub participants: Option<u32>,
     /// Committed remote participants; excludes this Host.
