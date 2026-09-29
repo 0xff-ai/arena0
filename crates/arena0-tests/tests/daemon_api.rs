@@ -11,7 +11,10 @@ use arena0_api::{
     HostRequest, ReceiptArtifact, Request, Response, ResponseOk,
 };
 use arena0_protocol::{ExecId, NegotiationTarget, Slot};
-use common::{HostTarget, call, call_daemon, chess_wasm, created, daemon, drive, ok, rps_wasm};
+use common::{
+    HostTarget, call, call_daemon, chess_wasm, created, cumulative_sum_wasm, daemon, drive, ok,
+    rps_wasm,
+};
 use tokio::io::BufReader;
 use tokio::net::{UnixStream, unix::OwnedReadHalf, unix::OwnedWriteHalf};
 
@@ -1248,4 +1251,209 @@ async fn blobs_link_grant_and_export_by_hash() {
     .unwrap_err();
     assert_eq!(absent.code, arena0_api::ApiErrorCode::NotFound);
     assert!(!files.path().join("never.bin").exists());
+}
+
+/// Host A creates and Host B joins; both are driven to completion. The joiner
+/// passes `joiner_params`, so `None` exercises adopting the creator's terms.
+async fn complete_session(
+    d: &common::DaemonHarness,
+    creator_params: Option<serde_json::Value>,
+    joiner_params: Option<serde_json::Value>,
+) -> (ExecId, ExecId) {
+    let (exec_a, negotiation_id) = match ok(call(
+        &d.host_a,
+        &HostRequest::ExecNew {
+            exec_id: ExecId([0xa1; 32]),
+            program: d.program_id.to_string(),
+            params: creator_params,
+            ensemble: EnsembleSpec::Create {
+                participant_count: 2,
+            },
+            blobs: vec![],
+        },
+    )
+    .await)
+    {
+        ResponseOk::ExecCreated {
+            exec_id,
+            negotiation_id: Some(negotiation_id),
+            ..
+        } => (exec_id, negotiation_id),
+        other => panic!("unexpected creator response: {other:?}"),
+    };
+    let exec_b = created(
+        call(
+            &d.host_b,
+            &HostRequest::ExecNew {
+                exec_id: ExecId([0xb1; 32]),
+                program: d.program_id.to_string(),
+                params: joiner_params,
+                ensemble: EnsembleSpec::Join {
+                    target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
+                },
+                blobs: vec![],
+            },
+        )
+        .await,
+    );
+    let (session_a, session_b) = tokio::join!(drive(&d.host_a, exec_a), drive(&d.host_b, exec_b));
+    assert_eq!(session_a, session_b, "both Hosts completed one session");
+    (exec_a, exec_b)
+}
+
+/// Every participant's Host projects the offer params, including the joiner
+/// that submitted none and adopted the creator's terms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inspect_projects_offer_params() {
+    let d = daemon(&cumulative_sum_wasm()).await;
+    let params = serde_json::json!({ "target_size": 2 });
+    let (exec_a, exec_b) = complete_session(&d, Some(params.clone()), None).await;
+
+    for (host, exec_id) in [(&d.host_a, exec_a), (&d.host_b, exec_b)] {
+        let ResponseOk::Inspection(inspection) = ok(call(
+            host,
+            &HostRequest::ExecInspect {
+                exec_id,
+                events_from: None,
+                events_limit: 16,
+            },
+        )
+        .await) else {
+            panic!("expected Inspection from {}", host.name);
+        };
+        let activation = inspection
+            .activation
+            .unwrap_or_else(|| panic!("{} holds the activation", host.name));
+        assert_eq!(activation.params, params, "offer params on {}", host.name);
+    }
+}
+
+/// Agreed steps carry the local time this Host stored them, and the status
+/// carries the request's creation time and the latest durable transition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trace_and_status_carry_local_times() {
+    let d = daemon(&rps_wasm()).await;
+    let no_params = Some(serde_json::json!(null));
+    let (exec_a, exec_b) = complete_session(&d, no_params.clone(), no_params).await;
+    let after_run = arena0_node::unix_time_ms();
+
+    for (host, exec_id) in [(&d.host_a, exec_a), (&d.host_b, exec_b)] {
+        let ResponseOk::Status(status) = ok(call(host, &HostRequest::ExecStatus { exec_id }).await)
+        else {
+            panic!("expected Status from {}", host.name);
+        };
+        let ResponseOk::Trace(steps) = ok(call(
+            host,
+            &HostRequest::ExecTrace {
+                exec_id,
+                from: 0,
+                to: u64::MAX,
+            },
+        )
+        .await) else {
+            panic!("expected Trace from {}", host.name);
+        };
+        assert!(!steps.is_empty(), "a completed session agreed on steps");
+        assert!(
+            steps
+                .iter()
+                .enumerate()
+                .all(|(index, step)| step.entry.step == index as u64),
+            "{} returns the trace in step order",
+            host.name
+        );
+        assert!(
+            steps
+                .windows(2)
+                .all(|pair| pair[0].certified_at_ms <= pair[1].certified_at_ms),
+            "certification times never decrease by step on {}",
+            host.name
+        );
+        let first = steps.first().expect("non-empty").certified_at_ms;
+        let last = steps.last().expect("non-empty").certified_at_ms;
+        assert!(
+            status.created_at_ms <= first,
+            "{}: request created at {} after its first step at {first}",
+            host.name,
+            status.created_at_ms
+        );
+        assert!(
+            last <= after_run,
+            "{}: last step at {last} is after the run ended at {after_run}",
+            host.name
+        );
+        assert!(
+            status.created_at_ms <= status.updated_at_ms,
+            "{}: created {} after updated {}",
+            host.name,
+            status.created_at_ms,
+            status.updated_at_ms
+        );
+        assert!(
+            last <= status.updated_at_ms,
+            "{}: the latest transition ({}) predates the last step ({last})",
+            host.name,
+            status.updated_at_ms
+        );
+    }
+}
+
+/// `blob.list` reports every linked blob ordered by hash, and an empty Host
+/// reports none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blob_list_reports_imported_blobs() {
+    let d = daemon(&rps_wasm()).await;
+    assert_eq!(
+        ok(call(&d.host_a, &HostRequest::BlobList).await),
+        ResponseOk::BlobList(vec![]),
+        "a Host with no blobs lists none"
+    );
+
+    let files = tempfile::tempdir().expect("blob files");
+    let mut expected = Vec::new();
+    for (name, bytes) in [
+        ("short.bin", vec![1u8; 10]),
+        ("long.bin", (0..5_000u32).map(|i| (i % 253) as u8).collect()),
+    ] {
+        let path = files.path().join(name);
+        std::fs::write(&path, &bytes).unwrap();
+        expected.push(arena0_api::BlobEntry {
+            hash: arena0_protocol::BlobHash(arena0_crypto::hash(
+                arena0_crypto::HashAlgorithm::Blake3,
+                &bytes,
+            )),
+            length: bytes.len() as u64,
+            path: std::fs::canonicalize(&path).unwrap(),
+            linked: true,
+        });
+    }
+    // Import the greater hash first, so listing in insertion order would
+    // differ from the required hash order.
+    expected.sort_by_key(|entry| std::cmp::Reverse(entry.hash.0));
+    for entry in &expected {
+        assert_eq!(
+            ok(call(
+                &d.host_a,
+                &HostRequest::BlobImport {
+                    path: entry.path.clone()
+                }
+            )
+            .await),
+            ResponseOk::BlobImported {
+                hash: entry.hash,
+                length: entry.length
+            }
+        );
+    }
+    expected.sort_by_key(|entry| entry.hash.0);
+
+    assert_eq!(
+        ok(call(&d.host_a, &HostRequest::BlobList).await),
+        ResponseOk::BlobList(expected)
+    );
+    assert_eq!(
+        ok(call(&d.host_b, &HostRequest::BlobList).await),
+        ResponseOk::BlobList(vec![]),
+        "blobs are per Host"
+    );
 }

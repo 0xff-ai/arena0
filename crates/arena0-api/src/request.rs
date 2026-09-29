@@ -69,6 +69,8 @@ pub enum HostRequest {
     BlobImport { path: PathBuf },
     #[serde(rename = "blob.export")]
     BlobExport { hash: BlobHash, path: PathBuf },
+    #[serde(rename = "blob.list")]
+    BlobList,
     #[serde(rename = "program.remove")]
     ProgramRemove { program: String },
 

@@ -501,7 +501,7 @@ impl HostMonitor {
             )
             .await?
         {
-            ResponseOk::Trace(entries) => Ok(entries),
+            ResponseOk::Trace(steps) => Ok(steps.into_iter().map(|step| step.entry).collect()),
             other => bail!("unexpected exec.trace response: {other:?}"),
         }
     }
@@ -1039,6 +1039,8 @@ mod tests {
             state: ExecStatusState::Negotiating {
                 queue_position: None,
             },
+            created_at_ms: 0,
+            updated_at_ms: 0,
         }
     }
 

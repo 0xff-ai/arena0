@@ -1958,6 +1958,26 @@ impl HostService {
                 })?
                 .map(|length| ResponseOk::BlobExported { length })
                 .ok_or_else(|| ApiError::new(ApiErrorCode::NotFound, "no such blob")),
+            HostRequest::BlobList => self
+                .store
+                .list_blobs()
+                .await
+                .map(|blobs| {
+                    ResponseOk::BlobList(
+                        blobs
+                            .into_iter()
+                            .map(|blob| arena0_api::BlobEntry {
+                                hash: blob.hash,
+                                length: blob.length,
+                                path: blob.path,
+                                linked: blob.linked,
+                            })
+                            .collect(),
+                    )
+                })
+                .map_err(|error| {
+                    ApiError::new(ApiErrorCode::Storage, format!("list blobs: {error}"))
+                }),
             HostRequest::ProgramRemove { program } => {
                 let program_id = self.resolve_program(&program).await?;
                 let removed = self
@@ -2183,8 +2203,20 @@ impl HostService {
         } else {
             false
         };
-        project_exec_status_facts(self.peer_id, request, activation, state, receipt_available)
-            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))
+        let execution_updated_at_ms = self
+            .store
+            .execution_updated_at_ms(exec_id)
+            .await
+            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
+        project_exec_status_facts(
+            self.peer_id,
+            request,
+            activation,
+            state,
+            execution_updated_at_ms,
+            receipt_available,
+        )
+        .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))
     }
 
     async fn active_execution_count(&self) -> Result<usize, ApiError> {
@@ -3479,21 +3511,31 @@ impl HostService {
         Ok(ResponseOk::ExecView { step, view })
     }
 
-    /// Read trace entries directly from the durable runtime journal.
+    /// Read agreed steps and their local certification times directly from
+    /// the durable runtime journal.
     async fn trace(
         &self,
         exec_id: ExecId,
         from: u64,
         to: u64,
-    ) -> Result<Vec<arena0_protocol::TraceEntry>, ApiError> {
+    ) -> Result<Vec<arena0_api::AgreedStep>, ApiError> {
         self.store
             .load_execution(exec_id)
             .await
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
             .ok_or_else(|| ApiError::new(ApiErrorCode::NotFound, "no such execution"))?;
         self.store
-            .read_trace(exec_id, from, to)
+            .read_agreed_steps(exec_id, from, to)
             .await
+            .map(|steps| {
+                steps
+                    .into_iter()
+                    .map(|step| arena0_api::AgreedStep {
+                        certified_at_ms: step.certified_at_ms,
+                        entry: step.entry,
+                    })
+                    .collect()
+            })
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))
     }
 
@@ -3540,6 +3582,7 @@ fn project_exec_status_facts(
     request: ExecutionRequest,
     activation: Option<ActivationRecord>,
     state: Option<arena0_protocol::execution::ExecutionState>,
+    execution_updated_at_ms: Option<u64>,
     receipt_available: bool,
 ) -> anyhow::Result<ExecStatus> {
     let exec_id = request.execution_id();
@@ -3607,12 +3650,19 @@ fn project_exec_status_facts(
             anyhow::bail!("{lifecycle:?} execution {exec_id} has no execution aggregate")
         }
     };
+    // The latest durable transition is the most advanced record that exists:
+    // the execution row, else the activation record, else the request itself.
+    let updated_at_ms = execution_updated_at_ms
+        .or_else(|| activation.as_ref().map(ActivationRecord::updated_at_ms))
+        .unwrap_or_else(|| request.created_at_ms());
     Ok(ExecStatus {
         end,
         exec_id,
         negotiation_id,
         program_id,
         state,
+        created_at_ms: request.created_at_ms(),
+        updated_at_ms,
     })
 }
 
@@ -3635,6 +3685,8 @@ fn project_activation_inspection(record: ActivationRecord) -> ActivationInspecti
     let prepared = record.prepared();
     let offer = prepared.offer();
     let data = offer.data();
+    let params = serde_json::from_slice(data.params.as_bytes())
+        .expect("a loaded offer's params are validated JSON");
     ActivationInspection {
         state: match record.status() {
             ActivationRecordStatus::Prepared => ActivationInspectionState::Prepared,
@@ -3654,6 +3706,7 @@ fn project_activation_inspection(record: ActivationRecord) -> ActivationInspecti
                 ticket_hash: arena0_protocol::TicketHash::of(&ticket.data),
             })
             .collect(),
+        params,
     }
 }
 
@@ -5137,9 +5190,15 @@ mod tests {
             .await
             .expect("load prepared activation")
             .expect("prepared activation exists");
-        let prepared_status =
-            project_exec_status_facts(peer, request.clone(), Some(prepared_record), None, false)
-                .expect("project prepared status");
+        let prepared_status = project_exec_status_facts(
+            peer,
+            request.clone(),
+            Some(prepared_record),
+            None,
+            None,
+            false,
+        )
+        .expect("project prepared status");
         assert!(matches!(
             prepared_status.state,
             ExecStatusState::Activating { session_id: None }
@@ -5178,9 +5237,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![peer, other]
         );
-        let committed_status =
-            project_exec_status_facts(peer, request, Some(committed_record.clone()), None, false)
-                .expect("project committed status");
+        let committed_status = project_exec_status_facts(
+            peer,
+            request,
+            Some(committed_record.clone()),
+            None,
+            None,
+            false,
+        )
+        .expect("project committed status");
         assert!(matches!(
             committed_status.state,
             ExecStatusState::Activating {
@@ -5213,9 +5278,15 @@ mod tests {
             .await
             .expect("load failed request")
             .expect("failed request exists");
-        let failed_status =
-            project_exec_status_facts(peer, failed_request, Some(committed_record), None, false)
-                .expect("project post-commit failure");
+        let failed_status = project_exec_status_facts(
+            peer,
+            failed_request,
+            Some(committed_record),
+            None,
+            None,
+            false,
+        )
+        .expect("project post-commit failure");
         assert!(matches!(
             failed_status.state,
             ExecStatusState::Failed {

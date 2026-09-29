@@ -52,6 +52,8 @@ fn active_status() -> ExecStatus {
                 receipt_available: false,
             },
         },
+        created_at_ms: 0,
+        updated_at_ms: 0,
     }
 }
 

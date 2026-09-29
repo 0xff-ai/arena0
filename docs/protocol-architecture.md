@@ -339,6 +339,9 @@ prevents two processes from writing the same file. The actor supplies complete
 transition records; SQLite persists the execution aggregate, accepted event and
 occurrence identities, shared and local state images, effects, terminal
 records, active timers, and receipt artifacts in one authoritative transaction.
+Each agreed step row also records `certified_at_ms`, the local time the Host
+stored it. That time is a local observation kept outside the portable
+`TraceEntry`, so it never enters a receipt, a trace hash, or any commitment.
 The store does not receive individual effect commands or lease delivery work,
 and a failed transaction cannot change later reads.
 
@@ -791,7 +794,7 @@ bytes. A stopped result includes the exact `StopCause`, preserving the
 distinction between an authenticated unilateral report and a shared N-of-N
 stop. Verification does not execute Wasm and stops at these checks.
 
-This release uses store schema version 10 and rejects earlier databases with an
+This release uses store schema version 11 and rejects earlier databases with an
 unsupported-schema error. It does not rewrite or delete old evidence. Version-1
 producer-sealed receipts are also rejected; they must be inspected with the
 matching older release. Automatic migration is not provided.
@@ -963,7 +966,7 @@ The public release guarantees:
 The current compatibility boundary is `ABI_VERSION = 24`, execution profile
 version 4, `TraceEntry` format 3, the v4 `StepCommitment` domain, receipt
 artifact and body version 5, the v5 `ReceiptId` domain, and store schema
-version 9. Decoders reject unsupported versions, and no format silently accepts
+version 11. Decoders reject unsupported versions, and no format silently accepts
 evidence from an earlier release.
 
 The public workspace has no remote discovery, addressing, relay, remote program

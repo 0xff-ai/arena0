@@ -1729,10 +1729,10 @@ async fn refresh_tui(
         .await
         .with_context(|| format!("refresh TUI trace for execution {exec_id}"))?
     {
-        ResponseOk::Trace(entries) => {
+        ResponseOk::Trace(steps) => {
             tui.update(RunUpdate::Trace {
                 host: host.clone(),
-                entries,
+                entries: steps.into_iter().map(|step| step.entry).collect(),
             })
             .await?
         }
@@ -3053,6 +3053,8 @@ mod tests {
                     receipt_available: false,
                 },
             },
+            created_at_ms: 0,
+            updated_at_ms: 0,
         }))
     }
 

@@ -72,6 +72,7 @@ requested participant count must fall within it.
 |---|---|---|
 | `blob.import` | `{path}` | `BlobImported` `{hash, length}` |
 | `blob.export` | `{hash, path}` | `BlobExported` `{length}` |
+| `blob.list` | — | `BlobList` `[{hash, length, path, linked}]` |
 
 A blob is immutable content of at most 16 MiB, named by its BLAKE3 hash as 64
 hex characters. Paths are absolute paths on the Host's machine.
@@ -87,11 +88,15 @@ path, or content over the limit, is `BadRequest`.
 existing file (`BadRequest`). An unknown hash is `NotFound`; a blob whose file
 is gone or shorter than its length is `BadRequest`.
 
+`blob.list` returns every blob the Host stores, ordered by hash. `path` is the
+file the Host reads the blob from. `linked` is true for a file imported in
+place with `blob.import` and false for a file the Host received and owns.
+
 An execution reads only the blobs its participant grants in `exec.new` and the
 blobs it receives and commits. Pass a blob's `hash` and `length` to the program
 as ordinary params. The Host never logs blob bytes. The CLI wraps these as
-`arena0 blob import FILE`, `arena0 blob export HASH FILE`, and
-`arena0 exec create PROGRAM --blob HASH` (repeatable).
+`arena0 blob import FILE`, `arena0 blob export HASH FILE`, `arena0 blob list`,
+and `arena0 exec create PROGRAM --blob HASH` (repeatable).
 
 ## Execution
 
@@ -106,7 +111,7 @@ as ordinary params. The Host never logs blob bytes. The CLI wraps these as
 | `exec.submit` | `{exec_id, pending_id, answer?}` | `Ack` |
 | `exec.query` | `{exec_id, query?}` | `Query` |
 | `exec.view` | `{exec, width, color}` | `ExecView` |
-| `exec.trace` | `{exec_id, from, to}` | `Trace` |
+| `exec.trace` | `{exec_id, from, to}` | `Trace` `[{certified_at_ms, entry}]` |
 | `exec.cancel_creation` | `{exec_id}` | `Ack` |
 | `exec.withdraw` | `{exec_id}` | `Ack` |
 | `exec.terminate` | `{exec_id, reason}` | `Ack` |
@@ -140,6 +145,12 @@ Once session progress exists, its `session` object also reports the public step,
 committed participants, pending callout summary, and whether this Host's
 receipt or stop report is durably available.
 
+`exec.status` also reports two local times in Unix milliseconds:
+`created_at_ms`, when the execution request was created, and `updated_at_ms`,
+the execution's latest durable transition. Before the execution exists,
+`updated_at_ms` is the activation record's latest change, and before that the
+request's `created_at_ms`.
+
 The top-level `end` object reports local confirmation of the terminal result:
 `{"phase":"open","unconfirmed":[]}`, `{"phase":"ending","unconfirmed":["<peer-id>"]}`,
 or `{"phase":"ended","unconfirmed":[]}`. `ended` can retain unconfirmed
@@ -148,14 +159,21 @@ of this phase.
 
 `exec.inspect` is a bounded, Host-local diagnostic projection for operator
 interfaces. It returns `exec.status`, durable activation facts, participant
-peer IDs and ticket commitments, and summaries of event dispatch records.
+peer IDs and ticket commitments, the offer `params` as JSON (every participant
+of the offer signed them), and summaries of event dispatch records.
 It never returns event payloads, replacement local state, signatures, keys,
-parameters, outcomes, or callout context. Event records are the latest
+outcomes, or callout context. Event records are the latest
 store-bounded window. The response exposes the page through `events_from`,
 `events`, `events_total`, and `events_next`; `events_total` reveals when older
 records are omitted.
 Inspection data is local diagnostic evidence, not a protocol receipt or
 semantic system-event stream.
+
+`exec.trace` returns the agreed steps in `[from, to)`, each as
+`{certified_at_ms, entry}`. `entry` is the portable trace entry.
+`certified_at_ms` is the local time, in Unix milliseconds, at which this Host
+durably stored the step. It is a local observation that differs between Hosts
+and is not part of the trace entry, the trace hashes, or any receipt.
 
 ### Admission
 

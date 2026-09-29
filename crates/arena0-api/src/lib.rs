@@ -30,11 +30,11 @@ pub use events::{
 };
 pub use request::{AwaitState, EnsembleSpec, HostRequest, ProgramRefError, ReceiptRef, Request};
 pub use response::{
-    ActivationInspection, ActivationInspectionState, ActivationParticipant, ApiError, ApiErrorCode,
-    DaemonInfo, EventRecordSummary, ExecEndPhase, ExecEndStatus, ExecStatus, ExecStatusState,
-    ExecutionInspection, HostInfo, HostStatus, IdInfo, NextEvent, PendingCalloutStatus,
-    ProgramDetail, ProgramSummary, ReceiptListEntry, Response, ResponseOk, SessionProgress,
-    SessionStatus,
+    ActivationInspection, ActivationInspectionState, ActivationParticipant, AgreedStep, ApiError,
+    ApiErrorCode, BlobEntry, DaemonInfo, EventRecordSummary, ExecEndPhase, ExecEndStatus,
+    ExecStatus, ExecStatusState, ExecutionInspection, HostInfo, HostStatus, IdInfo, NextEvent,
+    PendingCalloutStatus, ProgramDetail, ProgramSummary, ReceiptListEntry, Response, ResponseOk,
+    SessionProgress, SessionStatus,
 };
 
 #[cfg(test)]
@@ -320,6 +320,8 @@ mod tests {
                     receipt_available: false,
                 },
             },
+            created_at_ms: 1_000,
+            updated_at_ms: 2_000,
         };
 
         let json = serde_json::to_value(&status).unwrap();

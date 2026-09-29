@@ -21,7 +21,7 @@ impl Database {
         prepared: PreparedActivation,
         now_ms: u64,
     ) -> Result<PrepareActivationOutcome, StoreError> {
-        let incoming = prepared_activation_record(execution_id, prepared.clone());
+        let incoming = prepared_activation_record(execution_id, prepared.clone(), now_ms);
         let encoded = prepared_activation_bytes(&prepared)?;
         self.ensure_program_registered(prepared.offer().data().program_hash)?;
         let existing = self.load_activation_in_transaction(execution_id)?;
@@ -103,7 +103,7 @@ impl Database {
         activation: Activation,
         now_ms: u64,
     ) -> Result<CommitActivationOutcome, StoreError> {
-        let incoming = committed_activation_record(execution_id, activation.clone())?;
+        let incoming = committed_activation_record(execution_id, activation.clone(), now_ms)?;
         let Some(existing) = self.load_activation_in_transaction(execution_id)? else {
             return Err(StoreError::ActivationNotFound(execution_id));
         };
@@ -169,7 +169,8 @@ impl Database {
         let row = self
             .connection
             .query_row(
-                "SELECT session_id, status, prepared_activation, committed_activation
+                "SELECT session_id, status, prepared_activation, committed_activation,
+                        updated_at_ms
                  FROM activation_records WHERE execution_id = ?1",
                 params![execution_id.0.to_vec()],
                 |row| {
@@ -178,74 +179,78 @@ impl Database {
                         row.get::<_, String>(1)?,
                         row.get::<_, Vec<u8>>(2)?,
                         row.get::<_, Option<Vec<u8>>>(3)?,
+                        row.get::<_, i64>(4)?,
                     ))
                 },
             )
             .optional()?;
-        row.map(|(session_bytes, status, prepared_bytes, committed_bytes)| {
-            let payload = open_envelope(
-                EnvelopeKind::PreparedActivation,
-                &prepared_bytes,
-                MAX_ACTIVATION_BYTES,
-            )?;
-            let prepared: PreparedActivation = decode_borsh(&payload, "prepared activation")?;
-            prepared
-                .validate()
-                .map_err(|error| StoreError::Corruption(format!("prepared activation: {error}")))?;
-            let status = parse_activation_status(&status)?;
-            let session_id = SessionHash(array32(&session_bytes, "activation session")?);
-            if prepared.session_hash() == SessionHash([0; 32]) {
-                return Err(StoreError::Corruption(
-                    "activation has zero session identity".into(),
-                ));
-            }
-            if prepared.session_hash() != session_id {
-                return Err(StoreError::Corruption(
-                    "activation session index does not match prepared evidence".into(),
-                ));
-            }
-            let committed = committed_bytes
-                .map(|bytes| {
-                    let payload =
-                        open_envelope(EnvelopeKind::Activation, &bytes, MAX_ACTIVATION_BYTES)?;
-                    let activation: Activation = decode_borsh(&payload, "activation")?;
-                    activation
-                        .validate()
-                        .map_err(|error| StoreError::Corruption(format!("activation: {error}")))?;
-                    if !prepared.matches(&activation) {
-                        return Err(StoreError::Corruption(
-                            "committed activation does not match prepared evidence".into(),
-                        ));
-                    }
-                    Ok(activation)
-                })
-                .transpose()?;
-            if matches!(status, ActivationRecordStatus::Prepared) != committed.is_none() {
-                return Err(StoreError::Corruption(
-                    "activation status and committed evidence disagree".into(),
-                ));
-            }
-            let state = match (status, committed) {
-                (ActivationRecordStatus::Prepared, None) => {
-                    ActivationRecordState::Prepared { evidence: prepared }
+        row.map(
+            |(session_bytes, status, prepared_bytes, committed_bytes, updated_at_ms)| {
+                let payload = open_envelope(
+                    EnvelopeKind::PreparedActivation,
+                    &prepared_bytes,
+                    MAX_ACTIVATION_BYTES,
+                )?;
+                let prepared: PreparedActivation = decode_borsh(&payload, "prepared activation")?;
+                prepared.validate().map_err(|error| {
+                    StoreError::Corruption(format!("prepared activation: {error}"))
+                })?;
+                let status = parse_activation_status(&status)?;
+                let session_id = SessionHash(array32(&session_bytes, "activation session")?);
+                if prepared.session_hash() == SessionHash([0; 32]) {
+                    return Err(StoreError::Corruption(
+                        "activation has zero session identity".into(),
+                    ));
                 }
-                (ActivationRecordStatus::Committed, Some(activation)) => {
-                    ActivationRecordState::Committed {
-                        evidence: prepared,
-                        activation: Box::new(activation),
-                    }
+                if prepared.session_hash() != session_id {
+                    return Err(StoreError::Corruption(
+                        "activation session index does not match prepared evidence".into(),
+                    ));
                 }
-                _ => {
+                let committed = committed_bytes
+                    .map(|bytes| {
+                        let payload =
+                            open_envelope(EnvelopeKind::Activation, &bytes, MAX_ACTIVATION_BYTES)?;
+                        let activation: Activation = decode_borsh(&payload, "activation")?;
+                        activation.validate().map_err(|error| {
+                            StoreError::Corruption(format!("activation: {error}"))
+                        })?;
+                        if !prepared.matches(&activation) {
+                            return Err(StoreError::Corruption(
+                                "committed activation does not match prepared evidence".into(),
+                            ));
+                        }
+                        Ok(activation)
+                    })
+                    .transpose()?;
+                if matches!(status, ActivationRecordStatus::Prepared) != committed.is_none() {
                     return Err(StoreError::Corruption(
                         "activation status and committed evidence disagree".into(),
                     ));
                 }
-            };
-            Ok(ActivationRecord {
-                execution_id,
-                state,
-            })
-        })
+                let state = match (status, committed) {
+                    (ActivationRecordStatus::Prepared, None) => {
+                        ActivationRecordState::Prepared { evidence: prepared }
+                    }
+                    (ActivationRecordStatus::Committed, Some(activation)) => {
+                        ActivationRecordState::Committed {
+                            evidence: prepared,
+                            activation: Box::new(activation),
+                        }
+                    }
+                    _ => {
+                        return Err(StoreError::Corruption(
+                            "activation status and committed evidence disagree".into(),
+                        ));
+                    }
+                };
+                Ok(ActivationRecord {
+                    execution_id,
+                    state,
+                    updated_at_ms: sqlite_i64(updated_at_ms)?,
+                })
+            },
+        )
         .transpose()
     }
 
