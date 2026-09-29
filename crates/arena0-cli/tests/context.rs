@@ -518,7 +518,14 @@ fn cli_create_and_open_join_activate_two_context_hosts() {
             "arena0 exec await",
         );
         assert_eq!(active["exec_id"], exec_id);
-        assert_eq!(active["exec_state"], "Active");
+        // Rock-paper-scissors opens a callout once the session starts, so
+        // await may observe the session before (`Active`) or after
+        // (`Waiting`) that first dispatch; both mean it activated.
+        let state = active["exec_state"].as_str().expect("exec state");
+        assert!(
+            matches!(state, "Active" | "Waiting"),
+            "await returned {state}"
+        );
     }
     daemon.stop();
 }
