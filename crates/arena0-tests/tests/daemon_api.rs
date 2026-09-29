@@ -93,7 +93,12 @@ async fn exec_new_returns_immediately_and_await_blocks() {
     .await)
     {
         ResponseOk::Awaited { exec_state, .. } => {
-            assert_eq!(exec_state, ExecLifecycle::Active, "await Active reached");
+            // Rock-paper-scissors opens a callout in its first dispatch, so
+            // the activated session may already be waiting on its participant.
+            assert!(
+                matches!(exec_state, ExecLifecycle::Active | ExecLifecycle::Waiting),
+                "await Active reached: {exec_state:?}"
+            );
         }
         other => panic!("unexpected await response: {other:?}"),
     }
