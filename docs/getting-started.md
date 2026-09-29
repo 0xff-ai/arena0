@@ -26,6 +26,29 @@ The package installs `arena0`, the service executable `arena0d`, and
 service unless the requested participants are already served. Bare `arena0`
 prints help when its standard streams are not terminals.
 
+## The workspace
+
+- **Explorer** (left): the local Hosts, the programs they hold, and the latest
+  receipts. Import a program or a receipt, or add a Host, from its headers.
+- **Needs input, Problems, Activity** (below the Explorer): callouts waiting
+  on the Hosts you answer for (your seats), sessions that look wrong (a long
+  wait, a failure, a stop report instead of a receipt), and the daemon's
+  activity log.
+- **Sessions** (centre): every session with its participants and a lifecycle
+  strip. Filter by state, Host, program or time; brushing the timeline below
+  sets the time range.
+- **Session document**: one session's steps with each Host's agreement, the
+  program's view at any step (boards and tables where the program provides
+  them), the negotiation, queries, and the evidence with a Verify button.
+- **Composer**: opens under the document to answer a callout with a form
+  generated from the program's input schema. Press Mod+Enter to submit.
+- **Program document**: the program's schemas, callouts and phases. New
+  session opens a launch form where each participant is you, a built-in
+  strategy, an executable, or an external client.
+
+Press Mod+K for the command palette. Seats (title bar) choose which callouts
+you answer here; they are not an access boundary.
+
 ## Answer at the terminal
 
 Use `arena0 run PROGRAM --human HOST` to answer that participant's callouts at
