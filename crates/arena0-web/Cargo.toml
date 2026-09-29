@@ -1,0 +1,19 @@
+[package]
+name = "arena0-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "arena0's browser workspace: the embedded web UI and its loopback gateway to the daemon"
+publish.workspace = true
+
+[dependencies]
+arena0-client = { path = "../arena0-client" }
+
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ts-rs = { version = "12.0.1", features = ["serde-json-impl"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,6 @@
+node_modules/
+dist/
+e2e/artifacts/
+test-results/
+playwright-report/
+*.tsbuildinfo

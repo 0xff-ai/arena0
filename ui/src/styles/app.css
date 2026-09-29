@@ -1,0 +1,248 @@
+/*
+ * The workspace's design tokens. Every colour, size, radius and font the UI
+ * uses comes from here; Tailwind's default palette and scales are removed so
+ * a stray `bg-blue-500` fails to build instead of drifting from the theme.
+ *
+ * Themes: One Light on :root, One Dark under [data-theme="dark"] on <html>.
+ * The app resolves "system" to one of the two before paint.
+ */
+@import "tailwindcss";
+@import "@fontsource/ibm-plex-sans/400.css";
+@import "@fontsource/ibm-plex-sans/500.css";
+@import "@fontsource/ibm-plex-sans/600.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+@plugin "tailwindcss-react-aria-components";
+
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+:root {
+  --title: #dcdcdd;
+  --surface: #ebebec;
+  --editor: #fafafa;
+  --elev: #f2f2f3;
+  --line: #c9c9ca;
+  --line-soft: #dfdfe0;
+  --fg: #242529;
+  --muted: #58585a;
+  --subtle: #7e8086;
+  --faint: #a2a3a7;
+  --hover: rgb(36 37 41 / 0.045);
+  --active: #efeff1;
+  --selected: rgb(92 120 226 / 0.13);
+  --accent: #5c78e2;
+  --ok: #5d9a4f;
+  --done: #a449ab;
+  --bad: #d36151;
+  --warn: #9f7e0e;
+  --info: #5c78e2;
+  --hint: #7274a7;
+  --syn-kw: #a449ab;
+  --syn-str: #5f9a51;
+  --syn-fn: #4f6fd9;
+  --syn-num: #ad6e25;
+  --syn-const: #b07a00;
+  --syn-cmt: #9b9ca0;
+  --syn-type: #3882b7;
+  --p0: #5c78e2;
+  --p1: #a449ab;
+  --p2: #2f8793;
+  --p3: #a8762a;
+  --p4: #c05a9a;
+  --pq: #9b9ca0;
+  --ansi-0: #383a42;
+  --ansi-1: #e45649;
+  --ansi-2: #50a14f;
+  --ansi-3: #c18401;
+  --ansi-4: #4078f2;
+  --ansi-5: #a626a4;
+  --ansi-6: #0184bc;
+  --ansi-7: #a0a1a7;
+  --ansi-8: #696c77;
+  --ansi-9: #ca1243;
+  --ansi-10: #3e953a;
+  --ansi-11: #a67c00;
+  --ansi-12: #2f5fd0;
+  --ansi-13: #8a1f8a;
+  --ansi-14: #0f6f8f;
+  --ansi-15: #242529;
+  --shadow-color: rgb(0 0 0 / 0.18);
+  color-scheme: light;
+}
+
+[data-theme="dark"] {
+  --title: #3b414d;
+  --surface: #2f343e;
+  --editor: #282c33;
+  --elev: #2f343e;
+  --line: #464b57;
+  --line-soft: #363c46;
+  --fg: #dce0e5;
+  --muted: #a9afbc;
+  --subtle: #878a98;
+  --faint: #5d636f;
+  --hover: rgb(255 255 255 / 0.035);
+  --active: #2f343e;
+  --selected: rgb(116 173 232 / 0.16);
+  --accent: #74ade8;
+  --ok: #34a864;
+  --done: #b477cf;
+  --bad: #e06c76;
+  --warn: #dec184;
+  --info: #74ade8;
+  --hint: #788ca6;
+  --syn-kw: #b477cf;
+  --syn-str: #a1c181;
+  --syn-fn: #73ade9;
+  --syn-num: #bf956a;
+  --syn-const: #dfc184;
+  --syn-cmt: #6b717d;
+  --syn-type: #6eb4bf;
+  --p0: #74ade8;
+  --p1: #b477cf;
+  --p2: #6eb4bf;
+  --p3: #bf956a;
+  --p4: #d898c0;
+  --pq: #6b717d;
+  --ansi-0: #3f4451;
+  --ansi-1: #e06c75;
+  --ansi-2: #98c379;
+  --ansi-3: #e5c07b;
+  --ansi-4: #61afef;
+  --ansi-5: #c678dd;
+  --ansi-6: #56b6c2;
+  --ansi-7: #d7dae0;
+  --ansi-8: #5c6370;
+  --ansi-9: #ef7d86;
+  --ansi-10: #a5e075;
+  --ansi-11: #f0cf8e;
+  --ansi-12: #7ec3ff;
+  --ansi-13: #de8eee;
+  --ansi-14: #6ed2de;
+  --ansi-15: #ffffff;
+  --shadow-color: rgb(0 0 0 / 0.45);
+  color-scheme: dark;
+}
+
+@theme {
+  --color-*: initial;
+  --font-*: initial;
+  --text-*: initial;
+  --radius-*: initial;
+  --shadow-*: initial;
+
+  --font-sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* Dense editor scale. Data is 12px mono; prose and controls are 13px sans. */
+  --text-2xs: 10.5px;
+  --text-2xs--line-height: 14px;
+  --text-xs: 11px;
+  --text-xs--line-height: 16px;
+  --text-sm: 12px;
+  --text-sm--line-height: 18px;
+  --text-base: 13px;
+  --text-base--line-height: 20px;
+  --text-md: 14px;
+  --text-md--line-height: 20px;
+  --text-lg: 16px;
+  --text-lg--line-height: 24px;
+
+  /* Square-ish corners. Chips and badges use `xs`; controls `sm`; overlays `md`.
+     `full` is for dots only. */
+  --radius-xs: 2px;
+  --radius-sm: 3px;
+  --radius-md: 4px;
+  --radius-full: 9999px;
+
+  --shadow-overlay: 0 12px 40px var(--shadow-color);
+}
+
+@theme inline {
+  --color-title: var(--title);
+  --color-surface: var(--surface);
+  --color-editor: var(--editor);
+  --color-elev: var(--elev);
+  --color-line: var(--line);
+  --color-line-soft: var(--line-soft);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-subtle: var(--subtle);
+  --color-faint: var(--faint);
+  --color-hover: var(--hover);
+  --color-active: var(--active);
+  --color-selected: var(--selected);
+  --color-accent: var(--accent);
+  --color-ok: var(--ok);
+  --color-done: var(--done);
+  --color-bad: var(--bad);
+  --color-warn: var(--warn);
+  --color-info: var(--info);
+  --color-hint: var(--hint);
+  --color-syn-kw: var(--syn-kw);
+  --color-syn-str: var(--syn-str);
+  --color-syn-fn: var(--syn-fn);
+  --color-syn-num: var(--syn-num);
+  --color-syn-const: var(--syn-const);
+  --color-syn-cmt: var(--syn-cmt);
+  --color-syn-type: var(--syn-type);
+  --color-p0: var(--p0);
+  --color-p1: var(--p1);
+  --color-p2: var(--p2);
+  --color-p3: var(--p3);
+  --color-p4: var(--p4);
+  --color-pq: var(--pq);
+  --color-ansi-0: var(--ansi-0);
+  --color-ansi-1: var(--ansi-1);
+  --color-ansi-2: var(--ansi-2);
+  --color-ansi-3: var(--ansi-3);
+  --color-ansi-4: var(--ansi-4);
+  --color-ansi-5: var(--ansi-5);
+  --color-ansi-6: var(--ansi-6);
+  --color-ansi-7: var(--ansi-7);
+  --color-ansi-8: var(--ansi-8);
+  --color-ansi-9: var(--ansi-9);
+  --color-ansi-10: var(--ansi-10);
+  --color-ansi-11: var(--ansi-11);
+  --color-ansi-12: var(--ansi-12);
+  --color-ansi-13: var(--ansi-13);
+  --color-ansi-14: var(--ansi-14);
+  --color-ansi-15: var(--ansi-15);
+  --color-transparent: transparent;
+  --color-current: currentColor;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-editor font-sans text-base text-fg antialiased;
+    overflow: hidden;
+  }
+  * {
+    @apply border-line-soft;
+  }
+  ::selection {
+    @apply bg-selected;
+  }
+  :focus-visible {
+    @apply outline-1 outline-offset-[-1px] outline-accent;
+  }
+  code,
+  kbd,
+  samp,
+  pre {
+    @apply font-mono;
+  }
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--line) transparent;
+  }
+}
+
+@utility tabular {
+  font-variant-numeric: tabular-nums;
+}
