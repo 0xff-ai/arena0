@@ -264,9 +264,10 @@ export type SeatDriver = { "kind": "you" } | { "kind": "builtin", strategy: stri
 
 export type ViewReply = { 
 /**
- * The step whose shared state was rendered.
+ * Index of the latest agreed step applied to the rendered state; `None`
+ * is the initial state before step 0.
  */
-step: number, 
+step: number | null, 
 /**
  * Slot text: UTF-8 with ANSI SGR sequences only.
  */

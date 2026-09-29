@@ -274,8 +274,9 @@ pub enum SeatDriver {
 
 #[derive(Debug, Clone, PartialEq, Serialize, TS)]
 pub struct ViewReply {
-    /// The step whose shared state was rendered.
-    pub step: u64,
+    /// Index of the latest agreed step applied to the rendered state; `None`
+    /// is the initial state before step 0.
+    pub step: Option<u64>,
     /// Slot text: UTF-8 with ANSI SGR sequences only.
     pub header: Option<String>,
     pub agents: Option<String>,
