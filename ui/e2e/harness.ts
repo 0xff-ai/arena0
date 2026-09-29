@@ -3,19 +3,28 @@
 // `arena0 ui` runs against a fresh ARENA0_HOME with its default two Hosts and
 // the bundled programs. Tests seed state through the real CLI (`arena0 run`,
 // `arena0 launch`) against that same home, then drive the page. Nothing is
-// faked. The binary comes from ARENA0_BIN, else ../target/debug/arena0; it
-// must have been built after `pnpm build` so it embeds the current UI.
+// faked. The binary comes from ARENA0_BIN, else ../target/debug/arena0.
+//
+// The page comes from one of two places:
+// - default: a Vite dev server per worker, proxying /ws to that worker's
+//   gateway (`--dev-origin`), so suites test the current source without
+//   rebuilding the binary;
+// - ARENA0_E2E_EMBEDDED=1: the UI embedded in the binary, as users get it
+//   (`just test-ui` builds the UI and the binary first).
 
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test as base, expect, type Page } from "@playwright/test";
 
 export { expect };
 
-const BIN = process.env.ARENA0_BIN ?? resolve(import.meta.dirname, "../../target/debug/arena0");
+const UI_DIR = resolve(import.meta.dirname, "..");
+const BIN = process.env.ARENA0_BIN ?? resolve(UI_DIR, "../target/debug/arena0");
 const ARTIFACTS = resolve(import.meta.dirname, "artifacts");
+const EMBEDDED = process.env.ARENA0_E2E_EMBEDDED === "1";
 
 export interface Arena {
   /** The page URL, token in the fragment. */
@@ -27,52 +36,102 @@ export interface Arena {
   spawn(args: string[]): void;
 }
 
-function startArena(): Promise<{ arena: Arena; stop(): Promise<void> }> {
+function freePort(): Promise<number> {
+  return new Promise((done, fail) => {
+    const server = createServer();
+    server.once("error", fail);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = typeof address === "object" && address !== null ? address.port : 0;
+      server.close(() => done(port));
+    });
+  });
+}
+
+/** Resolve with the first stdout line starting with `{`, parsed. */
+function firstJsonLine(child: ChildProcess, what: string): Promise<{ url: string }> {
+  return new Promise((done, fail) => {
+    let out = "";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      out += chunk.toString();
+      const line = out.split("\n").find((l) => l.startsWith("{"));
+      if (line !== undefined) done(JSON.parse(line) as { url: string });
+    });
+    child.once("exit", (code) => fail(new Error(`${what} exited (${code}) before it was ready`)));
+  });
+}
+
+async function waitForHttp(url: string): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const ok = await fetch(url).then(
+      (response) => response.ok,
+      () => false,
+    );
+    if (ok) return;
+    await new Promise((wake) => setTimeout(wake, 100));
+  }
+  throw new Error(`${url} did not answer within 30 s`);
+}
+
+async function startArena(): Promise<{ arena: Arena; stop(): Promise<void> }> {
   const home = mkdtempSync(join(tmpdir(), "arena0-e2e-"));
   const env = { ...process.env, ARENA0_HOME: home };
   const background: ChildProcess[] = [];
-  const ui = spawn(BIN, ["--json", "ui", "--no-open", "--port", "0"], {
-    env,
-    stdio: ["ignore", "pipe", "inherit"],
-  });
-  const exited = new Promise<void>((done) => ui.once("exit", () => done()));
+  const devPort = EMBEDDED ? null : await freePort();
+  const devOrigin = devPort === null ? null : `http://127.0.0.1:${devPort}`;
+  const ui = spawn(
+    BIN,
+    [
+      "--json",
+      "ui",
+      "--no-open",
+      "--port",
+      "0",
+      ...(devOrigin === null ? [] : ["--dev-origin", devOrigin]),
+    ],
+    { env, stdio: ["ignore", "pipe", "inherit"] },
+  );
+  const uiExited = new Promise<void>((done) => ui.once("exit", () => done()));
+  const { url: gatewayUrl } = await firstJsonLine(ui, "arena0 ui");
+
+  let url = gatewayUrl;
+  if (devOrigin !== null) {
+    const gateway = new URL(gatewayUrl);
+    const vite = spawn("pnpm", ["vite", "--port", String(devPort), "--strictPort"], {
+      cwd: UI_DIR,
+      env: { ...process.env, ARENA0_GATEWAY: gateway.host },
+      stdio: "ignore",
+    });
+    background.push(vite);
+    await waitForHttp(`${devOrigin}/`);
+    url = `${devOrigin}/${gateway.hash}`;
+  }
 
   const stop = async () => {
     for (const child of background) child.kill("SIGINT");
     // SIGINT is the gateway's Ctrl-C: it closes sockets and stops the daemon it started.
     ui.kill("SIGINT");
-    await exited;
+    await uiExited;
     rmSync(home, { recursive: true, force: true });
   };
 
-  return new Promise((ready, fail) => {
-    let out = "";
-    ui.stdout?.on("data", (chunk: Buffer) => {
-      out += chunk.toString();
-      const line = out.split("\n").find((l) => l.startsWith("{"));
-      if (line === undefined) return;
-      const { url } = JSON.parse(line) as { url: string };
-      ready({
-        arena: {
-          url,
-          home,
-          cli: (args) =>
-            new Promise((done, reject) => {
-              execFile(BIN, args, { env, timeout: 120_000 }, (error, stdout, stderr) =>
-                error ? reject(new Error(`arena0 ${args.join(" ")}: ${stderr}`)) : done(stdout),
-              );
-            }),
-          spawn: (args) => {
-            background.push(spawn(BIN, args, { env, stdio: "ignore" }));
-          },
-        },
-        stop,
-      });
-    });
-    ui.once("exit", (code) =>
-      fail(new Error(`arena0 ui exited (${code}) before printing its URL`)),
-    );
-  });
+  return {
+    arena: {
+      url,
+      home,
+      cli: (args) =>
+        new Promise((done, reject) => {
+          execFile(BIN, args, { env, timeout: 120_000 }, (error, stdout, stderr) =>
+            error ? reject(new Error(`arena0 ${args.join(" ")}: ${stderr}`)) : done(stdout),
+          );
+        }),
+      spawn: (args) => {
+        background.push(spawn(BIN, args, { env, stdio: "ignore" }));
+      },
+    },
+    stop,
+  };
 }
 
 export const test = base.extend<object, { arena: Arena }>({
