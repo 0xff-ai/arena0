@@ -134,7 +134,7 @@ async function startArena(): Promise<{ arena: Arena; stop(): Promise<void> }> {
   };
 }
 
-export const test = base.extend<object, { arena: Arena }>({
+export const test = base.extend<{ daemonState: void }, { arena: Arena }>({
   arena: [
     async ({}, use) => {
       const { arena, stop } = await startArena();
@@ -142,6 +142,30 @@ export const test = base.extend<object, { arena: Arena }>({
       await stop();
     },
     { scope: "worker" },
+  ],
+  // On failure, attach what the daemon holds (every Host's executions, with
+  // lifecycle and terminal reasons) so a failed run explains itself instead
+  // of being rerun.
+  daemonState: [
+    async ({ arena }, use, testInfo) => {
+      await use();
+      if (testInfo.status === testInfo.expectedStatus) return;
+      const status = JSON.parse(await arena.cli(["--json", "status"])) as {
+        hosts: { host: { id: string } }[];
+      };
+      for (const { host } of status.hosts) {
+        const executions = await arena
+          .cli(["--json", "--host", host.id, "exec", "list"])
+          .catch((error: unknown) => String(error));
+        const path = testInfo.outputPath(`${host.id}-executions.json`);
+        writeFileSync(path, executions);
+        await testInfo.attach(`${host.id}-executions.json`, {
+          path,
+          contentType: "application/json",
+        });
+      }
+    },
+    { auto: true },
   ],
 });
 
@@ -159,10 +183,12 @@ export function watchConsole(page: Page): () => string[] {
   return () => problems;
 }
 
-/** Open the workspace at `path` and wait until the gateway snapshot is live. */
+/** Open the workspace at `path` (which may carry a `?search`) and wait until the snapshot is live. */
 export async function openApp(page: Page, arena: Arena, path = "/"): Promise<void> {
-  const url = new URL(arena.url);
-  url.pathname = path;
+  const base = new URL(arena.url);
+  const url = new URL(path, base);
+  // The token travels in the fragment; keep it.
+  url.hash = base.hash;
   await page.goto(url.toString());
   await expect(page.getByTestId("connection")).toHaveText(/live/, { timeout: 30_000 });
 }
@@ -179,15 +205,17 @@ export const seed = {
       "host-01=first-allowed",
       "--builtin",
       "host-02=first-allowed",
-      "--no-tui",
     ]);
   },
   /**
-   * Start a session where host-01 plays a built-in strategy and host-02 is
-   * left to the user: host-02's callouts stay open for the page to answer.
+   * Start a session where host-01 plays the program's bundled example policy
+   * and host-02 is left to the user: host-02's callouts stay open for the
+   * page to answer. `sample`, not `first-allowed`: which participant moves
+   * first varies per session, and `first-allowed` only answers enum callouts
+   * (chess moves are free-form), so it would abort whenever host-01 moves.
    */
   awaitingYou(arena: Arena, program: string): void {
-    arena.spawn(["--json", "launch", program, "--builtin", "host-01=first-allowed"]);
+    arena.spawn(["--json", "launch", program, "--builtin", "host-01=sample"]);
   },
 };
 
@@ -209,6 +237,17 @@ export class Evidence {
         window.dispatchEvent(new StorageEvent("storage", { key: "arena0.theme" }));
       }, theme);
       await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+      // Theme changes fade colours; capture the settled frame. Infinite
+      // animations (pulsing status dots) never settle and are ignored.
+      await page.waitForFunction(() =>
+        document
+          .getAnimations()
+          .every(
+            (animation) =>
+              animation.playState !== "running" ||
+              animation.effect?.getTiming().iterations === Number.POSITIVE_INFINITY,
+          ),
+      );
       mkdirSync(join(this.#dir, theme), { recursive: true });
       await page.screenshot({ path: join(this.#dir, theme, `${name}.png`) });
     }
