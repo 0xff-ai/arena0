@@ -15,6 +15,7 @@ use crate::{MAX_EFFECT_PAYLOAD_BYTES, MAX_TERMINAL_OUTCOME_BYTES, MAX_TERMINAL_R
 /// Kind of an [`Effect`], for diagnostics that never expose its payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum EffectKind {
     SessionEnd,
     SessionAbort,
@@ -28,6 +29,7 @@ pub enum EffectKind {
 /// deliberately never returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct EffectSummary {
     pub kind: EffectKind,
     pub payload_bytes: Option<u64>,

@@ -8,6 +8,7 @@ description = "Cryptographic types, hashing, signing, and verification for arena
 publish = true
 
 [dependencies]
+ts-rs = { workspace = true, optional = true }
 serde.workspace = true
 borsh.workspace = true
 schemars.workspace = true
@@ -28,3 +29,6 @@ arena0-protocol = { path = "../arena0-protocol" }
 
 [lints]
 workspace = true
+
+[features]
+ts = ["dep:ts-rs"]

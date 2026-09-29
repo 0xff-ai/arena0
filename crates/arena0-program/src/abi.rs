@@ -39,6 +39,8 @@ pub const VERIFY_RESULT_OVERHEAD_BYTES: usize = 8;
 
 /// Bounded, complete JSON bytes at an agent-facing request or projection boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(as = "Vec<u8>"))]
 pub struct JsonBytes(Vec<u8>);
 
 impl JsonBytes {

@@ -15,6 +15,7 @@ use arena0_program::ProgramHash;
 // Keep terminal causes inline, matching the execution status and verification result.
 #[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ReceiptTermination {
     /// A `SessionEnd` certified by every committed participant.
     Completed,
@@ -31,6 +32,7 @@ pub enum ReceiptTermination {
 /// trace (the verifier confirms the recovered `(program_hash, session_hash)` and
 /// the ensemble match), so a forged header is caught at verification.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SessionHeader {
     /// The confirmed session activation: the offer and its exact ticket set.
     pub activation: Activation,

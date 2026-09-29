@@ -23,6 +23,7 @@ use crate::events::EventFilter;
 /// an upload named by the BLAKE3 hash of its bytes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum FileSource {
     Path(PathBuf),
     Upload(BlobHash),
@@ -31,6 +32,7 @@ pub enum FileSource {
 /// name their target explicitly; daemon operations do not select a Host.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "method", content = "params", deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum Request {
     /// Dispatch an existing Host operation in one exact local namespace.
     #[serde(rename = "host.call")]
@@ -55,6 +57,7 @@ pub enum Request {
 /// Event subscriptions acknowledge the request, then stream Host event frames.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "method", content = "params", deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum HostRequest {
     #[serde(rename = "negotiation.offers")]
     NegotiationOffers,
@@ -182,6 +185,7 @@ pub enum HostRequest {
 
 /// The state `exec.await` blocks for: session established, or terminal.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum AwaitState {
     /// The session has confirmed and started (execution can run).
     Active,
@@ -191,6 +195,7 @@ pub enum AwaitState {
 
 /// How `exec.new` starts or joins a negotiation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum EnsembleSpec {
     /// Create an offer and collect exactly this many participants, including
     /// the local Host.
@@ -202,6 +207,7 @@ pub enum EnsembleSpec {
 
 /// Select exact stored evidence, this Host's session publication, or an inline artifact.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ReceiptRef {
     Produced(SessionHash),
     Stored(arena0_protocol::ReceiptId),

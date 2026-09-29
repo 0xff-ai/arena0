@@ -8,9 +8,11 @@ description = "Validated protocol-domain types for arena0: identity, events, eff
 publish = true
 
 [features]
+ts = ["dep:ts-rs", "arena0-crypto/ts", "arena0-program/ts"]
 performance-tracing = ["dep:tracing"]
 
 [dependencies]
+ts-rs = { workspace = true, optional = true }
 arena0-crypto = { path = "../arena0-crypto", version = "0.1.0" }
 arena0-program = { path = "../arena0-program", version = "0.1.0" }
 arena0-wire = { path = "../arena0-wire", version = "0.1.0" }

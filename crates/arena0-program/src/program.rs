@@ -28,6 +28,8 @@ pub const PROGRAM_MAX_LEN: u64 = 64 * 1024 * 1024;
     Ord,
     Hash,
 )]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(type = "string", rename = "ProgramHash"))]
 pub struct Hash(pub [u8; 32]);
 
 impl Hash {
@@ -113,6 +115,7 @@ impl Hash {
     Eq,
 )]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ParticipantCount {
     /// The program requires one exact participant count.
     Exact { count: u8 },

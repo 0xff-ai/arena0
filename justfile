@@ -21,13 +21,13 @@ build-linux-release: build-ui
 build-ui:
     cd ui && pnpm install --frozen-lockfile && pnpm build
 
-# Regenerate the browser's wire types from crates/arena0-web.
+# Regenerate the browser's wire types from crates/arena0-api.
 ui-types:
-    cargo run --quiet --locked -p arena0-web --example export_ts > ui/src/sync/protocol.gen.ts
+    cargo run --quiet --locked -p arena0-api --features ts --example export_ts > ui/src/api/types.gen.ts
 
 # Types fresh, lint, typecheck.
 check-ui:
-    cargo run --quiet --locked -p arena0-web --example export_ts | diff -u ui/src/sync/protocol.gen.ts -
+    cargo run --quiet --locked -p arena0-api --features ts --example export_ts | diff -u ui/src/api/types.gen.ts -
     cd ui && pnpm biome check . && pnpm tsc -b
 
 # Live browser suites (gallery, shell, and the app against the real binary

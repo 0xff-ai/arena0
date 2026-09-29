@@ -25,6 +25,8 @@ const MAX_DIAGNOSTIC_JSON_BYTES: usize = 1024 * 1024;
 /// execution, hashing, receipt construction, or verification.
 #[derive(Serialize, BorshSerialize, Debug, Clone, PartialEq, Eq)]
 #[serde(transparent)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(as = "Vec<u8>"))]
 pub struct BorshSchemaDocument(Vec<u8>);
 
 impl BorshSchemaDocument {
@@ -356,6 +358,8 @@ fn finite_float(value: f64) -> Result<Value, BorshDiagnosticError> {
 /// A standard JSON Schema Draft 2020-12 document.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(transparent)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(as = "serde_json::Value"))]
 pub struct JsonSchemaDocument(Value);
 
 impl JsonSchemaDocument {
@@ -451,6 +455,7 @@ pub enum JsonSchemaDocumentError {
 
 /// Top-level schema for a program.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProgramSchema {
     /// Schema for the program's persistent state.
     pub state: StateSchema,
@@ -471,6 +476,7 @@ pub struct ProgramSchema {
 
 /// One declared program phase.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PhaseSchema {
     /// Machine-readable phase name, as reported by the turn projection.
     pub name: String,
@@ -484,6 +490,7 @@ pub struct PhaseSchema {
 
 /// Schema for a program's persistent state region.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct StateSchema {
     /// Type layout of the state.
     pub schema: JsonSchemaDocument,
@@ -493,6 +500,7 @@ pub struct StateSchema {
 
 /// Schema for one callout variant that a program can request from agents.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct CalloutSchema {
     /// Machine-readable variant name.
     pub name: String,
@@ -506,6 +514,7 @@ pub struct CalloutSchema {
 
 /// Schema for one peer-to-peer message type.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct MessageSchema {
     /// Borsh layout of the program's complete peer-message type.
     pub borsh: BorshSchemaDocument,
@@ -513,6 +522,7 @@ pub struct MessageSchema {
 
 /// Schema for a read-only query endpoint.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct QuerySchema {
     /// Machine-readable query name.
     pub name: String,

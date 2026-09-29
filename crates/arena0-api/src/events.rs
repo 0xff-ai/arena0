@@ -17,6 +17,7 @@ use crate::{ApiError, ApiErrorCode, HostInfo};
 /// Why an execution record was created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ExecOrigin {
     Request,
     Recovery,
@@ -25,6 +26,7 @@ pub enum ExecOrigin {
 /// Host failure class projected on `exec.terminated`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ExecutionFailureKind {
     Negotiation,
     HostStopped,
@@ -36,6 +38,7 @@ pub enum ExecutionFailureKind {
 /// Negotiation machine stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum NegotiationStage {
     Gossiping,
     Prepared,
@@ -80,10 +83,12 @@ impl From<arena0_protocol::NegotiationStage> for NegotiationStage {
 /// The terminal payload nested in `exec.session.ended`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum SessionTerminal {
     #[serde(rename = "completed")]
     Completed {
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         outcome: Option<Value>,
     },
     #[serde(rename = "aborted")]
@@ -92,6 +97,7 @@ pub enum SessionTerminal {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum OfferClosedReason {
     Complete,
     Expired,
@@ -102,6 +108,7 @@ pub enum OfferClosedReason {
 /// producing top-level `kind` and nested `data` fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum EventData {
     #[serde(rename = "host.started")]
     HostStarted {
@@ -112,6 +119,7 @@ pub enum EventData {
     #[serde(rename = "host.stopped")]
     HostStopped {
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         reason: Option<String>,
         uptime_secs: u64,
     },
@@ -134,8 +142,10 @@ pub enum EventData {
     Created {
         program_id: ProgramHash,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         negotiation_id: Option<NegotiationId>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         queue_position: Option<usize>,
         origin: ExecOrigin,
     },
@@ -143,6 +153,7 @@ pub enum EventData {
     Terminated {
         reason: String,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         failed_class: Option<ExecutionFailureKind>,
     },
     #[serde(rename = "exec.negotiation.started")]
@@ -276,6 +287,7 @@ impl EventData {
 
 /// One pushed event on a subscription stream.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct EventFrame {
     pub host: HostInfo,
     pub boot_id: String,
@@ -284,8 +296,10 @@ pub struct EventFrame {
     #[serde(flatten)]
     pub data: EventData,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub exec_id: Option<ExecId>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub session_id: Option<SessionHash>,
 }
 
@@ -388,6 +402,7 @@ impl<'de> Deserialize<'de> for EventFrame {
 /// What a subscriber wants to watch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct EventFilter {
     #[serde(default)]
     pub include: Vec<String>,

@@ -18,6 +18,7 @@ pub type Response = Result<ResponseOk, ApiError>;
 /// The successful payload, one variant per request shape.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ResponseOk {
     /// A method with no payload succeeded (e.g. `daemon.stop`, `program.remove`).
     Ack,
@@ -94,6 +95,7 @@ pub enum ResponseOk {
 /// authenticated by the creator's ticket and not yet complete or expired.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct OpenOffer {
     pub program_id: ProgramHash,
     pub negotiation_id: NegotiationId,
@@ -111,6 +113,7 @@ pub struct OpenOffer {
 /// identity belongs to its retained keys. User agent is caller-reported metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct HostInfo {
     pub id: String,
     pub peer_id: PeerId,
@@ -119,6 +122,7 @@ pub struct HostInfo {
 
 /// Process-level information for the shared daemon endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct DaemonInfo {
     pub version: String,
     pub abi_version: u32,
@@ -131,6 +135,7 @@ pub struct DaemonInfo {
 
 /// Current information from one Host's authoritative service and store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct HostStatus {
     pub host: HostInfo,
     pub transport_key: AgentPubKey,
@@ -141,6 +146,7 @@ pub struct HostStatus {
 /// A structured error a client can match on.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
 #[error("{code:?}: {message}")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ApiError {
     pub code: ApiErrorCode,
     pub message: String,
@@ -157,6 +163,7 @@ impl ApiError {
 
 /// Error categories. The daemon maps internal errors onto these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ApiErrorCode {
     /// The referenced identity, program, execution, or receipt was not found.
     NotFound,
@@ -188,6 +195,7 @@ pub enum ApiErrorCode {
 
 /// Public material for the Host identity. Seeds never appear here.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct IdInfo {
     pub peer_id: PeerId,
     /// The persistent Ed25519 identity key used by the Host.
@@ -198,6 +206,7 @@ pub struct IdInfo {
 
 /// A registry listing entry (no wasm bytes, no schema).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProgramSummary {
     pub program_hash: ProgramHash,
     pub name: String,
@@ -209,6 +218,7 @@ pub struct ProgramSummary {
 
 /// `program.get`: a summary plus the full schema (callouts, messages, params, ...).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProgramDetail {
     pub summary: ProgramSummary,
     pub schema: ProgramSchema,
@@ -217,6 +227,7 @@ pub struct ProgramDetail {
 /// A daemon-owned public execution snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ExecStatus {
     /// Local end handshake; independent of receipt publication.
     pub end: ExecEndStatus,
@@ -234,6 +245,7 @@ pub struct ExecStatus {
 /// Public local end-confirmation progress.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ExecEndStatus {
     pub phase: ExecEndPhase,
     pub unconfirmed: Vec<PeerId>,
@@ -242,6 +254,7 @@ pub struct ExecEndStatus {
 /// Phase of the local end handshake.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ExecEndPhase {
     #[default]
     Open,
@@ -269,6 +282,7 @@ impl From<&arena0_protocol::EndPhase> for ExecEndStatus {
 /// The facts valid at each public execution lifecycle.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "exec_state", deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ExecStatusState {
     Negotiating {
         queue_position: Option<usize>,
@@ -297,6 +311,7 @@ pub enum ExecStatusState {
 /// started, its durable activation facts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ExecListEntry {
     pub status: ExecStatus,
     pub activation: Option<ActivationInspection>,
@@ -305,6 +320,7 @@ pub struct ExecListEntry {
 /// Session facts retained after a session starts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SessionStatus {
     pub session_id: SessionHash,
     pub step: u64,
@@ -328,6 +344,7 @@ pub struct SessionStatus {
 /// terminal outcome; signatures, keys, and other participant payloads are absent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ExecutionInspection {
     /// The ordinary lifecycle projection for this execution.
     pub status: ExecStatus,
@@ -346,6 +363,7 @@ pub struct ExecutionInspection {
 /// Durable activation facts safe to display in a local diagnostic view.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ActivationInspection {
     /// Whether the permanent record is prepared or committed.
     pub state: ActivationInspectionState,
@@ -371,6 +389,7 @@ pub struct ActivationInspection {
 /// State of a durable activation record.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ActivationInspectionState {
     Prepared,
     Committed,
@@ -380,6 +399,7 @@ pub enum ActivationInspectionState {
 /// intentionally remain host-owned and are not exposed by this projection.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ActivationParticipant {
     pub peer_id: PeerId,
     pub ticket_hash: TicketHash,
@@ -388,6 +408,7 @@ pub struct ActivationParticipant {
 /// A bounded summary of one durable Host-local event record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct EventRecordSummary {
     /// Authoritative local event position.
     pub event_position: u64,
@@ -403,6 +424,7 @@ pub struct EventRecordSummary {
 /// How far a failed execution got before it stopped.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "session_state", deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum SessionProgress {
     Activated { session_id: SessionHash },
     Started { session: SessionStatus },
@@ -412,6 +434,7 @@ pub enum SessionProgress {
 /// participant context, projected from the same durable facts as `exec.next`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PendingCalloutStatus {
     pub pending_id: CalloutId,
     pub callout_index: u32,
@@ -515,6 +538,7 @@ impl ExecStatusState {
 /// The blocking return of `exec.next`. Guest signing stays inside the
 /// execution actor, which owns the custodied key.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum NextEvent {
     /// The program is asking the agent to decide. `name`/`prompt` come from the
     /// program schema, `schema` is the answer type inline (so a cold agent needs no
@@ -540,6 +564,7 @@ pub enum NextEvent {
 /// is a local observation and is not part of the portable trace.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AgreedStep {
     pub certified_at_ms: u64,
     pub entry: TraceEntry,
@@ -551,6 +576,7 @@ pub struct AgreedStep {
 /// A message payload as JSON, or why it could not be decoded. The error
 /// describes the schema mismatch, never the payload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum DecodedMessage {
     Json(Value),
     Undecodable { error: String },
@@ -559,6 +585,7 @@ pub enum DecodedMessage {
 /// One stored blob.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct BlobEntry {
     pub hash: BlobHash,
     pub length: u64,
@@ -570,6 +597,7 @@ pub struct BlobEntry {
 /// A `receipt.list` entry: the content address, its session and producer, program,
 /// completion, and the complete local provenance projection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ReceiptListEntry {
     pub receipt_id: String,
     pub session_id: SessionHash,

@@ -44,6 +44,7 @@ pub struct StepSig {
 /// participant that diverges signs a different commitment and cannot appear in
 /// the honest aggregate.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct StepCommitment {
     /// Domain separation tag ([`STEP_COMMIT_DOMAIN`]).
     pub domain: [u8; 24],
@@ -118,6 +119,7 @@ impl StepCommitment {
     Eq,
     Hash,
 )]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SignerSet(pub Vec<u8>);
 
 impl SignerSet {
@@ -244,6 +246,7 @@ impl SignerSet {
 /// plus a bitmap of who signed. Certificate frames carry this same evidence
 /// so a peer can commit a staged step without collecting each signature again.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AggregateAttestation {
     /// Aggregate of the signers' `StepCommitment` signatures. The separate
     /// activation aggregate signs the `ActivationData` instead.

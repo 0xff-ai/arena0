@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 #[derive(
     Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq,
 )]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ColorDepth {
     Mono,
     Ansi16,
@@ -91,6 +92,7 @@ impl Viewport {
     PartialOrd,
     Ord,
 )]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum Slot {
     Header,
     Agents,
@@ -104,11 +106,13 @@ pub enum Slot {
 #[derive(
     Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Default, PartialEq, Eq,
 )]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct View {
     pub slots: BTreeMap<Slot, String>,
     /// Typed blocks for rich clients. Text slots remain the portable
     /// rendering; clients that do not understand a block ignore it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<_>", optional))]
     pub blocks: Vec<Block>,
 }
 
@@ -118,6 +122,7 @@ pub struct View {
 /// laid out for a client that can draw a board or a table.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum Block {
     /// Labelled values, such as the reserve price or whose turn it is.
     Facts {
@@ -152,6 +157,7 @@ pub enum Block {
 /// A labelled value in a [`Block::Facts`].
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Fact {
     pub label: String,
     pub value: Cell,
@@ -161,11 +167,13 @@ pub struct Fact {
 /// in the committed ensemble so clients can colour it consistently.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Cell {
     pub text: String,
     #[serde(default)]
     pub tone: Tone,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub participant: Option<u8>,
 }
 
@@ -195,6 +203,7 @@ impl Cell {
 /// One participant's line in a [`Block::Roster`].
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RosterEntry {
     pub participant: u8,
     pub status: Cell,
@@ -215,6 +224,7 @@ pub struct RosterEntry {
     Eq,
 )]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum Tone {
     #[default]
     Normal,
