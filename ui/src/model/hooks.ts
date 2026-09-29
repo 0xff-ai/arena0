@@ -93,8 +93,11 @@ export function useFlags(sessions: Session[]): Map<string, Flag[]> {
   return flags;
 }
 
-/** Every row of a collection, live. */
-function useRows<T extends object>(collection: Collection<T, string>): T[] {
+/**
+ * Every row of a collection, live. The workspace reads the plain collections
+ * (Hosts, programs, receipts, offers, activity, callouts) through this.
+ */
+export function useRows<T extends object>(collection: Collection<T, string>): T[] {
   const { data } = useLiveQuery((q) => q.from({ rows: collection }));
   return data;
 }

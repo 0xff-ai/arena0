@@ -1,0 +1,90 @@
+import { CheckboxGroup, Dialog, DialogTrigger } from "react-aria-components";
+import { useRows, useSeats, useTheme } from "~/model";
+import { useCollections, useConnection, useHello } from "~/sync";
+import { Button, Checkbox, Dot, IconButton, Icons, Kbd, Popover, type Tone } from "~/ui";
+import { openPalette } from "./shell";
+
+const NEXT_THEME = { light: "dark", dark: "system", system: "light" } as const;
+
+export const connectionTone: Record<string, Tone> = {
+  live: "ok",
+  syncing: "warn",
+  connecting: "warn",
+  offline: "bad",
+};
+
+export function TitleBar() {
+  const hello = useHello();
+  const connection = useConnection();
+  const [theme, setTheme] = useTheme();
+  const hosts = useRows(useCollections().hosts);
+  const [seats, setSeats] = useSeats(hosts.map((host) => host.id));
+
+  return (
+    <header className="flex h-9 items-center gap-3 border-b border-line bg-title px-3">
+      <span className="flex items-center gap-1.5 font-mono text-base font-medium text-fg">
+        <span aria-hidden>▣</span>
+        arena0
+      </span>
+      {hello && <span className="font-mono text-xs text-subtle">{hello.daemon.version}</span>}
+
+      <Button
+        onPress={() => openPalette("all")}
+        className="ml-2 w-72 max-w-[40vw] justify-start gap-2 bg-editor! text-subtle"
+        aria-label="Find"
+      >
+        <span className="flex min-w-0 flex-1 items-center gap-1.5 text-left text-sm">
+          <Icons.search size={13} strokeWidth={1.5} aria-hidden />
+          Find…
+        </span>
+        <Kbd keys="Mod+K" />
+      </Button>
+
+      <span className="flex-1" />
+
+      <Button size="sm" variant="primary" icon={Icons.add} onPress={() => openPalette("programs")}>
+        New session
+      </Button>
+
+      <DialogTrigger>
+        <Button size="sm" icon={Icons.host}>
+          Seats: {seats.size === 0 ? "none" : [...seats].join(", ")}
+          <Icons.chevronDown size={12} strokeWidth={1.5} className="text-subtle" aria-hidden />
+        </Button>
+        <Popover placement="bottom end">
+          <Dialog aria-label="Seats" className="flex w-64 flex-col gap-2 p-2 outline-none">
+            <CheckboxGroup
+              aria-label="Seats"
+              value={[...seats]}
+              onChange={setSeats}
+              className="flex flex-col gap-1.5"
+            >
+              {hosts.map((host) => (
+                <Checkbox key={host.id} value={host.id}>
+                  {host.id}
+                </Checkbox>
+              ))}
+            </CheckboxGroup>
+            <p className="text-xs text-subtle">
+              Seats choose which callouts you answer here. They are not an access boundary.
+            </p>
+          </Dialog>
+        </Popover>
+      </DialogTrigger>
+
+      <span
+        role="status"
+        className="inline-flex h-5 items-center gap-1.5 rounded-xs border border-line px-1.5 text-xs text-muted"
+      >
+        <Dot tone={connectionTone[connection.status] ?? "neutral"} />
+        {connection.status}
+      </span>
+
+      <IconButton
+        icon={Icons.theme}
+        label={`Theme: ${theme} (click for ${NEXT_THEME[theme]})`}
+        onPress={() => setTheme(NEXT_THEME[theme])}
+      />
+    </header>
+  );
+}

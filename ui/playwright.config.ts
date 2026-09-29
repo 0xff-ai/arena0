@@ -15,6 +15,11 @@ export default defineConfig({
       testMatch: /gallery\.spec\.ts/,
       use: { baseURL: "http://127.0.0.1:5173", viewport: { width: 1440, height: 900 } },
     },
+    {
+      name: "shell",
+      testMatch: /shell\.spec\.ts/,
+      use: { baseURL: "http://127.0.0.1:5173", viewport: { width: 1440, height: 900 } },
+    },
   ],
   webServer: {
     command: "pnpm vite --port 5173 --strictPort",
