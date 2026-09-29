@@ -436,6 +436,18 @@ creates one resident `ProgramInstance`; it owns fixed `arena0_shared` and
 `arena0_dispatch`. State memories survive dispatches, while work memory and
 mutable globals reset to the resident baseline for each dispatch.
 
+A view is the four text slots plus optional typed blocks (`facts`, `table`,
+`board`, `progress`, `roster`) that carry the same information for clients that
+can lay it out. Blocks are guest output, so the Host validates them wherever it
+decodes a view, for live, terminal, and past-step views alike: at most 16
+blocks; tables of at most 64 rows and 16 columns; boards of at most 32 by 32
+with exactly `rows * cols` cells and label lists that are empty or match;
+rosters of at most 64 entries; texts of at most 256 bytes; participant indices
+below the committed ensemble size. `View::validate` owns these limits. A
+violation fails the view request with an execution error naming the limit; it
+never truncates a block and never ends the session. Blocks are not part of any
+receipt: they are a projection of the agreed state, like the text slots.
+
 The daemon owns one shared `WasmtimeEngine` for program validation and execution
 loading, not a second program catalog. Each Host must first resolve the hash from
 its own SQLite program catalog. Every execution loads its imported artifact

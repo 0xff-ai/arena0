@@ -126,6 +126,33 @@ The reply's `step` is the index of the latest agreed step the rendered state
 includes, numbered from 0 like `exec.trace` entries and `exec.session.step`
 events; `null` renders the initial state before step 0 is certified.
 
+The reply's `view` has the four text `slots` and, for programs that provide
+them, `blocks`: typed pieces a rich client can lay out, in the same order the
+program produced them. Text slots stay the portable rendering; a client that
+does not know a block ignores it. Every block is an object with a `kind`:
+
+| `kind` | Fields |
+| --- | --- |
+| `facts` | `title?`, `items: [{label, value: Cell}]` |
+| `table` | `title?`, `columns: [text]`, `rows: [[Cell]]` |
+| `board` | `title?`, `rows`, `cols`, `cells: [Cell]` (row-major), `row_labels`, `col_labels` |
+| `progress` | `label`, `value`, `max` |
+| `roster` | `title?`, `entries: [{participant, status: Cell, detail?}]` |
+
+A `Cell` is `{text, tone?, participant?}`. `tone` is one of `normal` (the
+default), `muted`, `good`, `warn`, `bad`, `highlight`; clients choose the
+colours. `participant` is an index into the committed ensemble, so a client
+colours a participant's values consistently. Blocks appear only in the reply
+when a program produces them; a view without blocks has no `blocks` field.
+
+The Host validates blocks before replying. At most 16 blocks; tables of at
+most 64 rows and 16 columns; boards of at most 32 rows and 32 columns whose
+`cells` hold exactly `rows * cols` cells and whose label lists are empty or one
+per row and column; rosters of at most 64 entries; every text at most 256
+bytes; every `participant` below the ensemble size. A view that breaks a limit
+fails the request with `Execution` and a message naming the limit. Nothing is
+truncated.
+
 `at_step` renders the shared state after that agreed step instead of the latest
 state; `step` in the reply is then `at_step`. The latest agreed step is the
 `step` of the last trace entry. The Host does not store past states. It

@@ -195,6 +195,41 @@ and `StatusBar` slots. Rendering must leave state unchanged and support plain
 text. Private state should not leak through a view merely because the renderer
 can access it.
 
+## Structured views
+
+Beside the text slots, a view can carry typed blocks for clients that can
+draw a board or a table. Blocks describe the same state the text shows; never
+reveal in a block what the text hides. The chess program renders its board and
+the side to move like this:
+
+```rust
+let view = View::new()
+    .header(header)
+    .state(board_text)
+    .status_bar(status)
+    .block(Block::Board {
+        title: None,
+        rows: 8,
+        cols: 8,
+        cells, // row-major; a piece is Cell::text("♟").participant(1)
+        row_labels, // "8" .. "1", or empty
+        col_labels, // "a" .. "h", or empty
+    })
+    .block(Block::Facts {
+        title: None,
+        items: vec![Fact {
+            label: "To move".into(),
+            value: Cell::text("white").participant(0),
+        }],
+    });
+```
+
+`Cell::tone` marks emphasis (`Tone::Highlight` for the last move); clients pick
+the colours. The Host rejects a view whose blocks exceed the limits in
+`View::validate` (16 blocks, 64 table rows, 16 columns, 32 by 32 boards, 64
+roster entries, 256 bytes per text, participants inside the ensemble), so
+trim long histories in the program.
+
 ## Execute and verify
 
 Use the [guided or agent flow](getting-started.md) to execute the built program.

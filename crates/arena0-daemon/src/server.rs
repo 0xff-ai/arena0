@@ -3553,6 +3553,7 @@ impl HostService {
                 .binding()
                 .ensemble()
                 .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
+            let ensemble_len = ensemble.len();
             let engine = Arc::clone(&self.engine);
             let step = state.agreed_step().checked_sub(1);
             let shared = state.shared_state().clone();
@@ -3564,7 +3565,7 @@ impl HostService {
             .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
             return Ok(ResponseOk::ExecView {
                 step,
-                view: parse_view(&projection)?,
+                view: parse_view(&projection, ensemble_len)?,
             });
         }
         let entry = self.execs.get(&exec_id).ok_or_else(|| {
@@ -3603,6 +3604,7 @@ impl HostService {
             .binding()
             .ensemble()
             .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
+        let ensemble_len = ensemble.len();
         let binding = state.binding().clone();
         let local_peer = state.producer();
         // `at_step <= latest < u64::MAX`, so the exclusive bound cannot wrap.
@@ -3627,7 +3629,7 @@ impl HostService {
         .map_err(|error| ApiError::new(ApiErrorCode::Internal, error.to_string()))??;
         Ok(ResponseOk::ExecView {
             step: Some(at_step),
-            view: parse_view(&projection)?,
+            view: parse_view(&projection, ensemble_len)?,
         })
     }
 
@@ -3716,13 +3718,21 @@ impl HostService {
     }
 }
 
-/// Decode a guest view projection into the protocol's [`View`](arena0_protocol::View).
+/// Decode a guest view projection into the protocol's [`View`](arena0_protocol::View)
+/// and check its blocks against the limits for a session of `participants`.
+/// The view is guest output, so a violation fails the request.
 fn parse_view(
     projection: &arena0_sandbox::GuestProjectionResult,
+    participants: usize,
 ) -> Result<arena0_protocol::View, ApiError> {
-    serde_json::from_slice(projection.output.as_bytes()).map_err(|error| {
+    let view = serde_json::from_slice::<arena0_protocol::View>(projection.output.as_bytes())
+        .map_err(|error| {
+            ApiError::new(ApiErrorCode::Execution, format!("view projection: {error}"))
+        })?;
+    view.validate(participants).map_err(|error| {
         ApiError::new(ApiErrorCode::Execution, format!("view projection: {error}"))
-    })
+    })?;
+    Ok(view)
 }
 
 fn project_exec_status_facts(

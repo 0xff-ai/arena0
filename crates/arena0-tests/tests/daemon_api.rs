@@ -10,7 +10,10 @@ use arena0_api::{
     AwaitState, ColorDepth, EnsembleSpec, EventData, EventFilter, EventFrame, ExecLifecycle,
     HostRequest, NextEvent, ReceiptArtifact, Request, Response, ResponseOk,
 };
-use arena0_protocol::{CalloutId, ExecId, NegotiationTarget, Slot, View};
+use arena0_protocol::{
+    Block, CalloutId, Cell, ExecId, Fact, NegotiationTarget, RosterEntry, Slot, Tone, View,
+};
+use arena0_tests::fixtures::{LIVE_EXECUTION_TIMEOUT, view_program_wasm};
 use common::{
     DaemonHarness, HostTarget, call, call_daemon, chess_wasm, created, cumulative_sum_wasm, daemon,
     drive, ok, prisoner_dilemma_wasm, rps_wasm, timer_dispatch_wasm,
@@ -1887,4 +1890,291 @@ async fn program_schema_lists_declared_phases() {
             phase("playing", "Round in progress", false),
         ]
     );
+}
+
+/// The cell of `board` on `square` (for example "e5"), located through the
+/// board's own labels so the check does not assume an orientation.
+fn board_cell<'a>(
+    cells: &'a [Cell],
+    row_labels: &[String],
+    col_labels: &[String],
+    square: &str,
+) -> &'a Cell {
+    let (file, rank) = square.split_at(1);
+    let row = row_labels.iter().position(|label| label == rank).unwrap();
+    let col = col_labels.iter().position(|label| label == file).unwrap();
+    &cells[row * col_labels.len() + col]
+}
+
+/// Chess renders a board and the side to move as typed blocks next to its
+/// text slots, and the blocks agree with the text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn views_carry_structured_blocks() {
+    let d = daemon(&chess_wasm()).await;
+    let (exec_a, negotiation_id) = create_on_host_a(&d).await;
+    let exec_b = join_on_host_b(&d, negotiation_id).await;
+
+    let mut answered = None;
+    for chess_move in ["e2e4", "e7e5"] {
+        let (target, exec_id, pending_id) = next_callout(&d, exec_a, exec_b, answered).await;
+        ok(call(
+            target,
+            &HostRequest::ExecSubmit {
+                exec_id,
+                pending_id,
+                answer: Some(serde_json::json!(chess_move)),
+            },
+        )
+        .await);
+        answered = Some(pending_id);
+    }
+    // White is to move again. A callout opens only after the latest agreed
+    // step landed, so this view observes the position after both moves.
+    let (target, exec_id, _) = next_callout(&d, exec_a, exec_b, answered).await;
+    let (_, view) = view_reply(view_at(target, exec_id, None).await);
+
+    let board = view
+        .blocks
+        .iter()
+        .find(|block| matches!(block, Block::Board { .. }))
+        .expect("a board block");
+    let Block::Board {
+        rows,
+        cols,
+        cells,
+        row_labels,
+        col_labels,
+        ..
+    } = board
+    else {
+        unreachable!("matched a board above");
+    };
+    assert_eq!((*rows, *cols, cells.len()), (8, 8, 64));
+    let cell = |square| board_cell(cells, row_labels, col_labels, square);
+
+    let pieces: Vec<&Cell> = cells.iter().filter(|cell| !cell.text.is_empty()).collect();
+    assert_eq!(pieces.len(), 32, "no piece was captured");
+    for owner in [0, 1] {
+        assert_eq!(
+            pieces
+                .iter()
+                .filter(|cell| cell.participant == Some(owner))
+                .count(),
+            16,
+            "participant {owner} owns sixteen pieces"
+        );
+    }
+    assert!(
+        cells
+            .iter()
+            .filter(|cell| cell.text.is_empty())
+            .all(|cell| cell.participant.is_none()),
+        "an empty square has no owner"
+    );
+
+    // Black's e7-e5 was the last move: its origin and destination are
+    // highlighted, and white's earlier e4 pawn is not.
+    let destination = cell("e5");
+    assert_eq!(destination.text, "\u{265f}");
+    assert_eq!(destination.participant, Some(1));
+    assert_eq!(destination.tone, Tone::Highlight);
+    assert_eq!(cell("e7").tone, Tone::Highlight);
+    let earlier = cell("e4");
+    assert_eq!(earlier.participant, Some(0));
+    assert_eq!(earlier.tone, Tone::Normal);
+    assert_eq!(
+        cells
+            .iter()
+            .filter(|cell| cell.tone == Tone::Highlight)
+            .count(),
+        2,
+        "only the last move's two squares are highlighted"
+    );
+
+    let facts = view
+        .blocks
+        .iter()
+        .find_map(|block| match block {
+            Block::Facts { items, .. } => Some(items),
+            _ => None,
+        })
+        .expect("a facts block");
+    let fact = |label: &str| {
+        &facts
+            .iter()
+            .find(|fact| fact.label == label)
+            .unwrap_or_else(|| panic!("no fact named {label}"))
+            .value
+    };
+    let to_move = fact("To move");
+    let move_number = fact("Move");
+    let status_bar = &view.slots[&Slot::StatusBar];
+    assert_eq!(
+        *status_bar,
+        format!("{}'s turn, move {}", to_move.text, move_number.text),
+        "the facts say what the status bar says"
+    );
+    assert_eq!(to_move.text, "white");
+    assert_eq!(to_move.participant, Some(0));
+}
+
+/// Start a session of the daemon's program on two Hosts and wait until its
+/// first agreed step is durable, so both a live view and a past view exist.
+async fn start_view_session(d: &DaemonHarness) -> ExecId {
+    let (mut events, _keep_open) = subscribe_events(&d.host_a).await;
+    let (exec_a, negotiation_id) = create_on_host_a(d).await;
+    join_on_host_b(d, negotiation_id).await;
+    tokio::time::timeout(LIVE_EXECUTION_TIMEOUT, async {
+        loop {
+            let frame = read_event(&mut events).await;
+            if frame.exec_id == Some(exec_a)
+                && matches!(frame.data, EventData::SessionStep { step: 0, .. })
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the session's first step is agreed");
+    exec_a
+}
+
+fn text_only(count: usize) -> Vec<Cell> {
+    vec![Cell::text(""); count]
+}
+
+/// The Host decodes a program's blocks as untrusted output. Blocks within the
+/// documented limits reach the client unchanged; each way to break a limit
+/// fails the view with an error naming it, on the live path and on the
+/// replayed past-step path, and never truncates or drops the block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn view_validation_rejects_oversized_blocks() {
+    let table = |rows: usize, columns: usize| Block::Table {
+        title: None,
+        columns: vec!["c".into(); columns],
+        rows: vec![text_only(columns); rows],
+    };
+    let board = |rows: u8, cols: u8, cells: usize| Block::Board {
+        title: None,
+        rows,
+        cols,
+        cells: text_only(cells),
+        row_labels: vec![],
+        col_labels: vec![],
+    };
+    let roster = |entries: usize, participant: u8| Block::Roster {
+        title: None,
+        entries: vec![
+            RosterEntry {
+                participant,
+                status: Cell::text("ready"),
+                detail: None,
+            };
+            entries
+        ],
+    };
+    let progress = || Block::Progress {
+        label: "p".into(),
+        value: 1,
+        max: 2,
+    };
+    let facts = |text: &str| Block::Facts {
+        title: None,
+        items: vec![Fact {
+            label: "f".into(),
+            value: Cell::text(text),
+        }],
+    };
+    let cases: Vec<(&str, Vec<Block>, &str)> = vec![
+        (
+            "board cells",
+            vec![board(2, 2, 3)],
+            "needs 4 cells but has 3",
+        ),
+        ("board size", vec![board(33, 1, 33)], "board is 33x1"),
+        (
+            "board labels",
+            vec![Block::Board {
+                title: None,
+                rows: 2,
+                cols: 1,
+                cells: text_only(2),
+                row_labels: vec!["1".into()],
+                col_labels: vec![],
+            }],
+            "1 row labels",
+        ),
+        ("table rows", vec![table(65, 1)], "65 rows"),
+        ("table columns", vec![table(1, 17)], "17 columns"),
+        ("roster entries", vec![roster(65, 0)], "65 entries"),
+        (
+            "block count",
+            (0..17).map(|_| progress()).collect(),
+            "17 blocks",
+        ),
+        ("text length", vec![facts(&"x".repeat(257))], "257 bytes"),
+        (
+            "participant",
+            vec![roster(1, 2)],
+            "participant 2 is outside the ensemble of 2",
+        ),
+        (
+            "cell participant",
+            vec![Block::Facts {
+                title: None,
+                items: vec![Fact {
+                    label: "f".into(),
+                    value: Cell::text("x").participant(2),
+                }],
+            }],
+            "participant 2 is outside the ensemble of 2",
+        ),
+    ];
+
+    // Each limit at its edge is accepted as written. The fixture holds one
+    // view of under 32 KiB, so the two 1024-cell edges get a session each.
+    let at_limits: Vec<(&str, Vec<Block>)> = vec![
+        ("table at limits", vec![table(64, 16)]),
+        ("board at limits", vec![board(32, 32, 1024)]),
+        (
+            "counts and text at limits",
+            std::iter::repeat_n(facts(&"x".repeat(256)), 15)
+                .chain([roster(64, 1)])
+                .collect(),
+        ),
+    ];
+    let rejected = cases
+        .into_iter()
+        .map(|(name, blocks, fragment)| (name, blocks, Some(fragment)));
+    let accepted = at_limits
+        .into_iter()
+        .map(|(name, blocks)| (name, blocks, None));
+    for (name, blocks, rejection) in accepted.chain(rejected) {
+        let mut view = View::new().header("fixture");
+        for block in &blocks {
+            view = view.block(block.clone());
+        }
+        let json = serde_json::to_string(&view).expect("view JSON");
+        let d = daemon(&view_program_wasm(&json)).await;
+        let exec = start_view_session(&d).await;
+        for at_step in [None, Some(0)] {
+            let reply = view_at(&d.host_a, exec, at_step).await;
+            match rejection {
+                None => assert_eq!(
+                    view_reply(reply).1,
+                    view,
+                    "{name} at {at_step:?}: blocks within the limits pass through"
+                ),
+                Some(fragment) => {
+                    let error = reply.unwrap_err();
+                    assert_eq!(error.code, arena0_api::ApiErrorCode::Execution, "{name}");
+                    assert!(
+                        error.message.contains(fragment),
+                        "{name} at {at_step:?}: `{}` does not name `{fragment}`",
+                        error.message
+                    );
+                }
+            }
+        }
+    }
 }

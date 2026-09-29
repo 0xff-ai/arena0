@@ -239,13 +239,19 @@ impl ExecutionActor {
         viewport: JsonBytes,
     ) -> Result<(Option<u64>, arena0_protocol::View), ExecError> {
         let state = &self.state;
-        let projection =
-            self.context
-                .program
-                .view(state.shared_state(), &self.ensemble(), viewport)?;
-        let view = serde_json::from_slice(projection.output.as_bytes()).map_err(|error| {
-            ExecError::Unavailable(format!("view projection is not a View: {error}"))
-        })?;
+        let ensemble = self.ensemble();
+        let projection = self
+            .context
+            .program
+            .view(state.shared_state(), &ensemble, viewport)?;
+        let view = serde_json::from_slice::<arena0_protocol::View>(projection.output.as_bytes())
+            .map_err(|error| {
+                ExecError::Unavailable(format!("view projection is not a View: {error}"))
+            })?;
+        // The view is guest output: a violation fails this request and leaves
+        // the session running.
+        view.validate(ensemble.len())
+            .map_err(|error| ExecError::Unavailable(format!("view projection: {error}")))?;
         Ok((state.agreed_step().checked_sub(1), view))
     }
 

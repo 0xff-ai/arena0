@@ -149,6 +149,31 @@ pub mod cumulative_sum {
                     "collecting"
                 }
             )))
+            .block(Block::Progress {
+                label: "Total".into(),
+                value: display_total,
+                max: target,
+            })
+            .block(Block::Facts {
+                title: None,
+                items: vec![
+                    Fact {
+                        label: "Phase".into(),
+                        value: Cell::text(if state.finalized {
+                            "finalized"
+                        } else {
+                            "collecting"
+                        }),
+                    },
+                    Fact {
+                        label: "Contributions".into(),
+                        value: Cell::text(format!(
+                            "{} of {participant_count}",
+                            state.contributions.iter().flatten().count()
+                        )),
+                    },
+                ],
+            })
     }
 
     fn participant_count(ensemble: &Ensemble) -> usize {

@@ -252,11 +252,73 @@ pub mod chess {
             None => "Chess - waiting for game to start".to_string(),
         };
 
-        View::new()
+        let view = View::new()
             .header(vp.fit_text(header))
             .agents(vp.fit_text(render_agents(board.as_ref(), me)))
             .state(vp.fit_text(render_board_state(state, board.as_ref(), viewer, vp)))
-            .status_bar(vp.fit_text(render_status(&state.status, board.as_ref())))
+            .status_bar(vp.fit_text(render_status(&state.status, board.as_ref())));
+        match board {
+            Some(board) => view
+                .block(board_block(&board, last_move_squares(&state.move_history)))
+                .block(facts_block(&state.status, &board)),
+            None => view,
+        }
+    }
+
+    /// The board in White-first orientation, matching the text rendering.
+    /// Each piece belongs to the participant playing its colour.
+    fn board_block(board: &CozyBoard, last_move: Option<(CozySquare, CozySquare)>) -> Block {
+        let files = oriented_files(Color::White);
+        let ranks = oriented_ranks(Color::White);
+        let mut cells = Vec::with_capacity(64);
+        for &rank in &ranks {
+            for &file in &files {
+                let square = CozySquare::new(file, rank);
+                let mut cell = match board.piece_on(square).zip(board.color_on(square)) {
+                    Some((piece, color)) => Cell::text(unicode_piece(piece, color).to_string())
+                        .participant(Participant::from(Color::from(color)).as_u8()),
+                    None => Cell::text(""),
+                };
+                if last_move.is_some_and(|(from, to)| square == from || square == to) {
+                    cell = cell.tone(Tone::Highlight);
+                }
+                cells.push(cell);
+            }
+        }
+        Block::Board {
+            title: None,
+            rows: 8,
+            cols: 8,
+            cells,
+            row_labels: ranks.iter().map(|rank| rank.to_string()).collect(),
+            col_labels: files.iter().map(|file| file.to_string()).collect(),
+        }
+    }
+
+    fn facts_block(status: &Status, board: &CozyBoard) -> Block {
+        let mut items = Vec::new();
+        if matches!(status, Status::InProgress) {
+            let to_move = Color::from(board.side_to_move());
+            items.push(Fact {
+                label: "To move".into(),
+                value: Cell::text(to_move.to_string())
+                    .participant(Participant::from(to_move).as_u8()),
+            });
+            items.push(Fact {
+                label: "Move".into(),
+                value: Cell::text(board.fullmove_number().to_string()),
+            });
+        }
+        let in_check = !board.checkers().is_empty();
+        items.push(Fact {
+            label: "Status".into(),
+            value: match status {
+                Status::InProgress if in_check => Cell::text("Check").tone(Tone::Warn),
+                Status::InProgress => Cell::text("In progress"),
+                terminal => Cell::text(terminal.game_result()).tone(Tone::Highlight),
+            },
+        });
+        Block::Facts { title: None, items }
     }
 
     fn render_agents(board: Option<&CozyBoard>, me: Option<usize>) -> String {

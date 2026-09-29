@@ -197,6 +197,54 @@ pub mod rock_paper_scissors {
             .agents(agents)
             .state(state_slot)
             .status_bar(status_bar)
+            .block(roster_block(state))
+            .block(facts_block(state))
+    }
+
+    /// Who has committed or revealed. A throw appears only once both are
+    /// revealed, exactly when the text view shows it.
+    fn roster_block(state: &Shared) -> Block {
+        let phase = state.commit_reveal.phase();
+        Block::Roster {
+            title: None,
+            entries: (0..2u8)
+                .map(|participant| {
+                    let choice = state.commit_reveal.value_at(usize::from(participant));
+                    let (status, tone) = match phase {
+                        commit_reveal::Phase::Idle => ("waiting", Tone::Muted),
+                        commit_reveal::Phase::Revealing => ("committed", Tone::Normal),
+                        commit_reveal::Phase::Complete => ("revealed", Tone::Good),
+                    };
+                    RosterEntry {
+                        participant,
+                        status: Cell::text(status).tone(tone).participant(participant),
+                        detail: choice
+                            .map(|choice| format!("{} {}", choice.glyph(), choice.label())),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn facts_block(state: &Shared) -> Block {
+        let mut items = vec![Fact {
+            label: "Round".into(),
+            value: Cell::text(format!("{} of {}", state.round, state.total_rounds)),
+        }];
+        if let Some([p0, p1]) = state.commit_reveal.values().as_deref() {
+            let result = if p0.beats(**p1) {
+                Cell::text("P0 wins").participant(0).tone(Tone::Good)
+            } else if p1.beats(**p0) {
+                Cell::text("P1 wins").participant(1).tone(Tone::Good)
+            } else {
+                Cell::text("Draw")
+            };
+            items.push(Fact {
+                label: "Result".into(),
+                value: result,
+            });
+        }
+        Block::Facts { title: None, items }
     }
 
     fn render_agents(state: &Shared, me: Option<usize>, vp: &Viewport) -> String {
