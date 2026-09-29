@@ -29,21 +29,26 @@ impl super::WasmtimeEngine {
     }
 
     fn configured(persistent_cache: Option<wasmtime::Cache>) -> Result<Self, SandboxError> {
+        let profile = ExecutionProfile::current();
+        let features = profile.wasm_features;
         let mut config = wasmtime::Config::new();
-        config.cranelift_nan_canonicalization(true);
+        config.cranelift_nan_canonicalization(features.canonicalize_nan);
         config.max_wasm_stack(super::STACK_LIMIT);
         config.consume_fuel(true);
-        config.wasm_simd(false);
-        config.wasm_relaxed_simd(false);
-        config.wasm_multi_memory(false);
-        config.wasm_memory64(false);
-        config.wasm_tail_call(false);
+        config.wasm_simd(features.simd);
+        config.wasm_relaxed_simd(features.relaxed_simd);
+        config.wasm_multi_memory(features.multi_memory);
+        config.wasm_memory64(features.memory64);
+        config.wasm_tail_call(features.tail_call);
+        config.wasm_wide_arithmetic(features.wide_arithmetic);
+        // GC and exception handling need Wasmtime's `gc` Cargo feature, which
+        // this workspace does not enable; the engine test pins their rejection.
         config.cache(persistent_cache.clone());
         let engine = wasmtime::Engine::new(&config)
             .map_err(|error| SandboxError::compilation_failed(error.to_string()))?;
         Ok(Self {
             engine,
-            profile: ExecutionProfile::current(),
+            profile,
             loaded: moka::sync::Cache::new(super::PROGRAM_CACHE_CAPACITY),
             persistent_cache,
         })
@@ -220,5 +225,32 @@ impl super::LoadedProgram {
     #[must_use]
     pub fn profile(&self) -> &ExecutionProfile {
         &self.profile
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::WasmtimeEngine;
+    use wasmtime::Module;
+
+    #[test]
+    fn engine_rejects_proposals_outside_the_profile() {
+        let engine = WasmtimeEngine::new().unwrap();
+        Module::new(&engine.engine, "(module (func (result i32) i32.const 1))")
+            .expect("baseline module compiles");
+        for (proposal, wat) in [
+            ("gc", "(module (type (struct (field i32))))"),
+            ("exceptions", "(module (tag $e) (func throw $e))"),
+            (
+                "wide arithmetic",
+                "(module (func (param i64 i64 i64 i64) (result i64 i64) \
+                 local.get 0 local.get 1 local.get 2 local.get 3 i64.add128))",
+            ),
+        ] {
+            assert!(
+                Module::new(&engine.engine, wat).is_err(),
+                "{proposal} module must not compile"
+            );
+        }
     }
 }

@@ -34,7 +34,7 @@ publish = false
 
 [workspace.dependencies]
 # Wasm runtime
-wasmtime = { version = "46.0.3", default-features = false, features = [
+wasmtime = { version = "48.0.3", default-features = false, features = [
     "anyhow",
     "cache",
     "cranelift",
