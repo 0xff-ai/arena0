@@ -4,12 +4,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::call::DispatchKind;
 use arena0_program::ExecutionProfile;
-use wasmtime::Module;
+use arena0_protocol::Lifecycle;
+use wasmtime::{Linker, Module, Store};
 
 use super::imports::{register_always_available, register_metadata_imports};
-use super::{CallKind, InstanceConfig, instantiate_module};
+use super::{CallKind, HostState, InstanceConfig, instantiate_module};
 use crate::validation;
 use crate::{Program, SandboxError};
 
@@ -29,21 +29,26 @@ impl super::WasmtimeEngine {
     }
 
     fn configured(persistent_cache: Option<wasmtime::Cache>) -> Result<Self, SandboxError> {
+        let profile = ExecutionProfile::current();
+        let features = profile.wasm_features;
         let mut config = wasmtime::Config::new();
-        config.cranelift_nan_canonicalization(true);
+        config.cranelift_nan_canonicalization(features.canonicalize_nan);
         config.max_wasm_stack(super::STACK_LIMIT);
         config.consume_fuel(true);
-        config.wasm_simd(false);
-        config.wasm_relaxed_simd(false);
-        config.wasm_multi_memory(true);
-        config.wasm_memory64(false);
-        config.wasm_tail_call(false);
+        config.wasm_simd(features.simd);
+        config.wasm_relaxed_simd(features.relaxed_simd);
+        config.wasm_multi_memory(features.multi_memory);
+        config.wasm_memory64(features.memory64);
+        config.wasm_tail_call(features.tail_call);
+        config.wasm_wide_arithmetic(features.wide_arithmetic);
+        // GC and exception handling need Wasmtime's `gc` Cargo feature, which
+        // this workspace does not enable; the engine test pins their rejection.
         config.cache(persistent_cache.clone());
         let engine = wasmtime::Engine::new(&config)
             .map_err(|error| SandboxError::compilation_failed(error.to_string()))?;
         Ok(Self {
             engine,
-            profile: ExecutionProfile::current(),
+            profile,
             loaded: moka::sync::Cache::new(super::PROGRAM_CACHE_CAPACITY),
             persistent_cache,
         })
@@ -120,8 +125,7 @@ impl super::WasmtimeEngine {
     fn compile(&self, program: &Program) -> Result<Arc<super::LoadedProgram>, SandboxError> {
         let module = Module::new(&self.engine, program.bytes())
             .map_err(|error| SandboxError::compilation_failed(error.to_string()))?;
-        crate::finalize::validate_finalized_shape(program.bytes(), &self.profile)?;
-        validation::validate_required_exports(&module)?;
+        validation::validate_exports(&module)?;
         validation::validate_imports(&module, &program.definition().metadata)?;
         let _probe = instantiate_module(
             &self.engine,
@@ -131,7 +135,8 @@ impl super::WasmtimeEngine {
                 schema: &program.definition().schema,
                 profile: &self.profile,
                 call_kind: CallKind::Metadata,
-                dispatch: DispatchKind::Local,
+                lifecycle: Lifecycle::PreSession,
+                random_replay: None,
             },
         )?;
         Ok(Arc::new(super::LoadedProgram {
@@ -148,22 +153,10 @@ impl super::WasmtimeEngine {
     /// output uses the bounded metadata export probe.
     pub fn build_program(&self, wasm: &[u8]) -> Result<Program, SandboxError> {
         match Program::parse(wasm) {
-            Ok(program) => {
-                // Probe completed artifacts as well as section-less raw
-                // modules. This rejects stale ABI versions before a caller
-                // can treat the parsed bytes as a current ProgramHash.
-                self.compile(&program)?;
-                Ok(program)
-            }
+            Ok(program) => Ok(program),
             Err(SandboxError::MissingMetadata) => {
                 let definition = self.metadata_for_embedding(wasm)?;
-                let finalized = crate::finalize::finalize(wasm, &self.profile)?;
-                let module = Module::new(&self.engine, &finalized)
-                    .map_err(|error| SandboxError::compilation_failed(error.to_string()))?;
-                crate::finalize::validate_finalized_shape(&finalized, &self.profile)?;
-                validation::validate_required_exports(&module)?;
-                validation::validate_imports(&module, &definition.metadata)?;
-                Program::embed(&finalized, &definition)
+                Program::embed(wasm, &definition)
             }
             Err(error) => Err(error),
         }
@@ -175,23 +168,30 @@ impl super::WasmtimeEngine {
     ) -> Result<arena0_program::ProgramDefinition, SandboxError> {
         let module = Module::new(&self.engine, binary)
             .map_err(|error| SandboxError::compilation_failed(error.to_string()))?;
-        validation::validate_raw_exports(&module)?;
-        // The probe shares the fresh-instance bootstrap; only its import set
-        // (every capability, since none are declared yet) differs.
-        let mut instance = super::prepare_instance(
+        validation::validate_exports(&module)?;
+        let mut store = Store::new(
             &self.engine,
-            &module,
-            &self.profile,
-            CallKind::Metadata,
-            DispatchKind::Local,
-            Vec::new(),
-            |linker| {
-                register_always_available(linker)?;
-                register_metadata_imports(linker)
-            },
-        )?;
+            HostState::new(
+                self.profile.clone(),
+                CallKind::Metadata,
+                Lifecycle::PreSession,
+                None,
+                Vec::new(),
+            ),
+        );
+        store.limiter(|state| &mut state.limits);
+        store
+            .set_fuel(self.profile.fuel.per_call)
+            .map_err(|error| SandboxError::instantiation_failed(error.to_string()))?;
+        let mut linker = Linker::new(&self.engine);
+        register_always_available(&mut linker)?;
+        register_metadata_imports(&mut linker)?;
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .map_err(|error| SandboxError::instantiation_failed(error.to_string()))?;
+        validation::check_abi_version(&mut store, &instance)?;
         let (ptr, len) = {
-            let mut guest = super::memory::Guest::new(&mut instance.store, &instance.instance);
+            let mut guest = super::memory::Guest::new(&mut store, &instance);
             guest.call_metadata()?
         };
         if len as usize > self.profile.limits.max_metadata_bytes as usize {
@@ -201,7 +201,7 @@ impl super::WasmtimeEngine {
             )));
         }
         let bytes = {
-            let mut guest = super::memory::Guest::new(&mut instance.store, &instance.instance);
+            let mut guest = super::memory::Guest::new(&mut store, &instance);
             let bytes = guest.read_mem(ptr, len)?;
             guest.dealloc(ptr, len)?;
             bytes
@@ -225,5 +225,32 @@ impl super::LoadedProgram {
     #[must_use]
     pub fn profile(&self) -> &ExecutionProfile {
         &self.profile
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::WasmtimeEngine;
+    use wasmtime::Module;
+
+    #[test]
+    fn engine_rejects_proposals_outside_the_profile() {
+        let engine = WasmtimeEngine::new().unwrap();
+        Module::new(&engine.engine, "(module (func (result i32) i32.const 1))")
+            .expect("baseline module compiles");
+        for (proposal, wat) in [
+            ("gc", "(module (type (struct (field i32))))"),
+            ("exceptions", "(module (tag $e) (func throw $e))"),
+            (
+                "wide arithmetic",
+                "(module (func (param i64 i64 i64 i64) (result i64 i64) \
+                 local.get 0 local.get 1 local.get 2 local.get 3 i64.add128))",
+            ),
+        ] {
+            assert!(
+                Module::new(&engine.engine, wat).is_err(),
+                "{proposal} module must not compile"
+            );
+        }
     }
 }
