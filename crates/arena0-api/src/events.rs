@@ -191,6 +191,11 @@ pub enum EventData {
     },
     #[serde(rename = "exec.session.ended")]
     SessionEnded { terminal: SessionTerminal },
+    #[serde(rename = "exec.session.end_progress")]
+    SessionEndProgress {
+        phase: crate::ExecEndPhase,
+        unconfirmed: Vec<PeerId>,
+    },
     #[serde(rename = "stream.lagged")]
     Lagged { skipped: u64 },
 }
@@ -220,6 +225,7 @@ impl EventData {
             Self::SessionCalloutAnswered { .. } => "exec.session.callout_answered",
             Self::SessionStep { .. } => "exec.session.step",
             Self::SessionEnded { .. } => "exec.session.ended",
+            Self::SessionEndProgress { .. } => "exec.session.end_progress",
             Self::Lagged { .. } => "stream.lagged",
         }
     }
@@ -241,6 +247,7 @@ impl EventData {
                 | Self::SessionCalloutAnswered { .. }
                 | Self::SessionStep { .. }
                 | Self::SessionEnded { .. }
+                | Self::SessionEndProgress { .. }
         )
     }
 
@@ -446,6 +453,7 @@ const CATALOG: &[&str] = &[
     "exec.session.callout_answered",
     "exec.session.step",
     "exec.session.ended",
+    "exec.session.end_progress",
     "stream.lagged",
 ];
 
@@ -724,6 +732,14 @@ mod tests {
             frame(
                 EventData::SessionEnded {
                     terminal: SessionTerminal::Completed { outcome: None },
+                },
+                Some(exec),
+                Some(sid),
+            ),
+            frame(
+                EventData::SessionEndProgress {
+                    phase: crate::ExecEndPhase::Ended,
+                    unconfirmed: vec![peer],
                 },
                 Some(exec),
                 Some(sid),

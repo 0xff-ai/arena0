@@ -406,6 +406,9 @@ pub(super) fn event_activity(host: &str, frame: &EventFrame) -> ActivityRow {
                 (format!("session aborted at step {step}"), Level::Warn)
             }
         },
+        EventData::SessionEndProgress { phase, .. } => {
+            (format!("end handshake {phase:?}"), Level::Info)
+        }
         EventData::Lagged { skipped } => {
             (format!("{skipped} events skipped · reloading"), Level::Warn)
         }

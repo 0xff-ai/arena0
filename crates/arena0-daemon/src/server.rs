@@ -361,6 +361,10 @@ enum ResumeCause {
 /// projection, so producers construct this value once.
 #[derive(Debug, Clone)]
 pub(crate) enum HostEvent {
+    SessionEndProgress {
+        source: EventSource,
+        end: arena0_api::ExecEndStatus,
+    },
     HostStopped {
         reason: Option<String>,
         uptime_secs: u64,
@@ -427,6 +431,7 @@ impl HostEvent {
     fn source(&self) -> Option<&EventSource> {
         match self {
             Self::Negotiation { source, .. }
+            | Self::SessionEndProgress { source, .. }
             | Self::Created { source, .. }
             | Self::Failed { source, .. }
             | Self::SessionStarted { source, .. }
@@ -441,6 +446,7 @@ impl HostEvent {
 
     fn system_event(&self) -> Option<SystemEvent> {
         match self {
+            Self::SessionEndProgress { .. } => None,
             Self::HostStopped { .. } | Self::OfferSeen { .. } => None,
             Self::Negotiation { source, event } => Some(SystemEvent::Negotiation {
                 source: source.clone(),
@@ -617,6 +623,10 @@ impl HostEvent {
                 terminal: arena0_api::SessionTerminal::Completed {
                     outcome: outcome.clone(),
                 },
+            },
+            Self::SessionEndProgress { end, .. } => EventData::SessionEndProgress {
+                phase: end.phase,
+                unconfirmed: end.unconfirmed.clone(),
             },
             Self::SessionAborted {
                 source,
@@ -1416,8 +1426,17 @@ impl HostService {
                 .await?;
             let next = page.next_cursor();
             for candidate in page.into_candidates() {
+                let request = candidate.request().clone();
                 self.resume_candidate(candidate, ResumeCause::Startup)
                     .await?;
+                if let Some(name) = request.strategy() {
+                    let status = self.exec_status(request.execution_id()).await?;
+                    if !status.lifecycle().is_terminal() {
+                        let strategy = crate::strategy::Strategy::parse(name)
+                            .context("stored execution has unknown built-in strategy")?;
+                        self.start_strategy(request.execution_id(), strategy).await;
+                    }
+                }
             }
             let Some(next) = next else {
                 return Ok(());
@@ -2013,11 +2032,12 @@ impl HostService {
                 params,
                 ensemble,
                 blobs,
+                strategy,
             } => {
-                self.new_exec(exec_id, program, params, ensemble, blobs)
+                self.new_exec(exec_id, program, params, ensemble, blobs, strategy)
                     .await
             }
-            HostRequest::ExecList => self.exec_statuses().await.map(ResponseOk::ExecList),
+            HostRequest::ExecList => self.exec_list().await.map(ResponseOk::ExecList),
             HostRequest::ExecStatus { exec_id } => {
                 self.exec_status(exec_id).await.map(ResponseOk::Status)
             }
@@ -2118,7 +2138,7 @@ impl HostService {
         }
     }
 
-    async fn exec_statuses(&self) -> Result<Vec<ExecStatus>, ApiError> {
+    async fn exec_list(&self) -> Result<Vec<arena0_api::ExecListEntry>, ApiError> {
         let requests = self
             .store
             .list_execution_requests(4_096)
@@ -2126,7 +2146,15 @@ impl HostService {
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
         let mut statuses = Vec::with_capacity(requests.len());
         for request in requests {
-            statuses.push(self.project_exec_status(request.execution_id()).await?);
+            let exec_id = request.execution_id();
+            let status = self.project_exec_status(exec_id).await?;
+            let activation = self
+                .store
+                .load_activation(exec_id)
+                .await
+                .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
+                .map(project_activation_inspection);
+            statuses.push(arena0_api::ExecListEntry { status, activation });
         }
         Ok(statuses)
     }
@@ -2230,6 +2258,27 @@ impl HostService {
             Some(state) => Some(self.project_turn(exec_id, state).await?),
             None => None,
         };
+        let callout = if let Some(open) = state.as_ref().and_then(|state| state.callout()) {
+            let schema = self
+                .catalog
+                .schema(request.program_hash())
+                .await
+                .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
+                .ok_or_else(|| {
+                    ApiError::new(ApiErrorCode::Storage, "execution program schema is missing")
+                })?;
+            Some(
+                crate::exec_manager::project_callout(
+                    open.id,
+                    open.callout_index,
+                    &open.context,
+                    &schema,
+                )
+                .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?,
+            )
+        } else {
+            None
+        };
         project_exec_status_facts(
             self.peer_id,
             request,
@@ -2238,6 +2287,7 @@ impl HostService {
             turn,
             execution_updated_at_ms,
             receipt_available,
+            callout,
         )
         .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))
     }
@@ -2386,7 +2436,25 @@ impl HostService {
         params: Option<serde_json::Value>,
         ensemble: EnsembleSpec,
         blobs: Vec<arena0_protocol::BlobHash>,
+        strategy: Option<String>,
     ) -> Response {
+        let strategy = strategy
+            .map(|name| {
+                crate::strategy::Strategy::parse(&name).ok_or_else(|| {
+                    let supported: Vec<_> = crate::strategy::Strategy::ALL
+                        .iter()
+                        .map(|strategy| strategy.name())
+                        .collect();
+                    ApiError::new(
+                        ApiErrorCode::BadRequest,
+                        format!(
+                            "unknown built-in strategy '{name}'; supported strategies: {}",
+                            supported.join(", ")
+                        ),
+                    )
+                })
+            })
+            .transpose()?;
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
         let mut tasks = self.tasks.lock().await;
@@ -2405,7 +2473,7 @@ impl HostService {
         let daemon = Arc::clone(self);
         tasks.spawn(async move {
             let response = daemon
-                .new_exec_inner(exec_id, program, params, ensemble, blobs)
+                .new_exec_inner(exec_id, program, params, ensemble, blobs, strategy)
                 .await;
             if response_tx.send(response).is_err() {
                 daemon.finish_creation(exec_id, true).await;
@@ -2470,6 +2538,7 @@ impl HostService {
         params: Option<serde_json::Value>,
         ensemble: EnsembleSpec,
         blobs: Vec<arena0_protocol::BlobHash>,
+        strategy: Option<crate::strategy::Strategy>,
     ) -> Response {
         let (program_id, plan, admission) = match ensemble {
             EnsembleSpec::Create { participant_count } => {
@@ -2544,6 +2613,7 @@ impl HostService {
                 request_params,
                 admission,
                 &blobs,
+                strategy.map(|strategy| strategy.name().to_owned()),
                 unix_time_ms(),
             )
             .await
@@ -2594,6 +2664,9 @@ impl HostService {
             .instrument(span),
         );
 
+        if let Some(strategy) = strategy {
+            self.start_strategy(exec_id, strategy).await;
+        }
         Ok(ResponseOk::ExecCreated {
             exec_id,
             negotiation_id,
@@ -2601,6 +2674,67 @@ impl HostService {
             exec_state: ExecLifecycle::Negotiating,
             queue_position,
         })
+    }
+
+    /// The service task set owns strategy lifetime and cancels it on shutdown.
+    /// After submitting, observe a durable callout change before answering again:
+    /// submission acknowledgement can precede the actor's next durable step.
+    async fn start_strategy(
+        self: &Arc<Self>,
+        exec_id: ExecId,
+        strategy: crate::strategy::Strategy,
+    ) {
+        let service = Arc::clone(self);
+        self.tasks.lock().await.spawn(async move {
+            loop {
+                let event = match service.next(exec_id).await {
+                    Ok(event) => event,
+                    Err(error) => {
+                        tracing::warn!(%exec_id, code = ?error.code, "built-in strategy stopped");
+                        return;
+                    }
+                };
+                let NextEvent::Callout { pending_id, name, context, schema, .. } = event else {
+                    return;
+                };
+                let answer = strategy.answer(&name, &context, schema.as_value());
+                let result = match answer {
+                    Ok(answer) => service.submit(exec_id, pending_id, Some(answer)).await,
+                    Err(_) => Err(ApiError::new(ApiErrorCode::InputRejected, "strategy answer failed")),
+                };
+                match result {
+                    Err(error) if error.code == ApiErrorCode::CalloutNotPending => continue,
+                    Err(error) if error.code == ApiErrorCode::InputRejected || error.code == ApiErrorCode::Schema => {
+                        let reason = format!("built-in strategy '{}' could not answer '{name}'", strategy.name());
+                        let entry = service.execs.get(&exec_id).expect("strategy execution has a live driver");
+                        if let Err(error) = entry.terminate(reason).await {
+                            tracing::warn!(%exec_id, code = ?error.code, "built-in strategy stopped");
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%exec_id, code = ?error.code, "built-in strategy stopped");
+                        return;
+                    }
+                    Ok(_) => {}
+                }
+                let entry = service.execs.get(&exec_id).expect("strategy execution has a live driver");
+                loop {
+                    // Register before reading so a commit between read and wait
+                    // cannot strand the strategy behind a lost notification.
+                    let changed = entry.change_notified();
+                    match service.next_ready(exec_id).await {
+                        Ok(Some(NextEvent::Callout { pending_id: next, .. })) if next != pending_id => break,
+                        Ok(Some(NextEvent::Completed { .. } | NextEvent::Failed { .. })) => return,
+                        Ok(_) => changed.await,
+                        Err(error) => {
+                            tracing::warn!(%exec_id, code = ?error.code, "built-in strategy stopped");
+                            return;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     async fn withdraw_or_cancel_creation(&self, exec_id: ExecId) -> Response {
@@ -3660,11 +3794,20 @@ impl HostService {
         from: u64,
         to: u64,
     ) -> Result<Vec<arena0_api::AgreedStep>, ApiError> {
-        self.store
+        let state = self
+            .store
             .load_execution(exec_id)
             .await
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
             .ok_or_else(|| ApiError::new(ApiErrorCode::NotFound, "no such execution"))?;
+        let schema = self
+            .catalog
+            .schema(state.binding().program_hash())
+            .await
+            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
+            .ok_or_else(|| {
+                ApiError::new(ApiErrorCode::Storage, "execution program schema is missing")
+            })?;
         self.store
             .read_agreed_steps(exec_id, from, to)
             .await
@@ -3673,6 +3816,22 @@ impl HostService {
                     .into_iter()
                     .map(|step| arena0_api::AgreedStep {
                         certified_at_ms: step.certified_at_ms,
+                        message: match &step.entry.event {
+                            arena0_protocol::StepEvent::Message { data, .. } => {
+                                Some(match schema.messages.first() {
+                                    Some(message) => match message.borsh.decode_json(data) {
+                                        Ok(value) => arena0_api::DecodedMessage::Json(value),
+                                        Err(error) => arena0_api::DecodedMessage::Undecodable {
+                                            error: error.to_string(),
+                                        },
+                                    },
+                                    None => arena0_api::DecodedMessage::Undecodable {
+                                        error: "program declares no message schema".to_owned(),
+                                    },
+                                })
+                            }
+                            _ => None,
+                        },
                         entry: step.entry,
                     })
                     .collect()
@@ -3743,6 +3902,7 @@ fn project_exec_status_facts(
     turn: Option<Turn>,
     execution_updated_at_ms: Option<u64>,
     receipt_available: bool,
+    callout: Option<PendingCalloutStatus>,
 ) -> anyhow::Result<ExecStatus> {
     let exec_id = request.execution_id();
     let program_id = request.program_hash();
@@ -3762,10 +3922,7 @@ fn project_exec_status_facts(
                 .filter(|peer| *peer != peer_id)
                 .collect(),
             participants: binding.activation().tickets().len(),
-            pending_callout: state.callout().map(|callout| PendingCalloutStatus {
-                pending_id: callout.id,
-                callout_index: callout.callout_index,
-            }),
+            pending_callout: callout.clone(),
             receipt_available,
             writer: turn.writer,
             phase: turn.phase.clone(),
@@ -3800,16 +3957,33 @@ fn project_exec_status_facts(
         },
         (ExecLifecycle::Completed, Some(state)) => ExecStatusState::Completed {
             session: session_status(&state),
+            outcome: state
+                .terminal_outcome_json()
+                .map(serde_json::from_slice)
+                .transpose()?,
         },
         (ExecLifecycle::Aborted, Some(state)) => ExecStatusState::Aborted {
             session: session_status(&state),
+            reason: state
+                .status()
+                .terminal_cause()
+                .context("aborted execution has no terminal cause")?
+                .reason()
+                .to_owned(),
         },
         (ExecLifecycle::Failed, Some(state)) => ExecStatusState::Failed {
+            reason: request.failure().map(str::to_owned).or_else(|| {
+                state
+                    .status()
+                    .terminal_cause()
+                    .map(|cause| cause.reason().to_owned())
+            }),
             session: Some(SessionProgress::Started {
                 session: session_status(&state),
             }),
         },
         (ExecLifecycle::Failed, None) => ExecStatusState::Failed {
+            reason: request.failure().map(str::to_owned),
             session: committed_session.map(|session_id| SessionProgress::Activated { session_id }),
         },
         (lifecycle, None) => {
@@ -4667,6 +4841,7 @@ mod tests {
 
         let response = daemon
             .dispatch(HostRequest::ExecNew {
+                strategy: None,
                 exec_id,
                 program: "missing".to_owned(),
                 params: None,
@@ -4766,6 +4941,7 @@ mod tests {
                 Some(JsonBytes::try_new(b"null".to_vec()).unwrap()),
                 ExecutionAdmission::join(PeerId([0x11; 32]), negotiation_id),
                 &[],
+                None,
                 1,
             )
             .await
@@ -4829,7 +5005,7 @@ mod tests {
         match daemon.dispatch(HostRequest::ExecList).await {
             Ok(ResponseOk::ExecList(statuses)) => {
                 assert_eq!(statuses.len(), 1);
-                assert_eq!(statuses[0].exec_id, exec_id);
+                assert_eq!(statuses[0].status.exec_id, exec_id);
             }
             other => panic!("expected exec.list, got {other:?}"),
         }
@@ -4876,6 +5052,7 @@ mod tests {
                     )
                     .expect("admission"),
                     &[],
+                    None,
                     index,
                 )
                 .await
@@ -4924,7 +5101,7 @@ mod tests {
             ExecutionAdmission::create(offer.negotiation_id, offer.target_size).expect("admission");
         let mut writer = daemon.runtime.claim_execution(execution_id).unwrap();
         writer
-            .create_execution_request(program_hash, Some(params), admission, &[], 1)
+            .create_execution_request(program_hash, Some(params), admission, &[], None, 1)
             .await
             .expect("request");
         writer
@@ -5378,6 +5555,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .expect("project prepared status");
         assert!(matches!(
@@ -5426,6 +5604,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .expect("project committed status");
         assert!(matches!(
@@ -5446,6 +5625,7 @@ mod tests {
                 Some(JsonBytes::try_new(b"null".to_vec()).expect("params")),
                 ExecutionAdmission::create(negotiation_id, 2).expect("admission"),
                 &[],
+                None,
                 4,
             )
             .await
@@ -5468,12 +5648,13 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .expect("project post-commit failure");
         assert!(matches!(
             failed_status.state,
             ExecStatusState::Failed {
-                session: Some(SessionProgress::Activated { session_id })
+                session: Some(SessionProgress::Activated { session_id }), ..
             } if session_id == activation.session_hash()
         ));
         let state = ExecutionState::new(

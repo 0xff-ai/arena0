@@ -21,6 +21,288 @@ use common::{
 use tokio::io::BufReader;
 use tokio::net::{UnixStream, unix::OwnedReadHalf, unix::OwnedWriteHalf};
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_carries_callout_details_and_terminal_facts() {
+    let d = daemon(&rps_wasm()).await;
+    let (a, b) = launch_pair(&d, Some(serde_json::Value::Null), None).await;
+    let (from_a, _) = next_from_either(&d.host_a, a, &d.host_b, b).await;
+    let (host, exec_id) = if from_a {
+        (&d.host_a, a)
+    } else {
+        (&d.host_b, b)
+    };
+    {
+        let ResponseOk::Next(NextEvent::Callout {
+            pending_id,
+            callout_index,
+            name,
+            prompt,
+            schema,
+            context,
+        }) = ok(call(host, &HostRequest::ExecNext { exec_id }).await)
+        else {
+            panic!("expected callout");
+        };
+        let expected = arena0_api::PendingCalloutStatus {
+            pending_id,
+            callout_index,
+            name,
+            prompt,
+            schema,
+            context,
+        };
+        let ResponseOk::Status(status) = ok(call(host, &HostRequest::ExecStatus { exec_id }).await)
+        else {
+            panic!("expected status");
+        };
+        assert_eq!(status.pending_callout(), Some(&expected));
+        let ResponseOk::ExecList(entries) = ok(call(host, &HostRequest::ExecList).await) else {
+            panic!("expected list");
+        };
+        let entry = entries
+            .iter()
+            .find(|entry| entry.status.exec_id == exec_id)
+            .unwrap();
+        assert_eq!(entry.status.pending_callout(), Some(&expected));
+        let ResponseOk::Inspection(inspection) = ok(call(
+            host,
+            &HostRequest::ExecInspect {
+                exec_id,
+                events_from: None,
+                events_limit: 16,
+            },
+        )
+        .await) else {
+            panic!("expected inspection");
+        };
+        assert!(entry.activation.is_some());
+        assert_eq!(entry.activation, inspection.activation);
+    }
+    tokio::join!(drive(&d.host_a, a), drive(&d.host_b, b));
+    for (host, exec_id) in [(&d.host_a, a), (&d.host_b, b)] {
+        let ResponseOk::Next(NextEvent::Completed { outcome, .. }) =
+            ok(call(host, &HostRequest::ExecNext { exec_id }).await)
+        else {
+            panic!("expected completion");
+        };
+        let ResponseOk::Status(status) = ok(call(host, &HostRequest::ExecStatus { exec_id }).await)
+        else {
+            panic!("expected status");
+        };
+        let arena0_api::ExecStatusState::Completed {
+            outcome: actual, ..
+        } = status.state
+        else {
+            panic!("expected completed status");
+        };
+        assert_eq!(actual, outcome);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aborted_status_carries_reason() {
+    let d = daemon(&rps_wasm()).await;
+    let (a, _) = launch_pair(&d, Some(serde_json::Value::Null), None).await;
+    await_active(&d.host_a, a).await;
+    let reason = "API termination reason";
+    ok(call(
+        &d.host_a,
+        &HostRequest::ExecTerminate {
+            exec_id: a,
+            reason: reason.into(),
+        },
+    )
+    .await);
+    ok(call(
+        &d.host_a,
+        &HostRequest::ExecAwait {
+            exec_id: a,
+            until: AwaitState::Terminal,
+        },
+    )
+    .await);
+    let ResponseOk::Status(status) =
+        ok(call(&d.host_a, &HostRequest::ExecStatus { exec_id: a }).await)
+    else {
+        panic!("expected status");
+    };
+    match status.state {
+        arena0_api::ExecStatusState::Aborted { reason: actual, .. }
+        | arena0_api::ExecStatusState::Failed {
+            reason: Some(actual),
+            ..
+        } => assert_eq!(actual, reason),
+        other => panic!("expected abort with reason, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trace_decodes_messages() {
+    let d = daemon(&rps_wasm()).await;
+    let (a, b) = complete_session(&d, Some(serde_json::Value::Null), None).await;
+    for (host, exec_id) in [(&d.host_a, a), (&d.host_b, b)] {
+        let ResponseOk::Trace(steps) = ok(call(
+            host,
+            &HostRequest::ExecTrace {
+                exec_id,
+                from: 0,
+                to: u64::MAX,
+            },
+        )
+        .await) else {
+            panic!("expected trace");
+        };
+        assert_eq!(steps[0].entry.step, 0);
+        assert_eq!(steps[0].message, None);
+        let mut messages = 0;
+        for step in steps {
+            if matches!(step.entry.event, arena0_protocol::StepEvent::Message { .. }) {
+                messages += 1;
+                assert!(matches!(
+                    step.message,
+                    Some(arena0_api::DecodedMessage::Json(_))
+                ));
+            }
+        }
+        assert!(messages > 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn end_progress_events_follow_the_handshake() {
+    let d = daemon(&rps_wasm()).await;
+    let (mut events_a, _write_a) = subscribe_events(&d.host_a).await;
+    let (mut events_b, _write_b) = subscribe_events(&d.host_b).await;
+    let (a, b) = complete_session(&d, Some(serde_json::Value::Null), None).await;
+    for (host, exec_id, events) in [(&d.host_a, a, &mut events_a), (&d.host_b, b, &mut events_b)] {
+        let end = tokio::time::timeout(LIVE_EXECUTION_TIMEOUT, async {
+            loop {
+                let frame = read_event(events).await;
+                if let EventData::SessionEndProgress { phase, unconfirmed } = frame.data {
+                    if phase == arena0_api::ExecEndPhase::Ended {
+                        break arena0_api::ExecEndStatus { phase, unconfirmed };
+                    }
+                }
+            }
+        })
+        .await
+        .expect("end handshake progress");
+        let ResponseOk::Status(status) = ok(call(host, &HostRequest::ExecStatus { exec_id }).await)
+        else {
+            panic!("expected status");
+        };
+        assert_eq!(end, status.end);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn builtin_strategy_plays_a_session() {
+    let d = daemon(&rps_wasm()).await;
+    let a = ExecId([0xa1; 32]);
+    let b = ExecId([0xb1; 32]);
+    let ResponseOk::ExecCreated {
+        negotiation_id: Some(negotiation_id),
+        ..
+    } = ok(call(
+        &d.host_a,
+        &HostRequest::ExecNew {
+            exec_id: a,
+            program: d.program_id.to_string(),
+            params: Some(serde_json::Value::Null),
+            ensemble: EnsembleSpec::Create {
+                participant_count: 2,
+            },
+            blobs: vec![],
+            strategy: Some("first-allowed".into()),
+        },
+    )
+    .await)
+    else {
+        panic!("expected created execution");
+    };
+    created(
+        call(
+            &d.host_b,
+            &HostRequest::ExecNew {
+                exec_id: b,
+                program: d.program_id.to_string(),
+                params: None,
+                ensemble: EnsembleSpec::Join {
+                    target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
+                },
+                blobs: vec![],
+                strategy: Some("first-allowed".into()),
+            },
+        )
+        .await,
+    );
+    for (host, exec_id) in [(&d.host_a, a), (&d.host_b, b)] {
+        let ResponseOk::Awaited { exec_state, .. } = ok(call(
+            host,
+            &HostRequest::ExecAwait {
+                exec_id,
+                until: AwaitState::Terminal,
+            },
+        )
+        .await) else {
+            panic!("expected terminal");
+        };
+        assert_eq!(exec_state, ExecLifecycle::Completed);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_strategy_is_rejected() {
+    let d = daemon(&rps_wasm()).await;
+    let before = ok(call(&d.host_a, &HostRequest::ExecList).await);
+    let error = call(
+        &d.host_a,
+        &HostRequest::ExecNew {
+            exec_id: ExecId([0xa1; 32]),
+            program: d.program_id.to_string(),
+            params: Some(serde_json::Value::Null),
+            ensemble: EnsembleSpec::Create {
+                participant_count: 2,
+            },
+            blobs: vec![],
+            strategy: Some("FIRST".into()),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, arena0_api::ApiErrorCode::BadRequest);
+    assert_eq!(
+        error.message,
+        "unknown built-in strategy 'FIRST'; supported strategies: first-allowed, sample"
+    );
+    assert_eq!(ok(call(&d.host_a, &HostRequest::ExecList).await), before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn strategy_list_names_the_builtins() {
+    let d = daemon(&rps_wasm()).await;
+    let ResponseOk::StrategyList(strategies) =
+        ok(call_daemon(&d.host_a.socket, &Request::StrategyList).await)
+    else {
+        panic!("expected strategies");
+    };
+    assert_eq!(
+        strategies,
+        vec![
+            arena0_api::StrategyInfo {
+                name: "first-allowed".into(),
+                description: "Answers with the first value the callout's schema allows".into()
+            },
+            arena0_api::StrategyInfo {
+                name: "sample".into(),
+                description:
+                    "Plays the bundled example policy for the program, else the first allowed value"
+                        .into()
+            },
+        ]
+    );
+}
+
 async fn next_from_either(
     target_a: &HostTarget,
     exec_a: ExecId,
@@ -47,6 +329,7 @@ async fn exec_new_returns_immediately_and_await_blocks() {
     let resp_a = call(
         &d.host_a,
         &HostRequest::ExecNew {
+            strategy: None,
             exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
@@ -76,6 +359,7 @@ async fn exec_new_returns_immediately_and_await_blocks() {
     let resp_b = call(
         &d.host_b,
         &HostRequest::ExecNew {
+            strategy: None,
             exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
@@ -157,6 +441,7 @@ async fn competing_callout_submissions_return_typed_conflict_and_execution_conti
     let (exec_a, negotiation_id) = match ok(call(
         &d.host_a,
         &HostRequest::ExecNew {
+            strategy: None,
             exec_id: ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
@@ -179,6 +464,7 @@ async fn competing_callout_submissions_return_typed_conflict_and_execution_conti
         call(
             &d.host_b,
             &HostRequest::ExecNew {
+                strategy: None,
                 exec_id: ExecId([line!() as u8; 32]),
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
@@ -252,6 +538,7 @@ async fn rejected_input_is_typed_and_emits_no_answered_event() {
     let (exec_a, negotiation_id) = match ok(call(
         &d.host_a,
         &HostRequest::ExecNew {
+            strategy: None,
             exec_id: ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
@@ -274,6 +561,7 @@ async fn rejected_input_is_typed_and_emits_no_answered_event() {
         call(
             &d.host_b,
             &HostRequest::ExecNew {
+                strategy: None,
                 exec_id: ExecId([line!() as u8; 32]),
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
@@ -372,6 +660,7 @@ async fn stale_callout_after_terminal_is_typed_conflict_and_missing_exec_is_not_
     let (exec_a, negotiation_id) = match ok(call(
         &d.host_a,
         &HostRequest::ExecNew {
+            strategy: None,
             exec_id: ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
@@ -394,6 +683,7 @@ async fn stale_callout_after_terminal_is_typed_conflict_and_missing_exec_is_not_
         call(
             &d.host_b,
             &HostRequest::ExecNew {
+                strategy: None,
                 exec_id: ExecId([line!() as u8; 32]),
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
@@ -551,6 +841,7 @@ async fn negotiating_ticket_can_be_withdrawn() {
         call(
             &d.host_a,
             &HostRequest::ExecNew {
+                strategy: None,
                 exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
@@ -593,6 +884,7 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
     let (exec_a, negotiation_id) = match ok(call(
         &d.host_a,
         &HostRequest::ExecNew {
+            strategy: None,
             exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
@@ -634,6 +926,7 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
         call(
             &d.host_b,
             &HostRequest::ExecNew {
+                strategy: None,
                 exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
@@ -746,6 +1039,7 @@ async fn create_on_host_a(d: &DaemonHarness) -> (ExecId, arena0_protocol::Negoti
     match ok(call(
         &d.host_a,
         &HostRequest::ExecNew {
+            strategy: None,
             exec_id: ExecId([0xA1; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
@@ -774,6 +1068,7 @@ async fn join_on_host_b(
         call(
             &d.host_b,
             &HostRequest::ExecNew {
+                strategy: None,
                 exec_id: ExecId([0xB1; 32]),
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
@@ -982,6 +1277,7 @@ async fn events_subscribe_streams_negotiation_step_terminal() {
     let (exec_a, negotiation_id) = match ok(call(
         &d.host_a,
         &HostRequest::ExecNew {
+            strategy: None,
             exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
@@ -1004,6 +1300,7 @@ async fn events_subscribe_streams_negotiation_step_terminal() {
         call(
             &d.host_b,
             &HostRequest::ExecNew {
+                strategy: None,
                 exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
@@ -1136,6 +1433,7 @@ async fn receipt_id_import_idempotence_and_list() {
     let (exec_a, negotiation_id) = match ok(call(
         &d.host_a,
         &HostRequest::ExecNew {
+            strategy: None,
             exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
@@ -1158,6 +1456,7 @@ async fn receipt_id_import_idempotence_and_list() {
         call(
             &d.host_b,
             &HostRequest::ExecNew {
+                strategy: None,
                 exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
@@ -1309,6 +1608,7 @@ async fn one_endpoint_routes_multiple_hosts_and_rejects_invalid_host_calls() {
         call(
             &d.host_a,
             &HostRequest::ExecNew {
+                strategy: None,
                 exec_id: ExecId([line!() as u8; 32]),
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
@@ -1410,6 +1710,7 @@ async fn blobs_link_grant_and_export_by_hash() {
     let refused = call(
         &d.host_a,
         &HostRequest::ExecNew {
+            strategy: None,
             exec_id: ExecId([line!() as u8; 32]),
             program: d.program_id.to_string(),
             params: Some(serde_json::json!(null)),
@@ -1428,6 +1729,7 @@ async fn blobs_link_grant_and_export_by_hash() {
         ok(call(
             &d.host_a,
             &HostRequest::ExecNew {
+                strategy: None,
                 exec_id: granted,
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
@@ -1495,6 +1797,7 @@ async fn launch_pair(
     let (exec_a, negotiation_id) = match ok(call(
         &d.host_a,
         &HostRequest::ExecNew {
+            strategy: None,
             exec_id: ExecId([0xa1; 32]),
             program: d.program_id.to_string(),
             params: creator_params,
@@ -1517,6 +1820,7 @@ async fn launch_pair(
         call(
             &d.host_b,
             &HostRequest::ExecNew {
+                strategy: None,
                 exec_id: ExecId([0xb1; 32]),
                 program: d.program_id.to_string(),
                 params: joiner_params,

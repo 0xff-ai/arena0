@@ -23,6 +23,7 @@ mod schema;
 mod server;
 mod startup;
 mod store;
+mod strategy;
 mod system_event;
 
 #[cfg(test)]

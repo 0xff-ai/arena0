@@ -322,6 +322,7 @@ impl Ops {
                 self.host(
                     &host,
                     HostRequest::ExecNew {
+                        strategy: None,
                         exec_id,
                         program,
                         params,
@@ -355,6 +356,7 @@ impl Ops {
                 self.host(
                     &host,
                     HostRequest::ExecNew {
+                        strategy: None,
                         exec_id,
                         program,
                         params: None,

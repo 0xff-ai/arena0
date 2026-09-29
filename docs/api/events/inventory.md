@@ -68,6 +68,7 @@ The activation events `prepared`, `resumed`, and `committed` carry
 | `exec.session.callout_answered` | `{pending_id}` |
 | `exec.session.step` | `{step, pre_state, post_state, signers, participants}` |
 | `exec.session.ended` | `{terminal}` |
+| `exec.session.end_progress` | `{phase, unconfirmed}` |
 
 `exec.session.callout_answered` is emitted only for an accepted answer. A
 program-level rejection leaves the pending callout open and emits no event.

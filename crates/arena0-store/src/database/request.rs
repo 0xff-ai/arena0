@@ -8,6 +8,7 @@ impl Database {
         params_bytes: Option<Vec<u8>>,
         admission: ExecutionAdmission,
         mut grants: Vec<arena0_protocol::BlobHash>,
+        strategy: Option<String>,
         created_at_ms: u64,
     ) -> Result<ExecutionRequestOutcome, StoreError> {
         grants.sort_unstable();
@@ -33,6 +34,7 @@ impl Database {
                     && existing.params.as_ref().map(JsonBytes::as_bytes) == params_bytes.as_deref()
                     && existing.admission == admission
                     && stored == grants_bytes
+                    && existing.strategy == strategy
                 {
                     return Ok(ExecutionRequestOutcome::AlreadyExists);
                 }
@@ -56,8 +58,8 @@ impl Database {
             }
             store.connection.execute(
                 "INSERT INTO exec_requests
-                 (execution_id, program_hash, params, admission, created_at_ms, failure, grants)
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
+                 (execution_id, program_hash, params, admission, created_at_ms, failure, grants, strategy)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
                 params![
                     execution_id.0.to_vec(),
                     program_hash.as_bytes().to_vec(),
@@ -65,6 +67,7 @@ impl Database {
                     envelope(EnvelopeKind::ExecutionAdmission, &admission_bytes)?,
                     sqlite_u64(created_at_ms)?,
                     grants_bytes,
+                    strategy,
                 ],
             )?;
             for hash in grants {
@@ -152,7 +155,7 @@ impl Database {
             .connection
             .query_row(
                 "SELECT created_order, program_hash, params, admission,
-                        created_at_ms, failure
+                        created_at_ms, failure, strategy
                  FROM exec_requests WHERE execution_id = ?1",
                 params![execution_id.0.to_vec()],
                 |row| {
@@ -163,12 +166,21 @@ impl Database {
                         row.get::<_, Vec<u8>>(3)?,
                         row.get::<_, i64>(4)?,
                         row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
             .optional()?;
         row.map(
-            |(created_order, program_hash, params_bytes, admission, created_at_ms, failure)| {
+            |(
+                created_order,
+                program_hash,
+                params_bytes,
+                admission,
+                created_at_ms,
+                failure,
+                strategy,
+            )| {
                 let admission: ExecutionAdmission = decode_borsh(
                     &open_envelope(
                         EnvelopeKind::ExecutionAdmission,
@@ -194,6 +206,7 @@ impl Database {
                     created_order: sqlite_i64(created_order)?,
                     created_at_ms: sqlite_i64(created_at_ms)?,
                     failure,
+                    strategy,
                 })
             },
         )

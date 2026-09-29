@@ -241,6 +241,7 @@ impl Fixture {
                     |peer| ExecutionAdmission::join(peer.local_keys.peer_id(), NEGOTIATION_ID),
                 ),
                 &[],
+                None,
                 2,
             )
             .await

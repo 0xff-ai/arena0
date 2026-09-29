@@ -190,6 +190,7 @@ async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Re
         .call_host(
             &host_a,
             &HostRequest::ExecNew {
+                strategy: None,
                 exec_id: arena0_client::protocol::ExecId([line!() as u8; 32]),
                 program,
                 params: None,
@@ -212,6 +213,7 @@ async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Re
         .call_host(
             &host_b,
             &HostRequest::ExecNew {
+                strategy: None,
                 exec_id: arena0_client::protocol::ExecId([line!() as u8; 32]),
                 program: "rock-paper-scissors".into(),
                 params: None,

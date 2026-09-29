@@ -121,7 +121,8 @@ fn record_session_progress(
         SessionMessage::CalloutRequested { .. }
         | SessionMessage::Completed { .. }
         | SessionMessage::Aborted { .. }
-        | SessionMessage::Failed { .. } => None,
+        | SessionMessage::Failed { .. }
+        | SessionMessage::EndChanged { .. } => None,
     };
     if let Some(progress) = progress {
         record_progress(timeline, started, participant, progress);
@@ -383,6 +384,7 @@ impl Arena {
                     Some(JsonBytes::try_new(creator_params.clone()).expect("valid request params")),
                     admission,
                     &grants[i],
+                    None,
                     unix_time_ms(),
                 )
                 .await

@@ -1161,6 +1161,20 @@ impl Daemon {
                     let response = self.daemon_info().map(ResponseOk::DaemonInfo);
                     frame::write_frame(&mut write, &response).await?;
                 }
+                Request::StrategyList => {
+                    let strategies = crate::strategy::Strategy::ALL
+                        .into_iter()
+                        .map(|strategy| arena0_api::StrategyInfo {
+                            name: strategy.name().to_owned(),
+                            description: strategy.description().to_owned(),
+                        })
+                        .collect();
+                    frame::write_frame(
+                        &mut write,
+                        &Ok::<_, ApiError>(ResponseOk::StrategyList(strategies)),
+                    )
+                    .await?;
+                }
                 Request::HostsList => {
                     let response = self.host_statuses().await.map(ResponseOk::Hosts);
                     frame::write_frame(&mut write, &response).await?;

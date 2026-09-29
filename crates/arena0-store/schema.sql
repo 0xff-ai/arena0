@@ -32,6 +32,7 @@ CREATE TABLE exec_requests (
     params BLOB CHECK (params IS NULL OR length(params) <= 1024),
     admission BLOB NOT NULL,
     grants BLOB NOT NULL,
+    strategy TEXT,
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
     failure TEXT CHECK (failure IS NULL OR length(failure) <= 4096),
     FOREIGN KEY (program_hash) REFERENCES programs(program_hash)

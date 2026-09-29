@@ -408,7 +408,7 @@ impl Worker {
             host: &self.host,
             programs: &self.programs,
         };
-        let ids: Vec<ExecId> = statuses.iter().map(|status| status.exec_id).collect();
+        let ids: Vec<ExecId> = statuses.iter().map(|entry| entry.status.exec_id).collect();
         drop(statuses);
         let reads: Vec<_> = futures::stream::iter(ids)
             .map(|exec_id| reader.read_exec(exec_id, Cursor::default(), true))
@@ -623,6 +623,7 @@ impl Worker {
                 other => bail!("unexpected exec.list response: {other:?}"),
             };
             for status in statuses {
+                let status = status.status;
                 if !self.cursors.contains_key(&status.exec_id) {
                     self.refresh_exec(status.exec_id, true).await?;
                 }
@@ -765,6 +766,11 @@ impl Worker {
                     .await?;
                     self.refresh_exec(exec_id, false).await?;
                     self.refresh_receipts().await?;
+                }
+            }
+            EventData::SessionEndProgress { .. } => {
+                if let Some(exec_id) = exec_id {
+                    self.refresh_exec(exec_id, false).await?;
                 }
             }
             EventData::Terminated { reason, .. } => {

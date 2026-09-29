@@ -210,6 +210,9 @@ pub(crate) fn render_frame(
             )
         }
         EventData::SessionEnded { terminal } => render_terminal(terminal, p),
+        EventData::SessionEndProgress { phase, unconfirmed } => {
+            format!("end handshake {phase:?}: {} unconfirmed", unconfirmed.len())
+        }
         EventData::Lagged { skipped } => p.yellow(&format!("lagged: dropped {skipped} frames")),
     };
     let host = if event.host.id.is_empty() {

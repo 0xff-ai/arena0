@@ -166,6 +166,8 @@ An empty or absent `include` selects all catalog tags. An empty or absent
 
 ### `exec.session.ended`
 
+The terminal result is independent of local end-confirmation progress.
+
 ```json
 {
   "host": {
@@ -187,6 +189,21 @@ An empty or absent `include` selects all catalog tags. An empty or absent
     }
   }
 }
+```
+
+### `exec.session.end_progress`
+
+Emitted after a durable change to the local end-handshake phase or confirmations.
+`phase` is `open`, `ending`, or `ended`; `unconfirmed` contains remote peer IDs
+still awaiting confirmation. The payload matches the `end` object in
+`exec.status`. An `ended` phase can retain peers when the confirmation window
+expires. This Host-local event has no semantic system-event counterpart.
+
+The frame carries the usual Host, sequence, time, execution, and session fields;
+its event-specific fields are:
+
+```json
+{"kind":"exec.session.end_progress","data":{"phase":"ended","unconfirmed":[]}}
 ```
 
 ### `stream.lagged`

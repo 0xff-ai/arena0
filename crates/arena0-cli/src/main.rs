@@ -1336,6 +1336,7 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
             let exec_id = ExecId(rand::random());
             let created = ctx
                 .call_raw(&HostRequest::ExecNew {
+                    strategy: None,
                     exec_id,
                     program,
                     params,
@@ -1415,12 +1416,13 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
             };
             if ctx.mode.is_json() {
                 ui::print_json(&json!({
-                    "executions": list.iter().map(exec_json).collect::<Vec<_>>()
+                    "executions": list.iter().map(|entry| exec_json(&entry.status)).collect::<Vec<_>>()
                 }));
             } else {
                 let rows = list
                     .iter()
                     .map(|status| {
+                        let status = &status.status;
                         vec![
                             status.exec_id.fmt_short().to_string(),
                             status.program_id.fmt_short().to_string(),

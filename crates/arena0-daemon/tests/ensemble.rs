@@ -182,6 +182,7 @@ async fn variable_size_program_accepts_supported_creator_count() {
         &host(
             "host-01",
             HostRequest::ExecNew {
+                strategy: None,
                 exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                 program: "rock-paper-scissors".into(),
                 params: None,
@@ -201,6 +202,7 @@ async fn variable_size_program_accepts_supported_creator_count() {
         &host(
             "host-01",
             HostRequest::ExecNew {
+                strategy: None,
                 exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                 program: "cumulative-sum".into(),
                 params: Some(serde_json::json!({ "target_size": 3 })),

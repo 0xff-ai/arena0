@@ -46,7 +46,8 @@ pub enum ResponseOk {
         exec_state: ExecLifecycle,
         queue_position: Option<usize>,
     },
-    ExecList(Vec<ExecStatus>),
+    ExecList(Vec<ExecListEntry>),
+    StrategyList(Vec<StrategyInfo>),
     Status(ExecStatus),
     /// `exec.inspect`: an additive, bounded local diagnostic projection.
     Inspection(ExecutionInspection),
@@ -251,12 +252,43 @@ impl From<&arena0_protocol::EndPhase> for ExecEndStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "exec_state", deny_unknown_fields)]
 pub enum ExecStatusState {
-    Negotiating { queue_position: Option<usize> },
-    Activating { session_id: Option<SessionHash> },
-    Active { session: SessionStatus },
-    Completed { session: SessionStatus },
-    Aborted { session: SessionStatus },
-    Failed { session: Option<SessionProgress> },
+    Negotiating {
+        queue_position: Option<usize>,
+    },
+    Activating {
+        session_id: Option<SessionHash>,
+    },
+    Active {
+        session: SessionStatus,
+    },
+    Completed {
+        session: SessionStatus,
+        outcome: Option<Value>,
+    },
+    Aborted {
+        session: SessionStatus,
+        reason: String,
+    },
+    Failed {
+        session: Option<SessionProgress>,
+        reason: Option<String>,
+    },
+}
+
+/// One `exec.list` entry: the execution's status and, once preparation has
+/// started, its durable activation facts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecListEntry {
+    pub status: ExecStatus,
+    pub activation: Option<ActivationInspection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StrategyInfo {
+    pub name: String,
+    pub description: String,
 }
 
 /// Session facts retained after a session starts.
@@ -281,8 +313,8 @@ pub struct SessionStatus {
 
 /// A bounded, host-local projection of durable execution facts for inspection
 /// UIs. It contains the offer params, which every participant of the offer
-/// signed, and no signatures, keys, outcomes, callout contexts, or
-/// participant-specific payload bytes.
+/// signed. Its status includes the local participant's callout context and
+/// terminal outcome; signatures, keys, and other participant payloads are absent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionInspection {
@@ -365,12 +397,17 @@ pub enum SessionProgress {
     Started { session: SessionStatus },
 }
 
-/// The public identity of an agent-visible open callout.
+/// The open callout's identity, program-authored answer contract, and local
+/// participant context, projected from the same durable facts as `exec.next`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PendingCalloutStatus {
     pub pending_id: CalloutId,
     pub callout_index: u32,
+    pub name: String,
+    pub prompt: String,
+    pub schema: JsonSchemaDocument,
+    pub context: Value,
 }
 
 impl ExecStatus {
@@ -434,11 +471,12 @@ impl ExecStatusState {
 
     fn session(&self) -> Option<&SessionStatus> {
         match self {
-            Self::Active { session } | Self::Completed { session } | Self::Aborted { session } => {
-                Some(session)
-            }
+            Self::Active { session }
+            | Self::Completed { session, .. }
+            | Self::Aborted { session, .. } => Some(session),
             Self::Failed {
                 session: Some(SessionProgress::Started { session }),
+                ..
             } => Some(session),
             _ => None,
         }
@@ -448,15 +486,17 @@ impl ExecStatusState {
         match self {
             Self::Activating { session_id } => *session_id,
             Self::Active { session }
-            | Self::Completed { session }
-            | Self::Aborted { session }
+            | Self::Completed { session, .. }
+            | Self::Aborted { session, .. }
             | Self::Failed {
                 session: Some(SessionProgress::Started { session }),
+                ..
             } => Some(session.session_id),
             Self::Failed {
                 session: Some(SessionProgress::Activated { session_id }),
+                ..
             } => Some(*session_id),
-            Self::Negotiating { .. } | Self::Failed { session: None } => None,
+            Self::Negotiating { .. } | Self::Failed { session: None, .. } => None,
         }
     }
 }
@@ -492,6 +532,17 @@ pub enum NextEvent {
 pub struct AgreedStep {
     pub certified_at_ms: u64,
     pub entry: TraceEntry,
+    /// The step's message decoded with the program's Borsh message schema;
+    /// `None` for steps without a message (session start).
+    pub message: Option<DecodedMessage>,
+}
+
+/// A message payload as JSON, or why it could not be decoded. The error
+/// describes the schema mismatch, never the payload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DecodedMessage {
+    Json(Value),
+    Undecodable { error: String },
 }
 
 /// One stored blob.

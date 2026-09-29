@@ -657,6 +657,7 @@ impl Arena0Mcp {
             .request(
                 &authorized,
                 HostRequest::ExecNew {
+                    strategy: None,
                     exec_id,
                     program: arg.program.program_id,
                     params: arg.params,
@@ -730,7 +731,7 @@ impl Arena0Mcp {
             ResponseOk::ExecList(statuses) => Ok(Json(ExecutionListOutput {
                 executions: statuses
                     .into_iter()
-                    .map(status_output)
+                    .map(|entry| status_output(entry.status))
                     .collect::<Result<_, _>>()?,
             })),
             other => Err(unexpected(&other)),
