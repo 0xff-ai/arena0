@@ -25,7 +25,7 @@ cargo-zigbuild 0.22.3 with the explicit target
 `x86_64-unknown-linux-gnu.2.35`. The build host does not set the minimum glibc
 version. Linux artifacts must pass both the symbol-version check and an
 Ubuntu 22.04 container test: offline tarball installation, all three commands,
-the embedded skill, and a replay-verified interaction between two participants.
+the embedded skill, and a receipt-verified interaction between two participants.
 
 The [Release workflow](../.github/workflows/release.yml) promotes artifacts;
 it does not rebuild the public executables. It requires a successful

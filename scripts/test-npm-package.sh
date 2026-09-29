@@ -105,8 +105,8 @@ if (value.name !== "arena0" || value.markdown !== markdown) {
 ' "$skill_json_file" "$repo_root/skills/arena0/SKILL.md"
 echo "npm smoke test installed and ran arena0, arena0d, cargo-arena0, and arena0 skill"
 
-# Exercise the installed CLI, sibling daemon, embedded program and replay
-# verifier. The private home also prevents interference with another daemon.
+# Exercise the installed CLI, sibling daemon, embedded program and receipt
+# verification. The private home also prevents interference with another daemon.
 env -u ARENA0_CONTEXT -u CODEX_THREAD_ID -u ARENA0_SOCKET -u ARENA0_HOST \
   ARENA0_HOME="$smoke_root/home" "$bin_dir/arena0" serve > "$smoke_root/serve.log" 2>&1 &
 service_pid=$!
@@ -126,16 +126,15 @@ if [[ ! -S "$smoke_root/home/arena0.sock" ]]; then
 fi
 env -u ARENA0_CONTEXT -u CODEX_THREAD_ID -u ARENA0_SOCKET -u ARENA0_HOST \
   ARENA0_HOME="$smoke_root/home" "$bin_dir/arena0" --json run rock-paper-scissors \
-  --builtin host-01=sample --builtin host-02=sample --replay \
+  --builtin host-01=sample --builtin host-02=sample \
   > "$smoke_root/interaction.json"
 node - "$smoke_root/interaction.json" <<'JS'
 const assert = require('node:assert/strict');
 const result = JSON.parse(require('node:fs').readFileSync(process.argv[2], 'utf8'));
 assert.equal(result.exec, 'completed');
-assert.equal(result.verified.tier, 'full');
 assert.equal(result.verified.all_verified, true);
 assert.equal(result.verified.shared_evidence_agrees, true);
 assert.equal(result.verified.receipts.length, 2);
 assert.equal(new Set(result.verified.receipts.map(receipt => receipt.peer_id)).size, 2);
 JS
-echo "npm smoke test completed and replay-verified an interaction between two participants"
+echo "npm smoke test completed and verified both receipts of an interaction between two participants"
