@@ -1,4 +1,4 @@
-import type { Cell, ReceiptArtifact } from "~/api/types.gen";
+import type { Cell, HostRequest, ReceiptArtifact } from "~/api/types.gen";
 import { hostRow } from "./project";
 import type {
   BlobImported,
@@ -12,7 +12,7 @@ import type {
   VerifyTarget,
   ViewReply,
 } from "./rows";
-import { DaemonError, hostCall, rpc, upload } from "./rpc";
+import { assertReply, DaemonError, hostCall, rpc, upload } from "./rpc";
 
 export interface LaunchArgs {
   program: string;
@@ -72,6 +72,19 @@ export interface OpReplies {
   host_open: HostRow;
 }
 
+/** exec.new with a fresh random exec_id. */
+async function execNew(
+  host: string,
+  params: Omit<Extract<HostRequest, { method: "exec.new" }>["params"], "exec_id">,
+): Promise<CreatedReply> {
+  const exec_id = Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+  const reply = await hostCall(host, { method: "exec.new", params: { exec_id, ...params } });
+  assertReply(reply, "ExecCreated");
+  return reply.ExecCreated;
+}
+
 /** Each operation sends requests once; failures are returned to its caller. */
 export const ops: { [K in OpName]: (args: OpArgs<K>) => Promise<OpReplies[K]> } = {
   async view({ host, exec_id, width, at_step }) {
@@ -79,8 +92,7 @@ export const ops: { [K in OpName]: (args: OpArgs<K>) => Promise<OpReplies[K]> } 
       method: "exec.view",
       params: { exec: exec_id, width, at_step, color: "TrueColor" },
     });
-    if (typeof reply !== "object" || !("ExecView" in reply))
-      throw new Error("unexpected reply to exec.view");
+    assertReply(reply, "ExecView");
     const { step, view } = reply.ExecView;
     // Wire cells omit absent participant indexes; rows have an explicit null.
     const cell = (value: Cell) => ({ ...value, participant: value.participant ?? null });
@@ -117,8 +129,7 @@ export const ops: { [K in OpName]: (args: OpArgs<K>) => Promise<OpReplies[K]> } 
       method: "exec.inspect",
       params: { exec_id, events_from: from, events_limit: limit },
     });
-    if (typeof reply !== "object" || !("Inspection" in reply))
-      throw new Error("unexpected reply to exec.inspect");
+    assertReply(reply, "Inspection");
     const inspection = reply.Inspection;
     return {
       from: inspection.events_from,
@@ -138,8 +149,7 @@ export const ops: { [K in OpName]: (args: OpArgs<K>) => Promise<OpReplies[K]> } 
   },
   async query({ host, exec_id, query }) {
     const reply = await hostCall(host, { method: "exec.query", params: { exec_id, query } });
-    if (typeof reply !== "object" || !("Query" in reply))
-      throw new Error("unexpected reply to exec.query");
+    assertReply(reply, "Query");
     return reply.Query.result;
   },
   async receipt({ host, receipt_id }) {
@@ -147,8 +157,7 @@ export const ops: { [K in OpName]: (args: OpArgs<K>) => Promise<OpReplies[K]> } 
       method: "receipt.get",
       params: { receipt: { Stored: receipt_id } },
     });
-    if (typeof reply !== "object" || !("Receipt" in reply))
-      throw new Error("unexpected reply to receipt.get");
+    assertReply(reply, "Receipt");
     return reply.Receipt;
   },
   async verify({ host, target }) {
@@ -158,8 +167,7 @@ export const ops: { [K in OpName]: (args: OpArgs<K>) => Promise<OpReplies[K]> } 
         ? { Stored: target.receipt_id }
         : { Inline: target.artifact as ReceiptArtifact };
     const reply = await hostCall(host, { method: "receipt.verify", params: { receipt } });
-    if (typeof reply !== "object" || !("Verified" in reply))
-      throw new Error("unexpected reply to receipt.verify");
+    assertReply(reply, "Verified");
     const summary = reply.Verified;
     let termination: VerifyReply["termination"] = { kind: "completed" };
     if (summary.terminal !== "Completed") {
@@ -189,67 +197,38 @@ export const ops: { [K in OpName]: (args: OpArgs<K>) => Promise<OpReplies[K]> } 
     return null;
   },
   async create({ host, program, params, participants, blobs }) {
-    const exec_id = Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) =>
-      byte.toString(16).padStart(2, "0"),
-    ).join("");
-    const reply = await hostCall(host, {
-      method: "exec.new",
-      params: {
-        exec_id,
-        program,
-        params,
-        blobs,
-        ensemble: { Create: { participant_count: participants } },
-      },
+    return execNew(host, {
+      program,
+      params,
+      blobs,
+      ensemble: { Create: { participant_count: participants } },
     });
-    if (typeof reply !== "object" || !("ExecCreated" in reply))
-      throw new Error("unexpected reply to exec.new");
-    return { exec_id: reply.ExecCreated.exec_id };
   },
   async join({ host, program, target, blobs }) {
-    const exec_id = Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) =>
-      byte.toString(16).padStart(2, "0"),
-    ).join("");
-    const reply = await hostCall(host, {
-      method: "exec.new",
-      params: { exec_id, program, params: null, blobs, ensemble: { Join: { target } } },
-    });
-    if (typeof reply !== "object" || !("ExecCreated" in reply))
-      throw new Error("unexpected reply to exec.new");
-    return { exec_id: reply.ExecCreated.exec_id };
+    return execNew(host, { program, params: null, blobs, ensemble: { Join: { target } } });
   },
   async launch({ program, params, seats }) {
     const execs: LaunchReply["execs"] = [];
     try {
       const host = seats[0]!.host;
       const info = await hostCall(host, { method: "host.info" });
-      if (typeof info !== "object" || !("HostStatus" in info))
-        throw new Error("unexpected reply to host.info");
-      const exec_id = Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) =>
-        byte.toString(16).padStart(2, "0"),
-      ).join("");
-      const reply = await hostCall(host, {
-        method: "exec.new",
-        params: {
-          exec_id,
-          program,
-          params,
-          blobs: [],
-          ensemble: { Create: { participant_count: seats.length } },
-        },
+      assertReply(info, "HostStatus");
+      const created = await ops.create({
+        host,
+        program,
+        params,
+        participants: seats.length,
+        blobs: [],
       });
-      if (typeof reply !== "object" || !("ExecCreated" in reply))
-        throw new Error("unexpected reply to exec.new");
-      execs.push({ host, exec_id: reply.ExecCreated.exec_id });
-      if (reply.ExecCreated.negotiation_id === null)
-        throw new Error("unexpected reply to exec.new");
+      execs.push({ host, exec_id: created.exec_id });
+      // A Create always selects its own negotiation.
       const target = {
         creator: info.HostStatus.host.peer_id,
-        negotiation_id: reply.ExecCreated.negotiation_id,
+        negotiation_id: created.negotiation_id!,
       };
       for (const seat of seats.slice(1)) {
-        const created = await ops.join({ host: seat.host, program, target, blobs: [] });
-        execs.push({ host: seat.host, exec_id: created.exec_id });
+        const joined = await ops.join({ host: seat.host, program, target, blobs: [] });
+        execs.push({ host: seat.host, exec_id: joined.exec_id });
       }
       return { execs };
     } catch (error) {
@@ -275,8 +254,7 @@ export const ops: { [K in OpName]: (args: OpArgs<K>) => Promise<OpReplies[K]> } 
     const uploaded = await upload(file, "application/wasm");
     if (hosts.length === 0) {
       const reply = await rpc({ method: "hosts.list" });
-      if (typeof reply !== "object" || !("Hosts" in reply))
-        throw new Error("unexpected reply to hosts.list");
+      assertReply(reply, "Hosts");
       hosts = reply.Hosts.map((status) => status.host.id);
     }
     if (hosts.length === 0) throw new DaemonError("BadRequest", "no Host to import into");
@@ -290,8 +268,7 @@ export const ops: { [K in OpName]: (args: OpArgs<K>) => Promise<OpReplies[K]> } 
     );
     let hash = "";
     for (const reply of replies) {
-      if (typeof reply !== "object" || !("Program" in reply))
-        throw new Error("unexpected reply to program.import");
+      assertReply(reply, "Program");
       hash = reply.Program.summary.program_hash;
     }
     return { hash, hosts };
@@ -316,17 +293,14 @@ export const ops: { [K in OpName]: (args: OpArgs<K>) => Promise<OpReplies[K]> } 
       method: "blob.import",
       params: { source: { upload: uploaded.upload } },
     });
-    if (typeof reply !== "object" || !("BlobImported" in reply))
-      throw new Error("unexpected reply to blob.import");
+    assertReply(reply, "BlobImported");
     return reply.BlobImported;
   },
   async host_open(params) {
     const reply = await rpc({ method: "hosts.open", params });
-    if (typeof reply !== "object" || !("HostOpened" in reply))
-      throw new Error("unexpected reply to hosts.open");
+    assertReply(reply, "HostOpened");
     const status = await hostCall(reply.HostOpened.id, { method: "host.info" });
-    if (typeof status !== "object" || !("HostStatus" in status))
-      throw new Error("unexpected reply to host.info");
+    assertReply(status, "HostStatus");
     return hostRow(status.HostStatus, true, 0, null);
   },
 };

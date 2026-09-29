@@ -44,6 +44,17 @@ export async function rpc(request: Request): Promise<ResponseOk> {
   return reply.Ok;
 }
 
+type Variant = ResponseOk extends infer R ? (R extends object ? keyof R : never) : never;
+
+/** Narrows a reply to the variant its request produces; any other reply is a UI/daemon mismatch. */
+export function assertReply<K extends Variant>(
+  reply: ResponseOk,
+  variant: K,
+): asserts reply is Extract<ResponseOk, Record<K, unknown>> {
+  if (typeof reply !== "object" || !(variant in reply))
+    throw new Error(`expected a ${variant} reply`);
+}
+
 /** Call one Host in the daemon's local namespace. */
 export async function hostCall(host: string, request: HostRequest): Promise<ResponseOk> {
   return rpc({ method: "host.call", params: { host, request } });

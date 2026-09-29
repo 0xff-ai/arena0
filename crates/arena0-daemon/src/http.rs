@@ -188,8 +188,18 @@ pub(crate) async fn serve(
 
 fn router(daemon: Arc<Daemon>, bearer_token: Option<String>) -> axum::Router {
     let shutdown = daemon.shutdown_receiver();
-    let router = axum::Router::new()
-        .nest_service("/mcp", crate::mcp::mcp_service(Arc::clone(&daemon)))
+    // `ARENA0_MCP_TOKEN` guards MCP only. The browser routes are loopback-only
+    // and unauthenticated: EventSource cannot send an Authorization header.
+    let mcp =
+        axum::Router::new().nest_service("/mcp", crate::mcp::mcp_service(Arc::clone(&daemon)));
+    let mcp = match bearer_token {
+        Some(token) => mcp.layer(middleware::from_fn_with_state(
+            Arc::<str>::from(token),
+            require_bearer,
+        )),
+        None => mcp,
+    };
+    axum::Router::new()
         .route("/rpc", post(rpc))
         .route("/events", get(events))
         .route(
@@ -198,18 +208,12 @@ fn router(daemon: Arc<Daemon>, bearer_token: Option<String>) -> axum::Router {
         )
         .route("/hosts/{host}/blobs/{hash}", get(blob))
         .fallback(get(asset))
-        .with_state(daemon);
-    let router = match bearer_token {
-        Some(token) => router.layer(middleware::from_fn_with_state(
-            Arc::<str>::from(token),
-            require_bearer,
-        )),
-        None => router,
-    };
-    router.layer(middleware::from_fn_with_state(
-        shutdown,
-        cancel_inflight_request,
-    ))
+        .with_state(daemon)
+        .merge(mcp)
+        .layer(middleware::from_fn_with_state(
+            shutdown,
+            cancel_inflight_request,
+        ))
 }
 
 async fn rpc(State(daemon): State<Arc<Daemon>>, Json(request): Json<Request>) -> Json<Response> {

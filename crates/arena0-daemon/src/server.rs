@@ -2371,8 +2371,7 @@ impl HostService {
             self.peer_id,
             request,
             activation,
-            state,
-            turn,
+            state.zip(turn),
             execution_updated_at_ms,
             receipt_available,
             callout,
@@ -3883,17 +3882,16 @@ fn project_exec_status_facts(
     peer_id: PeerId,
     request: ExecutionRequest,
     activation: Option<ActivationRecord>,
-    state: Option<arena0_protocol::execution::ExecutionState>,
-    turn: Option<Turn>,
+    state: Option<(arena0_protocol::execution::ExecutionState, Turn)>,
     execution_updated_at_ms: Option<u64>,
     receipt_available: bool,
     callout: Option<PendingCalloutStatus>,
 ) -> anyhow::Result<ExecStatus> {
+    let (state, turn) = state.unzip();
     let exec_id = request.execution_id();
     let program_id = request.program_hash();
     let negotiation_id = request.negotiation_id();
-    // `turn` accompanies `state`: the caller projects it for every execution
-    // aggregate, and only an aggregate yields a session status.
+    // `turn` is `Some` exactly when `state` is: they arrive as one pair.
     let session_status = |state: &arena0_protocol::execution::ExecutionState| {
         let turn = turn
             .as_ref()
@@ -5774,7 +5772,6 @@ mod tests {
             Some(prepared_record),
             None,
             None,
-            None,
             false,
             None,
         )
@@ -5823,7 +5820,6 @@ mod tests {
             Some(committed_record.clone()),
             None,
             None,
-            None,
             false,
             None,
         )
@@ -5864,7 +5860,6 @@ mod tests {
             peer,
             failed_request,
             Some(committed_record),
-            None,
             None,
             None,
             false,

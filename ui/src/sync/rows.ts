@@ -447,7 +447,7 @@ export type VerifyReply = {
 
 export type Termination = { kind: "completed" } | { kind: "stopped"; cause: string };
 
-export type CreatedReply = { exec_id: string };
+export type CreatedReply = { exec_id: string; negotiation_id: string | null };
 
 export type ProgramImported = { hash: string; hosts: Array<string> };
 

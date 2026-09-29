@@ -6,7 +6,3 @@ const TONES: readonly ParticipantTone[] = ["p0", "p1", "p2", "p3", "p4"];
 export function participantTone(index: number): ParticipantTone {
   return TONES[index] ?? "pq";
 }
-
-export function participantLabel(index: number): string {
-  return `P${index}`;
-}

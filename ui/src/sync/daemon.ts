@@ -22,7 +22,7 @@ import {
   stepRow,
 } from "./project";
 import type { CollectionName, NegotiationMark, RowBatch, RowOf } from "./rows";
-import { DaemonError, hostCall, rpc } from "./rpc";
+import { assertReply, DaemonError, hostCall, rpc } from "./rpc";
 
 export type ConnectionStatus = "connecting" | "syncing" | "live" | "offline";
 export interface ConnectionState {
@@ -54,7 +54,8 @@ export function connectDaemon(): Daemon {
   let poll: ReturnType<typeof setTimeout> | undefined;
   const states = new Set<(state: ConnectionState) => void>();
   const listeners = new Set<(reset: boolean, batch: RowBatch) => void>();
-  let snapshots: RowBatch[] = [];
+  // The latest synced generation's rows, replayed to listeners that subscribe late.
+  let snapshot: () => RowBatch[] = () => [];
   // Live-only history belongs to the page, not a transport generation: the
   // daemon cannot reconstruct marks or activity observed before a reconnect.
   const marks = new Map<string, NegotiationMark[]>();
@@ -120,10 +121,7 @@ export function connectDaemon(): Daemon {
         for (const op of batch.ops) {
           if (op.op === "upsert") hostHistory.set(op.row.id, op.row);
         }
-      if (ready) {
-        snapshots = batches();
-        for (const listener of listeners) listener(false, batch);
-      }
+      if (ready) for (const listener of listeners) listener(false, batch);
     };
     const read = async (host: string, request: HostRequest) => {
       const reply = await hostCall(host, request);
@@ -182,15 +180,13 @@ export function connectDaemon(): Daemon {
     };
     const loadOffers = async (host: string) => {
       const reply = await read(host, { method: "negotiation.offers" });
-      if (typeof reply !== "object" || !("Offers" in reply))
-        throw new Error("unexpected reply to negotiation.offers");
+      assertReply(reply, "Offers");
       offers.set(host, reply.Offers);
       mergeOffers();
     };
     const loadPrograms = async (host: string) => {
       const reply = await read(host, { method: "program.list" });
-      if (typeof reply !== "object" || !("ProgramList" in reply))
-        throw new Error("unexpected reply to program.list");
+      assertReply(reply, "ProgramList");
       const hashes = new Set(reply.ProgramList.map((program) => program.program_hash));
       for (const previous of [...rows.programs.values()])
         if (previous.hosts.includes(host) && !hashes.has(previous.hash)) {
@@ -209,8 +205,7 @@ export function connectDaemon(): Daemon {
               method: "program.get",
               params: { program: summary.program_hash },
             });
-            if (typeof detail !== "object" || !("Program" in detail))
-              throw new Error("unexpected reply to program.get");
+            assertReply(detail, "Program");
             const hosts = [
               ...new Set([...(rows.programs.get(summary.program_hash)?.hosts ?? []), host]),
             ].sort();
@@ -224,8 +219,7 @@ export function connectDaemon(): Daemon {
     };
     const loadReceipts = async (host: string) => {
       const reply = await read(host, { method: "receipt.list" });
-      if (typeof reply !== "object" || !("ReceiptList" in reply))
-        throw new Error("unexpected reply to receipt.list");
+      assertReply(reply, "ReceiptList");
       publish({
         collection: "receipts",
         ops: reply.ReceiptList.map((entry) => ({ op: "upsert", row: receiptRow(host, entry) })),
@@ -244,8 +238,7 @@ export function connectDaemon(): Daemon {
           method: "exec.trace",
           params: { exec_id: status.exec_id, from, to: row.latest_step + 1 },
         });
-        if (typeof reply !== "object" || !("Trace" in reply))
-          throw new Error("unexpected reply to exec.trace");
+        assertReply(reply, "Trace");
         publish({
           collection: "steps",
           ops: reply.Trace.map((step) => ({
@@ -296,8 +289,7 @@ export function connectDaemon(): Daemon {
     };
     const refreshExecution = async (host: string, execId: string) => {
       const reply = await read(host, { method: "exec.status", params: { exec_id: execId } });
-      if (typeof reply !== "object" || !("Status" in reply))
-        throw new Error("unexpected reply to exec.status");
+      assertReply(reply, "Status");
       const key = `${host}/${execId}`;
       const previous = rows.executions.get(key);
       if (
@@ -306,8 +298,7 @@ export function connectDaemon(): Daemon {
         previous.lifecycle === "activating"
       ) {
         const list = await read(host, { method: "exec.list" });
-        if (typeof list !== "object" || !("ExecList" in list))
-          throw new Error("unexpected reply to exec.list");
+        assertReply(list, "ExecList");
         for (const entry of list.ExecList)
           activations.set(`${host}/${entry.status.exec_id}`, entry.activation);
       }
@@ -352,8 +343,7 @@ export function connectDaemon(): Daemon {
       });
       await loadPrograms(host);
       const list = await read(host, { method: "exec.list" });
-      if (typeof list !== "object" || !("ExecList" in list))
-        throw new Error("unexpected reply to exec.list");
+      assertReply(list, "ExecList");
       for (let from = 0; from < list.ExecList.length; from += 8) {
         await Promise.all(
           list.ExecList.slice(from, from + 8).map(async (entry) => {
@@ -364,8 +354,7 @@ export function connectDaemon(): Daemon {
       }
       await loadReceipts(host);
       const blobs = await read(host, { method: "blob.list" });
-      if (typeof blobs !== "object" || !("BlobList" in blobs))
-        throw new Error("unexpected reply to blob.list");
+      assertReply(blobs, "BlobList");
       publish({
         collection: "blobs",
         ops: blobs.BlobList.map((entry) => ({ op: "upsert", row: blobRow(host, entry) })),
@@ -403,8 +392,7 @@ export function connectDaemon(): Daemon {
       boots.set(host, frame.boot_id);
       if (!statuses.has(host)) {
         const roster = await rpc({ method: "hosts.list" });
-        if (typeof roster !== "object" || !("Hosts" in roster))
-          throw new Error("unexpected reply to hosts.list");
+        assertReply(roster, "Hosts");
         for (const status of roster.Hosts)
           if (!statuses.has(status.host.id)) await loadHost(status, false);
       }
@@ -503,16 +491,14 @@ export function connectDaemon(): Daemon {
       changeState("syncing", state.attempt, null);
       schedule(async () => {
         const daemonInfo = await rpc({ method: "daemon.info" });
-        if (typeof daemonInfo !== "object" || !("DaemonInfo" in daemonInfo))
-          throw new Error("unexpected reply to daemon.info");
+        assertReply(daemonInfo, "DaemonInfo");
         const roster = await rpc({ method: "hosts.list" });
-        if (typeof roster !== "object" || !("Hosts" in roster))
-          throw new Error("unexpected reply to hosts.list");
+        assertReply(roster, "Hosts");
         for (const status of roster.Hosts) await loadHost(status, false);
         if (!current()) return;
         info = daemonInfo.DaemonInfo;
-        snapshots = batches();
-        for (const batch of snapshots) for (const listener of listeners) listener(true, batch);
+        snapshot = batches;
+        for (const batch of batches()) for (const listener of listeners) listener(true, batch);
         ready = true;
         // New frames remain queued until all frames already received during
         // loading have been applied. Only then can the workspace become live.
@@ -528,8 +514,7 @@ export function connectDaemon(): Daemon {
         return Promise.reject(new DaemonError("transport", "daemon unreachable"));
       return schedule(async () => {
         const roster = await rpc({ method: "hosts.list" });
-        if (typeof roster !== "object" || !("Hosts" in roster))
-          throw new Error("unexpected reply to hosts.list");
+        assertReply(roster, "Hosts");
         if (!current()) throw new DaemonError("transport", "daemon unreachable");
         const status = roster.Hosts.find((entry) => entry.host.id === host)!;
         const previous = rows.hosts.get(host);
@@ -560,7 +545,7 @@ export function connectDaemon(): Daemon {
     },
     onRows: (listener) => {
       listeners.add(listener);
-      for (const batch of snapshots) listener(true, batch);
+      for (const batch of snapshot()) listener(true, batch);
       return () => {
         listeners.delete(listener);
       };

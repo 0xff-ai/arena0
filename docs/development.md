@@ -73,7 +73,7 @@ version pinned in `ui/package.json`.
 
 - `just build-ui` installs locked dependencies and builds `ui/dist`, which
   `crates/arena0-daemon/build.rs` embeds when the Rust executable is built.
-- `just ui-types` regenerates `ui/src/sync/protocol.gen.ts`; run it after changing
+- `just ui-types` regenerates `ui/src/api/types.gen.ts`; run it after changing
   the daemon’s browser API types.
 - `just check-ui` checks generated type freshness, lint, and TypeScript types.
 - `just test-ui` builds the required binaries and runs the live Playwright

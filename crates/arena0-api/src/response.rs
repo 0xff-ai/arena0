@@ -19,6 +19,8 @@ pub type Response = Result<ResponseOk, ApiError>;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+// Built once per reply and serialized at once; boxing a variant buys nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum ResponseOk {
     /// A method with no payload succeeded (e.g. `daemon.stop`, `program.remove`).
     Ack,
@@ -425,6 +427,7 @@ pub struct EventRecordSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "session_state", deny_unknown_fields)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[allow(clippy::large_enum_variant)] // A one-shot wire value, like `ResponseOk`.
 pub enum SessionProgress {
     Activated { session_id: SessionHash },
     Started { session: SessionStatus },

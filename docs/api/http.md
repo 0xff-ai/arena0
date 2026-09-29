@@ -2,9 +2,9 @@
 
 The daemon binds one loopback HTTP server. `daemon.info` returns its base URL
 as `http_url`; append `/mcp` for MCP or `/` for the embedded browser UI.
-When configured, the existing `ARENA0_MCP_TOKEN` bearer token covers every
-route, including files and event streams. Send `Authorization: Bearer TOKEN`.
-There are no additional Origin or Host checks.
+When configured, the `ARENA0_MCP_TOKEN` bearer token guards `/mcp` only; send
+`Authorization: Bearer TOKEN`. The other routes are unauthenticated and
+reachable only from loopback. There are no Origin or Host checks.
 
 | Route | Request | Response |
 |---|---|---|
