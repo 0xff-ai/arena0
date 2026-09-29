@@ -267,7 +267,26 @@ step: number,
 /**
  * Slot text: UTF-8 with ANSI SGR sequences only.
  */
-header: string | null, agents: string | null, state: string | null, status_bar: string | null, structured: JsonValue | null, };
+header: string | null, agents: string | null, state: string | null, status_bar: string | null, 
+/**
+ * Typed blocks the program rendered next to its text slots, validated
+ * by the daemon. Empty for programs that render text only.
+ */
+blocks: Array<BlockRow>, };
+
+export type BlockRow = { "kind": "facts", title: string | null, items: Array<FactRow>, } | { "kind": "table", title: string | null, columns: Array<string>, rows: Array<Array<CellRow>>, } | { "kind": "board", title: string | null, rows: number, cols: number, cells: Array<CellRow>, row_labels: Array<string>, col_labels: Array<string>, } | { "kind": "progress", label: string, value: number, max: number, } | { "kind": "roster", title: string | null, entries: Array<RosterEntryRow>, };
+
+export type FactRow = { label: string, value: CellRow, };
+
+export type CellRow = { text: string, tone: ToneRow, 
+/**
+ * Participant index in the committed ensemble, for consistent colour.
+ */
+participant: number | null, };
+
+export type RosterEntryRow = { participant: number, status: CellRow, detail: string | null, };
+
+export type ToneRow = "normal" | "muted" | "good" | "warn" | "bad" | "highlight";
 
 export type RecordsReply = { from: number, total: number, next: number | null, records: Array<RecordRow>, };
 

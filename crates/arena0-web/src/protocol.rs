@@ -281,7 +281,75 @@ pub struct ViewReply {
     pub agents: Option<String>,
     pub state: Option<String>,
     pub status_bar: Option<String>,
-    pub structured: Option<Value>,
+    /// Typed blocks the program rendered next to its text slots, validated
+    /// by the daemon. Empty for programs that render text only.
+    pub blocks: Vec<BlockRow>,
+}
+
+/// One typed piece of a program view; mirrors `arena0_protocol::Block`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BlockRow {
+    Facts {
+        title: Option<String>,
+        items: Vec<FactRow>,
+    },
+    Table {
+        title: Option<String>,
+        columns: Vec<String>,
+        rows: Vec<Vec<CellRow>>,
+    },
+    /// Row-major cells; `cells.len() == rows * cols`.
+    Board {
+        title: Option<String>,
+        rows: u8,
+        cols: u8,
+        cells: Vec<CellRow>,
+        row_labels: Vec<String>,
+        col_labels: Vec<String>,
+    },
+    Progress {
+        label: String,
+        value: u64,
+        max: u64,
+    },
+    Roster {
+        title: Option<String>,
+        entries: Vec<RosterEntryRow>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+pub struct FactRow {
+    pub label: String,
+    pub value: CellRow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+pub struct CellRow {
+    pub text: String,
+    pub tone: ToneRow,
+    /// Participant index in the committed ensemble, for consistent colour.
+    pub participant: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+pub struct RosterEntryRow {
+    pub participant: u8,
+    pub status: CellRow,
+    pub detail: Option<String>,
+}
+
+/// A semantic emphasis; the UI chooses the colours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ToneRow {
+    Normal,
+    Muted,
+    Good,
+    Warn,
+    Bad,
+    Highlight,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, TS)]
