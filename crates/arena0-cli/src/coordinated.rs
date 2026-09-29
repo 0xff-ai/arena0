@@ -1318,8 +1318,10 @@ async fn await_activation(
                 .with_context(|| {
                     format!("wait for Host '{host}' execution {exec_id} to activate")
                 })? {
+                // A program may open a callout in its first dispatch, so an
+                // activated session can already be waiting on its participant.
                 ResponseOk::Awaited {
-                    exec_state: ExecLifecycle::Active,
+                    exec_state: ExecLifecycle::Active | ExecLifecycle::Waiting,
                     ..
                 } => {}
                 ResponseOk::Awaited {
@@ -3054,7 +3056,9 @@ mod tests {
         }))
     }
 
-    async fn run_scripted_coordinator() -> Vec<crate::progress::RunProgressState> {
+    async fn run_scripted_coordinator(
+        awaited: [ExecLifecycle; 2],
+    ) -> Vec<crate::progress::RunProgressState> {
         let directory = tempfile::tempdir().expect("socket directory");
         let program_id = ProgramHash([0x31; 32]);
         let session_id = SessionHash([0x32; 32]);
@@ -3073,7 +3077,7 @@ mod tests {
                 created_response(ExecId([0; 32]), negotiation_id),
                 Ok(ResponseOk::Awaited {
                     exec_id: ExecId([0; 32]),
-                    exec_state: ExecLifecycle::Active,
+                    exec_state: awaited[index],
                     reason: None,
                 }),
                 active_status_response(program_id, session_id, peers[1 - index]),
@@ -3199,8 +3203,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn activation_accepts_a_session_already_waiting_on_its_participant() {
+        let observations =
+            run_scripted_coordinator([ExecLifecycle::Active, ExecLifecycle::Waiting]).await;
+        assert!(
+            observations.contains(&crate::progress::RunProgressState::Active {
+                stage: RunStage::Activation,
+                amount: crate::progress::ProgressAmount::Known {
+                    completed: 2,
+                    total: 2,
+                },
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn coordinated_work_reports_real_typed_stages_and_exact_receipt_counts() {
-        let observations = run_scripted_coordinator().await;
+        let observations =
+            run_scripted_coordinator([ExecLifecycle::Active, ExecLifecycle::Active]).await;
         for stage in [
             RunStage::Connecting,
             RunStage::ProgramResolution,
