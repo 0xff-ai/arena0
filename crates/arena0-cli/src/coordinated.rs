@@ -1119,6 +1119,7 @@ async fn create_executions(
             program: program_id.to_string(),
             params,
             ensemble: EnsembleSpec::Create { participant_count },
+            blobs: vec![],
         },
         cancelled,
     )
@@ -1198,6 +1199,7 @@ async fn create_executions(
                                 negotiation_id,
                             )),
                         },
+                        blobs: vec![],
                     },
                     &mut cancelled,
                 )

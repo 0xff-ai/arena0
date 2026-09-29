@@ -325,6 +325,20 @@ fn module_handler_methods(items: &[Item]) -> Result<Vec<TokenStream2>> {
             }
         });
     }
+    if let Some(direct_ty) = module_direct_arg(items)? {
+        methods.push(quote! {
+            fn on_direct(
+                ctx: &mut ::arena0::LocalContext<Self::Shared, Self::Local>,
+                from: ::arena0::Participant,
+                msg: ::std::vec::Vec<u8>,
+                attachment: ::core::option::Option<::arena0::Attachment>,
+            ) -> Result<(), ::arena0::ProgramFault> {
+                let msg: #direct_ty = ::arena0::borsh::from_slice(&msg)
+                    .map_err(|error| ::arena0::anyhow::anyhow!("direct message decode failed: {error}"))?;
+                self::on_direct(ctx, from, msg, attachment)
+            }
+        });
+    }
     if let Some(timer_ty) = module_timer_arg(items)? {
         methods.push(quote! {
             fn on_timer(
@@ -357,6 +371,29 @@ fn module_view_impl(items: &[Item], program_ident: &Ident, shared_ty: &Type) -> 
         impl ::arena0::ProgramView for #program_ident {
             #view_method
         }
+    }
+}
+
+/// The direct-message type of a module's `on_direct(ctx, from, msg: T, attachment)`, if any.
+fn module_direct_arg(items: &[Item]) -> Result<Option<Type>> {
+    let Some(function) = items.iter().find_map(|item| match item {
+        Item::Fn(function) if function.sig.ident == "on_direct" => Some(function),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    let inputs: Vec<_> = function.sig.inputs.iter().collect();
+    match inputs.as_slice() {
+        [
+            syn::FnArg::Typed(_),
+            syn::FnArg::Typed(_),
+            syn::FnArg::Typed(msg),
+            syn::FnArg::Typed(_),
+        ] => Ok(Some((*msg.ty).clone())),
+        _ => Err(Error::new(
+            function.sig.span(),
+            "on_direct must take (ctx: &mut LocalContext, from: Participant, msg: T, attachment: Option<Attachment>)",
+        )),
     }
 }
 

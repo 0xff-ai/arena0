@@ -1,7 +1,8 @@
 use super::*;
-use crate::lock::restrict_database_companions;
+use crate::lock::{restrict_database_companions, sync_parent_directory};
 
 mod activation;
+mod blobs;
 mod execution;
 mod integrity;
 mod receipt;
@@ -15,6 +16,8 @@ pub(super) struct Database {
     _lock: OwnerLock,
     host_id: PeerId,
     transaction_poison: Option<String>,
+    /// Owned received files, created at open with mode 0o700 on Unix.
+    blob_dir: PathBuf,
 }
 
 struct ExecutionIndexRow {
@@ -42,14 +45,33 @@ impl Database {
         let connection = Connection::open(&config.path)?;
         configure_connection(&connection, config.busy_timeout)?;
         initialize_schema(&connection)?;
+        // Use the full database filename, including its extension. The owner
+        // lock and the sweep must cover exactly the same store's files.
+        let mut blob_dir = config.path.as_os_str().to_os_string();
+        blob_dir.push(".blobs");
         let mut database = Self {
             connection,
             _lock: lock,
             host_id: config.host_id,
             transaction_poison: None,
+            blob_dir: PathBuf::from(blob_dir),
         };
         database.bind_metadata()?;
         database.validate_database()?;
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.recursive(true).create(&database.blob_dir)?;
+        // Appends sync files and blob_dir, but its own directory entry belongs
+        // to the parent. Persist that entry before any transition can use it.
+        sync_parent_directory(&database.blob_dir)?;
+        // Linked paths are canonical. Use the same spelling for owned paths
+        // so the sweep also preserves links within a relatively opened store.
+        database.blob_dir = std::fs::canonicalize(&database.blob_dir)?;
+        database.sweep_blob_files()?;
         restrict_database_companions(&config.path)?;
         Ok(database)
     }

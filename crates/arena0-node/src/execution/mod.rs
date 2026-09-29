@@ -18,6 +18,7 @@ use crate::context::{ActorContext, SessionMessage};
 use crate::unix_time_ms as now_ms;
 
 mod actor;
+mod blobs;
 mod delivery;
 mod guest;
 mod terminal;
@@ -60,7 +61,7 @@ struct ExecutionActor {
     pub(super) instance: Option<ProgramInstance>,
     messages: mpsc::Sender<SessionMessage>,
     send_lanes: HashMap<arena0_protocol::PeerId, delivery::SendLane>,
-    send_tasks: JoinSet<delivery::SendResult>,
+    send_tasks: JoinSet<delivery::SendTaskResult>,
     /// Local clock for the current end-confirmation activity. The store's
     /// `updated_at_ms` anchors an `Ending` timer after restart; an `Ended`
     /// actor woken by peer traffic gets a fresh window to receive that peer.

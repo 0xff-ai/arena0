@@ -253,6 +253,7 @@ impl Host {
             context.bind(
                 Arc::clone(&self.identity),
                 execution_store,
+                self.store.clone(),
                 Arc::clone(&self.transport),
             ),
             Arc::clone(self),

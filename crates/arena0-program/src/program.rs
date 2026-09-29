@@ -33,6 +33,7 @@ pub struct Hash(pub [u8; 32]);
 impl Hash {
     /// Content address of a Wasm binary: blake3 of the bytes.
     #[must_use]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn of(wasm: &[u8]) -> Self {
         Self(*blake3::hash(wasm).as_bytes())
     }
@@ -250,6 +251,8 @@ pub enum Capability {
     Timers,
     /// Sign data with the given schemes.
     Sign { schemes: Vec<SignScheme> },
+    /// Resolve, create, fill, and commit objects in the local blob store.
+    Blobs,
 }
 
 /// An owned, deduplicated set of declared and inferred capabilities.

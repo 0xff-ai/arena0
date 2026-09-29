@@ -167,7 +167,7 @@ async fn variable_size_program_accepts_supported_creator_count() {
         Ok(ResponseOk::ProgramList(programs)) => programs,
         response => panic!("unexpected program response: {response:?}"),
     };
-    assert_eq!(programs.len(), 7);
+    assert_eq!(programs.len(), 8);
     let cumulative = programs
         .iter()
         .find(|program| program.name == "cumulative-sum")
@@ -188,6 +188,7 @@ async fn variable_size_program_accepts_supported_creator_count() {
                 ensemble: EnsembleSpec::Create {
                     participant_count: 3,
                 },
+                blobs: vec![],
             },
         ),
     )
@@ -206,6 +207,7 @@ async fn variable_size_program_accepts_supported_creator_count() {
                 ensemble: EnsembleSpec::Create {
                     participant_count: 3,
                 },
+                blobs: vec![],
             },
         ),
     )

@@ -1933,6 +1933,31 @@ impl HostService {
                         ApiError::new(ApiErrorCode::Internal, "imported program vanished")
                     })
             }
+            HostRequest::BlobImport { path } => {
+                let (hash, length) = self.store.link_blob(path).await.map_err(|error| {
+                    let code = match error {
+                        arena0_store::StoreError::BlobTooLarge { .. }
+                        | arena0_store::StoreError::Io(_) => ApiErrorCode::BadRequest,
+                        _ => ApiErrorCode::Storage,
+                    };
+                    ApiError::new(code, format!("import blob: {error}"))
+                })?;
+                Ok(ResponseOk::BlobImported { hash, length })
+            }
+            HostRequest::BlobExport { hash, path } => self
+                .store
+                .export_blob(hash, path)
+                .await
+                .map_err(|error| {
+                    let code = match error {
+                        arena0_store::StoreError::Io(_)
+                        | arena0_store::StoreError::BlobUnreadable(_) => ApiErrorCode::BadRequest,
+                        _ => ApiErrorCode::Storage,
+                    };
+                    ApiError::new(code, format!("export blob: {error}"))
+                })?
+                .map(|length| ResponseOk::BlobExported { length })
+                .ok_or_else(|| ApiError::new(ApiErrorCode::NotFound, "no such blob")),
             HostRequest::ProgramRemove { program } => {
                 let program_id = self.resolve_program(&program).await?;
                 let removed = self
@@ -1954,7 +1979,11 @@ impl HostService {
                 program,
                 params,
                 ensemble,
-            } => self.new_exec(exec_id, program, params, ensemble).await,
+                blobs,
+            } => {
+                self.new_exec(exec_id, program, params, ensemble, blobs)
+                    .await
+            }
             HostRequest::ExecList => self.exec_statuses().await.map(ResponseOk::ExecList),
             HostRequest::ExecStatus { exec_id } => {
                 self.exec_status(exec_id).await.map(ResponseOk::Status)
@@ -2256,6 +2285,7 @@ impl HostService {
         program: String,
         params: Option<serde_json::Value>,
         ensemble: EnsembleSpec,
+        blobs: Vec<arena0_protocol::BlobHash>,
     ) -> Response {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
@@ -2275,7 +2305,7 @@ impl HostService {
         let daemon = Arc::clone(self);
         tasks.spawn(async move {
             let response = daemon
-                .new_exec_inner(exec_id, program, params, ensemble)
+                .new_exec_inner(exec_id, program, params, ensemble, blobs)
                 .await;
             if response_tx.send(response).is_err() {
                 daemon.finish_creation(exec_id, true).await;
@@ -2339,6 +2369,7 @@ impl HostService {
         program: String,
         params: Option<serde_json::Value>,
         ensemble: EnsembleSpec,
+        blobs: Vec<arena0_protocol::BlobHash>,
     ) -> Response {
         let (program_id, plan, admission) = match ensemble {
             EnsembleSpec::Create { participant_count } => {
@@ -2408,10 +2439,22 @@ impl HostService {
             .claim_execution(exec_id)
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
         match execution_store
-            .create_execution_request(program_id, request_params, admission, unix_time_ms())
+            .create_execution_request(
+                program_id,
+                request_params,
+                admission,
+                &blobs,
+                unix_time_ms(),
+            )
             .await
-            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
-        {
+            .map_err(|error| {
+                let code = if matches!(error, arena0_store::StoreError::BlobNotFound(_)) {
+                    ApiErrorCode::NotFound
+                } else {
+                    ApiErrorCode::Storage
+                };
+                ApiError::new(code, error.to_string())
+            })? {
             arena0_store::ExecutionRequestOutcome::Created
             | arena0_store::ExecutionRequestOutcome::AlreadyExists => {}
             arena0_store::ExecutionRequestOutcome::Conflict => {
@@ -3946,6 +3989,7 @@ async fn offer_is_usable_for_join(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use arena0_api::NextEvent;
     use arena0_crypto::bls::BlsSecretKey;
     use arena0_crypto::{BlsSignature, SecretKey, key_binding_message};
@@ -4410,6 +4454,7 @@ mod tests {
                 ensemble: EnsembleSpec::Create {
                     participant_count: 2,
                 },
+                blobs: vec![],
             })
             .await;
         assert!(matches!(
@@ -4501,6 +4546,7 @@ mod tests {
                 program_hash,
                 Some(JsonBytes::try_new(b"null".to_vec()).unwrap()),
                 ExecutionAdmission::join(PeerId([0x11; 32]), negotiation_id),
+                &[],
                 1,
             )
             .await
@@ -4610,6 +4656,7 @@ mod tests {
                         2,
                     )
                     .expect("admission"),
+                    &[],
                     index,
                 )
                 .await
@@ -4658,7 +4705,7 @@ mod tests {
             ExecutionAdmission::create(offer.negotiation_id, offer.target_size).expect("admission");
         let mut writer = daemon.runtime.claim_execution(execution_id).unwrap();
         writer
-            .create_execution_request(program_hash, Some(params), admission, 1)
+            .create_execution_request(program_hash, Some(params), admission, &[], 1)
             .await
             .expect("request");
         writer
@@ -4837,6 +4884,7 @@ mod tests {
                     event,
                     effects,
                     timer_id: None,
+                    blobs: Vec::new(),
                 },
                 now_ms: 5,
             })
@@ -5150,6 +5198,7 @@ mod tests {
                 program_hash,
                 Some(JsonBytes::try_new(b"null".to_vec()).expect("params")),
                 ExecutionAdmission::create(negotiation_id, 2).expect("admission"),
+                &[],
                 4,
             )
             .await

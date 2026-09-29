@@ -196,6 +196,7 @@ async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Re
                 ensemble: EnsembleSpec::Create {
                     participant_count: 2,
                 },
+                blobs: vec![],
             },
         )
         .await?;
@@ -220,6 +221,7 @@ async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Re
                         negotiation_id,
                     )),
                 },
+                blobs: vec![],
             },
         )
         .await?;

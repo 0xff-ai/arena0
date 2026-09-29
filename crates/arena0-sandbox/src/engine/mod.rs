@@ -162,7 +162,6 @@ impl ResourceLedger {
 }
 
 /// Mutable state threaded through `wasmtime::Caller` for one call only.
-#[derive(Debug)]
 pub(crate) struct HostState {
     pub limits: StoreLimits,
     pub call_kind: CallKind,
@@ -176,6 +175,13 @@ pub(crate) struct HostState {
     pub profile: ExecutionProfile,
     pub callout_inputs: Vec<arena0_program::JsonSchemaDocument>,
     pub signer: crate::signing::SignerSlot,
+    pub verifier: Option<Arc<dyn crate::GuestVerifier>>,
+    pub blobs: Option<Arc<dyn crate::BlobView>>,
+    pub staged_blobs: Vec<arena0_protocol::execution::BlobChange>,
+    pub attachment: Option<Vec<u8>>,
+    pub direct_queued: Vec<(arena0_protocol::PeerId, usize)>,
+    pub peer_id: Option<arena0_protocol::PeerId>,
+    pub session: Option<arena0_protocol::Ensemble<arena0_protocol::Committed>>,
 }
 
 impl HostState {
@@ -203,6 +209,13 @@ impl HostState {
             profile,
             callout_inputs,
             signer: crate::signing::SignerSlot::default(),
+            verifier: None,
+            blobs: None,
+            staged_blobs: Vec::new(),
+            attachment: None,
+            direct_queued: Vec::new(),
+            peer_id: None,
+            session: None,
         }
     }
 
@@ -233,6 +246,13 @@ impl HostState {
         self.ledger = ResourceLedger::new();
         self.entropy.reset();
         self.signer.clear();
+        self.verifier = None;
+        self.blobs = None;
+        self.staged_blobs.clear();
+        self.attachment = None;
+        self.direct_queued.clear();
+        self.peer_id = None;
+        self.session = None;
     }
 
     /// Clear setup observations while retaining the call kind selected for a
@@ -246,6 +266,13 @@ impl HostState {
         self.ledger = ResourceLedger::new();
         self.entropy.reset();
         self.signer.clear();
+        self.verifier = None;
+        self.blobs = None;
+        self.staged_blobs.clear();
+        self.attachment = None;
+        self.direct_queued.clear();
+        self.peer_id = None;
+        self.session = None;
     }
 }
 

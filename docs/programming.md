@@ -40,7 +40,7 @@ The SDK uses an actor-oriented model. Every session source produces one flat
 `Event`. Agreed handlers (`on_session_started`, `on_message`) receive a mutable
 `Context` over the participant's shared and local state and return a transition;
 they may emit any `Effect`, including a lifecycle effect. Local handlers
-(`on_input`, `on_timer`) receive a `LocalContext` whose shared state is
+(`on_input`, `on_timer`, `on_direct`) receive a `LocalContext` whose shared state is
 read-only and return nothing; they may update local state and queue messages.
 The Host applies the agreement rules for an agreed dispatch. Queries and views
 project information without changing state.
@@ -87,6 +87,7 @@ The minimal program demonstrates the full path:
 | `on_input` | Validate the answer in a read-only-shared local context, update local state, and queue any message; return an error to reject it. |
 | `on_message` | Accept or reject the message and mutate either state. |
 | `on_timer` | Handle one typed `TimerFired` event in a read-only-shared local context. |
+| `on_direct` | Handle one direct message from another participant in a read-only-shared local context; return an error to reject it. |
 | `callout` | Derive the current open callout from a read-only state image. |
 | `outcome` | Derive the terminal result from shared state. |
 | `view` | Render the current program state without changing it. |
@@ -96,11 +97,18 @@ transition. `SessionStarted` and `MessageReceived` provide the portable public
 agreement path; the protocol certifies the shared execution and terminal
 evidence. The program defines the outcome; it does not assemble its own receipt.
 
-Guest signing is synchronous. In `InputReceived` and `TimerFired` handlers,
+Guest signing is synchronous. In `InputReceived`, `TimerFired`, and
+`DirectReceived` handlers,
 `ctx.sign(scheme, payload)` returns a `Signed` value containing the exact signed
 bytes and signature. The call is unavailable during `SessionStarted`,
 `MessageReceived`, and read-only projections. Declaring the `Sign` capability is
-still required before a handler can use it.
+still required before a handler can use it. `ctx.verify(signed)` checks a
+`Signed` value from another participant of the session and returns its payload.
+
+Programs never run cryptography or touch file bytes. `arena0_sdk::hash` and
+`arena0_sdk::permutation` are Host calls that every handler may use; they give
+the same result on every participant. The cryptography crates do not build for
+Wasm, so a program cannot link them.
 
 ## Interfaces and encoding
 
@@ -116,14 +124,30 @@ projection, not an alternate execution format or part of the signed commitment.
 ## Effects and capabilities
 
 Request runtime work through the explicit `SessionEnd`, `SessionAbort`, `Fail`,
-`Broadcast`, and `SetTimer` effects. Agreed handlers may emit any of them;
-local handlers (`on_input`, `on_timer`) may emit only `Broadcast` and
-`SetTimer`, and the runtime performs permitted effects after accepting the corresponding
+`Broadcast`, `SendDirect`, and `SetTimer` effects. Agreed handlers may emit any
+of them except `SendDirect`; local handlers (`on_input`, `on_timer`,
+`on_direct`) may emit only `Broadcast`, `SendDirect`, and `SetTimer`, and the runtime performs permitted effects after accepting the corresponding
 execution work. Programs have no ambient access to the network, filesystem,
 credentials, or clock. Callouts are state projections and signing is a
 synchronous host call; neither is an effect. A timer is a program value:
 `ctx.effects().set_timer(Timer::Deadline, delay)` carries it as a typed
 `TimerPayload`, and `on_timer(ctx, timer: Timer)` receives it back.
+
+`ctx.send_direct(to, &msg, range)` queues a message to one other participant
+outside agreement. It never enters the trace or the receipt, so use it for bulk
+or private traffic and agree on what matters through program messages. A full
+per-recipient queue returns `SendError::QueueFull`. The stack delivers each
+queued message once, in order, across crashes, so programs do not resend.
+
+With the `Blobs` capability, local handlers use the blobs granted to the
+execution, by hash. The optional `range` attaches raw bytes of a granted blob
+to the message. The receiver's `on_direct` gets an `Attachment` token;
+`ctx.blobs().append(hash, length, attachment)` adds those bytes to the object
+being received, and `commit(hash)` checks the whole object against its hash
+and publishes it. The Host verifies nothing else on its own: to check bytes
+before appending them, compute `ctx.blobs().subtree_cv(..)` and merge chaining
+values with `arena0::merge_cv`, as the verified-transfer primitive does. The
+program sees hashes and results, never the bytes.
 
 An agent may use external tools or model inference to answer a callout. The
 program must decide which answers are valid and how accepted observations enter
@@ -142,6 +166,7 @@ shared steps.
 | Turn-taking | Track the participant allowed to act next. |
 | Voting | Record ballots and evaluate the program's threshold. |
 | Proposal agreement | Manage a proposal lifecycle over ballots. |
+| Verified transfer | Move one stored object to another participant with signed, checked progress. |
 
 The [primitive source](../crates/arena0-primitives/src/lib.rs) owns the available
 interfaces. Bundled programs provide examples of composition:
@@ -153,6 +178,7 @@ interfaces. Bundled programs provide examples of composition:
 | [Contract net](../programs/contract-net) | Collect work proposals and select an award. |
 | [Prisoner's Dilemma](../programs/prisoner-dilemma) | Repeat a choice under a shared scoring rule. |
 | [Chess](../programs/chess) | Enforce turn order and legal moves. |
+| [Verified transfer](../programs/verified-transfer) | Exchange two files in opposite directions, checking every piece before storing it. |
 
 ## Test the rules
 

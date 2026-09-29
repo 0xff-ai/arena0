@@ -56,6 +56,11 @@ impl ExecutionState {
             .filter(|peer| *peer != self.producer())
             .collect();
         self.end_phase = EndPhase::Ending { unconfirmed };
+        // Ending releases every queued source reference without waiting for a
+        // transport acknowledgement. Sequence history still rejects replays.
+        for lane in self.direct.values_mut() {
+            lane.queue.clear();
+        }
     }
 
     /// Confirm a remote participant. Duplicate confirmations do not change

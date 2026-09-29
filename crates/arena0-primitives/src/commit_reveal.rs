@@ -512,7 +512,7 @@ impl CommitReveal<[u8; 32]> {
 /// this one.
 pub(crate) fn compute_hash<T: BorshSerialize>(value: &T, salt: &[u8; 32]) -> [u8; 32] {
     let bytes = borsh::to_vec(&(value, salt)).expect("borsh serialization failed");
-    *blake3::hash(&bytes).as_bytes()
+    arena0::hash(&bytes)
 }
 
 #[cfg(test)]

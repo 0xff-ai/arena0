@@ -21,7 +21,9 @@ const _: () = assert!(
     "the sandbox effect count must not exceed the protocol maximum"
 );
 
+mod blobs;
 mod call;
+pub use blobs::BlobView;
 mod engine;
 mod error;
 mod finalize;
@@ -31,7 +33,7 @@ mod validation;
 pub use call::DispatchCall;
 pub use engine::{LoadedProgram, ProgramInstance, WasmtimeEngine};
 pub use error::SandboxError;
-pub use signing::GuestSigner;
+pub use signing::{GuestSigner, GuestVerifier};
 
 mod program;
 pub use program::Program;
@@ -50,6 +52,8 @@ use arena0_protocol::Effect;
 /// carries only the reason and no images, so rejection clones nothing.
 #[derive(Debug)]
 pub struct DispatchCallResult {
+    /// Blob changes in call order, empty when the dispatch is rejected.
+    pub blobs: Vec<arena0_protocol::execution::BlobChange>,
     /// Whether the event was accepted or rejected.
     pub status: CallStatus,
     /// Bounded guest reason when an input dispatch was rejected.

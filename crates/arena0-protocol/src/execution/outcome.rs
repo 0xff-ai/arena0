@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use arena0_program::bounded;
 
-use super::{MAX_TERMINAL_OUTCOME_BYTES, ProtocolError};
+use super::ProtocolError;
+use crate::MAX_TERMINAL_OUTCOME_BYTES;
 
 /// The canonical Borsh outcome and its agent-facing JSON projection produced
 /// by one fresh guest outcome call.

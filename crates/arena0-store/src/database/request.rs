@@ -7,8 +7,12 @@ impl Database {
         program_hash: ProgramHash,
         params_bytes: Option<Vec<u8>>,
         admission: ExecutionAdmission,
+        mut grants: Vec<arena0_protocol::BlobHash>,
         created_at_ms: u64,
     ) -> Result<ExecutionRequestOutcome, StoreError> {
+        grants.sort_unstable();
+        grants.dedup();
+        let grants_bytes = borsh::to_vec(&grants)?;
         let params_len = params_bytes.as_ref().map_or(0, Vec::len);
         if params_len > arena0_protocol::MAX_PARAMS_LEN {
             return Err(StoreError::PayloadTooLarge {
@@ -20,15 +24,26 @@ impl Database {
         self.transaction(|store| {
             let existing = store.load_execution_request_in_transaction(execution_id)?;
             if let Some(existing) = existing {
+                let stored: Vec<u8> = store.connection.query_row(
+                    "SELECT grants FROM exec_requests WHERE execution_id = ?1",
+                    params![execution_id.0.as_slice()],
+                    |row| row.get(0),
+                )?;
                 if existing.program_hash == program_hash
                     && existing.params.as_ref().map(JsonBytes::as_bytes) == params_bytes.as_deref()
                     && existing.admission == admission
+                    && stored == grants_bytes
                 {
                     return Ok(ExecutionRequestOutcome::AlreadyExists);
                 }
                 return Ok(ExecutionRequestOutcome::Conflict);
             }
             store.ensure_program_registered(program_hash)?;
+            for hash in &grants {
+                if store.blob_location(*hash)?.is_none() {
+                    return Err(StoreError::BlobNotFound(*hash));
+                }
+            }
             validate_local_admission(store.host_id, &admission)?;
             let admission_bytes = borsh::to_vec(&admission).map_err(|error| {
                 StoreError::InvalidAdmission(format!("admission encoding failed: {error}"))
@@ -41,16 +56,23 @@ impl Database {
             }
             store.connection.execute(
                 "INSERT INTO exec_requests
-                 (execution_id, program_hash, params, admission, created_at_ms, failure)
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                 (execution_id, program_hash, params, admission, created_at_ms, failure, grants)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
                 params![
                     execution_id.0.to_vec(),
                     program_hash.as_bytes().to_vec(),
                     params_bytes,
                     envelope(EnvelopeKind::ExecutionAdmission, &admission_bytes)?,
                     sqlite_u64(created_at_ms)?,
+                    grants_bytes,
                 ],
             )?;
+            for hash in grants {
+                store.connection.execute(
+                    "INSERT INTO blob_grants (execution_id, hash) VALUES (?1, ?2)",
+                    params![execution_id.0.as_slice(), hash.0.as_slice()],
+                )?;
+            }
             Ok(ExecutionRequestOutcome::Created)
         })
     }

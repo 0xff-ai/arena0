@@ -56,6 +56,7 @@ check-daemon: build-programs
 check-programs: build-programs
     cargo fmt --manifest-path programs/Cargo.toml --all --check
     cargo clippy --locked --manifest-path programs/Cargo.toml --all-targets
+    ./scripts/check-guest-crypto.sh
 
 # Format + clippy both Cargo workspaces at the project's warn level.
 check:

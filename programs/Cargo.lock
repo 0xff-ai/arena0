@@ -17,6 +17,7 @@ dependencies = [
  "borsh",
  "ed25519-dalek",
  "hex",
+ "rand_chacha",
  "schemars",
  "serde",
  "sha2",
@@ -30,9 +31,7 @@ name = "arena0-primitives"
 version = "0.1.0"
 dependencies = [
  "arena0-sdk",
- "blake3",
  "borsh",
- "rand_chacha",
  "serde",
  "thiserror",
 ]
@@ -78,14 +77,10 @@ dependencies = [
  "arena0-program",
  "arena0-protocol",
  "arena0-sdk-macros",
- "blake3",
  "borsh",
- "ed25519-dalek",
  "schemars",
  "serde",
  "serde_json",
- "sha2",
- "tiny-keccak",
 ]
 
 [[package]]
@@ -881,6 +876,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "verified-transfer"
+version = "0.1.0"
+dependencies = [
+ "arena0-primitives",
+ "arena0-sdk",
+ "borsh",
+ "serde",
 ]
 
 [[package]]

@@ -66,6 +66,7 @@ async fn daemon_hosts_play_and_verify() {
         ensemble: EnsembleSpec::Create {
             participant_count: 2,
         },
+        blobs: vec![],
     };
     let (exec_a, negotiation_id) = match ok(call(&d.host_a, &req_a).await) {
         ResponseOk::ExecCreated {
@@ -85,6 +86,7 @@ async fn daemon_hosts_play_and_verify() {
                 ensemble: EnsembleSpec::Join {
                     target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
                 },
+                blobs: vec![],
             },
         )
         .await,
@@ -246,6 +248,7 @@ async fn joiner_without_params_adopts_creator_terms() {
         ensemble: EnsembleSpec::Create {
             participant_count: 2,
         },
+        blobs: vec![],
     };
     let (exec_a, negotiation_id) = match ok(call(&d.host_a, &req_a).await) {
         ResponseOk::ExecCreated {
@@ -265,6 +268,7 @@ async fn joiner_without_params_adopts_creator_terms() {
                 ensemble: EnsembleSpec::Join {
                     target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
                 },
+                blobs: vec![],
             },
         )
         .await,

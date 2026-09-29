@@ -13,14 +13,18 @@ borsh.workspace = true
 schemars.workspace = true
 thiserror.workspace = true
 hex.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 blake3.workspace = true
 sha2.workspace = true
 tiny-keccak.workspace = true
 ed25519-dalek.workspace = true
-zeroize.workspace = true
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 blst.workspace = true
+rand_chacha.workspace = true
+
+[dev-dependencies]
+arena0-protocol = { path = "../arena0-protocol" }
 
 [lints]
 workspace = true

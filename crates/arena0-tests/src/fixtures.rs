@@ -231,6 +231,7 @@ pub async fn spawn_live_execution_with_delivery(
             Some(params_json.clone()),
             ExecutionAdmission::create(negotiation_id, peer_ids.len() as u16)
                 .expect("creator admission"),
+            &[],
             2,
         )
         .await
@@ -532,7 +533,7 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
           (import "arena0" "broadcast" (func $broadcast (param i32 i32) (result i32)))
           {stop_import}
           (memory (export "memory") 1)
-          (global (export "arena0_abi_version") i32 (i32.const 22))
+          (global (export "arena0_abi_version") i32 (i32.const 24))
           (data (i32.const 2048) "{init}")
           (data (i32.const 32768) "{accepted}")
           (data (i32.const 32772) "{rejected}")

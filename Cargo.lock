@@ -179,11 +179,13 @@ dependencies = [
 name = "arena0-crypto"
 version = "0.1.0"
 dependencies = [
+ "arena0-protocol",
  "blake3",
  "blst",
  "borsh",
  "ed25519-dalek",
  "hex",
+ "rand_chacha 0.3.1",
  "schemars",
  "serde",
  "sha2",
@@ -261,10 +263,9 @@ dependencies = [
 name = "arena0-primitives"
 version = "0.1.0"
 dependencies = [
+ "arena0-crypto",
  "arena0-sdk",
- "blake3",
  "borsh",
- "rand_chacha 0.3.1",
  "serde",
  "thiserror 2.0.18",
 ]
@@ -335,14 +336,10 @@ dependencies = [
  "arena0-program",
  "arena0-protocol",
  "arena0-sdk-macros",
- "blake3",
  "borsh",
- "ed25519-dalek",
  "schemars",
  "serde",
  "serde_json",
- "sha2",
- "tiny-keccak",
 ]
 
 [[package]]
@@ -399,6 +396,7 @@ dependencies = [
  "arena0-store",
  "arena0-test-engine",
  "arena0-transport",
+ "borsh",
  "hex",
  "serde_json",
  "tempfile",

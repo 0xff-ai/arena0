@@ -1,5 +1,7 @@
 //! Capability-gated imports and per-call resource accounting.
 
+#[cfg(test)]
+pub(crate) mod blob_tests;
 mod capabilities;
 mod core;
 
@@ -23,6 +25,7 @@ pub(super) fn register_metadata_imports(
     let capabilities = [
         Capability::Messaging,
         Capability::Timers,
+        Capability::Blobs,
         Capability::Sign {
             schemes: vec![SignScheme::Ed25519, SignScheme::Bls],
         },
@@ -42,11 +45,21 @@ pub(super) trait CallerExt {
         label: &str,
     ) -> Result<Vec<u8>, wasmtime::Error>;
     fn begin_import(&mut self, _name: &str) -> Result<(), wasmtime::Error>;
+    /// Subtract `fuel` from the store's remaining fuel; trap when it would go negative.
+    fn charge_fuel(&mut self, fuel: u64, name: &str) -> Result<(), wasmtime::Error>;
     fn reject_read_only(&self, name: &str) -> Result<(), wasmtime::Error>;
     fn record_effect(&mut self, effect: Effect) -> Result<(), wasmtime::Error>;
 }
 
 impl CallerExt for Caller<'_, HostState> {
+    fn charge_fuel(&mut self, fuel: u64, name: &str) -> Result<(), wasmtime::Error> {
+        let remaining = self
+            .get_fuel()?
+            .checked_sub(fuel)
+            .ok_or_else(|| wasmtime::Error::msg(format!("{name}: insufficient fuel")))?;
+        self.set_fuel(remaining)
+    }
+
     fn work_memory(&mut self) -> Result<Memory, wasmtime::Error> {
         match self.get_export(arena0_program::abi::exports::WORK_MEMORY) {
             Some(Extern::Memory(memory)) => Ok(memory),
@@ -124,6 +137,13 @@ impl CallerExt for Caller<'_, HostState> {
                 self.data().call_kind
             )));
         }
+        if matches!(effect, Effect::SendDirect { .. })
+            && self.data().dispatch != DispatchKind::Local
+        {
+            return Err(wasmtime::Error::msg(
+                "send_direct: only available in local handlers",
+            ));
+        }
         let queue = &self.data().effect_queue;
         if effect.is_lifecycle() {
             if self.data().dispatch != DispatchKind::Agreed {
@@ -185,6 +205,7 @@ fn effect_name(effect: &Effect) -> &'static str {
         Effect::Fail { .. } => imports::FAIL,
         Effect::SetTimer { .. } => imports::SET_TIMER,
         Effect::Broadcast { .. } => imports::BROADCAST,
+        Effect::SendDirect { .. } => imports::SEND_DIRECT,
     }
 }
 

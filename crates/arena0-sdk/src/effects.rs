@@ -7,7 +7,10 @@
 use arena0_crypto::SignScheme;
 #[cfg(not(target_arch = "wasm32"))]
 use arena0_program::abi::imports;
-use arena0_protocol::{LogLevel, TimerPayload};
+use arena0_protocol::{
+    Attachment, BlobError, BlobHash, ChainingValue, CvSource, LogLevel, PeerId, RangeAttachment,
+    TimerPayload,
+};
 
 /// State-memory selector used by the always-available state imports.
 #[doc(hidden)]
@@ -23,8 +26,21 @@ unsafe extern "C" {
     fn log(level: u32, msg_ptr: u32, msg_len: u32);
     fn random(buf_ptr: u32, buf_len: u32);
     fn broadcast(data_ptr: u32, data_len: u32) -> u32;
+    fn send_direct(to_ptr: u32, msg_ptr: u32, msg_len: u32, range_ptr: u32, range_len: u32) -> u32;
+    fn blob_append(hash_ptr: u32, length: u64, attachment: u32) -> u32;
+    fn blob_commit(hash_ptr: u32) -> u32;
+    fn subtree_cv(source_ptr: u32, source_len: u32, offset: u64, out_ptr: u32) -> u32;
     fn set_timer(delay_ms: u64, type_ptr: u32, type_len: u32, data_ptr: u32, data_len: u32);
     fn sign(scheme: u32, data_ptr: u32, data_len: u32, out_ptr: u32, out_cap: u32) -> u32;
+    fn verify(
+        signed_ptr: u32,
+        signed_len: u32,
+        sig_ptr: u32,
+        sig_len: u32,
+        signer_ptr: u32,
+        out_ptr: u32,
+        out_cap: u32,
+    ) -> u32;
     fn end_session(result_ptr: u32, result_len: u32);
     fn abort_session(reason_ptr: u32, reason_len: u32);
     fn state_len(kind: u32) -> u32;
@@ -95,12 +111,12 @@ pub(crate) fn host_random(buf: &mut [u8]) {
 
 /// Broadcast a message to every participant.
 ///
-/// Returns [`BroadcastError::QueueFull`] when the durable outgoing queue is
+/// Returns [`SendError::QueueFull`] when the durable outgoing queue is
 /// full; the host then queues nothing.
-pub(crate) fn host_broadcast(msg_bytes: &[u8]) -> Result<(), crate::context::BroadcastError> {
+pub(crate) fn host_broadcast(msg_bytes: &[u8]) -> Result<(), crate::context::SendError> {
     host_import!(BROADCAST(msg_bytes) {
         if broadcast(msg_bytes.as_ptr() as u32, msg_bytes.len() as u32) != 0 {
-            return Err(crate::context::BroadcastError::QueueFull);
+            return Err(crate::context::SendError::QueueFull);
         }
         Ok(())
     })
@@ -139,6 +155,87 @@ pub(crate) fn host_guest_sign(scheme: SignScheme, payload: &[u8]) -> (Vec<u8>, V
         let bytes = core::slice::from_raw_parts(out, written).to_vec();
         crate::io_alloc::io_dealloc(out, capacity);
         borsh::from_slice(&bytes).expect("host sign result decode failed")
+    })
+}
+
+/// Allocate room for the payload and Borsh result envelope, then decode the
+/// Host's verification result. Native builds panic through `host_import!`.
+pub(crate) fn host_guest_verify(
+    signed_bytes: &[u8],
+    signature: &[u8],
+    signer: PeerId,
+) -> Result<Vec<u8>, arena0_protocol::VerifyError> {
+    host_import!(VERIFY(signed_bytes, signature, signer) {
+        let capacity = signed_bytes.len()
+            .saturating_add(arena0_program::VERIFY_RESULT_OVERHEAD_BYTES);
+        let out = crate::io_alloc::io_alloc(capacity);
+        assert!(!out.is_null(), "guest verify buffer allocation failed");
+        // A verified payload cannot exceed its signed preimage. The overhead
+        // covers the Borsh result tag and vector length (or encoded error).
+        let written = verify(
+            signed_bytes.as_ptr() as u32, signed_bytes.len() as u32,
+            signature.as_ptr() as u32, signature.len() as u32,
+            signer.0.as_ptr() as u32, out as u32, capacity as u32,
+        ) as usize;
+        debug_assert!(written <= capacity);
+        let bytes = core::slice::from_raw_parts(out, written).to_vec();
+        crate::io_alloc::io_dealloc(out, capacity);
+        borsh::from_slice(&bytes).expect("host verify result decode failed")
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn blob_result(status: u32) -> Result<(), BlobError> {
+    if status == 0 {
+        Ok(())
+    } else {
+        let tag = u8::try_from(status - 1).expect("host blob error tag fits u8");
+        Err(borsh::from_slice(&[tag]).expect("host blob error decode failed"))
+    }
+}
+
+pub(crate) fn host_send_direct(
+    to: PeerId,
+    msg: &[u8],
+    range: Option<RangeAttachment>,
+) -> Result<(), crate::SendError> {
+    host_import!(SEND_DIRECT(to, msg, range) {
+        let range = range.map(|r| borsh::to_vec(&r).expect("range serialization failed")).unwrap_or_default();
+        match send_direct(to.0.as_ptr() as u32, msg.as_ptr() as u32, msg.len() as u32, range.as_ptr() as u32, range.len() as u32) {
+            0 => Ok(()),
+            1 => Err(crate::SendError::QueueFull),
+            _ => panic!("invalid host send_direct status"),
+        }
+    })
+}
+
+pub(crate) fn host_blob_append(
+    hash: BlobHash,
+    length: u64,
+    attachment: Attachment,
+) -> Result<(), BlobError> {
+    host_import!(BLOB_APPEND(hash, length, attachment) {
+        blob_result(blob_append(hash.0.as_ptr() as u32, length, attachment.0))
+    })
+}
+
+pub(crate) fn host_blob_commit(hash: BlobHash) -> Result<(), BlobError> {
+    host_import!(BLOB_COMMIT(hash) {
+        blob_result(blob_commit(hash.0.as_ptr() as u32))
+    })
+}
+
+pub(crate) fn host_subtree_cv(source: CvSource, offset: u64) -> Result<ChainingValue, BlobError> {
+    host_import!(SUBTREE_CV(source, offset) {
+        let source = borsh::to_vec(&source).expect("cv source serialization failed");
+        let mut out = [0u8; 32];
+        blob_result(subtree_cv(
+            source.as_ptr() as u32,
+            source.len() as u32,
+            offset,
+            out.as_mut_ptr() as u32,
+        ))?;
+        Ok(out)
     })
 }
 

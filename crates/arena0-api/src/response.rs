@@ -4,6 +4,7 @@
 
 use arena0_crypto::AgentPubKey;
 use arena0_program::{JsonSchemaDocument, ParticipantCount, ProgramHash, ProgramSchema};
+use arena0_protocol::BlobHash;
 use arena0_protocol::{
     CalloutId, EffectSummary, EventKind, ExecId, ExecLifecycle, NegotiationId, OfferHash, PeerId,
     ReceiptArtifact, ReceiptSummary, SessionHash, StateHash, TicketHash, TraceEntry, View,
@@ -23,6 +24,13 @@ pub enum ResponseOk {
     Id(IdInfo),
     Program(Box<ProgramDetail>),
     ProgramList(Vec<ProgramSummary>),
+    BlobImported {
+        hash: BlobHash,
+        length: u64,
+    },
+    BlobExported {
+        length: u64,
+    },
     /// `exec.new` returns immediately; negotiation runs in the background. The state
     /// is `Negotiating` (or its later observable states); `queue_position` is `Some`
     /// when this creation waits behind another daemon-wide negotiation.

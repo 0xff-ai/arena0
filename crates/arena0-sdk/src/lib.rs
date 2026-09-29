@@ -71,9 +71,12 @@
 //! Programs are pure state machines. The runtime handles transport,
 //! callout/input collection, and state verification.
 
+mod blobs;
+pub use blobs::Blobs;
 pub mod context;
 mod effects;
 pub mod fault;
+mod host;
 #[doc(hidden)]
 #[cfg(target_arch = "wasm32")]
 pub mod io_alloc;
@@ -97,9 +100,9 @@ pub use arena0_sdk_macros::{
     callout, callouts, data, local, message, outcome, phases, primitive, program, query, state,
 };
 pub use context::{
-    AgreedMode, BroadcastError, CalloutContext, Context, Crypto, Ctx, EffectMode, Effects,
-    LocalContext, LocalMode, Mode, PrimitiveField, PrimitiveOutput, PrimitiveRoute,
-    RawPrimitiveRoute, ReadMode, Signed,
+    AgreedMode, CalloutContext, Context, Ctx, EffectMode, Effects, LocalContext, LocalMode, Mode,
+    PrimitiveField, PrimitiveOutput, PrimitiveRoute, RawPrimitiveRoute, ReadMode, SendError,
+    Signed,
 };
 #[doc(hidden)]
 pub use effects::{
@@ -110,6 +113,7 @@ pub use effects::{
 #[doc(hidden)]
 pub use effects::{host_fail as __host_fail, host_log as __host_log};
 pub use fault::{ProgramFault, ProtocolFault};
+pub use host::{hash, merge_cv, permutation};
 #[doc(hidden)]
 #[cfg(target_arch = "wasm32")]
 pub use io_alloc::prepare_allocator as __prepare_allocator;
@@ -126,7 +130,7 @@ pub use timer::{decode_timer_payload, timer_payload};
 pub use transition::{AbortReason, Transition};
 
 pub use anyhow;
-pub use arena0_crypto::{HashAlgorithm, SignScheme};
+pub use arena0_crypto::SignScheme;
 pub use arena0_program::{
     ABI_VERSION, AbiEnvelopeError, BorshSchemaDocument, CallStatus, CalloutRequest, CalloutSchema,
     Capability, CapabilityImport, CapabilitySet, DispatchInput, DispatchOutput, ExecutionProfile,
@@ -141,10 +145,10 @@ pub use arena0_program::{
 };
 pub use arena0_protocol as types;
 pub use arena0_protocol::{
-    Committed, Effect, Ensemble, EnsembleError, Event, LogLevel, Open, Participant, PeerId,
-    SessionHash, StateHash, TimerPayload, TraceEntry, View, Viewport,
+    Attachment, BlobError, BlobHash, ChainingValue, Committed, CvSource, Effect, Ensemble,
+    EnsembleError, Event, LogLevel, Open, Participant, PeerId, RangeAttachment, SessionHash,
+    StateHash, TimerPayload, VerifyError, View, Viewport,
 };
-pub use blake3;
 pub use borsh;
 pub use schemars;
 pub use serde;
@@ -193,6 +197,12 @@ macro_rules! __arena0_capability_vec {
         capabilities
     }};
     (Timers) => { ::std::vec![$crate::Capability::Timers] };
+    (Blobs, $($rest:tt)*) => {{
+        let mut capabilities = ::std::vec![$crate::Capability::Blobs];
+        capabilities.extend($crate::__arena0_capability_vec!($($rest)*));
+        capabilities
+    }};
+    (Blobs) => { ::std::vec![$crate::Capability::Blobs] };
     (Sign { schemes: [$($scheme:ident),* $(,)?] }, $($rest:tt)*) => {{
         let mut capabilities = ::std::vec![
             $crate::Capability::Sign {

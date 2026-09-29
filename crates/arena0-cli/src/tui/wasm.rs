@@ -421,6 +421,7 @@ pub(super) fn event_name(kind: EventKind) -> &'static str {
         EventKind::MessageReceived => "message received",
         EventKind::InputReceived => "input received",
         EventKind::TimerFired => "timer fired",
+        EventKind::DirectReceived => "direct message received",
     }
 }
 
@@ -431,6 +432,7 @@ fn effect_label(effect: &arena0_client::api::EffectSummary) -> String {
         EffectKind::Broadcast => "broadcast",
         EffectKind::SetTimer => "set timer",
         EffectKind::Fail => "fail",
+        EffectKind::SendDirect => "send direct",
     };
     effect
         .payload_bytes

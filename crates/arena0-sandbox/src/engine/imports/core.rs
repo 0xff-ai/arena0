@@ -12,13 +12,153 @@ use super::CallerExt as _;
 use crate::SandboxError;
 use crate::engine::HostState;
 
-/// Register imports required by every generated module. Read-only calls still
-/// link these names because Wasm imports are module-scoped; the call-kind guard
-/// rejects their use before any allocation or effect occurs.
+/// Register imports required by every generated module. Pure imports are also
+/// available to read-only calls; effect and state imports enforce their own
+/// call-kind boundaries before allocating or changing state.
 pub(crate) fn register_always_available(
     linker: &mut Linker<HostState>,
 ) -> Result<(), SandboxError> {
     let map_err = |error: wasmtime::Error| SandboxError::instantiation_failed(error.to_string());
+
+    linker
+        .func_wrap(
+            abi::HOST_MODULE,
+            imports::HASH,
+            |mut caller: Caller<'_, HostState>, data_ptr: u32, data_len: u32, out_ptr: u32| {
+                caller.begin_import(imports::HASH)?;
+                let data = caller.read_guest_bytes(data_ptr, data_len, imports::HASH)?;
+                let fuel = u64::from(data_len) * caller.data().profile.fuel.hash_per_byte;
+                caller.charge_fuel(fuel, imports::HASH)?;
+                let max = caller.data().profile.limits.max_host_bytes;
+                caller
+                    .data_mut()
+                    .ledger
+                    .copy_bytes(32, max)
+                    .map_err(wasmtime::Error::new)?;
+                let digest = arena0_crypto::hash(arena0_crypto::HashAlgorithm::Blake3, &data);
+                caller
+                    .work_memory()?
+                    .write(&mut caller, out_ptr as usize, &digest)
+                    .map_err(|error| wasmtime::Error::msg(error.to_string()))
+            },
+        )
+        .map_err(map_err)?;
+
+    linker
+        .func_wrap(
+            abi::HOST_MODULE,
+            imports::MERGE_CV,
+            |mut caller: Caller<'_, HostState>,
+             left_ptr: u32,
+             right_ptr: u32,
+             root: u32,
+             out_ptr: u32| {
+                caller.begin_import(imports::MERGE_CV)?;
+                let left = caller.read_guest_bytes(left_ptr, 32, imports::MERGE_CV)?;
+                let right = caller.read_guest_bytes(right_ptr, 32, imports::MERGE_CV)?;
+                // One BLAKE3 compression over the 64-byte parent block.
+                let fuel = 64 * caller.data().profile.fuel.hash_per_byte;
+                caller.charge_fuel(fuel, imports::MERGE_CV)?;
+                let max = caller.data().profile.limits.max_host_bytes;
+                caller
+                    .data_mut()
+                    .ledger
+                    .copy_bytes(32, max)
+                    .map_err(wasmtime::Error::new)?;
+                let parent = arena0_crypto::blake3_tree::merge_cv(
+                    &left.try_into().expect("cv width"),
+                    &right.try_into().expect("cv width"),
+                    root != 0,
+                );
+                caller
+                    .work_memory()?
+                    .write(&mut caller, out_ptr as usize, &parent)
+                    .map_err(|error| wasmtime::Error::msg(error.to_string()))
+            },
+        )
+        .map_err(map_err)?;
+
+    linker
+        .func_wrap(
+            abi::HOST_MODULE,
+            imports::PERMUTATION,
+            |mut caller: Caller<'_, HostState>, seed_ptr: u32, n: u32, out_ptr: u32| {
+                caller.begin_import(imports::PERMUTATION)?;
+                if u64::from(n) > caller.data().profile.limits.max_permutation_len {
+                    return Err(wasmtime::Error::msg("permutation: length exceeds maximum"));
+                }
+                let seed = caller.read_guest_bytes(seed_ptr, 32, imports::PERMUTATION)?;
+                let max = caller.data().profile.limits.max_host_bytes;
+                caller
+                    .data_mut()
+                    .ledger
+                    .copy_bytes(4 * n as usize, max)
+                    .map_err(wasmtime::Error::new)?;
+                let fuel = u64::from(n) * caller.data().profile.fuel.permutation_per_item;
+                caller.charge_fuel(fuel, imports::PERMUTATION)?;
+                let order = arena0_crypto::permutation(seed.try_into().expect("32-byte seed"), n)
+                    .ok_or_else(|| {
+                    wasmtime::Error::msg("permutation: random draw exhausted")
+                })?;
+                let memory = caller.work_memory()?;
+                for (index, item) in order.into_iter().enumerate() {
+                    memory
+                        .write(
+                            &mut caller,
+                            out_ptr as usize + 4 * index,
+                            &item.to_le_bytes(),
+                        )
+                        .map_err(|error| wasmtime::Error::msg(error.to_string()))?;
+                }
+                Ok(())
+            },
+        )
+        .map_err(map_err)?;
+
+    linker
+        .func_wrap(
+            abi::HOST_MODULE,
+            imports::VERIFY,
+            |mut caller: Caller<'_, HostState>,
+             signed_ptr: u32,
+             signed_len: u32,
+             sig_ptr: u32,
+             sig_len: u32,
+             signer_ptr: u32,
+             out_ptr: u32,
+             out_cap: u32| {
+                caller.begin_import(imports::VERIFY)?;
+                let verifier = caller.data().verifier.clone().ok_or_else(|| {
+                    wasmtime::Error::msg("verify is only available in dispatches")
+                })?;
+                let fuel = caller.data().profile.fuel.verify;
+                caller.charge_fuel(fuel, imports::VERIFY)?;
+                let signed = caller.read_guest_bytes(signed_ptr, signed_len, imports::VERIFY)?;
+                let signature = caller.read_guest_bytes(sig_ptr, sig_len, imports::VERIFY)?;
+                let signer = caller.read_guest_bytes(signer_ptr, 32, imports::VERIFY)?;
+                let signer =
+                    arena0_protocol::PeerId(signer.try_into().expect("32-byte peer identity"));
+                let encoded = borsh::to_vec(&verifier.verify(&signed, &signature, &signer))
+                    .expect("verification result is serializable");
+                if encoded.len() > out_cap as usize {
+                    return Err(wasmtime::Error::msg(
+                        "verify: result exceeds output capacity",
+                    ));
+                }
+                let max = caller.data().profile.limits.max_host_bytes;
+                caller
+                    .data_mut()
+                    .ledger
+                    .copy_bytes(encoded.len(), max)
+                    .map_err(wasmtime::Error::new)?;
+                caller
+                    .work_memory()?
+                    .write(&mut caller, out_ptr as usize, &encoded)
+                    .map_err(|error| wasmtime::Error::msg(error.to_string()))?;
+                Ok(encoded.len() as u32)
+            },
+        )
+        .map_err(map_err)?;
 
     linker
         .func_wrap(
@@ -258,4 +398,205 @@ fn state_payload_max(caller: &Caller<'_, HostState>, kind: u32) -> Result<usize,
     };
     usize::try_from(max)
         .map_err(|_| wasmtime::Error::msg("state payload maximum does not fit in usize"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hash_writes_blake3_and_charges_fuel() {
+        let wat = r#"(module
+            (import "arena0" "hash" (func $hash (param i32 i32 i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 64) "abc")
+            (func (export "run")
+                i32.const 64 i32.const 3 i32.const 0 call $hash))"#;
+        let mut config = wasmtime::Config::new();
+        config.consume_fuel(true);
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let module = wasmtime::Module::new(&engine, wat).unwrap();
+        let mut linker = Linker::new(&engine);
+        register_always_available(&mut linker).unwrap();
+        let mut store = wasmtime::Store::new(
+            &engine,
+            HostState::new(
+                arena0_program::ExecutionProfile::current(),
+                crate::engine::CallKind::Query,
+                crate::call::DispatchKind::Agreed,
+                Vec::new(),
+            ),
+        );
+        store.set_fuel(10_000_000).unwrap();
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        let memory = instance.get_memory(&mut store, "memory").unwrap();
+
+        let run = instance
+            .get_typed_func::<(), ()>(&mut store, "run")
+            .unwrap();
+        store.data_mut().profile.fuel.hash_per_byte = 0;
+        run.call(&mut store, ()).unwrap();
+        let baseline = 10_000_000 - store.get_fuel().unwrap();
+        store.set_fuel(10_000_000).unwrap();
+        store.data_mut().profile.fuel.hash_per_byte = arena0_program::profile::HASH_FUEL_PER_BYTE;
+        run.call(&mut store, ()).unwrap();
+        assert_eq!(
+            10_000_000 - store.get_fuel().unwrap(),
+            baseline + 3 * arena0_program::profile::HASH_FUEL_PER_BYTE
+        );
+        assert_eq!(
+            &memory.data(&store)[..32],
+            &arena0_crypto::hash(arena0_crypto::HashAlgorithm::Blake3, b"abc")
+        );
+        assert_eq!(store.data().ledger.host_bytes, 2 * (3 + 32));
+        assert!(store.data().effect_queue.is_empty());
+    }
+
+    #[test]
+    fn permutation_matches_arena0_crypto_and_rejects_over_the_limit() {
+        let wat = r#"(module
+            (import "arena0" "permutation" (func $permutation (param i32 i32 i32)))
+            (memory (export "memory") 1)
+            (func (export "run") (param $n i32)
+                i32.const 0 local.get $n i32.const 64 call $permutation))"#;
+        let mut config = wasmtime::Config::new();
+        config.consume_fuel(true);
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let module = wasmtime::Module::new(&engine, wat).unwrap();
+        let mut linker = Linker::new(&engine);
+        register_always_available(&mut linker).unwrap();
+        let mut store = wasmtime::Store::new(
+            &engine,
+            HostState::new(
+                arena0_program::ExecutionProfile::current(),
+                crate::engine::CallKind::Query,
+                crate::call::DispatchKind::Agreed,
+                Vec::new(),
+            ),
+        );
+        store.set_fuel(10_000_000).unwrap();
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        let memory = instance.get_memory(&mut store, "memory").unwrap();
+
+        memory.write(&mut store, 0, &[7; 32]).unwrap();
+        let run = instance
+            .get_typed_func::<u32, ()>(&mut store, "run")
+            .unwrap();
+        for n in [0, 1, 64, arena0_program::profile::MAX_PERMUTATION_LEN] {
+            run.call(&mut store, n).unwrap();
+            let actual = memory.data(&store)[64..64 + 4 * n as usize]
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, arena0_crypto::permutation([7; 32], n).unwrap());
+        }
+        let copied = store.data().ledger.host_bytes;
+        let before = memory.data(&store).to_vec();
+        let error = run
+            .call(&mut store, arena0_program::profile::MAX_PERMUTATION_LEN + 1)
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("length exceeds maximum"));
+        assert_eq!(store.data().ledger.host_bytes, copied);
+        assert_eq!(memory.data(&store), before);
+        assert!(store.data().effect_queue.is_empty());
+    }
+
+    #[test]
+    fn verify_without_a_verifier_traps() {
+        let wat = r#"(module
+            (import "arena0" "verify" (func $verify (param i32 i32 i32 i32 i32 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (func (export "run") (result i32)
+                i32.const 0 i32.const 0 i32.const 0 i32.const 0
+                i32.const 0 i32.const 64 i32.const 128 call $verify))"#;
+        let mut config = wasmtime::Config::new();
+        config.consume_fuel(true);
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let module = wasmtime::Module::new(&engine, wat).unwrap();
+        let mut linker = Linker::new(&engine);
+        register_always_available(&mut linker).unwrap();
+        let mut store = wasmtime::Store::new(
+            &engine,
+            HostState::new(
+                arena0_program::ExecutionProfile::current(),
+                crate::engine::CallKind::Query,
+                crate::call::DispatchKind::Agreed,
+                Vec::new(),
+            ),
+        );
+        store.set_fuel(10_000_000).unwrap();
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        let memory = instance.get_memory(&mut store, "memory").unwrap();
+
+        let run = instance
+            .get_typed_func::<(), u32>(&mut store, "run")
+            .unwrap();
+        let error = run.call(&mut store, ()).unwrap_err();
+        assert!(format!("{error:?}").contains("verify is only available in dispatches"));
+        assert_eq!(store.data().ledger.host_bytes, 0);
+        assert_eq!(&memory.data(&store)[64..192], &[0; 128]);
+    }
+
+    #[test]
+    fn verify_writes_the_verifier_result() {
+        struct Verifier(Result<Vec<u8>, arena0_protocol::VerifyError>);
+        impl crate::GuestVerifier for Verifier {
+            fn verify(
+                &self,
+                signed: &[u8],
+                signature: &[u8],
+                signer: &arena0_protocol::PeerId,
+            ) -> Result<Vec<u8>, arena0_protocol::VerifyError> {
+                assert_eq!(signed, b"signed");
+                assert_eq!(signature, b"signature");
+                assert_eq!(signer.0, [7; 32]);
+                self.0.clone()
+            }
+        }
+        let wat = r#"(module
+            (import "arena0" "verify" (func $verify (param i32 i32 i32 i32 i32 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 0) "signed")
+            (data (i32.const 16) "signature")
+            (func (export "run") (param $cap i32) (result i32)
+                i32.const 0 i32.const 6 i32.const 16 i32.const 9
+                i32.const 32 i32.const 64 local.get $cap call $verify))"#;
+        let mut config = wasmtime::Config::new();
+        config.consume_fuel(true);
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let module = wasmtime::Module::new(&engine, wat).unwrap();
+        let mut linker = Linker::new(&engine);
+        register_always_available(&mut linker).unwrap();
+        let mut store = wasmtime::Store::new(
+            &engine,
+            HostState::new(
+                arena0_program::ExecutionProfile::current(),
+                crate::engine::CallKind::Query,
+                crate::call::DispatchKind::Agreed,
+                Vec::new(),
+            ),
+        );
+        store.set_fuel(10_000_000).unwrap();
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        let memory = instance.get_memory(&mut store, "memory").unwrap();
+
+        memory.write(&mut store, 32, &[7; 32]).unwrap();
+        store.data_mut().call_kind = crate::engine::CallKind::Dispatch;
+        let run = instance
+            .get_typed_func::<u32, u32>(&mut store, "run")
+            .unwrap();
+        for result in [
+            Ok(b"payload".to_vec()),
+            Err(arena0_protocol::VerifyError::BadSignature),
+        ] {
+            store.data_mut().verifier = Some(std::sync::Arc::new(Verifier(result.clone())));
+            let len = run.call(&mut store, 128).unwrap();
+            let decoded: Result<Vec<u8>, arena0_protocol::VerifyError> =
+                borsh::from_slice(&memory.data(&store)[64..64 + len as usize]).unwrap();
+            assert_eq!(decoded, result);
+            let error = run.call(&mut store, 0).unwrap_err();
+            assert!(format!("{error:?}").contains("result exceeds output capacity"));
+        }
+        assert!(store.data().effect_queue.is_empty());
+    }
 }

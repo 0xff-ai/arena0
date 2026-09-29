@@ -90,7 +90,7 @@ fn owner_lock_path(path: &Path) -> PathBuf {
     PathBuf::from(value)
 }
 
-fn sync_parent_directory(path: &Path) -> Result<(), StoreError> {
+pub(super) fn sync_parent_directory(path: &Path) -> Result<(), StoreError> {
     #[cfg(unix)]
     {
         let parent = path
@@ -185,6 +185,7 @@ pub(crate) fn initialize_schema(connection: &Connection) -> Result<(), StoreErro
     connection.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| {
         connection.execute_batch(include_str!("../schema.sql"))?;
+        Database::create_blob_tables(connection)?;
         connection.pragma_update(None, "user_version", sqlite_u64(SCHEMA_VERSION)?)?;
         Ok::<(), StoreError>(())
     })();

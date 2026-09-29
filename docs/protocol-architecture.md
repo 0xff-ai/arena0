@@ -365,11 +365,29 @@ never defines execution serialization and never participates in commitments,
 receipts, or portable verification. Other program Borsh values, including
 receipt params and outcomes, remain opaque bytes to the Host.
 
+Every cryptographic operation and every file-byte operation runs in the Host,
+for every program, and only when the program calls an import for it: the
+runtime itself moves program bytes without interpreting them. A program holds
+small control values: terms, indexes, blob hashes, chaining values, and opaque
+signed envelopes it stores or forwards. It hashes with the `hash` import,
+merges BLAKE3 chaining values with `merge_cv`, derives a seeded shuffle with the
+`permutation` import, signs with `sign`, and checks a signature with `verify`.
+`hash`, `merge_cv`, and `permutation` are pure, so they are allowed in every dispatch mode,
+compute identically on every participant, and repeat exactly on a rerun. Each
+charges its input and output against the dispatch's import ledger before the
+Host allocates. `verify` checks the envelope's session, program, and the
+signer's activation key, and returns the signed payload or a `VerifyError`; the
+signer's execution and coordinates stay in the preimage but cannot be checked
+against the verifier's own. The cryptography crates are Host-only dependencies
+(`cfg(not(target_arch = "wasm32"))`), so a guest that calls one fails to build;
+`scripts/check-guest-crypto.sh` asserts that no program's Wasm dependency tree
+contains them.
+
 Program import validates every required guest export before the artifact enters
 the Host's program catalog. The canonical list of names and signatures is
 `arena0_sandbox::validation::REQUIRED_FUNC_EXPORTS`, and the ABI is
-`ABI_VERSION = 22`.
-The execution profile is version 3 and binds the fixed shared/local memories,
+`ABI_VERSION = 24`.
+The execution profile is version 4 and binds the fixed shared/local memories,
 resident dispatch semantics, resource limits, and engine identity used by the
 Host. Activation carries its profile hash, so a Host rejects a different
 execution environment before the session starts.
@@ -576,11 +594,86 @@ agreement. An accepted answer consumes the ID, so a question asked again after
 an answer gets a fresh one. Any other handler keeps the ID while the state
 derives the same index and context, and replaces it when they differ.
 
-Direct messages are a future delivery extension. It would use per-recipient
-sequence numbers, a small queue of unacknowledged sends whose payload remains in
-the event record, receiver-side last-applied sequence numbers committed with
-the handler result, and attachments pinned until acknowledgement. This note
-does not define that extension's wire or storage format.
+### Blobs
+
+A blob is immutable content up to `MAX_BLOB_BYTES` (16 MiB), named by its
+BLAKE3 `BlobHash` everywhere: in the store, the program API, and the client
+API. Blob bytes live in files; the store records only each blob's hash,
+length, and path. `blob.import` links a file on the Host's machine in place:
+the Host hashes it once, streaming, and never copies it. Bytes a session
+receives go to files the Host owns. `blob.export` copies a blob to a new file.
+The store never deletes blobs.
+
+An execution reads only blobs granted to it: those its participant lists when
+creating or joining it (checked and saved with the admission request, and part
+of the request's identity), and those it receives and commits. A participant
+passes a blob's hash and length to the program as ordinary params.
+
+Programs with `Capability::Blobs` use blobs only in local handlers, by hash:
+
+- `append(hash, length, attachment)` adds a received attachment's bytes to the
+  execution's partial object at its written offset. It checks bounds, not
+  content.
+- `commit(hash)` requires every byte, hashes the object, and on a match
+  publishes it and grants it to the execution; otherwise it returns `Mismatch`.
+  An execution receives a given hash at most once, so a published file is never
+  written again.
+- `subtree_cv(source, offset)` returns the BLAKE3 chaining value of a granted
+  blob's range or of the attachment, as the subtree at `offset` of a larger
+  input. With the pure `merge_cv(left, right, root)`, a program rebuilds any
+  part of BLAKE3's tree and checks received bytes before appending them.
+
+`commit` and `subtree_cv` charge fuel per hashed byte before reading; file
+latency is not bounded by fuel. Blob operations are staged during the dispatch
+and saved as `BlobChange`s in its `TransitionRecord`: appended bytes are written
+at their offset and synced before the transition commits, so received bytes are
+durable exactly when their transition is, and a rejected dispatch leaves
+none. Bytes past a partial's recorded length are never read. Each database owns
+the adjacent `<database filename>.blobs` directory. At open it sweeps only that
+directory, deleting received files that no blob or unfinished partial names.
+Separate databases in one parent directory therefore have separate cleanup
+ownership. Linked sources are reopened nonblocking and checked through the
+opened descriptor on every read; replacing a source with a FIFO cannot block
+the regular-file check.
+
+### Direct messages
+
+A local handler may queue a direct message to one other participant with
+`send_direct(to, msg, range)`. Direct messages travel outside agreement: they
+never enter the public trace, a commitment, or a receipt. `msg` is at most
+`MAX_DIRECT_CONTROL_BYTES`. The optional range names a blob granted to the
+execution and at most `MAX_DIRECT_RANGE_BYTES` of it. The Host checks both
+bounds at the call. Each recipient has a queue of at most `MAX_DIRECT_QUEUE`
+unacknowledged entries in execution state; a full queue returns `QueueFull` and
+records nothing.
+
+Each peer's send lane sends any eligible agreement or terminal frame first and a
+direct frame only when none is eligible. Direct frames go in sequence order. For
+a ranged entry the lane reads exactly that range of the blob's file when it
+sends and attaches the raw bytes; they are never stored in execution state. If
+the file can no longer supply the range, the lane sends the frame without its
+attachment, so the receiving program sees none and decides. The largest
+attachment fits the frame limit with the control message, which is a
+compile-time assertion. A `not yet` answer or a transport error delays only
+direct frames to that peer. An acknowledgement, a rejection, or a conflict
+removes the entry, so the lane moves on.
+
+The receiver classifies each frame against the last sequence it applied from
+that sender. A duplicate is acknowledged without a dispatch, and a gap is
+rejected. The next frame waits with `not yet` while a proposal is staged.
+Otherwise it dispatches as a local `DirectReceived` event. The attachment bytes
+stay in the dispatch's Host context, and the program receives only an
+`Attachment` token that is valid during that dispatch. The transition that
+commits the dispatch also records the applied sequence, and the Host
+acknowledges after saving it. A rejected dispatch restores memories and still
+records the sequence, so one bad frame cannot block the lane. A crash before
+the save leaves the frame unacknowledged, and the sender redelivers it with its
+attachment. So an accepted direct message is delivered once, in order, across
+crashes; programs do not resend.
+
+The transition that enters `EndPhase` clears every direct queue. `EndPhase`
+never waits for direct traffic, and direct frames that arrive afterwards are
+acknowledged and dropped.
 
 ### Terminal evidence and publication
 
@@ -698,7 +791,7 @@ bytes. A stopped result includes the exact `StopCause`, preserving the
 distinction between an authenticated unilateral report and a shared N-of-N
 stop. Verification does not execute Wasm and stops at these checks.
 
-This release uses store schema version 7 and rejects earlier databases with an
+This release uses store schema version 10 and rejects earlier databases with an
 unsupported-schema error. It does not rewrite or delete old evidence. Version-1
 producer-sealed receipts are also rejected; they must be inspected with the
 matching older release. Automatic migration is not provided.
@@ -867,10 +960,10 @@ The public release guarantees:
 - canonical receipt identity, distinct unilateral stop reports, and local provenance;
 - the `Transport` seam without changing runtime or proof semantics.
 
-The current compatibility boundary is `ABI_VERSION = 22`, execution profile
-version 3, `TraceEntry` format 3, the v4 `StepCommitment` domain, receipt
+The current compatibility boundary is `ABI_VERSION = 24`, execution profile
+version 4, `TraceEntry` format 3, the v4 `StepCommitment` domain, receipt
 artifact and body version 5, the v5 `ReceiptId` domain, and store schema
-version 7. Decoders reject unsupported versions, and no format silently accepts
+version 9. Decoders reject unsupported versions, and no format silently accepts
 evidence from an earlier release.
 
 The public workspace has no remote discovery, addressing, relay, remote program

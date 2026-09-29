@@ -9,6 +9,7 @@ members = [
     "vickrey-auction",
     "contract-net",
     "timer-dispatch",
+    "verified-transfer",
 ]
 
 [workspace.package]

@@ -9,4 +9,5 @@ mod cumulative_sum_trilateral;
 mod prisoner_dilemma_bilateral;
 mod rock_paper_scissors_bilateral;
 mod sequential_count_multiparty;
+mod verified_transfer_bilateral;
 mod vickrey_auction_multiparty;

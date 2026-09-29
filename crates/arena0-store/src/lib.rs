@@ -42,7 +42,9 @@ use lock::{
     OwnerLock, acquire_process_lock, configure_connection, initialize_schema, prepare_database_file,
 };
 
-const SCHEMA_VERSION: u64 = 7;
+// Version 10 gives each database its own blob directory. Older partial rows
+// reconstruct paths in a shared directory and cannot be reopened under this layout.
+const SCHEMA_VERSION: u64 = 10;
 const ENVELOPE_VERSION: u16 = 2;
 const ENVELOPE_MAGIC: [u8; 8] = *b"AR0STOR1";
 const ENVELOPE_DOMAIN: &[u8] = b"arena0/store-envelope/v2";
@@ -74,6 +76,8 @@ pub struct StoreConfig {
 
 impl StoreConfig {
     /// Bind a store to a database path and the owning Host identity.
+    /// Received files live beside it in `<database filename>.blobs`, so separate
+    /// databases in the same directory never sweep one another's files.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>, host_id: PeerId) -> Self {
         Self {
@@ -354,6 +358,15 @@ impl StoredProgram {
 /// Errors returned by the concrete SQLite store.
 #[derive(Debug, Error)]
 pub enum StoreError {
+    /// Imported content exceeds the blob object bound.
+    #[error("blob length {length} exceeds the maximum")]
+    BlobTooLarge { length: u64 },
+    /// A grant or export names a blob the store does not have.
+    #[error("no such blob {0}")]
+    BlobNotFound(arena0_protocol::BlobHash),
+    /// A blob's file is missing, unreadable, or shorter than its length.
+    #[error("blob {0} is unreadable")]
+    BlobUnreadable(arena0_protocol::BlobHash),
     /// SQLite rejected an operation.
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
@@ -531,6 +544,7 @@ impl EventRecordSummary {
             Event::MessageReceived { msg, .. } => (EventKind::MessageReceived, bytes(msg)),
             Event::InputReceived { data, .. } => (EventKind::InputReceived, bytes(data)),
             Event::TimerFired { timer } => (EventKind::TimerFired, bytes(&timer.data)),
+            Event::DirectReceived { msg, .. } => (EventKind::DirectReceived, bytes(msg)),
         };
         let effects = effects
             .iter()
@@ -543,6 +557,7 @@ impl EventRecordSummary {
                     Effect::Broadcast { data } => (EffectKind::Broadcast, data.as_slice()),
                     Effect::SetTimer { timer, .. } => (EffectKind::SetTimer, timer.data.as_slice()),
                     Effect::Fail { reason } => (EffectKind::Fail, reason.as_bytes()),
+                    Effect::SendDirect { msg, .. } => (EffectKind::SendDirect, msg.as_slice()),
                 };
                 EffectSummary {
                     kind,
@@ -677,6 +692,8 @@ pub enum Change {
         event: Event<Vec<u8>>,
         effects: Vec<Effect>,
         timer_id: Option<TimerId>,
+        /// Blob changes staged in call order and applied in this transaction.
+        blobs: Vec<arena0_protocol::execution::BlobChange>,
     },
     /// Record a signature, releasing a certified proposal when present.
     StepSignature {
@@ -732,7 +749,9 @@ impl StoredReceipt {
 /// Execution mutations require an [`ExecutionStore`] claimed for the target
 /// execution, so cloning this handle cannot create a second live writer.
 ///
-/// Operations run on the blocking pool and serialize on the connection mutex.
+/// Async operations run on the blocking pool; SQL access serializes on the
+/// connection mutex. Blob reads, hashing, linking, and export release the
+/// mutex before file I/O. Appends retain it for their persist transaction.
 /// Dropping an operation's future does not cancel work already submitted to
 /// that pool; a lost response must be treated as an unknown outcome.
 #[derive(Clone, Debug)]
@@ -896,7 +915,226 @@ impl Drop for Store {
     }
 }
 
+/// Validate the opened descriptor, not a path that could change before open.
+/// A linked file can be replaced after admission; nonblocking open lets us
+/// reject a replacement FIFO without waiting for a writer.
+fn open_blob_file(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "blob is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 impl StoreHandle {
+    /// Link a daemon-local file as a blob: canonicalize `path`, stream the file
+    /// once through BLAKE3, and record `(hash, length, path)` as a linked blob.
+    /// The file is neither copied nor read whole into memory. Linking content the
+    /// store already owns keeps the owned file; relinking linked content
+    /// records the new path. Fails `BlobTooLarge` over `MAX_BLOB_BYTES`.
+    pub async fn link_blob(
+        &self,
+        path: PathBuf,
+    ) -> Result<(arena0_protocol::BlobHash, u64), StoreError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let path = std::fs::canonicalize(path)?;
+            if path.to_str().is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "blob path is not UTF-8",
+                )
+                .into());
+            }
+            let mut file = open_blob_file(&path)?;
+            let metadata = file.metadata()?;
+            if metadata.len() > arena0_protocol::MAX_BLOB_BYTES {
+                return Err(StoreError::BlobTooLarge {
+                    length: metadata.len(),
+                });
+            }
+            let mut hasher = blake3::Hasher::new();
+            // Bound working memory independently of the linked file's size.
+            let mut buffer = [0; 64 * 1024];
+            let mut length = 0;
+            loop {
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                length += count as u64;
+                if length > arena0_protocol::MAX_BLOB_BYTES {
+                    return Err(StoreError::BlobTooLarge { length });
+                }
+                hasher.update(&buffer[..count]);
+            }
+            let hash = arena0_protocol::BlobHash(*hasher.finalize().as_bytes());
+            let mut guard = inner.db.lock().map_err(|_| StoreError::Closed)?;
+            let db = guard.as_mut().ok_or(StoreError::Closed)?;
+            if db.is_poisoned() {
+                return Err(StoreError::Closed);
+            }
+            db.insert_linked_blob(hash, length, &path)?;
+            Ok((hash, length))
+        })
+        .await
+        .map_err(|_| StoreError::Closed)?
+    }
+
+    /// Copy blob `hash`'s bytes `[0, length)` to a new file at `destination`
+    /// and return the length. Never replaces an existing file (`Io` with
+    /// `AlreadyExists`). `Ok(None)` when the store has no such blob;
+    /// `BlobUnreadable` when its file cannot supply `length` bytes, in which
+    /// case no destination file remains.
+    pub async fn export_blob(
+        &self,
+        hash: arena0_protocol::BlobHash,
+        destination: PathBuf,
+    ) -> Result<Option<u64>, StoreError> {
+        let location = self.run(move |db| db.blob_location(hash)).await?;
+        let Some((path, length)) = location else {
+            return Ok(None);
+        };
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let source = open_blob_file(&path).map_err(|_| StoreError::BlobUnreadable(hash))?;
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination)?;
+            match std::io::copy(&mut source.take(length), &mut output) {
+                Ok(copied) if copied == length => Ok(Some(length)),
+                result => {
+                    drop(output);
+                    std::fs::remove_file(destination)?;
+                    match result {
+                        Ok(_) => Err(StoreError::BlobUnreadable(hash)),
+                        Err(error) => Err(StoreError::Io(error)),
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| StoreError::Closed)?
+    }
+
+    /// The length of `hash` if it is granted to `execution_id`. One indexed
+    /// lookup on the caller's thread.
+    pub fn blob_granted_blocking(
+        &self,
+        execution_id: ExecId,
+        hash: arena0_protocol::BlobHash,
+    ) -> Result<Option<u64>, StoreError> {
+        let guard = self.inner.db.lock().map_err(|_| StoreError::Closed)?;
+        let db = guard.as_ref().ok_or(StoreError::Closed)?;
+        if db.is_poisoned() {
+            return Err(StoreError::Closed);
+        }
+        db.blob_granted(execution_id, hash)
+    }
+
+    /// Bytes `range` of blob `hash` from its file, on the caller's thread. The
+    /// connection mutex is held only for the path lookup, not the file read.
+    /// `Ok(None)` when the store has no such blob or the file is missing,
+    /// unreadable, or shorter than `range.end`. Grant checks are the caller's.
+    pub fn read_blob_range_blocking(
+        &self,
+        hash: arena0_protocol::BlobHash,
+        range: std::ops::Range<u64>,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        use std::io::{Read, Seek, SeekFrom};
+        let location = {
+            let guard = self.inner.db.lock().map_err(|_| StoreError::Closed)?;
+            let db = guard.as_ref().ok_or(StoreError::Closed)?;
+            if db.is_poisoned() {
+                return Err(StoreError::Closed);
+            }
+            db.blob_location(hash)?
+        };
+        let Some((path, _)) = location else {
+            return Ok(None);
+        };
+        let read = || -> std::io::Result<Vec<u8>> {
+            let mut file = open_blob_file(&path)?;
+            file.seek(SeekFrom::Start(range.start))?;
+            let mut bytes =
+                vec![0; usize::try_from(range.end - range.start).expect("blob range fits memory")];
+            file.read_exact(&mut bytes)?;
+            Ok(bytes)
+        };
+        Ok(read().ok())
+    }
+
+    /// `execution_id`'s partial object for `hash`, if it received any of it.
+    pub fn blob_partial_blocking(
+        &self,
+        execution_id: ExecId,
+        hash: arena0_protocol::BlobHash,
+    ) -> Result<Option<arena0_protocol::execution::BlobPartial>, StoreError> {
+        let guard = self.inner.db.lock().map_err(|_| StoreError::Closed)?;
+        let db = guard.as_ref().ok_or(StoreError::Closed)?;
+        if db.is_poisoned() {
+            return Err(StoreError::Closed);
+        }
+        db.blob_partial(execution_id, hash)
+    }
+
+    /// BLAKE3 of the partial's durable bytes `[0, written)` followed by
+    /// `tail`, streamed from its file on the caller's thread. Fails
+    /// `Corruption` when the partial row is missing or its file is shorter
+    /// than `written`.
+    pub fn hash_blob_partial_blocking(
+        &self,
+        execution_id: ExecId,
+        hash: arena0_protocol::BlobHash,
+        tail: &[u8],
+    ) -> Result<arena0_protocol::BlobHash, StoreError> {
+        use std::io::Read;
+        let (partial, path) = {
+            let guard = self.inner.db.lock().map_err(|_| StoreError::Closed)?;
+            let db = guard.as_ref().ok_or(StoreError::Closed)?;
+            if db.is_poisoned() {
+                return Err(StoreError::Closed);
+            }
+            let partial = db
+                .blob_partial(execution_id, hash)?
+                .ok_or_else(|| StoreError::Corruption("hashing a missing blob partial".into()))?;
+            (partial, db.received_path(execution_id, hash))
+        };
+        let mut hasher = blake3::Hasher::new();
+        let mut read = || -> std::io::Result<()> {
+            let mut file = open_blob_file(&path)?.take(partial.written);
+            // Read only the SQL-committed prefix; failed appends may leave tails.
+            let mut buffer = [0; 64 * 1024];
+            let mut remaining = partial.written;
+            while remaining > 0 {
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
+                hasher.update(&buffer[..count]);
+                remaining -= count as u64;
+            }
+            Ok(())
+        };
+        read().map_err(|_| {
+            StoreError::Corruption("blob partial file is shorter than written".into())
+        })?;
+        hasher.update(tail);
+        Ok(arena0_protocol::BlobHash(*hasher.finalize().as_bytes()))
+    }
+
     /// Read bounded reconstruction metadata for a dormant end handshake.
     pub async fn end_wake_candidate(
         &self,
@@ -1195,13 +1433,20 @@ impl ExecutionStore {
     /// and execution all share one live ownership token. Creator admission
     /// requires `Some(params)`; join admission may omit its preferred params
     /// until the creator's offer is authenticated.
+    ///
+    /// `grants` are the blobs this participant grants the execution; each must
+    /// be stored (`BlobNotFound`). The canonical (sorted, deduplicated) set is
+    /// part of the request's identity: a retry with a different set is a
+    /// `Conflict`.
     pub async fn create_execution_request(
         &mut self,
         program_hash: ProgramHash,
         params: Option<JsonBytes>,
         admission: ExecutionAdmission,
+        grants: &[arena0_protocol::BlobHash],
         created_at_ms: u64,
     ) -> Result<ExecutionRequestOutcome, StoreError> {
+        let grants = grants.to_vec();
         let params_len = params.as_ref().map_or(0, JsonBytes::len);
         if params_len > arena0_protocol::MAX_PARAMS_LEN {
             return Err(StoreError::PayloadTooLarge {
@@ -1217,6 +1462,7 @@ impl ExecutionStore {
                     program_hash,
                     params.map(JsonBytes::into_bytes),
                     admission,
+                    grants,
                     created_at_ms,
                 )
             })

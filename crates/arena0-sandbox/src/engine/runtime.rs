@@ -2,9 +2,9 @@
 
 use crate::call::DispatchKind;
 use arena0_program::{
-    CallStatus, DispatchInput, DispatchOutput, InitInput, JsonBytes, LocalStateBytes, OutcomeInput,
-    OutcomeOutput, QueryInput, QueryOutput, SharedStateBytes, StateFrameError, ViewInput,
-    ViewOutput, WriterInput, WriterOutput, abi,
+    CallStatus, DispatchOutput, InitInput, JsonBytes, LocalStateBytes, OutcomeInput, OutcomeOutput,
+    QueryInput, QueryOutput, SharedStateBytes, StateFrameError, ViewInput, ViewOutput, WriterInput,
+    WriterOutput, abi,
 };
 use arena0_protocol::{Committed, Ensemble};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -12,7 +12,7 @@ use wasmtime::{Global, Instance, Memory, Store, StoreLimitsBuilder, Val};
 
 use super::memory::Guest;
 use super::{CallKind, InstanceConfig, instantiate_module, max_output};
-use crate::call::{DispatchCall, serialize};
+use crate::call::{DispatchCall, DispatchParts, serialize};
 use crate::finalize::MUTABLE_GLOBAL_EXPORT_PREFIX;
 use crate::{
     CallObservations, DispatchCallResult, GuestOutcomeResult, GuestProjectionResult,
@@ -460,8 +460,7 @@ impl std::fmt::Debug for ProgramInstance {
 impl ProgramInstance {
     /// Dispatch one event through the sole mutating guest export.
     pub fn dispatch(&mut self, call: DispatchCall) -> Result<DispatchCallResult, SandboxError> {
-        let (input, dispatch, outgoing_len, signer) = call.into_input()?;
-        self.dispatch_input(input, dispatch, outgoing_len, signer)
+        self.dispatch_input(call.into_input()?)
     }
 
     /// Replace the resident state with durable committed payloads during actor
@@ -540,20 +539,33 @@ impl ProgramInstance {
         Err(error)
     }
 
-    fn dispatch_input(
-        &mut self,
-        input: DispatchInput,
-        dispatch: DispatchKind,
-        outgoing_len: usize,
-        signer: Option<std::sync::Arc<dyn crate::GuestSigner>>,
-    ) -> Result<DispatchCallResult, SandboxError> {
+    fn dispatch_input(&mut self, parts: DispatchParts) -> Result<DispatchCallResult, SandboxError> {
+        let DispatchParts {
+            input,
+            dispatch,
+            outgoing_len,
+            signer,
+            verifier,
+            blobs,
+            attachment,
+            direct_queued,
+            peer_id,
+            session,
+        } = parts;
         let bytes = encode_envelope(&input, self.profile.limits.max_call_envelope_bytes)?;
         if let Err(error) = self.reset_for_dispatch(dispatch, outgoing_len) {
             return self.rollback_error(error);
         }
-        // A signer is installed only for this dispatch; any rollback path
-        // clears it together with the rest of the per-call host state.
+        // Host custody and the received attachment belong to this dispatch. Rollback
+        // clears them and staged changes; the next entry resets the counters
+        // before installing a new view, identity, and queue snapshot.
         self.store.data_mut().signer.install(signer);
+        self.store.data_mut().verifier = verifier;
+        self.store.data_mut().blobs = blobs;
+        self.store.data_mut().attachment = attachment;
+        self.store.data_mut().direct_queued = direct_queued;
+        self.store.data_mut().peer_id = Some(peer_id);
+        self.store.data_mut().session = Some(session);
         let (output, fuel_used) = call_export::<DispatchOutput>(
             &mut self.store,
             &self.instance,
@@ -579,6 +591,7 @@ impl ProgramInstance {
             // A rejection carries no images: the caller keeps its committed
             // state and nothing is cloned here.
             return Ok(DispatchCallResult {
+                blobs: Vec::new(),
                 status: output.status,
                 reason: output.reason,
                 callout: None,
@@ -609,6 +622,7 @@ impl ProgramInstance {
             .resident_payloads()
             .or_else(|error| self.rollback_error(error))?;
         Ok(DispatchCallResult {
+            blobs: std::mem::take(&mut self.store.data_mut().staged_blobs),
             status: output.status,
             reason: output.reason,
             callout: output.callout,
@@ -814,7 +828,7 @@ mod resident_runtime_tests {
               (import "arena0" "state_write" (func $state_write (param i32 i32 i32)))
               {extra_imports}
               (memory (export "memory") 1)
-              (global (export "arena0_abi_version") i32 (i32.const 22))
+              (global (export "arena0_abi_version") i32 (i32.const 24))
               (global $counter (mut i32) (i32.const 0))
               (data (i32.const 1024) "sh")
               (data (i32.const 1100) "effect")
@@ -1016,7 +1030,7 @@ mod resident_runtime_tests {
               (memory (export "memory") 1 1024)
               (memory (export "arena0_shared") 65 65)
               (memory (export "arena0_local") 65 65)
-              (global (export "arena0_abi_version") i32 (i32.const 22))
+              (global (export "arena0_abi_version") i32 (i32.const 24))
               (data (i32.const 32768) "\00\00\00")
               (func $pack (param $ptr i32) (param $len i32) (result i64)
                 local.get $ptr
@@ -1058,7 +1072,7 @@ mod resident_runtime_tests {
               (memory (export "memory") 1 1024)
               (memory (export "arena0_shared") 65 65)
               (memory (export "arena0_local") 65 65)
-              (global (export "arena0_abi_version") i32 (i32.const 22))
+              (global (export "arena0_abi_version") i32 (i32.const 24))
               (data (i32.const 32768) "\00")
               (func (export "arena0_alloc") (param i32) (result i32)
                 {allocator_body})
@@ -1292,6 +1306,87 @@ mod resident_runtime_tests {
         assert!(result.observations.logs.is_empty());
         assert!(result.observations.random_draws.is_empty());
         assert_eq!(instance.committed_payloads(), (&shared, &local));
+    }
+
+    #[test]
+    fn blob_dispatch_installs_context_and_returns_changes() {
+        use arena0_protocol::BlobHash;
+        use arena0_protocol::execution::BlobChange;
+        let bytes = b"opaque attachment".to_vec();
+        let hash = BlobHash(arena0_crypto::hash(
+            arena0_crypto::HashAlgorithm::Blake3,
+            &bytes,
+        ));
+        let imports = format!(
+            r#"
+            (import "arena0" "blob_append" (func $append (param i32 i64 i32) (result i32)))
+            (import "arena0" "blob_commit" (func $commit (param i32) (result i32)))
+            (data (i32.const 1200) "{}")
+        "#,
+            wat_data(&hash.0)
+        );
+        let body = format!(
+            r#"
+            i32.const 1200 i64.const {} i32.const 0 call $append if unreachable end
+            i32.const 1200 call $commit if unreachable end
+            i32.const 32768 i32.const 3 call $pack
+        "#,
+            bytes.len()
+        );
+        let mut instance = resident(
+            &body,
+            vec![Capability::Blobs, Capability::Messaging],
+            &imports,
+        );
+        let result = instance
+            .dispatch(
+                call()
+                    .with_blobs(std::sync::Arc::new(
+                        crate::engine::imports::blob_tests::View::default(),
+                    ))
+                    .with_attachment(bytes.clone()),
+            )
+            .unwrap();
+        assert_eq!(result.status, arena0_program::CallStatus::Accepted);
+        assert_eq!(
+            result.blobs,
+            vec![
+                BlobChange::Append {
+                    hash,
+                    length: bytes.len() as u64,
+                    offset: 0,
+                    bytes
+                },
+                BlobChange::Commit { hash },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejected_dispatch_discards_staged_blob_changes() {
+        let body = format!(
+            "i32.const 0 i64.const 1 i32.const 0 call $append if unreachable end {}",
+            rejected_body()
+        );
+        let mut instance = resident(
+            &body,
+            vec![Capability::Blobs],
+            r#"(import "arena0" "blob_append" (func $append (param i32 i64 i32) (result i32)))"#,
+        );
+        let result = instance
+            .dispatch(
+                call()
+                    .with_blobs(std::sync::Arc::new(
+                        crate::engine::imports::blob_tests::View::default(),
+                    ))
+                    .with_attachment(vec![1]),
+            )
+            .unwrap();
+        assert_eq!(result.status, arena0_program::CallStatus::Rejected);
+        assert!(result.blobs.is_empty());
+        // Supply valid bytes again so only the missing view can cause the trap:
+        // a rejected dispatch must not lend its authority to the next one.
+        assert!(instance.dispatch(call().with_attachment(vec![1])).is_err());
     }
 
     #[test]

@@ -12,6 +12,829 @@ use arena0_protocol::{
 };
 use std::path::Path;
 
+#[tokio::test]
+async fn linking_hashes_the_file_in_place() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreConfig::new(
+        directory.path().join("store.sqlite"),
+        host(9),
+    ))
+    .unwrap();
+    let shared = store.handle();
+    let bytes = vec![0x93; 100 * 1024];
+    let first = directory.path().join("first");
+    std::fs::write(&first, &bytes).unwrap();
+    let (hash, length) = shared.link_blob(first.clone()).await.unwrap();
+    assert_eq!(hash.0, *blake3::hash(&bytes).as_bytes());
+    assert_eq!(length, bytes.len() as u64);
+    assert_eq!(
+        std::fs::read_dir(directory.path().join("store.sqlite.blobs"))
+            .unwrap()
+            .count(),
+        0
+    );
+    let destination = directory.path().join("export");
+    assert_eq!(
+        shared.export_blob(hash, destination.clone()).await.unwrap(),
+        Some(length)
+    );
+    assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+    assert!(
+        matches!(shared.export_blob(hash, destination.clone()).await,
+        Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists)
+    );
+    let second = directory.path().join("second");
+    std::fs::write(&second, &bytes).unwrap();
+    assert_eq!(
+        shared.link_blob(second.clone()).await.unwrap(),
+        (hash, length)
+    );
+    std::fs::remove_file(first).unwrap();
+    std::fs::remove_file(&destination).unwrap();
+    assert_eq!(
+        shared.export_blob(hash, destination.clone()).await.unwrap(),
+        Some(length)
+    );
+    assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+    std::fs::write(&second, b"short").unwrap();
+    std::fs::remove_file(&destination).unwrap();
+    assert!(
+        matches!(shared.export_blob(hash, destination.clone()).await, Err(StoreError::BlobUnreadable(found)) if found == hash)
+    );
+    assert!(!destination.exists());
+    let oversized = directory.path().join("oversized");
+    let over = arena0_protocol::MAX_BLOB_BYTES + 1;
+    std::fs::File::create(&oversized)
+        .unwrap()
+        .set_len(over)
+        .unwrap();
+    assert!(
+        matches!(shared.link_blob(oversized).await, Err(StoreError::BlobTooLarge { length }) if length == over)
+    );
+    assert_eq!(
+        shared
+            .export_blob(arena0_protocol::BlobHash([0xff; 32]), destination.clone())
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(!destination.exists());
+    assert!(
+        matches!(shared.link_blob(directory.path().to_path_buf()).await,
+        Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidInput)
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let fifo = directory.path().join("fifo");
+        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_name is a live, NUL-terminated path for this call.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let import = shared.link_blob(fifo.clone());
+        tokio::pin!(import);
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut import).await;
+        if result.is_err() {
+            // Unblock a regressed blocking open before failing, so the runtime
+            // can join its blocking worker instead of hanging at shutdown.
+            let _writer = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(fifo)
+                .unwrap();
+            let _ = import.await;
+            panic!("linking a FIFO waited for a writer");
+        }
+        assert!(matches!(result.unwrap(), Err(StoreError::Io(error))
+            if error.kind() == std::io::ErrorKind::InvalidInput));
+
+        let invalid = directory
+            .path()
+            .join(std::ffi::OsString::from_vec(vec![0xff]));
+        std::fs::write(&invalid, b"bytes").unwrap();
+        assert!(matches!(shared.link_blob(invalid).await,
+            Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidInput));
+    }
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn replaced_linked_file_cannot_block_export_or_direct_reads() {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreConfig::new(
+        directory.path().join("store.sqlite"),
+        host(9),
+    ))
+    .unwrap();
+    let shared = store.handle();
+    let source = directory.path().join("source");
+    let destination = directory.path().join("export");
+    std::fs::write(&source, b"abc").unwrap();
+    let (hash, _) = shared.link_blob(source.clone()).await.unwrap();
+    std::fs::remove_file(&source).unwrap();
+    let name = std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+    // SAFETY: name is a live, NUL-terminated path for this call.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+
+    for export in [false, true] {
+        let handle = shared.clone();
+        let output_path = destination.clone();
+        let mut task = tokio::spawn(async move {
+            if export {
+                matches!(handle.export_blob(hash, output_path).await,
+                    Err(StoreError::BlobUnreadable(found)) if found == hash)
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    handle
+                        .read_blob_range_blocking(hash, 0..3)
+                        .unwrap()
+                        .is_none()
+                })
+                .await
+                .unwrap()
+            }
+        });
+        match tokio::time::timeout(Duration::from_secs(2), &mut task).await {
+            Ok(result) => assert!(result.unwrap()),
+            Err(_) => {
+                // Release a regressed blocking open/read before failing so
+                // the runtime can join its blocking workers at shutdown.
+                let mut writer = OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&source)
+                    .unwrap();
+                let _ = writer.write_all(b"abc");
+                drop(writer);
+                let _ = task.await;
+                panic!("linked FIFO blocked a blob read (export={export})");
+            }
+        }
+        assert!(!destination.exists());
+    }
+    std::fs::remove_file(&source).unwrap();
+    std::fs::create_dir(&source).unwrap();
+    assert!(
+        shared
+            .read_blob_range_blocking(hash, 0..3)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        matches!(shared.export_blob(hash, destination.clone()).await,
+        Err(StoreError::BlobUnreadable(found)) if found == hash)
+    );
+    assert!(!destination.exists());
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn admission_grants_are_validated_and_part_of_request_identity() {
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreConfig::new(
+        directory.path().join("store.sqlite"),
+        fixture.producer,
+    ))
+    .unwrap();
+    let shared = store.handle();
+    let (program_hash, _) = shared
+        .register_program(fixture.program.clone(), 1)
+        .await
+        .unwrap();
+    let a_path = directory.path().join("a");
+    let b_path = directory.path().join("b");
+    std::fs::write(&a_path, b"a").unwrap();
+    std::fs::write(&b_path, b"bb").unwrap();
+    let (a, a_length) = shared.link_blob(a_path).await.unwrap();
+    let (b, b_length) = shared.link_blob(b_path).await.unwrap();
+    let execution_id = ExecId([0x92; 32]);
+    let mut writer = shared.claim_execution(execution_id).unwrap();
+    let admission = ExecutionAdmission::create(NegotiationId([0x11; 32]), 2).unwrap();
+    let params = Some(JsonBytes::try_new(br#"{}"#.to_vec()).unwrap());
+    assert_eq!(
+        writer
+            .create_execution_request(
+                program_hash,
+                params.clone(),
+                admission.clone(),
+                &[b, a, a],
+                2
+            )
+            .await
+            .unwrap(),
+        ExecutionRequestOutcome::Created
+    );
+    assert_eq!(
+        shared.blob_granted_blocking(execution_id, a).unwrap(),
+        Some(a_length)
+    );
+    assert_eq!(
+        shared.blob_granted_blocking(execution_id, b).unwrap(),
+        Some(b_length)
+    );
+    assert_eq!(
+        writer
+            .create_execution_request(program_hash, params.clone(), admission.clone(), &[a, b], 3)
+            .await
+            .unwrap(),
+        ExecutionRequestOutcome::AlreadyExists
+    );
+    assert_eq!(
+        writer
+            .create_execution_request(program_hash, params.clone(), admission.clone(), &[a], 3)
+            .await
+            .unwrap(),
+        ExecutionRequestOutcome::Conflict
+    );
+    let other_id = ExecId([0x93; 32]);
+    let mut other = shared.claim_execution(other_id).unwrap();
+    let unknown = arena0_protocol::BlobHash([0xff; 32]);
+    assert!(
+        matches!(other.create_execution_request(program_hash, params, admission, &[a, unknown], 4).await, Err(StoreError::BlobNotFound(hash)) if hash == unknown)
+    );
+    assert!(other.load_execution_request().await.unwrap().is_none());
+    assert_eq!(shared.blob_granted_blocking(other_id, a).unwrap(), None);
+    drop((writer, other));
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn received_blob_is_durable_with_its_transition() {
+    use arena0_protocol::execution::{BlobChange, BlobPartial};
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("store.sqlite");
+    let execution_id = ExecId([0x92; 32]);
+    let store = create_execution(&path, &fixture, execution_id).await;
+    let shared = store.handle();
+    let hash = arena0_protocol::BlobHash(*blake3::hash(b"abcdef").as_bytes());
+    let mut writer = shared.claim_execution(execution_id).unwrap();
+    let before = writer.load_execution().await.unwrap().unwrap();
+    let event = Event::TimerFired {
+        timer: TimerPayload::unit(),
+    };
+    let mut next = before.clone();
+    next.apply_dispatch(
+        &event,
+        before.shared_state().clone(),
+        before.local_state().clone(),
+        &[],
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    writer
+        .persist(TransitionRecord {
+            expected: before.version(),
+            next: next.clone(),
+            now_ms: 10,
+            change: Change::Dispatch {
+                event,
+                effects: vec![],
+                timer_id: None,
+                blobs: vec![
+                    BlobChange::Append {
+                        hash,
+                        length: 6,
+                        offset: 0,
+                        bytes: b"ab".to_vec(),
+                    },
+                    BlobChange::Append {
+                        hash,
+                        length: 6,
+                        offset: 2,
+                        bytes: b"cd".to_vec(),
+                    },
+                ],
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(writer.load_execution().await.unwrap().unwrap(), next);
+    assert_eq!(
+        shared.blob_partial_blocking(execution_id, hash).unwrap(),
+        Some(BlobPartial {
+            length: 6,
+            written: 4,
+            committed: false
+        })
+    );
+    assert_eq!(
+        shared
+            .hash_blob_partial_blocking(execution_id, hash, b"ef")
+            .unwrap(),
+        hash
+    );
+    assert_eq!(
+        shared.blob_granted_blocking(execution_id, hash).unwrap(),
+        None
+    );
+    let received = directory.path().join("store.sqlite.blobs").join(format!(
+        "recv-{}-{}",
+        blake3::Hash::from_bytes(execution_id.0).to_hex(),
+        blake3::hash(b"abcdef").to_hex()
+    ));
+    assert_eq!(std::fs::read(&received).unwrap(), b"abcd");
+    // A database with the same stem must not sweep this store's partial,
+    // whether this store is open or shut down.
+    let other_path = directory.path().join("store.other");
+    let other = Store::open(StoreConfig::new(&other_path, fixture.producer)).unwrap();
+    assert_eq!(
+        shared
+            .hash_blob_partial_blocking(execution_id, hash, b"ef")
+            .unwrap(),
+        hash
+    );
+    other.shutdown().await.unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&received).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(directory.path().join("store.sqlite.blobs"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+    drop(writer);
+    store.shutdown().await.unwrap();
+    let other = Store::open(StoreConfig::new(&other_path, fixture.producer)).unwrap();
+    other.shutdown().await.unwrap();
+    let store = Store::open(StoreConfig::new(&path, fixture.producer)).unwrap();
+    let shared = store.handle();
+    assert_eq!(
+        shared
+            .hash_blob_partial_blocking(execution_id, hash, b"ef")
+            .unwrap(),
+        hash
+    );
+    let mut writer = shared.claim_execution(execution_id).unwrap();
+    let before = writer.load_execution().await.unwrap().unwrap();
+    let event = Event::TimerFired {
+        timer: TimerPayload::unit(),
+    };
+    let mut next = before.clone();
+    next.apply_dispatch(
+        &event,
+        before.shared_state().clone(),
+        before.local_state().clone(),
+        &[],
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    writer
+        .persist(TransitionRecord {
+            expected: before.version(),
+            next: next.clone(),
+            now_ms: 11,
+            change: Change::Dispatch {
+                event,
+                effects: vec![],
+                timer_id: None,
+                blobs: vec![
+                    BlobChange::Append {
+                        hash,
+                        length: 6,
+                        offset: 4,
+                        bytes: b"ef".to_vec(),
+                    },
+                    BlobChange::Commit { hash },
+                ],
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(writer.load_execution().await.unwrap().unwrap(), next);
+    assert_eq!(
+        shared.blob_partial_blocking(execution_id, hash).unwrap(),
+        Some(BlobPartial {
+            length: 6,
+            written: 6,
+            committed: true
+        })
+    );
+    assert_eq!(
+        shared.blob_granted_blocking(execution_id, hash).unwrap(),
+        Some(6)
+    );
+    assert_eq!(
+        shared.read_blob_range_blocking(hash, 1..5).unwrap(),
+        Some(b"bcde".to_vec())
+    );
+    assert_eq!(std::fs::read(&received).unwrap(), b"abcdef");
+    drop(writer);
+    store.shutdown().await.unwrap();
+    let store = Store::open(StoreConfig::new(&path, fixture.producer)).unwrap();
+    assert_eq!(
+        store.handle().read_blob_range_blocking(hash, 0..6).unwrap(),
+        Some(b"abcdef".to_vec())
+    );
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_transition_leaves_no_partial_and_reopen_sweeps_its_file() {
+    use arena0_protocol::execution::BlobChange;
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    // Exercise equivalent path spellings: linked paths are canonicalized.
+    let path = directory.path().join(".").join("store.sqlite");
+    let execution_id = ExecId([0x92; 32]);
+    let store = create_execution(&path, &fixture, execution_id).await;
+    let shared = store.handle();
+    let mut writer = shared.claim_execution(execution_id).unwrap();
+    let hash = arena0_protocol::BlobHash(*blake3::hash(b"abcdef").as_bytes());
+    let before = writer.load_execution().await.unwrap().unwrap();
+    let event = Event::TimerFired {
+        timer: TimerPayload::unit(),
+    };
+    let mut next = before.clone();
+    next.apply_dispatch(
+        &event,
+        before.shared_state().clone(),
+        before.local_state().clone(),
+        &[],
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let blobs = vec![BlobChange::Append {
+        hash,
+        length: 6,
+        offset: 0,
+        bytes: b"abc".to_vec(),
+    }];
+    let result = writer
+        .persist(TransitionRecord {
+            expected: ExecutionVersion::ZERO,
+            next: next.clone(),
+            now_ms: 10,
+            change: Change::Dispatch {
+                event: event.clone(),
+                effects: vec![],
+                timer_id: None,
+                blobs: blobs.clone(),
+            },
+        })
+        .await;
+    assert!(
+        matches!(result, Err(StoreError::Corruption(reason)) if reason == "execution version moved")
+    );
+    assert_eq!(writer.load_execution().await.unwrap().unwrap(), before);
+    assert_eq!(
+        shared.blob_partial_blocking(execution_id, hash).unwrap(),
+        None
+    );
+    // A stale version is rejected before file I/O. An incomplete commit forces
+    // rollback after an append, leaving a real orphan for the open-time sweep.
+    let mut blobs = blobs;
+    blobs.push(BlobChange::Commit { hash });
+    let result = writer
+        .persist(TransitionRecord {
+            expected: before.version(),
+            next,
+            now_ms: 10,
+            change: Change::Dispatch {
+                event,
+                effects: vec![],
+                timer_id: None,
+                blobs,
+            },
+        })
+        .await;
+    assert!(
+        matches!(result, Err(StoreError::Corruption(reason)) if reason == "committing an incomplete blob partial")
+    );
+    assert_eq!(
+        shared.blob_partial_blocking(execution_id, hash).unwrap(),
+        None
+    );
+    assert_eq!(writer.load_execution().await.unwrap().unwrap(), before);
+    let blob_dir = directory.path().join("store.sqlite.blobs");
+    let received = blob_dir.join(format!(
+        "recv-{}-{}",
+        blake3::Hash::from_bytes(execution_id.0).to_hex(),
+        blake3::hash(b"abcdef").to_hex()
+    ));
+    assert_eq!(std::fs::read(&received).unwrap(), b"abc");
+    let untouched = blob_dir.join("keep");
+    std::fs::write(&untouched, b"unowned").unwrap();
+    let linked = blob_dir.join("recv-linked");
+    std::fs::write(&linked, b"linked").unwrap();
+    let (linked_hash, _) = shared.link_blob(linked.clone()).await.unwrap();
+    drop(writer);
+    store.shutdown().await.unwrap();
+    let store = Store::open(StoreConfig::new(path, fixture.producer)).unwrap();
+    assert!(!received.exists());
+    assert_eq!(std::fs::read(untouched).unwrap(), b"unowned");
+    assert_eq!(std::fs::read(linked).unwrap(), b"linked");
+    assert_eq!(
+        store
+            .handle()
+            .read_blob_range_blocking(linked_hash, 0..6)
+            .unwrap(),
+        Some(b"linked".to_vec())
+    );
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn bytes_past_written_are_ignored() {
+    use arena0_protocol::execution::BlobChange;
+    use std::os::unix::fs::FileExt;
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("store.sqlite");
+    let execution_id = ExecId([0x92; 32]);
+    let store = create_execution(&path, &fixture, execution_id).await;
+    let hash = arena0_protocol::BlobHash(*blake3::hash(b"abcdef").as_bytes());
+    let mut writer = store.handle().claim_execution(execution_id).unwrap();
+    let before = writer.load_execution().await.unwrap().unwrap();
+    let event = Event::TimerFired {
+        timer: TimerPayload::unit(),
+    };
+    let mut next = before.clone();
+    next.apply_dispatch(
+        &event,
+        before.shared_state().clone(),
+        before.local_state().clone(),
+        &[],
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    writer
+        .persist(TransitionRecord {
+            expected: before.version(),
+            next,
+            now_ms: 10,
+            change: Change::Dispatch {
+                event,
+                effects: vec![],
+                timer_id: None,
+                blobs: vec![BlobChange::Append {
+                    hash,
+                    length: 6,
+                    offset: 0,
+                    bytes: b"abc".to_vec(),
+                }],
+            },
+        })
+        .await
+        .unwrap();
+    let received = directory.path().join("store.sqlite.blobs").join(format!(
+        "recv-{}-{}",
+        blake3::Hash::from_bytes(execution_id.0).to_hex(),
+        blake3::hash(b"abcdef").to_hex()
+    ));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&received)
+        .unwrap();
+    file.write_all_at(b"garbage past written", 3).unwrap();
+    file.sync_data().unwrap();
+    drop(file);
+    drop(writer);
+    store.shutdown().await.unwrap();
+    let store = Store::open(StoreConfig::new(path, fixture.producer)).unwrap();
+    assert_eq!(
+        std::fs::read(&received).unwrap(),
+        b"abcgarbage past written"
+    );
+    assert_eq!(
+        store
+            .handle()
+            .hash_blob_partial_blocking(execution_id, hash, b"def")
+            .unwrap(),
+        hash
+    );
+    let mut writer = store.handle().claim_execution(execution_id).unwrap();
+    let before = writer.load_execution().await.unwrap().unwrap();
+    let event = Event::TimerFired {
+        timer: TimerPayload::unit(),
+    };
+    let mut next = before.clone();
+    next.apply_dispatch(
+        &event,
+        before.shared_state().clone(),
+        before.local_state().clone(),
+        &[],
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    writer
+        .persist(TransitionRecord {
+            expected: before.version(),
+            next,
+            now_ms: 11,
+            change: Change::Dispatch {
+                event,
+                effects: vec![],
+                timer_id: None,
+                blobs: vec![
+                    BlobChange::Append {
+                        hash,
+                        length: 6,
+                        offset: 3,
+                        bytes: b"def".to_vec(),
+                    },
+                    BlobChange::Commit { hash },
+                ],
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store.handle().read_blob_range_blocking(hash, 0..6).unwrap(),
+        Some(b"abcdef".to_vec())
+    );
+    let exported = directory.path().join("export");
+    assert_eq!(
+        store
+            .handle()
+            .export_blob(hash, exported.clone())
+            .await
+            .unwrap(),
+        Some(6)
+    );
+    assert_eq!(std::fs::read(exported).unwrap(), b"abcdef");
+    drop(writer);
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn owned_received_content_replaces_a_link() {
+    use arena0_protocol::execution::BlobChange;
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("store.sqlite");
+    let first_id = ExecId([0x92; 32]);
+    let second_id = ExecId([0x93; 32]);
+    let store = create_execution(&path, &fixture, first_id).await;
+    store.shutdown().await.unwrap();
+    let second_fixture =
+        activation_fixture_with_initial_state(SharedStateBytes::try_new(vec![1]).unwrap());
+    let store = Store::open(StoreConfig::new(&path, fixture.producer)).unwrap();
+    let mut writer = store.handle().claim_execution(second_id).unwrap();
+    writer
+        .create_execution_request(
+            ProgramHash::of(&second_fixture.program),
+            Some(JsonBytes::try_new(br#"{}"#.to_vec()).unwrap()),
+            ExecutionAdmission::create(NegotiationId([0x11; 32]), 2).unwrap(),
+            &[],
+            2,
+        )
+        .await
+        .unwrap();
+    writer
+        .prepare_activation(second_fixture.prepared.clone(), 3)
+        .await
+        .unwrap();
+    writer
+        .commit_activation(second_fixture.activation.clone(), 4)
+        .await
+        .unwrap();
+    writer
+        .create_execution(
+            second_fixture.activation.clone(),
+            second_fixture.producer,
+            SharedStateBytes::try_new(vec![1]).unwrap(),
+            LocalStateBytes::try_new(vec![]).unwrap(),
+            5,
+        )
+        .await
+        .unwrap();
+    activate_record(&mut writer, ExecutionVersion::ZERO, 6)
+        .await
+        .unwrap();
+    drop(writer);
+    let linked = directory.path().join("linked");
+    std::fs::write(&linked, b"abcdef").unwrap();
+    let (hash, length) = store.handle().link_blob(linked.clone()).await.unwrap();
+    let exported = directory.path().join("export");
+    for execution_id in [first_id, second_id] {
+        let mut writer = store.handle().claim_execution(execution_id).unwrap();
+        let before = writer.load_execution().await.unwrap().unwrap();
+        let event = Event::TimerFired {
+            timer: TimerPayload::unit(),
+        };
+        let mut next = before.clone();
+        next.apply_dispatch(
+            &event,
+            before.shared_state().clone(),
+            before.local_state().clone(),
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        writer
+            .persist(TransitionRecord {
+                expected: before.version(),
+                next,
+                now_ms: 10,
+                change: Change::Dispatch {
+                    event,
+                    effects: vec![],
+                    timer_id: None,
+                    blobs: vec![
+                        BlobChange::Append {
+                            hash,
+                            length,
+                            offset: 0,
+                            bytes: b"abcdef".to_vec(),
+                        },
+                        BlobChange::Commit { hash },
+                    ],
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .handle()
+                .blob_granted_blocking(execution_id, hash)
+                .unwrap(),
+            Some(length)
+        );
+        if execution_id == first_id {
+            std::fs::remove_file(&linked).unwrap();
+            assert_eq!(
+                store
+                    .handle()
+                    .export_blob(hash, exported.clone())
+                    .await
+                    .unwrap(),
+                Some(length)
+            );
+            assert_eq!(std::fs::read(&exported).unwrap(), b"abcdef");
+            std::fs::remove_file(&exported).unwrap();
+            // Relinking must also preserve the owned row.
+            std::fs::write(&linked, b"abcdef").unwrap();
+            assert_eq!(
+                store.handle().link_blob(linked.clone()).await.unwrap(),
+                (hash, length)
+            );
+            std::fs::remove_file(&linked).unwrap();
+        }
+    }
+    let blob_dir = directory.path().join("store.sqlite.blobs");
+    let first_received = blob_dir.join(format!(
+        "recv-{}-{}",
+        blake3::Hash::from_bytes(first_id.0).to_hex(),
+        blake3::hash(b"abcdef").to_hex()
+    ));
+    let second_received = blob_dir.join(format!(
+        "recv-{}-{}",
+        blake3::Hash::from_bytes(second_id.0).to_hex(),
+        blake3::hash(b"abcdef").to_hex()
+    ));
+    assert!(first_received.exists());
+    assert!(second_received.exists());
+    store.shutdown().await.unwrap();
+    let store = Store::open(StoreConfig::new(path, fixture.producer)).unwrap();
+    assert!(first_received.exists());
+    assert!(!second_received.exists());
+    assert_eq!(
+        store
+            .handle()
+            .export_blob(hash, exported.clone())
+            .await
+            .unwrap(),
+        Some(length)
+    );
+    assert_eq!(std::fs::read(exported).unwrap(), b"abcdef");
+    assert_eq!(
+        store
+            .handle()
+            .blob_granted_blocking(second_id, hash)
+            .unwrap(),
+        Some(length)
+    );
+    store.shutdown().await.unwrap();
+}
+
 pub(crate) struct ActivationFixture {
     pub(crate) activation: Activation,
     prepared: PreparedActivation,
@@ -36,6 +859,7 @@ async fn create_execution(path: &Path, fixture: &ActivationFixture, execution_id
             program_hash,
             Some(JsonBytes::try_new(br#"{}"#.to_vec()).expect("params")),
             ExecutionAdmission::create(NegotiationId([0x11; 32]), 2).expect("admission"),
+            &[],
             2,
         )
         .await
@@ -477,6 +1301,7 @@ async fn failed_rollback_closes_store_calls() {
             program,
             Some(JsonBytes::try_new(b"{}".to_vec()).expect("params")),
             creator_admission(NegotiationId([1; 32])),
+            &[],
             2,
         )
         .await;
@@ -659,14 +1484,14 @@ async fn request_is_idempotent_and_salt_is_durable() {
         .expect("execution writer");
     assert_eq!(
         writer
-            .create_execution_request(hash, Some(params.clone()), admission.clone(), 2)
+            .create_execution_request(hash, Some(params.clone()), admission.clone(), &[], 2)
             .await
             .expect("request"),
         ExecutionRequestOutcome::Created
     );
     assert_eq!(
         writer
-            .create_execution_request(hash, Some(params), admission, 3)
+            .create_execution_request(hash, Some(params), admission, &[], 3)
             .await
             .expect("retry"),
         ExecutionRequestOutcome::AlreadyExists
@@ -718,6 +1543,7 @@ async fn persisted_zero_execution_salt_is_store_corruption() {
             program_hash,
             Some(JsonBytes::try_new(br#"{}"#.to_vec()).expect("params")),
             ExecutionAdmission::create(NegotiationId([0x74; 32]), 2).expect("admission"),
+            &[],
             2,
         )
         .await
@@ -770,7 +1596,13 @@ async fn creator_admission_requires_params() {
         .claim_execution(execution_id)
         .expect("execution writer");
     let result = writer
-        .create_execution_request(hash, None, creator_admission(NegotiationId([0x72; 32])), 2)
+        .create_execution_request(
+            hash,
+            None,
+            creator_admission(NegotiationId([0x72; 32])),
+            &[],
+            2,
+        )
         .await;
     assert!(matches!(result, Err(StoreError::InvalidAdmission(_))));
     assert!(
@@ -813,6 +1645,7 @@ async fn create_admission_rejects_invalid_participant_counts() {
                     negotiation_id: NegotiationId([byte; 32]),
                     participant_count,
                 },
+                &[],
                 2,
             )
             .await;
@@ -860,6 +1693,7 @@ async fn join_preferred_params_must_match_creator_activation() {
             hash,
             Some(JsonBytes::try_new(br#"{"preferred":true}"#.to_vec()).expect("params")),
             ExecutionAdmission::join(fixture.producer, NegotiationId([0x11; 32])),
+            &[],
             2,
         )
         .await
@@ -895,7 +1729,7 @@ async fn open_join_target_binding_is_compare_and_set_and_durable() {
         .claim_execution(execution_id)
         .expect("execution writer");
     writer
-        .create_execution_request(hash, None, ExecutionAdmission::join_open(), 2)
+        .create_execution_request(hash, None, ExecutionAdmission::join_open(), &[], 2)
         .await
         .expect("request");
     let request = writer
@@ -934,7 +1768,7 @@ async fn open_join_target_binding_is_compare_and_set_and_durable() {
         .claim_execution(failed_execution_id)
         .expect("failed execution writer");
     failed_writer
-        .create_execution_request(hash, None, ExecutionAdmission::join_open(), 3)
+        .create_execution_request(hash, None, ExecutionAdmission::join_open(), &[], 3)
         .await
         .expect("failed request");
     assert_eq!(
@@ -994,6 +1828,7 @@ async fn join_without_params_survives_reopen_recovery() {
             hash,
             None,
             ExecutionAdmission::join(fixture.producer, NegotiationId([0x11; 32])),
+            &[],
             2,
         )
         .await
@@ -1124,6 +1959,7 @@ async fn request_failure_is_compare_and_set() {
             hash,
             Some(JsonBytes::try_new(b"null".to_vec()).expect("json")),
             admission,
+            &[],
             1,
         )
         .await
@@ -1178,6 +2014,7 @@ async fn request_failure_cannot_compete_with_activation_authority() {
             program_hash,
             Some(JsonBytes::try_new(br#"{}"#.to_vec()).expect("params")),
             ExecutionAdmission::create(NegotiationId([0x11; 32]), 2).expect("admission"),
+            &[],
             2,
         )
         .await
@@ -1237,6 +2074,7 @@ async fn recovery_projection_filters_terminal_history_before_paging() {
                 program_hash,
                 Some(JsonBytes::try_new(b"null".to_vec()).expect("params")),
                 creator_admission(NegotiationId([index; 32])),
+                &[],
                 u64::from(index),
             )
             .await
@@ -1300,6 +2138,7 @@ async fn recovery_projection_pages_a_maximal_execution_state() {
             program_hash,
             Some(JsonBytes::try_new(br#"{}"#.to_vec()).expect("params")),
             ExecutionAdmission::create(NegotiationId([0x11; 32]), 2).expect("admission"),
+            &[],
             2,
         )
         .await
@@ -1378,6 +2217,7 @@ async fn activation_prepare_commit_is_idempotent_and_recoverable() {
             hash,
             Some(JsonBytes::try_new(b"{}".to_vec()).expect("json")),
             admission,
+            &[],
             1,
         )
         .await
@@ -2087,6 +2927,7 @@ async fn activation_cannot_exceed_durable_admission_authority() {
             hash,
             Some(JsonBytes::try_new(b"{}".to_vec()).expect("json")),
             creator,
+            &[],
             2,
         )
         .await
@@ -2108,6 +2949,7 @@ async fn activation_cannot_exceed_durable_admission_authority() {
             hash,
             Some(JsonBytes::try_new(b"{}".to_vec()).expect("json")),
             ExecutionAdmission::join(PeerId([0xfe; 32]), NegotiationId([0x11; 32])),
+            &[],
             4,
         )
         .await
@@ -2877,6 +3719,7 @@ async fn dispatch_record(
             expected,
             next: next.clone(),
             change: Change::Dispatch {
+                blobs: Vec::new(),
                 event,
                 effects,
                 timer_id,
@@ -2970,6 +3813,7 @@ async fn stale_transition_writes_neither_state_nor_side_rows() {
             expected: ExecutionVersion::ZERO,
             next,
             change: Change::Dispatch {
+                blobs: Vec::new(),
                 event,
                 effects: Vec::new(),
                 timer_id: None,

@@ -22,6 +22,7 @@ pub trait IdSource {
     fn peer_id(&self) -> Id;
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl IdSource for arena0_crypto::NodeKeys {
     fn peer_id(&self) -> Id {
         Id::from_ed25519(&self.ed25519_public_key())

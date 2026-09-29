@@ -542,7 +542,7 @@ fn validate_exec_route(
     session_hash: SessionHash,
 ) -> Result<(), TransportError> {
     match frame {
-        DomainExecFrame::Message { .. } => {}
+        DomainExecFrame::Message { .. } | DomainExecFrame::Direct { .. } => {}
         DomainExecFrame::StepCertificate { certificate } => {
             if certificate.commitment().session_id != session_hash {
                 return Err(TransportError::ProtocolMismatch(

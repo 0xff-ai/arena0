@@ -13,9 +13,10 @@
 //! value and emit effects; the runtime decides whether the complete dispatch
 //! result is accepted at the dispatch boundary.
 
-use arena0_crypto::{CryptoError, HashAlgorithm, SignScheme};
-use arena0_protocol::{Committed, Ensemble, LogLevel, Participant, PeerId};
+use arena0_crypto::SignScheme;
+use arena0_protocol::{Committed, Ensemble, LogLevel, Participant, PeerId, VerifyError};
 use borsh::{BorshDeserialize, BorshSerialize};
+use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 
 use crate::effects;
@@ -58,7 +59,7 @@ pub trait Mode: sealed::Sealed {}
 /// ```
 pub trait EffectMode: Mode + Sized {
     /// The result of one broadcast: `()` for agreed handlers,
-    /// `Result<(), BroadcastError>` for local handlers.
+    /// `Result<(), SendError>` for local handlers.
     type Broadcast;
 
     #[doc(hidden)]
@@ -74,7 +75,7 @@ pub trait EffectMode: Mode + Sized {
 pub struct AgreedMode;
 
 /// A local handler (`on_input`, `on_timer`): shared state is read-only, a
-/// broadcast can fail with [`BroadcastError::QueueFull`], and it may `sign`.
+/// broadcast can fail with [`SendError::QueueFull`], and it may `sign`.
 #[derive(Debug, Clone, Copy)]
 pub struct LocalMode;
 
@@ -99,7 +100,7 @@ impl EffectMode for AgreedMode {
 }
 
 impl EffectMode for LocalMode {
-    type Broadcast = Result<(), BroadcastError>;
+    type Broadcast = Result<(), SendError>;
 
     fn __broadcast<Shared>(_: &mut Effects<'_, Shared, Self>, bytes: Vec<u8>) -> Self::Broadcast {
         effects::host_broadcast(&bytes)
@@ -155,6 +156,17 @@ impl<Shared: std::fmt::Debug, Local: std::fmt::Debug, M> std::fmt::Debug for Ctx
 }
 
 impl<Shared, Local, M: Mode> Ctx<Shared, Local, M> {
+    /// Ask the Host to verify `signed` as produced by `signer`'s `sign` call in
+    /// this session, and return its payload. The Host checks the preimage's
+    /// session and program, that `signer` is a participant, and the signature
+    /// under `signer`'s key for the preimage's scheme. The result depends only on
+    /// the arguments and the session, so agreed handlers compute it identically on
+    /// every participant and on a rerun after a crash. Available in every handler
+    /// mode; the Host traps outside a dispatch.
+    pub fn verify(&self, signed: &Signed, signer: PeerId) -> Result<Vec<u8>, VerifyError> {
+        effects::host_guest_verify(&signed.signed_bytes, &signed.signature, signer)
+    }
+
     #[doc(hidden)]
     pub fn __set_participant(&mut self, participant: Participant) {
         self.participant = Some(participant);
@@ -379,11 +391,6 @@ impl<Shared, Local, M: EffectMode> Ctx<Shared, Local, M> {
         buf
     }
 
-    /// Pure synchronous cryptographic helpers.
-    pub fn crypto(&self) -> Crypto {
-        Crypto
-    }
-
     /// Convert a primitive-produced peer message into a detached broadcast output.
     pub fn primitive_output<T>(&mut self, msg: T) -> PrimitiveOutput<T> {
         PrimitiveOutput {
@@ -484,6 +491,27 @@ impl<Shared, Local> Ctx<Shared, Local, AgreedMode> {
 }
 
 impl<Shared, Local> Ctx<Shared, Local, LocalMode> {
+    /// Queue a direct message to `to`, outside agreement, optionally carrying an
+    /// object range the Host proves and sends. `to` must be another participant.
+    pub fn send_direct<T: BorshSerialize>(
+        &mut self,
+        to: Participant,
+        msg: &T,
+        range: Option<crate::RangeAttachment>,
+    ) -> Result<(), SendError> {
+        let to = self
+            .ensemble()
+            .peer_at(to)
+            .expect("direct recipient is a participant");
+        let msg = borsh::to_vec(msg).expect("direct message serialization failed");
+        effects::host_send_direct(to, &msg, range)
+    }
+
+    /// The blob store, for local handlers of programs with Capability::Blobs.
+    pub fn blobs(&mut self) -> crate::Blobs<'_> {
+        crate::Blobs::new()
+    }
+
     /// Build the context for one local dispatch.
     ///
     /// # Safety
@@ -506,7 +534,7 @@ impl<Shared, Local> Ctx<Shared, Local, LocalMode> {
     /// coordinates and returns both that exact preimage and its signature; both
     /// schemes are deterministic, so re-running the handler after a crash
     /// produces the same signature. Available only in local handlers
-    /// (`InputReceived`, `TimerFired`) whose program declared a `Sign`
+    /// (`InputReceived`, `TimerFired`, `DirectReceived`) whose program declared a `Sign`
     /// capability for the requested scheme.
     pub fn sign(&mut self, scheme: SignScheme, payload: &[u8]) -> Signed {
         let (signed_bytes, signature) = effects::host_guest_sign(scheme, payload);
@@ -517,17 +545,14 @@ impl<Shared, Local> Ctx<Shared, Local, LocalMode> {
     }
 }
 
-/// Failure to emit a broadcast.
-///
-/// A broadcast that returns an error queued nothing; the program may retry or
-/// carry on.
+/// Failure to queue a message. A call that returns an error queued nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BroadcastError {
+pub enum SendError {
     /// The durable outgoing queue has reached its bound.
     QueueFull,
 }
 
-impl std::fmt::Display for BroadcastError {
+impl std::fmt::Display for SendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::QueueFull => write!(f, "the outgoing message queue is full"),
@@ -535,7 +560,7 @@ impl std::fmt::Display for BroadcastError {
     }
 }
 
-impl std::error::Error for BroadcastError {}
+impl std::error::Error for SendError {}
 
 /// Host side-effect handle passed to [`Context::effects`].
 ///
@@ -550,7 +575,18 @@ pub struct Effects<'a, Shared, M = AgreedMode> {
 ///
 /// The guest receives both so it can persist or forward the exact preimage the
 /// host signed; the host never lets the guest guess what was signed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+    borsh::BorshSchema,
+)]
 pub struct Signed {
     /// The exact versioned, execution-bound preimage the host signed.
     pub signed_bytes: Vec<u8>,
@@ -614,29 +650,6 @@ impl<Shared, Local, P, Route, Mode> std::fmt::Debug
     }
 }
 
-/// Pure cryptographic helpers available inside deterministic handlers.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Crypto;
-
-impl Crypto {
-    /// Hash `data` synchronously inside the guest.
-    #[must_use]
-    pub fn hash(&self, algorithm: HashAlgorithm, data: &[u8]) -> [u8; 32] {
-        arena0_crypto::hash(algorithm, data)
-    }
-
-    /// Verify a signature synchronously inside the guest.
-    pub fn verify(
-        &self,
-        scheme: SignScheme,
-        key: &[u8],
-        data: &[u8],
-        signature: &[u8],
-    ) -> Result<bool, CryptoError> {
-        arena0_crypto::verify(scheme, key, data, signature)
-    }
-}
-
 impl<Shared, M> std::fmt::Debug for Effects<'_, Shared, M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Effects").finish_non_exhaustive()
@@ -654,7 +667,7 @@ impl<Shared, M: EffectMode> Effects<'_, Shared, M> {
     /// In an agreed handler this cannot fail: an agreed handler never observes
     /// the local queue, and if the agreed step would overflow the queue the
     /// Host fails the session instead of signing it. In a local handler it
-    /// returns [`BroadcastError::QueueFull`] when the queue is full and queues
+    /// returns [`SendError::QueueFull`] when the queue is full and queues
     /// nothing.
     pub fn broadcast<T: BorshSerialize>(&mut self, msg: &T) -> M::Broadcast {
         M::__broadcast(self, borsh::to_vec(msg).expect("message serialization"))
@@ -744,87 +757,5 @@ impl<Shared, Local, P, Route> PrimitiveField<'_, Shared, Local, P, Route, Agreed
     pub fn mutate<R>(&mut self, f: impl FnOnce(&mut P) -> R) -> R {
         let field = self.field;
         self.ctx.mutate_shared(|shared| f(field(shared)))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sha2::Digest as _;
-    use tiny_keccak::Hasher as _;
-
-    #[test]
-    fn crypto_hash_matches_supported_algorithms() {
-        let crypto = Crypto;
-        let data = b"arena0";
-
-        assert_eq!(
-            crypto.hash(HashAlgorithm::Blake3, data),
-            *blake3::hash(data).as_bytes()
-        );
-
-        let sha256 = sha2::Sha256::digest(data);
-        let mut expected_sha256 = [0u8; 32];
-        expected_sha256.copy_from_slice(&sha256);
-        assert_eq!(crypto.hash(HashAlgorithm::Sha256, data), expected_sha256);
-
-        let mut expected_keccak = [0u8; 32];
-        let mut keccak = tiny_keccak::Keccak::v256();
-        keccak.update(data);
-        keccak.finalize(&mut expected_keccak);
-        assert_eq!(crypto.hash(HashAlgorithm::Keccak256, data), expected_keccak);
-    }
-
-    #[test]
-    fn crypto_verifies_ed25519_synchronously() {
-        use ed25519_dalek::Signer as _;
-
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let verifying_key = signing_key.verifying_key();
-        let data = b"sign me";
-        let signature = signing_key.sign(data);
-        let crypto = Crypto;
-
-        assert!(
-            crypto
-                .verify(
-                    SignScheme::Ed25519,
-                    verifying_key.as_bytes(),
-                    data,
-                    &signature.to_bytes(),
-                )
-                .expect("valid ed25519 verification"),
-        );
-        assert!(
-            !crypto
-                .verify(
-                    SignScheme::Ed25519,
-                    verifying_key.as_bytes(),
-                    b"tampered",
-                    &signature.to_bytes(),
-                )
-                .expect("invalid signatures return false"),
-        );
-    }
-
-    #[test]
-    fn crypto_rejects_malformed_ed25519_inputs() {
-        let crypto = Crypto;
-
-        let key_err = crypto
-            .verify(SignScheme::Ed25519, &[1, 2, 3], b"data", &[0u8; 64])
-            .expect_err("short key should fail before verification");
-        assert!(matches!(
-            key_err,
-            CryptoError::InvalidKeyLength {
-                expected: 32,
-                actual: 3
-            }
-        ));
-
-        let sig_err = crypto
-            .verify(SignScheme::Ed25519, &[0u8; 32], b"data", &[0u8; 8])
-            .expect_err("short signature should be rejected");
-        assert!(matches!(sig_err, CryptoError::InvalidSignature));
     }
 }

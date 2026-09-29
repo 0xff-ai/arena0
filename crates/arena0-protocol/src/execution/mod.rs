@@ -6,15 +6,19 @@
 
 mod abort;
 mod binding;
+mod blob_change;
 mod callout;
 mod certificate;
 mod cursor;
+mod direct;
 mod end;
 mod error;
 mod outcome;
 mod signing;
 mod state;
 mod status;
+#[cfg(test)]
+mod test_fixtures;
 mod timer;
 mod validation;
 
@@ -22,6 +26,8 @@ mod validation;
 pub const MAX_EFFECTS: usize = 128;
 /// Maximum number of messages one execution may hold in its outgoing queue.
 pub const MAX_OUTGOING_MESSAGES: usize = 16;
+/// Maximum unacknowledged direct messages queued for one recipient.
+pub const MAX_DIRECT_QUEUE: usize = 8;
 /// Maximum number of active one-shot timers in one execution.
 pub const MAX_ACTIVE_TIMERS: usize = 64;
 /// Maximum number of signatures retained for one step proposal.
@@ -30,16 +36,8 @@ pub const MAX_PROOF_SIGNATURES: usize = crate::MAX_PARTICIPANTS;
 /// proposal can retain both the current and proposed shared/local memories,
 /// plus up to the program's complete dispatch-effect budget.
 pub const MAX_EXECUTION_STATE_BYTES: usize = 32 * 1024 * 1024;
-/// Maximum opaque bytes in one effect payload.
-pub const MAX_EFFECT_PAYLOAD_BYTES: usize = 64 * 1024;
 /// Maximum opaque bytes in one receipt artifact.
 pub const MAX_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
-/// Maximum opaque bytes in one timer payload.
-pub const MAX_TIMER_PAYLOAD_BYTES: usize = 64 * 1024;
-/// Maximum UTF-8 bytes in one terminal reason.
-pub const MAX_TERMINAL_REASON_BYTES: usize = 4 * 1024;
-/// Maximum opaque bytes in one successful terminal outcome.
-pub const MAX_TERMINAL_OUTCOME_BYTES: usize = 64 * 1024;
 /// Maximum total encoded bytes for one trace entry.
 pub const MAX_TRACE_ENTRY_BYTES: usize = 256 * 1024;
 /// Maximum number of entries in a complete receipt trace.
@@ -47,12 +45,14 @@ pub const MAX_RECEIPT_TRACE_ENTRIES: usize = 65_536;
 
 pub use abort::{ABORT_OCCURRENCE_DOMAIN, ABORT_OCCURRENCE_VERSION, AbortKind, AbortOccurrence};
 pub use binding::ExecutionBinding;
+pub use blob_change::{BlobChange, BlobPartial};
 pub use callout::{CalloutId, CalloutIdParseError, OpenCallout, callout_id};
 pub use certificate::{
     ParticipantStepSignature, Receipt, ReceiptArtifact, ReceiptBody, ReceiptId, ReceiptKind,
     ReceiptProvenance, ReceiptSummary, StopReport,
 };
 pub use cursor::{ExecutionVersion, StepCursor};
+pub use direct::{DirectArrival, DirectEntry, DirectLane};
 pub use end::{EndMatch, EndPhase};
 pub use error::ProtocolError;
 pub use outcome::TerminalOutcome;

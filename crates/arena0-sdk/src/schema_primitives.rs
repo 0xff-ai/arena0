@@ -1,6 +1,7 @@
 //! `ProgramValue` implementations for the closed set of public ABI values.
 
-use arena0_protocol::{Participant, PeerId};
+use crate::Signed;
+use arena0_protocol::{Attachment, BlobHash, Participant, PeerId, RangeAttachment};
 
 use crate::ProgramValue;
 
@@ -26,6 +27,10 @@ impl_program_value!(
     (),
     PeerId,
     Participant,
+    BlobHash,
+    Attachment,
+    RangeAttachment,
+    Signed,
 );
 
 impl<T: ProgramValue> ProgramValue for Option<T> {}
@@ -137,6 +142,10 @@ mod tests {
     fn allowlisted_composites_implement_program_value() {
         assert_program_value::<Option<Vec<(u32, [u8; 2])>>>();
         assert_program_value::<PeerId>();
+        assert_program_value::<BlobHash>();
+        assert_program_value::<Attachment>();
+        assert_program_value::<RangeAttachment>();
+        assert_program_value::<Signed>();
         assert_program_value::<Participant>();
     }
 

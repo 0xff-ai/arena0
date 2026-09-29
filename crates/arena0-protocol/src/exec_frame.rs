@@ -24,8 +24,20 @@ const EXEC_KIND_STEP_SIGNATURE: u8 = 0x01;
 const EXEC_KIND_ABORT: u8 = 0x02;
 /// Frame kind of [`ExecFrame::StepCertificate`].
 const EXEC_KIND_STEP_CERTIFICATE: u8 = 0x03;
+/// Frame kind of [`ExecFrame::Direct`].
+const EXEC_KIND_DIRECT: u8 = 0x04;
+/// Largest direct frame: kind, sequence, the control message with its length
+/// prefix, and an optional attachment with its option tag and length prefix.
+const MAX_DIRECT_FRAME_BYTES: usize = 1
+    + size_of::<u64>()
+    + size_of::<u32>()
+    + crate::MAX_DIRECT_CONTROL_BYTES
+    + 1
+    + size_of::<u32>()
+    + crate::MAX_DIRECT_RANGE_BYTES as usize;
+const _: () = assert!(MAX_DIRECT_FRAME_BYTES <= MAX_EXEC_FRAME_BYTES);
 /// Maximum signer bitmap size for the protocol's participant bound.
-const MAX_EXEC_SIGNER_BYTES: usize = crate::negotiation::MAX_PARTICIPANTS.div_ceil(8);
+const MAX_EXEC_SIGNER_BYTES: usize = crate::MAX_PARTICIPANTS.div_ceil(8);
 /// Borsh size of a [`StepCommitment`]: domain, session, step, entry hash,
 /// pre/post state hashes, and chain link.
 const STEP_COMMITMENT_BYTES: usize = 24 + 32 + 8 + 32 + 32 + 32 + 32;
@@ -65,6 +77,17 @@ pub enum ExecFrame {
     StepCertificate {
         /// The certified commitment and its aggregate agreement.
         certificate: StepCertificate,
+    },
+    /// One point-to-point message outside agreement, numbered per recipient.
+    Direct {
+        /// The sender's sequence number for this recipient, starting at 1.
+        seq: u64,
+        /// The program's control message.
+        msg: Vec<u8>,
+        /// The raw bytes of the message's blob range, read at send time. Absent
+        /// when the message has no range, or when the sender's Host could not
+        /// read the range (the receiver's program sees no attachment).
+        attachment: Option<Vec<u8>>,
     },
     /// Unilateral termination.
     Abort {
@@ -108,6 +131,32 @@ impl BorshSerialize for ExecFrame {
                 )?;
                 BorshSerialize::serialize(&agreement.aggregate, writer)
             }
+            Self::Direct {
+                seq,
+                msg,
+                attachment,
+            } => {
+                BorshSerialize::serialize(&EXEC_KIND_DIRECT, writer)?;
+                BorshSerialize::serialize(seq, writer)?;
+                serialize_bounded_bytes(
+                    writer,
+                    msg,
+                    crate::MAX_DIRECT_CONTROL_BYTES,
+                    "exec.direct.msg",
+                )?;
+                match attachment {
+                    None => BorshSerialize::serialize(&0u8, writer),
+                    Some(attachment) => {
+                        BorshSerialize::serialize(&1u8, writer)?;
+                        serialize_bounded_bytes(
+                            writer,
+                            attachment,
+                            crate::MAX_DIRECT_RANGE_BYTES as usize,
+                            "exec.direct.attachment",
+                        )
+                    }
+                }
+            }
         }
     }
 }
@@ -140,6 +189,28 @@ impl BorshDeserialize for ExecFrame {
                     },
                 })
             }
+            EXEC_KIND_DIRECT => Ok(Self::Direct {
+                seq: u64::deserialize_reader(reader)?,
+                msg: read_bounded_bytes(
+                    reader,
+                    crate::MAX_DIRECT_CONTROL_BYTES,
+                    "exec.direct.msg",
+                )?,
+                attachment: match u8::deserialize_reader(reader)? {
+                    0 => None,
+                    1 => Some(read_bounded_bytes(
+                        reader,
+                        crate::MAX_DIRECT_RANGE_BYTES as usize,
+                        "exec.direct.attachment",
+                    )?),
+                    tag => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid direct attachment option tag {tag}"),
+                        ));
+                    }
+                },
+            }),
             tag => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown execution frame tag {tag}"),

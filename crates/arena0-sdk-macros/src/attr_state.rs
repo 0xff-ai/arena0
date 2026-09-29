@@ -90,6 +90,9 @@ fn primitive_output_type(ty: &syn::Type) -> Option<TokenStream2> {
     if segment.ident == "FairRandom" {
         return Some(quote! { ::arena0_primitives::commit_reveal::Message<[u8; 32]> });
     }
+    if segment.ident == "VerifiedTransfer" {
+        return Some(quote! { ::arena0_primitives::verified_transfer::TransferMessage });
+    }
     if segment.ident != "CommitReveal" {
         return None;
     }
@@ -362,7 +365,7 @@ pub(crate) fn expand_arena0_state(
             let output_ty = primitive_output_type(&f.ty).ok_or_else(|| {
                 Error::new(
                     f.ident.span(),
-                    "#[primitive(route = ...)] currently supports CommitReveal<T> and FairRandom fields",
+                    "#[primitive(route = ...)] currently supports CommitReveal<T>, FairRandom and VerifiedTransfer fields",
                 )
             });
             Some(output_ty.map(|output_ty| {

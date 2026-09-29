@@ -113,6 +113,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Move files in and out of this Host's blob store.
+    #[command(subcommand)]
+    Blob(BlobCommand),
     /// Print the agent-facing arena0 skill without contacting a Host.
     Skill,
     /// Open the Host bound to the current harness context.
@@ -249,6 +252,20 @@ enum ProgramCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum BlobCommand {
+    /// Link a file on the Host's machine into its blob store; prints its hash
+    /// and length for use as program parameters. The Host reads the file in
+    /// place, so it must stay unchanged while executions use it.
+    Import { file: PathBuf },
+    /// Write the blob with this hash to a new file on the Host's machine.
+    Export {
+        #[arg(value_parser = |value: &str| value.parse::<arena0_client::protocol::BlobHash>().map(|_| value.to_owned()))]
+        hash: String,
+        file: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum ExecCommand {
     /// Create an execution; negotiation continues in the Host.
     Create {
@@ -261,6 +278,13 @@ enum ExecCommand {
         join: Option<Vec<String>>,
         #[arg(long, value_name = "KEY=VALUE")]
         param: Vec<String>,
+        /// Grant the execution read access to an imported blob. Repeatable.
+        #[arg(
+            long = "blob",
+            value_name = "HASH",
+            value_parser = |value: &str| value.parse::<arena0_client::protocol::BlobHash>().map_err(|error| error.to_string()),
+        )]
+        blobs: Vec<arena0_client::protocol::BlobHash>,
     },
     /// List executions known by the Host.
     List,
@@ -854,6 +878,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Stop => stop(&ctx).await,
         Command::Identity => identity(&ctx).await,
         Command::Program { command } => program(&ctx, command).await,
+        Command::Blob(command) => blob(&ctx, command).await,
         Command::Exec { command } => execution(&ctx, command).await,
         Command::Watch { exec } => watch::watch(&ctx, exec).await,
         Command::Receipt { command } => receipt(&ctx, command).await,
@@ -1264,6 +1289,45 @@ fn id_json(info: &arena0_client::api::IdInfo) -> Value {
     })
 }
 
+async fn blob(ctx: &Ctx, command: BlobCommand) -> anyhow::Result<()> {
+    match command {
+        BlobCommand::Import { file } => {
+            let path = std::fs::canonicalize(&file)
+                .with_context(|| format!("resolve {}", file.display()))?;
+            let ResponseOk::BlobImported { hash, length } =
+                ctx.call(&HostRequest::BlobImport { path }).await?
+            else {
+                bail!("unexpected response to blob.import");
+            };
+            if ctx.mode.is_json() {
+                ui::print_json(&json!({ "hash": hash, "length": length }));
+            } else {
+                println!("{hash} {length}");
+            }
+        }
+        BlobCommand::Export { hash, file } => {
+            let hash = hash.parse::<arena0_client::protocol::BlobHash>()?;
+            let path = std::path::absolute(&file)
+                .with_context(|| format!("resolve {}", file.display()))?;
+            let ResponseOk::BlobExported { length } = ctx
+                .call(&HostRequest::BlobExport {
+                    hash,
+                    path: path.clone(),
+                })
+                .await?
+            else {
+                bail!("unexpected response to blob.export");
+            };
+            if ctx.mode.is_json() {
+                ui::print_json(&json!({ "file": path, "length": length }));
+            } else {
+                println!("wrote {length} bytes to {}", path.display());
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn program(ctx: &Ctx, command: ProgramCommand) -> anyhow::Result<()> {
     let response = match command {
         ProgramCommand::List => ctx.call(&HostRequest::ProgramList).await?,
@@ -1347,6 +1411,7 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
             participants,
             join,
             param,
+            blobs,
         } => {
             let ensemble = ensemble_spec(ctx, &program, participants, join.as_deref()).await?;
             let params = answer::assemble_params(&param).map_err(anyhow::Error::msg)?;
@@ -1357,6 +1422,7 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
                     program,
                     params,
                     ensemble,
+                    blobs,
                 })
                 .await;
             let created = match created {
@@ -1929,6 +1995,23 @@ mod tests {
 
     #[test]
     fn current_command_paths_parse() {
+        let imported = Cli::try_parse_from(["arena0", "blob", "import", "input.bin"]).unwrap();
+        assert!(
+            matches!(imported.command, Some(Command::Blob(BlobCommand::Import { file }))
+            if file == Path::new("input.bin"))
+        );
+        let hash = "ab".repeat(32);
+        let exported =
+            Cli::try_parse_from(["arena0", "blob", "export", &hash, "output.bin"]).unwrap();
+        assert!(
+            matches!(exported.command, Some(Command::Blob(BlobCommand::Export { hash: parsed, file }))
+            if parsed == hash && file == Path::new("output.bin"))
+        );
+        for invalid in ["", "ab", &"g".repeat(64), &"a".repeat(63), &"a".repeat(65)] {
+            let error = Cli::try_parse_from(["arena0", "blob", "export", invalid, "output.bin"])
+                .unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        }
         assert!(Cli::try_parse_from(["arena0", "--tmp"]).is_ok());
         assert!(
             Cli::try_parse_from(["arena0", "--tmp", "--socket", "/tmp/arena0.sock", "status"])
@@ -1950,6 +2033,20 @@ mod tests {
                 .is_ok()
         );
         assert!(Cli::try_parse_from(["arena0", "exec", "create", "program", "--join"]).is_ok());
+        let hash = "ab".repeat(32);
+        let granted = Cli::try_parse_from([
+            "arena0", "exec", "create", "program", "--join", "--blob", &hash, "--blob", &hash,
+        ])
+        .unwrap();
+        assert!(matches!(
+            granted.command,
+            Some(Command::Exec {
+                command: ExecCommand::Create { blobs, .. }
+            }) if blobs.len() == 2
+        ));
+        assert!(
+            Cli::try_parse_from(["arena0", "exec", "create", "program", "--blob", "zz"]).is_err()
+        );
         assert!(
             Cli::try_parse_from([
                 "arena0",

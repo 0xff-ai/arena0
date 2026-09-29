@@ -16,6 +16,7 @@ use syn::{Expr, Item, ItemFn, Pat, Type};
 struct EffectCapabilityVisitor {
     messaging: bool,
     timers: bool,
+    blobs: bool,
     sign_ed25519: bool,
     sign_bls: bool,
     effect_bindings: HashSet<String>,
@@ -78,6 +79,13 @@ impl<'ast> Visit<'ast> for EffectCapabilityVisitor {
             && receiver_is_context_handle(&node.receiver, &self.context_bindings)
         {
             self.record_sign_scheme(node.args.first());
+        }
+        if receiver_is_context_handle(&node.receiver, &self.context_bindings) {
+            match node.method.to_string().as_str() {
+                "send_direct" => self.messaging = true,
+                "blobs" => self.blobs = true,
+                _ => {}
+            }
         }
         syn::visit::visit_expr_method_call(self, node);
     }
@@ -200,6 +208,11 @@ fn inferred_effect_capabilities(visitor: EffectCapabilityVisitor) -> Vec<Inferre
     if visitor.messaging {
         capabilities.push(InferredEffectCapability {
             capability: quote! { ::arena0::Capability::Messaging },
+        });
+    }
+    if visitor.blobs {
+        capabilities.push(InferredEffectCapability {
+            capability: quote! { ::arena0::Capability::Blobs },
         });
     }
     if visitor.timers {

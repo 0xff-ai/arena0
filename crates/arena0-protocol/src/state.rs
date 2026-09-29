@@ -1,5 +1,6 @@
 //! The shared-state commitment.
 
+#[cfg(not(target_arch = "wasm32"))]
 use arena0_program::{SharedStateBytes, canonical_state_image};
 
 use crate::id::id_type;
@@ -17,6 +18,7 @@ id_type!(
     Default
 );
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Hash {
     /// Hash arbitrary already-canonical bytes.
     #[must_use]

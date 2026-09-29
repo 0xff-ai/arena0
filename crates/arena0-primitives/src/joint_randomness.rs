@@ -3,30 +3,20 @@
 //! [`shuffle`](crate::joint_randomness::shuffle) composes the existing
 //! [`CommitReveal<[u8; 32]>`] state machine.
 //! It hashes the revealed contributions in their canonical participant order
-//! with an explicit versioned domain, then seeds
-//! [`rand_chacha::ChaCha20Rng`]. The helper never samples ambient randomness
-//! and never depends on collection iteration order.
+//! with an explicit versioned domain. The Host draws the permutation through
+//! `arena0::permutation`; this helper applies it without sampling ambient
+//! randomness or depending on collection iteration order.
 //!
-//! An internal rejection sampler drives the descending Fisher-Yates loop
-//! without modulo bias. The
-//! [`shuffle`](crate::joint_randomness::shuffle) function returns `None` until
-//! commit-reveal is complete or if the bounded rejection budget is exhausted.
+//! `shuffle` returns `None` until commit-reveal completes or if the item count
+//! does not fit a `u32`. The Host traps above its profile's permutation limit.
 
 use crate::commit_reveal::CommitReveal;
-use rand_chacha::ChaCha20Rng;
-use rand_chacha::rand_core::{RngCore, SeedableRng};
 
 /// Versioned domain for the derived joint-randomness seed.
 ///
 /// The preimage is the UTF-8 bytes of this domain, followed by the little-endian
 /// `u32` contribution count and each 32-byte contribution in participant order.
 const DOMAIN: &[u8] = b"arena0/joint-randomness/v1";
-
-/// Maximum number of discarded random words before a bounded operation gives
-/// up. The rejection probability is below `2^-32` for the launch program's
-/// participant counts, so exhausting this budget is an internal fault rather
-/// than a normal result.
-const MAX_REJECTIONS: usize = 1024;
 
 /// Derive the shared seed from a completed commit-reveal round.
 ///
@@ -35,13 +25,13 @@ const MAX_REJECTIONS: usize = 1024;
 /// sizes cannot share a seed merely because their common prefix matches.
 fn seed(protocol: &CommitReveal<[u8; 32]>) -> Option<[u8; 32]> {
     let values = protocol.values()?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(DOMAIN);
-    hasher.update(&(values.len() as u32).to_le_bytes());
+    let mut preimage = Vec::with_capacity(DOMAIN.len() + 4 + values.len() * 32);
+    preimage.extend_from_slice(DOMAIN);
+    preimage.extend_from_slice(&(values.len() as u32).to_le_bytes());
     for value in values {
-        hasher.update(value);
+        preimage.extend_from_slice(value);
     }
-    Some(*hasher.finalize().as_bytes())
+    Some(arena0::hash(&preimage))
 }
 
 /// Shuffle `items` with an unbiased descending Fisher-Yates pass.
@@ -51,30 +41,20 @@ fn seed(protocol: &CommitReveal<[u8; 32]>) -> Option<[u8; 32]> {
 /// explicitly before calling this function.
 pub fn shuffle<T>(protocol: &CommitReveal<[u8; 32]>, items: &mut [T]) -> Option<()> {
     let seed = seed(protocol)?;
-    let mut rng = ChaCha20Rng::from_seed(seed);
-    for index in (1..items.len()).rev() {
-        let swap = choose_from_rng(&mut rng, (index + 1) as u64)? as usize;
-        items.swap(index, swap);
+    let mut order = arena0::permutation(seed, u32::try_from(items.len()).ok()?);
+    // Each cycle maps destination to original source. Swapping along that
+    // cycle pulls each source into place; identity entries mark visited slots.
+    for start in 0..order.len() {
+        let mut current = start;
+        while order[current] as usize != start {
+            let next = order[current] as usize;
+            items.swap(current, next);
+            order[current] = current as u32;
+            current = next;
+        }
+        order[current] = current as u32;
     }
     Some(())
-}
-
-fn choose_from_rng(rng: &mut ChaCha20Rng, upper_bound: u64) -> Option<u64> {
-    if upper_bound == 0 {
-        return None;
-    }
-
-    // `wrapping_neg()` computes 2^64 modulo `upper_bound`. Rejecting values
-    // below that threshold leaves a whole number of equal-sized residue
-    // classes in the remaining 64-bit sample space.
-    let threshold = upper_bound.wrapping_neg() % upper_bound;
-    for _ in 0..MAX_REJECTIONS {
-        let value = rng.next_u64();
-        if value >= threshold {
-            return Some(value % upper_bound);
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -184,24 +164,18 @@ mod tests {
     }
 
     #[test]
-    fn choose_and_shuffle_are_stable() {
+    fn shuffle_is_stable() {
         let protocol = completed([[0x11; 32], [0x22; 32], [0x44; 32]]);
-        let mut rng = ChaCha20Rng::from_seed(seed(&protocol).unwrap());
-        assert_eq!(choose_from_rng(&mut rng, 7), Some(0));
         let mut values = [0u8, 1, 2, 3, 4];
         shuffle(&protocol, &mut values).unwrap();
         assert_eq!(values, [4, 0, 3, 2, 1]);
     }
 
     #[test]
-    fn incomplete_or_invalid_bounds_are_rejected() {
+    fn incomplete_round_cannot_seed_or_shuffle() {
         let protocol = CommitReveal::<[u8; 32]>::default();
         assert_eq!(seed(&protocol), None);
         let mut values = [1, 2, 3];
         assert_eq!(shuffle(&protocol, &mut values), None);
-
-        let complete = completed([[0x11; 32], [0x22; 32], [0x44; 32]]);
-        let mut rng = ChaCha20Rng::from_seed(seed(&complete).unwrap());
-        assert_eq!(choose_from_rng(&mut rng, 0), None);
     }
 }

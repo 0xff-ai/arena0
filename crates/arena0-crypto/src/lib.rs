@@ -5,23 +5,37 @@
 //! [`ExecutionKey`] is a separate host-only BLS signer derived from a persisted
 //! random [`ExecutionSalt`].
 
+#[cfg(not(target_arch = "wasm32"))]
 mod keys;
+
+/// BLAKE3 tree primitives: subtree chaining values and parent merges.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod blake3_tree;
 
 /// Host-only BLS12-381 (MinSig) aggregate signing and verification.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod bls;
 
 #[cfg(not(target_arch = "wasm32"))]
+mod permutation;
+#[cfg(not(target_arch = "wasm32"))]
+pub use permutation::permutation;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub use keys::ExecutionKey;
+#[cfg(not(target_arch = "wasm32"))]
 pub use keys::NodeKeys;
+#[cfg(not(target_arch = "wasm32"))]
 pub use keys::{BLS_BINDING_DOMAIN, key_binding_message, verify_key_binding};
 
 use core::fmt;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_arch = "wasm32"))]
 use sha2::Digest as _;
 use thiserror::Error;
+#[cfg(not(target_arch = "wasm32"))]
 use tiny_keccak::Hasher as _;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -159,36 +173,6 @@ pub struct BlsSignature(pub [u8; 48]);
 #[derive(BorshSerialize, BorshDeserialize, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Ed25519Signature(pub [u8; 64]);
 
-#[cfg(target_arch = "wasm32")]
-impl BlsPublicKey {
-    /// BLS verification requires the host-only `blst` implementation.
-    pub fn verify(&self, _msg: &[u8], _sig: &BlsSignature) -> Result<bool, CryptoError> {
-        Err(bls_unavailable())
-    }
-
-    /// BLS key-binding verification requires the host-only `blst` implementation.
-    pub fn verify_binding(&self, _msg: &[u8], _sig: &BlsSignature) -> Result<bool, CryptoError> {
-        Err(bls_unavailable())
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-impl BlsSignature {
-    /// BLS aggregation requires the host-only `blst` implementation.
-    pub fn aggregate(_sigs: &[Self]) -> Result<Self, CryptoError> {
-        Err(bls_unavailable())
-    }
-
-    /// BLS aggregate verification requires the host-only `blst` implementation.
-    pub fn fast_aggregate_verify(
-        &self,
-        _msg: &[u8],
-        _pubkeys: &[BlsPublicKey],
-    ) -> Result<bool, CryptoError> {
-        Err(bls_unavailable())
-    }
-}
-
 /// serde and display for fixed-size byte arrays as hex (serde derives only support
 /// arrays up to 32 bytes, so these are hand-rolled).
 macro_rules! hex_bytes {
@@ -320,16 +304,11 @@ impl CryptoError {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-fn bls_unavailable() -> CryptoError {
-    CryptoError::UnsupportedAlgorithm("Bls is unavailable on Wasm".into())
-}
-
-/// Hash `data` with the requested algorithm. Wasm-safe (blake3, SHA-256, and
-/// Keccak-256 only involve pure-Rust deps already linked by the guest SDK), and
-/// infallible: every [`HashAlgorithm`] variant always produces a digest. Shared
-/// by the SDK's guest-side `Crypto::hash`.
+/// Hash `data` on the Host with the requested algorithm. Every
+/// [`HashAlgorithm`] variant always produces a digest. Wasm guests request
+/// hashing through Host imports instead of linking these implementations.
 #[must_use]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn hash(algo: HashAlgorithm, data: &[u8]) -> [u8; 32] {
     match algo {
         HashAlgorithm::Blake3 => *blake3::hash(data).as_bytes(),
@@ -352,8 +331,9 @@ pub fn hash(algo: HashAlgorithm, data: &[u8]) -> [u8; 32] {
 /// Verify `sig` over `data` against the given public `key`.
 ///
 /// Returns `Ok(false)` for a valid key with a non-matching signature, and
-/// `Err` for malformed keys or signatures that cannot be parsed. Local BLS
-/// verification is unavailable on Wasm targets.
+/// `Err` for malformed keys or signatures that cannot be parsed. Cryptographic
+/// verification is Host-only; Wasm guests use the binding-aware Host import.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn verify(
     scheme: SignScheme,
     key: &[u8],
@@ -379,25 +359,14 @@ pub fn verify(
             Ok(verifying_key.verify(data, &signature).is_ok())
         }
         SignScheme::Bls => {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let pk = crate::BlsPublicKey(key.try_into().map_err(|_| {
-                    CryptoError::InvalidKeyLength {
-                        expected: 96,
-                        actual: key.len(),
-                    }
+            let pk =
+                crate::BlsPublicKey(key.try_into().map_err(|_| CryptoError::InvalidKeyLength {
+                    expected: 96,
+                    actual: key.len(),
                 })?);
-                let signature =
-                    crate::BlsSignature(sig.try_into().map_err(|_| CryptoError::InvalidSignature)?);
-                pk.verify(data, &signature)
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                let _ = (key, data, sig);
-                Err(CryptoError::UnsupportedAlgorithm(
-                    "Bls is unavailable on Wasm".into(),
-                ))
-            }
+            let signature =
+                crate::BlsSignature(sig.try_into().map_err(|_| CryptoError::InvalidSignature)?);
+            pk.verify(data, &signature)
         }
     }
 }

@@ -5,7 +5,7 @@ use arena0_protocol::{Committed, Ensemble, Event, PeerId};
 use borsh::BorshSerialize;
 use std::sync::Arc;
 
-use crate::GuestSigner;
+use crate::{BlobView, GuestSigner, GuestVerifier};
 
 /// Whether a dispatch event is an agreed event or a local event.
 ///
@@ -18,23 +18,33 @@ pub(crate) enum DispatchKind {
 }
 
 /// Decoded inputs for one resident dispatch: the ABI envelope, the dispatch
-/// kind the guest sees, the committed outgoing length, and the per-dispatch
-/// signer.
-type DispatchParts = (
-    DispatchInput,
-    DispatchKind,
-    usize,
-    Option<Arc<dyn GuestSigner>>,
-);
+/// kind the guest sees, identity, queue lengths, and per-dispatch Host custody.
+/// Host-only values never enter the serialized guest envelope.
+pub(crate) struct DispatchParts {
+    pub(crate) input: DispatchInput,
+    pub(crate) dispatch: DispatchKind,
+    pub(crate) outgoing_len: usize,
+    pub(crate) signer: Option<Arc<dyn GuestSigner>>,
+    pub(crate) verifier: Option<Arc<dyn GuestVerifier>>,
+    pub(crate) peer_id: PeerId,
+    pub(crate) session: Ensemble<Committed>,
+    pub(crate) blobs: Option<Arc<dyn BlobView>>,
+    pub(crate) attachment: Option<Vec<u8>>,
+    pub(crate) direct_queued: Vec<(PeerId, usize)>,
+}
 
 /// One event dispatched through the resident Wasm instance.
 #[derive(Clone)]
 pub struct DispatchCall {
+    pub(crate) blobs: Option<Arc<dyn BlobView>>,
+    pub(crate) attachment: Option<Vec<u8>>,
+    pub(crate) direct_queued: Vec<(PeerId, usize)>,
     pub(crate) peer_id: PeerId,
     pub(crate) session: Ensemble<Committed>,
     pub(crate) event: Event<Vec<u8>>,
     pub(crate) outgoing_len: usize,
     pub(crate) signer: Option<Arc<dyn GuestSigner>>,
+    pub(crate) verifier: Option<Arc<dyn GuestVerifier>>,
 }
 
 impl std::fmt::Debug for DispatchCall {
@@ -45,6 +55,7 @@ impl std::fmt::Debug for DispatchCall {
             .field("session", &self.session)
             .field("event", &self.event)
             .field("signer", &self.signer.is_some())
+            .field("verifier", &self.verifier.is_some())
             .finish()
     }
 }
@@ -60,6 +71,10 @@ impl DispatchCall {
             event,
             outgoing_len: 0,
             signer: None,
+            verifier: None,
+            blobs: None,
+            attachment: None,
+            direct_queued: Vec::new(),
         }
     }
 
@@ -83,6 +98,35 @@ impl DispatchCall {
         self
     }
 
+    /// Install the verifier exposed to this dispatch's `verify` calls. Every
+    /// dispatch kind may carry one; a call without one traps on `verify`.
+    #[must_use]
+    pub fn with_verifier(mut self, verifier: Arc<dyn GuestVerifier>) -> Self {
+        self.verifier = Some(verifier);
+        self
+    }
+
+    /// Expose the executing program's view of the blob store to this dispatch.
+    #[must_use]
+    pub fn with_blobs(mut self, view: Arc<dyn BlobView>) -> Self {
+        self.blobs = Some(view);
+        self
+    }
+
+    /// The bytes behind `Event::DirectReceived { attachment: Some(Attachment(0)), .. }`.
+    #[must_use]
+    pub fn with_attachment(mut self, attachment: Vec<u8>) -> Self {
+        self.attachment = Some(attachment);
+        self
+    }
+
+    /// Current direct queue length per recipient (`ExecutionState::direct_queue_lens`).
+    #[must_use]
+    pub fn with_direct_queued(mut self, queued: Vec<(PeerId, usize)>) -> Self {
+        self.direct_queued = queued;
+        self
+    }
+
     pub(crate) fn into_input(self) -> Result<DispatchParts, crate::SandboxError> {
         let Self {
             peer_id,
@@ -90,6 +134,10 @@ impl DispatchCall {
             event,
             outgoing_len,
             signer,
+            verifier,
+            blobs,
+            attachment,
+            direct_queued,
         } = self;
         let session_bytes = serialize(&session)?;
         let event_bytes = serialize(&event)?;
@@ -97,9 +145,22 @@ impl DispatchCall {
             .map_err(|error| crate::SandboxError::input_limit(error.to_string()))?;
         let dispatch = match event {
             Event::SessionStarted { .. } | Event::MessageReceived { .. } => DispatchKind::Agreed,
-            Event::InputReceived { .. } | Event::TimerFired { .. } => DispatchKind::Local,
+            Event::InputReceived { .. }
+            | Event::TimerFired { .. }
+            | Event::DirectReceived { .. } => DispatchKind::Local,
         };
-        Ok((input, dispatch, outgoing_len, signer))
+        Ok(DispatchParts {
+            input,
+            dispatch,
+            outgoing_len,
+            signer,
+            verifier,
+            peer_id,
+            session,
+            blobs,
+            attachment,
+            direct_queued,
+        })
     }
 }
 
@@ -126,7 +187,7 @@ mod tests {
         )
         .into_input()
         .unwrap()
-        .0;
+        .input;
         assert_eq!(input.peer_id, [1; 32]);
         assert!(borsh::from_slice::<Ensemble<Committed>>(&input.session).is_ok());
     }

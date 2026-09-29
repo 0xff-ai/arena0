@@ -9,11 +9,13 @@
 //! and forwards it unchanged; the guest converts it to concrete DTOs.
 
 use arena0_program::ProgramHash;
+use arena0_protocol::BlobHash;
 use arena0_protocol::{
     CalloutId, ColorDepth, ExecId, NegotiationTarget, ReceiptArtifact, SessionHash,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 
 use crate::events::EventFilter;
 /// One request to the daemon's shared Unix endpoint. Host operations always
@@ -60,6 +62,13 @@ pub enum HostRequest {
     ProgramGet { program: String },
     #[serde(rename = "program.import")]
     ProgramImport { wasm: Vec<u8> },
+    // Blobs. Paths are on the daemon's filesystem. Import links the file in
+    // place: the daemon hashes it once and reads it again only to send or
+    // export ranges; the file must stay unchanged while executions use it.
+    #[serde(rename = "blob.import")]
+    BlobImport { path: PathBuf },
+    #[serde(rename = "blob.export")]
+    BlobExport { hash: BlobHash, path: PathBuf },
     #[serde(rename = "program.remove")]
     ProgramRemove { program: String },
 
@@ -78,6 +87,10 @@ pub enum HostRequest {
         /// schema.
         params: Option<Value>,
         ensemble: EnsembleSpec,
+        /// Stored blobs this participant grants the execution to read, by
+        /// hash. Each must already be imported.
+        #[serde(default)]
+        blobs: Vec<BlobHash>,
     },
     #[serde(rename = "exec.list")]
     ExecList,

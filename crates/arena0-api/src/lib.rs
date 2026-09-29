@@ -96,6 +96,7 @@ mod tests {
                     ensemble: EnsembleSpec::Create {
                         participant_count: 2,
                     },
+                    blobs: vec![],
                 },
                 "exec.new",
             ),
@@ -187,6 +188,7 @@ mod tests {
                     NegotiationId([2u8; 32]),
                 )),
             },
+            blobs: vec![],
         };
         let join_json = serde_json::to_value(&join_request).unwrap();
         assert_eq!(
@@ -234,6 +236,7 @@ mod tests {
                     ensemble: EnsembleSpec::Create {
                         participant_count: 2,
                     },
+                    blobs: vec![],
                 },
                 "params_raw",
             ),

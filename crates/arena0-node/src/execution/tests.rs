@@ -32,6 +32,71 @@ use crate::context::ExecContext;
 const EXEC_ID: ExecId = ExecId([0x44; 32]);
 const NEGOTIATION_ID: NegotiationId = NegotiationId([0x11; 32]);
 
+#[tokio::test(start_paused = true)]
+async fn duplicate_and_gap_direct_frames_are_acked_or_rejected_without_dispatch() {
+    let fixture = Fixture::new(false).await;
+    let mut actor = fixture.prepare_active_actor().await;
+    fixture.commit_session_started(&mut actor).await;
+    let peer = fixture.remote_keys.peer_id();
+    let frame = |seq| ExecFrame::Direct {
+        seq,
+        msg: vec![1],
+        attachment: None,
+    };
+    assert_eq!(actor.accept_frame(peer, frame(1)).await.unwrap(), None);
+    let state = borsh::to_vec(&actor.state).unwrap();
+    assert_eq!(actor.accept_frame(peer, frame(1)).await.unwrap(), None);
+    assert_eq!(
+        actor.accept_frame(peer, frame(3)).await.unwrap(),
+        Some(arena0_transport::ExecDeliveryRejection::Rejected)
+    );
+    assert_eq!(borsh::to_vec(&actor.state).unwrap(), state);
+    assert_eq!(
+        actor.state.direct_arrival(peer, 2),
+        arena0_protocol::DirectArrival::Next
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn direct_frames_wait_while_a_proposal_is_staged() {
+    let fixture = Fixture::new(false).await;
+    let mut actor = fixture.prepare_active_actor().await;
+    assert_eq!(
+        actor
+            .dispatch_event(
+                Event::SessionStarted {
+                    ensemble: actor.ensemble()
+                },
+                DispatchSource::Local
+            )
+            .await
+            .unwrap(),
+        DispatchOutcome::Committed
+    );
+    assert!(actor.state.proposal_commitment().is_some());
+    let state = borsh::to_vec(&actor.state).unwrap();
+    let peer = fixture.remote_keys.peer_id();
+    assert_eq!(
+        actor
+            .accept_frame(
+                peer,
+                ExecFrame::Direct {
+                    seq: 1,
+                    msg: vec![1],
+                    attachment: None
+                }
+            )
+            .await
+            .unwrap(),
+        Some(arena0_transport::ExecDeliveryRejection::NotYet)
+    );
+    assert_eq!(borsh::to_vec(&actor.state).unwrap(), state);
+    assert_eq!(
+        actor.state.direct_arrival(peer, 1),
+        arena0_protocol::DirectArrival::Next
+    );
+}
+
 fn guest_wasm(stem: &str) -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../programs/target/wasm32-unknown-unknown/release")
@@ -175,6 +240,7 @@ impl Fixture {
                     || ExecutionAdmission::create(NEGOTIATION_ID, 2).expect("admission"),
                     |peer| ExecutionAdmission::join(peer.local_keys.peer_id(), NEGOTIATION_ID),
                 ),
+                &[],
                 2,
             )
             .await
@@ -252,6 +318,7 @@ impl Fixture {
                 .handle()
                 .claim_execution(EXEC_ID)
                 .expect("execution writer"),
+            self.store.handle().clone(),
             self.local_transport.clone() as Arc<dyn Transport + Sync>,
         );
         let state = ExecutionActor::ensure_execution(&mut context)
@@ -2338,7 +2405,7 @@ async fn session_started_may_end_the_session() {
 
 #[tokio::test]
 async fn input_broadcast_at_the_payload_bound_is_accepted() {
-    let at_limit = arena0_protocol::execution::MAX_EFFECT_PAYLOAD_BYTES as u32;
+    let at_limit = arena0_protocol::MAX_EFFECT_PAYLOAD_BYTES as u32;
     let fixture = Fixture::with_mode(false, GuestMode::InputBroadcast(at_limit)).await;
     let (messages, observations) = mpsc::channel(32);
     let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
@@ -2355,7 +2422,7 @@ async fn input_broadcast_at_the_payload_bound_is_accepted() {
 
 #[tokio::test]
 async fn input_broadcast_over_the_payload_bound_is_rejected_and_changes_nothing() {
-    let over = arena0_protocol::execution::MAX_EFFECT_PAYLOAD_BYTES as u32 + 1;
+    let over = arena0_protocol::MAX_EFFECT_PAYLOAD_BYTES as u32 + 1;
     let fixture = Fixture::with_mode(false, GuestMode::InputBroadcast(over)).await;
     let mut actor = fixture.prepare_active_actor().await;
     fixture.commit_session_started(&mut actor).await;
@@ -2864,7 +2931,7 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
           (import "arena0" "state_write" (func $state_write (param i32 i32 i32)))
           {extra_imports}
           (memory (export "memory") 1)
-          (global (export "arena0_abi_version") i32 (i32.const 22))
+          (global (export "arena0_abi_version") i32 (i32.const 24))
           (data (i32.const 1024) "\01")
           (data (i32.const 1030) "\02")
           (data (i32.const 1040) "\09")
@@ -3029,6 +3096,7 @@ async fn failed_persist_reloads_state_and_rebuilds_resident_on_next_dispatch() {
             expected: before.version(),
             next: durable.clone(),
             change: Change::Dispatch {
+                blobs: Vec::new(),
                 event: Event::TimerFired {
                     timer: arena0_protocol::TimerPayload::unit(),
                 },

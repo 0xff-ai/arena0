@@ -139,7 +139,7 @@ impl SignerSet {
     /// committed participant count whenever they consume a signer set so that
     /// trailing bytes and bits cannot select an uncommitted participant.
     pub fn validate(&self, participant_count: usize) -> Result<(), String> {
-        let max = crate::negotiation::MAX_PARTICIPANTS;
+        let max = crate::MAX_PARTICIPANTS;
         if participant_count > max {
             return Err(format!(
                 "participant count {participant_count} exceeds maximum {max}"
@@ -175,10 +175,10 @@ impl SignerSet {
 
     /// Build a bitmap from participant indices after checking each index.
     pub fn from_indices(participant_count: usize, indices: &[usize]) -> Result<Self, String> {
-        if participant_count > crate::negotiation::MAX_PARTICIPANTS {
+        if participant_count > crate::MAX_PARTICIPANTS {
             return Err(format!(
                 "participant count {participant_count} exceeds maximum {}",
-                crate::negotiation::MAX_PARTICIPANTS
+                crate::MAX_PARTICIPANTS
             ));
         }
         let mut signers = Self::with_capacity(participant_count);
@@ -195,10 +195,10 @@ impl SignerSet {
 
     /// Build a bitmap with every participant index set.
     pub fn full(participant_count: usize) -> Result<Self, String> {
-        if participant_count > crate::negotiation::MAX_PARTICIPANTS {
+        if participant_count > crate::MAX_PARTICIPANTS {
             return Err(format!(
                 "participant count {participant_count} exceeds maximum {}",
-                crate::negotiation::MAX_PARTICIPANTS
+                crate::MAX_PARTICIPANTS
             ));
         }
         let mut signers = Self(vec![u8::MAX; participant_count.div_ceil(8)]);
@@ -423,7 +423,7 @@ mod tests {
         assert!(SignerSet(vec![0x08]).validate(3).is_err());
         assert!(
             SignerSet::empty()
-                .validate(crate::negotiation::MAX_PARTICIPANTS + 1)
+                .validate(crate::MAX_PARTICIPANTS + 1)
                 .is_err()
         );
         assert!(SignerSet(vec![0x05]).validate(3).is_ok());
@@ -436,9 +436,9 @@ mod tests {
             SignerSet(vec![0x05])
         );
         assert!(SignerSet::from_indices(3, &[3]).is_err());
-        assert!(SignerSet::from_indices(crate::negotiation::MAX_PARTICIPANTS + 1, &[]).is_err());
+        assert!(SignerSet::from_indices(crate::MAX_PARTICIPANTS + 1, &[]).is_err());
         assert_eq!(SignerSet::full(3).expect("full set"), SignerSet(vec![0x07]));
-        assert!(SignerSet::full(crate::negotiation::MAX_PARTICIPANTS + 1).is_err());
+        assert!(SignerSet::full(crate::MAX_PARTICIPANTS + 1).is_err());
     }
 
     #[test]

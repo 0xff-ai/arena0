@@ -10,7 +10,7 @@ use crate::{LocalStateBytes, SharedStateBytes};
 use crate::Capability;
 
 /// Current ABI version. A sandbox rejects modules declaring a different one.
-pub const ABI_VERSION: u32 = 22;
+pub const ABI_VERSION: u32 = 24;
 
 /// Wasm import module name for all arena0 host functions.
 pub const HOST_MODULE: &str = "arena0";
@@ -28,6 +28,12 @@ pub const MAX_CALLOUT_CONTEXT_BYTES: usize = 64 * 1024;
 /// `(signed_bytes, signature)` pair, and a 64-byte Ed25519 signature. A guest
 /// allocates `payload.len() + SIGN_RESULT_OVERHEAD_BYTES` for the result.
 pub const SIGN_RESULT_OVERHEAD_BYTES: usize = 256;
+
+/// Host bytes a synchronous `verify` call adds around the recovered payload:
+/// the Borsh `Result` tag and the payload's `Vec<u8>` length prefix. The
+/// payload is shorter than the signed preimage it sits in, so a guest allocates
+/// `signed_bytes.len() + VERIFY_RESULT_OVERHEAD_BYTES` for the result.
+pub const VERIFY_RESULT_OVERHEAD_BYTES: usize = 8;
 
 /// Bounded, complete JSON bytes at an agent-facing request or projection boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -644,6 +650,35 @@ pub mod imports {
     pub const END_SESSION: &str = "end_session";
     /// Abort the current session.
     pub const ABORT_SESSION: &str = "abort_session";
+    /// BLAKE3 of guest bytes: `(data_ptr, data_len, out_ptr)`; writes 32 bytes.
+    pub const HASH: &str = "hash";
+    /// Seeded permutation of `0..n`: `(seed_ptr, n, out_ptr)`; reads a 32-byte
+    /// seed and writes `n` little-endian `u32`s.
+    pub const PERMUTATION: &str = "permutation";
+    /// Verify a guest signature: `(signed_ptr, signed_len, sig_ptr, sig_len,
+    /// signer_ptr, out_ptr, out_cap) -> len`; reads a 32-byte signer `PeerId`
+    /// and writes a Borsh `Result<Vec<u8>, VerifyError>`.
+    pub const VERIFY: &str = "verify";
+    /// Queue one direct message: `(to_ptr, msg_ptr, msg_len, range_ptr,
+    /// range_len) -> status`; reads a 32-byte `PeerId` and, when `range_len` is
+    /// non-zero, a Borsh `RangeAttachment`. Returns `0`, or `1` when the
+    /// recipient's direct queue is full. Gated by `Capability::Messaging`.
+    pub const SEND_DIRECT: &str = "send_direct";
+    /// Append the dispatch's attachment to the execution's partial object
+    /// `(hash, length)`: `(hash_ptr, length: u64, attachment: u32) -> status`;
+    /// reads a 32-byte `BlobHash`. Status is `0` or a `BlobError` tag plus one.
+    pub const BLOB_APPEND: &str = "blob_append";
+    /// Hash the complete partial object and publish it under its hash:
+    /// `(hash_ptr) -> status`; reads a 32-byte `BlobHash`.
+    pub const BLOB_COMMIT: &str = "blob_commit";
+    /// BLAKE3 chaining value of a blob range or the attachment placed at
+    /// `offset` in a larger input: `(source_ptr, source_len, offset: u64,
+    /// out_ptr) -> status`; reads a Borsh `CvSource`, writes 32 bytes on success.
+    pub const SUBTREE_CV: &str = "subtree_cv";
+    /// BLAKE3 parent node of two chaining values: `(left_ptr, right_ptr,
+    /// root: u32, out_ptr)`; reads 2 x 32 bytes and writes 32. `root != 0`
+    /// yields the root hash instead of a chaining value.
+    pub const MERGE_CV: &str = "merge_cv";
 }
 
 impl Capability {
@@ -651,9 +686,14 @@ impl Capability {
     #[must_use]
     pub fn imports(&self) -> &'static [&'static str] {
         match self {
-            Self::Messaging => &[imports::BROADCAST],
+            Self::Messaging => &[imports::BROADCAST, imports::SEND_DIRECT],
             Self::Timers => &[imports::SET_TIMER],
             Self::Sign { .. } => &[imports::SIGN],
+            Self::Blobs => &[
+                imports::BLOB_APPEND,
+                imports::BLOB_COMMIT,
+                imports::SUBTREE_CV,
+            ],
         }
     }
 }
@@ -670,6 +710,10 @@ pub fn always_available_imports() -> &'static [&'static str] {
         imports::RANDOM,
         imports::END_SESSION,
         imports::ABORT_SESSION,
+        imports::HASH,
+        imports::MERGE_CV,
+        imports::PERMUTATION,
+        imports::VERIFY,
     ]
 }
 
@@ -685,6 +729,10 @@ pub fn all_effect_imports() -> &'static [&'static str] {
         imports::SIGN,
         imports::END_SESSION,
         imports::ABORT_SESSION,
+        imports::SEND_DIRECT,
+        imports::BLOB_APPEND,
+        imports::BLOB_COMMIT,
+        imports::SUBTREE_CV,
     ]
 }
 
@@ -707,7 +755,14 @@ mod tests {
 
     #[test]
     fn imports_for_each_capability() {
-        assert_eq!(Capability::Messaging.imports(), &["broadcast"]);
+        assert_eq!(
+            Capability::Messaging.imports(),
+            &["broadcast", "send_direct"]
+        );
+        assert_eq!(
+            Capability::Blobs.imports(),
+            &["blob_append", "blob_commit", "subtree_cv"]
+        );
         assert_eq!(Capability::Timers.imports(), &["set_timer"]);
         assert_eq!(
             Capability::Sign {
