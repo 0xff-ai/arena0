@@ -22,7 +22,7 @@ use crate::progress::RunProgress;
 /// Longest run error shown to the browser.
 const MAX_ERROR_CHARS: usize = 300;
 
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Default, clap::Args)]
 pub(crate) struct UiArgs {
     /// Borrow a running daemon; never start one.
     #[arg(long)]
@@ -186,7 +186,6 @@ async fn launch(socket: PathBuf, args: LaunchArgs) -> Result<LaunchReply, ErrorR
             program: args.program,
             params: args.params,
             bindings,
-            use_tui: false,
             created: Some(created),
         },
         RunProgress::hidden(),

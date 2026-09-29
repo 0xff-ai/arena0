@@ -1,8 +1,7 @@
 //! Typed coordinated-run progress and its one inline terminal projection.
 //!
 //! The coordinator records real work here. Indicatif owns the transient stderr
-//! line, while Rattles supplies the spinner frames. Full-screen rendering stays
-//! in `tui` and machine results stay on stdout.
+//! line, while Rattles supplies the spinner frames. Machine results stay on stdout.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -24,14 +23,8 @@ pub(crate) enum ProgressMode {
 
 impl ProgressMode {
     #[must_use]
-    pub(crate) const fn for_run(
-        human_output: bool,
-        use_tui: bool,
-        streams_are_terminal: bool,
-    ) -> Self {
-        if use_tui {
-            Self::Hidden
-        } else if human_output && streams_are_terminal {
+    pub(crate) const fn for_run(human_output: bool, streams_are_terminal: bool) -> Self {
+        if human_output && streams_are_terminal {
             Self::Interactive
         } else {
             Self::Plain
@@ -353,22 +346,9 @@ mod tests {
 
     #[test]
     fn modes_keep_animation_out_of_machine_and_nonterminal_runs() {
-        assert_eq!(
-            ProgressMode::for_run(true, false, true),
-            ProgressMode::Interactive
-        );
-        assert_eq!(
-            ProgressMode::for_run(false, false, true),
-            ProgressMode::Plain
-        );
-        assert_eq!(
-            ProgressMode::for_run(true, false, false),
-            ProgressMode::Plain
-        );
-        assert_eq!(
-            ProgressMode::for_run(true, true, true),
-            ProgressMode::Hidden
-        );
+        assert_eq!(ProgressMode::for_run(true, true), ProgressMode::Interactive);
+        assert_eq!(ProgressMode::for_run(false, true), ProgressMode::Plain);
+        assert_eq!(ProgressMode::for_run(true, false), ProgressMode::Plain);
     }
 
     #[tokio::test]

@@ -12,19 +12,15 @@ mod coordinated;
 mod harness_hook;
 mod line_input;
 mod local_daemon;
-mod monitor;
 mod process;
 mod progress;
 mod run;
 mod serve;
 mod setup;
-mod terminal;
-mod tui;
 mod ui;
 mod verify;
 mod watch;
 mod web;
-mod workspace;
 
 use arena0_client::api::Request;
 use std::io::{IsTerminal as _, Write as _};
@@ -34,8 +30,8 @@ use std::process::ExitCode;
 use anyhow::{Context, anyhow, bail};
 use arena0_client::answer;
 use arena0_client::api::{
-    ApiErrorCode, AwaitState, CalloutId, EnsembleSpec, ExecStatus, HostRequest, NextEvent,
-    ReceiptSummary, ResponseOk,
+    AwaitState, CalloutId, EnsembleSpec, ExecStatus, HostRequest, NextEvent, ReceiptSummary,
+    ResponseOk,
 };
 use arena0_client::proto::DaemonClient;
 use arena0_client::protocol::{ExecId, ReceiptTermination, View, Viewport};
@@ -92,7 +88,7 @@ impl Ctx {
 #[command(
     name = "arena0",
     about = "Run local Hosts, inspect executions, and verify receipts",
-    after_help = "Examples:\n  arena0\n  arena0 launch rock-paper-scissors --hosts host-01,host-02\n  arena0 monitor\n  arena0 run rock-paper-scissors --human host-01 --builtin host-02=sample\n  arena0 serve\n  arena0 verify receipt.json\n\nOn a terminal, bare `arena0` opens the local program workspace. `arena0 launch` opens the launcher; adding a program starts a headless emulation; `arena0 monitor` attaches to its daemon. `arena0 serve` keeps Hosts running independently for CLI and API clients.",
+    after_help = "Examples:\n  arena0\n  arena0 launch rock-paper-scissors --hosts host-01,host-02\n  arena0 ui --attach\n  arena0 run rock-paper-scissors --human host-01 --builtin host-02=sample\n  arena0 serve\n  arena0 verify receipt.json\n\nOn a terminal, bare `arena0` opens the browser workspace, like `arena0 ui`. `arena0 launch PROGRAM` starts a headless emulation; `arena0 ui --attach` attaches to its daemon. `arena0 serve` keeps Hosts running independently for CLI and API clients.",
     version
 )]
 struct Cli {
@@ -142,16 +138,16 @@ enum Command {
         #[command(subcommand)]
         command: HookCommand,
     },
-    /// Launch a headless emulation, or open the launcher when PROGRAM is omitted.
+    /// Launch a headless emulation of PROGRAM.
     Launch {
         /// Launch two Codex Participants in the current pane and a new right pane.
         #[arg(
             long,
-            conflicts_with_all = ["program", "hosts", "builtin", "agent", "param"]
+            conflicts_with_all = ["hosts", "builtin", "agent", "param"]
         )]
         agents: bool,
         /// Program name, id, or Wasm path.
-        program: Option<String>,
+        program: String,
         /// Participating Hosts (default: host-01,host-02). Unbound Hosts use external clients.
         #[arg(long, value_delimiter = ',', value_name = "NAME")]
         hosts: Vec<HostName>,
@@ -167,8 +163,6 @@ enum Command {
     },
     /// Open the browser workspace.
     Ui(web::UiArgs),
-    /// Observe the local daemon and optionally answer individual callouts.
-    Monitor(monitor::MonitorArgs),
     /// Show daemon status and its Hosts; --host narrows the report.
     Status,
     /// Stop the local daemon and its Hosts.
@@ -207,7 +201,7 @@ enum Command {
     Run {
         /// Program name, id prefix, full content id, or Wasm path.
         program: String,
-        /// Bind an interactive human driver to this Host (repeatable in the TUI).
+        /// Answer this Host's callouts at the terminal prompt.
         #[arg(long, value_name = "HOST")]
         human: Vec<HostName>,
         /// Bind a deterministic built-in strategy as HOST=STRATEGY.
@@ -219,9 +213,6 @@ enum Command {
         /// Program params as KEY=VALUE (repeatable).
         #[arg(long, value_name = "KEY=VALUE")]
         param: Vec<String>,
-        /// Use inline terminal output instead of the focused TUI.
-        #[arg(long)]
-        no_tui: bool,
     },
 }
 
@@ -368,10 +359,6 @@ fn main() -> ExitCode {
     if let Some(exit) = dispatch_setup(&cli) {
         return exit;
     }
-    if cli.tmp && matches!(cli.command, Some(Command::Monitor(_))) {
-        eprintln!("error: --tmp does not apply to `arena0 monitor`; attach to an existing home");
-        return ExitCode::FAILURE;
-    }
     if cli.tmp && matches!(cli.command, Some(Command::Hello { .. })) {
         eprintln!("error: --tmp does not apply to `arena0 hello`; context Hosts are persistent");
         return ExitCode::FAILURE;
@@ -387,11 +374,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // The monitor renders diagnostics in its own panes; stderr tracing would
-    // overwrite the alternate screen when it shares the terminal.
-    if !matches!(cli.command, Some(Command::Monitor(_))) {
-        init_tracing();
-    }
+    init_tracing();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -533,99 +516,6 @@ fn init_tracing() {
         .try_init();
 }
 
-fn should_use_tui(
-    has_human: bool,
-    no_tui: bool,
-    mode: Mode,
-    streams_are_terminal: bool,
-    tracing_enabled: bool,
-) -> bool {
-    has_human && !no_tui && !mode.is_json() && streams_are_terminal && !tracing_enabled
-}
-
-async fn interactive_workspace() -> anyhow::Result<()> {
-    let hosts = local_daemon::host_names(2);
-    eprintln!("preparing {} local Hosts", hosts.len());
-    let daemon = local_daemon::LocalDaemon::connect_or_start(hosts.clone()).await?;
-    choose_and_run(
-        daemon,
-        workspace::Setup {
-            hosts,
-            fixed_hosts: false,
-            bindings: None,
-            params: None,
-        },
-        None,
-    )
-    .await
-}
-
-async fn choose_and_run(
-    mut daemon: local_daemon::LocalDaemon,
-    setup: workspace::Setup,
-    reference: Option<&str>,
-) -> anyhow::Result<()> {
-    let selected = async {
-        let client = DaemonClient::from_env()?;
-        let (mut programs, executions) = workspace::load(&client, &setup.hosts[0]).await?;
-        if let Some(reference) = reference {
-            let prefix = reference.to_ascii_lowercase();
-            let has_name = programs
-                .iter()
-                .any(|program| program.summary.name == reference);
-            programs.retain(|program| {
-                if has_name {
-                    program.summary.name == reference
-                } else {
-                    program
-                        .summary
-                        .program_hash
-                        .to_string()
-                        .starts_with(&prefix)
-                }
-            });
-        }
-        workspace::choose(programs, executions, setup).await
-    }
-    .await;
-    let selection = match selected {
-        Ok(selection) => selection,
-        Err(error) => return finish_with_daemon(Err(error), daemon).await,
-    };
-    let workspace::Exit::Launch(launch) = selection else {
-        return finish_with_daemon(Ok(()), daemon).await;
-    };
-    if let Err(error) = daemon.ensure_hosts(launch.hosts.clone()).await {
-        return finish_with_daemon(Err(error), daemon).await;
-    }
-    let bindings = match launch.input_control {
-        workspace::InputControl::Configured(bindings) => bindings,
-        control => launch
-            .hosts
-            .into_iter()
-            .map(|host| {
-                let driver = match &control {
-                    workspace::InputControl::AllHosts => coordinated::DriverSpec::Human,
-                    workspace::InputControl::OneHost { host: human } if human == &host => {
-                        coordinated::DriverSpec::Human
-                    }
-                    workspace::InputControl::OneHost { .. } => {
-                        coordinated::DriverSpec::Builtin("sample".to_owned())
-                    }
-                    workspace::InputControl::Configured(_) => {
-                        unreachable!("handled configured bindings")
-                    }
-                };
-                coordinated::DriverBinding::new(host, driver)
-            })
-            .collect(),
-    };
-    let result =
-        run_with_connected_bindings(Mode::Human, launch.program, launch.params, bindings, false)
-            .await;
-    finish_with_daemon(result, daemon).await
-}
-
 async fn run(cli: Cli) -> anyhow::Result<()> {
     let Cli {
         socket,
@@ -643,7 +533,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         && std::io::stdout().is_terminal()
         && std::io::stderr().is_terminal()
     {
-        return interactive_workspace().await;
+        return ui_command(socket, host, tmp, mode, web::UiArgs::default()).await;
     }
     if command.is_none() {
         let mut command = Cli::command();
@@ -679,8 +569,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             return serve::serve(args);
         }
         Command::Setup { .. } => unreachable!("setup returned before runtime setup"),
-        Command::Launch { agents: true, .. } => {
-            return run_agent_launch(socket.as_ref(), host.as_ref(), json).await;
+        Command::Launch {
+            agents: true,
+            program,
+            ..
+        } => {
+            return run_agent_launch(socket.as_ref(), host.as_ref(), json, program).await;
         }
         Command::Launch {
             agents: false,
@@ -693,15 +587,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             if socket.is_some() || host.is_some() {
                 bail!("--socket and --host do not apply to `arena0 launch`; use --hosts");
             }
-            let interactive = !mode.is_json()
-                && std::io::stdin().is_terminal()
-                && std::io::stdout().is_terminal()
-                && std::io::stderr().is_terminal();
-            if program.is_none() && !interactive {
-                bail!("a program is required outside a terminal; use `arena0 launch <program>`");
-            }
-            let fixed_hosts = !hosts.is_empty() || !builtin.is_empty() || !agent.is_empty();
-            let configured = !builtin.is_empty() || !agent.is_empty();
             let bindings = launch_bindings(hosts, builtin, agent)?;
             if bindings.len() < 2 {
                 bail!("an emulation requires at least two distinct Hosts");
@@ -714,18 +599,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     .collect(),
             )
             .await?;
-            let setup = workspace::Setup {
-                hosts: bindings
-                    .iter()
-                    .map(|binding| binding.host.clone())
-                    .collect(),
-                fixed_hosts,
-                bindings: configured.then(|| bindings.clone()),
-                params: params.clone(),
-            };
-            let Some(mut program) = program else {
-                return choose_and_run(daemon, setup, None).await;
-            };
+            let mut program = program;
             let client = DaemonClient::from_env()?;
             if coordinated::wasm_reference(&program).is_none() {
                 let resolved = client
@@ -739,18 +613,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 let resolved = match resolved {
                     Ok(Ok(ResponseOk::Program(detail))) => {
                         Ok(detail.summary.program_hash.to_string())
-                    }
-                    Ok(Err(error)) if error.code == ApiErrorCode::Ambiguous && interactive => {
-                        return choose_and_run(
-                            daemon,
-                            workspace::Setup {
-                                bindings: Some(bindings),
-                                fixed_hosts: true,
-                                ..setup
-                            },
-                            Some(&program),
-                        )
-                        .await;
                     }
                     Ok(Err(error)) => Err(error.into()),
                     Ok(Ok(other)) => Err(anyhow!("unexpected program.get response: {other:?}")),
@@ -767,65 +629,26 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 };
             }
             if !mode.is_json() {
-                eprintln!("preparing headless emulation; attach with `arena0 monitor`");
+                eprintln!("preparing headless emulation; attach with `arena0 ui --attach`");
                 if bindings
                     .iter()
                     .any(|binding| binding.driver == coordinated::DriverSpec::External)
                 {
-                    eprintln!("unbound Hosts wait for an external client or a monitor answer");
+                    eprintln!(
+                        "unbound Hosts wait for an external client or an `arena0 ui --attach` answer"
+                    );
                 }
             }
-            let result = run_with_connected_bindings(mode, program, params, bindings, true).await;
+            let result = run_with_connected_bindings(mode, program, params, bindings).await;
             return finish_with_daemon(result, daemon).await;
         }
-        Command::Ui(args) => {
-            if host.is_some() {
-                bail!("--host does not apply to `arena0 ui`");
-            }
-            if socket.is_some() && !args.attach {
-                bail!("--socket applies to `arena0 ui` only with --attach");
-            }
-            if tmp && args.attach {
-                bail!("--tmp does not apply to `arena0 ui --attach`");
-            }
-            let client = match socket {
-                Some(socket) => DaemonClient::new(socket),
-                None => DaemonClient::from_env()?,
-            };
-            let ctx = Ctx {
-                client,
-                host: HostName::default(),
-                mode,
-                palette: Palette::for_mode(mode),
-            };
-            return web::run(&ctx, args).await;
-        }
-        Command::Monitor(mut args) => {
-            if json || tmp {
-                bail!("--json and --tmp do not apply to `arena0 monitor`");
-            }
-            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-                bail!("arena0 monitor requires a terminal; use `arena0 watch --json` for a stream");
-            }
-            if let Some(host) = host {
-                if !args.hosts.is_empty() {
-                    bail!("use either --host or monitor --hosts to filter Hosts");
-                }
-                args.hosts.push(host);
-            }
-            let client = match socket {
-                Some(socket) => DaemonClient::new(socket),
-                None => DaemonClient::from_env()?,
-            };
-            return monitor::attach(client, args).await;
-        }
+        Command::Ui(args) => return ui_command(socket, host, tmp, mode, args).await,
         Command::Run {
             program,
             human,
             builtin,
             agent,
             param,
-            no_tui,
         } => {
             if socket.is_some() || host.is_some() {
                 bail!("--socket and --host do not apply to coordinated `arena0 run`");
@@ -838,7 +661,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     builtins: builtin,
                     agents: agent,
                     params: param,
-                    no_tui,
                 },
             )
             .await;
@@ -917,8 +739,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Receipt { command } => receipt(&ctx, command).await,
         Command::Verify { target, .. } => verify::verify(&ctx, target).await,
         Command::Run { .. } => unreachable!("coordinated run returned before client construction"),
-        Command::Launch { .. } | Command::Monitor(_) | Command::Ui(_) => {
-            unreachable!("launch/monitor/ui returned before client construction")
+        Command::Launch { .. } | Command::Ui(_) => {
+            unreachable!("launch/ui returned before client construction")
         }
     }
 }
@@ -929,7 +751,6 @@ struct CoordinatedCliArgs {
     builtins: Vec<String>,
     agents: Vec<String>,
     params: Vec<String>,
-    no_tui: bool,
 }
 
 fn launch_bindings(
@@ -974,6 +795,36 @@ fn launch_bindings(
         .collect())
 }
 
+/// Serve the browser workspace: `arena0 ui`, and bare `arena0` on a terminal.
+async fn ui_command(
+    socket: Option<PathBuf>,
+    host: Option<HostName>,
+    tmp: bool,
+    mode: Mode,
+    args: web::UiArgs,
+) -> anyhow::Result<()> {
+    if host.is_some() {
+        bail!("--host does not apply to `arena0 ui`");
+    }
+    if socket.is_some() && !args.attach {
+        bail!("--socket applies to `arena0 ui` only with --attach");
+    }
+    if tmp && args.attach {
+        bail!("--tmp does not apply to `arena0 ui --attach`");
+    }
+    let client = match socket {
+        Some(socket) => DaemonClient::new(socket),
+        None => DaemonClient::from_env()?,
+    };
+    let ctx = Ctx {
+        client,
+        host: HostName::default(),
+        mode,
+        palette: Palette::for_mode(mode),
+    };
+    web::run(&ctx, args).await
+}
+
 async fn coordinated_run(mode: Mode, args: CoordinatedCliArgs) -> anyhow::Result<()> {
     if mode.is_json() && !args.humans.is_empty() {
         bail!("--human cannot be used with --json; bind every Host to --builtin or --agent");
@@ -994,7 +845,7 @@ async fn coordinated_run(mode: Mode, args: CoordinatedCliArgs) -> anyhow::Result
         bindings.push(parse_agent_binding(&binding)?);
     }
     let params = answer::assemble_params(&args.params).map_err(anyhow::Error::msg)?;
-    run_with_bindings(mode, args.program, params, bindings, args.no_tui).await
+    run_with_bindings(mode, args.program, params, bindings).await
 }
 
 fn parse_agent_binding(value: &str) -> anyhow::Result<coordinated::DriverBinding> {
@@ -1017,11 +868,12 @@ async fn run_agent_launch(
     socket: Option<&PathBuf>,
     host: Option<&HostName>,
     json: bool,
+    program: String,
 ) -> anyhow::Result<()> {
     if socket.is_some() || host.is_some() || json {
         bail!("--socket, --host, and --json do not apply to `arena0 launch --agents`");
     }
-    agent_launch::run().await
+    agent_launch::run(&program).await
 }
 
 fn parse_builtin_binding(value: &str) -> anyhow::Result<coordinated::DriverBinding> {
@@ -1045,7 +897,6 @@ async fn run_with_bindings(
     program: String,
     params: Option<Value>,
     bindings: Vec<coordinated::DriverBinding>,
-    no_tui: bool,
 ) -> anyhow::Result<()> {
     if bindings.len() < 2 {
         bail!("a coordinated run requires at least two distinct Hosts");
@@ -1058,7 +909,7 @@ async fn run_with_bindings(
         eprintln!("preparing {} local Hosts", hosts.len());
     }
     let daemon = local_daemon::LocalDaemon::connect_or_start(hosts).await?;
-    let result = run_with_connected_bindings(mode, program, params, bindings, no_tui).await;
+    let result = run_with_connected_bindings(mode, program, params, bindings).await;
     finish_with_daemon(result, daemon).await
 }
 
@@ -1067,26 +918,14 @@ async fn run_with_connected_bindings(
     program: String,
     params: Option<Value>,
     bindings: Vec<coordinated::DriverBinding>,
-    no_tui: bool,
 ) -> anyhow::Result<()> {
-    let has_human = bindings
-        .iter()
-        .any(|binding| matches!(binding.driver, coordinated::DriverSpec::Human));
     let streams_are_terminal = std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
         && std::io::stderr().is_terminal();
     let tracing_enabled = std::env::var_os("RUST_LOG").is_some();
-    let use_tui = should_use_tui(
-        has_human,
-        no_tui,
-        mode,
-        streams_are_terminal,
-        tracing_enabled,
-    );
     let progress = progress::RunProgress::new(
         progress::ProgressMode::for_run(
             matches!(mode, Mode::Human),
-            use_tui,
             streams_are_terminal && !tracing_enabled,
         ),
         Palette::for_stderr(mode),
@@ -1096,7 +935,6 @@ async fn run_with_connected_bindings(
             program: program.clone(),
             params,
             bindings,
-            use_tui,
             created: None,
         },
         progress,
@@ -2062,7 +1900,7 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(Cli::try_parse_from(["arena0", "monitor"]).is_ok());
+        assert!(Cli::try_parse_from(["arena0", "launch"]).is_err());
     }
 
     #[test]
@@ -2110,8 +1948,8 @@ mod tests {
             .is_ok()
         );
         assert!(Cli::try_parse_from(["arena0", "identity"]).is_ok());
-        assert!(Cli::try_parse_from(["arena0", "launch", "--agents"]).is_ok());
-        assert!(Cli::try_parse_from(["arena0", "launch", "chess", "--agents"]).is_err());
+        assert!(Cli::try_parse_from(["arena0", "launch", "chess", "--agents"]).is_ok());
+        assert!(Cli::try_parse_from(["arena0", "launch", "--agents"]).is_err());
         assert!(
             Cli::try_parse_from(["arena0", "exec", "create", "program", "--participants", "2",])
                 .is_ok()
@@ -2170,14 +2008,5 @@ mod tests {
             assert!(parse(missing_separator).is_err());
             assert!(parse(missing_driver).is_err());
         }
-    }
-
-    #[test]
-    fn operational_tracing_and_noninteractive_modes_disable_the_tui() {
-        assert!(should_use_tui(true, false, Mode::Human, true, false));
-        assert!(!should_use_tui(true, false, Mode::Human, true, true));
-        assert!(!should_use_tui(true, true, Mode::Human, true, false));
-        assert!(!should_use_tui(true, false, Mode::Json, true, false));
-        assert!(!should_use_tui(true, false, Mode::Human, false, false));
     }
 }

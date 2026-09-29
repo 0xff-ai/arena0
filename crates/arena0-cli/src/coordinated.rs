@@ -6,8 +6,6 @@
 //! participant, and all asynchronous work is joined by the [`Coordinator`]
 //! before the operation returns.
 
-mod inspection;
-
 use std::collections::HashSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -16,14 +14,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, anyhow, bail};
 use arena0_client::answer;
 use arena0_client::api::{
-    ApiErrorCode, AwaitState, EnsembleSpec, EventData, EventFilter, HostRequest, NextEvent,
-    ProgramDetail, ProgramSummary, ReceiptRef, ReceiptSummary, ReceiptTermination, Request,
-    ResponseOk,
+    ApiErrorCode, AwaitState, EnsembleSpec, HostRequest, NextEvent, ProgramDetail, ProgramSummary,
+    ReceiptRef, ReceiptSummary, ReceiptTermination, Request, ResponseOk,
 };
-use arena0_client::proto::{DaemonClient, Subscription};
+use arena0_client::proto::DaemonClient;
 use arena0_client::protocol::{
-    AbortKind, CalloutId, ColorDepth, ExecId, ExecLifecycle, PeerId, ProgramHash, SessionHash,
-    StopCause, View,
+    AbortKind, ColorDepth, ExecId, ExecLifecycle, PeerId, ProgramHash, SessionHash, StopCause, View,
 };
 use arena0_home::HostName;
 use serde_json::Value;
@@ -32,10 +28,6 @@ use tokio::task::JoinSet;
 
 use crate::agent::{DEFAULT_RESPONSE_TIMEOUT, ExecutableAgent};
 use crate::progress::{RunProgress, RunStage, RunTerminalState};
-use crate::tui::{
-    EVENT_INSPECTION_LIMIT, RunUpdate, TuiCalloutRequest, TuiConfig, TuiDriver, TuiHandle, TuiHost,
-    TuiSession,
-};
 
 const RECEIPT_RETRY_ATTEMPTS: usize = 20;
 const RECEIPT_RETRY_DELAY: Duration = Duration::from_millis(150);
@@ -77,10 +69,9 @@ fn record_stage(
 /// from the order in which these values are supplied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DriverSpec {
-    /// An independently connected MCP or monitor client supplies answers.
+    /// An independently connected MCP or browser workspace client supplies answers.
     External,
-    /// Reserved for the focused TUI path.  The JSON coordinator rejects it
-    /// until a caller supplies an interactive input function.
+    /// Answers at the terminal prompt.  The JSON coordinator rejects it.
     Human,
     /// A deterministic policy selected by the CLI.
     Builtin(String),
@@ -92,7 +83,6 @@ pub(crate) enum DriverSpec {
 enum HumanFrontend {
     None,
     InlineSingle,
-    SharedTui,
 }
 
 /// One validated CLI binding between a named Host and a local driver policy.
@@ -160,7 +150,7 @@ impl ValidatedBindings {
             }
         }
         if human_frontend == HumanFrontend::InlineSingle && human_count > 1 {
-            bail!("inline input supports at most one human driver; use the shared TUI");
+            bail!("inline input supports at most one human driver");
         }
 
         Ok(Self(bindings))
@@ -178,7 +168,6 @@ pub(crate) struct CoordinatedRunArgs {
     pub(crate) program: String,
     pub(crate) params: Option<Value>,
     pub(crate) bindings: Vec<DriverBinding>,
-    pub(crate) use_tui: bool,
     /// Receives each seat's Host and execution once, after every seat's
     /// execution exists. Dropped unsent when the run ends before that.
     pub(crate) created: Option<tokio::sync::oneshot::Sender<Vec<(HostName, ExecId)>>>,
@@ -327,9 +316,7 @@ impl Coordinator {
             .bindings
             .iter()
             .any(|binding| matches!(binding.driver, DriverSpec::Human));
-        let human_frontend = if request.use_tui {
-            HumanFrontend::SharedTui
-        } else if has_human {
+        let human_frontend = if has_human {
             HumanFrontend::InlineSingle
         } else {
             HumanFrontend::None
@@ -385,18 +372,6 @@ impl Coordinator {
         let program_id = program.summary.program_hash;
         validate_participant_count(&program.summary, connections.len())?;
 
-        let tui_subscriptions = if request.use_tui {
-            tokio::select! {
-                result = open_tui_subscriptions(&connections) => result?,
-                reason = wait_for_cancel_reason(&mut signal_received) => {
-                    progress.terminal(RunTerminalState::Cancelled);
-                    return Err(anyhow!(reason));
-                }
-            }
-        } else {
-            Vec::new()
-        };
-
         let started = Instant::now();
         let created = progress
             .during(
@@ -441,97 +416,26 @@ impl Coordinator {
             progress,
         };
         let (cancel, cancelled) = watch::channel(false);
-        let (user_cancel, mut user_cancelled) = watch::channel(None::<String>);
-        let mut tui = if request.use_tui {
-            if !coordinator
-                .participants
-                .iter()
-                .any(|participant| matches!(participant.driver, DriverSpec::Human))
-            {
-                bail!("run TUI requires at least one human driver");
-            }
-            let hosts = coordinator
-                .participants
-                .iter()
-                .map(|participant| TuiHost {
-                    host: participant.host.clone(),
-                    peer_id: participant.peer_id,
-                    driver: match &participant.driver {
-                        DriverSpec::Human => TuiDriver::Human,
-                        DriverSpec::Builtin(strategy) => TuiDriver::Builtin(strategy.clone()),
-                        DriverSpec::Executable(_) => TuiDriver::Agent,
-                        DriverSpec::External => TuiDriver::External,
-                    },
-                })
-                .collect();
-            Some(TuiSession::start(
-                TuiConfig {
-                    program: program.summary.display_name.clone(),
-                    hosts,
-                    message_schema: program
-                        .schema
-                        .messages
-                        .first()
-                        .map(|message| message.borsh.clone()),
-                },
-                user_cancel,
-            ))
-        } else {
-            None
-        };
-        let tui_handle = tui.as_ref().map(TuiSession::handle);
         // One short-lived value per run; boxing the result buys nothing.
         #[allow(clippy::large_enum_variant)]
         enum RunOutcome {
             Finished(anyhow::Result<AggregateResult>),
             Cancelled(anyhow::Result<String>),
         }
-        let mut operation = Box::pin(coordinator.complete(
-            program_id,
-            cancel.clone(),
-            cancelled,
-            tui_handle,
-            tui_subscriptions,
-        ));
+        let mut operation = Box::pin(coordinator.complete(program_id, cancel.clone(), cancelled));
         let outcome = tokio::select! {
             biased;
-            reason = wait_for_cancel_reason(&mut user_cancelled) => RunOutcome::Cancelled(Ok(reason)),
             result = &mut operation => RunOutcome::Finished(result),
             reason = wait_for_cancel_reason(&mut signal_received) => {
                 RunOutcome::Cancelled(Ok(reason))
             },
         };
         match outcome {
-            RunOutcome::Finished(Ok(result)) => {
-                if let Some(tui) = &mut tui {
-                    match &result.terminal {
-                        AggregateTerminal::Completed { outcome } => {
-                            tui.complete(outcome.clone()).await?
-                        }
-                        AggregateTerminal::Stopped => {
-                            tui.stop("run stopped; Host receipts verified".to_owned())
-                                .await?;
-                        }
-                        AggregateTerminal::Failed => {
-                            tui.fail("run failed; Host receipts verified".to_owned())
-                                .await?;
-                        }
-                    }
-                }
-                Ok(result)
-            }
+            RunOutcome::Finished(Ok(result)) => Ok(result),
             RunOutcome::Finished(Err(error)) => {
                 cancel.send_replace(true);
                 let cleanup = coordinator.stop_all().await;
                 let executions = coordinator.execution_refs();
-                if let Some(tui) = &mut tui {
-                    let summary = if cleanup.is_ok() {
-                        format!("run failed: {error:#}; owned executions were stopped")
-                    } else {
-                        format!("run failed: {error:#}; execution cleanup was incomplete")
-                    };
-                    let _ = tui.fail(summary).await;
-                }
                 if let Err(cleanup) = cleanup {
                     return Err(error.context(format!(
                         "execution cleanup was incomplete: {cleanup:#}; durable executions: {executions}"
@@ -547,9 +451,6 @@ impl Coordinator {
                 cancel.send_replace(true);
                 let drained = tokio::time::timeout(Duration::from_secs(3), &mut operation).await;
                 drop(operation);
-                if let Some(tui) = &mut tui {
-                    let _ = tui.close().await;
-                }
                 let cleanup = coordinator.stop_all().await;
                 let executions = coordinator.execution_refs();
                 match (drained, cleanup) {
@@ -579,64 +480,7 @@ impl Coordinator {
         &self,
         program_id: ProgramHash,
         cancel: watch::Sender<bool>,
-        cancelled: watch::Receiver<bool>,
-        tui: Option<TuiHandle>,
-        tui_subscriptions: Vec<Subscription>,
-    ) -> anyhow::Result<AggregateResult> {
-        let Some(tui_handle) = tui.clone() else {
-            return self
-                .complete_inner(program_id, cancel, cancelled, None)
-                .await;
-        };
-        if tui_subscriptions.len() != self.participants.len() {
-            bail!("run TUI lost a Host event subscription");
-        }
-        let sources = self
-            .participants
-            .iter()
-            .zip(tui_subscriptions)
-            .map(|(participant, subscription)| TuiEventSource {
-                host: participant.host.clone(),
-                client: participant.client.clone(),
-                exec_id: participant.exec_id,
-                subscription,
-            })
-            .collect();
-        let (stop_observer, observer_stopped) = watch::channel(false);
-        let operation = self.complete_inner(
-            program_id,
-            cancel,
-            cancelled.clone(),
-            Some(tui_handle.clone()),
-        );
-        let observe = observe_tui(sources, tui_handle, observer_stopped);
-        tokio::pin!(operation);
-        tokio::pin!(observe);
-        tokio::select! {
-            result = &mut operation => {
-                stop_observer.send_replace(true);
-                match (result, observe.await) {
-                    (Ok(result), Ok(())) => Ok(result),
-                    (Err(error), Ok(())) => Err(error),
-                    (Ok(_), Err(error)) => Err(error.context("stop run TUI observation")),
-                    (Err(error), Err(observer)) => Err(error.context(format!(
-                        "run TUI observation cleanup failed: {observer:#}"
-                    ))),
-                }
-            }
-            result = &mut observe => {
-                result?;
-                bail!("run TUI observation stopped before coordinated execution")
-            }
-        }
-    }
-
-    async fn complete_inner(
-        &self,
-        program_id: ProgramHash,
-        cancel: watch::Sender<bool>,
         mut cancelled: watch::Receiver<bool>,
-        tui: Option<TuiHandle>,
     ) -> anyhow::Result<AggregateResult> {
         let started = Instant::now();
         let activated = self
@@ -663,11 +507,7 @@ impl Coordinator {
         let started = Instant::now();
         let driven = self
             .progress
-            .during(
-                RunStage::Execution,
-                0,
-                self.drive(cancel, cancelled, tui.clone()),
-            )
+            .during(RunStage::Execution, 0, self.drive(cancel, cancelled))
             .await;
         record_stage(
             "execute",
@@ -699,7 +539,7 @@ impl Coordinator {
             .during(
                 RunStage::Verification,
                 self.participants.len(),
-                self.verify_receipts(session_id, tui.clone()),
+                self.verify_receipts(session_id),
             )
             .await;
         record_stage(
@@ -764,7 +604,6 @@ impl Coordinator {
         &self,
         cancel: watch::Sender<bool>,
         cancelled: watch::Receiver<bool>,
-        tui: Option<TuiHandle>,
     ) -> anyhow::Result<Vec<HostTerminal>> {
         let mut jobs = JoinSet::new();
         for (index, participant) in self.participants.iter().enumerate() {
@@ -774,11 +613,8 @@ impl Coordinator {
             let driver = participant.driver.clone();
             let cancelled = cancelled.clone();
             let progress = self.progress.clone();
-            let tui = matches!(driver, DriverSpec::Human)
-                .then(|| tui.clone())
-                .flatten();
             jobs.spawn(async move {
-                drive_to_terminal(host, client, exec_id, driver, cancelled, tui, progress)
+                drive_to_terminal(host, client, exec_id, driver, cancelled, progress)
                     .await
                     .map(|terminal| (index, terminal))
             });
@@ -811,39 +647,20 @@ impl Coordinator {
             .collect()
     }
 
-    async fn verify_receipts(
-        &self,
-        session_id: SessionHash,
-        tui: Option<TuiHandle>,
-    ) -> anyhow::Result<Vec<HostEvidence>> {
+    async fn verify_receipts(&self, session_id: SessionHash) -> anyhow::Result<Vec<HostEvidence>> {
         let mut jobs = JoinSet::new();
         for participant in &self.participants {
             let client = participant.client.clone();
             let peer_id = participant.peer_id;
             let host = participant.host.clone();
-            jobs.spawn(async move {
-                verify_one_receipt(host.clone(), client, session_id, peer_id)
-                    .await
-                    .map(|evidence| (host, peer_id, evidence))
-            });
+            jobs.spawn(async move { verify_one_receipt(host, client, session_id, peer_id).await });
         }
 
         let mut evidence = Vec::with_capacity(self.participants.len());
-        let mut verified = 0;
         while let Some(joined) = jobs.join_next().await {
             self.progress.advance();
-            let (host, peer_id, receipt) =
+            let receipt =
                 joined.context("coordinated receipt verification task failed to join")??;
-            verified += 1;
-            if let Some(tui) = &tui {
-                tui.update(RunUpdate::ReceiptVerified { host, peer_id })
-                    .await?;
-                tui.update(RunUpdate::VerificationProgress {
-                    verified,
-                    total: self.participants.len(),
-                })
-                .await?;
-            }
             evidence.push(receipt);
         }
         evidence.sort_by_key(|entry| entry.peer_id);
@@ -969,34 +786,6 @@ async fn connect_hosts(
         connections.push(connection);
     }
     Ok(connections)
-}
-
-async fn open_tui_subscriptions(
-    connections: &[HostConnection],
-) -> anyhow::Result<Vec<Subscription>> {
-    let filter = EventFilter::try_new(vec!["exec.*".to_owned(), "host.*".to_owned()], Vec::new())?;
-    let mut jobs = JoinSet::new();
-    for (index, connection) in connections.iter().enumerate() {
-        let client = connection.client.clone();
-        let host = connection.host.clone();
-        let filter = filter.clone();
-        jobs.spawn(async move {
-            client
-                .subscribe(&host, filter)
-                .await
-                .with_context(|| format!("subscribe to Host '{host}' events"))
-                .map(|subscription| (index, subscription))
-        });
-    }
-    let mut subscriptions = (0..connections.len()).map(|_| None).collect::<Vec<_>>();
-    while let Some(joined) = jobs.join_next().await {
-        let (index, subscription) = joined.context("Host event subscription task failed")??;
-        subscriptions[index] = Some(subscription);
-    }
-    subscriptions
-        .into_iter()
-        .map(|subscription| subscription.ok_or_else(|| anyhow!("missing Host event subscription")))
-        .collect()
 }
 
 /// Resolve a catalog entry on every Host or import one exact Wasm byte buffer
@@ -1393,7 +1182,6 @@ async fn drive_to_terminal(
     exec_id: ExecId,
     driver: DriverSpec,
     mut cancelled: watch::Receiver<bool>,
-    tui: Option<TuiHandle>,
     progress: RunProgress,
 ) -> anyhow::Result<HostTerminal> {
     if driver == DriverSpec::External {
@@ -1437,14 +1225,13 @@ async fn drive_to_terminal(
             () = wait_for_cancel(&mut cancelled) => bail!("coordinated run cancelled while observing {exec_id}"),
         };
     }
-    let mut driver = ActiveDriver::start(driver, tui.clone())?;
+    let mut driver = ActiveDriver::start(driver)?;
     let result = drive_loop(
         &host,
         &client,
         exec_id,
         &mut driver,
         &mut cancelled,
-        tui,
         &progress,
     )
     .await;
@@ -1469,7 +1256,6 @@ async fn drive_loop(
     exec_id: ExecId,
     driver: &mut ActiveDriver,
     cancelled: &mut watch::Receiver<bool>,
-    tui: Option<TuiHandle>,
     progress: &RunProgress,
 ) -> anyhow::Result<HostTerminal> {
     let mut answered = None;
@@ -1484,7 +1270,6 @@ async fn drive_loop(
         match next {
             ResponseOk::Next(NextEvent::Callout {
                 pending_id,
-                callout_index,
                 name,
                 prompt,
                 schema,
@@ -1509,8 +1294,6 @@ async fn drive_loop(
                                 client,
                                 exec_id,
                             },
-                            pending_id,
-                            callout_index,
                             Callout {
                                 name: &name,
                                 prompt: &prompt,
@@ -1556,14 +1339,8 @@ async fn drive_loop(
                         }
                     };
                     match rejected {
-                        None => {
-                            if let ActiveDriver::Human(Some(tui)) = driver {
-                                tui.answer_accepted(host.clone(), exec_id, pending_id)
-                                    .await?;
-                            }
-                            break;
-                        }
-                        Some(error) if matches!(driver, ActiveDriver::Human(_)) => {
+                        None => break,
+                        Some(error) if matches!(driver, ActiveDriver::Human) => {
                             rejection = Some(error.message);
                         }
                         Some(error) => return Err(error.into()),
@@ -1575,12 +1352,6 @@ async fn drive_loop(
                 session_id,
                 outcome,
             }) => {
-                if let Some(tui) = &tui {
-                    tokio::try_join!(
-                        refresh_tui(tui, host, client, exec_id),
-                        refresh_tui_view(tui, host, client, exec_id),
-                    )?;
-                }
                 return Ok(HostTerminal::Completed {
                     session_id,
                     outcome,
@@ -1594,291 +1365,18 @@ async fn drive_loop(
     }
 }
 
-struct TuiEventSource {
-    host: HostName,
-    client: DaemonClient,
-    exec_id: ExecId,
-    subscription: Subscription,
-}
-
-impl TuiEventSource {
-    async fn observe(mut self, tui: &TuiHandle) -> anyhow::Result<()> {
-        loop {
-            let frame = self
-                .subscription
-                .next()
-                .await?
-                .ok_or_else(|| anyhow!("run TUI event stream closed"))?;
-            if frame.exec_id == Some(self.exec_id) {
-                let agreement = match &frame.data {
-                    EventData::SessionStep {
-                        signers,
-                        participants,
-                        ..
-                    } => Some((*signers, *participants)),
-                    _ => None,
-                };
-                let refresh_view = matches!(
-                    &frame.data,
-                    EventData::SessionStarted { .. }
-                        | EventData::SessionCallout { .. }
-                        | EventData::SessionCalloutAnswered { .. }
-                        | EventData::SessionStep { .. }
-                        | EventData::SessionEnded { .. }
-                );
-                tui.update(RunUpdate::SystemEvent { frame }).await?;
-                if let Some((signers, participants)) = agreement {
-                    tui.update(RunUpdate::Agreement {
-                        host: self.host.clone(),
-                        agreed: signers,
-                        total: participants,
-                    })
-                    .await?;
-                }
-                if refresh_view {
-                    tokio::try_join!(
-                        refresh_tui(tui, &self.host, &self.client, self.exec_id),
-                        refresh_tui_view(tui, &self.host, &self.client, self.exec_id),
-                    )?;
-                }
-            } else if matches!(
-                frame.data,
-                EventData::HostStarted { .. }
-                    | EventData::HostStopped { .. }
-                    | EventData::OfferSeen { .. }
-                    | EventData::Lagged { .. }
-            ) {
-                let refresh = matches!(&frame.data, EventData::Lagged { .. });
-                tui.update(RunUpdate::SystemEvent { frame }).await?;
-                if refresh {
-                    tokio::try_join!(
-                        refresh_tui(tui, &self.host, &self.client, self.exec_id),
-                        refresh_tui_view(tui, &self.host, &self.client, self.exec_id),
-                    )?;
-                }
-            }
-        }
-    }
-}
-
-async fn observe_tui(
-    sources: Vec<TuiEventSource>,
-    tui: TuiHandle,
-    mut stopped: watch::Receiver<bool>,
-) -> anyhow::Result<()> {
-    let mut observers = JoinSet::new();
-    let inspection_sources = sources
-        .iter()
-        .map(|source| (source.host.clone(), source.client.clone(), source.exec_id))
-        .collect::<Vec<_>>();
-    refresh_tui_all(&tui, &inspection_sources).await?;
-    let view_sources = inspection_sources.clone();
-    for source in sources {
-        let events_tui = tui.clone();
-        observers.spawn(async move { source.observe(&events_tui).await });
-    }
-    let inspection_tui = tui.clone();
-    let inspection_page_sources = inspection_sources.clone();
-    let width_tui = tui.clone();
-    observers.spawn(async move {
-        let mut tui = width_tui;
-        loop {
-            tui.changed_width().await;
-            refresh_tui_views(&tui, &view_sources).await?;
-        }
-    });
-    observers
-        .spawn(async move { inspection::observe(inspection_tui, inspection_page_sources).await });
-
-    tokio::select! {
-        () = wait_for_cancel(&mut stopped) => {},
-        result = observers.join_next() => match result {
-            Some(result) => {
-                result.context("run TUI observer task failed to join")??;
-                bail!("run TUI observer stopped unexpectedly")
-            }
-            None => bail!("run TUI has no active observers"),
-        },
-    }
-    observers.abort_all();
-    while observers.join_next().await.is_some() {}
-    refresh_tui_inspections(&tui, &inspection_sources).await;
-    Ok(())
-}
-
-async fn refresh_tui(
-    tui: &TuiHandle,
-    host: &HostName,
-    client: &DaemonClient,
-    exec_id: ExecId,
-) -> anyhow::Result<()> {
-    let status = match client
-        .call_host(host, &HostRequest::ExecStatus { exec_id })
-        .await
-        .with_context(|| format!("refresh TUI status for execution {exec_id}"))?
-    {
-        ResponseOk::Status(status) => status,
-        other => bail!("unexpected exec.status response while refreshing TUI: {other:?}"),
-    };
-    tui.update(RunUpdate::Status {
-        host: host.clone(),
-        status: status.clone(),
-    })
-    .await?;
-    if status.session().is_none() {
-        return Ok(());
-    }
-
-    match client
-        .call_host(
-            host,
-            &HostRequest::ExecTrace {
-                exec_id,
-                from: 0,
-                to: u64::MAX,
-            },
-        )
-        .await
-        .with_context(|| format!("refresh TUI trace for execution {exec_id}"))?
-    {
-        ResponseOk::Trace(steps) => {
-            tui.update(RunUpdate::Trace {
-                host: host.clone(),
-                entries: steps.into_iter().map(|step| step.entry).collect(),
-            })
-            .await?
-        }
-        other => bail!("unexpected exec.trace response while refreshing TUI: {other:?}"),
-    }
-
-    Ok(())
-}
-
-async fn refresh_tui_inspection(
-    tui: &TuiHandle,
-    host: &HostName,
-    client: &DaemonClient,
-    exec_id: ExecId,
-    events_from: Option<u64>,
-) -> anyhow::Result<()> {
-    match client
-        .call_host(
-            host,
-            &HostRequest::ExecInspect {
-                exec_id,
-                events_from,
-                events_limit: EVENT_INSPECTION_LIMIT,
-            },
-        )
-        .await
-        .with_context(|| format!("refresh TUI inspection for Host '{host}' execution {exec_id}"))?
-    {
-        ResponseOk::Inspection(inspection) => {
-            tui.update(RunUpdate::Inspection {
-                host: host.clone(),
-                inspection: Box::new(inspection),
-            })
-            .await
-        }
-        other => bail!(
-            "unexpected exec.inspect response while refreshing TUI for Host '{host}': {other:?}"
-        ),
-    }
-}
-
-async fn refresh_tui_all(
-    tui: &TuiHandle,
-    sources: &[(HostName, DaemonClient, ExecId)],
-) -> anyhow::Result<()> {
-    let mut jobs = JoinSet::new();
-    for (host, client, exec_id) in sources.iter().cloned() {
-        let tui = tui.clone();
-        jobs.spawn(async move {
-            tokio::try_join!(
-                refresh_tui(&tui, &host, &client, exec_id),
-                refresh_tui_inspection(&tui, &host, &client, exec_id, None),
-                refresh_tui_view(&tui, &host, &client, exec_id),
-            )?;
-            Ok::<_, anyhow::Error>(())
-        });
-    }
-    while let Some(joined) = jobs.join_next().await {
-        joined.context("TUI Host refresh task failed to join")??;
-    }
-    Ok(())
-}
-
-async fn refresh_tui_inspections(tui: &TuiHandle, sources: &[(HostName, DaemonClient, ExecId)]) {
-    let mut jobs = JoinSet::new();
-    for (host, client, exec_id) in sources.iter().cloned() {
-        let tui = tui.clone();
-        jobs.spawn(
-            async move { refresh_tui_inspection(&tui, &host, &client, exec_id, None).await },
-        );
-    }
-    while let Some(joined) = jobs.join_next().await {
-        if joined.is_err() || joined.is_ok_and(|result| result.is_err()) {
-            tracing::warn!("final TUI inspection refresh failed");
-        }
-    }
-}
-
-async fn refresh_tui_views(
-    tui: &TuiHandle,
-    sources: &[(HostName, DaemonClient, ExecId)],
-) -> anyhow::Result<()> {
-    let mut jobs = JoinSet::new();
-    for (host, client, exec_id) in sources.iter().cloned() {
-        let tui = tui.clone();
-        jobs.spawn(async move { refresh_tui_view(&tui, &host, &client, exec_id).await });
-    }
-    while let Some(joined) = jobs.join_next().await {
-        joined.context("TUI view refresh task failed to join")??;
-    }
-    Ok(())
-}
-
-async fn refresh_tui_view(
-    tui: &TuiHandle,
-    host: &HostName,
-    client: &DaemonClient,
-    exec_id: ExecId,
-) -> anyhow::Result<()> {
-    let Some((step, view)) = client
-        .exec_view(
-            host,
-            exec_id,
-            arena0_client::protocol::Viewport {
-                width: tui.view_width(),
-                color: ColorDepth::Mono,
-            },
-            None,
-        )
-        .await
-        .with_context(|| format!("refresh TUI view for Host '{host}' execution {exec_id}"))?
-    else {
-        return Ok(());
-    };
-    tui.update(RunUpdate::View {
-        host: host.clone(),
-        step,
-        view,
-    })
-    .await
-}
-
 #[derive(Debug)]
 enum ActiveDriver {
-    Human(Option<TuiHandle>),
+    Human,
     Builtin(String),
     Executable(Box<ExecutableAgent>),
 }
 
 impl ActiveDriver {
-    fn start(spec: DriverSpec, tui: Option<TuiHandle>) -> anyhow::Result<Self> {
+    fn start(spec: DriverSpec) -> anyhow::Result<Self> {
         match spec {
             DriverSpec::External => bail!("external executions do not own a local driver"),
-            DriverSpec::Human => Ok(Self::Human(tui)),
+            DriverSpec::Human => Ok(Self::Human),
             DriverSpec::Builtin(strategy) => Ok(Self::Builtin(strategy)),
             DriverSpec::Executable(path) => Ok(Self::Executable(Box::new(ExecutableAgent::spawn(
                 path,
@@ -1890,32 +1388,12 @@ impl ActiveDriver {
     async fn answer(
         &mut self,
         scope: DriverAnswerContext<'_>,
-        pending_id: CalloutId,
-        callout_index: u32,
         callout: Callout<'_>,
         rejection: Option<String>,
         progress: &RunProgress,
     ) -> anyhow::Result<Value> {
         match self {
-            Self::Human(Some(tui)) => {
-                if let Some(reason) = rejection {
-                    tui.retry_answer(scope.host.clone(), scope.exec_id, pending_id, reason)
-                        .await
-                } else {
-                    tui.answer(TuiCalloutRequest {
-                        host: scope.host.clone(),
-                        exec_id: scope.exec_id,
-                        pending_id,
-                        callout_index,
-                        name: callout.name.to_owned(),
-                        prompt: callout.prompt.to_owned(),
-                        context: callout.context.clone(),
-                        schema: callout.schema.clone(),
-                    })
-                    .await
-                }
-            }
-            Self::Human(None) => {
+            Self::Human => {
                 progress.suspend_for_callout();
                 if let Some(reason) = rejection {
                     eprintln!("program rejected answer: {reason}");
@@ -1956,14 +1434,14 @@ impl ActiveDriver {
 
     async fn finish(&mut self) -> anyhow::Result<()> {
         match self {
-            Self::Human(_) | Self::Builtin(_) => Ok(()),
+            Self::Human | Self::Builtin(_) => Ok(()),
             Self::Executable(agent) => agent.finish().await,
         }
     }
 
     async fn abort(&mut self) -> anyhow::Result<()> {
         match self {
-            Self::Human(_) | Self::Builtin(_) => Ok(()),
+            Self::Human | Self::Builtin(_) => Ok(()),
             Self::Executable(agent) => agent.terminate().await,
         }
     }
@@ -1989,7 +1467,7 @@ async fn wait_for_cancel_reason(cancelled: &mut watch::Receiver<Option<String>>)
             return reason;
         }
     }
-    "run TUI closed unexpectedly".to_owned()
+    "run cancellation channel closed unexpectedly".to_owned()
 }
 
 async fn prompt_human(
@@ -2341,6 +1819,7 @@ fn first_allowed_value(
 mod tests {
     use super::*;
     use arena0_client::api::{ApiError, ExecStatus, ExecStatusState, Response, SessionStatus};
+    use arena0_client::protocol::CalloutId;
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
@@ -2724,7 +2203,6 @@ mod tests {
                 exec_id,
                 DriverSpec::Builtin("first-allowed".into()),
                 cancelled,
-                None,
                 test_progress(),
             ),
         )
@@ -2742,120 +2220,6 @@ mod tests {
         assert!(
             matches!(requests.as_slice(), [HostRequest::ExecNext { .. }, HostRequest::ExecSubmit { pending_id: id, .. }, HostRequest::ExecNext { .. }] if *id == pending_id)
         );
-    }
-
-    #[tokio::test]
-    async fn human_driver_retries_a_program_rejection_for_the_same_callout() {
-        let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("input-rejected.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let host = host("host-01");
-        let exec_id = ExecId([0x91; 32]);
-        let session_id = SessionHash([0x92; 32]);
-        let pending_id = CalloutId::new(21);
-        let server = tokio::spawn(serve_script(
-            listener,
-            host.clone(),
-            vec![
-                Ok(ResponseOk::Next(NextEvent::Callout {
-                    pending_id,
-                    callout_index: 0,
-                    name: "Move".into(),
-                    prompt: "Choose a move".into(),
-                    schema: arena0_client::program::JsonSchemaDocument::new(schema(
-                        json!({"type":"string"}),
-                    ))
-                    .unwrap(),
-                    context: Value::Null,
-                })),
-                Err(ApiError::new(ApiErrorCode::InputRejected, "illegal move")),
-                Ok(ResponseOk::Ack),
-                Ok(ResponseOk::Next(NextEvent::Completed {
-                    session_id,
-                    outcome: None,
-                })),
-            ],
-        ));
-        let (tui, mut updates, _pages) = TuiHandle::test_channel();
-        let (cancel, mut cancelled) = watch::channel(false);
-        let run = tokio::spawn(async move {
-            let _cancel = cancel;
-            let client = DaemonClient::new(socket);
-            let mut driver = ActiveDriver::start(DriverSpec::Human, Some(tui)).unwrap();
-            let progress = test_progress();
-            drive_loop(
-                &host,
-                &client,
-                exec_id,
-                &mut driver,
-                &mut cancelled,
-                None,
-                &progress,
-            )
-            .await
-        });
-
-        let first = tokio::time::timeout(Duration::from_secs(3), updates.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let RunUpdate::Callout {
-            reply,
-            pending_id: id,
-            ..
-        } = first
-        else {
-            panic!("expected first callout");
-        };
-        assert_eq!(id, pending_id);
-        reply.send(json!("illegal move")).unwrap();
-
-        let retry = tokio::time::timeout(Duration::from_secs(3), updates.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let RunUpdate::CalloutRejected {
-            reply,
-            reason,
-            pending_id: id,
-            ..
-        } = retry
-        else {
-            panic!("expected rejected callout");
-        };
-        assert_eq!(id, pending_id);
-        assert_eq!(reason, "illegal move");
-        reply.send(json!("legal move")).unwrap();
-
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(3), updates.recv())
-                .await
-                .unwrap(),
-            Some(RunUpdate::CalloutAccepted { pending_id: id, .. }) if id == pending_id
-        ));
-        let terminal = tokio::time::timeout(Duration::from_secs(3), run)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            terminal,
-            HostTerminal::Completed {
-                session_id,
-                outcome: None
-            }
-        );
-        let requests = server.await.unwrap();
-        assert!(matches!(
-            requests.as_slice(),
-            [HostRequest::ExecNext { .. },
-             HostRequest::ExecSubmit { pending_id: first, answer: Some(first_answer), .. },
-             HostRequest::ExecSubmit { pending_id: second, answer: Some(second_answer), .. },
-             HostRequest::ExecNext { .. }]
-             if *first == pending_id && *second == pending_id
-                && first_answer == &json!("illegal move")
-                && second_answer == &json!("legal move")
-        ));
     }
 
     #[tokio::test]
@@ -2906,7 +2270,6 @@ mod tests {
                 exec_id,
                 DriverSpec::Builtin("first-allowed".into()),
                 cancelled,
-                None,
                 test_progress(),
             ),
         )
@@ -2965,7 +2328,6 @@ mod tests {
                 exec_id,
                 DriverSpec::External,
                 cancelled,
-                None,
                 test_progress(),
             ),
         )
@@ -3182,11 +2544,7 @@ mod tests {
 
         let (cancel, cancelled) = watch::channel(false);
         let terminals = progress
-            .during(
-                RunStage::Execution,
-                0,
-                coordinator.drive(cancel, cancelled, None),
-            )
+            .during(RunStage::Execution, 0, coordinator.drive(cancel, cancelled))
             .await
             .expect("scripted execution");
         assert_eq!(terminals.len(), 2);
@@ -3195,7 +2553,7 @@ mod tests {
             .during(
                 RunStage::Verification,
                 coordinator.participants.len(),
-                coordinator.verify_receipts(session_id, None),
+                coordinator.verify_receipts(session_id),
             )
             .await
             .expect("scripted receipt verification");
@@ -3574,7 +2932,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_tui_accepts_multiple_human_hosts_but_inline_input_does_not() {
+    fn inline_input_rejects_multiple_human_hosts() {
         let humans = || {
             vec![
                 DriverBinding::new(host("host-01"), DriverSpec::Human),
@@ -3582,7 +2940,6 @@ mod tests {
             ]
         };
 
-        assert!(ValidatedBindings::new(humans(), HumanFrontend::SharedTui).is_ok());
         assert!(
             ValidatedBindings::new(humans(), HumanFrontend::InlineSingle)
                 .unwrap_err()

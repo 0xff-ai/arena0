@@ -17,13 +17,10 @@ arena0-home = { path = "../arena0-home" }
 arena0-web = { path = "../arena0-web" }
 
 clap = { workspace = true }
-crossterm = { workspace = true }
 futures = { workspace = true }
 indicatif = { workspace = true }
 jsonschema = { workspace = true }
 owo-colors = { workspace = true }
-ratatui = { workspace = true }
-ratatui-textarea = { workspace = true }
 rattles = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
