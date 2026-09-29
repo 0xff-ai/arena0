@@ -1,0 +1,65 @@
+name: Published npm agent demos
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-agent-demos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  demos:
+    name: install and run all demos
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Prepare credential and published version
+        id: setup
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [[ -z "$OPENAI_API_KEY" ]]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "### Published npm agent demos" >> "$GITHUB_STEP_SUMMARY"
+            echo "Skipped until the repository secret \`OPENAI_API_KEY\` is configured." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          umask 077
+          credential="$RUNNER_TEMP/arena0-openai-api-key"
+          printf '%s' "$OPENAI_API_KEY" > "$credential"
+          version=$(npm view @0xff-ai/arena0 version)
+          {
+            echo "available=true"
+            echo "credential=$credential"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run published package through every agent demo
+        if: steps.setup.outputs.available == 'true'
+        env:
+          ARENA0_NPM_VERSION: ${{ steps.setup.outputs.version }}
+        run: ./scripts/test-npm-agent-demos.sh "${{ steps.setup.outputs.credential }}"
+
+      - name: Remove credential
+        if: always() && steps.setup.outputs.available == 'true'
+        run: rm -f -- "${{ steps.setup.outputs.credential }}"
+
+      - name: Upload demo evidence
+        if: always() && steps.setup.outputs.available == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-agent-demos-${{ github.sha }}
+          path: output/npm-agent-demos
+          if-no-files-found: warn
+          retention-days: 14
