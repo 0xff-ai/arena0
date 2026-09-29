@@ -5,6 +5,7 @@ import type { Locator, Page } from "@playwright/test";
 import { type Arena, Evidence, expect, openApp, test, watchConsole } from "../harness";
 
 const evidence = new Evidence("app-composer");
+test.use({ suite: "app-composer" });
 test.afterAll(() => evidence.write());
 
 // The suites share one daemon per worker and build on each other: the launch

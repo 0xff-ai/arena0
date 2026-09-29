@@ -141,3 +141,24 @@ export function Segmented<K extends string>(props: {
     </ToggleButtonGroup>
   );
 }
+
+/** A button that stays pressed, drawn like the default button. */
+export function Toggle(props: {
+  isSelected: boolean;
+  onChange: (selected: boolean) => void;
+  size?: "sm" | "md";
+  children: string;
+}) {
+  return (
+    <ToggleButton
+      isSelected={props.isSelected}
+      onChange={props.onChange}
+      className={cx(
+        button({ size: props.size ?? "sm" }),
+        "selected:border-accent selected:bg-selected",
+      )}
+    >
+      {props.children}
+    </ToggleButton>
+  );
+}

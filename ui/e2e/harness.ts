@@ -25,6 +25,8 @@ const UI_DIR = resolve(import.meta.dirname, "..");
 const BIN = process.env.ARENA0_BIN ?? resolve(UI_DIR, "../target/debug/arena0");
 const ARTIFACTS = resolve(import.meta.dirname, "artifacts");
 const EMBEDDED = process.env.ARENA0_E2E_EMBEDDED === "1";
+/** crates/arena0-daemon/src/exec_manager.rs `NEGOTIATION_TIMEOUT`. */
+const NEGOTIATION_TIMEOUT_MS = 30_000;
 
 export interface Arena {
   /** The page URL, token in the fragment. */
@@ -134,9 +136,15 @@ async function startArena(): Promise<{ arena: Arena; stop(): Promise<void> }> {
   };
 }
 
-export const test = base.extend<{ daemonState: void }, { arena: Arena }>({
+export const test = base.extend<{ daemonState: void }, { arena: Arena; suite: string }>({
+  // Each spec file sets its own `suite`. Workers are keyed by their worker
+  // options, so files never share a worker, and so never share a daemon: a
+  // suite sees only the sessions it seeded.
+  suite: ["", { scope: "worker", option: true }],
   arena: [
-    async ({}, use) => {
+    async ({ suite }, use) => {
+      if (suite === "")
+        throw new Error('call test.use({ suite: "<name>" }) in every live spec file');
       const { arena, stop } = await startArena();
       await use(arena);
       await stop();
@@ -209,13 +217,29 @@ export const seed = {
   },
   /**
    * Start a session where host-01 plays the program's bundled example policy
-   * and host-02 is left to the user: host-02's callouts stay open for the
-   * page to answer. `sample`, not `first-allowed`: which participant moves
-   * first varies per session, and `first-allowed` only answers enum callouts
-   * (chess moves are free-form), so it would abort whenever host-01 moves.
+   * and host-02 is left to the user, and resolve once host-02 has an open
+   * callout for the page to answer. `sample`, not `first-allowed`: which
+   * participant moves first varies per session, and `first-allowed` only
+   * answers enum callouts (chess moves are free-form).
    */
-  awaitingYou(arena: Arena, program: string): void {
+  async awaitingYou(arena: Arena, program: string): Promise<{ execId: string }> {
     arena.spawn(["--json", "launch", program, "--builtin", "host-01=sample"]);
+    // Negotiation alone may take up to the daemon's 30 s negotiation timeout.
+    const deadline = Date.now() + NEGOTIATION_TIMEOUT_MS + 15_000;
+    while (Date.now() < deadline) {
+      const list = JSON.parse(await arena.cli(["--json", "--host", "host-02", "exec", "list"])) as {
+        executions: {
+          exec_id: string;
+          state: { exec_state: string; session?: { pending_callout: unknown } };
+        }[];
+      };
+      const waiting = list.executions.find(
+        (e) => e.state.exec_state === "Active" && e.state.session?.pending_callout != null,
+      );
+      if (waiting !== undefined) return { execId: waiting.exec_id };
+      await new Promise((wake) => setTimeout(wake, 250));
+    }
+    throw new Error(`host-02 has no open ${program} callout after the negotiation deadline`);
   },
 };
 

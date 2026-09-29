@@ -147,6 +147,11 @@
   --text-md--line-height: 20px;
   --text-lg: 16px;
   --text-lg--line-height: 24px;
+  /* Program views: ANSI slots, and board glyphs sized to fill a cell. */
+  --text-code: 12.5px;
+  --text-code--line-height: 18px;
+  --text-glyph: 28px;
+  --text-glyph--line-height: 1;
 
   /* Square-ish corners. Chips and badges use `xs`; controls `sm`; overlays `md`.
      `full` is for dots only. */

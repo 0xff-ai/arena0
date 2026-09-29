@@ -143,3 +143,49 @@ export function JsonView(props: { value: JsonLike; collapseDepth?: number }) {
     </div>
   );
 }
+
+function inlineNodes(value: JsonLike, key?: string): ReactNode {
+  const name =
+    key === undefined ? null : (
+      <>
+        <span className="text-syn-fn">{JSON.stringify(key)}</span>
+        <span className={punct}>: </span>
+      </>
+    );
+  if (value === null || typeof value !== "object") {
+    const tone =
+      typeof value === "string"
+        ? "text-syn-str"
+        : typeof value === "number"
+          ? "text-syn-num"
+          : "text-syn-const";
+    return (
+      <>
+        {name}
+        <span className={tone}>{JSON.stringify(value)}</span>
+      </>
+    );
+  }
+  const entries = Array.isArray(value)
+    ? value.map((item, i) => [String(i), item] as const)
+    : Object.entries(value);
+  const [open, close] = Array.isArray(value) ? ["[", "]"] : ["{", "}"];
+  return (
+    <>
+      {name}
+      <span className={punct}>{open}</span>
+      {entries.map(([k, item], i) => (
+        <span key={k}>
+          {i > 0 && <span className={punct}>, </span>}
+          {inlineNodes(item, Array.isArray(value) ? undefined : k)}
+        </span>
+      ))}
+      <span className={punct}>{close}</span>
+    </>
+  );
+}
+
+/** A value as one syntax-coloured line; the caller truncates it. */
+export function InlineJson(props: { value: JsonLike }) {
+  return <span className="font-mono">{inlineNodes(props.value)}</span>;
+}

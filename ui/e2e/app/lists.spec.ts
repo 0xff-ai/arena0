@@ -3,13 +3,14 @@
 import { Evidence, expect, openApp, seed, test, watchConsole } from "../harness";
 
 const evidence = new Evidence("app-lists");
+test.use({ suite: "app-lists" });
 test.afterAll(() => evidence.write());
 
 test("the list documents show what the daemon holds", async ({ page, arena }) => {
   const problems = watchConsole(page);
   await seed.completed(arena, "rock-paper-scissors");
   await seed.completed(arena, "prisoner-dilemma");
-  seed.awaitingYou(arena, "chess");
+  await seed.awaitingYou(arena, "chess");
   await openApp(page, arena, "/sessions");
 
   const sessions = page.getByRole("grid", { name: "Sessions" });

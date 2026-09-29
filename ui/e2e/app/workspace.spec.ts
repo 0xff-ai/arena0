@@ -3,6 +3,7 @@
 import { Evidence, expect, openApp, seed, test, watchConsole } from "../harness";
 
 const evidence = new Evidence("app-workspace");
+test.use({ suite: "app-workspace" });
 test.afterAll(() => evidence.write());
 
 test("the shell syncs Hosts, programs and a completed session", async ({ page, arena }) => {

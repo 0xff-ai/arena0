@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { Evidence, expect, openApp, seed, test, watchConsole } from "../harness";
 
 const evidence = new Evidence("app-explorer");
+test.use({ suite: "app-explorer" });
 test.afterAll(() => evidence.write());
 
 const SEQUENTIAL_COUNT = resolve(
@@ -14,7 +15,7 @@ const SEQUENTIAL_COUNT = resolve(
 test("explorer, signals and timeline follow the live daemon", async ({ page, arena }) => {
   const problems = watchConsole(page);
   await seed.completed(arena, "rock-paper-scissors");
-  seed.awaitingYou(arena, "chess");
+  await seed.awaitingYou(arena, "chess");
   await openApp(page, arena, "/sessions");
 
   const explorer = page.getByRole("region", { name: "Explorer" });

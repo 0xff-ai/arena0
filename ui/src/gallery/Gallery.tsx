@@ -49,6 +49,7 @@ import {
   Section,
   Segmented,
   Select,
+  Slider,
   Sparkline,
   type StripMark,
   type StripSpan,
@@ -58,6 +59,7 @@ import {
   type TimeBucket,
   TimelineChart,
   ToastRegion,
+  Toggle,
   type Tone,
   Toolbar,
   ToolbarSeparator,
@@ -205,10 +207,12 @@ function Readout(props: { label: string; value: string }) {
 function ButtonSection() {
   const [view, setView] = useState<"list" | "host">("list");
   const [size, setSize] = useState<"sm" | "md">("md");
+  const [step, setStep] = useState(7);
+  const [latest, setLatest] = useState(false);
   return (
     <Sec
       id="button"
-      title="Button, IconButton, Segmented"
+      title="Button, IconButton, Segmented, Toggle, Slider"
       note="Default, primary, ghost and danger at 24 px (sm) and 28 px (md). Every icon-only button carries a tooltip."
     >
       {(["md", "sm"] as const).map((s) => (
@@ -279,6 +283,14 @@ function ButtonSection() {
         />
         <Readout label="view" value={view} />
         <Readout label="size" value={size} />
+      </Demo>
+      <Demo title="Toggle, Slider (a step picker: one tick per step up to 100)">
+        <Slider label="Step" max={12} value={step} onChange={setStep} className="w-64" />
+        <Readout label="step" value={String(step)} />
+        <Toggle isSelected={latest} onChange={setLatest}>
+          Latest
+        </Toggle>
+        <Slider label="Disabled" max={0} value={0} onChange={setStep} isDisabled className="w-40" />
       </Demo>
     </Sec>
   );
