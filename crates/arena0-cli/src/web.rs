@@ -194,13 +194,12 @@ async fn launch(socket: PathBuf, args: LaunchArgs) -> Result<LaunchReply, ErrorR
         seats = seats => match seats {
             Ok(seats) => {
                 // The run keeps driving its seats in the background until the
-                // session ends; its result is reported only in the log.
+                // session ends; the replica shows how it ended. The failure's
+                // chain can quote a seat's answer, so it is not logged.
                 tokio::spawn(async move {
                     match run.await {
                         Ok(Ok(_)) => {}
-                        Ok(Err(failure)) => {
-                            tracing::warn!("launched session ended with an error: {failure:#}");
-                        }
+                        Ok(Err(_)) => tracing::warn!("launched session ended with an error"),
                         Err(_) => tracing::warn!("launched session task failed"),
                     }
                 });

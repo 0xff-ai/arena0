@@ -20,6 +20,10 @@ use crate::protocol::{CallResult, ClientFrame, ErrorCode, ErrorRow, Hello, Serve
 
 /// Queued row frames beyond this drop the queue and resend a snapshot.
 const OUTGOING_FRAMES: usize = 256;
+/// Calls in flight plus replies not yet written. Replies cannot be dropped,
+/// so a browser that keeps calling without reading its replies is
+/// disconnected at this bound instead of growing the queue.
+const PENDING_REPLIES: usize = 256;
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
 
 /// Frames waiting for the writer. Replies are never dropped; row frames are,
@@ -42,6 +46,10 @@ impl Outbox {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn replies_queued(&self) -> usize {
+        self.state().replies.len()
     }
 
     fn reply(&self, frame: String) {
@@ -155,6 +163,9 @@ pub(crate) async fn serve(socket: WebSocket, gateway: Arc<Gateway>) {
             _ = &mut writer => break,
             message = stream.next() => match message {
                 Some(Ok(Message::Text(text))) => {
+                    if calls.len() + outbox.replies_queued() >= PENDING_REPLIES {
+                        break;
+                    }
                     match serde_json::from_str::<ClientFrame>(text.as_str()) {
                         Ok(ClientFrame::Call { id, op }) => {
                             let gateway = gateway.clone();

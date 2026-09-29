@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
 use arena0_api::{
-    ApiError, ApiErrorCode, AwaitState, EventData, EventFilter, EventFrame, ExecStatus,
-    HostRequest, NextEvent, ProgramDetail, Request, ResponseOk, SessionTerminal,
+    ApiError, ApiErrorCode, AwaitState, EventData, EventFilter, EventFrame, ExecEndPhase,
+    ExecStatus, HostRequest, NextEvent, ProgramDetail, Request, ResponseOk, SessionTerminal,
 };
 use arena0_client::proto::{DaemonClient, is_connect_error};
 use arena0_program::ProgramHash;
@@ -59,6 +59,10 @@ struct Cursor {
     last_certified_ms: Option<u64>,
     open_callout: Option<String>,
     terminal: bool,
+    /// The end handshake is waiting for peers. No event reports its
+    /// confirmations or its deadline, so the execution is polled until it
+    /// leaves this phase, even after it is terminal.
+    ending: bool,
     terminal_read: bool,
     activation: Option<ActivationRow>,
 }
@@ -126,6 +130,7 @@ impl Reader<'_> {
             Err(error) => return Err(error),
         };
         cursor.terminal = status.lifecycle().is_terminal();
+        cursor.ending = status.end.phase == ExecEndPhase::Ending;
         let exec_text = exec_id.to_string();
 
         let mut steps = Vec::new();
@@ -561,13 +566,13 @@ impl Worker {
         self.send(Update::Receipts(rows)).await
     }
 
-    /// Every non-terminal execution's status, so a missed event heals within
-    /// two seconds.
+    /// Every non-terminal or still-ending execution's status, so a missed
+    /// event heals within two seconds.
     async fn poll(&mut self) -> anyhow::Result<()> {
         let live: Vec<(ExecId, Cursor)> = self
             .cursors
             .iter()
-            .filter(|(_, cursor)| !cursor.terminal)
+            .filter(|(_, cursor)| !cursor.terminal || cursor.ending)
             .map(|(id, cursor)| (*id, cursor.clone()))
             .collect();
         let reader = Reader {
@@ -576,15 +581,22 @@ impl Worker {
             programs: &self.programs,
         };
         let reads: Vec<_> = futures::stream::iter(live)
-            .map(|(exec_id, cursor)| reader.read_exec(exec_id, cursor, false))
+            .map(|(exec_id, cursor)| {
+                let was_terminal = cursor.terminal;
+                let reader = &reader;
+                async move {
+                    let read = reader.read_exec(exec_id, cursor, false).await;
+                    (was_terminal, read)
+                }
+            })
             .buffered(READ_CONCURRENCY)
             .collect()
             .await;
         let mut ended = false;
-        for read in reads {
+        for (was_terminal, read) in reads {
             match read {
                 Ok(Some(read)) => {
-                    ended |= read.cursor.terminal;
+                    ended |= read.cursor.terminal && !was_terminal;
                     self.publish(read).await?;
                 }
                 Ok(None) => {}
