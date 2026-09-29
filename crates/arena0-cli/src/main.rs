@@ -1309,7 +1309,6 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
             let exec_id = ExecId(rand::random());
             let created = ctx
                 .call_raw(&HostRequest::ExecNew {
-                    strategy: None,
                     exec_id,
                     program,
                     params,

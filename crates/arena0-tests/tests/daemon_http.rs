@@ -15,10 +15,6 @@ use common::{call, call_daemon, daemon, import, ok, rps_wasm};
 async fn rpc_answers_like_the_socket() {
     let d = daemon(&rps_wasm()).await;
     assert_eq!(
-        rpc(d.http, &Request::StrategyList).await,
-        call_daemon(&d.socket, &Request::StrategyList).await
-    );
-    assert_eq!(
         rpc(d.http, &Request::HostsList).await,
         call_daemon(&d.socket, &Request::HostsList).await
     );
@@ -284,7 +280,6 @@ async fn events_stream_all_hosts() {
     ok(rpc(
         d.http,
         &d.host_a.request(&HostRequest::ExecNew {
-            strategy: None,
             exec_id,
             program: d.program_id.to_string(),
             params: Some(serde_json::Value::Null),

@@ -116,6 +116,30 @@ as ordinary params. The Host never logs blob bytes. The CLI wraps these as
 `arena0 blob import FILE`, `arena0 blob export HASH FILE`, `arena0 blob list`,
 and `arena0 exec create PROGRAM --blob HASH` (repeatable).
 
+## Open offers
+
+`negotiation.offers` is a Host request with no params. It returns
+`Offers(Vec<OpenOffer>)`, ordered by `(program_id, creator, negotiation_id)`.
+Each `OpenOffer` contains `program_id`, `negotiation_id`, `creator`, `offer_seq`,
+`target_size`, `params` (JSON), `deadline_unix_ms`, and `first_seen_ms` (the local
+Unix-millisecond time this Host first observed that negotiation).
+
+Each Host watches every program in its catalog, including programs imported
+after startup. The list contains other peers' offers authenticated by the
+creator's Active ticket; the Host's own offers are excluded. Discovery does
+not initialize the guest: a Join still checks whether the offered params and
+initial state are usable before accepting. Use the listed `creator` and
+`negotiation_id` as an `exec.new` Join target.
+
+New entries emit `negotiation.offer_seen`. Completion, expiration, and catalog
+removal emit `negotiation.offer_closed` with `complete`, `expired`, or `unwatched`.
+Listing removes expired entries immediately; otherwise a five-second sweep
+expires them. The list holds at most 256 offers, evicting the oldest local
+observation without a closure event when full. Refresh the list to reconcile
+capacity eviction or a lagged event stream. A newer or equal offer sequence
+updates an entry without changing its first-seen time or emitting another
+`offer_seen` event.
+
 ## Execution
 
 | Method | Params | Success |

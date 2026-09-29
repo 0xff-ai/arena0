@@ -225,7 +225,6 @@ async fn admission_grants_are_validated_and_part_of_request_identity() {
                 params.clone(),
                 admission.clone(),
                 &[b, a, a],
-                None,
                 2
             )
             .await
@@ -242,28 +241,14 @@ async fn admission_grants_are_validated_and_part_of_request_identity() {
     );
     assert_eq!(
         writer
-            .create_execution_request(
-                program_hash,
-                params.clone(),
-                admission.clone(),
-                &[a, b],
-                None,
-                3
-            )
+            .create_execution_request(program_hash, params.clone(), admission.clone(), &[a, b], 3)
             .await
             .unwrap(),
         ExecutionRequestOutcome::AlreadyExists
     );
     assert_eq!(
         writer
-            .create_execution_request(
-                program_hash,
-                params.clone(),
-                admission.clone(),
-                &[a],
-                None,
-                3
-            )
+            .create_execution_request(program_hash, params.clone(), admission.clone(), &[a], 3)
             .await
             .unwrap(),
         ExecutionRequestOutcome::Conflict
@@ -272,7 +257,7 @@ async fn admission_grants_are_validated_and_part_of_request_identity() {
     let mut other = shared.claim_execution(other_id).unwrap();
     let unknown = arena0_protocol::BlobHash([0xff; 32]);
     assert!(
-        matches!(other.create_execution_request(program_hash, params, admission, &[a, unknown], None, 4).await, Err(StoreError::BlobNotFound(hash)) if hash == unknown)
+        matches!(other.create_execution_request(program_hash, params, admission, &[a, unknown], 4).await, Err(StoreError::BlobNotFound(hash)) if hash == unknown)
     );
     assert!(other.load_execution_request().await.unwrap().is_none());
     assert_eq!(shared.blob_granted_blocking(other_id, a).unwrap(), None);
@@ -717,7 +702,6 @@ async fn owned_received_content_replaces_a_link() {
             Some(JsonBytes::try_new(br#"{}"#.to_vec()).unwrap()),
             ExecutionAdmission::create(NegotiationId([0x11; 32]), 2).unwrap(),
             &[],
-            None,
             2,
         )
         .await
@@ -876,7 +860,6 @@ async fn create_execution(path: &Path, fixture: &ActivationFixture, execution_id
             Some(JsonBytes::try_new(br#"{}"#.to_vec()).expect("params")),
             ExecutionAdmission::create(NegotiationId([0x11; 32]), 2).expect("admission"),
             &[],
-            None,
             2,
         )
         .await
@@ -1319,7 +1302,6 @@ async fn failed_rollback_closes_store_calls() {
             Some(JsonBytes::try_new(b"{}".to_vec()).expect("params")),
             creator_admission(NegotiationId([1; 32])),
             &[],
-            None,
             2,
         )
         .await;
@@ -1502,40 +1484,19 @@ async fn request_is_idempotent_and_salt_is_durable() {
         .expect("execution writer");
     assert_eq!(
         writer
-            .create_execution_request(
-                hash,
-                Some(params.clone()),
-                admission.clone(),
-                &[],
-                Some("sample".into()),
-                2
-            )
+            .create_execution_request(hash, Some(params.clone()), admission.clone(), &[], 2)
             .await
             .expect("request"),
         ExecutionRequestOutcome::Created
     );
     assert_eq!(
         writer
-            .create_execution_request(
-                hash,
-                Some(params.clone()),
-                admission.clone(),
-                &[],
-                Some("sample".into()),
-                3
-            )
+            .create_execution_request(hash, Some(params.clone()), admission.clone(), &[], 3)
             .await
             .expect("retry"),
         ExecutionRequestOutcome::AlreadyExists
     );
     let first = writer.load_or_create_execution_salt(4).await.expect("salt");
-    assert_eq!(
-        writer
-            .create_execution_request(hash, Some(params), admission, &[], None, 3)
-            .await
-            .expect("strategy conflict"),
-        ExecutionRequestOutcome::Conflict
-    );
     let second = writer
         .load_or_create_execution_salt(5)
         .await
@@ -1548,15 +1509,6 @@ async fn request_is_idempotent_and_salt_is_durable() {
         .handle()
         .claim_execution(id)
         .expect("execution writer after reopen");
-    assert_eq!(
-        writer
-            .load_execution_request()
-            .await
-            .unwrap()
-            .unwrap()
-            .strategy(),
-        Some("sample")
-    );
     assert_eq!(
         writer
             .load_or_create_execution_salt(6)
@@ -1592,7 +1544,6 @@ async fn persisted_zero_execution_salt_is_store_corruption() {
             Some(JsonBytes::try_new(br#"{}"#.to_vec()).expect("params")),
             ExecutionAdmission::create(NegotiationId([0x74; 32]), 2).expect("admission"),
             &[],
-            None,
             2,
         )
         .await
@@ -1650,7 +1601,6 @@ async fn creator_admission_requires_params() {
             None,
             creator_admission(NegotiationId([0x72; 32])),
             &[],
-            None,
             2,
         )
         .await;
@@ -1696,7 +1646,6 @@ async fn create_admission_rejects_invalid_participant_counts() {
                     participant_count,
                 },
                 &[],
-                None,
                 2,
             )
             .await;
@@ -1745,7 +1694,6 @@ async fn join_preferred_params_must_match_creator_activation() {
             Some(JsonBytes::try_new(br#"{"preferred":true}"#.to_vec()).expect("params")),
             ExecutionAdmission::join(fixture.producer, NegotiationId([0x11; 32])),
             &[],
-            None,
             2,
         )
         .await
@@ -1781,7 +1729,7 @@ async fn open_join_target_binding_is_compare_and_set_and_durable() {
         .claim_execution(execution_id)
         .expect("execution writer");
     writer
-        .create_execution_request(hash, None, ExecutionAdmission::join_open(), &[], None, 2)
+        .create_execution_request(hash, None, ExecutionAdmission::join_open(), &[], 2)
         .await
         .expect("request");
     let request = writer
@@ -1820,7 +1768,7 @@ async fn open_join_target_binding_is_compare_and_set_and_durable() {
         .claim_execution(failed_execution_id)
         .expect("failed execution writer");
     failed_writer
-        .create_execution_request(hash, None, ExecutionAdmission::join_open(), &[], None, 3)
+        .create_execution_request(hash, None, ExecutionAdmission::join_open(), &[], 3)
         .await
         .expect("failed request");
     assert_eq!(
@@ -1881,7 +1829,6 @@ async fn join_without_params_survives_reopen_recovery() {
             None,
             ExecutionAdmission::join(fixture.producer, NegotiationId([0x11; 32])),
             &[],
-            None,
             2,
         )
         .await
@@ -2013,7 +1960,6 @@ async fn request_failure_is_compare_and_set() {
             Some(JsonBytes::try_new(b"null".to_vec()).expect("json")),
             admission,
             &[],
-            None,
             1,
         )
         .await
@@ -2069,7 +2015,6 @@ async fn request_failure_cannot_compete_with_activation_authority() {
             Some(JsonBytes::try_new(br#"{}"#.to_vec()).expect("params")),
             ExecutionAdmission::create(NegotiationId([0x11; 32]), 2).expect("admission"),
             &[],
-            None,
             2,
         )
         .await
@@ -2130,7 +2075,6 @@ async fn recovery_projection_filters_terminal_history_before_paging() {
                 Some(JsonBytes::try_new(b"null".to_vec()).expect("params")),
                 creator_admission(NegotiationId([index; 32])),
                 &[],
-                None,
                 u64::from(index),
             )
             .await
@@ -2195,7 +2139,6 @@ async fn recovery_projection_pages_a_maximal_execution_state() {
             Some(JsonBytes::try_new(br#"{}"#.to_vec()).expect("params")),
             ExecutionAdmission::create(NegotiationId([0x11; 32]), 2).expect("admission"),
             &[],
-            None,
             2,
         )
         .await
@@ -2275,7 +2218,6 @@ async fn activation_prepare_commit_is_idempotent_and_recoverable() {
             Some(JsonBytes::try_new(b"{}".to_vec()).expect("json")),
             admission,
             &[],
-            None,
             1,
         )
         .await
@@ -2986,7 +2928,6 @@ async fn activation_cannot_exceed_durable_admission_authority() {
             Some(JsonBytes::try_new(b"{}".to_vec()).expect("json")),
             creator,
             &[],
-            None,
             2,
         )
         .await
@@ -3009,7 +2950,6 @@ async fn activation_cannot_exceed_durable_admission_authority() {
             Some(JsonBytes::try_new(b"{}".to_vec()).expect("json")),
             ExecutionAdmission::join(PeerId([0xfe; 32]), NegotiationId([0x11; 32])),
             &[],
-            None,
             4,
         )
         .await

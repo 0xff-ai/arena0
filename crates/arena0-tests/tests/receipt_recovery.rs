@@ -64,7 +64,6 @@ async fn recover_after(cut: CrashAfter) {
                 Some(params.clone()),
                 ExecutionAdmission::create(negotiation_id, peers.len() as u16).unwrap(),
                 &[],
-                None,
                 2,
             )
             .await

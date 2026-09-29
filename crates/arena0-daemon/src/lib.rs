@@ -18,13 +18,13 @@ mod exec_manager;
 mod http;
 mod mcp;
 mod mcp_auth;
+mod offers;
 mod paths;
 mod run;
 mod schema;
 mod server;
 mod startup;
 mod store;
-mod strategy;
 mod system_event;
 mod ui_assets;
 

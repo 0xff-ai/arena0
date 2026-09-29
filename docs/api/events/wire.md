@@ -122,6 +122,10 @@ An empty or absent `include` selects all catalog tags. An empty or absent
 
 ### `negotiation.offer_seen`
 
+Emitted when an authenticated offer from another peer is added to this Host's
+open offers. Catalog watchers emit it even when no local Join is listening.
+Updates to an existing entry do not emit it again.
+
 ```json
 {
   "host": {
@@ -141,6 +145,14 @@ An empty or absent `include` selects all catalog tags. An empty or absent
   }
 }
 ```
+
+### `negotiation.offer_closed`
+
+Uses the same Host-local envelope as `negotiation.offer_seen`, with no execution
+or session correlation. Its `data` contains `program_id`, `negotiation_id`,
+`creator`, and `reason`: `complete`, `expired`, or `unwatched`. It reports a
+listed offer completing, passing its deadline, or losing its watched catalog
+program. Capacity eviction is not a closure and emits no event.
 
 ### `exec.created`
 

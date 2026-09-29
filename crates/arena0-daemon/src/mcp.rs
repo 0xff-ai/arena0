@@ -644,7 +644,6 @@ impl Arena0Mcp {
             .request(
                 &authorized,
                 HostRequest::ExecNew {
-                    strategy: None,
                     exec_id,
                     program: arg.program.program_id,
                     params: arg.params,

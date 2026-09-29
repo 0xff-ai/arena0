@@ -1827,7 +1827,6 @@ mod tests {
                 Some(arena0_program::JsonBytes::try_new(params.clone()).expect("params")),
                 ExecutionAdmission::create(negotiation_id, 2).expect("admission"),
                 &[],
-                None,
                 1,
             )
             .await
@@ -2162,7 +2161,6 @@ mod tests {
                 Some(arena0_program::JsonBytes::try_new(params.clone()).expect("params")),
                 ExecutionAdmission::create(negotiation_id, 2).expect("creator admission"),
                 &[],
-                None,
                 1,
             )
             .await
@@ -2296,7 +2294,6 @@ mod tests {
                 Some(arena0_program::JsonBytes::try_new(params.clone()).expect("params")),
                 ExecutionAdmission::join(creator_peer, negotiation_id),
                 &[],
-                None,
                 1,
             )
             .await

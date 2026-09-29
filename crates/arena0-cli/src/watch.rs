@@ -112,6 +112,7 @@ pub(crate) fn render_frame(
                     .unwrap_or_default()
             )
         }
+        EventData::OfferClosed { reason, .. } => format!("offer closed: {reason:?}"),
         EventData::OfferSeen {
             program_id,
             negotiation_id,

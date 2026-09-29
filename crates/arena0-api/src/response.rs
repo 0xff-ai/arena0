@@ -24,6 +24,8 @@ pub enum ResponseOk {
     Id(IdInfo),
     Program(Box<ProgramDetail>),
     ProgramList(Vec<ProgramSummary>),
+    /// Open offers ordered by `(program_id, creator, negotiation_id)`.
+    Offers(Vec<OpenOffer>),
     BlobImported {
         hash: BlobHash,
         length: u64,
@@ -46,7 +48,6 @@ pub enum ResponseOk {
         queue_position: Option<usize>,
     },
     ExecList(Vec<ExecListEntry>),
-    StrategyList(Vec<StrategyInfo>),
     Status(ExecStatus),
     /// `exec.inspect`: an additive, bounded local diagnostic projection.
     Inspection(ExecutionInspection),
@@ -87,6 +88,23 @@ pub enum ResponseOk {
     Hosts(Vec<HostStatus>),
     HostStatus(HostStatus),
     HostOpened(HostInfo),
+}
+
+/// An offer another peer published on a program topic this Host watches,
+/// authenticated by the creator's ticket and not yet complete or expired.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OpenOffer {
+    pub program_id: ProgramHash,
+    pub negotiation_id: NegotiationId,
+    pub creator: PeerId,
+    pub offer_seq: u64,
+    pub target_size: u16,
+    /// Offer params as JSON; every joiner signs these terms.
+    pub params: Value,
+    pub deadline_unix_ms: u64,
+    /// Local time this Host first saw this negotiation, Unix milliseconds.
+    pub first_seen_ms: u64,
 }
 
 /// Public metadata for one Host. The local id locates its namespace; the peer
@@ -282,13 +300,6 @@ pub enum ExecStatusState {
 pub struct ExecListEntry {
     pub status: ExecStatus,
     pub activation: Option<ActivationInspection>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct StrategyInfo {
-    pub name: String,
-    pub description: String,
 }
 
 /// Session facts retained after a session starts.

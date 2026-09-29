@@ -90,6 +90,14 @@ pub enum SessionTerminal {
     Aborted { step: u64, reason: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfferClosedReason {
+    Complete,
+    Expired,
+    Unwatched,
+}
+
 /// Event-specific payload. The serde tag is flattened into [`EventFrame`],
 /// producing top-level `kind` and nested `data` fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -107,12 +115,20 @@ pub enum EventData {
         reason: Option<String>,
         uptime_secs: u64,
     },
+    /// Added to this Host's open offers, independently of any local Join.
     #[serde(rename = "negotiation.offer_seen")]
     OfferSeen {
         program_id: ProgramHash,
         negotiation_id: NegotiationId,
         creator: PeerId,
         offer_seq: u64,
+    },
+    #[serde(rename = "negotiation.offer_closed")]
+    OfferClosed {
+        program_id: ProgramHash,
+        negotiation_id: NegotiationId,
+        creator: PeerId,
+        reason: OfferClosedReason,
     },
     #[serde(rename = "exec.created")]
     Created {
@@ -208,6 +224,7 @@ impl EventData {
             Self::HostStarted { .. } => "host.started",
             Self::HostStopped { .. } => "host.stopped",
             Self::OfferSeen { .. } => "negotiation.offer_seen",
+            Self::OfferClosed { .. } => "negotiation.offer_closed",
             Self::Created { .. } => "exec.created",
             Self::Terminated { .. } => "exec.terminated",
             Self::NegotiationStarted { .. } => "exec.negotiation.started",
@@ -441,6 +458,7 @@ const CATALOG: &[&str] = &[
     "host.started",
     "host.stopped",
     "negotiation.offer_seen",
+    "negotiation.offer_closed",
     "exec.created",
     "exec.terminated",
     "exec.negotiation.started",

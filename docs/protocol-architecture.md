@@ -237,6 +237,18 @@ expires does not withdraw or finish the durable execution.
 
 ## 7. Negotiation and activation
 
+Every Host watches the negotiation topic for each program in its catalog,
+starting after recovery and updating subscriptions on import and removal.
+Watchers pair offers with the creator's authenticated Active ticket using the
+same structural checks as Join, excluding local and complete offers; a Join
+separately checks guest initialization before acceptance. The Host exposes a
+bounded, in-memory list through `negotiation.offers`, emitting Host-local events
+when entries are first seen or close. An offer leaves the list as complete only
+when every ticket it lists has been seen and verified; otherwise it stays until
+its deadline. Removed programs close their entries immediately; list requests
+and a five-second sweep remove expired entries. All watcher and sweep tasks
+stop with their Host.
+
 The offer is self-contained:
 
 ```text

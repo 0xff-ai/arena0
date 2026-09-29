@@ -384,7 +384,6 @@ impl Arena {
                     Some(JsonBytes::try_new(creator_params.clone()).expect("valid request params")),
                     admission,
                     &grants[i],
-                    None,
                     unix_time_ms(),
                 )
                 .await

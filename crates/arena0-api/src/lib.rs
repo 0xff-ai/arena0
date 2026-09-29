@@ -27,7 +27,7 @@ pub use arena0_protocol::{
 };
 pub use events::{
     EventData, EventFilter, EventFrame, ExecOrigin, ExecutionFailureKind, NegotiationStage,
-    SessionTerminal,
+    OfferClosedReason, SessionTerminal,
 };
 pub use http::Uploaded;
 pub use request::{
@@ -37,8 +37,8 @@ pub use response::{
     ActivationInspection, ActivationInspectionState, ActivationParticipant, AgreedStep, ApiError,
     ApiErrorCode, BlobEntry, DaemonInfo, DecodedMessage, EventRecordSummary, ExecEndPhase,
     ExecEndStatus, ExecListEntry, ExecStatus, ExecStatusState, ExecutionInspection, HostInfo,
-    HostStatus, IdInfo, NextEvent, PendingCalloutStatus, ProgramDetail, ProgramSummary,
-    ReceiptListEntry, Response, ResponseOk, SessionProgress, SessionStatus, StrategyInfo,
+    HostStatus, IdInfo, NextEvent, OpenOffer, PendingCalloutStatus, ProgramDetail, ProgramSummary,
+    ReceiptListEntry, Response, ResponseOk, SessionProgress, SessionStatus,
 };
 
 #[cfg(test)]
@@ -94,7 +94,6 @@ mod tests {
             ),
             (
                 HostRequest::ExecNew {
-                    strategy: None,
                     exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                     program: "rock-paper-scissors".into(),
                     params: Some(serde_json::json!({"rounds": 3})),
@@ -186,7 +185,6 @@ mod tests {
         );
 
         let join_request = HostRequest::ExecNew {
-            strategy: None,
             exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
             program: String::new(),
             params: None,
@@ -238,7 +236,6 @@ mod tests {
         let cases = [
             (
                 HostRequest::ExecNew {
-                    strategy: None,
                     exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                     program: "rock-paper-scissors".into(),
                     params: Some(serde_json::json!({})),

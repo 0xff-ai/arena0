@@ -252,18 +252,10 @@ impl HostExecutionStore {
         params: Option<JsonBytes>,
         admission: ExecutionAdmission,
         grants: &[arena0_protocol::BlobHash],
-        strategy: Option<String>,
         created_at_ms: u64,
     ) -> Result<ExecutionRequestOutcome, StoreError> {
         self.store
-            .create_execution_request(
-                program_hash,
-                params,
-                admission,
-                grants,
-                strategy,
-                created_at_ms,
-            )
+            .create_execution_request(program_hash, params, admission, grants, created_at_ms)
             .await
     }
 

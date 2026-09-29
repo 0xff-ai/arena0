@@ -32,8 +32,6 @@ pub enum FileSource {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "method", content = "params", deny_unknown_fields)]
 pub enum Request {
-    #[serde(rename = "strategy.list")]
-    StrategyList,
     /// Dispatch an existing Host operation in one exact local namespace.
     #[serde(rename = "host.call")]
     Host { host: String, request: HostRequest },
@@ -58,6 +56,8 @@ pub enum Request {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "method", content = "params", deny_unknown_fields)]
 pub enum HostRequest {
+    #[serde(rename = "negotiation.offers")]
+    NegotiationOffers,
     #[serde(rename = "host.info")]
     Info,
     // Identity / custody (CLI only; never sent by the MCP server). Seeds never
@@ -104,10 +104,6 @@ pub enum HostRequest {
         /// hash. Each must already be imported.
         #[serde(default)]
         blobs: Vec<BlobHash>,
-        /// A built-in strategy from `strategy.list`. When set, the daemon answers
-        /// every callout of this execution itself; callers must not submit.
-        #[serde(default)]
-        strategy: Option<String>,
     },
     #[serde(rename = "exec.list")]
     ExecList,

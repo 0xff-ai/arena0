@@ -60,7 +60,6 @@ async fn daemon_hosts_play_and_verify() {
     // negotiation id. Params are omitted (the program takes none); the program
     // is named by its full content id.
     let req_a = HostRequest::ExecNew {
-        strategy: None,
         exec_id: requested_exec_a,
         program: d.program_id.to_string(),
         params: Some(serde_json::json!(null)),
@@ -81,7 +80,6 @@ async fn daemon_hosts_play_and_verify() {
         call(
             &d.host_b,
             &HostRequest::ExecNew {
-                strategy: None,
                 exec_id: requested_exec_b,
                 program: d.program_id.to_string(),
                 params: Some(serde_json::json!(null)),
@@ -244,7 +242,6 @@ async fn joiner_without_params_adopts_creator_terms() {
 
     // Creator proposes exact terms; the joiner sends NO params at all.
     let req_a = HostRequest::ExecNew {
-        strategy: None,
         exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
         program: d.program_id.to_string(),
         params: Some(serde_json::json!({ "target_size": 2, "bias": 0 })),
@@ -265,7 +262,6 @@ async fn joiner_without_params_adopts_creator_terms() {
         call(
             &d.host_b,
             &HostRequest::ExecNew {
-                strategy: None,
                 exec_id: arena0_protocol::ExecId([line!() as u8; 32]),
                 program: d.program_id.to_string(),
                 params: None,

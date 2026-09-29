@@ -919,7 +919,6 @@ async fn create_executions(
         &creator.client,
         &creator.host,
         HostRequest::ExecNew {
-            strategy: None,
             exec_id: creator_exec,
             program: program_id.to_string(),
             params,
@@ -995,7 +994,6 @@ async fn create_executions(
                     &client,
                     &host_name,
                     HostRequest::ExecNew {
-                        strategy: None,
                         exec_id,
                         program: program_id.to_string(),
                         params: None,

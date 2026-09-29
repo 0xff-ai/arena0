@@ -1214,15 +1214,6 @@ impl Daemon {
                 }
                 service.dispatch(request).await
             }
-            Request::StrategyList => Ok(ResponseOk::StrategyList(
-                crate::strategy::Strategy::ALL
-                    .into_iter()
-                    .map(|strategy| arena0_api::StrategyInfo {
-                        name: strategy.name().to_owned(),
-                        description: strategy.description().to_owned(),
-                    })
-                    .collect(),
-            )),
             Request::DaemonInfo => self.daemon_info().map(ResponseOk::DaemonInfo),
             Request::HostsList => self.host_statuses().await.map(ResponseOk::Hosts),
             Request::HostsOpen { id, user_agent } => self

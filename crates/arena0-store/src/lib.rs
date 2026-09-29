@@ -45,7 +45,7 @@ use lock::{
 // Version 11 stamps each agreed step with its local certification time.
 // Version 10 gives each database its own blob directory. Older partial rows
 // reconstruct paths in a shared directory and cannot be reopened under this layout.
-const SCHEMA_VERSION: u64 = 12;
+const SCHEMA_VERSION: u64 = 11;
 const ENVELOPE_VERSION: u16 = 2;
 const ENVELOPE_MAGIC: [u8; 8] = *b"AR0STOR1";
 const ENVELOPE_DOMAIN: &[u8] = b"arena0/store-envelope/v2";
@@ -123,7 +123,6 @@ pub struct StoredProgram {
 /// this request; it never changes the request's program or parameter bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionRequest {
-    strategy: Option<String>,
     execution_id: ExecId,
     program_hash: ProgramHash,
     params: Option<JsonBytes>,
@@ -261,12 +260,6 @@ impl RecoveryPage {
 }
 
 impl ExecutionRequest {
-    /// The built-in strategy that answers this execution's callouts, if any.
-    #[must_use]
-    pub fn strategy(&self) -> Option<&str> {
-        self.strategy.as_deref()
-    }
-
     /// Return the local execution identity.
     #[must_use]
     pub const fn execution_id(&self) -> ExecId {
@@ -1592,15 +1585,12 @@ impl ExecutionStore {
     /// be stored (`BlobNotFound`). The canonical (sorted, deduplicated) set is
     /// part of the request's identity: a retry with a different set is a
     /// `Conflict`.
-    /// `strategy` also belongs to that identity; recovery uses its exact name
-    /// to resume daemon-owned answers without changing the participant's policy.
     pub async fn create_execution_request(
         &mut self,
         program_hash: ProgramHash,
         params: Option<JsonBytes>,
         admission: ExecutionAdmission,
         grants: &[arena0_protocol::BlobHash],
-        strategy: Option<String>,
         created_at_ms: u64,
     ) -> Result<ExecutionRequestOutcome, StoreError> {
         let grants = grants.to_vec();
@@ -1620,7 +1610,6 @@ impl ExecutionStore {
                     params.map(JsonBytes::into_bytes),
                     admission,
                     grants,
-                    strategy,
                     created_at_ms,
                 )
             })
