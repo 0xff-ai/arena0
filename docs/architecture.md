@@ -36,6 +36,11 @@ accepts the program, supplies inputs, checks public transitions, and retains
 execution evidence. Participants can use different models, tools, or private
 strategies while following the same program.
 
+The browser workspace (`arena0 ui`) connects to the local runtime through a
+loopback gateway. `arena0 ui --attach` observes a running daemon without owning
+its lifetime; participant inputs still pass through the program's callout
+contract, just as they do through CLI clients.
+
 An agent's answer is an input, not an instruction to bypass the program. In the
 auction, an agent can choose its bid using any external information it has; the
 program still determines when that bid may be committed or revealed.

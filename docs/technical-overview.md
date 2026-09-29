@@ -26,22 +26,16 @@ implementation names are used below to explain ownership and local topology.
 Phase 1 runs an `Ensemble` of independent logical Hosts in one `arena0d` process. The daemon owns the shared Unix API endpoint. Each Host has its own identity, program catalog, SQLite store, execution actors, and receipts. `LocalTransport` connects the Hosts through bounded in-process channels and the real protocol codec.
 
 ```text
-human or agent
-    |
-    +-- arena0 CLI -------------> arena0d
-                                  |
-                                  +-- Unix API (one socket, explicit Host routing)
-                                  |
-                                  +-- Ensemble
-                                      |
-                                      +-- Host A
-                                      |   +-- SQLite store
-                                      |   +-- execution actors
-                                      |   +-- Wasm sandbox
-                                      |
-                                      +-- Host B ... Host N
-                                      |
-                                      +-- LocalTransport
+browser <-> arena0-web gateway <-> arena0d Unix socket <-> Ensemble
+                                        ^                   |
+human or agent <-> arena0 CLI -----------+                   +-- Host A
+                                                            |   +-- SQLite store
+                                                            |   +-- execution actors
+                                                            |   +-- Wasm sandbox
+                                                            |
+                                                            +-- Host B ... Host N
+                                                            |
+                                                            +-- LocalTransport
 ```
 
 One machine controls the process and all Host keys. The topology proves deterministic co-execution, agreement, persistence, and receipt construction. It does not provide independent machine or key custody.
@@ -65,7 +59,8 @@ The workspace manifests own dependency selection and exact versions. The table b
 | Execution agreement | BLS12-381 MinSig through `blst` | Per-execution keys and N-of-N aggregate agreements |
 | Local Host API | Length-prefixed JSON over one daemon Unix socket | Explicit routing to independent Hosts |
 | Observability | `tracing` and `tracing-subscriber` | Redacted semantic events and opt-in performance records |
-| CLI | Clap, Ratatui, and Crossterm | Commands, the local workspace, and the execution observatory |
+| CLI | Clap | Commands, terminal callout prompts, and browser gateway lifecycle |
+| Browser workspace | React and TanStack DB | UI and a keyed replica of daemon facts |
 | Build orchestration | Cargo and `just` | Program builds, workspace builds, tests, checks, docs, audits, and release artifacts |
 
 The release uses one Unix domain socket per daemon for its local API. Host requests name their target explicitly. The packaged targets and platform limits live in the [project README](../README.md).
@@ -86,8 +81,9 @@ guest authoring and Host runtime
     arena0-node
 
 applications
-    arena0-home + arena0-api + arena0-client + arena0-daemon
+    arena0-home + arena0-api + arena0-client + arena0-daemon + arena0-web
     arena0 + arena0d + cargo-arena0
+    ui/ (React workspace)
 ```
 
 This drawing is an orientation, not an exact Cargo graph. The [crate ownership table](protocol-architecture.md#3-crate-ownership) and manifests define the precise boundaries.
@@ -97,7 +93,7 @@ Protocol crates do not depend on Tokio, SQLite, Wasmtime, a transport implementa
 The three executables retain narrow dependency closures:
 
 ```text
-arena0       -> arena0-home + arena0-client
+arena0       -> arena0-home + arena0-client + arena0-web
 arena0d      -> arena0-home + arena0-daemon
 cargo-arena0 -> arena0-sandbox
 ```
@@ -106,6 +102,19 @@ cargo-arena0 -> arena0-sandbox
 sandbox dependencies in the CLI's normal dependency graph. The sandbox's
 `engine_version` integration test checks that its resolved Wasmtime version
 matches the engine identity recorded in the execution profile.
+
+`arena0-web` is the loopback gateway between the browser and the daemon's Unix
+socket. It places a per-launch token in the page URL fragment; the browser
+offers it as a WebSocket subprotocol. Upgrades require exact `Host` and `Origin`
+matches (with an explicitly configured development origin allowed). The gateway
+serves assets with a Content Security Policy (CSP) and sends no CORS headers.
+It replicates daemon facts as keyed rows: `hello`, a reset for each collection,
+`ready`, then row deltas. Browser calls map to daemon requests; the gateway does
+not own durable execution state.
+
+`ui/` contains the React workspace and its TanStack DB replica. The build script
+`crates/arena0-web/build.rs` embeds `ui/dist` at Rust build time; build the UI
+before compiling a binary that must serve it.
 
 ## Responsibility and state ownership
 
@@ -239,7 +248,7 @@ Cancellation must preserve a recoverable durable boundary. A graceful shutdown s
 
 Phase 1 assumes one machine operator controls all supervised Hosts. Separate identities and stores do not defend against compromise of that machine.
 
-The local Unix API and monitor are operator interfaces. Harness context
+The local Unix API and browser workspace are operator interfaces. Harness context
 binding selects a participant for CLI commands; it is not an access boundary
 against other processes controlled by the same machine operator.
 
@@ -283,13 +292,12 @@ The opt-in `arena0::performance` target records aggregate and per-item timings. 
 
 Daemon information and event frames share a Host metadata projection: local ID, cryptographic peer ID, and optional user agent. Each event captures the metadata at emission, preserving earlier labels in buffered history.
 
-The CLI, execution observatory, and JSON output project typed Host state. Presentation code does not own protocol or execution state.
+The CLI, browser workspace, and JSON output project typed Host state. Presentation code does not own protocol or execution state.
 
-`arena0 launch` performs headless coordinated setup and supervises configured
-local drivers. `arena0 monitor` attaches independently to the existing daemon
-and uses the same terminal observatory for multiparty execution tables,
-guest-owned textual views, activity, and public agreement. The monitor can
-answer the current open callout through the ordinary Host submission boundary,
+`arena0 launch PROGRAM` performs headless coordinated setup and supervises
+configured local drivers. `arena0 ui --attach` connects the browser workspace
+to the existing daemon without taking ownership of its lifetime. Browser
+callout submissions use the ordinary Host submission boundary,
 under the same [callout identity rules](protocol-architecture.md#10-execution-and-agreement)
 as any other client. Adapter activity has its own bounded operational stream,
 separate from semantic Host events.

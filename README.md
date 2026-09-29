@@ -38,13 +38,13 @@ public transition and retain signed evidence of the execution.
 npm install --global @0xff-ai/arena0
 
 # run either:
-# 1. a local sandbox for manual testing
+# 1. the browser workspace for manual testing
 arena0
 
 # 2. two Codex agents in an temp workspace, preloaded with the arena0 skill,
 # ready to play chess, rock-paper-scissors, or Prisoner's Dilemma with each other
 # launches in tmux or herdr
-arena0 launch --agents
+arena0 launch --agents chess
 ```
 
 Run `arena0` instead to open the local workspace for human input and built-in
@@ -57,18 +57,24 @@ cd arena0
 make
 
 # run either:
-# 1. a local sandbox for manual testing
+# 1. the browser workspace for manual testing
 arena0
 
 # 2. two Codex agents in an temp workspace, preloaded with the arena0 skill,
 # ready to play chess, rock-paper-scissors, or Prisoner's Dilemma with each other
 # launches in tmux or herdr
-arena0 launch --agents
+arena0 launch --agents chess
 ```
+
+On a terminal, bare `arena0` opens the browser workspace, as does `arena0 ui`.
+It starts a daemon when none runs; Ctrl-C stops the gateway and only the daemon
+it started. Use `arena0 ui --attach` to observe a running daemon.
+`arena0 launch PROGRAM` runs headlessly; `arena0 run PROGRAM --human HOST`
+answers callouts at the terminal prompt.
 
 ## Demos
 
-Run `arena0 launch --agents` to start two autonomous Codex participants in
+Run `arena0 launch --agents PROGRAM` to start two autonomous Codex participants in
 adjacent panes. Each participant discovers its peer, retains its execution ID,
 prints the program-authored view before every answer, and verifies the shared
 receipt when the interaction completes.
@@ -141,7 +147,7 @@ Smaller examples: [Cumulative sum](programs/cumulative-sum) · [Sequential count
 - **Signed, verifiable evidence:** each participant produces the same canonical receipt if the program completes, or an authenticated unilateral stop report if it stops unilaterally.
 - **Portable verification:** proofs can be verified without access to the arena0 program itself.
 - **Human and agent interfaces:** participate through interactive input, built-in policies, executable agents, or the local CLI.
-- **Inspectable execution:** follow program state, messages, agreement, and activity through the tracing subsystem and the TUI.
+- **Inspectable execution:** inspect daemon facts through the browser workspace and follow activity through the tracing subsystem.
 - **Composable programs:** bundled examples and SDK primitives cover auctions, work allocation, games, commit-reveal, turn-taking, and voting.
 
 ## Roadmap
@@ -202,7 +208,7 @@ networks, identity providers, and application services.
 ## Documentation
 
 - [Architecture](docs/architecture.md): programs, participants, agreement, effects, and execution evidence.
-- [Getting started](docs/getting-started.md): install, run, connect agents, monitor, and verify.
+- [Getting started](docs/getting-started.md): install, run, connect agents, open the browser workspace, and verify.
 - [Programming](docs/programming.md): SDK, state machines, primitives, schemas, and tests.
 - [Contributing](docs/contributing.md): repository setup, development checks, and change rules.
 - [Technical overview](docs/technical-overview.md): implementation structure and ownership.

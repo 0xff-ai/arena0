@@ -18,7 +18,7 @@ scripts/check-affected.sh --scope [BASE [HEAD]]
 ```
 
 `--plan` prints `git diff --check` and the selected recipes. `--scope` prints
-one of `docs`, `cli`, `daemon`, `programs`, or `full` for CI. Unknown, shared,
+one of `docs`, `cli`, `daemon`, `programs`, `ui`, or `full` for CI. Unknown, shared,
 mixed code owners, build files, manifests, locks, empty, or unavailable change
 sets select `full`. Documentation can accompany one code owner on its focused
 route; changed-file whitespace is checked in every resolved range.
@@ -30,19 +30,20 @@ test Rust, check Markdown links or facts, or verify a documented journey.
 
 Use the named recipes directly when the affected owner is known:
 
-Each `check-*` recipe runs focused formatting and Clippy. Each `test-*` recipe
+Each Rust `check-*` recipe runs focused formatting and Clippy. Each `test-*` recipe
 runs the owner's tests, including its existing external proofs. Run the pair
 in one `just` invocation to prepare shared guest artifacts once.
 
 | Area | Checks |
 | --- | --- |
-| CLI | `just check-cli test-cli` |
+| CLI | `just check-cli test-cli check-ui test-ui` |
+| Web UI | `just check-ui test-ui` |
 | Daemon | `just check-daemon test-daemon` |
 | Programs | `just check-programs test-programs` |
 
-The CLI test recipe builds program Wasm, builds the sibling `arena0d` executable,
-and runs the existing real CLI package tests. Those tests do not provide the
-missing external PTY navigation/schema-fetch journey; AR-1 remains pending.
+The CLI test recipe builds program Wasm and the UI, builds the sibling `arena0d`
+executable, and runs the real CLI package tests. The CLI route also checks the
+browser's generated wire types and runs its live Playwright suites.
 
 The daemon test recipe includes an MCP two-client admission and receipt
 scenario that waits at least 40 seconds, Unix `daemon_e2e`, and actual process
@@ -59,10 +60,32 @@ The scoped recipes retain the configured compiler wrapper and cache and the
 
 ## Full gates
 
-`just test` remains the full test route: it builds program Wasm, runs the full
-host suite, runs the SDK and primitives doctests, and runs the guest-native
-program tests. `just check` remains full validation. `just release-check`
-remains the full release gate.
+The full affected-change gate is `just build-programs check test doc check-ui test-ui`.
+`just test` builds program Wasm and the UI, runs the full host suite, runs the SDK
+and primitives doctests, and runs the guest-native program tests. `just check`
+checks Rust; `check-ui test-ui` adds the browser checks and live suites.
+`just release-check` remains the full release gate.
+
+## Web UI
+
+Use Node 22 or newer and enable Corepack (`corepack enable`) to select the pnpm
+version pinned in `ui/package.json`.
+
+- `just build-ui` installs locked dependencies and builds `ui/dist`, which
+  `crates/arena0-web/build.rs` embeds when the Rust executable is built.
+- `just ui-types` regenerates `ui/src/sync/protocol.gen.ts`; run it after changing
+  `crates/arena0-web/src/model.rs` or `crates/arena0-web/src/protocol.rs`.
+- `just check-ui` checks generated type freshness, lint, and TypeScript types.
+- `just test-ui` builds the required binaries and runs the live Playwright
+  suites with `ARENA0_E2E_EMBEDDED=1`. Evidence goes to `ui/e2e/artifacts/`.
+  Direct `pnpm playwright test` in `ui/` defaults to dev-server mode; set
+  `ARENA0_E2E_EMBEDDED=1` to exercise the embedded build instead. The suites use
+  `/usr/bin/google-chrome`.
+
+For development, run `just ui-dev` for the gateway and, in a second terminal,
+run `cd ui && pnpm dev`. Open `http://127.0.0.1:5173/` with the `#token=...`
+fragment from the gateway's printed URL. The component gallery is available at
+`http://127.0.0.1:5173/gallery` on the dev server.
 
 ## CI policy
 

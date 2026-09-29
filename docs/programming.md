@@ -197,6 +197,8 @@ can access it.
 
 ## Structured views
 
+The browser workspace renders structured blocks next to the text slots.
+
 Beside the text slots, a view can carry typed blocks for clients that can
 draw a board or a table. Blocks describe the same state the text shows; never
 reveal in a block what the text hides. The chess program renders its board and
@@ -243,5 +245,5 @@ receipt or the exact stop cause for a stopped artifact. Use it alongside
 Arena tests: Arena tests exercise your rules, while portable verification
 authenticates an actual certified execution.
 
-See [Getting started](getting-started.md) for the guided flow, agent connections, and monitoring,
+See [Getting started](getting-started.md) for the browser workspace, agent connections, and terminal input,
 and [Architecture](architecture.md) for the execution and evidence model.

@@ -60,7 +60,7 @@ jobs:
             range_available=true
             if selected=$(./scripts/check-affected.sh --scope "$base" "$head"); then
               case "$selected" in
-                docs|cli|daemon|programs|full) scope=$selected ;;
+                docs|cli|daemon|programs|ui|full) scope=$selected ;;
                 *) echo "invalid validation scope '$selected'; using full scope" >&2 ;;
               esac
             else
@@ -97,6 +97,12 @@ jobs:
       - name: Test release safety contracts
         run: node --test npm/release.test.mjs scripts/resolve-release-run.test.mjs
 
+      - name: Install UI dependencies
+        if: ${{ contains(fromJSON('["ui", "cli", "full"]'), steps.scope.outputs.scope) }}
+        run: |
+          corepack enable
+          cd ui && pnpm install --frozen-lockfile
+
       # rust-toolchain.toml is the source of truth: it pins the channel, clippy,
       # rustfmt, and the wasm32 target. `rustup show` installs exactly that set.
       - name: Install toolchain
@@ -110,7 +116,7 @@ jobs:
           tool: nextest@0.9.143
 
       - name: Install just
-        if: ${{ steps.scope.outputs.scope != 'docs' && steps.scope.outputs.scope != 'full' }}
+        if: ${{ steps.scope.outputs.scope != 'docs' }}
         uses: taiki-e/install-action@84f5ac3124727fb3d284d4d22ee9ab3654fd09a6 # v2.87.7
         with:
           tool: just@1.58.0
@@ -148,7 +154,11 @@ jobs:
         env:
           NEXTEST_PROFILE: ci
           VALIDATION_SCOPE: ${{ steps.scope.outputs.scope }}
-        run: just "check-$VALIDATION_SCOPE" "test-$VALIDATION_SCOPE"
+        run: |
+          just "check-$VALIDATION_SCOPE" "test-$VALIDATION_SCOPE"
+          if [[ "$VALIDATION_SCOPE" == cli ]]; then
+            just check-ui test-ui
+          fi
 
       - name: Format
         if: ${{ steps.scope.outputs.scope == 'full' }}
@@ -200,6 +210,10 @@ jobs:
       - name: Test (programs)
         if: ${{ steps.scope.outputs.scope == 'full' }}
         run: cargo nextest run --locked --manifest-path programs/Cargo.toml --profile ci
+
+      - name: Check and test Web UI
+        if: ${{ steps.scope.outputs.scope == 'full' }}
+        run: just check-ui test-ui
 
       - name: Save Rust cache
         if: ${{ !cancelled() && runner.environment == 'github-hosted' && steps.scope.outputs.scope != 'docs' && steps.rust-cache.outputs.cache-primary-key != '' }}

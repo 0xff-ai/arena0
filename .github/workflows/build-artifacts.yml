@@ -60,6 +60,11 @@ jobs:
         with:
           node-version: 22
 
+      - name: Build Web UI
+        run: |
+          corepack enable
+          cd ui && pnpm install --frozen-lockfile && pnpm build
+
       # cargo-arena0 builds the guest Wasm and embeds the metadata section that
       # the daemon's build script packages into the shipped binary.
       - name: Build programs (wasm32)

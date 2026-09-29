@@ -883,13 +883,14 @@ The CLI remains a Unix-socket client. `arena0 skill` prints the packaged,
 CLI agent instructions offline; `--json` wraps the same Markdown in a
 machine-readable response. `arena0 serve` replaces the CLI process
 with the installed `arena0d` executable and provides a persistent service for
-CLI and API clients. Bare `arena0` on a human terminal opens a local workspace;
-`arena0 run` provides the explicit scriptable grammar. These paths may start an
+CLI and API clients. Bare `arena0` on a human terminal and `arena0 ui` open the
+browser workspace; `arena0 run` provides the explicit scriptable grammar, with
+`--human HOST` answering callouts at the terminal prompt. These paths may start an
 installed `arena0d` child for the selected local Hosts and stop only that
 owned child when the command ends. The child still owns every Host, store,
 transport, sandbox, and runtime resource. The CLI owns only child-process
-supervision and typed socket clients. It reuses the shared endpoint and opens
-missing selected Hosts through the daemon's existing provisioning operation.
+supervision, the browser gateway, and typed socket clients. It reuses the shared
+endpoint and opens missing selected Hosts through the daemon's existing provisioning operation.
 It never stops a borrowed service.
 
 `arena0 run` creates an offer for the selected Host count and targets that offer
@@ -898,21 +899,19 @@ peers: another Host may join the shared program topic first. The runner checks
 the verified receipt ensemble against its selected Hosts and reports a
 mismatch rather than presenting that run as their shared result.
 
-`arena0 launch <program>` uses the same coordinated admission and receipt
-verification without opening the terminal interface. Omitting the program in
-a terminal opens the existing launcher; ambiguous references offer a choice
-there. Selections carry exact program hashes into coordinated admission. It
-supervises configured local drivers; unbound Hosts wait for independent
-clients. `arena0 launch --agents` opens a two-Participant program and harness
+`arena0 launch PROGRAM` uses the same coordinated admission and receipt
+verification headlessly. Program references resolve to exact program hashes
+before coordinated admission. It supervises configured local drivers; unbound Hosts wait for independent
+clients. `arena0 launch --agents PROGRAM` opens a two-participant program and harness
 selector, creates a private temporary home, and runs distinct Codex contexts in
 the current pane and a new right pane. The creator and open joiner use the same
-program-topic discovery as other agent clients. `arena0 monitor`
-attaches through the shared daemon socket and observes the complete daemon
-Ensemble. It owns subscriptions and presentation only, and detaching never
-stops the daemon or its executions. Executions are keyed by Host and local
-execution ID; negotiation and session identities group multiparty views.
+program-topic discovery as other agent clients. `arena0 ui --attach` serves the
+browser workspace through a loopback gateway connected to the shared daemon
+socket and observes the complete daemon Ensemble. Ctrl-C stops that gateway
+without stopping the borrowed daemon or its executions. Executions are keyed
+by Host and local execution ID; negotiation and session identities group multiparty views.
 
-A monitor may submit one answer for the open callout through the ordinary
+The browser gateway may submit one answer for the open callout through the ordinary
 `exec.submit` operation. The answer must name the exact open `CalloutId`;
 reading a callout grants no ownership or reservation. The execution actor
 serializes competing answers. A stale or losing submission reports
@@ -922,21 +921,16 @@ and a program rejection or input-handler trap returns `InputRejected` without
 ending the session. A lost submission response is an unknown outcome and must
 not trigger automatic resubmission.
 
-The workspace projects the typed program catalog and lets a human select one
-program, an admitted Host count, a CLI-local human control choice for one or
-all selected Hosts, and program parameters. Each Host remains an independent
-protocol actor; the choice only selects which
-callouts the shared terminal answers. Launching opens the focused full-screen
-run interface. Its persistent Host scope independently selects all Hosts, one
-Host, or a two-Host comparison for the execution lifecycle, guest-owned
-four-slot `View`, durable trace, Host-local event-record summaries, and redacted system
-events. Neither screen owns protocol or durable state. Bare `arena0` prints
-help instead of opening a terminal interface when any standard stream is not a
-terminal.
+The browser gateway replicates typed daemon facts and maps browser calls to
+daemon requests. Each Host remains an independent protocol actor; presentation
+does not own protocol or durable state. `arena0 ui` starts a daemon when none
+runs, and Ctrl-C stops the gateway and only the daemon it started. Bare `arena0`
+prints help when any standard stream is not a terminal; explicit `arena0 ui`
+opens the browser workspace without that terminal requirement.
 The global `--tmp` option scopes these client paths to one private temporary
 arena0 home and removes it after all command-owned processes have stopped. It
 does not apply to the process-replacing, persistent `arena0 serve` path or to
-`arena0 monitor`, which attaches to an existing home.
+`arena0 ui --attach`, which attaches to an existing home.
 
 ## 13. Events
 
