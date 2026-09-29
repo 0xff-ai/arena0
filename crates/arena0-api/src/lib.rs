@@ -320,6 +320,8 @@ mod tests {
                         callout_index: 1,
                     }),
                     receipt_available: false,
+                    writer: None,
+                    phase: None,
                 },
             },
             created_at_ms: 1_000,

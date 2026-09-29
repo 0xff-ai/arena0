@@ -516,13 +516,15 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
             params: unit.clone(),
             queries: Vec::new(),
             outcome: unit,
+            phases: Vec::new(),
         },
     };
     let metadata = definition.encode().expect("ordering metadata");
     let init = wat_data(&[0, 0, 0, 0, 0, 0, 0, 0]);
     let accepted = wat_data(&[0, 0, 0]);
     let rejected = wat_data(&[1, 0, 0]);
-    let writer = wat_data(&[1, 1]);
+    // Borsh `TurnOutput { participant: Some(1), phase: None }`.
+    let writer = wat_data(&[1, 1, 0]);
     let outcome = wat_data(&[0, 0, 0, 0, 4, 0, 0, 0, b'n', b'u', b'l', b'l']);
     let query = wat_data(&[0, 0, 0, 0, 4, 0, 0, 0, b'n', b'u', b'l', b'l']);
     let view = wat_data(&[4, 0, 0, 0, b'n', b'u', b'l', b'l']);
@@ -533,7 +535,7 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
           (import "arena0" "broadcast" (func $broadcast (param i32 i32) (result i32)))
           {stop_import}
           (memory (export "memory") 1)
-          (global (export "arena0_abi_version") i32 (i32.const 24))
+          (global (export "arena0_abi_version") i32 (i32.const 25))
           (data (i32.const 2048) "{init}")
           (data (i32.const 32768) "{accepted}")
           (data (i32.const 32772) "{rejected}")
@@ -562,8 +564,8 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
           (func (export "arena0_initialize") (param i32 i32) (result i64)
             i32.const 2048 i32.const 8 call $pack)
           {dispatch_export}
-          (func (export "arena0_writer") (param i32 i32) (result i64)
-            i32.const 8192 i32.const 2 call $pack)
+          (func (export "arena0_turn") (param i32 i32) (result i64)
+            i32.const 8192 i32.const 3 call $pack)
           (func (export "arena0_outcome") (param i32 i32) (result i64)
             i32.const 10240 i32.const 12 call $pack)
           (func (export "arena0_query") (param i32 i32) (result i64)

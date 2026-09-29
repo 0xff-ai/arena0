@@ -50,6 +50,8 @@ fn active_status() -> ExecStatus {
                 participants: 3,
                 pending_callout: None,
                 receipt_available: false,
+                writer: None,
+                phase: None,
             },
         },
         created_at_ms: 0,

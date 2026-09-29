@@ -368,6 +368,15 @@ never defines execution serialization and never participates in commitments,
 receipts, or portable verification. Other program Borsh values, including
 receipt params and outcomes, remain opaque bytes to the Host.
 
+Program metadata declares the program's phases (`ProgramSchema.phases`: name,
+description, default and terminal flags, in declaration order; empty when the
+program declares none). The read-only `arena0_turn` export projects the agreed
+shared state to a `TurnOutput`: the participant that may author the next
+program message (`None` when none may) and the declared name of the current
+phase. The Host validates the participant index against the committed ensemble
+and rejects a phase name over 64 bytes. Message admission uses the participant
+selection; the daemon also reports both in `exec.status`.
+
 Every cryptographic operation and every file-byte operation runs in the Host,
 for every program, and only when the program calls an import for it: the
 runtime itself moves program bytes without interpreting them. A program holds
@@ -389,7 +398,7 @@ contains them.
 Program import validates every required guest export before the artifact enters
 the Host's program catalog. The canonical list of names and signatures is
 `arena0_sandbox::validation::REQUIRED_FUNC_EXPORTS`, and the ABI is
-`ABI_VERSION = 24`.
+`ABI_VERSION = 25`.
 The execution profile is version 4 and binds the fixed shared/local memories,
 resident dispatch semantics, resource limits, and engine identity used by the
 Host. Activation carries its profile hash, so a Host rejects a different
@@ -420,7 +429,7 @@ Program import also uses this method to validate imports and exact export
 signatures and to verify the ABI value in a disposable bounded instance before
 registering the artifact in the Host's program catalog. `LoadedProgram` owns
 the immutable compiled module and its execution profile. Initialization and
-read-only `writer`, `query`, `view`, and `outcome` projections create fresh
+read-only `turn`, `query`, `view`, and `outcome` projections create fresh
 bounded Wasm instances over explicit state snapshots. An active execution
 creates one resident `ProgramInstance`; it owns fixed `arena0_shared` and
 `arena0_local` memories and routes every session event through
@@ -471,10 +480,10 @@ queue with the candidate state.
   second one, or one combined with `SetTimer` traps the dispatch.
 
 A participant authors the next agreed message only from its outgoing queue.
-When no proposal is staged and the `writer` projection over the agreed shared
-state selects this participant, the actor takes the oldest queued message and
-applies it through its own `MessageReceived` dispatch, exactly as every other
-participant will. If the result is accepted, the actor stages the proposal and
+When no proposal is staged and the `writer` selected by the `arena0_turn`
+projection over the agreed shared state is this participant, the actor takes
+the oldest queued message and applies it through its own `MessageReceived`
+dispatch, exactly as every other participant will. If the result is accepted, the actor stages the proposal and
 sends the message frame carrying its complete `StepCommitment`. If its own program
 rejects the message, the actor removes it from the queue and records a local
 error; the message never reaches a peer. A local handler that wants to end the
@@ -963,7 +972,7 @@ The public release guarantees:
 - canonical receipt identity, distinct unilateral stop reports, and local provenance;
 - the `Transport` seam without changing runtime or proof semantics.
 
-The current compatibility boundary is `ABI_VERSION = 24`, execution profile
+The current compatibility boundary is `ABI_VERSION = 25`, execution profile
 version 4, `TraceEntry` format 3, the v4 `StepCommitment` domain, receipt
 artifact and body version 5, the v5 `ReceiptId` domain, and store schema
 version 11. Decoders reject unsupported versions, and no format silently accepts

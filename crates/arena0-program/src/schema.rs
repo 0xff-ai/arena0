@@ -464,6 +464,22 @@ pub struct ProgramSchema {
     pub queries: Vec<QuerySchema>,
     /// The program's derived terminal outcome.
     pub outcome: JsonSchemaDocument,
+    /// Lifecycle phases the program declares, in declaration order. Empty when
+    /// the program declares none.
+    pub phases: Vec<PhaseSchema>,
+}
+
+/// One declared program phase.
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PhaseSchema {
+    /// Machine-readable phase name, as reported by the turn projection.
+    pub name: String,
+    /// Human-facing description of the phase.
+    pub description: String,
+    /// Whether a new session starts in this phase.
+    pub is_default: bool,
+    /// Whether the session ends once it reaches this phase.
+    pub is_terminal: bool,
 }
 
 /// Schema for a program's persistent state region.

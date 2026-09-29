@@ -3029,6 +3029,7 @@ mod tests {
                 "params": schema,
                 "queries": [],
                 "outcome": schema,
+                "phases": [],
             },
         }))
         .expect("scripted program detail");
@@ -3053,6 +3054,8 @@ mod tests {
                     participants: 2,
                     pending_callout: None,
                     receipt_available: false,
+                    writer: None,
+                    phase: None,
                 },
             },
             created_at_ms: 0,

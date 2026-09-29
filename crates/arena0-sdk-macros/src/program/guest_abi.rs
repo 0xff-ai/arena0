@@ -506,12 +506,16 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn arena0_writer(input_ptr: i32, input_len: i32) -> i64 {
-            let input: ::arena0::WriterInput = __arena0_read_input(input_ptr, input_len);
+        pub extern "C" fn arena0_turn(input_ptr: i32, input_len: i32) -> i64 {
+            let input: ::arena0::TurnInput = __arena0_read_input(input_ptr, input_len);
             let shared = __arena0_restore_shared(&input.shared);
             let participant = <#program_ty as ::arena0::Program>::writer(&shared)
                 .map(::arena0::Participant::as_u8);
-            __arena0_write_result(&::arena0::WriterOutput { participant })
+            let phase = <#program_ty as ::arena0::Program>::__phase(&shared).map(|phase| {
+                <<#program_ty as ::arena0::Program>::Phase as ::arena0::Arena0Phase>::as_str(phase)
+                    .to_owned()
+            });
+            __arena0_write_result(&::arena0::TurnOutput { participant, phase })
         }
 
         #[unsafe(no_mangle)]
@@ -557,6 +561,15 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                 params: <#params_ty as ::arena0::ProgramValue>::json_schema(),
                 queries: <#query_ty as ::arena0::Arena0Query>::schemas(),
                 outcome: <#outcome_ty as ::arena0::ProgramValue>::json_schema(),
+                phases: <#program_ty as ::arena0::Program>::__phase_decls()
+                    .iter()
+                    .map(|decl| ::arena0::PhaseSchema {
+                        name: decl.name.into(),
+                        description: decl.description.into(),
+                        is_default: decl.is_default,
+                        is_terminal: decl.is_terminal,
+                    })
+                    .collect(),
             };
             let bytes = ::arena0::ProgramDefinition { metadata, schema }
                 .encode()

@@ -64,7 +64,10 @@ catalog. The local transport does not fetch programs; every selected Host must
 have the same exact Wasm locally. `ProgramSummary.participants` declares
 supported counts. Fixed programs use `{"kind":"exact","count":2}`,
 while variable-size programs use `{"kind":"range","min":2,"max":64}`. The
-requested participant count must fall within it.
+requested participant count must fall within it. The `schema` of `program.get`
+lists the program's declared `phases` in declaration order, each with `name`,
+`description`, `is_default`, and `is_terminal`; the list is empty when the
+program declares none. A session's `phase` is one of these names.
 
 ## Blobs
 
@@ -161,7 +164,14 @@ binding. The `exec.created` event omits the field while it is unknown.
 `exec.status` exposes the committed `session_id` as soon as activation commits.
 Once session progress exists, its `session` object also reports the public step,
 committed participants, pending callout summary, and whether this Host's
-receipt or stop report is durably available.
+receipt or stop report is durably available. It also carries the program's turn
+at the agreed step: `writer`, the `PeerId` of the participant allowed to author
+the next agreed message (`null` when the program admits none), and `phase`, the
+declared name of the program's current phase (`null` for a program that
+declares no phases). Every Host of the session reports the same `writer` and
+`phase` at the same step. The program computes both from the agreed shared
+state, and a status call fails rather than omit them when the program cannot
+project them.
 
 `exec.status` also reports two local times in Unix milliseconds:
 `created_at_ms`, when the execution request was created, and `updated_at_ms`,

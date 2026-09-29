@@ -1050,6 +1050,13 @@ async fn load_checked(
     Ok(loaded)
 }
 
+/// The program's turn at one agreed step, as the status projection reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Turn {
+    writer: Option<PeerId>,
+    phase: Option<String>,
+}
+
 /// The API operation owner for one Host.
 ///
 /// [`HostService`] owns one Host's execution supervisors and service tasks.
@@ -1076,6 +1083,11 @@ pub(crate) struct HostService {
     execs: Arc<ExecutionHandles>,
     /// Per-id rendezvous between caller-owned creation and cancellation.
     creation_states: StdMutex<CreationStates>,
+    /// Each execution's latest turn projection with the agreed step it was
+    /// computed at. A turn is a pure function of the agreed shared state, so
+    /// it is reused until the step changes; concurrent misses may both compute
+    /// it and the identical results overwrite each other.
+    turns: StdMutex<HashMap<ExecId, (u64, Turn)>>,
     negotiations_pending: AtomicUsize,
     /// Service tasks and negotiation drives. The runtime owns its accept path.
     tasks: TokioMutex<JoinSet<()>>,
@@ -1184,6 +1196,7 @@ impl HostService {
             owns_runtime,
             execs,
             creation_states: StdMutex::new(CreationStates::default()),
+            turns: StdMutex::new(HashMap::new()),
             negotiations_pending: AtomicUsize::new(0),
             tasks: TokioMutex::new(tasks),
             stopped: AtomicBool::new(false),
@@ -2213,15 +2226,65 @@ impl HostService {
             .execution_updated_at_ms(exec_id)
             .await
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
+        let turn = match &state {
+            Some(state) => Some(self.project_turn(exec_id, state).await?),
+            None => None,
+        };
         project_exec_status_facts(
             self.peer_id,
             request,
             activation,
             state,
+            turn,
             execution_updated_at_ms,
             receipt_available,
         )
         .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))
+    }
+
+    /// Ask the program for the turn at the execution's agreed step. A failed
+    /// projection fails the status call rather than reporting an empty turn.
+    async fn project_turn(
+        &self,
+        exec_id: ExecId,
+        state: &arena0_protocol::execution::ExecutionState,
+    ) -> Result<Turn, ApiError> {
+        let step = state.agreed_step();
+        if let Some((memo_step, turn)) = self.turns.lock().expect("turn memo").get(&exec_id)
+            && *memo_step == step
+        {
+            return Ok(turn.clone());
+        }
+        let program = self
+            .catalog
+            .load_program(state.binding().program_hash())
+            .await
+            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
+        let ensemble = state
+            .binding()
+            .ensemble()
+            .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
+        let shared = state.shared_state().clone();
+        let engine = Arc::clone(&self.engine);
+        let turn = tokio::task::spawn_blocking(move || {
+            let guest = engine.load(&program)?.turn(&shared, &ensemble)?;
+            Ok::<_, arena0_sandbox::SandboxError>(Turn {
+                writer: guest
+                    .writer
+                    .and_then(|participant| ensemble.peer_at(participant)),
+                phase: guest.phase,
+            })
+        })
+        .await
+        .map_err(|error| ApiError::new(ApiErrorCode::Internal, error.to_string()))?
+        .map_err(|error| {
+            ApiError::new(ApiErrorCode::Execution, format!("turn projection: {error}"))
+        })?;
+        self.turns
+            .lock()
+            .expect("turn memo")
+            .insert(exec_id, (step, turn.clone()));
+        Ok(turn)
     }
 
     async fn active_execution_count(&self) -> Result<usize, ApiError> {
@@ -3667,13 +3730,19 @@ fn project_exec_status_facts(
     request: ExecutionRequest,
     activation: Option<ActivationRecord>,
     state: Option<arena0_protocol::execution::ExecutionState>,
+    turn: Option<Turn>,
     execution_updated_at_ms: Option<u64>,
     receipt_available: bool,
 ) -> anyhow::Result<ExecStatus> {
     let exec_id = request.execution_id();
     let program_id = request.program_hash();
     let negotiation_id = request.negotiation_id();
+    // `turn` accompanies `state`: the caller projects it for every execution
+    // aggregate, and only an aggregate yields a session status.
     let session_status = |state: &arena0_protocol::execution::ExecutionState| {
+        let turn = turn
+            .as_ref()
+            .expect("an execution aggregate is projected with its turn");
         let binding = state.binding();
         SessionStatus {
             session_id: binding.session_id(),
@@ -3688,6 +3757,8 @@ fn project_exec_status_facts(
                 callout_index: callout.callout_index,
             }),
             receipt_available,
+            writer: turn.writer,
+            phase: turn.phase.clone(),
         }
     };
 
@@ -4955,14 +5026,28 @@ mod tests {
         use arena0_store::{Change, TransitionRecord};
 
         let (_dir, store, daemon, peer) = test_daemon();
+        // The status projection asks the program for its turn, so the shared
+        // state must be one the real guest can decode.
+        let wasm =
+            std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "../../programs/target/wasm32-unknown-unknown/release/rock_paper_scissors.wasm",
+            ))
+            .expect("built rock_paper_scissors guest; run `just build-programs`");
+        let program = Program::try_from(wasm.clone()).expect("program");
         let (program_hash, _) = store
             .handle()
-            .register_program(vec![1, 2, 3], 1)
+            .register_program(wasm, 1)
             .await
             .expect("program");
+        let initial_shared = daemon
+            .engine
+            .load(&program)
+            .expect("load program")
+            .initialize(JsonBytes::try_new(b"null".to_vec()).expect("params"))
+            .expect("initialize program")
+            .shared;
         let execution_id = ExecId([0xB4; 32]);
         let negotiation_id = NegotiationId([0xB5; 32]);
-        let initial_shared = SharedStateBytes::try_new(vec![0]).expect("shared state");
         let TwoPartyActivation {
             other,
             producer_bls,
@@ -4975,7 +5060,7 @@ mod tests {
             &mut writer,
             activation,
             peer,
-            initial_shared,
+            initial_shared.clone(),
             LocalStateBytes::try_new(Vec::new()).expect("local state"),
         )
         .await;
@@ -5006,7 +5091,7 @@ mod tests {
         let mut next = state.clone();
         next.apply_dispatch(
             &event,
-            SharedStateBytes::try_new(vec![1]).expect("next shared"),
+            initial_shared.clone(),
             LocalStateBytes::try_new(Vec::new()).expect("local state"),
             &effects,
             Some(TerminalOutcome::new(Vec::new(), b"null".to_vec()).expect("outcome")),
@@ -5281,6 +5366,7 @@ mod tests {
             Some(prepared_record),
             None,
             None,
+            None,
             false,
         )
         .expect("project prepared status");
@@ -5328,6 +5414,7 @@ mod tests {
             Some(committed_record.clone()),
             None,
             None,
+            None,
             false,
         )
         .expect("project committed status");
@@ -5367,6 +5454,7 @@ mod tests {
             peer,
             failed_request,
             Some(committed_record),
+            None,
             None,
             None,
             false,

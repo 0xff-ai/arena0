@@ -13,7 +13,7 @@ use arena0_api::{
 use arena0_protocol::{CalloutId, ExecId, NegotiationTarget, Slot, View};
 use common::{
     DaemonHarness, HostTarget, call, call_daemon, chess_wasm, created, cumulative_sum_wasm, daemon,
-    drive, ok, rps_wasm,
+    drive, ok, prisoner_dilemma_wasm, rps_wasm, timer_dispatch_wasm,
 };
 use tokio::io::BufReader;
 use tokio::net::{UnixStream, unix::OwnedReadHalf, unix::OwnedWriteHalf};
@@ -1482,9 +1482,9 @@ async fn blobs_link_grant_and_export_by_hash() {
     assert!(!files.path().join("never.bin").exists());
 }
 
-/// Host A creates and Host B joins; both are driven to completion. The joiner
-/// passes `joiner_params`, so `None` exercises adopting the creator's terms.
-async fn complete_session(
+/// Host A creates and Host B joins. The joiner passes `joiner_params`, so
+/// `None` exercises adopting the creator's terms.
+async fn launch_pair(
     d: &common::DaemonHarness,
     creator_params: Option<serde_json::Value>,
     joiner_params: Option<serde_json::Value>,
@@ -1525,6 +1525,16 @@ async fn complete_session(
         )
         .await,
     );
+    (exec_a, exec_b)
+}
+
+/// Launch a pair and drive both Hosts to completion.
+async fn complete_session(
+    d: &common::DaemonHarness,
+    creator_params: Option<serde_json::Value>,
+    joiner_params: Option<serde_json::Value>,
+) -> (ExecId, ExecId) {
+    let (exec_a, exec_b) = launch_pair(d, creator_params, joiner_params).await;
     let (session_a, session_b) = tokio::join!(drive(&d.host_a, exec_a), drive(&d.host_b, exec_b));
     assert_eq!(session_a, session_b, "both Hosts completed one session");
     (exec_a, exec_b)
@@ -1684,5 +1694,197 @@ async fn blob_list_reports_imported_blobs() {
         ok(call(&d.host_b, &HostRequest::BlobList).await),
         ResponseOk::BlobList(vec![]),
         "blobs are per Host"
+    );
+}
+
+async fn await_active(target: &HostTarget, exec_id: ExecId) {
+    ok(call(
+        target,
+        &HostRequest::ExecAwait {
+            exec_id,
+            until: AwaitState::Active,
+        },
+    )
+    .await);
+}
+
+async fn session_status(target: &HostTarget, exec_id: ExecId) -> arena0_api::SessionStatus {
+    let ResponseOk::Status(status) = ok(call(target, &HostRequest::ExecStatus { exec_id }).await)
+    else {
+        panic!("expected Status from {}", target.name);
+    };
+    status
+        .session()
+        .cloned()
+        .unwrap_or_else(|| panic!("{} reports no session: {:?}", target.name, status.state))
+}
+
+/// Wait until the agreed step at index `step` is durable on this Host. The
+/// step's trace entry and the execution's agreed-step cursor commit together,
+/// so a status read after this returns reflects the step.
+async fn read_until_step(reader: &mut BufReader<OwnedReadHalf>, step: u64) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if matches!(
+                read_event(reader).await.data,
+                EventData::SessionStep { step: agreed, .. } if agreed == step
+            ) {
+                return;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("agreed step {step} never arrived"));
+}
+
+/// `exec.status` names who may author the next agreed message and the
+/// program's phase, identically on every Host, and follows the session as it
+/// advances. A program that declares no writer reports `null`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_reports_the_writer_and_phase() {
+    let d = daemon(&chess_wasm()).await;
+    let (mut events_a, _events_a_write) = subscribe_events(&d.host_a).await;
+    let (mut events_b, _events_b_write) = subscribe_events(&d.host_b).await;
+    let no_params = Some(serde_json::json!(null));
+    let (exec_a, exec_b) = launch_pair(&d, no_params.clone(), no_params.clone()).await;
+    await_active(&d.host_a, exec_a).await;
+    await_active(&d.host_b, exec_b).await;
+
+    // The first mover is whoever the program asks for a move: the Host that
+    // holds the pending callout, an observation independent of `writer`.
+    let (mover_is_a, next) = next_from_either(&d.host_a, exec_a, &d.host_b, exec_b).await;
+    let (mover_target, mover_exec, mover, other_target, other_exec, other) = if mover_is_a {
+        (&d.host_a, exec_a, d.peer_a, &d.host_b, exec_b, d.peer_b)
+    } else {
+        (&d.host_b, exec_b, d.peer_b, &d.host_a, exec_a, d.peer_a)
+    };
+    let pending_id = match ok(next) {
+        ResponseOk::Next(arena0_api::NextEvent::Callout { pending_id, .. }) => pending_id,
+        other => panic!("expected the first mover's callout: {other:?}"),
+    };
+
+    let declared: Vec<String> = match ok(call(
+        &d.host_a,
+        &HostRequest::ProgramGet {
+            program: d.program_id.to_string(),
+        },
+    )
+    .await)
+    {
+        ResponseOk::Program(detail) => detail
+            .schema
+            .phases
+            .into_iter()
+            .map(|phase| phase.name)
+            .collect(),
+        other => panic!("expected the program detail: {other:?}"),
+    };
+
+    let before = session_status(mover_target, mover_exec).await;
+    for (target, exec_id) in [(mover_target, mover_exec), (other_target, other_exec)] {
+        let session = session_status(target, exec_id).await;
+        assert_eq!(
+            session.step, before.step,
+            "{} at the same step",
+            target.name
+        );
+        assert_eq!(
+            session.writer,
+            Some(mover),
+            "{} names the peer that moves first",
+            target.name
+        );
+        let phase = session.phase.unwrap_or_else(|| {
+            panic!(
+                "{} reports no phase for a program that declares them",
+                target.name
+            )
+        });
+        assert!(
+            declared.contains(&phase),
+            "{} reports {phase:?}, not one of {declared:?}",
+            target.name
+        );
+        // Chess leaves its default `setup` phase when the session starts.
+        assert_eq!(phase, "playing", "{}", target.name);
+    }
+
+    ok(call(
+        mover_target,
+        &HostRequest::ExecSubmit {
+            exec_id: mover_exec,
+            pending_id,
+            answer: Some(serde_json::json!("e2e4")),
+        },
+    )
+    .await);
+    let (mover_events, other_events) = if mover_is_a {
+        (&mut events_a, &mut events_b)
+    } else {
+        (&mut events_b, &mut events_a)
+    };
+    read_until_step(mover_events, before.step).await;
+    read_until_step(other_events, before.step).await;
+
+    for (target, exec_id) in [(mover_target, mover_exec), (other_target, other_exec)] {
+        let session = session_status(target, exec_id).await;
+        assert_eq!(
+            session.step,
+            before.step + 1,
+            "{} after one move",
+            target.name
+        );
+        assert_eq!(
+            session.writer,
+            Some(other),
+            "{} hands the move to the other peer",
+            target.name
+        );
+        assert_eq!(session.phase.as_deref(), Some("playing"), "{}", target.name);
+    }
+
+    // timer-dispatch declares a phase but no writer function.
+    let d = daemon(&timer_dispatch_wasm()).await;
+    let (exec_a, exec_b) = launch_pair(&d, no_params.clone(), no_params).await;
+    await_active(&d.host_a, exec_a).await;
+    await_active(&d.host_b, exec_b).await;
+    for (target, exec_id) in [(&d.host_a, exec_a), (&d.host_b, exec_b)] {
+        let session = session_status(target, exec_id).await;
+        assert_eq!(session.writer, None, "{}", target.name);
+        assert_eq!(session.phase.as_deref(), Some("waiting"), "{}", target.name);
+        let json = serde_json::to_value(&session).expect("session status JSON");
+        assert!(
+            json["writer"].is_null(),
+            "{}: writer is an explicit null on the wire: {json}",
+            target.name
+        );
+    }
+}
+
+/// `program.get` lists the phases a program declares, in declaration order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn program_schema_lists_declared_phases() {
+    let d = daemon(&prisoner_dilemma_wasm()).await;
+    let ResponseOk::Program(detail) = ok(call(
+        &d.host_a,
+        &HostRequest::ProgramGet {
+            program: d.program_id.to_string(),
+        },
+    )
+    .await) else {
+        panic!("expected the program detail");
+    };
+    let phase = |name: &str, description: &str, is_default: bool| arena0_program::PhaseSchema {
+        name: name.to_owned(),
+        description: description.to_owned(),
+        is_default,
+        is_terminal: false,
+    };
+    assert_eq!(
+        detail.schema.phases,
+        vec![
+            phase("setup", "Waiting for opponent", true),
+            phase("playing", "Round in progress", false),
+        ]
     );
 }

@@ -273,6 +273,10 @@ pub struct SessionStatus {
     pub pending_callout: Option<PendingCalloutStatus>,
     /// Whether this Host's locally produced artifact is durably available.
     pub receipt_available: bool,
+    /// The participant allowed to author the next agreed message, if any.
+    pub writer: Option<PeerId>,
+    /// The program's current phase name, for programs that declare phases.
+    pub phase: Option<String>,
 }
 
 /// A bounded, host-local projection of durable execution facts for inspection

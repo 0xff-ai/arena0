@@ -34,6 +34,16 @@ pub fn cumulative_sum_wasm() -> Vec<u8> {
     arena0_tests::wasm::program_wasm("cumulative_sum")
 }
 
+/// The required prisoner-dilemma guest artifact.
+pub fn prisoner_dilemma_wasm() -> Vec<u8> {
+    arena0_tests::wasm::program_wasm("prisoner_dilemma")
+}
+
+/// The required timer-dispatch guest artifact; it declares no writer.
+pub fn timer_dispatch_wasm() -> Vec<u8> {
+    arena0_tests::wasm::program_wasm("timer_dispatch")
+}
+
 /// One explicit Host target on the shared daemon endpoint.
 #[derive(Clone, Debug)]
 pub struct HostTarget {

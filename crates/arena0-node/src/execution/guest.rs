@@ -344,7 +344,7 @@ impl ExecutionActor {
         shared: &arena0_program::SharedStateBytes,
         ensemble: &Ensemble<Committed>,
     ) -> Result<Option<arena0_protocol::PeerId>, ExecError> {
-        let writer = self.context.program.writer(shared, ensemble)?.writer;
+        let writer = self.context.program.turn(shared, ensemble)?.writer;
         Ok(writer.and_then(|participant| ensemble.peer_at(participant)))
     }
 
