@@ -162,7 +162,7 @@ fn empty_monitor_discovers_participants_and_renders_their_views() {
             },
             status,
             inspection: Some(inspected),
-            view: Some((3, View::new().state("Current board"))),
+            view: Some((Some(3), View::new().state("Current board"))),
             trace: Vec::new(),
             observed_at: epoch_seconds(),
             gap: None,
@@ -779,7 +779,7 @@ fn overview_uses_a_wide_mosaic_and_preserves_program_content_height() {
     let mut state = ScreenState::new(config());
     state.apply(RunUpdate::View {
         host: first_host(),
-        step: 1,
+        step: Some(1),
         view: View::new().state("rank 8\nrank 7\nrank 6\nrank 5"),
     });
     let area = Rect::new(0, 0, 100, 30);
@@ -825,7 +825,7 @@ fn all_hosts_program_summary_reports_incomplete_uniform_and_different_views() {
     let mut state = ScreenState::new(config());
     state.apply(RunUpdate::View {
         host: first_host(),
-        step: 2,
+        step: Some(2),
         view: View::new().state("same state"),
     });
     let (title, _, _) = overview_program_content(&state);
@@ -833,7 +833,7 @@ fn all_hosts_program_summary_reports_incomplete_uniform_and_different_views() {
 
     state.apply(RunUpdate::View {
         host: "host-02".parse().unwrap(),
-        step: 2,
+        step: Some(2),
         view: View::new().state("same state"),
     });
     let (title, body, _) = overview_program_content(&state);
@@ -842,7 +842,7 @@ fn all_hosts_program_summary_reports_incomplete_uniform_and_different_views() {
 
     state.apply(RunUpdate::View {
         host: "host-02".parse().unwrap(),
-        step: 2,
+        step: Some(2),
         view: View::new().state("different state"),
     });
     let (title, body, _) = overview_program_content(&state);
@@ -859,7 +859,7 @@ fn view_history_is_bounded_and_navigable() {
         for (host, label) in [(first_host(), "score"), (other.clone(), "other")] {
             state.apply(RunUpdate::View {
                 host,
-                step,
+                step: Some(step),
                 view: View::new().state(format!("{label} {step}")),
             });
         }
@@ -867,14 +867,20 @@ fn view_history_is_bounded_and_navigable() {
 
     let history = state.view_history.get(&first_host()).unwrap();
     assert_eq!(history.len(), MAX_VIEW_HISTORY);
-    assert_eq!(history.front().map(|snapshot| snapshot.step), Some(4));
-    assert_eq!(history.back().map(|snapshot| snapshot.step), Some(259));
+    assert_eq!(history.front().map(|snapshot| snapshot.step), Some(Some(4)));
+    assert_eq!(
+        history.back().map(|snapshot| snapshot.step),
+        Some(Some(259))
+    );
     let other_history = state.view_history.get(&other).unwrap();
     assert_eq!(other_history.len(), MAX_VIEW_HISTORY);
-    assert_eq!(other_history.front().map(|snapshot| snapshot.step), Some(4));
+    assert_eq!(
+        other_history.front().map(|snapshot| snapshot.step),
+        Some(Some(4))
+    );
     assert_eq!(
         other_history.back().map(|snapshot| snapshot.step),
-        Some(259)
+        Some(Some(259))
     );
     assert!(state.is_live_view());
 
@@ -890,7 +896,7 @@ fn view_history_is_bounded_and_navigable() {
     );
     state.apply(RunUpdate::View {
         host: first_host(),
-        step: 259,
+        step: Some(259),
         view: View::new().state("score 259 resized"),
     });
     assert_eq!(state.view_history[&first_host()].len(), MAX_VIEW_HISTORY);
@@ -1078,12 +1084,12 @@ fn host_qualified_views_preserve_each_host_history() {
     let other: HostName = "host-02".parse().expect("valid Host name");
     state.apply(RunUpdate::View {
         host: first_host(),
-        step: 1,
+        step: Some(1),
         view: View::new().state("host-01 state"),
     });
     state.apply(RunUpdate::View {
         host: other.clone(),
-        step: 1,
+        step: Some(1),
         view: View::new().state("other state"),
     });
     assert_eq!(state.view_history.len(), 2);
@@ -1249,7 +1255,7 @@ fn monitor_partial_refresh_retains_values_until_a_fresh_snapshot_arrives() {
         host: host.clone(),
         exec_id: initial_status.exec_id,
     };
-    let initial_view = Some((3, View::new().state("before")));
+    let initial_view = Some((Some(3), View::new().state("before")));
     state.apply(RunUpdate::Monitor(MonitorUpdate::Execution {
         key: key.clone(),
         status: initial_status.clone(),

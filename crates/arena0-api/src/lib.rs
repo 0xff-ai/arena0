@@ -127,6 +127,7 @@ mod tests {
                     exec: ExecId([8u8; 32]),
                     width: 80,
                     color: ColorDepth::Ansi16,
+                    at_step: None,
                 },
                 "exec.view",
             ),
@@ -170,6 +171,7 @@ mod tests {
             exec: exec_id,
             width: 80,
             color: ColorDepth::Ansi16,
+            at_step: Some(3),
         };
         let exec_json = serde_json::to_value(&exec_request).unwrap();
         assert_eq!(exec_json["params"]["exec"], exec_id.to_string());

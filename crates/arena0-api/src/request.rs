@@ -137,6 +137,10 @@ pub enum HostRequest {
         exec: ExecId,
         width: u16,
         color: ColorDepth,
+        /// Render the shared state after this agreed step. `None` renders the
+        /// latest state.
+        #[serde(default)]
+        at_step: Option<u64>,
     },
     #[serde(rename = "exec.trace")]
     ExecTrace { exec_id: ExecId, from: u64, to: u64 },

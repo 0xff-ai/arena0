@@ -2047,7 +2047,12 @@ impl HostService {
                 answer,
             } => self.submit(exec_id, pending_id, answer).await,
             HostRequest::ExecQuery { exec_id, query } => self.query(exec_id, query).await,
-            HostRequest::ExecView { exec, width, color } => self.view(exec, width, color).await,
+            HostRequest::ExecView {
+                exec,
+                width,
+                color,
+                at_step,
+            } => self.view(exec, width, color, at_step).await,
             HostRequest::ExecTrace { exec_id, from, to } => {
                 self.trace(exec_id, from, to).await.map(ResponseOk::Trace)
             }
@@ -3431,13 +3436,15 @@ impl HostService {
         })
     }
 
-    /// Render the program view from live or terminal shared state. Terminal
-    /// projection uses its durable snapshot after the execution actor exits.
+    /// Render the program view from live or terminal shared state, or, with
+    /// `at_step`, from the state after that agreed step. Terminal projection
+    /// uses its durable snapshot after the execution actor exits.
     async fn view(
         &self,
         exec_id: ExecId,
         width: u16,
         color: arena0_protocol::ColorDepth,
+        at_step: Option<u64>,
     ) -> Response {
         self.store
             .load_execution_request(exec_id)
@@ -3459,42 +3466,13 @@ impl HostService {
             .map_err(|error| ApiError::new(ApiErrorCode::BadRequest, error.to_string()))?;
         let viewport = JsonBytes::try_new(viewport)
             .map_err(|error| ApiError::new(ApiErrorCode::BadRequest, error.to_string()))?;
-        if state.lifecycle().is_terminal() {
-            if state.binding().execution_profile()
-                != arena0_program::ExecutionProfile::current().hash()
-            {
-                return Err(ApiError::new(
-                    ApiErrorCode::Execution,
-                    "execution profile is not supported by this runtime",
-                ));
-            }
-            let program = self
-                .catalog
-                .load_program(state.binding().program_hash())
-                .await
-                .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
-            let ensemble = state
-                .binding()
-                .ensemble()
-                .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
-            let engine = Arc::clone(&self.engine);
-            let step = state.agreed_step();
-            let shared = state.shared_state().clone();
-            let projection = tokio::task::spawn_blocking(move || {
-                engine.load(&program)?.view(&shared, &ensemble, viewport)
-            })
-            .await
-            .map_err(|error| ApiError::new(ApiErrorCode::Internal, error.to_string()))?
-            .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
-            let view = serde_json::from_slice(projection.output.as_bytes()).map_err(|error| {
-                ApiError::new(ApiErrorCode::Execution, format!("view projection: {error}"))
-            })?;
-            return Ok(ResponseOk::ExecView { step, view });
-        }
-        if !matches!(
-            state.lifecycle(),
-            ExecLifecycle::Active | ExecLifecycle::Waiting
-        ) {
+        let terminal = state.lifecycle().is_terminal();
+        if !terminal
+            && !matches!(
+                state.lifecycle(),
+                ExecLifecycle::Active | ExecLifecycle::Waiting
+            )
+        {
             return Err(ApiError::new(
                 ApiErrorCode::Execution,
                 format!(
@@ -3503,12 +3481,110 @@ impl HostService {
                 ),
             ));
         }
+        if let Some(at_step) = at_step {
+            return self.view_at_step(exec_id, &state, at_step, viewport).await;
+        }
+        if terminal {
+            let program = self.load_session_program(&state).await?;
+            let ensemble = state
+                .binding()
+                .ensemble()
+                .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
+            let engine = Arc::clone(&self.engine);
+            let step = state.agreed_step().checked_sub(1);
+            let shared = state.shared_state().clone();
+            let projection = tokio::task::spawn_blocking(move || {
+                engine.load(&program)?.view(&shared, &ensemble, viewport)
+            })
+            .await
+            .map_err(|error| ApiError::new(ApiErrorCode::Internal, error.to_string()))?
+            .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
+            return Ok(ResponseOk::ExecView {
+                step,
+                view: parse_view(&projection)?,
+            });
+        }
         let entry = self.execs.get(&exec_id).ok_or_else(|| {
             ApiError::new(ApiErrorCode::Execution, "execution has no live driver")
         })?;
 
         let (step, view) = entry.view(viewport).await?;
         Ok(ResponseOk::ExecView { step, view })
+    }
+
+    /// Render the shared state after agreed step `at_step` of a session that
+    /// has started, live or terminal. The store keeps only the latest shared
+    /// state, so this replays the agreed steps `0..=at_step` in a fresh
+    /// instance; the cost grows with `at_step`.
+    async fn view_at_step(
+        &self,
+        exec_id: ExecId,
+        state: &arena0_protocol::execution::ExecutionState,
+        at_step: u64,
+        viewport: JsonBytes,
+    ) -> Response {
+        let Some(latest) = state.agreed_step().checked_sub(1) else {
+            return Err(ApiError::new(
+                ApiErrorCode::Execution,
+                "execution has no agreed step yet",
+            ));
+        };
+        if at_step > latest {
+            return Err(ApiError::new(
+                ApiErrorCode::BadRequest,
+                format!("step {at_step} is beyond the latest agreed step {latest}"),
+            ));
+        }
+        let program = self.load_session_program(state).await?;
+        let ensemble = state
+            .binding()
+            .ensemble()
+            .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
+        let binding = state.binding().clone();
+        let local_peer = state.producer();
+        // `at_step <= latest < u64::MAX`, so the exclusive bound cannot wrap.
+        let steps = self
+            .store
+            .read_trace(exec_id, 0, at_step + 1)
+            .await
+            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
+        let engine = Arc::clone(&self.engine);
+        fn execution_error(error: impl std::fmt::Display) -> ApiError {
+            ApiError::new(ApiErrorCode::Execution, error.to_string())
+        }
+        let projection = tokio::task::spawn_blocking(move || {
+            let program = engine.load(&program).map_err(execution_error)?;
+            let shared = arena0_node::replay_shared(&program, &binding, local_peer, &steps)
+                .map_err(execution_error)?;
+            program
+                .view(&shared, &ensemble, viewport)
+                .map_err(execution_error)
+        })
+        .await
+        .map_err(|error| ApiError::new(ApiErrorCode::Internal, error.to_string()))??;
+        Ok(ResponseOk::ExecView {
+            step: Some(at_step),
+            view: parse_view(&projection)?,
+        })
+    }
+
+    /// Load the program a started execution runs, refusing an execution
+    /// profile this runtime does not support.
+    async fn load_session_program(
+        &self,
+        state: &arena0_protocol::execution::ExecutionState,
+    ) -> Result<Program, ApiError> {
+        if state.binding().execution_profile() != arena0_program::ExecutionProfile::current().hash()
+        {
+            return Err(ApiError::new(
+                ApiErrorCode::Execution,
+                "execution profile is not supported by this runtime",
+            ));
+        }
+        self.catalog
+            .load_program(state.binding().program_hash())
+            .await
+            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))
     }
 
     /// Read agreed steps and their local certification times directly from
@@ -3575,6 +3651,15 @@ impl HostService {
         let receipt = self.resolve_receipt(receipt).await?;
         Ok(ResponseOk::Verified(receipt.summary()))
     }
+}
+
+/// Decode a guest view projection into the protocol's [`View`](arena0_protocol::View).
+fn parse_view(
+    projection: &arena0_sandbox::GuestProjectionResult,
+) -> Result<arena0_protocol::View, ApiError> {
+    serde_json::from_slice(projection.output.as_bytes()).map_err(|error| {
+        ApiError::new(ApiErrorCode::Execution, format!("view projection: {error}"))
+    })
 }
 
 fn project_exec_status_facts(

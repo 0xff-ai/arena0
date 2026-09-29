@@ -386,6 +386,7 @@ impl HostMonitor {
                     width: self.handle.view_width(),
                     color: ColorDepth::Mono,
                 },
+                None,
             )
             .await;
         let trace = self.fetch_trace(exec_id, status.step()).await;

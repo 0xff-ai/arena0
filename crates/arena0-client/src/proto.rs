@@ -115,18 +115,26 @@ impl DaemonClient {
             .map_err(|error| anyhow!("{error}"))
     }
 
-    /// Fetch a program-authored execution view for a terminal viewport.
+    /// Fetch a program-authored execution view for a terminal viewport, at the
+    /// latest state or, with `at_step`, after that agreed step.
     ///
-    /// A Host can legitimately have no view while an execution is still
+    /// A Host can legitimately have no latest view while an execution is still
     /// negotiating or otherwise has no active/terminal session. That
-    /// execution-level API error is represented as `None`; transport errors,
-    /// other API errors, and mismatched success payloads remain failures.
+    /// execution-level API error is represented as `None`. It is never `None`
+    /// for an explicit `at_step`: there an execution error (such as a replay
+    /// that diverged from the agreed trace) is a failure, like transport
+    /// errors, other API errors, and mismatched success payloads.
+    ///
+    /// The step in the result is the index of the latest agreed step the view
+    /// includes, numbered from 0 like trace entries; `None` is the initial
+    /// state before step 0 is certified.
     pub async fn exec_view(
         &self,
         host: &HostName,
         exec: ExecId,
         viewport: Viewport,
-    ) -> anyhow::Result<Option<(u64, View)>> {
+        at_step: Option<u64>,
+    ) -> anyhow::Result<Option<(Option<u64>, View)>> {
         match self
             .call_host_raw(
                 host,
@@ -134,13 +142,14 @@ impl DaemonClient {
                     exec,
                     width: viewport.width,
                     color: viewport.color,
+                    at_step,
                 },
             )
             .await?
         {
             Ok(ResponseOk::ExecView { step, view }) => Ok(Some((step, view))),
             Ok(other) => bail!("unexpected response to exec.view: {other:?}"),
-            Err(error) if error.code == ApiErrorCode::Execution => Ok(None),
+            Err(error) if at_step.is_none() && error.code == ApiErrorCode::Execution => Ok(None),
             Err(error) => bail!("{error}"),
         }
     }

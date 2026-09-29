@@ -110,7 +110,7 @@ and `arena0 exec create PROGRAM --blob HASH` (repeatable).
 | `exec.next` | `{exec_id}` | `Next` |
 | `exec.submit` | `{exec_id, pending_id, answer?}` | `Ack` |
 | `exec.query` | `{exec_id, query?}` | `Query` |
-| `exec.view` | `{exec, width, color}` | `ExecView` |
+| `exec.view` | `{exec, width, color, at_step?}` | `ExecView` |
 | `exec.trace` | `{exec_id, from, to}` | `Trace` `[{certified_at_ms, entry}]` |
 | `exec.cancel_creation` | `{exec_id}` | `Ack` |
 | `exec.withdraw` | `{exec_id}` | `Ack` |
@@ -119,6 +119,24 @@ and `arena0 exec create PROGRAM --blob HASH` (repeatable).
 `exec.view` renders the program's shared-state view during execution and after
 termination. Terminal views use the saved shared state and remain available
 after the live execution driver exits. Negotiating executions have no view yet.
+The reply's `step` is the index of the latest agreed step the rendered state
+includes, numbered from 0 like `exec.trace` entries and `exec.session.step`
+events; `null` renders the initial state before step 0 is certified.
+
+`at_step` renders the shared state after that agreed step instead of the latest
+state; `step` in the reply is then `at_step`. The latest agreed step is the
+`step` of the last trace entry. The Host does not store past states. It
+replays the agreed steps `0` through `at_step` in a fresh program instance,
+checks the initial state and every step's `post_state` against the agreed
+trace, and renders the result, so the cost grows with `at_step`. It works for
+active and terminal executions. Errors:
+
+- `BadRequest`: `at_step` is beyond the latest agreed step
+  (`step 9 is beyond the latest agreed step 4`).
+- `Execution`: the execution has no agreed step yet (a negotiating or
+  activating execution returns the error a latest view returns), or the replay
+  did not reproduce the agreed trace. The message names the step; nothing is
+  rendered from a state that disagrees with the trace.
 
 `blobs` lists hashes of imported blobs this participant grants the execution;
 it defaults to none. An unknown hash is `NotFound`, before anything is

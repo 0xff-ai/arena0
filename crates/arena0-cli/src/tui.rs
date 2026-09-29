@@ -362,7 +362,9 @@ pub(crate) enum RunUpdate {
     },
     View {
         host: HostName,
-        step: u64,
+        /// Index of the latest agreed step the view includes; `None` before
+        /// step 0 is certified.
+        step: Option<u64>,
         view: View,
     },
     Trace {
@@ -436,7 +438,7 @@ pub(crate) struct MonitorExecution {
     pub(crate) key: MonitorExecutionKey,
     pub(crate) status: ExecStatus,
     pub(crate) inspection: Option<ExecutionInspection>,
-    pub(crate) view: Option<(u64, View)>,
+    pub(crate) view: Option<(Option<u64>, View)>,
     pub(crate) trace: Vec<TraceEntry>,
     pub(crate) agreement: Option<(u16, u16)>,
     pub(crate) observed_at: u64,
@@ -468,7 +470,7 @@ pub(crate) enum MonitorUpdate {
         key: MonitorExecutionKey,
         status: ExecStatus,
         inspection: Option<ExecutionInspection>,
-        view: Option<(u64, View)>,
+        view: Option<(Option<u64>, View)>,
         trace: Vec<TraceEntry>,
         observed_at: u64,
         gap: Option<String>,
@@ -907,8 +909,17 @@ impl TraceViewEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ViewSnapshot {
     host: HostName,
-    step: u64,
+    /// Index of the latest agreed step the view includes; `None` is the
+    /// initial state before step 0 is certified, which sorts first.
+    step: Option<u64>,
     view: View,
+}
+
+impl ViewSnapshot {
+    fn step_label(&self) -> String {
+        self.step
+            .map_or_else(|| "start".to_owned(), |step| step.to_string())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1977,7 +1988,7 @@ impl ScreenState {
         count == 0 || self.view_cursor + 1 >= count
     }
 
-    fn add_view_snapshot(&mut self, host: HostName, step: u64, view: View) {
+    fn add_view_snapshot(&mut self, host: HostName, step: Option<u64>, view: View) {
         let was_live = self.is_live_view();
         if self.selected_host.is_none() {
             self.selected_host = Some(host.clone());
@@ -2746,17 +2757,13 @@ impl ScreenState {
         };
         if let Some(host) = &self.selected_host
             && let Some(history) = self.view_history.get(host)
-        {
-            let program_step = step.saturating_add(1);
-            if let Some(index) = history
+            && let Some(index) = history
                 .iter()
-                .position(|snapshot| snapshot.step == program_step)
-                .or_else(|| history.iter().position(|snapshot| snapshot.step == step))
-            {
-                self.view_cursor = index;
-                self.view_new_count = history.len().saturating_sub(index + 1);
-                self.program_scroll = 0;
-            }
+                .position(|snapshot| snapshot.step == Some(step))
+        {
+            self.view_cursor = index;
+            self.view_new_count = history.len().saturating_sub(index + 1);
+            self.program_scroll = 0;
         }
         let public = CrossingKey::Public { step };
         if wasm::keys(self).contains(&public) {
@@ -3586,11 +3593,15 @@ fn render_monitor_guest(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) 
     } else {
         format!("LIVE  fetched {age}s ago")
     };
-    let step = execution
-        .view
-        .as_ref()
-        .map(|(step, _)| *step)
-        .or_else(|| execution.status.step());
+    // The status reports how many steps are agreed; the view reports the
+    // index of the last of them.
+    let step = match &execution.view {
+        Some((step, _)) => *step,
+        None => execution
+            .status
+            .step()
+            .and_then(|agreed| agreed.checked_sub(1)),
+    };
     let title = format!(
         "GUEST VIEW  {}  exec {}  step {}  {}",
         execution.key.host,

@@ -65,7 +65,10 @@ pub enum ResponseOk {
     },
     /// `exec.view`: the program-authored view rendered for a terminal viewport.
     ExecView {
-        step: u64,
+        /// Index of the latest agreed step applied to the rendered state (steps
+        /// are numbered from 0, like trace entries). `None` renders the initial
+        /// state before step 0 is certified.
+        step: Option<u64>,
         view: View,
     },
     Trace(Vec<AgreedStep>),

@@ -80,9 +80,9 @@ impl Ctx {
     pub(crate) async fn fetch_exec_view(
         &self,
         exec_id: ExecId,
-    ) -> anyhow::Result<Option<(u64, View)>> {
+    ) -> anyhow::Result<Option<(Option<u64>, View)>> {
         self.client
-            .exec_view(&self.host, exec_id, self.viewport())
+            .exec_view(&self.host, exec_id, self.viewport(), None)
             .await
     }
 }
@@ -312,8 +312,14 @@ enum ExecCommand {
     },
     /// Execute a read-only JSON query.
     Query { exec_id: String, input: String },
-    /// Render the program-authored view.
-    View { exec_id: String },
+    /// Render the program-authored view, by default of the latest state.
+    View {
+        exec_id: String,
+        /// Render the state after this agreed step instead. The Host replays
+        /// the agreed steps up to it, so the cost grows with the step.
+        #[arg(long)]
+        step: Option<u64>,
+    },
     /// Read the durable trace.
     Trace {
         exec_id: String,
@@ -1671,7 +1677,7 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
                 other => bail!("unexpected response to exec.query: {other:?}"),
             }
         }
-        ExecCommand::View { exec_id } => {
+        ExecCommand::View { exec_id, step } => {
             let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
             let viewport = ctx.viewport();
             match ctx
@@ -1679,6 +1685,7 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
                     exec: exec_id,
                     width: viewport.width,
                     color: viewport.color,
+                    at_step: step,
                 })
                 .await?
             {

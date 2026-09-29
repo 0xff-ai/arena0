@@ -1840,6 +1840,7 @@ async fn refresh_tui_view(
                 width: tui.view_width(),
                 color: ColorDepth::Mono,
             },
+            None,
         )
         .await
         .with_context(|| format!("refresh TUI view for Host '{host}' execution {exec_id}"))?
@@ -2025,6 +2026,7 @@ async fn fetch_human_view(
                 width: crate::ui::terminal_width(),
                 color,
             },
+            None,
         )
         .await
         .map(|view| view.map(|(_, view)| view))
@@ -2422,7 +2424,7 @@ mod tests {
                 } if exec == exec_id
             ));
             let response: Response = Ok(ResponseOk::ExecView {
-                step: 4,
+                step: Some(4),
                 view: View::new().state("score 1").status_bar("round 2"),
             });
             arena0_client::api::frame::write_frame(&mut write, &response)

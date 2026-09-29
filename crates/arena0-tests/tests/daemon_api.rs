@@ -8,12 +8,12 @@ use std::time::Duration;
 
 use arena0_api::{
     AwaitState, ColorDepth, EnsembleSpec, EventData, EventFilter, EventFrame, ExecLifecycle,
-    HostRequest, ReceiptArtifact, Request, Response, ResponseOk,
+    HostRequest, NextEvent, ReceiptArtifact, Request, Response, ResponseOk,
 };
-use arena0_protocol::{ExecId, NegotiationTarget, Slot};
+use arena0_protocol::{CalloutId, ExecId, NegotiationTarget, Slot, View};
 use common::{
-    HostTarget, call, call_daemon, chess_wasm, created, cumulative_sum_wasm, daemon, drive, ok,
-    rps_wasm,
+    DaemonHarness, HostTarget, call, call_daemon, chess_wasm, created, cumulative_sum_wasm, daemon,
+    drive, ok, rps_wasm,
 };
 use tokio::io::BufReader;
 use tokio::net::{UnixStream, unix::OwnedReadHalf, unix::OwnedWriteHalf};
@@ -620,6 +620,7 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
             exec: exec_a,
             width: 80,
             color: ColorDepth::Ansi16,
+            at_step: None,
         },
     )
     .await
@@ -663,6 +664,7 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
             exec: exec_a,
             width: 80,
             color: ColorDepth::Ansi16,
+            at_step: None,
         },
     )
     .await)
@@ -695,12 +697,17 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
                 exec,
                 width: 80,
                 color: ColorDepth::Ansi16,
+                at_step: None,
             },
         )
         .await)
         {
             ResponseOk::ExecView { step, view } => {
-                assert!(step > 0);
+                assert_eq!(
+                    step,
+                    Some(latest_agreed_step(socket, exec).await),
+                    "a latest view names the last agreed trace step"
+                );
                 assert!(
                     view.slots
                         .get(&Slot::Header)
@@ -722,11 +729,233 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
             exec: ExecId([0xFA; 32]),
             width: 80,
             color: ColorDepth::Ansi16,
+            at_step: None,
         },
     )
     .await
     .unwrap_err();
     assert_eq!(missing.code, arena0_api::ApiErrorCode::NotFound);
+}
+
+/// Create a two-participant execution on Host A; it stays negotiating until a
+/// joiner arrives.
+async fn create_on_host_a(d: &DaemonHarness) -> (ExecId, arena0_protocol::NegotiationId) {
+    match ok(call(
+        &d.host_a,
+        &HostRequest::ExecNew {
+            exec_id: ExecId([0xA1; 32]),
+            program: d.program_id.to_string(),
+            params: Some(serde_json::json!(null)),
+            ensemble: EnsembleSpec::Create {
+                participant_count: 2,
+            },
+            blobs: vec![],
+        },
+    )
+    .await)
+    {
+        ResponseOk::ExecCreated {
+            exec_id,
+            negotiation_id: Some(negotiation_id),
+            ..
+        } => (exec_id, negotiation_id),
+        other => panic!("unexpected creator response: {other:?}"),
+    }
+}
+
+async fn join_on_host_b(
+    d: &DaemonHarness,
+    negotiation_id: arena0_protocol::NegotiationId,
+) -> ExecId {
+    created(
+        call(
+            &d.host_b,
+            &HostRequest::ExecNew {
+                exec_id: ExecId([0xB1; 32]),
+                program: d.program_id.to_string(),
+                params: Some(serde_json::json!(null)),
+                ensemble: EnsembleSpec::Join {
+                    target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
+                },
+                blobs: vec![],
+            },
+        )
+        .await,
+    )
+}
+
+/// The next callout either participant has open and has not answered yet.
+async fn next_callout(
+    d: &DaemonHarness,
+    exec_a: ExecId,
+    exec_b: ExecId,
+    answered: Option<CalloutId>,
+) -> (&HostTarget, ExecId, CalloutId) {
+    loop {
+        let (is_a, next) = next_from_either(&d.host_a, exec_a, &d.host_b, exec_b).await;
+        match ok(next) {
+            ResponseOk::Next(NextEvent::Callout { pending_id, .. }) => {
+                if Some(pending_id) != answered {
+                    return if is_a {
+                        (&d.host_a, exec_a, pending_id)
+                    } else {
+                        (&d.host_b, exec_b, pending_id)
+                    };
+                }
+                // The answered callout is still projected until its step lands.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => panic!("expected a callout, got {other:?}"),
+        }
+    }
+}
+
+async fn view_at(target: &HostTarget, exec: ExecId, at_step: Option<u64>) -> Response {
+    call(
+        target,
+        &HostRequest::ExecView {
+            exec,
+            width: 80,
+            color: ColorDepth::Ansi16,
+            at_step,
+        },
+    )
+    .await
+}
+
+fn view_reply(response: Response) -> (Option<u64>, View) {
+    match ok(response) {
+        ResponseOk::ExecView { step, view } => (step, view),
+        other => panic!("unexpected view response: {other:?}"),
+    }
+}
+
+/// The step number of the last entry in the execution's agreed trace.
+async fn latest_agreed_step(target: &HostTarget, exec_id: ExecId) -> u64 {
+    let request = HostRequest::ExecTrace {
+        exec_id,
+        from: 0,
+        to: u64::MAX,
+    };
+    match ok(call(target, &request).await) {
+        ResponseOk::Trace(steps) => {
+            steps
+                .last()
+                .expect("a started session has step 0")
+                .entry
+                .step
+        }
+        other => panic!("unexpected trace response: {other:?}"),
+    }
+}
+
+/// A view at a past step is the replay of the agreed steps up to it, so it
+/// must be exactly the view the live Host rendered while that step was the
+/// latest one. Chess makes every step a different board, so a Host that
+/// ignored `at_step` and rendered its latest state would fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn past_view_equals_the_live_view_at_that_step() {
+    let d = daemon(&chess_wasm()).await;
+    let (exec_a, negotiation_id) = create_on_host_a(&d).await;
+    let exec_b = join_on_host_b(&d, negotiation_id).await;
+
+    // The session start plus fool's mate: five agreed steps. A callout opens
+    // only after the latest agreed step landed and nothing advances until it
+    // is answered, so each live view is a stable observation of one step.
+    let mut recorded: Vec<(u64, View)> = Vec::new();
+    let mut answered = None;
+    for chess_move in ["f2f3", "e7e5", "g2g4", "d8h4"] {
+        let (target, exec_id, pending_id) = next_callout(&d, exec_a, exec_b, answered).await;
+        let (step, view) = view_reply(view_at(target, exec_id, None).await);
+        recorded.push((step.expect("a callout follows an agreed step"), view));
+        ok(call(
+            target,
+            &HostRequest::ExecSubmit {
+                exec_id,
+                pending_id,
+                answer: Some(serde_json::json!(chess_move)),
+            },
+        )
+        .await);
+        answered = Some(pending_id);
+    }
+    for (target, exec_id) in [(&d.host_a, exec_a), (&d.host_b, exec_b)] {
+        ok(call(
+            target,
+            &HostRequest::ExecAwait {
+                exec_id,
+                until: AwaitState::Terminal,
+            },
+        )
+        .await);
+    }
+    let (step, terminal) = view_reply(view_at(&d.host_a, exec_a, None).await);
+    recorded.push((
+        step.expect("a completed session has agreed steps"),
+        terminal,
+    ));
+
+    let steps: Vec<u64> = recorded.iter().map(|(step, _)| *step).collect();
+    assert_eq!(steps, [0, 1, 2, 3, 4], "one recorded view per agreed step");
+    for (index, (_, view)) in recorded.iter().enumerate() {
+        assert!(
+            recorded[index + 1..].iter().all(|(_, other)| other != view),
+            "every step renders a different board"
+        );
+    }
+
+    for (target, exec_id) in [(&d.host_a, exec_a), (&d.host_b, exec_b)] {
+        for (step, live) in &recorded {
+            let (replayed_step, replayed) = view_reply(view_at(target, exec_id, Some(*step)).await);
+            assert_eq!(replayed_step, Some(*step));
+            assert_eq!(
+                &replayed, live,
+                "Host {} replayed step {step} differently from the live view",
+                target.name
+            );
+        }
+    }
+}
+
+/// Only agreed steps can be replayed, and only once a session has started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn past_view_rejects_future_steps() {
+    let d = daemon(&rps_wasm()).await;
+    let (exec_a, negotiation_id) = create_on_host_a(&d).await;
+
+    // Still negotiating: a past view fails exactly as a latest view does.
+    let latest = view_at(&d.host_a, exec_a, None).await.unwrap_err();
+    assert_eq!(latest.code, arena0_api::ApiErrorCode::Execution);
+    assert_eq!(
+        view_at(&d.host_a, exec_a, Some(0)).await.unwrap_err(),
+        latest
+    );
+
+    let exec_b = join_on_host_b(&d, negotiation_id).await;
+
+    // A live session: rock-paper-scissors opens callouts at the session start
+    // and nothing advances until one is answered.
+    let (target, exec_id, _) = next_callout(&d, exec_a, exec_b, None).await;
+    assert_future_step_rejected(target, exec_id).await;
+
+    let (_sa, _sb) = tokio::join!(drive(&d.host_a, exec_a), drive(&d.host_b, exec_b));
+    for (target, exec_id) in [(&d.host_a, exec_a), (&d.host_b, exec_b)] {
+        assert_future_step_rejected(target, exec_id).await;
+    }
+}
+
+async fn assert_future_step_rejected(target: &HostTarget, exec_id: ExecId) {
+    let latest = latest_agreed_step(target, exec_id).await;
+    let (step, _) = view_reply(view_at(target, exec_id, Some(latest)).await);
+    assert_eq!(step, Some(latest), "the latest agreed step can be replayed");
+    for beyond in [latest + 1, u64::MAX] {
+        let error = view_at(target, exec_id, Some(beyond)).await.unwrap_err();
+        assert_eq!(error.code, arena0_api::ApiErrorCode::BadRequest);
+        assert_eq!(
+            error.message,
+            format!("step {beyond} is beyond the latest agreed step {latest}")
+        );
+    }
 }
 
 /// `events.subscribe` delivers Negotiation, Step, and Terminal frames for a driven

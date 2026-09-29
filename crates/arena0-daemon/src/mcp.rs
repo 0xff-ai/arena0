@@ -423,7 +423,10 @@ struct ExecutionListOutput {
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
 struct ExecutionViewOutput {
-    step: u64,
+    /// Index of the latest agreed step applied to the rendered state (steps
+    /// are numbered from 0, like trace entries). Null renders the initial
+    /// state before step 0 is certified.
+    step: Option<u64>,
     view: Value,
 }
 
@@ -752,6 +755,7 @@ impl Arena0Mcp {
                     exec,
                     width: 80,
                     color: ColorDepth::Mono,
+                    at_step: None,
                 },
             )
             .await?
