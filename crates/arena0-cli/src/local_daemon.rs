@@ -338,7 +338,7 @@ mod tests {
                     abi_version: 1,
                     uptime_secs: 0,
                     socket: "test.sock".to_owned(),
-                    mcp_endpoint: "127.0.0.1:0".to_owned(),
+                    http_url: "http://127.0.0.1:0".to_owned(),
                 }))
             };
             write_frame(&mut write, &response).await?;

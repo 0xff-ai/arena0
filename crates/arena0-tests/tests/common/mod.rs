@@ -6,13 +6,15 @@
 
 #![allow(dead_code, unreachable_pub)]
 
+pub mod http;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use arena0_api::{HostRequest, NextEvent, Request, Response, ResponseOk};
-use arena0_daemon::{Daemon, McpConfig};
+use arena0_daemon::{Daemon, HttpConfig};
 use arena0_home::{Home, HostName};
 use arena0_program::ProgramHash;
 use arena0_protocol::SessionHash;
@@ -186,10 +188,12 @@ async fn wait_for_host(target: &HostTarget) {
 }
 
 pub async fn import(target: &HostTarget, wasm: &[u8]) -> ProgramHash {
+    let file = tempfile::NamedTempFile::new().expect("program file");
+    std::fs::write(file.path(), wasm).expect("write program");
     match ok(call(
         target,
         &HostRequest::ProgramImport {
-            wasm: wasm.to_vec(),
+            source: arena0_api::FileSource::Path(file.path().to_path_buf()),
         },
     )
     .await)
@@ -208,6 +212,7 @@ pub fn created(resp: Response) -> arena0_protocol::ExecId {
 
 /// One process-level daemon with two explicit Host targets used by the tests.
 pub struct DaemonHarness {
+    pub http: SocketAddr,
     pub _home: tempfile::TempDir,
     pub _daemon: Arc<Daemon>,
     pub socket: PathBuf,
@@ -226,7 +231,7 @@ pub async fn daemon(wasm: &[u8]) -> DaemonHarness {
     let socket = home.socket();
     let host_a = HostName::try_from("a").unwrap();
     let host_b = HostName::try_from("b").unwrap();
-    let mcp = McpConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)), None).unwrap();
+    let mcp = HttpConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)), None).unwrap();
     let engine = arena0_test_engine::shared_test_engine();
     let supervisor = Daemon::start(
         vec![host_a.clone(), host_b.clone()],
@@ -262,7 +267,17 @@ pub async fn daemon(wasm: &[u8]) -> DaemonHarness {
         other => panic!("unexpected host info response: {other:?}"),
     };
 
+    let ResponseOk::DaemonInfo(info) = ok(call_daemon(&socket, &Request::DaemonInfo).await) else {
+        panic!("expected daemon info");
+    };
+    let http = info
+        .http_url
+        .strip_prefix("http://")
+        .unwrap()
+        .parse()
+        .unwrap();
     DaemonHarness {
+        http,
         _home: home_dir,
         _daemon: supervisor,
         socket,

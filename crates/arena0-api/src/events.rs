@@ -398,6 +398,11 @@ impl<'de> Deserialize<'de> for EventFilter {
 }
 
 impl EventFilter {
+    /// Subscribe to every event tag.
+    pub fn all() -> Self {
+        Self::default()
+    }
+
     /// Build and validate an event filter.
     pub fn try_new(include: Vec<String>, exclude: Vec<String>) -> Result<Self, ApiError> {
         let filter = Self { include, exclude };

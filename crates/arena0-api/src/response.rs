@@ -11,7 +11,6 @@ use arena0_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::PathBuf;
 
 /// One response frame.
 pub type Response = Result<ResponseOk, ApiError>;
@@ -107,8 +106,9 @@ pub struct DaemonInfo {
     pub abi_version: u32,
     pub uptime_secs: u64,
     pub socket: String,
-    /// The actual bound MCP endpoint, including an assigned ephemeral port.
-    pub mcp_endpoint: String,
+    /// The daemon HTTP server, e.g. `http://127.0.0.1:43127`. MCP is at
+    /// `{http_url}/mcp`, the web UI at `{http_url}/`.
+    pub http_url: String,
 }
 
 /// Current information from one Host's authoritative service and store.
@@ -551,10 +551,8 @@ pub enum DecodedMessage {
 pub struct BlobEntry {
     pub hash: BlobHash,
     pub length: u64,
-    /// The daemon-local file the blob reads from.
-    pub path: PathBuf,
-    /// True when imported in place (`blob.import`); false for a file this Host
-    /// received and owns.
+    /// True for a path imported in place; false for an owned upload copy or
+    /// a file this Host received through execution.
     pub linked: bool,
 }
 

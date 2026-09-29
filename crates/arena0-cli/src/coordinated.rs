@@ -797,7 +797,8 @@ async fn resolve_program(
 ) -> anyhow::Result<ProgramDetail> {
     let wasm = wasm_reference(reference)
         .map(|path| {
-            std::fs::read(path).with_context(|| format!("read Wasm program {}", path.display()))
+            std::fs::canonicalize(path)
+                .with_context(|| format!("resolve Wasm program {}", path.display()))
         })
         .transpose()?;
 
@@ -810,7 +811,12 @@ async fn resolve_program(
         jobs.spawn(async move {
             let response = if let Some(wasm) = wasm {
                 client
-                    .call_host(&host_name, &HostRequest::ProgramImport { wasm })
+                    .call_host(
+                        &host_name,
+                        &HostRequest::ProgramImport {
+                            source: arena0_client::api::FileSource::Path(wasm),
+                        },
+                    )
                     .await
             } else {
                 client

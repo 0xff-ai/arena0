@@ -26,13 +26,14 @@ serde_json = { workspace = true }
 jsonschema = { workspace = true }
 hex = { workspace = true }
 anyhow = { workspace = true }
+blake3 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 valuable = { workspace = true }
 retry = { workspace = true }
 rmcp = { workspace = true }
 jsonwebtoken = { workspace = true }
-axum = { workspace = true }
+axum = { workspace = true, features = ["json"] }
 zeroize = { workspace = true }
 fs2 = "0.4"
 

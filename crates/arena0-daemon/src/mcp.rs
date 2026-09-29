@@ -6,16 +6,9 @@
 //! durable Host before a tool handler runs; wire references contain only
 //! Host-local execution/program/session ids and public peer identities.
 
-use futures::{
-    FutureExt as _,
-    future::{BoxFuture, Shared},
-};
 #[cfg(test)]
 use std::collections::BTreeSet;
-use std::future::Future as _;
-use std::io::IoSlice;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Instant;
 
 use arena0_api::{
@@ -26,10 +19,6 @@ use arena0_program::ParticipantCount;
 use arena0_protocol::{ExecId, NegotiationTarget, PeerId, SessionHash};
 #[cfg(test)]
 use arena0_test_engine::shared_test_engine;
-use axum::extract::{Request as HttpRequest, State};
-use axum::http::{StatusCode, header};
-use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response as HttpResponse};
 use rmcp::handler::server::common::Extension;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
@@ -41,14 +30,12 @@ use rmcp::transport::streamable_http_server::{
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, de::Deserializer};
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
 
-use crate::ensemble::{Daemon, McpConfig};
+use crate::ensemble::Daemon;
+#[cfg(test)]
+use crate::ensemble::HttpConfig;
 use crate::mcp_auth::{AuthError, VerifiedClaims};
 use crate::server::HostService;
-use crate::startup::StartupStage;
 
 /// The only Host selector available to authenticated MCP tools. It is kept
 /// private to this crate and inserted into RMCP request extensions after the
@@ -456,7 +443,7 @@ fn output_schema<T: schemars::JsonSchema + std::any::Any>() -> Arc<rmcp::model::
 }
 
 #[derive(Clone, Debug)]
-struct Arena0Mcp {
+pub(crate) struct Arena0Mcp {
     #[allow(dead_code)]
     tool_router: ToolRouter<Arena0Mcp>,
     daemon: Arc<Daemon>,
@@ -1089,236 +1076,17 @@ impl ServerHandler for Arena0Mcp {
     }
 }
 
-// The existing shutdown watch also interrupts incomplete HTTP headers and
-// blocked writes. Shared owns and removes each connection's wake registration.
-type ConnectionShutdown = Shared<BoxFuture<'static, ()>>;
-
-struct ShutdownTcpStream {
-    inner: TcpStream,
-    shutdown: ConnectionShutdown,
-    closed: bool,
-}
-
-impl ShutdownTcpStream {
-    fn is_closed(&mut self, context: &mut Context<'_>) -> bool {
-        if !self.closed {
-            self.closed = std::pin::Pin::new(&mut self.shutdown)
-                .poll(context)
-                .is_ready();
-        }
-        self.closed
-    }
-}
-
-impl AsyncRead for ShutdownTcpStream {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        if self.is_closed(context) {
-            return Poll::Ready(Ok(()));
-        }
-        std::pin::Pin::new(&mut self.inner).poll_read(context, buffer)
-    }
-}
-
-impl AsyncWrite for ShutdownTcpStream {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        if self.is_closed(context) {
-            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
-        }
-        std::pin::Pin::new(&mut self.inner).poll_write(context, buffer)
-    }
-
-    fn poll_write_vectored(
-        mut self: std::pin::Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffers: &[IoSlice<'_>],
-    ) -> Poll<std::io::Result<usize>> {
-        if self.is_closed(context) {
-            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
-        }
-        std::pin::Pin::new(&mut self.inner).poll_write_vectored(context, buffers)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
-    }
-
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_flush(context)
-    }
-
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_shutdown(context)
-    }
-}
-
-struct McpListener {
-    inner: TcpListener,
-    shutdown: ConnectionShutdown,
-}
-
-impl McpListener {
-    fn new(inner: TcpListener, shutdown: ConnectionShutdown) -> Self {
-        Self { inner, shutdown }
-    }
-}
-
-impl axum::serve::Listener for McpListener {
-    type Io = ShutdownTcpStream;
-    type Addr = std::net::SocketAddr;
-
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            match self.inner.accept().await {
-                Ok((stream, address)) => {
-                    return (
-                        ShutdownTcpStream {
-                            inner: stream,
-                            shutdown: self.shutdown.clone(),
-                            closed: false,
-                        },
-                        address,
-                    );
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "MCP accept failed; retrying");
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-            }
-        }
-    }
-
-    fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        self.inner.local_addr()
-    }
-}
-
-pub(crate) async fn serve(
+pub(crate) fn mcp_service(
     daemon: Arc<Daemon>,
-    config: McpConfig,
-    listener: TcpListener,
-    mut shutdown: watch::Receiver<bool>,
-) -> anyhow::Result<()> {
-    let startup = daemon.startup_timeline();
-    let router = router(daemon, config.bearer_token);
-    let address = match listener.local_addr() {
-        Ok(address) => address,
-        Err(error) => {
-            startup.progress(StartupStage::Failed);
-            return Err(error.into());
-        }
-    };
-    tracing::info!(endpoint = %format_args!("http://{address}/mcp"), "arena0d MCP listening");
-    let mut connection_shutdown = shutdown.clone();
-    let connection_shutdown = async move {
-        if !*connection_shutdown.borrow() {
-            let _ = connection_shutdown.changed().await;
-        }
-    }
-    .boxed()
-    .shared();
-    let listener = McpListener::new(listener, connection_shutdown);
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            if !*shutdown.borrow() {
-                let _ = shutdown.changed().await;
-            }
-        })
-        .await?;
-    Ok(())
-}
-
-fn router(daemon: Arc<Daemon>, bearer_token: Option<String>) -> axum::Router {
-    let shutdown = daemon.shutdown_receiver();
-    let service: StreamableHttpService<Arena0Mcp, LocalSessionManager> = StreamableHttpService::new(
+) -> StreamableHttpService<Arena0Mcp, LocalSessionManager> {
+    StreamableHttpService::new(
         move || Ok(Arena0Mcp::new(Arc::clone(&daemon))),
         Default::default(),
         // Every tool is self-contained, so MCP session state adds nothing.
         StreamableHttpServerConfig::default()
             .with_stateful_mode(false)
             .with_json_response(true),
-    );
-
-    let router = axum::Router::new().nest_service("/mcp", service);
-    let router = match bearer_token {
-        Some(token) => router.layer(middleware::from_fn_with_state(
-            Arc::<str>::from(token),
-            require_bearer,
-        )),
-        None => router,
-    };
-    router.layer(middleware::from_fn_with_state(
-        shutdown,
-        cancel_inflight_request,
-    ))
-}
-
-async fn require_bearer(
-    State(expected): State<Arc<str>>,
-    request: HttpRequest,
-    next: Next,
-) -> HttpResponse {
-    let supplied = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-    if supplied.is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes())) {
-        next.run(request).await
-    } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer")],
-            "unauthorized",
-        )
-            .into_response()
-    }
-}
-
-async fn cancel_inflight_request(
-    State(mut shutdown): State<watch::Receiver<bool>>,
-    request: HttpRequest,
-    next: Next,
-) -> HttpResponse {
-    if *shutdown.borrow() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "daemon is shutting down").into_response();
-    }
-    tokio::select! {
-        response = next.run(request) => response,
-        changed = shutdown.changed() => {
-            let _ = changed;
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "daemon is shutting down",
-            )
-                .into_response()
-        }
-    }
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (left ^ right)
-        })
-        == 0
+    )
 }
 
 fn exec_ref(exec_id: ExecId) -> ExecRef {
@@ -1462,7 +1230,7 @@ mod tests {
 
     async fn test_daemon() -> TestDaemon {
         let home = tempfile::tempdir().expect("temporary daemon home");
-        let mcp = McpConfig::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), None)
+        let mcp = HttpConfig::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), None)
             .expect("test MCP config");
         let dynamic_home = arena0_home::Home::from_root(home.path().to_path_buf()).unwrap();
         TestDaemon {
@@ -1532,7 +1300,7 @@ mod tests {
     async fn wait_for_mcp_address(daemon: &Daemon) -> SocketAddr {
         timeout(Duration::from_secs(10), async {
             loop {
-                if let Some(address) = daemon.mcp_endpoint()
+                if let Some(address) = daemon.http_address()
                     && address.port() != 0
                 {
                     return address;
@@ -1636,8 +1404,15 @@ mod tests {
             .expect("bind MCP test listener");
         let address = listener.local_addr().expect("MCP listener address");
         let daemon = Arc::clone(&test.daemon);
-        let serving =
-            tokio::spawn(async move { axum::serve(listener, router(daemon, None)).await });
+        let serving = tokio::spawn(async move {
+            crate::http::serve(
+                Arc::clone(&daemon),
+                HttpConfig::new(address, None).unwrap(),
+                listener,
+                daemon.shutdown_receiver(),
+            )
+            .await
+        });
 
         let omitted = post_mcp(
             address,
@@ -1689,8 +1464,15 @@ mod tests {
             .expect("bind MCP test listener");
         let address = listener.local_addr().expect("MCP listener address");
         let daemon = Arc::clone(&test.daemon);
-        let serving =
-            tokio::spawn(async move { axum::serve(listener, router(daemon, None)).await });
+        let serving = tokio::spawn(async move {
+            crate::http::serve(
+                Arc::clone(&daemon),
+                HttpConfig::new(address, None).unwrap(),
+                listener,
+                daemon.shutdown_receiver(),
+            )
+            .await
+        });
 
         let (first, second) = tokio::join!(
             post_mcp(
@@ -1772,7 +1554,7 @@ mod tests {
             .await
             .expect("bind occupied MCP port");
         let address = occupied.local_addr().expect("occupied MCP address");
-        let mcp = McpConfig::new(address, None).expect("MCP config");
+        let mcp = HttpConfig::new(address, None).expect("MCP config");
         let dynamic_home =
             arena0_home::Home::from_root(home.path().to_path_buf()).expect("dynamic Host home");
         let daemon = Daemon::start(
@@ -1797,31 +1579,6 @@ mod tests {
             "Unix service must not start after bind failure"
         );
         drop(occupied);
-    }
-
-    #[tokio::test]
-    async fn shutdown_stream_remains_closed_across_reads_and_writes() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let peer = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (stop, mut stopped) = watch::channel(false);
-        let shutdown = async move {
-            let _ = stopped.changed().await;
-        }
-        .boxed()
-        .shared();
-        let mut listener = McpListener::new(listener, shutdown);
-        let (mut stream, _) = axum::serve::Listener::accept(&mut listener).await;
-        stop.send_replace(true);
-        let mut buffer = [0; 1];
-        assert_eq!(stream.read(&mut buffer).await.unwrap(), 0);
-        assert_eq!(
-            stream.write(b"x").await.unwrap_err().kind(),
-            std::io::ErrorKind::BrokenPipe
-        );
-        assert_eq!(stream.read(&mut buffer).await.unwrap(), 0);
-        drop(peer);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1910,8 +1667,15 @@ mod tests {
             .expect("bind MCP test listener");
         let address = listener.local_addr().expect("MCP listener address");
         let daemon = Arc::clone(&test.daemon);
-        let serving =
-            tokio::spawn(async move { axum::serve(listener, router(daemon, None)).await });
+        let serving = tokio::spawn(async move {
+            crate::http::serve(
+                Arc::clone(&daemon),
+                HttpConfig::new(address, None).unwrap(),
+                listener,
+                daemon.shutdown_receiver(),
+            )
+            .await
+        });
 
         let client_a = ClientInfo::default()
             .serve(StreamableHttpClientTransport::from_config(
@@ -2047,7 +1811,7 @@ mod tests {
         for phase in 0..3 {
             let daemon = Daemon::start(
                 vec![],
-                McpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap(),
+                HttpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap(),
                 Arc::clone(&engine),
                 home.clone(),
                 true,
@@ -2318,16 +2082,8 @@ mod tests {
     }
 
     #[test]
-    fn bearer_comparison_rejects_prefixes_and_suffixes() {
-        assert!(constant_time_eq(b"secret", b"secret"));
-        assert!(!constant_time_eq(b"secret", b"secre"));
-        assert!(!constant_time_eq(b"secret", b"secret2"));
-        assert!(!constant_time_eq(b"secret", b"Secret"));
-    }
-
-    #[test]
     fn non_loopback_mcp_is_rejected() {
-        let result = McpConfig::new("0.0.0.0:7330".parse().expect("socket address"), None);
+        let result = HttpConfig::new("0.0.0.0:7330".parse().expect("socket address"), None);
         assert!(result.is_err());
     }
 }

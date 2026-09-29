@@ -15,6 +15,7 @@ mod assets;
 mod catalog;
 mod ensemble;
 mod exec_manager;
+mod http;
 mod mcp;
 mod mcp_auth;
 mod paths;
@@ -25,11 +26,12 @@ mod startup;
 mod store;
 mod strategy;
 mod system_event;
+mod ui_assets;
 
 #[cfg(test)]
 mod open_host_tests;
 
-pub use ensemble::{Daemon, McpConfig};
+pub use ensemble::{Daemon, HttpConfig};
 pub use paths::Paths;
 pub use run::run;
 pub use store::Keystore;

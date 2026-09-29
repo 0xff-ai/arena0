@@ -1674,7 +1674,7 @@ async fn blobs_link_grant_and_export_by_hash() {
     let ResponseOk::BlobImported { hash, length } = ok(call(
         &d.host_a,
         &HostRequest::BlobImport {
-            path: first.clone(),
+            source: arena0_api::FileSource::Path(first.clone()),
         },
     )
     .await) else {
@@ -1691,7 +1691,13 @@ async fn blobs_link_grant_and_export_by_hash() {
     let second = files.path().join("second.bin");
     std::fs::write(&second, &bytes).unwrap();
     assert_eq!(
-        ok(call(&d.host_a, &HostRequest::BlobImport { path: second }).await),
+        ok(call(
+            &d.host_a,
+            &HostRequest::BlobImport {
+                source: arena0_api::FileSource::Path(second)
+            }
+        )
+        .await),
         ResponseOk::BlobImported { hash, length }
     );
     std::fs::remove_file(&first).unwrap();
@@ -1699,7 +1705,7 @@ async fn blobs_link_grant_and_export_by_hash() {
     let missing = call(
         &d.host_a,
         &HostRequest::BlobImport {
-            path: files.path().join("absent.bin"),
+            source: arena0_api::FileSource::Path(files.path().join("absent.bin")),
         },
     )
     .await
@@ -1963,25 +1969,27 @@ async fn blob_list_reports_imported_blobs() {
     ] {
         let path = files.path().join(name);
         std::fs::write(&path, &bytes).unwrap();
-        expected.push(arena0_api::BlobEntry {
-            hash: arena0_protocol::BlobHash(arena0_crypto::hash(
-                arena0_crypto::HashAlgorithm::Blake3,
-                &bytes,
-            )),
-            length: bytes.len() as u64,
-            path: std::fs::canonicalize(&path).unwrap(),
-            linked: true,
-        });
+        expected.push((
+            path,
+            arena0_api::BlobEntry {
+                hash: arena0_protocol::BlobHash(arena0_crypto::hash(
+                    arena0_crypto::HashAlgorithm::Blake3,
+                    &bytes,
+                )),
+                length: bytes.len() as u64,
+                linked: true,
+            },
+        ));
     }
     // Import the greater hash first, so listing in insertion order would
     // differ from the required hash order.
-    expected.sort_by_key(|entry| std::cmp::Reverse(entry.hash.0));
-    for entry in &expected {
+    expected.sort_by_key(|(_, entry)| std::cmp::Reverse(entry.hash.0));
+    for (path, entry) in &expected {
         assert_eq!(
             ok(call(
                 &d.host_a,
                 &HostRequest::BlobImport {
-                    path: entry.path.clone()
+                    source: arena0_api::FileSource::Path(path.clone())
                 }
             )
             .await),
@@ -1991,11 +1999,11 @@ async fn blob_list_reports_imported_blobs() {
             }
         );
     }
-    expected.sort_by_key(|entry| entry.hash.0);
+    expected.sort_by_key(|(_, entry)| entry.hash.0);
 
     assert_eq!(
         ok(call(&d.host_a, &HostRequest::BlobList).await),
-        ResponseOk::BlobList(expected)
+        ResponseOk::BlobList(expected.into_iter().map(|(_, entry)| entry).collect())
     );
     assert_eq!(
         ok(call(&d.host_b, &HostRequest::BlobList).await),

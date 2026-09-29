@@ -1166,8 +1166,11 @@ async fn blob(ctx: &Ctx, command: BlobCommand) -> anyhow::Result<()> {
         BlobCommand::Import { file } => {
             let path = std::fs::canonicalize(&file)
                 .with_context(|| format!("resolve {}", file.display()))?;
-            let ResponseOk::BlobImported { hash, length } =
-                ctx.call(&HostRequest::BlobImport { path }).await?
+            let ResponseOk::BlobImported { hash, length } = ctx
+                .call(&HostRequest::BlobImport {
+                    source: arena0_client::api::FileSource::Path(path),
+                })
+                .await?
             else {
                 bail!("unexpected response to blob.import");
             };
@@ -1186,11 +1189,10 @@ async fn blob(ctx: &Ctx, command: BlobCommand) -> anyhow::Result<()> {
             } else {
                 for blob in blobs {
                     println!(
-                        "{} {} {} {}",
+                        "{} {} {}",
                         blob.hash,
                         blob.length,
-                        if blob.linked { "linked" } else { "received" },
-                        blob.path.display()
+                        if blob.linked { "linked" } else { "received" }
                     );
                 }
             }
@@ -1251,8 +1253,11 @@ async fn program(ctx: &Ctx, command: ProgramCommand) -> anyhow::Result<()> {
         ProgramCommand::List => ctx.call(&HostRequest::ProgramList).await?,
         ProgramCommand::Show { program } => ctx.call(&HostRequest::ProgramGet { program }).await?,
         ProgramCommand::Import { file } => {
-            let wasm = std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
-            ctx.call(&HostRequest::ProgramImport { wasm }).await?
+            let source = arena0_client::api::FileSource::Path(
+                std::fs::canonicalize(&file)
+                    .with_context(|| format!("resolve {}", file.display()))?,
+            );
+            ctx.call(&HostRequest::ProgramImport { source }).await?
         }
         ProgramCommand::Remove { program } => {
             ctx.call(&HostRequest::ProgramRemove { program }).await?

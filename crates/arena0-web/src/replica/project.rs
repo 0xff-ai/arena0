@@ -264,7 +264,7 @@ pub(super) fn blob_row(host: &str, entry: &BlobEntry) -> BlobRow {
         host: host.to_owned(),
         hash,
         length: entry.length,
-        path: entry.path.display().to_string(),
+        path: String::new(),
     }
 }
 

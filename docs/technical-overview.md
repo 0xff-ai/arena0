@@ -63,6 +63,13 @@ The workspace manifests own dependency selection and exact versions. The table b
 | Browser workspace | React and TanStack DB | UI and a keyed replica of daemon facts |
 | Build orchestration | Cargo and `just` | Program builds, workspace builds, tests, checks, docs, audits, and release artifacts |
 
+The daemon also owns one loopback [HTTP server](api/http.md): `/rpc` serves
+the typed JSON requests, `/events` merges Host events and activity as SSE,
+`/uploads` accepts browser files, and `/hosts/{host}/blobs/{hash}` downloads
+stored blobs. The same server mounts MCP at `/mcp` and embeds the UI at `/`.
+`DaemonInfo.http_url` identifies this server. Its optional bearer token covers
+all routes; daemon-local paths are accepted only through the Unix socket.
+
 The release uses one Unix domain socket per daemon for its local API. Host requests name their target explicitly. The packaged targets and platform limits live in the [project README](../README.md).
 
 ## Dependency direction

@@ -18,6 +18,15 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::events::EventFilter;
+
+/// Bytes read for an import: a daemon-local file (socket callers only), or
+/// an upload named by the BLAKE3 hash of its bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum FileSource {
+    Path(PathBuf),
+    Upload(BlobHash),
+}
 /// One request to the daemon's shared Unix endpoint. Host operations always
 /// name their target explicitly; daemon operations do not select a Host.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -63,12 +72,12 @@ pub enum HostRequest {
     #[serde(rename = "program.get")]
     ProgramGet { program: String },
     #[serde(rename = "program.import")]
-    ProgramImport { wasm: Vec<u8> },
+    ProgramImport { source: FileSource },
     // Blobs. Paths are on the daemon's filesystem. Import links the file in
     // place: the daemon hashes it once and reads it again only to send or
     // export ranges; the file must stay unchanged while executions use it.
     #[serde(rename = "blob.import")]
-    BlobImport { path: PathBuf },
+    BlobImport { source: FileSource },
     #[serde(rename = "blob.export")]
     BlobExport { hash: BlobHash, path: PathBuf },
     #[serde(rename = "blob.list")]

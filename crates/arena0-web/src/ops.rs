@@ -403,10 +403,35 @@ impl Ops {
                 } else {
                     hosts
                 };
-                let imports = hosts
-                    .iter()
-                    .map(|host| self.host(host, HostRequest::ProgramImport { wasm: wasm.clone() }));
+                let home = arena0_home::Home::from_env().map_err(|_| gateway("resolve home"))?;
+                tokio::fs::create_dir_all(home.temporary_dir())
+                    .await
+                    .map_err(|_| gateway("prepare import directory"))?;
+                let path = home
+                    .temporary_dir()
+                    .join(format!("program-{:016x}.wasm", rand::random::<u64>()));
+                let mut file = tokio::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&path)
+                    .await
+                    .map_err(|_| gateway("create import file"))?;
+                tokio::io::AsyncWriteExt::write_all(&mut file, &wasm)
+                    .await
+                    .map_err(|_| gateway("write import file"))?;
+                drop(file);
+                let imports = hosts.iter().map(|host| {
+                    self.host(
+                        host,
+                        HostRequest::ProgramImport {
+                            source: arena0_api::FileSource::Path(path.clone()),
+                        },
+                    )
+                });
                 let results = futures::future::join_all(imports).await;
+                tokio::fs::remove_file(&path)
+                    .await
+                    .map_err(|_| gateway("remove import file"))?;
                 let mut hash = None;
                 for result in results {
                     let ResponseOk::Program(detail) = result? else {
@@ -452,7 +477,7 @@ impl Ops {
                     .host(
                         &host,
                         HostRequest::BlobImport {
-                            path: PathBuf::from(path),
+                            source: arena0_api::FileSource::Path(PathBuf::from(path)),
                         },
                     )
                     .await?;

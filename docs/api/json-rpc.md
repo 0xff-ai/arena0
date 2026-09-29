@@ -6,6 +6,10 @@ local Host ID explicitly; identity and storage remain independent per Host.
 `arena0-api` owns the DTOs, `arena0-daemon` dispatches them, and
 `arena0-client::DaemonClient` is the shared Unix-socket client used by the CLI.
 
+The same requests are available over [HTTP](http.md). `daemon.info` returns
+`DaemonInfo { version, abi_version, uptime_secs, socket, http_url }`;
+`http_url` is the base HTTP URL, with MCP at `{http_url}/mcp`.
+
 ## Framing
 
 Each request and response is UTF-8 JSON preceded by a big-endian `u32`
@@ -54,8 +58,13 @@ Seeds never cross the socket. `IdInfo` contains public identity material only.
 |---|---|---|
 | `program.list` | — | `ProgramList` |
 | `program.get` | `{program}` | `Program` |
-| `program.import` | `{wasm}` | `Program` |
+| `program.import` | `{source}` | `Program` |
 | `program.remove` | `{program}` | `Ack` |
+
+`source` is either `{"path":"/absolute/file.wasm"}` (socket only) or
+`{"upload":"<64-hex>"}` from `POST /uploads`. Programs require an
+`application/wasm` upload. Missing uploads are `NotFound`; an octet-stream
+upload is `BadRequest`.
 
 `program` accepts a local name, an unambiguous content-hash prefix, or a full
 `ProgramHash`. Program import validates the complete guest ABI and embedded
@@ -73,27 +82,33 @@ program declares none. A session's `phase` is one of these names.
 
 | Method | Params | Success |
 |---|---|---|
-| `blob.import` | `{path}` | `BlobImported` `{hash, length}` |
+| `blob.import` | `{source}` | `BlobImported` `{hash, length}` |
 | `blob.export` | `{hash, path}` | `BlobExported` `{length}` |
-| `blob.list` | — | `BlobList` `[{hash, length, path, linked}]` |
+| `blob.list` | — | `BlobList` `[{hash, length, linked}]` |
 
 A blob is immutable content of at most 16 MiB, named by its BLAKE3 hash as 64
 hex characters. Paths are absolute paths on the Host's machine.
 
-`blob.import` links the file in place: the Host hashes it once and records its
+`blob.import` with `{"source":{"path":"/absolute/file"}}` links the file in place: the Host hashes it once and records its
 path, without copying it or reading it whole into memory. The file must stay
 unchanged while executions use it; a program that checks what it receives
 detects a changed file, but the Host does not. Importing the same content again
 succeeds with the same hash and records the new path. A missing or unreadable
 path, or content over the limit, is `BadRequest`.
 
-`blob.export` writes the blob to a new file at `path` and never replaces an
+`blob.import` with `{"source":{"upload":"<64-hex>"}}` copies an upload
+into an owned file (`linked: false`), preferring an octet-stream upload over
+a Wasm upload of the same hash. Content already held keeps its existing
+record. Uploads are shared across Hosts and cleared at daemon start; the
+owned copy survives that cleanup.
+
+`blob.export` is socket-only and writes the blob to a new file at `path` and never replaces an
 existing file (`BadRequest`). An unknown hash is `NotFound`; a blob whose file
 is gone or shorter than its length is `BadRequest`.
 
-`blob.list` returns every blob the Host stores, ordered by hash. `path` is the
-file the Host reads the blob from. `linked` is true for a file imported in
-place with `blob.import` and false for a file the Host received and owns.
+`blob.list` returns every blob the Host stores, ordered by hash, without
+filesystem paths. `linked` is true for a file imported in place and false
+for an owned copy or a file received through execution.
 
 An execution reads only the blobs its participant grants in `exec.new` and the
 blobs it receives and commits. Pass a blob's `hash` and `length` to the program

@@ -20,6 +20,13 @@ pub(super) struct Database {
     blob_dir: PathBuf,
 }
 
+impl Database {
+    /// The store's owned-blob directory.
+    pub(crate) fn blob_dir(&self) -> &Path {
+        &self.blob_dir
+    }
+}
+
 struct ExecutionIndexRow {
     execution_id: ExecId,
     state_bytes: Vec<u8>,

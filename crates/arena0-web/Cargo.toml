@@ -8,6 +8,7 @@ description = "arena0's browser workspace: the embedded web UI and its loopback 
 publish.workspace = true
 
 [dependencies]
+arena0-home = { path = "../arena0-home" }
 arena0-api = { path = "../arena0-api" }
 arena0-client = { path = "../arena0-client" }
 arena0-program = { path = "../arena0-program" }

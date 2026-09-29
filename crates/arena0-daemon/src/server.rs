@@ -22,7 +22,7 @@ use arena0_api::{
     ExecutionInspection, HostInfo, NextEvent, PendingCalloutStatus, ProgramRefError, ReceiptRef,
     Response, ResponseOk, SessionProgress, SessionStatus, frame,
 };
-use arena0_api::{HostRequest, HostStatus};
+use arena0_api::{FileSource, HostRequest, HostStatus};
 use arena0_crypto::{AgentPubKey, ExecutionKey, NodeKeys};
 use arena0_node::{ActivatedSession, NegotiationBook};
 use arena0_node::{
@@ -1067,6 +1067,38 @@ struct Turn {
     phase: Option<String>,
 }
 
+/// Activity frames with a synthesized lag marker before the next frame after
+/// loss. The receiver and activity owner live for the subscription.
+pub(crate) fn activity_stream(
+    activity: Arc<Activity>,
+    rx: broadcast::Receiver<ActivityFrame>,
+) -> impl futures::Stream<Item = ActivityFrame> + Send + 'static {
+    futures::stream::unfold(
+        (activity, rx, None),
+        |(activity, mut rx, pending)| async move {
+            if let Some(frame) = pending {
+                return Some((frame, (activity, rx, None)));
+            }
+            let mut skipped = 0u64;
+            loop {
+                match rx.recv().await {
+                    Ok(frame) => {
+                        if skipped > 0 {
+                            let lagged = activity.lagged(frame.seq.saturating_sub(1), skipped);
+                            return Some((lagged, (activity, rx, Some(frame))));
+                        }
+                        return Some((frame, (activity, rx, None)));
+                    }
+                    Err(broadcast::error::RecvError::Lagged(count)) => {
+                        skipped = skipped.saturating_add(count)
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        },
+    )
+}
+
 /// The API operation owner for one Host.
 ///
 /// [`HostService`] owns one Host's execution supervisors and service tasks.
@@ -1079,7 +1111,7 @@ pub(crate) struct HostService {
     transport: Arc<dyn Transport + Sync>,
     keystore: Arc<Keystore>,
     catalog: ProgramCatalog,
-    store: StoreHandle,
+    pub(crate) store: StoreHandle,
     engine: Arc<WasmtimeEngine>,
     startup: Arc<StartupTimeline>,
     pub(crate) events: Events,
@@ -1834,11 +1866,49 @@ impl HostService {
         Ok(())
     }
 
-    /// Stream matching event frames on a unix connection until the client hangs up.
-    pub(crate) async fn stream_events_unix<R, W>(
-        &self,
+    /// Matching events, with a lag marker before the next received frame after
+    /// loss. The owned receiver ends when the Host event channel closes.
+    pub(crate) fn event_stream(
+        self: &Arc<Self>,
         filter: EventFilter,
-        mut rx: broadcast::Receiver<EventFrame>,
+        rx: broadcast::Receiver<EventFrame>,
+    ) -> impl futures::Stream<Item = EventFrame> + Send + 'static {
+        let service = Arc::clone(self);
+        futures::stream::unfold(
+            (service, filter, rx, None),
+            |(service, filter, mut rx, pending)| async move {
+                if let Some(frame) = pending {
+                    return Some((frame, (service, filter, rx, None)));
+                }
+                let mut skipped = 0u64;
+                loop {
+                    match rx.recv().await {
+                        Ok(frame) => {
+                            if skipped > 0 {
+                                let lagged =
+                                    service.events.lagged(frame.seq.saturating_sub(1), skipped);
+                                let pending = filter.matches(&frame).then_some(frame);
+                                return Some((lagged, (service, filter, rx, pending)));
+                            }
+                            if filter.matches(&frame) {
+                                return Some((frame, (service, filter, rx, None)));
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(count)) => {
+                            skipped = skipped.saturating_add(count)
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    }
+                }
+            },
+        )
+    }
+
+    /// Stream matching events until EOF, retaining the socket's disconnect semantics.
+    pub(crate) async fn stream_events_unix<R, W>(
+        self: &Arc<Self>,
+        filter: EventFilter,
+        rx: broadcast::Receiver<EventFrame>,
         read: &mut R,
         write: &mut W,
     ) -> anyhow::Result<()>
@@ -1846,44 +1916,27 @@ impl HostService {
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
     {
-        let mut pending_skipped = 0u64;
+        use futures::StreamExt as _;
+        let stream = self.event_stream(filter, rx);
+        futures::pin_mut!(stream);
         let mut sink = [0u8; 256];
         loop {
             tokio::select! {
-                recv = rx.recv() => match recv {
-                    Ok(frame_msg) => {
-                        if pending_skipped > 0 {
-                            let lagged = self.events.lagged(
-                                frame_msg.seq.saturating_sub(1),
-                                pending_skipped,
-                            );
-                            frame::write_frame(write, &lagged).await?;
-                            pending_skipped = 0;
-                        }
-                        if filter.matches(&frame_msg) {
-                            frame::write_frame(write, &frame_msg).await?;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        pending_skipped = pending_skipped.saturating_add(skipped);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                message = stream.next() => match message {
+                    Some(message) => frame::write_frame(write, &message).await?,
+                    None => return Ok(()),
                 },
-                // Detect client disconnect: a subscriber sends nothing, so any read
-                // that returns 0 (EOF) or errors means the connection is gone.
                 n = read.read(&mut sink) => {
-                    if matches!(n, Ok(0) | Err(_)) {
-                        return Ok(());
-                    }
+                    if matches!(n, Ok(0) | Err(_)) { return Ok(()); }
                 }
             }
         }
     }
 
-    /// Stream daemon-wide MCP activity until the client hangs up.
+    /// Stream daemon-wide activity until the client hangs up.
     pub(crate) async fn stream_activity_unix<R, W>(
-        activity: &Activity,
-        mut rx: broadcast::Receiver<ActivityFrame>,
+        activity: &Arc<Activity>,
+        rx: broadcast::Receiver<ActivityFrame>,
         read: &mut R,
         write: &mut W,
     ) -> anyhow::Result<()>
@@ -1891,31 +1944,18 @@ impl HostService {
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
     {
-        let mut pending_skipped = 0u64;
+        use futures::StreamExt as _;
+        let stream = activity_stream(Arc::clone(activity), rx);
+        futures::pin_mut!(stream);
         let mut sink = [0u8; 256];
         loop {
             tokio::select! {
-                recv = rx.recv() => match recv {
-                    Ok(frame_msg) => {
-                        if pending_skipped > 0 {
-                            let lagged = activity.lagged(
-                                frame_msg.seq.saturating_sub(1),
-                                pending_skipped,
-                            );
-                            frame::write_frame(write, &lagged).await?;
-                            pending_skipped = 0;
-                        }
-                        frame::write_frame(write, &frame_msg).await?;
-                    }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        pending_skipped = pending_skipped.saturating_add(skipped);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                message = stream.next() => match message {
+                    Some(message) => frame::write_frame(write, &message).await?,
+                    None => return Ok(()),
                 },
                 n = read.read(&mut sink) => {
-                    if matches!(n, Ok(0) | Err(_)) {
-                        return Ok(());
-                    }
+                    if matches!(n, Ok(0) | Err(_)) { return Ok(()); }
                 }
             }
         }
@@ -1945,7 +1985,20 @@ impl HostService {
                     None => Err(ApiError::new(ApiErrorCode::NotFound, "no such program")),
                 }
             }
-            HostRequest::ProgramImport { wasm } => {
+            HostRequest::ProgramImport {
+                source: FileSource::Upload(_),
+            }
+            | HostRequest::BlobImport {
+                source: FileSource::Upload(_),
+            } => {
+                unreachable!("Daemon::handle resolves process-owned uploads before Host dispatch")
+            }
+            HostRequest::ProgramImport {
+                source: FileSource::Path(path),
+            } => {
+                let wasm = tokio::fs::read(path).await.map_err(|error| {
+                    ApiError::new(ApiErrorCode::BadRequest, format!("read program: {error}"))
+                })?;
                 let (id, _) = self
                     .catalog
                     .import(wasm, &self.engine, unix_time_ms())
@@ -1965,7 +2018,9 @@ impl HostService {
                         ApiError::new(ApiErrorCode::Internal, "imported program vanished")
                     })
             }
-            HostRequest::BlobImport { path } => {
+            HostRequest::BlobImport {
+                source: FileSource::Path(path),
+            } => {
                 let (hash, length) = self.store.link_blob(path).await.map_err(|error| {
                     let code = match error {
                         arena0_store::StoreError::BlobTooLarge { .. }
@@ -2001,7 +2056,6 @@ impl HostService {
                             .map(|blob| arena0_api::BlobEntry {
                                 hash: blob.hash,
                                 length: blob.length,
-                                path: blob.path,
                                 linked: blob.linked,
                             })
                             .collect(),

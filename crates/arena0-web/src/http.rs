@@ -54,7 +54,7 @@ impl Gateway {
             abi_version: info.abi_version,
             uptime_secs: info.uptime_secs,
             socket: info.socket,
-            mcp_endpoint: info.mcp_endpoint,
+            mcp_endpoint: format!("{}/mcp", info.http_url),
         })
     }
 

@@ -16,6 +16,7 @@ pub mod frame;
 
 mod activity;
 mod events;
+mod http;
 mod request;
 mod response;
 
@@ -28,7 +29,10 @@ pub use events::{
     EventData, EventFilter, EventFrame, ExecOrigin, ExecutionFailureKind, NegotiationStage,
     SessionTerminal,
 };
-pub use request::{AwaitState, EnsembleSpec, HostRequest, ProgramRefError, ReceiptRef, Request};
+pub use http::Uploaded;
+pub use request::{
+    AwaitState, EnsembleSpec, FileSource, HostRequest, ProgramRefError, ReceiptRef, Request,
+};
 pub use response::{
     ActivationInspection, ActivationInspectionState, ActivationParticipant, AgreedStep, ApiError,
     ApiErrorCode, BlobEntry, DaemonInfo, DecodedMessage, EventRecordSummary, ExecEndPhase,
