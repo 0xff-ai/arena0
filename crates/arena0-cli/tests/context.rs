@@ -163,7 +163,7 @@ fn host_count(home: &Path) -> usize {
             .and_then(serde_json::Value::as_str)
             .is_some()
     );
-    assert!(!daemon.contains_key("mcp_endpoint"));
+    assert!(!daemon.contains_key("http_url"));
     value["hosts"]
         .as_array()
         .expect("status should contain hosts")
