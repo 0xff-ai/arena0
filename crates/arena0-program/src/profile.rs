@@ -52,7 +52,7 @@ pub const MAX_WASM_MEMORIES: u32 = 1;
 /// Revision of the deterministic sandbox semantics.
 pub const EXECUTION_SEMANTICS_VERSION: u32 = 1;
 /// Compiler/engine identity bound into the execution profile.
-pub const EXECUTION_ENGINE_ID: &str = "wasmtime-46.0.3-cranelift";
+pub const EXECUTION_ENGINE_ID: &str = "wasmtime-48.0.3-cranelift";
 /// Fuel made available to one guest call.
 pub const DISPATCH_FUEL: u64 = 1_000_000_000;
 
@@ -77,6 +77,9 @@ pub struct WasmFeatures {
     pub memory64: bool,
     /// Enable tail-call instructions.
     pub tail_call: bool,
+    /// Enable wide-arithmetic (128-bit) instructions. Wasmtime enables these
+    /// by default from 49, so the profile states the choice explicitly.
+    pub wide_arithmetic: bool,
 }
 
 impl WasmFeatures {
@@ -90,6 +93,7 @@ impl WasmFeatures {
             multi_memory: false,
             memory64: false,
             tail_call: false,
+            wide_arithmetic: false,
         }
     }
 }
