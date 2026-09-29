@@ -1,0 +1,38 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": [
+      "ES2023",
+      "DOM"
+    ],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": false,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "types": [
+      "node"
+    ],
+    "paths": {
+      "~/*": [
+        "./src/*"
+      ]
+    },
+    "composite": true,
+    "tsBuildInfoFile": "./node_modules/.tmp/node.tsbuildinfo",
+    "emitDeclarationOnly": true,
+    "outDir": "./node_modules/.tmp/node"
+  },
+  "include": [
+    "e2e",
+    "vite.config.ts",
+    "playwright.config.ts"
+  ]
+}

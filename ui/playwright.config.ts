@@ -20,6 +20,12 @@ export default defineConfig({
       testMatch: /shell\.spec\.ts/,
       use: { baseURL: "http://127.0.0.1:5173", viewport: { width: 1440, height: 900 } },
     },
+    {
+      // Live suites: each worker runs a real `arena0 ui` (see e2e/harness.ts).
+      name: "app",
+      testMatch: /app\/.*\.spec\.ts/,
+      timeout: 120_000,
+    },
   ],
   webServer: {
     command: "pnpm vite --port 5173 --strictPort",

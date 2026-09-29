@@ -74,6 +74,7 @@ export function TitleBar() {
 
       <span
         role="status"
+        data-testid="connection"
         className="inline-flex h-5 items-center gap-1.5 rounded-xs border border-line px-1.5 text-xs text-muted"
       >
         <Dot tone={connectionTone[connection.status] ?? "neutral"} />

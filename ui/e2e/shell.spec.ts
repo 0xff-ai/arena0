@@ -3,20 +3,12 @@
 // no fake gateway here. Evidence goes to e2e/artifacts/shell/: a screenshot per
 // state and theme, and summary.json listing each check that passed. Run with
 // `pnpm playwright test --project shell`.
+import * as fs from "node:fs";
 import { expect, test } from "@playwright/test";
 
 const THEMES = ["light", "dark"] as const;
 
 test.use({ locale: "en-US", timezoneId: "UTC", reducedMotion: "reduce" });
-
-interface Fs {
-  mkdirSync(path: string, options: { recursive: true }): void;
-  writeFileSync(path: string, data: string): void;
-}
-// The project ships no Node type declarations, so `node:fs` is loaded through a
-// computed specifier and given the two-function shape used here.
-const FS_MODULE: string = "node:fs";
-const loadFs = async () => (await import(FS_MODULE)) as Fs;
 
 const passed: string[] = [];
 
@@ -31,7 +23,7 @@ for (const theme of THEMES) {
 
     test(`no token: the page says how to get a link (${theme})`, async ({ page }, testInfo) => {
       const shots = `${testInfo.project.testDir}/artifacts/shell/${theme}`;
-      (await loadFs()).mkdirSync(shots, { recursive: true });
+      fs.mkdirSync(shots, { recursive: true });
       const errors: string[] = [];
       page.on("pageerror", (error) => errors.push(error.message));
 
@@ -54,7 +46,7 @@ for (const theme of THEMES) {
       page,
     }, testInfo) => {
       const shots = `${testInfo.project.testDir}/artifacts/shell/${theme}`;
-      (await loadFs()).mkdirSync(shots, { recursive: true });
+      fs.mkdirSync(shots, { recursive: true });
       const errors: string[] = [];
       page.on("pageerror", (error) => errors.push(error.message));
 
@@ -80,7 +72,6 @@ for (const theme of THEMES) {
 
 test.afterAll(async ({}, testInfo) => {
   const dir = `${testInfo.project.testDir}/artifacts/shell`;
-  const fs = await loadFs();
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(
     `${dir}/summary.json`,

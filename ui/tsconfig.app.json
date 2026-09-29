@@ -1,0 +1,37 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": [
+      "ES2023",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": false,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "types": [
+      "vite/client"
+    ],
+    "paths": {
+      "~/*": [
+        "./src/*"
+      ]
+    },
+    "composite": true,
+    "tsBuildInfoFile": "./node_modules/.tmp/app.tsbuildinfo",
+    "emitDeclarationOnly": true,
+    "outDir": "./node_modules/.tmp/app"
+  },
+  "include": [
+    "src"
+  ]
+}

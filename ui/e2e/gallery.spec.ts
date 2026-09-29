@@ -3,6 +3,7 @@
 // e2e/artifacts/gallery/: one full-page and one per-section screenshot per
 // theme, a screenshot of every overlay, and summary.json listing each check
 // that passed. Run with `pnpm playwright test --project gallery`.
+import * as fs from "node:fs";
 import { expect, type Locator, type Page, test } from "@playwright/test";
 
 const THEMES = ["light", "dark"] as const;
@@ -49,15 +50,6 @@ test.use({
   permissions: ["clipboard-read", "clipboard-write"],
 });
 
-interface Fs {
-  mkdirSync(path: string, options: { recursive: true }): void;
-  writeFileSync(path: string, data: string): void;
-}
-// The project ships no Node type declarations, so `node:fs` is loaded through a
-// computed specifier and given the two-function shape used here.
-const FS_MODULE: string = "node:fs";
-const loadFs = async () => (await import(FS_MODULE)) as Fs;
-
 const passed: string[] = [];
 let running = "page load";
 
@@ -90,7 +82,7 @@ for (const theme of THEMES) {
   test(`gallery in the ${theme} theme`, async ({ page }, testInfo) => {
     const dir = `${testInfo.project.testDir}/artifacts/gallery`;
     const shots = `${dir}/${theme}`;
-    (await loadFs()).mkdirSync(shots, { recursive: true });
+    fs.mkdirSync(shots, { recursive: true });
 
     const problems: string[] = [];
     page.on("pageerror", (error) => problems.push(`[${running}] pageerror: ${error.message}`));
@@ -489,7 +481,6 @@ for (const theme of THEMES) {
 
 test.afterAll(async ({}, testInfo) => {
   const dir = `${testInfo.project.testDir}/artifacts/gallery`;
-  const fs = await loadFs();
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(
     `${dir}/summary.json`,
