@@ -83,6 +83,7 @@ export function DocTabs(props: {
           <Tab
             key={tab.id}
             id={tab.id}
+            data-preview={tab.preview || undefined}
             onDoubleClick={() => props.onPin(tab.id)}
             onMouseDown={(event) => {
               // Middle press would start the browser's autoscroll.
