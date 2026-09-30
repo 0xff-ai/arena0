@@ -235,7 +235,10 @@ function Tail(props: { session: Session; hasTerminalStep: boolean; nextStep: num
     <div className="flex h-6.5 items-center gap-2 text-sm">
       <span className="w-8 shrink-0 text-right font-mono text-faint tabular">{glyph}</span>
       <span className="w-9 shrink-0" />
-      <span className={`min-w-0 flex-1 truncate ${tone}`}>{children}</span>
+      {/* The inset matches the step event's ghost button: a 1 px border and `px-1`. */}
+      <span className={`min-w-0 flex-1 truncate border border-transparent px-1 ${tone}`}>
+        {children}
+      </span>
     </div>
   );
 

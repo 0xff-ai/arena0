@@ -65,7 +65,7 @@ export function DataTable<T>(props: {
               width={column.width}
               minWidth={column.minWidth}
               className={cx(
-                "flex items-center border-b border-line-soft bg-editor px-2 text-xs font-normal whitespace-nowrap text-subtle outline-none focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-accent",
+                "flex h-full items-center border-b border-line-soft bg-editor px-2 text-xs font-normal whitespace-nowrap text-subtle outline-none focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-accent",
                 column.align === "end" && "justify-end text-end",
               )}
             >
@@ -89,9 +89,11 @@ export function DataTable<T>(props: {
               )}
             >
               {(column) => (
+                // The virtualizer sizes cells to their content; `h-full` stretches them to the
+                // row so `items-center` centres short content such as dots.
                 <Cell
                   className={cx(
-                    "flex min-w-0 items-center overflow-hidden px-2 outline-none focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-accent",
+                    "flex h-full min-w-0 items-center overflow-hidden px-2 outline-none focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-accent",
                     column.align === "end" && "justify-end text-end",
                   )}
                 >
