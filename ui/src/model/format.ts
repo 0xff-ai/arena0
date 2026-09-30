@@ -1,3 +1,6 @@
+import type { JsonValue } from "../sync";
+import type { Session } from "./session";
+
 const pad2 = (n: number) => String(n).padStart(2, "0");
 
 /** "0s", "41s", "8m 45s", "2h 03m", "3d 4h". Negative durations (clock skew) read as "0s". */
@@ -29,6 +32,43 @@ export function fmtBytes(n: number): string {
   // Rounding can reach 1024.0: that is 1.0 MB.
   if (kb < 1024) return `${kb.toFixed(1)} KB`;
   return `${(n / 1024 ** 2).toFixed(1)} MB`;
+}
+
+/**
+ * A program outcome as one line, the way the CLI prints it: a single-variant
+ * object reads "Draw (scores [15, 15])", a `winner` field names a participant
+ * ("winner P1"). Other shapes fall back to compact JSON.
+ */
+export function fmtOutcome(value: JsonValue): string {
+  if (typeof value === "string") return value;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return JSON.stringify(value);
+  }
+  const entries = Object.entries(value);
+  const [variant, fields] = entries[0] ?? [];
+  if (entries.length === 1 && variant !== undefined) {
+    if (fields === null) return variant;
+    if (typeof fields === "object" && !Array.isArray(fields)) {
+      // Sorted by key, as the CLI's JSON map orders them.
+      const sorted = Object.entries(fields).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+      const parts = sorted.map(([key, field]) => {
+        if (typeof field === "number" && key === "winner") return `${key} P${field}`;
+        if (Array.isArray(field))
+          return `${key} [${field.map((v) => JSON.stringify(v)).join(", ")}]`;
+        if (typeof field === "string") return `${key} ${field}`;
+        if (field === null) return `${key} —`;
+        return `${key} ${JSON.stringify(field)}`;
+      });
+      return `${variant} (${parts.join(", ")})`;
+    }
+  }
+  return JSON.stringify(value);
+}
+
+/** The session's result once the daemon reports it; until then, the size of the outcome bytes. */
+export function endResult(session: Session, outcomeBytes: number): string {
+  const outcome = session.terminal?.outcome;
+  return outcome == null ? `outcome ${fmtBytes(outcomeBytes)}` : fmtOutcome(outcome);
 }
 
 export function shortHash(hex: string, n = 8): string {

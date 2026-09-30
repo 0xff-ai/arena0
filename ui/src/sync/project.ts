@@ -108,6 +108,14 @@ export function executionRow(
   };
 }
 
+/**
+ * Participant order: the committed ensemble sorts peer ids, and participant
+ * `P{i}` is the i-th of them. Signer bits and view cells use the same index.
+ */
+export function comparePeerIds(a: string, b: string): number {
+  return a.localeCompare(b);
+}
+
 export function activationRow(activation: ActivationInspection): ActivationRow {
   return {
     state: activation.state,
@@ -116,10 +124,9 @@ export function activationRow(activation: ActivationInspection): ActivationRow {
     target_size: activation.target_size,
     initial_state: activation.initial_state,
     // Ticket order can differ from the committed ensemble's sorted peer order.
-    // UI participant indexes must match signer bits and program view cells.
     participants: activation.participants
       .map((p) => ({ ...p }))
-      .sort((a, b) => a.peer_id.localeCompare(b.peer_id)),
+      .sort((a, b) => comparePeerIds(a.peer_id, b.peer_id)),
     params: activation.params,
   };
 }
@@ -331,8 +338,8 @@ export function eventActivity(host: string, frame: EventFrame): ActivityRow {
       text = `committed · ${frame.data.participants} participants`;
       break;
     case "exec.negotiation.retried":
+      // The negotiation's normal re-broadcast cadence, not a problem.
       text = `retried ${frame.data.attempt} at ${frame.data.stage}`;
-      level = "warn";
       break;
     case "exec.negotiation.rejoined":
       text = "rejoined";

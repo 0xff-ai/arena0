@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-aria-components";
 import { sessionRoute } from "~/app/router";
 import {
+  fmtOutcome,
   type Session,
   shortHash,
   useFlags,
@@ -288,6 +289,11 @@ export function SessionDoc() {
           {shortSessionKey(session.key)}
         </span>
         <StateWord state={session.state} />
+        {session.terminal?.outcome != null && (
+          <span data-testid="session-result" className="min-w-0 truncate text-sm text-fg">
+            {fmtOutcome(session.terminal.outcome)}
+          </span>
+        )}
         <div className="flex min-w-0 items-center gap-3">
           {flags.map((flag) => (
             <FlagHint key={flag.kind} flag={flag} />

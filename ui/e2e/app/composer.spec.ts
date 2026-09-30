@@ -132,6 +132,15 @@ test("launch a session from its program, answer through the composer until it co
     await seat1.getByRole("radio", { name: "You" }).click();
     await seat2.getByRole("radio", { name: "External" }).click();
     await evidence.shots(page, "launch-form");
+    // Participants are numbered by sorted peer id, so either Host can be P0.
+    // Seat 1 holds host-01 and seat 2 host-02, as checked above.
+    const formIndex = {
+      "host-01": (await page.getByTestId("seat-1-participant").textContent())!.trim(),
+      "host-02": (await page.getByTestId("seat-2-participant").textContent())!.trim(),
+    };
+    await evidence.check("the seat rows name two distinct participant indexes", async () => {
+      expect(new Set(Object.values(formIndex))).toEqual(new Set(["P0", "P1"]));
+    });
 
     // Either Host can act first; start the external seat before waiting for ours.
     const joined = page.waitForResponse((response) => {
@@ -158,6 +167,9 @@ test("launch a session from its program, answer through the composer until it co
       await expect(composerOf(page)).toContainText("host-01");
     });
     await evidence.shots(page, "composer-open");
+    await evidence.check("External removes host-02 from your Seats", async () => {
+      await expect(page.getByRole("button", { name: /^Seats: host-01$/ })).toBeVisible();
+    });
 
     const receipts = page.getByRole("tab", { name: /Receipts\s*2/ });
     let answers = 0;
@@ -179,6 +191,9 @@ test("launch a session from its program, answer through the composer until it co
         // Toasts stay for several rounds, so only the first one is unambiguous.
         if (answers === 0) await expect(page.getByText(/Answered · step \d+/)).toBeVisible();
         answers += 1;
+        await expect(
+          page.getByRole("grid", { name: "Needs input" }).getByRole("row", { name: /host-02/ }),
+        ).toHaveCount(0);
         // The next round's callout appears in Needs input; open it like a user would.
         // The last round is followed by the end handshake with the other Host, which takes seconds.
         await expect(needsRow(page).or(receipts)).toBeVisible({ timeout: 30_000 });
@@ -190,6 +205,26 @@ test("launch a session from its program, answer through the composer until it co
     await evidence.check("the session completed after several answers", async () => {
       expect(answers).toBeGreaterThan(1);
     });
+    const header = page.getByRole("main").locator("header").first();
+    await evidence.check("the session header states the result", async () => {
+      await expect(page.getByTestId("session-result")).toHaveText(
+        /^(Win \(scores \[\d+, \d+\], winner P[01]\)|Draw \(scores \[\d+, \d+\]\))$/,
+      );
+    });
+    await evidence.check("a browser launch is not flagged for negotiation retries", async () => {
+      await expect(header).not.toContainText("retried");
+    });
+    await evidence.check("each Host keeps the participant index the form showed", async () => {
+      const main = page.getByRole("main");
+      for (const host of ["host-01", "host-02"] as const) {
+        const other = formIndex[host] === "P0" ? "P1" : "P0";
+        await expect(
+          main.getByText(new RegExp(`^${formIndex[host]}\\s*${host}$`)).first(),
+        ).toBeVisible();
+        await expect(main.getByText(new RegExp(`^${other}\\s*${host}$`))).toHaveCount(0);
+      }
+    });
+    await evidence.shots(page, "session-result");
     await evidence.check("no console errors or warnings", async () => {
       expect(problems()).toEqual([]);
     });

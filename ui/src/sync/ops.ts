@@ -17,11 +17,8 @@ import { assertReply, DaemonError, hostCall, rpc, upload } from "./rpc";
 export interface LaunchArgs {
   program: string;
   params: JsonValue | null;
-  seats: Seat[];
-}
-export interface Seat {
-  host: string;
-  driver: "you" | "external";
+  /** One Host per participant; the first creates the session and the rest join it. */
+  hosts: string[];
 }
 export interface LaunchReply {
   execs: { host: string; exec_id: string }[];
@@ -207,17 +204,17 @@ export const ops: { [K in OpName]: (args: OpArgs<K>) => Promise<OpReplies[K]> } 
   async join({ host, program, target, blobs }) {
     return execNew(host, { program, params: null, blobs, ensemble: { Join: { target } } });
   },
-  async launch({ program, params, seats }) {
+  async launch({ program, params, hosts }) {
     const execs: LaunchReply["execs"] = [];
     try {
-      const host = seats[0]!.host;
+      const host = hosts[0]!;
       const info = await hostCall(host, { method: "host.info" });
       assertReply(info, "HostStatus");
       const created = await ops.create({
         host,
         program,
         params,
-        participants: seats.length,
+        participants: hosts.length,
         blobs: [],
       });
       execs.push({ host, exec_id: created.exec_id });
@@ -226,9 +223,9 @@ export const ops: { [K in OpName]: (args: OpArgs<K>) => Promise<OpReplies[K]> } 
         creator: info.HostStatus.host.peer_id,
         negotiation_id: created.negotiation_id!,
       };
-      for (const seat of seats.slice(1)) {
-        const joined = await ops.join({ host: seat.host, program, target, blobs: [] });
-        execs.push({ host: seat.host, exec_id: joined.exec_id });
+      for (const joiner of hosts.slice(1)) {
+        const joined = await ops.join({ host: joiner, program, target, blobs: [] });
+        execs.push({ host: joiner, exec_id: joined.exec_id });
       }
       return { execs };
     } catch (error) {

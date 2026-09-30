@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { sessionKey, useRows } from "~/model";
-import { type ExecRef, type ProgramRow, type Seat, useCall, useCollections } from "~/sync";
+import { sessionKey, useRows, useSeats } from "~/model";
+import { comparePeerIds, type ExecRef, type ProgramRow, useCall, useCollections } from "~/sync";
 import {
   Button,
   FieldError,
@@ -15,7 +15,7 @@ import { AddHostButton } from "../actions/imports";
 import { useComposer } from "../composer/store";
 import { useOpenDoc } from "../nav";
 
-type DriverKind = Seat["driver"];
+type DriverKind = "you" | "external";
 
 interface SeatDraft {
   host: string | null;
@@ -32,6 +32,9 @@ const isNullSchema = (schema: JsonLike): boolean =>
 
 /**
  * Starts a session: params, participant count and one seat per participant.
+ * A seat's driver is whether its Host is in your Seats: each row starts from
+ * the current Seats, and Launch writes the choices back, so the Answer button,
+ * the composer and Needs input never offer an External seat's callouts.
  * After `launch` replies it waits for the new executions to show up in the
  * replica, then opens the session (pinned) and, when a seat of yours has a
  * callout, the composer. Nothing outlives this component, so the navigation
@@ -46,6 +49,7 @@ export function LaunchForm(props: { program: ProgramRow }) {
   const openDoc = useOpenDoc();
   const composer = useComposer();
   const launch = useCall("launch");
+  const [yourSeats, setYourSeats] = useSeats(hosts.map((host) => host.id));
 
   // A seat needs a Host that holds the program.
   const capable = hosts.filter((host) => program.hosts.includes(host.id));
@@ -57,11 +61,11 @@ export function LaunchForm(props: { program: ProgramRow }) {
   const [attempted, setAttempted] = useState(false);
   const [started, setStarted] = useState<ExecRef[] | null>(null);
 
-  const seatAt = (index: number): SeatDraft => ({
-    host: capable[index]?.id ?? null,
-    kind: index === 0 ? "you" : "external",
-    ...seatDrafts[index],
-  });
+  const seatAt = (index: number): SeatDraft => {
+    const host = seatDrafts[index]?.host ?? capable[index]?.id ?? null;
+    const kind = host !== null && yourSeats.has(host) ? "you" : "external";
+    return { host, kind, ...seatDrafts[index] };
+  };
   const seats = Array.from({ length: Number.isFinite(count) ? Math.max(0, count) : 0 }, (_, i) =>
     seatAt(i),
   );
@@ -100,12 +104,15 @@ export function LaunchForm(props: { program: ProgramRow }) {
     ) {
       return;
     }
-    const wire: Seat[] = seats.flatMap<Seat>((seat) => {
-      if (seat.host === null) return [];
-      return [{ host: seat.host, driver: seat.kind }];
-    });
+    const next = new Set(yourSeats);
+    for (const seat of seats) {
+      if (seat.host === null) continue;
+      if (seat.kind === "you") next.add(seat.host);
+      else next.delete(seat.host);
+    }
+    setYourSeats([...next]);
     launch.mutate(
-      { program: program.hash, params: body, seats: wire },
+      { program: program.hash, params: body, hosts: chosen },
       { onSuccess: (reply) => setStarted(reply.execs) },
     );
   }
@@ -137,6 +144,14 @@ export function LaunchForm(props: { program: ProgramRow }) {
 
   const busy = launch.isPending || started !== null;
 
+  // The session numbers participants by sorted peer id, not by seat order.
+  const peerOf = (host: string | null) => hosts.find((row) => row.id === host)?.peer_id;
+  const peers = chosen.flatMap((host) => peerOf(host) ?? []).sort(comparePeerIds);
+  const participantOf = (host: string | null): number | null => {
+    const peer = peerOf(host);
+    return peer === undefined ? null : peers.indexOf(peer);
+  };
+
   return (
     <div className="flex max-w-3xl flex-col gap-4">
       {!noParams && (
@@ -167,6 +182,7 @@ export function LaunchForm(props: { program: ProgramRow }) {
             <SeatRow
               key={index}
               index={index}
+              participant={participantOf(seat.host)}
               seat={seat}
               hosts={capable.map((host) => ({
                 id: host.id,
@@ -199,6 +215,8 @@ export function LaunchForm(props: { program: ProgramRow }) {
 
 function SeatRow(props: {
   index: number;
+  /** The participant index this seat's Host will have; null until it has a Host. */
+  participant: number | null;
   seat: SeatDraft;
   hosts: { id: string; label: string; detail?: string }[];
   onChange: (change: Partial<SeatDraft>) => void;
@@ -207,7 +225,9 @@ function SeatRow(props: {
   const n = index + 1;
   return (
     <>
-      <span className="text-sm text-subtle">Seat {n}</span>
+      <span data-testid={`seat-${n}-participant`} className="text-sm text-subtle">
+        {props.participant === null ? "—" : `P${props.participant}`}
+      </span>
       <Select
         placeholder={`Host for seat ${n}`}
         items={props.hosts}
@@ -223,8 +243,8 @@ function SeatRow(props: {
       />
       <span className="text-sm text-subtle">
         {seat.kind === "you"
-          ? "You answer this seat's callouts"
-          : "An agent connects to this Host over MCP"}
+          ? "You answer this Host's callouts here"
+          : "An agent answers this Host's callouts, over MCP or the CLI"}
       </span>
     </>
   );

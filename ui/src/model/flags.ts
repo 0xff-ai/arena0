@@ -203,6 +203,11 @@ function divergenceFlag(session: Session, divergentStep: number | null): Flag | 
   };
 }
 
+/**
+ * Only a timeout is trouble. Retries are the negotiation's normal re-broadcast
+ * cadence (a creator retries until its joiners' tickets arrive), and the
+ * browser sees them only live, so they are not flagged.
+ */
 function negotiationFlag(session: Session): Flag | null {
   const timedOut = session.executions
     .flatMap((e) => e.negotiation)
@@ -216,16 +221,5 @@ function negotiationFlag(session: Session): Flag | null {
       long: `The negotiation timed out: ${timedOut.detail}.`,
     };
   }
-  // Each local Host logs the retries it saw; the busiest log is the count.
-  const retries = Math.max(
-    ...session.executions.map((e) => e.negotiation.filter((m) => m.kind === "retried").length),
-  );
-  if (retries === 0) return null;
-  return {
-    kind: "negotiation-trouble",
-    tier: 1,
-    severity: "warn",
-    short: `retried ${retries}×`,
-    long: `The negotiation was retried ${retries} time${retries === 1 ? "" : "s"}.`,
-  };
+  return null;
 }

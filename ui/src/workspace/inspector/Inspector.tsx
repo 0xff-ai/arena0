@@ -1,6 +1,7 @@
 import { useRouter } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 import {
+  endResult,
   fmtBytes,
   fmtClock,
   fmtDuration,
@@ -255,7 +256,7 @@ function StepInspector(props: { sessionKey: string; step: number; host: string |
         <Group title="Terminal">
           <span className="text-sm">
             {first.terminal.kind === "end"
-              ? `end · outcome ${fmtBytes(first.terminal.outcome_bytes)}`
+              ? `end · ${endResult(session, first.terminal.outcome_bytes)}`
               : `${first.terminal.kind} · ${first.terminal.reason}`}
           </span>
         </Group>

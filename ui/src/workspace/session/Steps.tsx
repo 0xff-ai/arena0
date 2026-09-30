@@ -1,6 +1,7 @@
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { GridList, GridListItem, ListLayout, Virtualizer } from "react-aria-components";
 import {
+  endResult,
   fmtBytes,
   fmtClock,
   fmtDuration,
@@ -191,7 +192,7 @@ function StepLine(props: {
             <span className="shrink-0">
               <Badge tone={terminal.kind === "end" ? "done" : "bad"}>
                 {terminal.kind === "end"
-                  ? `end · outcome ${fmtBytes(terminal.outcome_bytes)}`
+                  ? `end · ${endResult(session, terminal.outcome_bytes)}`
                   : `${terminal.kind} · ${terminal.reason}`}
               </Badge>
             </span>

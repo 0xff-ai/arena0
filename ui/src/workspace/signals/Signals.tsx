@@ -233,6 +233,7 @@ function Activity() {
             <EmptyState
               icon={Icons.activity}
               title={filter === "all" ? "No activity yet" : "No warnings"}
+              body="Activity lists what the daemon reports while this page is open; the daemon keeps no history of it."
             />
           }
         >

@@ -10,13 +10,22 @@ test("the list documents show what the daemon holds", async ({ page, arena }) =>
   const problems = watchConsole(page);
   await seed.completed(arena, "rock-paper-scissors");
   await seed.completed(arena, "prisoner-dilemma");
-  await seed.awaitingYou(arena, "chess");
   await openApp(page, arena, "/sessions");
 
   const sessions = page.getByRole("grid", { name: "Sessions" });
   const dataRows = (grid: typeof sessions) =>
     grid.getByRole("row").filter({ has: page.getByRole("gridcell") });
   const statusBar = page.getByRole("contentinfo");
+
+  await evidence.check("with only finished sessions, Live offers to show them all", async () => {
+    await expect(page.getByText("No live sessions")).toBeVisible();
+    await page.getByRole("button", { name: "Show all 2 sessions" }).click();
+    await expect(dataRows(sessions)).toHaveCount(2);
+    await expect(page).toHaveURL(/[?&]state=all/);
+  });
+
+  await seed.awaitingYou(arena, "chess");
+  await openApp(page, arena, "/sessions");
 
   await evidence.check("Live shows the active chess session and no completed one", async () => {
     await expect(dataRows(sessions)).toHaveCount(1);

@@ -280,13 +280,26 @@ export function SessionsList() {
     setText("");
     void navigate({ search: { state: "all" } });
   };
-  const empty = (
-    <EmptyState
-      icon={Icons.filter}
-      title="No sessions match these filters"
-      action={<Button onPress={clear}>Show all sessions</Button>}
-    />
-  );
+  // Live is the default, so a workspace whose sessions have all finished
+  // offers them rather than reading as if the filters matched nothing.
+  const empty =
+    state === "live" && counts.all > 0 ? (
+      <EmptyState
+        icon={Icons.filter}
+        title="No live sessions"
+        action={
+          <Button onPress={() => set({ state: "all" })}>
+            Show all {counts.all} session{counts.all === 1 ? "" : "s"}
+          </Button>
+        }
+      />
+    ) : (
+      <EmptyState
+        icon={Icons.filter}
+        title="No sessions match these filters"
+        action={<Button onPress={clear}>Show all sessions</Button>}
+      />
+    );
 
   const programName =
     search.program === undefined
