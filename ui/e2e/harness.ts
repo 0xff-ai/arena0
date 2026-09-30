@@ -5,11 +5,9 @@
 // `arena0 launch`) against that same home, then drive the page. Nothing is
 // faked. The binary comes from ARENA0_BIN, else ../target/debug/arena0.
 //
-// The page comes from one of two places:
-// - default: a Vite dev server per worker, proxying HTTP to that worker's
-//   daemon, so suites test the current source without rebuilding the binary;
-// - ARENA0_E2E_EMBEDDED=1: the UI embedded in the binary, as users get it
-//   (`just test-ui` builds the UI and the binary first).
+// The page comes from a Vite dev server per worker, proxying HTTP to that
+// worker's daemon, so suites test the current source without building the UI
+// or rebuilding the binary.
 
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -25,12 +23,11 @@ const BIN = process.env.ARENA0_BIN ?? resolve(UI_DIR, "../target/debug/arena0");
 const ARTIFACTS = resolve(import.meta.dirname, "artifacts");
 const FIRST = resolve(UI_DIR, "../examples/agents/first_allowed.py");
 const CHESS = resolve(UI_DIR, "e2e/agents/first_legal_move.py");
-const EMBEDDED = process.env.ARENA0_E2E_EMBEDDED === "1";
 /** crates/arena0-daemon/src/exec_manager.rs `NEGOTIATION_TIMEOUT`. */
 const NEGOTIATION_TIMEOUT_MS = 30_000;
 
 export interface Arena {
-  /** The page URL served by the daemon or the dev server. */
+  /** The page URL served by this worker's Vite dev server. */
   url: string;
   home: string;
   /** Run the CLI against this daemon; resolves with stdout, rejects on a non-zero exit. */
@@ -145,8 +142,8 @@ async function startArena(): Promise<{ arena: Arena; stop(): Promise<void> }> {
   delete env.CODEX_THREAD_ID;
   delete env.ARENA0_SOCKET;
   const background: ChildProcess[] = [];
-  const devPort = EMBEDDED ? null : await freePort();
-  const devOrigin = devPort === null ? null : `http://127.0.0.1:${devPort}`;
+  const devPort = await freePort();
+  const devOrigin = `http://127.0.0.1:${devPort}`;
   const ui = spawn(BIN, ["--json", "ui", "--no-open"], {
     env,
     stdio: ["ignore", "pipe", "inherit"],
@@ -155,19 +152,16 @@ async function startArena(): Promise<{ arena: Arena; stop(): Promise<void> }> {
   const { url: daemonUrl } = await firstJsonLine(ui, "arena0 ui");
   const relay = await startRelay(new URL(daemonUrl));
 
-  let url = relay.url;
-  if (devOrigin !== null) {
-    // The relay sits between Vite and the daemon, never in front of Vite: a
-    // dropped HMR socket makes the Vite client reload the page.
-    const vite = spawn("pnpm", ["vite", "--port", String(devPort), "--strictPort"], {
-      cwd: UI_DIR,
-      env: { ...process.env, ARENA0_DAEMON_URL: relay.url.replace(/\/$/, "") },
-      stdio: "ignore",
-    });
-    background.push(vite);
-    await waitForHttp(`${devOrigin}/`);
-    url = `${devOrigin}/`;
-  }
+  // The relay sits between Vite and the daemon, never in front of Vite: a
+  // dropped HMR socket makes the Vite client reload the page.
+  const vite = spawn("pnpm", ["vite", "--port", String(devPort), "--strictPort"], {
+    cwd: UI_DIR,
+    env: { ...process.env, ARENA0_DAEMON_URL: relay.url.replace(/\/$/, "") },
+    stdio: "ignore",
+  });
+  background.push(vite);
+  const url = `${devOrigin}/`;
+  await waitForHttp(url);
 
   const stop = async () => {
     await relay.close();

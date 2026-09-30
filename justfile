@@ -30,11 +30,11 @@ check-ui:
     cargo run --quiet --locked -p arena0-api --features ts --example export_ts | diff -u ui/src/api/types.gen.ts -
     cd ui && pnpm biome check . && pnpm tsc -b
 
-# Live browser suites (gallery, shell, and the app against the real binary
-# with the UI it embeds). Evidence lands in ui/e2e/artifacts/.
-test-ui: build-programs build-ui
+# Live browser suites (gallery, shell, and the app against the real binary,
+# with Vite serving the UI source). Evidence lands in ui/e2e/artifacts/.
+test-ui: build-programs
     cargo build --locked -p arena0-cli -p arena0d
-    cd ui && ARENA0_E2E_EMBEDDED=1 pnpm playwright test
+    cd ui && pnpm playwright test
 
 # Print the daemon HTTP URL for the browser workspace.
 ui-dev:
@@ -43,7 +43,7 @@ ui-dev:
 # Run host and program tests (programs wasm first so integration tests do not skip).
 # The doctest line covers the crate doc-tests (incl. the arena0-sdk compile_fail
 # doctest), which `cargo nextest run` does not run by default.
-test: build-programs build-ui test-release-scripts
+test: build-programs test-release-scripts
     cargo nextest run --workspace
     cargo test --doc -p arena0-primitives -p arena0-sdk
     cargo nextest run --manifest-path programs/Cargo.toml
@@ -54,7 +54,7 @@ check-affected base="HEAD" head="":
     ./scripts/check-affected.sh {{quote(base)}} {{quote(head)}}
 
 # CLI subprocess tests need the real sibling daemon executable.
-test-cli: build-programs build-ui
+test-cli: build-programs
     cargo build --locked -p arena0d
     cargo nextest run --locked -p arena0-cli
 

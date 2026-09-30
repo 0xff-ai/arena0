@@ -78,9 +78,8 @@ version pinned in `ui/package.json`.
   the daemon’s browser API types.
 - `just check-ui` checks generated type freshness, lint, and TypeScript types.
 - `just test-ui` builds the required binaries and runs the live Playwright
-  suites with `ARENA0_E2E_EMBEDDED=1`. Evidence goes to `ui/e2e/artifacts/`.
-  Direct `pnpm playwright test` in `ui/` defaults to dev-server mode; set
-  `ARENA0_E2E_EMBEDDED=1` to exercise the embedded build instead. The suites use
+  suites against Vite dev servers, so they test the UI source and need no
+  `ui/dist`. Evidence goes to `ui/e2e/artifacts/`. The suites use
   `/usr/bin/google-chrome`.
 
 For development, build the UI with `just build-ui`, then run `just ui-dev`
