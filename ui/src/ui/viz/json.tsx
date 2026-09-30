@@ -97,14 +97,8 @@ function Node(props: {
           <>
             <span className="text-subtle">
               {" "}
-              {entries.length}{" "}
-              {isArray
-                ? entries.length === 1
-                  ? "item"
-                  : "items"
-                : entries.length === 1
-                  ? "key"
-                  : "keys"}{" "}
+              {entries.length} {isArray ? "item" : "key"}
+              {entries.length === 1 ? "" : "s"}{" "}
             </span>
             <span className={punct}>{closing}</span>
             {comma}
@@ -145,13 +139,7 @@ export function JsonView(props: { value: JsonLike; collapseDepth?: number }) {
 }
 
 function inlineNodes(value: JsonLike, key?: string): ReactNode {
-  const name =
-    key === undefined ? null : (
-      <>
-        <span className="text-syn-fn">{JSON.stringify(key)}</span>
-        <span className={punct}>: </span>
-      </>
-    );
+  const name = <Key name={key} />;
   if (value === null || typeof value !== "object") {
     const tone =
       typeof value === "string"

@@ -4,7 +4,7 @@ import { type Collections, type StepRow, useCollections } from "../sync";
 import { useNow } from "./clock";
 import { divergentStep, type Flag, sessionFlags } from "./flags";
 import { useYourHosts } from "./prefs";
-import { deriveSessions, type Session } from "./session";
+import { deriveSessions, groupBy, type Session } from "./session";
 import { programStats } from "./stats";
 
 const NO_STEPS: StepRow[] = [];
@@ -66,14 +66,9 @@ export function useFlags(sessions: Session[]): Map<string, Flag[]> {
       programOf.set(execution.key, execution.program);
     }
   }
-  const stepsOfSession = new Map<string, StepRow[]>();
-  for (const step of steps) {
-    const key = sessionOfExecution.get(`${step.host}/${step.exec_id}`);
-    if (key === undefined) continue;
-    const group = stepsOfSession.get(key);
-    if (group === undefined) stepsOfSession.set(key, [step]);
-    else group.push(step);
-  }
+  const stepsOfSession = groupBy(steps, (step) =>
+    sessionOfExecution.get(`${step.host}/${step.exec_id}`),
+  );
 
   const stats = programStats(steps, programOf);
   const hosts = new Map(hostRows.map((host) => [host.id, host]));
@@ -135,12 +130,7 @@ export function useHostCounts(): Map<string, { programs: number; live: number }>
     return found;
   };
   for (const program of programs) for (const host of program.hosts) entry(host).programs += 1;
-  for (const execution of executions) {
-    const ended =
-      execution.lifecycle === "completed" ||
-      execution.lifecycle === "failed" ||
-      execution.lifecycle === "aborted";
-    if (!ended) entry(execution.host).live += 1;
-  }
+  for (const execution of executions)
+    if (execution.terminal === null) entry(execution.host).live += 1;
   return counts;
 }

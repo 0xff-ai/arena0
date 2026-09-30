@@ -4,6 +4,7 @@ import { comparePeerIds, type ExecRef, type ProgramRow, useCall, useCollections 
 import {
   Button,
   FieldError,
+  isNullSchema,
   type JsonLike,
   NumberField,
   SchemaForm,
@@ -26,9 +27,6 @@ const DRIVERS: { id: DriverKind; label: string }[] = [
   { id: "you", label: "You" },
   { id: "external", label: "External" },
 ];
-
-const isNullSchema = (schema: JsonLike): boolean =>
-  typeof schema === "object" && schema !== null && !Array.isArray(schema) && schema.type === "null";
 
 /**
  * Starts a session: params, participant count and a Host and driver per
@@ -62,13 +60,13 @@ export function LaunchForm(props: { program: ProgramRow }) {
   const [attempted, setAttempted] = useState(false);
   const [started, setStarted] = useState<ExecRef[] | null>(null);
 
-  const draftAt = (index: number): ParticipantDraft => {
-    const host = drafts[index]?.host ?? capable[index]?.id ?? null;
-    const kind = host !== null && yourHosts.has(host) ? "you" : "external";
-    return { host, kind, ...drafts[index] };
-  };
-  const rows = Array.from({ length: Number.isFinite(count) ? Math.max(0, count) : 0 }, (_, i) =>
-    draftAt(i),
+  const rows = Array.from(
+    { length: Number.isFinite(count) ? Math.max(0, count) : 0 },
+    (_, index): ParticipantDraft => {
+      const host = drafts[index]?.host ?? capable[index]?.id ?? null;
+      const kind = host !== null && yourHosts.has(host) ? "you" : "external";
+      return { host, kind, ...drafts[index] };
+    },
   );
   const edit = (index: number, change: Partial<ParticipantDraft>) =>
     setDrafts((all) => ({ ...all, [index]: { ...all[index], ...change } }));
@@ -114,7 +112,7 @@ export function LaunchForm(props: { program: ProgramRow }) {
     setYourHosts([...next]);
     launch.mutate(
       { program: program.hash, params: body, hosts: chosen },
-      { onSuccess: (reply) => setStarted(reply.execs) },
+      { onSuccess: setStarted },
     );
   }
 
@@ -131,11 +129,7 @@ export function LaunchForm(props: { program: ProgramRow }) {
   const first = mine[0];
   const settled =
     first !== undefined &&
-    (youHosts.size === 0 ||
-      firstCallout !== undefined ||
-      mine.every(
-        (e) => e.lifecycle === "completed" || e.lifecycle === "aborted" || e.lifecycle === "failed",
-      ));
+    (youHosts.size === 0 || firstCallout !== undefined || mine.every((e) => e.terminal !== null));
   useEffect(() => {
     if (!settled || first === undefined || opened.current) return;
     opened.current = true;

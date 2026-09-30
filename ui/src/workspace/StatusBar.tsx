@@ -64,7 +64,7 @@ export function StatusBar() {
         {gaps > 0 ? `${gaps} ${gaps === 1 ? "gap" : "gaps"}` : "no gaps"}
       </span>
       <span className="inline-flex items-center gap-1.5">
-        <Dot tone={connectionTone[connection.status] ?? "neutral"} />
+        <Dot tone={connectionTone[connection.status]} />
         {connection.status === "offline"
           ? `offline · reconnecting${connection.attempt > 0 ? `, attempt ${connection.attempt}` : ""}`
           : connection.status}

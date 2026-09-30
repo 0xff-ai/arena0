@@ -1,4 +1,5 @@
 import { type ReactNode, useEffect, useRef, useState } from "react";
+import type { UpdateSearch } from "~/app/router";
 import type { Session } from "~/model";
 import { useRead, type ViewReply } from "~/sync";
 import {
@@ -13,7 +14,6 @@ import {
   ToolbarSeparator,
   useElementSize,
 } from "~/ui";
-import type { UpdateSearch } from "./update";
 import { ViewBlocks } from "./ViewBlocks";
 
 type Mode = "blocks" | "text" | "both";
@@ -87,7 +87,7 @@ function Pane(props: {
   if (showBlocks) {
     body.push(
       <div key="blocks" className="p-3">
-        <ViewBlocks blocks={reply.blocks} participants={props.session.participants} />
+        <ViewBlocks blocks={reply.blocks} session={props.session} />
       </div>,
     );
   }
@@ -183,7 +183,6 @@ export function ViewPane(props: {
       <Toolbar aria-label="View controls">
         <div className="w-28">
           <Select
-            label=""
             placeholder="Host"
             items={hostItems}
             value={host}

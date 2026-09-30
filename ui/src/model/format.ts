@@ -1,4 +1,5 @@
-import type { JsonValue } from "../sync";
+import type { JsonValue } from "~/api/types.gen";
+import type { ProgramRow } from "../sync";
 import type { Session } from "./session";
 
 const pad2 = (n: number) => String(n).padStart(2, "0");
@@ -73,4 +74,14 @@ export function endResult(session: Session, outcomeBytes: number): string {
 
 export function shortHash(hex: string, n = 8): string {
   return hex.slice(0, n);
+}
+
+/** A participant range, "2" or "2–4". */
+export function fmtRange(range: { min: number; max: number }): string {
+  return range.min === range.max ? String(range.min) : `${range.min}–${range.max}`;
+}
+
+/** The program's display name, or its short hash when no local Host holds it. */
+export function programName(programs: ProgramRow[], hash: string): string {
+  return programs.find((program) => program.hash === hash)?.display_name ?? shortHash(hash);
 }

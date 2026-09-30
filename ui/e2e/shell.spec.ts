@@ -1,5 +1,5 @@
 // Shell suite: what the workspace shell shows without a daemon. The live
-// workspace is proven by the M4 suite against the real `arena0 ui`; there is
+// workspace is proven by the app suite against the real `arena0 ui`; there is
 // no fake daemon here. Evidence goes to e2e/artifacts/shell/: a screenshot per
 // state and theme, and summary.json listing each check that passed. Run with
 // `pnpm playwright test --project shell`.

@@ -6,6 +6,7 @@ import {
   FieldError,
   IconButton,
   Icons,
+  isNullSchema,
   type JsonLike,
   JsonView,
   KeyValue,
@@ -35,15 +36,6 @@ export function ComposerDock() {
  * the callout is no longer pending.
  */
 type Phase = "editing" | "submitting" | "accepted" | "unknown" | "elsewhere";
-
-function isNullSchema(schema: JsonLike): boolean {
-  return (
-    typeof schema === "object" &&
-    schema !== null &&
-    !Array.isArray(schema) &&
-    schema.type === "null"
-  );
-}
 
 function Composer(props: { calloutKey: string }) {
   const { calloutKey } = props;

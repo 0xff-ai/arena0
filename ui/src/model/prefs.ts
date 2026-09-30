@@ -1,6 +1,6 @@
 import { useLayoutEffect, useSyncExternalStore } from "react";
 
-export type ThemePref = "light" | "dark" | "system";
+type ThemePref = "light" | "dark" | "system";
 
 const THEME_KEY = "arena0.theme";
 const YOUR_HOSTS_KEY = "arena0.your-hosts";
@@ -28,14 +28,6 @@ function useStored(key: string): string | null {
   return useSyncExternalStore(subscribe, () => localStorage.getItem(key));
 }
 
-function setTheme(theme: ThemePref) {
-  write(THEME_KEY, theme);
-}
-
-function setYourHosts(hosts: string[]) {
-  write(YOUR_HOSTS_KEY, JSON.stringify(hosts));
-}
-
 /** Also keeps `<html data-theme>` in step; `system` follows the OS setting live. */
 export function useTheme(): [ThemePref, (theme: ThemePref) => void] {
   const stored = useStored(THEME_KEY);
@@ -51,7 +43,7 @@ export function useTheme(): [ThemePref, (theme: ThemePref) => void] {
     media.addEventListener("change", apply);
     return () => media.removeEventListener("change", apply);
   }, [theme]);
-  return [theme, setTheme];
+  return [theme, (next) => write(THEME_KEY, next)];
 }
 
 /**
@@ -63,7 +55,7 @@ export function useYourHosts(allHosts: string[]): [ReadonlySet<string>, (hosts: 
   const stored = parseHosts(useStored(YOUR_HOSTS_KEY));
   const yourHosts =
     stored === null ? new Set(allHosts) : new Set(stored.filter((host) => allHosts.includes(host)));
-  return [yourHosts, setYourHosts];
+  return [yourHosts, (hosts) => write(YOUR_HOSTS_KEY, JSON.stringify(hosts))];
 }
 
 /** Null when nothing usable is stored: localStorage is outside our control. */

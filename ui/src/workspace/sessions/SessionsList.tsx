@@ -4,6 +4,8 @@ import { sessionsRoute } from "~/app/router";
 import {
   fmtClock,
   fmtDuration,
+  groupBy,
+  isTerminal,
   type Session,
   useFlags,
   useNow,
@@ -11,7 +13,7 @@ import {
   useSessions,
   useYourHosts,
 } from "~/model";
-import { type StepRow, useCollections } from "~/sync";
+import { useCollections } from "~/sync";
 import {
   Badge,
   Button,
@@ -39,9 +41,6 @@ import { sessionStrip } from "./strip";
 const DAY_MS = 24 * 3600 * 1000;
 const ROW_HEIGHT = 26;
 const HEADING_HEIGHT = 24;
-
-const isTerminal = (session: Session) =>
-  session.state === "completed" || session.state === "failed" || session.state === "aborted";
 
 /** Which optional columns fit in a list this wide; the lifecycle strip keeps the rest. */
 function fits(width: number) {
@@ -125,18 +124,8 @@ export function SessionsList() {
       : Math.max(now - DAY_MS, Math.min(now, ...rows.map((row) => row.createdMs)));
   const axisTo = search.from !== undefined && search.to !== undefined ? search.to : now;
 
-  const stepsOf = stepsByExecution(steps);
+  const stepsOf = groupBy(steps, (step) => `${step.host}/${step.exec_id}`);
   const optional = fits(width);
-  const fixed =
-    28 +
-    220 +
-    56 +
-    (optional.participants ? 96 : 0) +
-    (optional.age ? 72 : 0) +
-    (optional.evidence ? 96 : 0) +
-    (optional.hint ? 220 : 0);
-  // The cell has 8 px of padding on each side.
-  const stripWidth = Math.max(200, width - fixed) - 16;
 
   const columns: Column<Session>[] = [
     {
@@ -246,6 +235,9 @@ export function SessionsList() {
         ]
       : []),
   ];
+  // The strip takes what the fixed-width columns leave; its cell has 8 px of padding on each side.
+  const fixed = columns.reduce((sum, c) => sum + (typeof c.width === "number" ? c.width : 0), 0);
+  const stripWidth = Math.max(200, width - fixed) - 16;
 
   const selectedKey = selection?.kind === "session" ? selection.key : null;
   const table = (label: string, list: Session[]) => (
@@ -375,18 +367,6 @@ export function SessionsList() {
       </div>
     </div>
   );
-}
-
-/** Steps grouped by their execution's key, which a step row carries as `{host, exec_id}`. */
-function stepsByExecution(steps: StepRow[]): Map<string, StepRow[]> {
-  const groups = new Map<string, StepRow[]>();
-  for (const step of steps) {
-    const key = `${step.host}/${step.exec_id}`;
-    const group = groups.get(key);
-    if (group === undefined) groups.set(key, [step]);
-    else group.push(step);
-  }
-  return groups;
 }
 
 function Participants(props: { session: Session; yourHosts: ReadonlySet<string> }) {

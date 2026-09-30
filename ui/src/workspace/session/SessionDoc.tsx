@@ -1,6 +1,7 @@
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { Link } from "react-aria-components";
+import type { UpdateSearch } from "~/app/router";
 import { sessionRoute } from "~/app/router";
 import {
   fmtOutcome,
@@ -23,12 +24,11 @@ import {
   KeyValue,
   MenuButton,
   MenuItem,
-  ParticipantChip,
   SubTabs,
   toasts,
 } from "~/ui";
 import { FlagHint } from "../common/FlagHint";
-import { shortSessionKey } from "../common/SessionLabel";
+import { participantChip, shortSessionKey } from "../common/SessionLabel";
 import { StateWord } from "../common/StateWord";
 import { useComposer } from "../composer/store";
 import { type SessionSub, sessionHref } from "../nav";
@@ -37,7 +37,6 @@ import { EvidencePane } from "./EvidencePane";
 import { NegotiationPane } from "./NegotiationPane";
 import { QueryPane } from "./QueryPane";
 import { Steps } from "./Steps";
-import type { UpdateSearch } from "./update";
 import { ViewPane } from "./ViewPane";
 
 const SUBS = [
@@ -47,18 +46,6 @@ const SUBS = [
   { id: "query", label: "Query", icon: Icons.query },
   { id: "evidence", label: "Evidence", icon: Icons.evidence },
 ] satisfies { id: SessionSub; label: string; icon: typeof Icons.steps }[];
-
-const TERMINAL = new Set(["completed", "aborted", "failed"]);
-
-function participantChip(session: Session, index: number) {
-  const participant = session.participants[index];
-  return (
-    <ParticipantChip
-      index={index}
-      label={participant?.host ?? shortHash(participant?.peerId ?? "", 6)}
-    />
-  );
-}
 
 function FrontMatter(props: { session: Session }) {
   const { session } = props;
@@ -167,7 +154,7 @@ function Actions(props: { session: Session }) {
   const mine = session.callouts.find((callout) => yourHosts.has(callout.host));
 
   // Each local Host runs its own execution, so ending the session is one call per Host that is still going.
-  const live = session.executions.filter((e) => !TERMINAL.has(e.lifecycle));
+  const live = session.executions.filter((e) => e.terminal === null);
   function stop(op: typeof withdraw | typeof terminate, verb: string) {
     for (const execution of live) {
       op.mutate(

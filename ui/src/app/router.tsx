@@ -1,11 +1,11 @@
 import { createRootRoute, createRoute, createRouter, redirect } from "@tanstack/react-router";
 import { lazy } from "react";
 import { EmptyWorkspace } from "~/workspace/EmptyWorkspace";
-import { docHref } from "~/workspace/nav";
+import { docHref, query, type SessionSub } from "~/workspace/nav";
 import { firstDoc } from "~/workspace/tabs";
 import { Workspace } from "~/workspace/Workspace";
 
-export type SessionsSearch = {
+type SessionsSearch = {
   state?: "live" | "flagged" | "all";
   group?: "list" | "host";
   host?: string;
@@ -15,13 +15,19 @@ export type SessionsSearch = {
   to?: number;
 };
 export type SessionSearch = {
-  sub?: "steps" | "view" | "negotiation" | "query" | "evidence";
+  sub?: SessionSub;
   step?: number;
   host?: string;
   compare?: string;
 };
-export type ReceiptsSearch = { host?: string };
-export type ProgramSearch = { launch?: boolean };
+/**
+ * Changes some of the document's search parameters and keeps the others. A key
+ * present with `undefined` clears that parameter. Every sub tab reads and
+ * writes its state here, so the address always reproduces what is shown.
+ */
+export type UpdateSearch = (patch: Partial<SessionSearch>) => void;
+type ReceiptsSearch = { host?: string };
+type ProgramSearch = { launch?: boolean };
 
 // Search values are validated at the address bar, the trust boundary: an
 // unknown or malformed value is dropped, never an error.
@@ -59,9 +65,7 @@ function validateSession(search: Record<string, unknown>): SessionSearch {
   };
 }
 
-const rootRoute = createRootRoute({ component: Workspace });
-
-export { rootRoute };
+export const rootRoute = createRootRoute({ component: Workspace });
 
 // The root shows the left-most open tab, or an empty workspace once every tab is closed.
 const indexRoute = createRoute({
@@ -162,14 +166,7 @@ export const router = createRouter({
   defaultPreload: false,
   // Plain strings, not JSON: a program hash of digits or `1e5` must stay text.
   parseSearch: (search) => Object.fromEntries(new URLSearchParams(search)),
-  stringifySearch: (search) => {
-    const params = new URLSearchParams();
-    for (const [name, value] of Object.entries(search)) {
-      if (value !== undefined && value !== null) params.set(name, String(value));
-    }
-    const encoded = params.toString();
-    return encoded === "" ? "" : `?${encoded}`;
-  },
+  stringifySearch: query,
 });
 
 declare module "@tanstack/react-router" {

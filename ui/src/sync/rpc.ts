@@ -23,23 +23,14 @@ export const OUTCOME_UNKNOWN = "outcome unknown";
 
 /** POST /rpc once. Resolves Ok, rejects DaemonError with the daemon's Err. */
 export async function rpc(request: Request): Promise<ResponseOk> {
-  let response: globalThis.Response;
-  try {
-    response = await fetch("/rpc", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(request),
-    });
-  } catch {
-    throw new DaemonError("transport", OUTCOME_UNKNOWN);
-  }
-  if (!response.ok) throw new DaemonError("transport", OUTCOME_UNKNOWN);
-  let reply: Response;
-  try {
-    reply = await response.json();
-  } catch {
-    throw new DaemonError("transport", OUTCOME_UNKNOWN);
-  }
+  const reply: Response | null = await fetch("/rpc", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  })
+    .then((response) => (response.ok ? response.json() : null))
+    .catch(() => null);
+  if (reply === null) throw new DaemonError("transport", OUTCOME_UNKNOWN);
   if ("Err" in reply) throw new DaemonError(reply.Err.code, reply.Err.message);
   return reply.Ok;
 }

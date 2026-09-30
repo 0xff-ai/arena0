@@ -1,8 +1,20 @@
 import { type Session, shortHash } from "~/model";
+import { ParticipantChip } from "~/ui";
 
 /** Eight characters of the key's last segment: keys are a negotiation id or `e:<host>/<exec id>`. */
 export function shortSessionKey(key: string): string {
   return shortHash(key.slice(key.lastIndexOf("/") + 1).replace(/^e:/, ""));
+}
+
+/** Participant `index` of the session, named by its local Host or else a short peer id. */
+export function participantChip(session: Session, index: number) {
+  const participant = session.participants[index];
+  return (
+    <ParticipantChip
+      index={index}
+      label={participant?.host ?? shortHash(participant?.peerId ?? "", 6)}
+    />
+  );
 }
 
 /** A session's program name and its short key. */

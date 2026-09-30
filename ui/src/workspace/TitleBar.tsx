@@ -1,12 +1,12 @@
 import { CheckboxGroup, Dialog, DialogTrigger } from "react-aria-components";
 import { useRows, useTheme, useYourHosts } from "~/model";
-import { useCollections, useConnection, useDaemonInfo } from "~/sync";
+import { type ConnectionStatus, useCollections, useConnection, useDaemonInfo } from "~/sync";
 import { Button, Checkbox, Dot, IconButton, Icons, Kbd, Popover, type Tone } from "~/ui";
 import { openPalette } from "./shell";
 
-const NEXT_THEME = { light: "dark", dark: "system", system: "light" } as const;
+export const NEXT_THEME = { light: "dark", dark: "system", system: "light" } as const;
 
-export const connectionTone: Record<string, Tone> = {
+export const connectionTone: Record<ConnectionStatus, Tone> = {
   live: "ok",
   syncing: "warn",
   connecting: "warn",
@@ -81,7 +81,7 @@ export function TitleBar() {
         data-testid="connection"
         className="inline-flex h-5 items-center gap-1.5 rounded-xs border border-line px-1.5 text-xs text-muted"
       >
-        <Dot tone={connectionTone[connection.status] ?? "neutral"} />
+        <Dot tone={connectionTone[connection.status]} />
         {connection.status}
       </span>
 

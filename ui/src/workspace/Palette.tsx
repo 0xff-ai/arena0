@@ -1,5 +1,5 @@
 import { useRouter } from "@tanstack/react-router";
-import { shortHash, useRows, useTheme } from "~/model";
+import { programName, shortHash, useRows, useTheme } from "~/model";
 import { useCollections } from "~/sync";
 import { CommandPalette, Icons, type PaletteItem } from "~/ui";
 import { shortSessionKey } from "./common/SessionLabel";
@@ -12,8 +12,7 @@ import {
   useProblems,
   useSignalsTab,
 } from "./shell";
-
-const NEXT_THEME = { light: "dark", dark: "system", system: "light" } as const;
+import { NEXT_THEME } from "./TitleBar";
 
 export function Palette() {
   const router = useRouter();
@@ -29,8 +28,6 @@ export function Palette() {
 
   const go = (path: string) => () => router.history.push(path);
   const goSignals = (tab: "needs" | "problems" | "activity") => () => setSignalsTab(tab);
-  const programName = (hash: string) =>
-    programs.find((program) => program.hash === hash)?.display_name ?? shortHash(hash);
 
   // The launch form is the program document with `launch` set.
   const newSession: PaletteItem[] = programs.map((program) => ({
@@ -146,7 +143,7 @@ export function Palette() {
             title: "Receipts",
             items: receipts.map((receipt) => ({
               id: `receipt:${receipt.key}`,
-              label: `${programName(receipt.program)} ${shortHash(receipt.receipt_id)}`,
+              label: `${programName(programs, receipt.program)} ${shortHash(receipt.receipt_id)}`,
               detail: `${receipt.kind === "stop_report" ? "stop report" : "receipt"} · ${receipt.host}`,
               icon: receipt.kind === "stop_report" ? Icons.stopReport : Icons.receipt,
               keywords: [receipt.receipt_id],
@@ -176,13 +173,11 @@ export function Palette() {
         ];
 
   return (
-    <>
-      <CommandPalette
-        isOpen={mode !== null}
-        onOpenChange={(open) => (open ? openPalette(mode ?? "all") : closePalette())}
-        groups={groups.filter((group) => group.items.length > 0)}
-        placeholder={mode === "programs" ? "Choose a program for the new session…" : undefined}
-      />
-    </>
+    <CommandPalette
+      isOpen={mode !== null}
+      onOpenChange={(open) => (open ? openPalette(mode ?? "all") : closePalette())}
+      groups={groups.filter((group) => group.items.length > 0)}
+      placeholder={mode === "programs" ? "Choose a program for the new session…" : undefined}
+    />
   );
 }

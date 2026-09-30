@@ -5,7 +5,7 @@ import { type Flag, type Session, useFlags, useSessions } from "~/model";
 // Small in-memory stores that the shell's parts share without props: the
 // title bar, palette, status bar and global keys are siblings.
 
-function store<T>(initial: T) {
+export function store<T>(initial: T) {
   let value = initial;
   const listeners = new Set<() => void>();
   return {
@@ -23,7 +23,7 @@ function store<T>(initial: T) {
 }
 
 /** "programs" opens the palette showing only "New <program> session" items. */
-export type PaletteMode = "all" | "programs";
+type PaletteMode = "all" | "programs";
 
 const palette = store<PaletteMode | null>(null);
 

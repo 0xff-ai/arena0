@@ -124,11 +124,10 @@ export function firstDoc(): DocRef | null {
 export function useDocTabs(): {
   docs: { ref: DocRef; preview: boolean }[];
   open(ref: DocRef, pin: boolean): void;
-  pin(ref: DocRef): void;
   close(ref: DocRef): void;
 } {
   const docs = useSyncExternalStore(subscribe, snapshot);
-  return { docs, open, pin, close };
+  return { docs, open, close };
 }
 
 function open(ref: DocRef, pin: boolean) {
@@ -146,10 +145,6 @@ function open(ref: DocRef, pin: boolean) {
   const replaced = docs.findIndex((doc) => doc.preview);
   if (replaced < 0) write([...docs, { ref, preview: true }]);
   else write(docs.map((doc, i) => (i === replaced ? { ref, preview: true } : doc)));
-}
-
-function pin(ref: DocRef) {
-  open(ref, true);
 }
 
 function close(ref: DocRef) {

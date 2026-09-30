@@ -153,14 +153,11 @@ interface Run {
 
 type Paint = Color | "fg" | "editor" | null;
 
-/** Inverse swaps the two colours; an unset side falls back to the page's own. */
-function paints(style: Style): { fg: Paint; bg: Paint } {
-  if (style.inverse) return { fg: style.bg ?? "editor", bg: style.fg ?? "fg" };
-  return { fg: style.fg, bg: style.bg };
-}
-
 function toRun(text: string, style: Style): Run {
-  const { fg, bg } = paints(style);
+  // Inverse swaps the two colours; an unset side falls back to the page's own.
+  const [fg, bg]: Paint[] = style.inverse
+    ? [style.bg ?? "editor", style.fg ?? "fg"]
+    : [style.fg, style.bg];
   const css: CSSProperties = {};
   const classes: string[] = [];
 

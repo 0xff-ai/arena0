@@ -1,12 +1,9 @@
-import type { Cell, HostRequest, ReceiptArtifact } from "~/api/types.gen";
+import type { HostRequest, JsonValue, NegotiationTarget, ReceiptArtifact } from "~/api/types.gen";
 import { hostRow } from "./project";
 import type {
-  BlobImported,
   CreatedReply,
+  ExecRef,
   HostRow,
-  JoinTarget,
-  JsonValue,
-  ProgramImported,
   RecordsReply,
   VerifyReply,
   VerifyTarget,
@@ -14,15 +11,6 @@ import type {
 } from "./rows";
 import { assertReply, DaemonError, hostCall, rpc, upload } from "./rpc";
 
-export interface LaunchArgs {
-  program: string;
-  params: JsonValue | null;
-  /** One Host per participant; the first creates the session and the rest join it. */
-  hosts: string[];
-}
-export interface LaunchReply {
-  execs: { host: string; exec_id: string }[];
-}
 export type OpName = keyof OpReplies;
 export type OpArgs<K extends OpName> = {
   view: { host: string; exec_id: string; width: number; at_step: number | null };
@@ -38,8 +26,13 @@ export type OpArgs<K extends OpName> = {
     participants: number;
     blobs: string[];
   };
-  join: { host: string; program: string; target: JoinTarget | null; blobs: string[] };
-  launch: LaunchArgs;
+  join: { host: string; program: string; target: NegotiationTarget | null; blobs: string[] };
+  launch: {
+    program: string;
+    params: JsonValue | null;
+    /** One Host per participant; the first creates the session and the rest join it. */
+    hosts: string[];
+  };
   withdraw: { host: string; exec_id: string };
   terminate: { host: string; exec_id: string };
   program_import: { hosts: string[]; file: File };
@@ -59,13 +52,13 @@ export interface OpReplies {
   answer: null;
   create: CreatedReply;
   join: CreatedReply;
-  launch: LaunchReply;
+  launch: ExecRef[];
   withdraw: null;
   terminate: null;
-  program_import: ProgramImported;
+  program_import: { hash: string; hosts: string[] };
   program_remove: null;
   receipt_import: { receipt_id: string };
-  blob_import: BlobImported;
+  blob_import: { hash: string; length: number };
   host_open: HostRow;
 }
 
@@ -91,34 +84,13 @@ export const ops: { [K in OpName]: (args: OpArgs<K>) => Promise<OpReplies[K]> } 
     });
     assertReply(reply, "ExecView");
     const { step, view } = reply.ExecView;
-    // Wire cells omit absent participant indexes; rows have an explicit null.
-    const cell = (value: Cell) => ({ ...value, participant: value.participant ?? null });
     return {
       step,
       header: view.slots.Header ?? null,
       agents: view.slots.Agents ?? null,
       state: view.slots.State ?? null,
       status_bar: view.slots.StatusBar ?? null,
-      blocks: (view.blocks ?? []).map((block) => {
-        switch (block.kind) {
-          case "facts":
-            return {
-              ...block,
-              items: block.items.map((item) => ({ ...item, value: cell(item.value) })),
-            };
-          case "table":
-            return { ...block, rows: block.rows.map((row) => row.map(cell)) };
-          case "board":
-            return { ...block, cells: block.cells.map(cell) };
-          case "roster":
-            return {
-              ...block,
-              entries: block.entries.map((entry) => ({ ...entry, status: cell(entry.status) })),
-            };
-          case "progress":
-            return block;
-        }
-      }),
+      blocks: view.blocks ?? [],
     };
   },
   async records({ host, exec_id, from, limit }) {
@@ -205,7 +177,7 @@ export const ops: { [K in OpName]: (args: OpArgs<K>) => Promise<OpReplies[K]> } 
     return execNew(host, { program, params: null, blobs, ensemble: { Join: { target } } });
   },
   async launch({ program, params, hosts }) {
-    const execs: LaunchReply["execs"] = [];
+    const execs: ExecRef[] = [];
     try {
       const host = hosts[0]!;
       const info = await hostCall(host, { method: "host.info" });
@@ -227,7 +199,7 @@ export const ops: { [K in OpName]: (args: OpArgs<K>) => Promise<OpReplies[K]> } 
         const joined = await ops.join({ host: joiner, program, target, blobs: [] });
         execs.push({ host: joiner, exec_id: joined.exec_id });
       }
-      return { execs };
+      return execs;
     } catch (error) {
       // Cleanup cannot replace the original failure, even if a Host has gone away.
       await Promise.allSettled(execs.map((exec) => ops.withdraw(exec)));

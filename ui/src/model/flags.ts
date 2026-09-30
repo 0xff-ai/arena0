@@ -115,8 +115,21 @@ export function sessionFlags(
     });
   }
 
-  const trouble = negotiationFlag(session);
-  if (trouble !== null) flags.push(trouble);
+  // Only a timeout is trouble. Retries are the negotiation's normal re-broadcast
+  // cadence (a creator retries until its joiners' tickets arrive), and the
+  // browser sees them only live, so they are not flagged.
+  const timedOut = session.executions
+    .flatMap((e) => e.negotiation)
+    .find((mark) => mark.kind === "timed_out");
+  if (timedOut !== undefined) {
+    flags.push({
+      kind: "negotiation-trouble",
+      tier: 2,
+      severity: "warn",
+      short: "timed out",
+      long: `The negotiation timed out: ${timedOut.detail}.`,
+    });
+  }
 
   const { phase, unconfirmed } = session.end;
   if (unconfirmed.length > 0 && phase !== "open") {
@@ -133,11 +146,11 @@ export function sessionFlags(
     });
   }
 
-  const gap = session.executions.some((e) => {
-    const gapMs = hosts.get(e.host)?.last_gap_ms;
-    return gapMs !== null && gapMs !== undefined && gapMs >= session.createdMs;
-  });
-  if (gap) {
+  if (
+    session.executions.some(
+      (e) => (hosts.get(e.host)?.last_gap_ms ?? Number.NEGATIVE_INFINITY) >= session.createdMs,
+    )
+  ) {
     flags.push({
       kind: "observation-gap",
       tier: 1,
@@ -201,25 +214,4 @@ function divergenceFlag(session: Session, divergentStep: number | null): Flag | 
     short: session.latestStep === null ? "session failed" : `failed at step ${session.latestStep}`,
     long: reason ? `The session failed: ${reason}` : "The session failed.",
   };
-}
-
-/**
- * Only a timeout is trouble. Retries are the negotiation's normal re-broadcast
- * cadence (a creator retries until its joiners' tickets arrive), and the
- * browser sees them only live, so they are not flagged.
- */
-function negotiationFlag(session: Session): Flag | null {
-  const timedOut = session.executions
-    .flatMap((e) => e.negotiation)
-    .find((mark) => mark.kind === "timed_out");
-  if (timedOut !== undefined) {
-    return {
-      kind: "negotiation-trouble",
-      tier: 2,
-      severity: "warn",
-      short: "timed out",
-      long: `The negotiation timed out: ${timedOut.detail}.`,
-    };
-  }
-  return null;
 }

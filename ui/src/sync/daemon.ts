@@ -19,6 +19,7 @@ import {
   offerRow,
   programRow,
   receiptRow,
+  startedSession,
   stepRow,
 } from "./project";
 import type { CollectionName, NegotiationMark, RowBatch, RowOf } from "./rows";
@@ -247,16 +248,7 @@ export function connectDaemon(): Daemon {
           })),
         });
       }
-      const state = status.state;
-      const session =
-        state.exec_state === "Failed"
-          ? state.session?.session_state === "Started"
-            ? state.session.session
-            : null
-          : "session" in state
-            ? state.session
-            : null;
-      const pending = session?.pending_callout;
+      const pending = startedSession(status.state)?.pending_callout;
       publish({
         collection: "callouts",
         ops: [...rows.callouts.values()]

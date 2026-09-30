@@ -1,13 +1,13 @@
 import { useRouter } from "@tanstack/react-router";
 import { useEffect } from "react";
-import { shortHash, useRows, useSessions } from "~/model";
+import { programName, shortHash, useRows, useSessions } from "~/model";
 import { useCollections } from "~/sync";
 import { type DocTab, DocTabs, Icons } from "~/ui";
 import { shortSessionKey } from "./common/SessionLabel";
 import { docHref, useActiveDoc, useCloseDoc } from "./nav";
 import { type DocRef, docId, type ListName, useDocTabs } from "./tabs";
 
-export const LIST_TABS: Record<ListName, { label: string; icon: typeof Icons.session }> = {
+const LIST_TABS: Record<ListName, { label: string; icon: typeof Icons.session }> = {
   offers: { label: "Offers", icon: Icons.offer },
   sessions: { label: "Sessions", icon: Icons.session },
   programs: { label: "Programs", icon: Icons.program },
@@ -38,8 +38,6 @@ export function TabRow() {
     receipts: receipts.length,
     programs: programs.length,
   };
-  const programName = (hash: string) =>
-    programs.find((program) => program.hash === hash)?.display_name ?? shortHash(hash);
 
   const docTab = (ref: DocRef, preview: boolean): DocTab => {
     switch (ref.kind) {
@@ -62,7 +60,12 @@ export function TabRow() {
         };
       }
       case "program":
-        return { id: docId(ref), label: programName(ref.hash), icon: Icons.program, preview };
+        return {
+          id: docId(ref),
+          label: programName(programs, ref.hash),
+          icon: Icons.program,
+          preview,
+        };
       case "host":
         return { id: docId(ref), label: ref.id, icon: Icons.host, preview };
       case "receipt": {
@@ -95,7 +98,7 @@ export function TabRow() {
       }}
       onPin={(id) => {
         const ref = byId(id);
-        if (ref) tabs.pin(ref);
+        if (ref) tabs.open(ref, true);
       }}
     />
   );

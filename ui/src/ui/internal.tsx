@@ -1,5 +1,6 @@
-// Helpers shared by several components. Not re-exported from index.ts: the
-// public surface is exactly the contract, this file is the library's own glue.
+// Helpers shared by several components. index.ts re-exports only the
+// participant colours: the public surface is exactly the contract, the rest of
+// this file is the library's own glue.
 import type { LucideIcon } from "lucide-react";
 import type { Tone } from "./badge";
 import { cx } from "./cx";
@@ -46,20 +47,7 @@ export const participantText: Record<ParticipantToneName, string> = {
 
 /** Participant index to its colour: five distinct tones, then one shared "many" tone. */
 export function participantToneOf(index: number): ParticipantToneName {
-  switch (index) {
-    case 0:
-      return "p0";
-    case 1:
-      return "p1";
-    case 2:
-      return "p2";
-    case 3:
-      return "p3";
-    case 4:
-      return "p4";
-    default:
-      return "pq";
-  }
+  return (["p0", "p1", "p2", "p3", "p4"] as const)[index] ?? "pq";
 }
 
 export function isParticipantTone(tone: Tone | ParticipantToneName): tone is ParticipantToneName {
@@ -84,15 +72,11 @@ export function Icon(props: {
   );
 }
 
-const macPattern = /mac|iphone|ipad|ipod/i;
-
 /** Evaluated once; the platform does not change during a page's life. */
-export const isMac: boolean = (() => {
-  if (typeof navigator === "undefined") return false;
-  const agentData = (navigator as Navigator & { userAgentData?: { platform?: string } })
-    .userAgentData;
-  return macPattern.test(agentData?.platform ?? navigator.platform);
-})();
+export const isMac: boolean = /mac|iphone|ipad|ipod/i.test(
+  (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform ??
+    navigator.platform,
+);
 
 /** Overlays fade in and out; RAC waits for the exit transition before unmounting. */
 export const fade = "transition-opacity duration-120 entering:opacity-0 exiting:opacity-0";

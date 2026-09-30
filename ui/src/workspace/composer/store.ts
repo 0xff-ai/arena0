@@ -1,31 +1,19 @@
 import { useSyncExternalStore } from "react";
 import type { JsonLike } from "~/ui";
+import { store } from "../shell";
 
 // The one callout the composer dock is answering. In memory only: a reload
 // drops it because the callout may have been answered elsewhere meanwhile.
-let calloutKey: string | null = null;
-const listeners = new Set<() => void>();
+const callout = store<string | null>(null);
 
-function subscribe(listener: () => void): () => void {
-  listeners.add(listener);
-  return () => listeners.delete(listener);
-}
-
-function set(key: string | null) {
-  if (key === calloutKey) return;
-  calloutKey = key;
-  for (const listener of listeners) listener();
-}
-
-const api = { open: (key: string) => set(key), close: () => set(null) };
+const api = { open: (key: string) => callout.set(key), close: () => callout.set(null) };
 
 export function useComposer(): {
   calloutKey: string | null;
   open(key: string): void;
   close(): void;
 } {
-  const key = useSyncExternalStore(subscribe, () => calloutKey);
-  return { calloutKey: key, ...api };
+  return { calloutKey: useSyncExternalStore(callout.subscribe, callout.get), ...api };
 }
 
 // Unsent answers, per callout key. In memory for the same reason as the open

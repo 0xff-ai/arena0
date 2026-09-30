@@ -1,4 +1,4 @@
-import type { Flag, Session } from "~/model";
+import { type Flag, isTerminal, type Session } from "~/model";
 import type { StepRow } from "~/sync";
 import type { StripMark, StripSpan } from "~/ui";
 
@@ -28,8 +28,7 @@ export function sessionStrip(
   }
   for (const at of stepTimes.values()) marks.push({ at, kind: "step" });
 
-  const settled =
-    session.state === "completed" || session.state === "failed" || session.state === "aborted";
+  const settled = isTerminal(session);
   const activation = stepTimes.get(0) ?? null;
   const ended = settled || session.state === "ending";
   // A settled session's life stops at its last lifecycle change; one still

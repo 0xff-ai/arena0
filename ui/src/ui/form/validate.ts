@@ -13,7 +13,11 @@ const AGGREGATE = new Set(["properties", "items", "prefixItems", "$ref", "$dynam
 
 const REQUIRED_PROPERTY = /required property "(.*)"\.$/;
 
-const escapePointer = (key: string) => key.replace(/~/g, "~0").replace(/\//g, "~1");
+export const escapePointer = (key: string) => key.replace(/~/g, "~0").replace(/\//g, "~1");
+
+/** A schema that admits only `null`, so there is nothing to fill in. */
+export const isNullSchema = (schema: JsonLike): boolean =>
+  typeof schema === "object" && schema !== null && !Array.isArray(schema) && schema.type === "null";
 
 /**
  * Validates `value` against a JSON Schema (draft 2020-12) and returns one

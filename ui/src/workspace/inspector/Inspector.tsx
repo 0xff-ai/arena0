@@ -5,7 +5,7 @@ import {
   fmtBytes,
   fmtClock,
   fmtDuration,
-  type Session,
+  fmtRange,
   shortHash,
   useHostCounts,
   useNow,
@@ -27,16 +27,15 @@ import {
   Kbd,
   KeyValue,
   List,
-  ParticipantChip,
   ParticipantDot,
-  type Tone,
 } from "~/ui";
-import { SessionLabel } from "../common/SessionLabel";
+import { participantChip, SessionLabel } from "../common/SessionLabel";
 import { StateWord } from "../common/StateWord";
 import { useComposer } from "../composer/store";
 import { VerifyCard } from "../evidence/VerifyCard";
 import { programHref, useOpenDoc } from "../nav";
 import { type Selection, useSelection } from "../selection";
+import { authorOf } from "../session/Steps";
 
 function Group(props: { title: string; children: ReactNode }) {
   return (
@@ -44,13 +43,6 @@ function Group(props: { title: string; children: ReactNode }) {
       <h3 className="m-0 text-xs font-medium tracking-wide text-subtle uppercase">{props.title}</h3>
       {props.children}
     </section>
-  );
-}
-
-function chip(session: Session, index: number, label?: string) {
-  const p = session.participants[index];
-  return (
-    <ParticipantChip index={index} label={label ?? p?.host ?? shortHash(p?.peerId ?? "", 6)} />
   );
 }
 
@@ -105,7 +97,7 @@ function SessionInspector(props: { sessionKey: string }) {
             const p = session.participants.find((candidate) => candidate.host === callout.host);
             return (
               <div key={callout.key} className="flex items-center gap-2 text-sm">
-                {p && chip(session, p.index)}
+                {p && participantChip(session, p.index)}
                 <span className="min-w-0 truncate text-fg">{callout.name}</span>
                 <span className="font-mono text-xs text-muted tabular">
                   {fmtDuration(now - callout.opened_ms)}
@@ -115,7 +107,7 @@ function SessionInspector(props: { sessionKey: string }) {
           })
         ) : writer ? (
           <div className="flex items-center gap-2 text-sm text-muted">
-            {chip(session, writer.index)} to write
+            {participantChip(session, writer.index)} to write
           </div>
         ) : (
           <span className="text-sm text-subtle">Nothing.</span>
@@ -124,7 +116,7 @@ function SessionInspector(props: { sessionKey: string }) {
       <Group title="Participants">
         {session.participants.map((participant) => (
           <div key={participant.index} className="flex items-center gap-2 text-sm">
-            {chip(session, participant.index)}
+            {participantChip(session, participant.index)}
             {participant.execution ? (
               <>
                 <ParticipantDot
@@ -153,7 +145,7 @@ function SessionInspector(props: { sessionKey: string }) {
             <div key={row.host} className="flex items-center gap-2 font-mono text-xs text-muted">
               <span className="w-14 shrink-0">{row.host}</span>
               <Fingerprint hash={row.post_state} size="sm" />
-              {shortHash(row.post_state, 8)}
+              {shortHash(row.post_state)}
             </div>
           ))}
         </Group>
@@ -206,12 +198,7 @@ function StepInspector(props: { sessionKey: string; step: number; host: string |
   const first = rows[0];
   if (first === undefined)
     return <EmptyState icon={Icons.step} title={`Step ${props.step} is not certified yet`} />;
-  const author =
-    first.event.kind === "message"
-      ? session.participants.find(
-          (p) => p.peerId === (first.event.kind === "message" ? first.event.from : ""),
-        )
-      : undefined;
+  const author = authorOf(session, first.event);
   return (
     <>
       <Group title={`Step ${first.step}`}>
@@ -219,7 +206,7 @@ function StepInspector(props: { sessionKey: string; step: number; host: string |
           dense
           items={[
             { k: "session", v: <SessionLabel session={session} /> },
-            { k: "author", v: author ? chip(session, author.index) : "—" },
+            { k: "author", v: author ? participantChip(session, author.index) : "—" },
             {
               k: "event",
               v:
@@ -359,10 +346,7 @@ function ProgramInspector(props: { hash: string }) {
             { k: "hash", v: <HashChip hash={program.hash} copy /> },
             {
               k: "participants",
-              v:
-                program.participants.min === program.participants.max
-                  ? String(program.participants.min)
-                  : `${program.participants.min}–${program.participants.max}`,
+              v: fmtRange(program.participants),
               mono: true,
             },
             { k: "Hosts", v: program.hosts.join(", ") },
@@ -417,7 +401,6 @@ function ReceiptInspector(props: { host: string; id: string }) {
   );
   if (receipt === undefined)
     return <EmptyState icon={Icons.receipt} title="This receipt no longer exists" />;
-  const tone: Tone = receipt.kind === "receipt" ? "done" : "warn";
   return (
     <>
       <Group title={receipt.kind === "receipt" ? "Receipt" : "Stop report"}>
@@ -428,7 +411,9 @@ function ReceiptInspector(props: { host: string; id: string }) {
             {
               k: "kind",
               v: (
-                <Badge tone={tone}>{receipt.kind === "receipt" ? "receipt" : "stop report"}</Badge>
+                <Badge tone={receipt.kind === "receipt" ? "done" : "warn"}>
+                  {receipt.kind === "receipt" ? "receipt" : "stop report"}
+                </Badge>
               ),
             },
             { k: "Host", v: receipt.host, mono: true },

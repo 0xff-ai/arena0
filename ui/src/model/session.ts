@@ -1,10 +1,8 @@
+import type { ExecEndPhase, ExecEndStatus, JsonValue } from "~/api/types.gen";
 import type {
   CalloutRow,
-  EndPhase,
-  EndRow,
   ExecutionRow,
   HostRow,
-  JsonValue,
   Lifecycle,
   ProgramRow,
   ReceiptRow,
@@ -59,7 +57,12 @@ export interface Session {
   writer: string | null;
   phase: string | null;
   terminal: TerminalRow | null;
-  end: EndRow;
+  end: ExecEndStatus;
+}
+
+/** The session has ended, however it ended; `ending` is still in progress. */
+export function isTerminal(session: Session): boolean {
+  return session.state === "completed" || session.state === "failed" || session.state === "aborted";
 }
 
 /**
@@ -199,9 +202,9 @@ function aggregateState(executions: ExecutionRow[]): SessionState {
   return "completed";
 }
 
-function sessionEnd(executions: ExecutionRow[]): EndRow {
+function sessionEnd(executions: ExecutionRow[]): ExecEndStatus {
   const phases = executions.map((e) => e.end.phase);
-  const phase: EndPhase = phases.includes("ending")
+  const phase: ExecEndPhase = phases.includes("ending")
     ? "ending"
     : phases.every((p) => p === "ended")
       ? "ended"
@@ -215,13 +218,7 @@ function sessionEnd(executions: ExecutionRow[]): EndRow {
  * outcome. Null until every execution is terminal.
  */
 function sessionTerminal(executions: ExecutionRow[]): TerminalRow | null {
-  if (
-    executions.some(
-      (e) => e.lifecycle !== "completed" && e.lifecycle !== "aborted" && e.lifecycle !== "failed",
-    )
-  ) {
-    return null;
-  }
+  if (executions.some((e) => e.terminal === null)) return null;
   const terminals = executions.flatMap((e) => (e.terminal === null ? [] : [e.terminal]));
   for (const kind of ["failed", "aborted", "completed"] as const) {
     const ofKind = terminals.filter((t) => t.kind === kind);
@@ -253,7 +250,8 @@ function maxOf(values: Array<number | null>): number | null {
   return max;
 }
 
-function groupBy<T>(items: T[], key: (item: T) => string | undefined): Map<string, T[]> {
+/** Items by key, in input order; items whose key is undefined are left out. */
+export function groupBy<T>(items: T[], key: (item: T) => string | undefined): Map<string, T[]> {
   const groups = new Map<string, T[]>();
   for (const item of items) {
     const k = key(item);

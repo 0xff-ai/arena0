@@ -58,10 +58,7 @@ export function OffersList() {
       title: "Creator",
       width: 140,
       minWidth: 140,
-      render: (offer) => {
-        const local = hostOfPeer(offer.creator);
-        return local ?? <HashChip hash={offer.creator} />;
-      },
+      render: (offer) => hostOfPeer(offer.creator) ?? <HashChip hash={offer.creator} />,
     },
     {
       id: "participants",

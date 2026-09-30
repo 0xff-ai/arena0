@@ -1,4 +1,5 @@
 import { useState } from "react";
+import type { UpdateSearch } from "~/app/router";
 import type { Session } from "~/model";
 import { useCall } from "~/sync";
 import {
@@ -11,7 +12,6 @@ import {
   Select,
   validate,
 } from "~/ui";
-import type { UpdateSearch } from "./update";
 
 export function QueryPane(props: {
   session: Session;

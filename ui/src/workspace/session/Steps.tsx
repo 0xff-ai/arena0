@@ -1,5 +1,6 @@
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { GridList, GridListItem, ListLayout, Virtualizer } from "react-aria-components";
+import type { UpdateSearch } from "~/app/router";
 import {
   endResult,
   fmtBytes,
@@ -29,7 +30,6 @@ import {
 } from "~/ui";
 import { useComposer } from "../composer/store";
 import { useRecords } from "./records";
-import type { UpdateSearch } from "./update";
 
 const ROW_PX = 26;
 
@@ -83,7 +83,7 @@ function buildItems(steps: StepRow[], records: Map<string, RecordRow[]>): Item[]
   return items;
 }
 
-function authorOf(session: Session, event: StepRow["event"]): Participant | null {
+export function authorOf(session: Session, event: StepRow["event"]): Participant | null {
   if (event.kind !== "message") return null;
   return session.participants.find((p) => p.peerId === event.from) ?? null;
 }
@@ -226,10 +226,6 @@ function Tail(props: { session: Session; hasTerminalStep: boolean; nextStep: num
   const composer = useComposer();
   const hosts = useRows(useCollections().hosts).map((host) => host.id);
   const [yourHosts] = useYourHosts(hosts);
-  const indexOf = (peerOrHost: { host?: string; peer?: string }) =>
-    session.participants.find((p) =>
-      peerOrHost.host !== undefined ? p.host === peerOrHost.host : p.peerId === peerOrHost.peer,
-    )?.index;
 
   const line = (glyph: string, children: ReactNode, tone = "text-muted") => (
     <div className="flex h-6.5 items-center gap-2 text-sm">
@@ -253,7 +249,7 @@ function Tail(props: { session: Session; hasTerminalStep: boolean; nextStep: num
   }
   const callout = session.callouts[0];
   if (callout !== undefined) {
-    const index = indexOf({ host: callout.host });
+    const index = session.participants.find((p) => p.host === callout.host)?.index;
     return line(
       String(props.nextStep),
       <span className="inline-flex items-center gap-2">
@@ -270,7 +266,7 @@ function Tail(props: { session: Session; hasTerminalStep: boolean; nextStep: num
     );
   }
   if (session.state === "active" && session.writer !== null) {
-    const index = indexOf({ peer: session.writer });
+    const index = session.participants.find((p) => p.peerId === session.writer)?.index;
     return line(
       String(props.nextStep),
       `${index === undefined ? shortHash(session.writer) : `P${index}`} to write`,
@@ -335,7 +331,6 @@ export function Steps(props: { session: Session; step: number | undefined; updat
             items={items}
             selectionMode="single"
             selectionBehavior="replace"
-            disallowEmptySelection={false}
             selectedKeys={props.step === undefined ? [] : [`s:${props.step}`]}
             onSelectionChange={(keys) => {
               if (keys === "all") return;

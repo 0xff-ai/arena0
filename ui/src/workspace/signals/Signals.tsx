@@ -25,12 +25,6 @@ const severityIcon: Record<FlagSeverity, { icon: LucideIcon; className: string }
   info: { icon: Icons.info, className: "text-info" },
 };
 
-const levelIcon = {
-  error: severityIcon.error,
-  warn: severityIcon.warn,
-  info: severityIcon.info,
-} as const;
-
 /** Which dock tab shows, with counts: needs input and problems are the two things to act on. */
 export function Signals() {
   const [tab, setTab] = useSignalsTab();
@@ -238,7 +232,7 @@ function Activity() {
           }
         >
           {(row) => {
-            const { icon: LevelIcon, className } = levelIcon[row.level];
+            const { icon: LevelIcon, className } = severityIcon[row.level];
             return (
               <div className="flex min-w-0 flex-1 items-center gap-1.5">
                 <span className="shrink-0 font-mono text-xs text-subtle tabular">

@@ -1,8 +1,7 @@
 import { useNavigate } from "@tanstack/react-router";
 import { receiptsRoute } from "~/app/router";
-import { shortHash, useRows, useSessions } from "~/model";
-import type { ReceiptRow } from "~/sync";
-import { useCollections } from "~/sync";
+import { programName, shortHash, useRows, useSessions } from "~/model";
+import { type ReceiptRow, useCollections } from "~/sync";
 import { Badge, type Column, DataTable, EmptyState, HashChip, Icons, Select, Toolbar } from "~/ui";
 import { ImportReceiptButton } from "../actions/imports";
 import { useOpenDoc } from "../nav";
@@ -70,10 +69,7 @@ export function ReceiptsList() {
       width: "1fr",
       minWidth: 140,
       render: (receipt) => (
-        <span className="truncate">
-          {programs.find((program) => program.hash === receipt.program)?.display_name ??
-            shortHash(receipt.program)}
-        </span>
+        <span className="truncate">{programName(programs, receipt.program)}</span>
       ),
     },
     {

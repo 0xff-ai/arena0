@@ -5,10 +5,10 @@ export type SessionSub = "steps" | "view" | "negotiation" | "query" | "evidence"
 
 // Search values are plain strings in the address bar (see `router.tsx`), so
 // hashes made only of digits are never turned into numbers.
-function query(params: Record<string, string | number | undefined>): string {
+export function query(params: Record<string, unknown>): string {
   const search = new URLSearchParams();
   for (const [name, value] of Object.entries(params)) {
-    if (value !== undefined) search.set(name, String(value));
+    if (value !== undefined && value !== null) search.set(name, String(value));
   }
   const text = search.toString();
   return text === "" ? "" : `?${text}`;

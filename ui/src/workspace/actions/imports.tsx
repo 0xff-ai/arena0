@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { FileTrigger } from "react-aria-components";
+import type { JsonValue } from "~/api/types.gen";
 import { shortHash, useRows } from "~/model";
-import { DaemonError, type JsonValue, useCall, useCollections } from "~/sync";
+import { useCall, useCollections } from "~/sync";
 import { Button, Dialog, IconButton, Icons, Select, TextField, toasts } from "~/ui";
 
 // Import and Host actions shared by the Explorer headers (compact) and the
@@ -10,7 +11,7 @@ import { Button, Dialog, IconButton, Icons, Select, TextField, toasts } from "~/
 const DEFAULT_USER_AGENT = "arena0-ui";
 
 function errorText(error: unknown): string {
-  return error instanceof DaemonError || error instanceof Error ? error.message : String(error);
+  return error instanceof Error ? error.message : String(error);
 }
 
 function PickerButton(props: { compact?: boolean; label: string; isDisabled?: boolean }) {
@@ -40,10 +41,7 @@ export function ImportProgramButton(props: { compact?: boolean }) {
     try {
       for (const host of hosts) {
         try {
-          const imported = await importProgram.mutateAsync({
-            hosts: [host.id],
-            file,
-          });
+          const imported = await importProgram.mutateAsync({ hosts: [host.id], file });
           toasts.show({
             tone: "ok",
             title: "Program imported",

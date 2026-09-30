@@ -1,6 +1,6 @@
 import { useRouter } from "@tanstack/react-router";
 import { useState } from "react";
-import { useRows, useSessions } from "~/model";
+import { fmtRange, isTerminal, useRows, useSessions } from "~/model";
 import { type ProgramRow, useCall, useCollections } from "~/sync";
 import {
   Button,
@@ -31,9 +31,8 @@ export function ProgramsList() {
 
   const live = new Map<string, number>();
   for (const session of sessions) {
-    if (session.state === "completed" || session.state === "failed" || session.state === "aborted")
-      continue;
-    live.set(session.programHash, (live.get(session.programHash) ?? 0) + 1);
+    if (!isTerminal(session))
+      live.set(session.programHash, (live.get(session.programHash) ?? 0) + 1);
   }
   const rows = [...programs].sort((a, b) => a.display_name.localeCompare(b.display_name));
 
@@ -92,11 +91,7 @@ export function ProgramsList() {
       width: 88,
       minWidth: 88,
       render: (program) => (
-        <span className="font-mono text-xs">
-          {program.participants.min === program.participants.max
-            ? program.participants.min
-            : `${program.participants.min}–${program.participants.max}`}
-        </span>
+        <span className="font-mono text-xs">{fmtRange(program.participants)}</span>
       ),
     },
     {

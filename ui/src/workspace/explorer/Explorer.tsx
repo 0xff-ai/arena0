@@ -3,7 +3,9 @@ import type { ReactNode } from "react";
 import { Button } from "react-aria-components";
 import {
   fmtAgo,
-  type Session,
+  fmtRange,
+  isTerminal,
+  programName,
   shortHash,
   useHostCounts,
   useNow,
@@ -34,9 +36,6 @@ const LIMIT = 30;
 const SPARK_BUCKETS = 12;
 const SPARK_BUCKET_MS = 5 * 60_000;
 
-const isLive = (session: Session) =>
-  session.state !== "completed" && session.state !== "failed" && session.state !== "aborted";
-
 /** A focusable name for an abbreviated cell; the row itself carries the meaning for a keyboard user. */
 function Named(props: { title: string; children: ReactNode }) {
   return (
@@ -62,13 +61,10 @@ export function Explorer() {
 
   const liveByProgram = new Map<string, number>();
   for (const session of sessions) {
-    if (isLive(session)) {
+    if (!isTerminal(session))
       liveByProgram.set(session.programHash, (liveByProgram.get(session.programHash) ?? 0) + 1);
-    }
   }
   const hostCounts = useHostCounts();
-  const programName = (hash: string) =>
-    programs.find((program) => program.hash === hash)?.display_name ?? shortHash(hash);
   const hostOfPeer = (peer: string) => hosts.find((host) => host.peer_id === peer)?.id;
 
   // Steps per 5 minutes over the last hour, oldest bucket first.
@@ -112,14 +108,14 @@ export function Explorer() {
       id: `offer:${offer.key}`,
       label: (
         <>
-          {programName(offer.program)}
+          {programName(programs, offer.program)}
           <span className="ml-1.5 text-xs text-subtle">
             from {hostOfPeer(offer.creator) ?? shortHash(offer.creator)} · {offer.target_size}{" "}
             participants
           </span>
         </>
       ),
-      title: `${programName(offer.program)} offer from ${offer.creator}`,
+      title: `${programName(programs, offer.program)} offer from ${offer.creator}`,
     }),
   );
 
@@ -141,14 +137,13 @@ export function Explorer() {
 
   const programNodes = programs.map((program): TreeNode => {
     const live = liveByProgram.get(program.hash) ?? 0;
-    const { min, max } = program.participants;
     return {
       id: `program:${program.hash}`,
       label: (
         <>
           {program.display_name}
           <span className="ml-1.5 text-subtle">
-            v{program.version} · {min === max ? min : `${min}–${max}`}
+            v{program.version} · {fmtRange(program.participants)}
           </span>
         </>
       ),
@@ -165,7 +160,7 @@ export function Explorer() {
     iconTone: receipt.kind === "stop_report" ? "warn" : undefined,
     label: (
       <>
-        {programName(receipt.program)}
+        {programName(programs, receipt.program)}
         <span className="ml-1.5 font-mono text-xs text-subtle">
           {shortHash(receipt.receipt_id)}
         </span>
@@ -255,9 +250,8 @@ export function Explorer() {
 }
 
 function HostTrailing(props: { host: HostRow; live: number; spark: number[]; now: number }) {
-  const { host } = props;
+  const { host, live } = props;
   const navigate = useNavigate();
-  const { live } = props;
   return (
     <>
       {host.gaps > 0 && host.last_gap_ms !== null && (

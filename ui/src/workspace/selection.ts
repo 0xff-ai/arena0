@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import { store } from "./shell";
 
 export type Selection =
   | { kind: "session"; key: string }
@@ -10,19 +11,8 @@ export type Selection =
 
 // What the inspector shows. It lives in memory only: a reload starts with
 // nothing selected, and the selected row may not exist any more.
-let current: Selection = null;
-const listeners = new Set<() => void>();
-
-function subscribe(listener: () => void): () => void {
-  listeners.add(listener);
-  return () => listeners.delete(listener);
-}
-
-function set(selection: Selection) {
-  current = selection;
-  for (const listener of listeners) listener();
-}
+const selection = store<Selection>(null);
 
 export function useSelection(): [Selection, (s: Selection) => void] {
-  return [useSyncExternalStore(subscribe, () => current), set];
+  return [useSyncExternalStore(selection.subscribe, selection.get), selection.set];
 }

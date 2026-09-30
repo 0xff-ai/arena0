@@ -255,9 +255,7 @@ export function watchConsole(page: Page): () => string[] {
 
 /** Open the workspace at `path` (which may carry a `?search`) and wait until the snapshot is live. */
 export async function openApp(page: Page, arena: Arena, path = "/"): Promise<void> {
-  const base = new URL(arena.url);
-  const url = new URL(path, base);
-  await page.goto(url.toString());
+  await page.goto(new URL(path, arena.url).toString());
   await expect(page.getByTestId("connection")).toHaveText(/live/, { timeout: 30_000 });
 }
 

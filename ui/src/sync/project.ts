@@ -5,11 +5,13 @@ import type {
   BlobEntry,
   EventFrame,
   ExecStatus,
+  ExecStatusState,
   HostStatus,
   OpenOffer,
   PendingCalloutStatus,
   ProgramDetail,
   ReceiptListEntry,
+  SessionStatus,
 } from "~/api/types.gen";
 import type {
   ActivationRow,
@@ -40,6 +42,13 @@ export function hostRow(
   };
 }
 
+/** The session status of an execution whose session has started, else null. */
+export function startedSession(state: ExecStatusState): SessionStatus | null {
+  if (state.exec_state === "Failed")
+    return state.session?.session_state === "Started" ? state.session.session : null;
+  return "session" in state ? state.session : null;
+}
+
 export function executionRow(
   host: string,
   status: ExecStatus,
@@ -47,14 +56,7 @@ export function executionRow(
   negotiation: NegotiationMark[],
 ): ExecutionRow {
   const state = status.state;
-  const session =
-    state.exec_state === "Failed"
-      ? state.session?.session_state === "Started"
-        ? state.session.session
-        : null
-      : "session" in state
-        ? state.session
-        : null;
+  const session = startedSession(state);
   const sessionId =
     session?.session_id ??
     (state.exec_state === "Activating"
@@ -90,7 +92,7 @@ export function executionRow(
         }
       : null,
     receipt_available: session?.receipt_available ?? false,
-    end: { ...status.end },
+    end: status.end,
     writer: session?.writer ?? null,
     phase: session?.phase ?? null,
     activation: activation ? activationRow(activation) : null,
@@ -116,7 +118,7 @@ export function comparePeerIds(a: string, b: string): number {
   return a.localeCompare(b);
 }
 
-export function activationRow(activation: ActivationInspection): ActivationRow {
+function activationRow(activation: ActivationInspection): ActivationRow {
   return {
     state: activation.state,
     offer_hash: activation.offer_hash,
@@ -124,9 +126,7 @@ export function activationRow(activation: ActivationInspection): ActivationRow {
     target_size: activation.target_size,
     initial_state: activation.initial_state,
     // Ticket order can differ from the committed ensemble's sorted peer order.
-    participants: activation.participants
-      .map((p) => ({ ...p }))
-      .sort((a, b) => comparePeerIds(a.peer_id, b.peer_id)),
+    participants: activation.participants.toSorted((a, b) => comparePeerIds(a.peer_id, b.peer_id)),
     params: activation.params,
   };
 }

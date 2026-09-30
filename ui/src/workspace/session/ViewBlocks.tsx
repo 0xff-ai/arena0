@@ -1,9 +1,10 @@
-import { type Participant, participantTone, shortHash } from "~/model";
-import type { BlockRow, CellRow, ToneRow } from "~/sync";
-import { cx, KeyValue, ParticipantChip } from "~/ui";
+import type { Block, Tone, Cell as ViewCell } from "~/api/types.gen";
+import type { Session } from "~/model";
+import { cx, KeyValue, participantText, participantToneOf } from "~/ui";
+import { participantChip } from "../common/SessionLabel";
 
 // Tailwind reads class names from source text, so each mapping is spelled out.
-const toneText: Record<ToneRow, string> = {
+const toneText: Record<Tone, string> = {
   normal: "text-fg",
   muted: "text-muted",
   good: "text-ok",
@@ -12,26 +13,17 @@ const toneText: Record<ToneRow, string> = {
   highlight: "text-fg",
 };
 
-const participantText = {
-  p0: "text-p0",
-  p1: "text-p1",
-  p2: "text-p2",
-  p3: "text-p3",
-  p4: "text-p4",
-  pq: "text-pq",
-} as const;
-
 /** A participant's own colour outranks the tone; `highlight` is a background, not a text colour. */
-function cellClass(cell: CellRow): string {
+function cellClass(cell: ViewCell): string {
   return cx(
-    cell.participant === null
+    cell.participant === undefined
       ? toneText[cell.tone]
-      : participantText[participantTone(cell.participant)],
+      : participantText[participantToneOf(cell.participant)],
     cell.tone === "highlight" && "bg-selected",
   );
 }
 
-function Cell(props: { cell: CellRow }) {
+function Cell(props: { cell: ViewCell }) {
   return <span className={cellClass(props.cell)}>{props.cell.text}</span>;
 }
 
@@ -44,7 +36,7 @@ function Title(props: { title: string | null }) {
   );
 }
 
-function Table(props: { block: Extract<BlockRow, { kind: "table" }> }) {
+function Table(props: { block: Extract<Block, { kind: "table" }> }) {
   const { block } = props;
   const columns = `repeat(${block.columns.length}, minmax(max-content, 1fr))`;
   return (
@@ -79,7 +71,7 @@ function Table(props: { block: Extract<BlockRow, { kind: "table" }> }) {
   );
 }
 
-function Board(props: { block: Extract<BlockRow, { kind: "board" }> }) {
+function Board(props: { block: Extract<Block, { kind: "board" }> }) {
   const { block } = props;
   return (
     <div
@@ -127,7 +119,7 @@ function Board(props: { block: Extract<BlockRow, { kind: "board" }> }) {
   );
 }
 
-function Progress(props: { block: Extract<BlockRow, { kind: "progress" }> }) {
+function Progress(props: { block: Extract<Block, { kind: "progress" }> }) {
   const { label, value, max } = props.block;
   const share = max <= 0 ? 0 : Math.min(1, Math.max(0, value / max));
   return (
@@ -152,69 +144,40 @@ function Progress(props: { block: Extract<BlockRow, { kind: "progress" }> }) {
   );
 }
 
-function Roster(props: {
-  block: Extract<BlockRow, { kind: "roster" }>;
-  participants: Participant[];
-}) {
+function Roster(props: { block: Extract<Block, { kind: "roster" }>; session: Session }) {
   return (
     <ul
       aria-label={props.block.title ?? "Roster"}
       className="m-0 flex list-none flex-col gap-1 p-0"
     >
-      {props.block.entries.map((entry) => {
-        const participant = props.participants.find((p) => p.index === entry.participant);
-        return (
-          <li key={entry.participant} className="flex items-center gap-2 text-sm">
-            <ParticipantChip
-              index={entry.participant}
-              label={participant?.host ?? shortHash(participant?.peerId ?? "", 6)}
-            />
-            <Cell cell={entry.status} />
-            {entry.detail !== null && <span className="text-subtle">{entry.detail}</span>}
-          </li>
-        );
-      })}
+      {props.block.entries.map((entry) => (
+        <li key={entry.participant} className="flex items-center gap-2 text-sm">
+          {participantChip(props.session, entry.participant)}
+          <Cell cell={entry.status} />
+          {entry.detail !== null && <span className="text-subtle">{entry.detail}</span>}
+        </li>
+      ))}
     </ul>
   );
 }
 
 /** The typed blocks a program rendered next to its text slots. */
-export function ViewBlocks(props: { blocks: BlockRow[]; participants: Participant[] }) {
+export function ViewBlocks(props: { blocks: Block[]; session: Session }) {
   return (
     <div className="flex flex-wrap items-start gap-x-8 gap-y-3">
       {props.blocks.map((block, i) => (
         // Blocks are positional: the program orders them.
         <section key={i} className="min-w-0">
+          {block.kind !== "progress" && <Title title={block.title} />}
           {block.kind === "facts" && (
-            <>
-              <Title title={block.title} />
-              <KeyValue
-                items={block.items.map((item) => ({
-                  k: item.label,
-                  v: <Cell cell={item.value} />,
-                }))}
-              />
-            </>
+            <KeyValue
+              items={block.items.map((item) => ({ k: item.label, v: <Cell cell={item.value} /> }))}
+            />
           )}
-          {block.kind === "table" && (
-            <>
-              <Title title={block.title} />
-              <Table block={block} />
-            </>
-          )}
-          {block.kind === "board" && (
-            <>
-              <Title title={block.title} />
-              <Board block={block} />
-            </>
-          )}
+          {block.kind === "table" && <Table block={block} />}
+          {block.kind === "board" && <Board block={block} />}
           {block.kind === "progress" && <Progress block={block} />}
-          {block.kind === "roster" && (
-            <>
-              <Title title={block.title} />
-              <Roster block={block} participants={props.participants} />
-            </>
-          )}
+          {block.kind === "roster" && <Roster block={block} session={props.session} />}
         </section>
       ))}
     </div>

@@ -10,6 +10,7 @@ import {
   EmptyState,
   HashChip,
   Icons,
+  isNullSchema,
   JsonView,
   KeyValue,
 } from "~/ui";
@@ -87,10 +88,7 @@ export function ProgramDoc() {
         ]}
       />
       <DocSection title="Params">
-        {typeof schema.params === "object" &&
-        schema.params !== null &&
-        !Array.isArray(schema.params) &&
-        schema.params.type === "null" ? (
+        {isNullSchema(schema.params) ? (
           <span className="text-sm text-subtle">This program takes no params.</span>
         ) : (
           <JsonView value={schema.params} collapseDepth={1} />

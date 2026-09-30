@@ -5,10 +5,7 @@ import { FieldError, NumberField, Select, Switch, TextField } from "../field";
 import { Icons } from "../icons";
 import type { JsonLike } from "../viz/json";
 import { JsonEditor } from "./jsoneditor";
-import { type SchemaIssue, validate } from "./validate";
-
-export type { SchemaIssue } from "./validate";
-export { validate } from "./validate";
+import { escapePointer, type SchemaIssue, validate } from "./validate";
 
 type JsonObject = { [k: string]: JsonLike };
 type Change = (value: JsonLike | undefined) => void;
@@ -39,7 +36,6 @@ interface FieldProps {
   hideLabel?: boolean;
 }
 
-const escapePointer = (key: string) => key.replace(/~/g, "~0").replace(/\//g, "~1");
 const childPath = (path: string, key: string) => `${path}/${escapePointer(key)}`;
 
 /** Follows local `$ref`s (`#/$defs/x`, any pointer into the root schema); siblings of the `$ref` win. */
@@ -159,6 +155,17 @@ const describe = (node: JsonObject, extras: string[] = []) =>
     .filter(Boolean)
     .join(" · ") || undefined;
 
+/** Applies edited JSON text: empty text clears the value; text that does not parse keeps it and reports why. */
+function applyText(text: string, setError: (error: string | undefined) => void, onChange: Change) {
+  try {
+    const parsed: JsonLike | undefined = text.trim() === "" ? undefined : JSON.parse(text);
+    setError(undefined);
+    onChange(parsed);
+  } catch (failure) {
+    setError((failure as SyntaxError).message);
+  }
+}
+
 function Issues(props: { shared: Shared; path: string }) {
   const here = props.shared.issues.filter((issue) => issue.path === props.path);
   if (here.length === 0) return null;
@@ -194,18 +201,7 @@ function RawField(props: FieldProps) {
         rows={4}
         onChange={(next) => {
           setText(next);
-          if (next.trim() === "") {
-            setError(undefined);
-            props.onChange(undefined);
-            return;
-          }
-          try {
-            const parsed: JsonLike = JSON.parse(next);
-            setError(undefined);
-            props.onChange(parsed);
-          } catch (failure) {
-            setError(failure instanceof Error ? failure.message : "invalid JSON");
-          }
+          applyText(next, setError, props.onChange);
         }}
       />
       <Issues shared={props.shared} path={props.path} />
@@ -524,18 +520,7 @@ export function SchemaForm(props: {
             error={parseError}
             onChange={(next) => {
               setText(next);
-              if (next.trim() === "") {
-                setParseError(undefined);
-                props.onChange(undefined);
-                return;
-              }
-              try {
-                const parsed: JsonLike = JSON.parse(next);
-                setParseError(undefined);
-                props.onChange(parsed);
-              } catch (failure) {
-                setParseError(failure instanceof Error ? failure.message : "invalid JSON");
-              }
+              applyText(next, setParseError, props.onChange);
             }}
           />
           {issues.map((issue) => (

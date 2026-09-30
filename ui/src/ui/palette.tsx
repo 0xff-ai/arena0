@@ -95,12 +95,9 @@ export function CommandPalette(props: {
                       >
                         {item.icon && <Icon icon={item.icon} className="text-subtle" />}
                         <span className="shrink-0">{item.label}</span>
-                        {item.detail && (
-                          <span className="min-w-0 flex-1 truncate text-sm text-subtle">
-                            {item.detail}
-                          </span>
-                        )}
-                        {!item.detail && <span className="flex-1" />}
+                        <span className="min-w-0 flex-1 truncate text-sm text-subtle">
+                          {item.detail}
+                        </span>
                         {item.kbd && <Kbd keys={item.kbd} />}
                       </MenuItem>
                     ))}

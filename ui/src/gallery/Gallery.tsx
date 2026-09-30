@@ -3,6 +3,7 @@
 // screenshots each <section> in both themes, so the ids below are contract.
 import { type ReactNode, useEffect, useState } from "react";
 import { DialogTrigger, Heading, Dialog as RACDialog } from "react-aria-components";
+import { fmtDuration } from "~/model/format";
 import {
   AgreementMeter,
   AnsiText,
@@ -120,15 +121,6 @@ const SESSIONS: SessionSample[] = Array.from({ length: 400 }, (_, i) => ({
   ageMs: (i * 37 + 20) * 1000,
   participants: 2 + (i % 4),
 }));
-
-function fmtAge(ms: number): string {
-  const s = Math.round(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  return m < 60
-    ? `${m}m ${String(s % 60).padStart(2, "0")}s`
-    : `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
-}
 
 const stateTone: Record<SessionState, Tone> = {
   active: "ok",
@@ -1064,7 +1056,7 @@ function SessionRow(props: { session: SessionSample }) {
       <StateBadge state={session.state} />
       <span className="ml-auto font-mono text-xs text-subtle tabular">step {session.step}</span>
       <span className="w-14 shrink-0 text-right font-mono text-xs text-subtle tabular">
-        {fmtAge(session.ageMs)}
+        {fmtDuration(session.ageMs)}
       </span>
     </div>
   );
@@ -1176,7 +1168,7 @@ function TableSection() {
                 title: "Age",
                 width: 72,
                 align: "end",
-                render: (s) => <span className="font-mono tabular">{fmtAge(s.ageMs)}</span>,
+                render: (s) => <span className="font-mono tabular">{fmtDuration(s.ageMs)}</span>,
               },
             ]}
           />
