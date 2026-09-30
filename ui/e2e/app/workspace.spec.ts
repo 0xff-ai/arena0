@@ -65,13 +65,13 @@ test("reconnecting reloads missed sessions and preserves observed activity", asy
   const observed = (await completed.textContent())!;
 
   await evidence.check("a dropped connection keeps the workspace visible", async () => {
-    await page.context().setOffline(true);
+    arena.disconnect();
     await expect(page.getByTestId("connection")).toHaveText(/offline|connecting/);
     await expect(page.getByRole("button", { name: "Find", exact: true })).toBeVisible();
   });
   // The daemon keeps running while the browser is disconnected.
   await seed.completed(arena, "rock-paper-scissors");
-  await page.context().setOffline(false);
+  arena.reconnect();
   await evidence.check(
     "reconnect resets rows to include work completed while offline",
     async () => {

@@ -95,7 +95,7 @@ export function connectDaemon(): Daemon {
     let ready = false;
     let loading = true;
     let chain = Promise.resolve();
-    const queued: (() => Promise<void>)[] = [];
+    const queued: (() => void)[] = [];
     const batches = (): RowBatch[] =>
       (Object.keys(rows) as CollectionName[]).map(
         (collection) =>
@@ -373,7 +373,124 @@ export function connectDaemon(): Daemon {
           .map((row) => ({ op: "delete", key: row.key })),
       });
     };
-    const hostEvent = async (frame: EventFrame) => {
+    // Frames apply in two halves. What a frame carries itself (activity,
+    // negotiation marks, Host online state) publishes as it arrives. What needs
+    // a daemon read only marks the owning rows stale; one flush re-reads them.
+    // A session emits dozens of frames per execution in bursts, and a read per
+    // frame lets the page fall seconds behind the daemon. A flush that starts
+    // after a frame arrived reads state at least as new as that frame.
+    const stale = {
+      reload: new Set<string>(),
+      programs: new Set<string>(),
+      executions: new Map<string, { host: string; execId: string }>(),
+      receipts: new Set<string>(),
+      offers: new Set<string>(),
+    };
+    // Frames from Hosts the roster did not list yet; they apply after the flush loads them.
+    let unknown: { frame: EventFrame; previousBoot: string | undefined }[] = [];
+    let flushQueued = false;
+    const staleExecution = (host: string, execId: string) =>
+      stale.executions.set(`${host}/${execId}`, { host, execId });
+    const flush = async () => {
+      flushQueued = false;
+      if (unknown.length) {
+        const frames = unknown;
+        unknown = [];
+        const roster = await rpc({ method: "hosts.list" });
+        assertReply(roster, "Hosts");
+        for (const status of roster.Hosts)
+          if (!statuses.has(status.host.id)) await loadHost(status, false);
+        for (const { frame, previousBoot } of frames) applyHostFrame(frame, previousBoot);
+      }
+      const reload = [...stale.reload];
+      const programs = [...stale.programs];
+      const executions = [...stale.executions.values()];
+      const receipts = [...stale.receipts];
+      const offers = [...stale.offers];
+      for (const set of [stale.reload, stale.programs, stale.receipts, stale.offers]) set.clear();
+      stale.executions.clear();
+      const reloaded = new Set(reload);
+      for (const host of reload) await loadHost(statuses.get(host)!, true);
+      for (const host of programs) if (!reloaded.has(host)) await loadPrograms(host);
+      const refresh = executions.filter((entry) => !reloaded.has(entry.host));
+      for (let from = 0; from < refresh.length; from += 8)
+        await Promise.all(
+          refresh.slice(from, from + 8).map((entry) => refreshExecution(entry.host, entry.execId)),
+        );
+      for (const host of receipts) if (!reloaded.has(host)) await loadReceipts(host);
+      for (const host of offers) if (!reloaded.has(host)) await loadOffers(host);
+    };
+    const invalidate = () => {
+      if (flushQueued) return;
+      flushQueued = true;
+      schedule(flush);
+    };
+    const applyHostFrame = (frame: EventFrame, previousBoot: string | undefined) => {
+      const host = frame.host.id;
+      if (!statuses.has(host)) {
+        unknown.push({ frame, previousBoot });
+        return;
+      }
+      switch (frame.kind) {
+        case "host.started": {
+          const row = rows.hosts.get(host)!;
+          publish({ collection: "hosts", ops: [{ op: "upsert", row: { ...row, online: true } }] });
+          if (previousBoot !== undefined && previousBoot !== frame.boot_id) stale.reload.add(host);
+          break;
+        }
+        case "host.stopped":
+          publish({
+            collection: "hosts",
+            ops: [{ op: "upsert", row: { ...rows.hosts.get(host)!, online: false } }],
+          });
+          break;
+        case "exec.created":
+          if (!rows.programs.has(frame.data.program_id)) stale.programs.add(host);
+          staleExecution(host, frame.exec_id!);
+          break;
+        case "exec.session.callout": {
+          // Only status publishes callouts: a queued event can name an already-answered pending_id.
+          const row = calloutRow(
+            host,
+            frame.exec_id!,
+            frame.session_id ?? null,
+            frame.data,
+            frame.ts,
+          );
+          rows.callouts.set(row.key, row);
+          staleExecution(host, frame.exec_id!);
+          break;
+        }
+        case "exec.negotiation.prepared":
+        case "exec.negotiation.committed":
+        case "exec.negotiation.resumed":
+        case "exec.session.started":
+        case "exec.session.step":
+        case "exec.session.end_progress":
+        case "exec.session.callout_answered":
+          staleExecution(host, frame.exec_id!);
+          break;
+        case "exec.session.ended":
+        case "exec.terminated":
+          staleExecution(host, frame.exec_id!);
+          stale.receipts.add(host);
+          break;
+        case "negotiation.offer_seen":
+        case "negotiation.offer_closed":
+          stale.offers.add(host);
+          break;
+        case "stream.lagged": {
+          const row = rows.hosts.get(host)!;
+          publish({
+            collection: "hosts",
+            ops: [{ op: "upsert", row: { ...row, gaps: row.gaps + 1, last_gap_ms: Date.now() } }],
+          });
+          stale.reload.add(host);
+          break;
+        }
+      }
+    };
+    const hostEvent = (frame: EventFrame) => {
       const host = frame.host.id;
       appendActivity(eventActivity(host, frame));
       const mark = negotiationMark(frame);
@@ -390,102 +507,36 @@ export function connectDaemon(): Daemon {
       }
       const previousBoot = boots.get(host);
       boots.set(host, frame.boot_id);
-      if (!statuses.has(host)) {
-        const roster = await rpc({ method: "hosts.list" });
-        assertReply(roster, "Hosts");
-        for (const status of roster.Hosts)
-          if (!statuses.has(status.host.id)) await loadHost(status, false);
-      }
-      const status = statuses.get(host)!;
-      switch (frame.kind) {
-        case "host.started": {
-          const row = rows.hosts.get(host)!;
-          publish({ collection: "hosts", ops: [{ op: "upsert", row: { ...row, online: true } }] });
-          if (previousBoot !== undefined && previousBoot !== frame.boot_id)
-            await loadHost(status, true);
-          break;
-        }
-        case "host.stopped":
-          publish({
-            collection: "hosts",
-            ops: [{ op: "upsert", row: { ...rows.hosts.get(host)!, online: false } }],
-          });
-          break;
-        case "exec.created":
-          if (!rows.programs.has(frame.data.program_id)) await loadPrograms(host);
-          await refreshExecution(host, frame.exec_id!);
-          break;
-        case "exec.session.callout": {
-          // Only status publishes callouts: a queued event can name an already-answered pending_id.
-          const row = calloutRow(
-            host,
-            frame.exec_id!,
-            frame.session_id ?? null,
-            frame.data,
-            frame.ts,
-          );
-          rows.callouts.set(row.key, row);
-          await refreshExecution(host, frame.exec_id!);
-          break;
-        }
-        case "exec.negotiation.prepared":
-        case "exec.negotiation.committed":
-        case "exec.negotiation.resumed":
-        case "exec.session.started":
-        case "exec.session.step":
-        case "exec.session.end_progress":
-        case "exec.session.callout_answered":
-          await refreshExecution(host, frame.exec_id!);
-          break;
-        case "exec.session.ended":
-        case "exec.terminated":
-          await refreshExecution(host, frame.exec_id!);
-          await loadReceipts(host);
-          break;
-        case "negotiation.offer_seen":
-        case "negotiation.offer_closed":
-          await loadOffers(host);
-          break;
-        case "stream.lagged": {
-          const row = rows.hosts.get(host)!;
-          publish({
-            collection: "hosts",
-            ops: [{ op: "upsert", row: { ...row, gaps: row.gaps + 1, last_gap_ms: Date.now() } }],
-          });
-          await loadHost(status, true);
-          break;
-        }
-      }
+      applyHostFrame(frame, previousBoot);
     };
     const startPoll = () => {
-      poll = setTimeout(
-        () =>
-          schedule(async () => {
-            for (const row of [...rows.executions.values()]) {
-              if (
-                rows.hosts.get(row.host)?.online &&
-                (row.terminal === null || row.end.phase !== "ended")
-              )
-                await refreshExecution(row.host, row.exec_id);
-            }
-            if (current()) startPoll();
-          }),
-        2000,
-      );
+      poll = setTimeout(() => {
+        for (const row of rows.executions.values())
+          if (
+            rows.hosts.get(row.host)?.online &&
+            (row.terminal === null || row.end.phase !== "ended")
+          )
+            staleExecution(row.host, row.exec_id);
+        invalidate();
+        schedule(async () => {
+          if (current()) startPoll();
+        });
+      }, 2000);
     };
+    // Frames received while the first load runs apply once it has published,
+    // in arrival order; their reads join the flush that precedes going live.
     stream.addEventListener("host", (event) => {
       const frame: EventFrame = JSON.parse((event as MessageEvent<string>).data);
-      const work = () => hostEvent(frame);
-      if (loading) queued.push(work);
-      else schedule(work);
+      if (loading) queued.push(() => hostEvent(frame));
+      else {
+        hostEvent(frame);
+        invalidate();
+      }
     });
     stream.addEventListener("activity", (event) => {
       const frame: ActivityFrame = JSON.parse((event as MessageEvent<string>).data);
-      const work = async () => {
-        appendActivity(activityRow(frame));
-      };
-      if (loading) queued.push(work);
-      else schedule(work);
+      if (loading) queued.push(() => appendActivity(activityRow(frame)));
+      else appendActivity(activityRow(frame));
     });
     stream.onopen = () => {
       changeState("syncing", state.attempt, null);
@@ -500,9 +551,10 @@ export function connectDaemon(): Daemon {
         snapshot = batches;
         for (const batch of batches()) for (const listener of listeners) listener(true, batch);
         ready = true;
-        // New frames remain queued until all frames already received during
-        // loading have been applied. Only then can the workspace become live.
-        while (queued.length) await queued.shift()!();
+        // The workspace becomes live only after every frame received during
+        // loading has been applied, reads included.
+        for (const apply of queued.splice(0)) apply();
+        await flush();
         loading = false;
         if (!current()) return;
         changeState("live", 0, null);

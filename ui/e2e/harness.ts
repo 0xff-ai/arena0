@@ -13,7 +13,7 @@
 
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
+import { connect, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test as base, expect, type Page } from "@playwright/test";
@@ -37,6 +37,10 @@ export interface Arena {
   cli(args: string[]): Promise<string>;
   /** Start a CLI command that keeps running (e.g. `launch`); killed at teardown. */
   spawn(args: string[]): void;
+  /** Drop the page's open connections and refuse new ones; the daemon keeps running. */
+  disconnect(): void;
+  /** Accept the page's connections again. */
+  reconnect(): void;
 }
 
 function freePort(): Promise<number> {
@@ -62,6 +66,61 @@ function firstJsonLine(child: ChildProcess, what: string): Promise<{ url: string
     });
     child.once("exit", (code) => fail(new Error(`${what} exited (${code}) before it was ready`)));
   });
+}
+
+// The page reaches the daemon through this relay, so a test can drop the page's
+// connections the way a dead link does. Chrome's offline emulation cannot: it
+// fails requests that start while offline but leaves an open /events stream up.
+async function startRelay(target: URL): Promise<{
+  url: string;
+  disconnect(): void;
+  reconnect(): void;
+  close(): Promise<void>;
+}> {
+  const open = new Set<Socket>();
+  let refusing = false;
+  const server = createServer((client) => {
+    if (refusing) {
+      client.destroy();
+      return;
+    }
+    const upstream = connect(Number(target.port), target.hostname);
+    for (const [socket, peer] of [
+      [client, upstream],
+      [upstream, client],
+    ] as const) {
+      open.add(socket);
+      socket.on("error", () => peer.destroy());
+      socket.on("close", () => {
+        open.delete(socket);
+        peer.destroy();
+      });
+      socket.pipe(peer);
+    }
+  });
+  const port = await new Promise<number>((done, fail) => {
+    server.once("error", fail);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      done(typeof address === "object" && address !== null ? address.port : 0);
+    });
+  });
+  const disconnect = () => {
+    refusing = true;
+    for (const socket of open) socket.destroy();
+  };
+  return {
+    url: `http://127.0.0.1:${port}${target.pathname}`,
+    disconnect,
+    reconnect: () => {
+      refusing = false;
+    },
+    close: () =>
+      new Promise((done) => {
+        disconnect();
+        server.close(() => done());
+      }),
+  };
 }
 
 async function waitForHttp(url: string): Promise<void> {
@@ -94,12 +153,15 @@ async function startArena(): Promise<{ arena: Arena; stop(): Promise<void> }> {
   });
   const uiExited = new Promise<void>((done) => ui.once("exit", () => done()));
   const { url: daemonUrl } = await firstJsonLine(ui, "arena0 ui");
+  const relay = await startRelay(new URL(daemonUrl));
 
-  let url = daemonUrl;
+  let url = relay.url;
   if (devOrigin !== null) {
+    // The relay sits between Vite and the daemon, never in front of Vite: a
+    // dropped HMR socket makes the Vite client reload the page.
     const vite = spawn("pnpm", ["vite", "--port", String(devPort), "--strictPort"], {
       cwd: UI_DIR,
-      env: { ...process.env, ARENA0_DAEMON_URL: daemonUrl.replace(/\/$/, "") },
+      env: { ...process.env, ARENA0_DAEMON_URL: relay.url.replace(/\/$/, "") },
       stdio: "ignore",
     });
     background.push(vite);
@@ -108,6 +170,7 @@ async function startArena(): Promise<{ arena: Arena; stop(): Promise<void> }> {
   }
 
   const stop = async () => {
+    await relay.close();
     for (const child of background) child.kill("SIGINT");
     // The UI command stops the daemon it started when it receives Ctrl-C.
     ui.kill("SIGINT");
@@ -128,6 +191,8 @@ async function startArena(): Promise<{ arena: Arena; stop(): Promise<void> }> {
       spawn: (args) => {
         background.push(spawn(BIN, args, { env, stdio: "ignore" }));
       },
+      disconnect: relay.disconnect,
+      reconnect: relay.reconnect,
     },
     stop,
   };

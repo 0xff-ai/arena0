@@ -13,7 +13,18 @@ export default defineConfig({
     strictPort: true,
     proxy: {
       "/rpc": { target: daemon },
-      "/events": { target: daemon },
+      "/events": {
+        target: daemon,
+        // Vite pipes the daemon's stream to the page but leaves the page's end
+        // open when the daemon's end drops mid-stream. Drop it too, so the page
+        // sees a dead daemon as it does against the embedded UI.
+        configure: (proxy) =>
+          proxy.on("proxyRes", (proxyRes, _req, res) =>
+            proxyRes.on("close", () => {
+              if (!proxyRes.complete) res.destroy();
+            }),
+          ),
+      },
       "/uploads": { target: daemon },
       "^/hosts/[^/]+/blobs/": { target: daemon },
     },
