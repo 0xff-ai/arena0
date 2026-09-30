@@ -82,9 +82,9 @@ version pinned in `ui/package.json`.
   `ui/dist`. Evidence goes to `ui/e2e/artifacts/`. The suites use
   `/usr/bin/google-chrome`.
 
-For development, build the UI with `just build-ui`, then run `just ui-dev`
-and open the daemon's printed URL. For the component gallery, run
-`cd ui && pnpm dev` and open `http://127.0.0.1:5173/gallery`.
+For development, run `just ui-dev`. It starts a daemon and a Vite server in front
+of it that reloads UI edits in place; open `http://127.0.0.1:5173/`, or
+`/gallery` for the component gallery. Ctrl-C stops both.
 
 ## CI policy
 

@@ -36,9 +36,19 @@ test-ui: build-programs
     cargo build --locked -p arena0-cli -p arena0d
     cd ui && pnpm playwright test
 
-# Print the daemon HTTP URL for the browser workspace.
-ui-dev:
-    cargo run -p arena0-cli -- ui --no-open
+# Arguments go to Vite, e.g. `just ui-dev --port 5174`; Ctrl-C stops both.
+# Run a daemon with a Vite server in front of it that reloads UI edits in place.
+ui-dev *vite_args: build-programs
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build -p arena0-cli -p arena0d
+    # `arena0 ui` prints the daemon URL, then runs until SIGINT and stops the
+    # daemon it started. The trap covers Vite exiting on its own too.
+    coproc UI { exec target/debug/arena0 --json ui --no-open; }
+    trap 'kill -INT "$UI_PID" 2>/dev/null || true; wait "$UI_PID" || true' EXIT
+    read -r line <&"${UI[0]}"
+    cd ui
+    ARENA0_DAEMON_URL=$(jq -r '.url | rtrimstr("/")' <<<"$line") pnpm vite {{vite_args}}
 
 # Run host and program tests (programs wasm first so integration tests do not skip).
 # The doctest line covers the crate doc-tests (incl. the arena0-sdk compile_fail
