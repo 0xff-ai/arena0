@@ -11,15 +11,28 @@ import {
   useSessions,
 } from "~/model";
 import { type HostRow, type ReceiptRow, useCollections } from "~/sync";
-import { Badge, IconButton, Icons, Section, Sparkline, Tooltip, Tree, type TreeNode } from "~/ui";
+import {
+  Badge,
+  Dot,
+  IconButton,
+  Icons,
+  Section,
+  Sparkline,
+  Tooltip,
+  Tree,
+  type TreeNode,
+} from "~/ui";
 import { AddHostButton, ImportProgramButton, ImportReceiptButton } from "../actions/imports";
+import { SessionLabel, shortSessionKey } from "../common/SessionLabel";
+import { STATE_TONE } from "../common/StateWord";
 import { useOpenDoc } from "../nav";
 import { useSelection } from "../selection";
+import type { ListName } from "../tabs";
 
-const RECEIPT_LIMIT = 30;
+/** Rows per section; the section's focus button opens the full list. */
+const LIMIT = 30;
 const SPARK_BUCKETS = 12;
 const SPARK_BUCKET_MS = 5 * 60_000;
-const ALL_RECEIPTS = "all-receipts";
 
 const isLive = (session: Session) =>
   session.state !== "completed" && session.state !== "failed" && session.state !== "aborted";
@@ -38,6 +51,7 @@ function Named(props: { title: string; children: ReactNode }) {
 export function Explorer() {
   const collections = useCollections();
   const hosts = useRows(collections.hosts);
+  const offers = useRows(collections.offers);
   const programs = useRows(collections.programs);
   const receipts = useRows(collections.receipts);
   const steps = useRows(collections.steps);
@@ -45,7 +59,6 @@ export function Explorer() {
   const now = useNow(30_000);
   const [selection, select] = useSelection();
   const open = useOpenDoc();
-  const navigate = useNavigate();
 
   const liveByProgram = new Map<string, number>();
   for (const session of sessions) {
@@ -54,7 +67,9 @@ export function Explorer() {
     }
   }
   const hostCounts = useHostCounts();
-  const programName = new Map(programs.map((program) => [program.hash, program.display_name]));
+  const programName = (hash: string) =>
+    programs.find((program) => program.hash === hash)?.display_name ?? shortHash(hash);
+  const hostOfPeer = (peer: string) => hosts.find((host) => host.peer_id === peer)?.id;
 
   // Steps per 5 minutes over the last hour, oldest bucket first.
   const stepsByHost = new Map<string, number[]>();
@@ -66,11 +81,13 @@ export function Explorer() {
     stepsByHost.set(step.host, buckets);
   }
 
+  // Rows carry no icon: every row in a section is the same kind of thing. A
+  // mark stays only where it tells rows apart (a session's state, a receipt
+  // against a stop report).
   const hostNodes = hosts.map((host): TreeNode => {
     const spark = stepsByHost.get(host.id) ?? new Array<number>(SPARK_BUCKETS).fill(0);
     return {
       id: `host:${host.id}`,
-      icon: Icons.host,
       label: (
         <>
           {host.id}
@@ -89,12 +106,44 @@ export function Explorer() {
     };
   });
 
+  const newestOffers = [...offers].sort((a, b) => b.first_seen_ms - a.first_seen_ms);
+  const offerNodes = newestOffers.slice(0, LIMIT).map(
+    (offer): TreeNode => ({
+      id: `offer:${offer.key}`,
+      label: (
+        <>
+          {programName(offer.program)}
+          <span className="ml-1.5 text-xs text-subtle">
+            from {hostOfPeer(offer.creator) ?? shortHash(offer.creator)} · {offer.target_size}{" "}
+            participants
+          </span>
+        </>
+      ),
+      title: `${programName(offer.program)} offer from ${offer.creator}`,
+    }),
+  );
+
+  // `useSessions` puts sessions that need an answer first, then live ones.
+  const sessionNodes = sessions.slice(0, LIMIT).map(
+    (session): TreeNode => ({
+      id: `session:${session.key}`,
+      label: (
+        <span className="inline-flex min-w-0 items-center gap-1.5">
+          <span role="img" aria-label={session.state} className="inline-flex">
+            <Dot tone={STATE_TONE[session.state]} pulse={session.state === "active"} />
+          </span>
+          <SessionLabel session={session} />
+        </span>
+      ),
+      title: `${session.program?.display_name ?? "session"} ${shortSessionKey(session.key)} · ${session.state}`,
+    }),
+  );
+
   const programNodes = programs.map((program): TreeNode => {
     const live = liveByProgram.get(program.hash) ?? 0;
     const { min, max } = program.participants;
     return {
       id: `program:${program.hash}`,
-      icon: Icons.program,
       label: (
         <>
           {program.display_name}
@@ -109,14 +158,14 @@ export function Explorer() {
   });
 
   // Receipt rows carry no time, so "latest" is the end of the replica's arrival order.
-  const latest: ReceiptRow[] = receipts.slice(-RECEIPT_LIMIT).reverse();
+  const latest: ReceiptRow[] = receipts.slice(-LIMIT).reverse();
   const receiptNodes: TreeNode[] = latest.map((receipt) => ({
     id: `receipt:${receipt.key}`,
     icon: receipt.kind === "stop_report" ? Icons.stopReport : Icons.receipt,
     iconTone: receipt.kind === "stop_report" ? "warn" : undefined,
     label: (
       <>
-        {programName.get(receipt.program) ?? shortHash(receipt.program)}
+        {programName(receipt.program)}
         <span className="ml-1.5 font-mono text-xs text-subtle">
           {shortHash(receipt.receipt_id)}
         </span>
@@ -125,30 +174,22 @@ export function Explorer() {
     ),
     title: `${receipt.kind === "stop_report" ? "Stop report" : "Receipt"} ${receipt.receipt_id} on ${receipt.host}`,
   }));
-  receiptNodes.push({
-    id: ALL_RECEIPTS,
-    title: "All receipts",
-    icon: Icons.chevronRight,
-    label: <span className="text-muted">All receipts ({receipts.length})</span>,
-  });
 
   const selectedId =
     selection?.kind === "host"
       ? `host:${selection.id}`
-      : selection?.kind === "program"
-        ? `program:${selection.hash}`
-        : selection?.kind === "receipt"
-          ? `receipt:${selection.host}/${selection.id}`
-          : null;
+      : selection?.kind === "session"
+        ? `session:${selection.key}`
+        : selection?.kind === "program"
+          ? `program:${selection.hash}`
+          : selection?.kind === "receipt"
+            ? `receipt:${selection.host}/${selection.id}`
+            : null;
+  const openList = (list: ListName) => open({ kind: "list", list });
 
   return (
-    <section aria-label="Explorer" className="h-full overflow-auto py-1">
-      <Section
-        title="Hosts"
-        icon={Icons.host}
-        count={hosts.length}
-        actions={<AddHostButton compact />}
-      >
+    <section aria-label="Explorer" className="flex h-full flex-col gap-4 overflow-auto py-1">
+      <Section title="Hosts" count={hosts.length} actions={<AddHostButton compact />}>
         <Tree
           label="Hosts"
           items={hostNodes}
@@ -157,11 +198,29 @@ export function Explorer() {
           onAction={(id) => open({ kind: "host", id: id.slice("host:".length) })}
         />
       </Section>
+      <Section title="Offers" count={offers.length} onOpen={() => openList("offers")}>
+        <Tree
+          label="Offers"
+          items={offerNodes}
+          selectedId={selectedId}
+          // An offer has no document of its own; its list is where you join it.
+          onAction={() => openList("offers")}
+        />
+      </Section>
+      <Section title="Sessions" count={sessions.length} onOpen={() => openList("sessions")}>
+        <Tree
+          label="Sessions"
+          items={sessionNodes}
+          selectedId={selectedId}
+          onSelect={(id) => select({ kind: "session", key: id.slice("session:".length) })}
+          onAction={(id) => open({ kind: "session", key: id.slice("session:".length) })}
+        />
+      </Section>
       <Section
         title="Programs"
-        icon={Icons.program}
         count={programs.length}
         actions={<ImportProgramButton compact />}
+        onOpen={() => openList("programs")}
       >
         <Tree
           label="Programs"
@@ -173,9 +232,9 @@ export function Explorer() {
       </Section>
       <Section
         title="Receipts"
-        icon={Icons.receipt}
         count={receipts.length}
         actions={<ImportReceiptButton compact />}
+        onOpen={() => openList("receipts")}
       >
         <Tree
           label="Receipts"
@@ -186,10 +245,6 @@ export function Explorer() {
             if (receipt) select({ kind: "receipt", host: receipt.host, id: receipt.receipt_id });
           }}
           onAction={(id) => {
-            if (id === ALL_RECEIPTS) {
-              void navigate({ to: "/receipts" });
-              return;
-            }
             const receipt = latest.find((r) => `receipt:${r.key}` === id);
             if (receipt) open({ kind: "receipt", host: receipt.host, id: receipt.receipt_id });
           }}

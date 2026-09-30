@@ -1,7 +1,8 @@
 import type { SessionState } from "~/model";
 import { Dot, type Tone } from "~/ui";
 
-const tone: Record<SessionState, Tone> = {
+/** Colour of a session state's dot; neutral states are the ones still settling. */
+export const STATE_TONE: Record<SessionState, Tone> = {
   active: "ok",
   completed: "done",
   failed: "bad",
@@ -13,12 +14,12 @@ const tone: Record<SessionState, Tone> = {
 
 /** A dot and the state's word; the word carries the meaning, the colour only helps scanning. */
 export function StateWord(props: { state: SessionState }) {
-  const quiet = tone[props.state] === "neutral";
+  const quiet = STATE_TONE[props.state] === "neutral";
   return (
     <span
       className={`inline-flex items-center gap-1.5 text-sm ${quiet ? "text-subtle" : "text-fg"}`}
     >
-      <Dot tone={tone[props.state]} />
+      <Dot tone={STATE_TONE[props.state]} />
       {props.state}
     </span>
   );

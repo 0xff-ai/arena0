@@ -196,6 +196,20 @@ export async function openApp(page: Page, arena: Arena, path = "/"): Promise<voi
   await expect(page.getByTestId("connection")).toHaveText(/live/, { timeout: 30_000 });
 }
 
+/** Open a list document the way a user does: the focus button on its Explorer heading. */
+export async function openList(
+  page: Page,
+  list: "Offers" | "Sessions" | "Programs" | "Receipts",
+): Promise<void> {
+  await page
+    .getByRole("region", { name: "Explorer" })
+    .getByRole("button", { name: `Open ${list}` })
+    .click();
+  await expect(
+    page.getByRole("tab", { name: new RegExp(`^${list}`), selected: true }),
+  ).toBeVisible();
+}
+
 /** Seeds through the real CLI. Program names are the bundled catalog names. */
 export const seed = {
   /** Run a program to completion with executable agents on both Hosts. */

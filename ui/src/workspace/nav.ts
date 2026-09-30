@@ -1,5 +1,5 @@
 import { useRouter, useRouterState } from "@tanstack/react-router";
-import { type DocRef, docId, useDocTabs } from "./tabs";
+import { type DocRef, docId, type ListName, useDocTabs } from "./tabs";
 
 export type SessionSub = "steps" | "view" | "negotiation" | "query" | "evidence";
 
@@ -35,6 +35,8 @@ export function receiptHref(host: string, id: string): string {
 
 export function docHref(ref: DocRef): string {
   switch (ref.kind) {
+    case "list":
+      return `/${ref.list}`;
     case "session":
       return sessionHref(ref.key);
     case "program":
@@ -46,23 +48,31 @@ export function docHref(ref: DocRef): string {
   }
 }
 
-/** Navigates to the document and makes sure it has a tab (a preview unless `pin`). */
+/**
+ * Navigates to the document and makes sure it has a tab: a preview unless
+ * `pin`, and always pinned for a list.
+ */
 export function useOpenDoc(): (doc: DocRef, options?: { pin?: boolean }) => void {
   const router = useRouter();
   const tabs = useDocTabs();
   return (doc, options) => {
-    tabs.open(doc, options?.pin ?? false);
+    tabs.open(doc, doc.kind === "list" || (options?.pin ?? false));
     router.history.push(docHref(doc));
   };
 }
 
-/** The document the current route shows, or null on a list route. */
+/** The document the current route shows, or null on the empty workspace. */
 export function useActiveDoc(): DocRef | null {
   // Route params arrive decoded, so a session key containing "/" stays whole.
   const leaf = useRouterState({ select: (state) => state.matches.at(-1) });
   if (leaf === undefined) return null;
   const params = leaf.params as Record<string, string | undefined>;
   switch (leaf.routeId) {
+    case "/sessions":
+    case "/offers":
+    case "/programs":
+    case "/receipts":
+      return { kind: "list", list: leaf.routeId.slice(1) as ListName };
     case "/s/$key":
       return params.key === undefined ? null : { kind: "session", key: params.key };
     case "/programs/$hash":
@@ -78,7 +88,10 @@ export function useActiveDoc(): DocRef | null {
   }
 }
 
-/** Closes a tab. Closing the active one goes to the tab on its left, else to the sessions list. */
+/**
+ * Closes a tab. Closing the active one goes to the tab on its left, else the
+ * one on its right, else the empty workspace.
+ */
 export function useCloseDoc(): (doc: DocRef) => void {
   const router = useRouter();
   const tabs = useDocTabs();
@@ -87,7 +100,7 @@ export function useCloseDoc(): (doc: DocRef) => void {
     const at = tabs.docs.findIndex((d) => docId(d.ref) === docId(doc));
     tabs.close(doc);
     if (active === null || docId(active) !== docId(doc)) return;
-    const left = tabs.docs[at - 1];
-    router.history.push(left ? docHref(left.ref) : "/sessions");
+    const next = tabs.docs[at - 1] ?? tabs.docs[at + 1];
+    router.history.push(next ? docHref(next.ref) : "/");
   };
 }

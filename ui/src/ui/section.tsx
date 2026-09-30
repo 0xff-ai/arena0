@@ -1,6 +1,7 @@
 import type { LucideIcon } from "lucide-react";
 import type { ReactNode } from "react";
 import { Button, Disclosure, DisclosurePanel, Heading } from "react-aria-components";
+import { IconButton } from "./button";
 import { Icons } from "./icons";
 import { Icon } from "./internal";
 
@@ -10,6 +11,8 @@ export function Section(props: {
   icon?: LucideIcon;
   count?: ReactNode;
   actions?: ReactNode;
+  /** Adds a focus button that opens the section's full document. */
+  onOpen?: () => void;
   defaultExpanded?: boolean;
   children: ReactNode;
 }) {
@@ -30,7 +33,14 @@ export function Section(props: {
         {props.count !== undefined && (
           <span className="shrink-0 font-mono text-2xs text-subtle tabular">{props.count}</span>
         )}
-        {props.actions && <div className="flex shrink-0 items-center">{props.actions}</div>}
+        {(props.actions || props.onOpen) && (
+          <div className="flex shrink-0 items-center">
+            {props.actions}
+            {props.onOpen && (
+              <IconButton icon={Icons.focus} label={`Open ${props.title}`} onPress={props.onOpen} />
+            )}
+          </div>
+        )}
       </div>
       <DisclosurePanel>{props.children}</DisclosurePanel>
     </Disclosure>

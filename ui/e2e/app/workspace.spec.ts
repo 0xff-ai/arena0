@@ -11,14 +11,30 @@ test("the shell syncs Hosts, programs and a completed session", async ({ page, a
   await seed.completed(arena, "rock-paper-scissors");
   await openApp(page, arena, "/sessions");
 
-  await evidence.check("the Sessions tab counts the completed session", async () => {
+  const explorer = page.getByRole("region", { name: "Explorer" });
+  const docTabs = page.getByRole("tablist", { name: "Open documents" }).getByRole("tab");
+  await evidence.check("a new browser opens on the Sessions tab alone", async () => {
+    await expect(docTabs).toHaveCount(1);
     await expect(page.getByRole("tab", { name: /Sessions\s*1/ })).toBeVisible();
   });
-  await evidence.check("the Programs tab counts the bundled programs", async () => {
-    await expect(page.getByRole("tab", { name: /Programs\s*[1-9]/ })).toBeVisible();
+  await evidence.check("the Explorer lists the bundled programs", async () => {
+    await expect(
+      explorer.getByRole("treegrid", { name: "Programs" }).getByRole("row").first(),
+    ).toBeVisible();
   });
-  await evidence.check("the Receipts tab counts one receipt per Host", async () => {
-    await expect(page.getByRole("tab", { name: /Receipts\s*2/ })).toBeVisible();
+  await evidence.check("the Explorer lists one receipt per Host", async () => {
+    await expect(explorer.getByRole("treegrid", { name: "Receipts" }).getByRole("row")).toHaveCount(
+      2,
+    );
+  });
+  await evidence.check("closing the last tab leaves an empty workspace", async () => {
+    await page.getByRole("tab", { name: /^Sessions/ }).click({ button: "middle" });
+    await expect(docTabs).toHaveCount(0);
+    await expect(page.getByText("No open documents")).toBeVisible();
+    await page.reload();
+    await expect(page.getByText("No open documents")).toBeVisible();
+    await explorer.getByRole("button", { name: "Open Sessions" }).click();
+    await expect(page.getByRole("tab", { name: /Sessions\s*1/ })).toBeVisible();
   });
   await evidence.shots(page, "sessions");
   await evidence.check("no console errors or warnings", async () => {

@@ -248,7 +248,7 @@ for (const theme of THEMES) {
     });
 
     await check(
-      `${theme}: DocTabs pin on double-click, close on middle-click and on x, fixed tabs have no x`,
+      `${theme}: DocTabs pin on double-click, close on middle-click and on x, lists included`,
       async () => {
         const section = page.locator("#tabs");
         const chess = section.getByRole("tab", { name: /chess/ });
@@ -268,11 +268,10 @@ for (const theme of THEMES) {
         // Closing must not select the tab first.
         await expect(section).toContainText("Active document: s2");
 
-        await expect(
-          section.getByRole("tab", { name: /Sessions/ }).locator("span[aria-hidden=true]"),
-        ).toHaveCount(0);
         await section.getByRole("tab", { name: /Offers/ }).click();
         await expect(section).toContainText("Active document: offers");
+        await section.getByRole("tab", { name: /Sessions/ }).click({ button: "middle" });
+        await expect(section).toContainText("last event: close sessions");
       },
     );
 

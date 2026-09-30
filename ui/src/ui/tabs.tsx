@@ -45,7 +45,6 @@ export interface DocTab {
   label: string;
   icon: LucideIcon;
   preview?: boolean;
-  fixed?: boolean;
   detail?: string;
   tone?: Tone;
 }
@@ -90,7 +89,7 @@ export function DocTabs(props: {
               if (event.button === 1) event.preventDefault();
             }}
             onAuxClick={(event) => {
-              if (event.button === 1 && !tab.fixed) props.onClose(tab.id);
+              if (event.button === 1) props.onClose(tab.id);
             }}
             className="group relative flex h-full shrink-0 cursor-default items-center gap-1.5 border-t border-r border-t-transparent border-r-line bg-surface px-3 text-base whitespace-nowrap text-muted outline-none transition-colors duration-120 hovered:text-fg selected:border-t-accent selected:bg-editor selected:text-fg focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-accent selected:after:absolute selected:after:inset-x-0 selected:after:-bottom-px selected:after:h-px selected:after:bg-editor"
           >
@@ -99,20 +98,18 @@ export function DocTabs(props: {
             {tab.detail && (
               <span className="max-w-24 truncate font-mono text-xs text-subtle">{tab.detail}</span>
             )}
-            {!tab.fixed && (
-              <span
-                aria-hidden
-                onPointerDown={stop}
-                onMouseDown={stop}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  props.onClose(tab.id);
-                }}
-                className="flex size-4 items-center justify-center rounded-xs text-subtle opacity-0 hover:bg-hover hover:text-fg group-hovered:opacity-100 group-selected:opacity-100"
-              >
-                <Icon icon={Icons.close} size={12} />
-              </span>
-            )}
+            <span
+              aria-hidden
+              onPointerDown={stop}
+              onMouseDown={stop}
+              onClick={(event) => {
+                event.stopPropagation();
+                props.onClose(tab.id);
+              }}
+              className="flex size-4 items-center justify-center rounded-xs text-subtle opacity-0 hover:bg-hover hover:text-fg group-hovered:opacity-100 group-selected:opacity-100"
+            >
+              <Icon icon={Icons.close} size={12} />
+            </span>
           </Tab>
         ))}
       </TabList>

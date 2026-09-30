@@ -1,25 +1,18 @@
-import { useRouter, useRouterState } from "@tanstack/react-router";
+import { useRouter } from "@tanstack/react-router";
 import { useEffect } from "react";
 import { shortHash, useRows, useSessions } from "~/model";
 import { useCollections } from "~/sync";
 import { type DocTab, DocTabs, Icons } from "~/ui";
 import { shortSessionKey } from "./common/SessionLabel";
 import { docHref, useActiveDoc, useCloseDoc } from "./nav";
-import { type DocRef, docId, useDocTabs } from "./tabs";
+import { type DocRef, docId, type ListName, useDocTabs } from "./tabs";
 
-const FIXED = [
-  { id: "sessions", label: "Sessions", icon: Icons.session, path: "/sessions" },
-  { id: "offers", label: "Offers", icon: Icons.offer, path: "/offers" },
-  { id: "receipts", label: "Receipts", icon: Icons.receipt, path: "/receipts" },
-  { id: "programs", label: "Programs", icon: Icons.program, path: "/programs" },
-] as const;
-
-/** The list route the current path belongs to, when the leaf route is a list. */
-function useActiveList(): string | null {
-  const leaf = useRouterState({ select: (state) => state.matches.at(-1)?.routeId });
-  const match = FIXED.find((fixed) => leaf === fixed.path);
-  return match ? `fixed:${match.id}` : null;
-}
+export const LIST_TABS: Record<ListName, { label: string; icon: typeof Icons.session }> = {
+  offers: { label: "Offers", icon: Icons.offer },
+  sessions: { label: "Sessions", icon: Icons.session },
+  programs: { label: "Programs", icon: Icons.program },
+  receipts: { label: "Receipts", icon: Icons.receipt },
+};
 
 export function TabRow() {
   const router = useRouter();
@@ -30,13 +23,13 @@ export function TabRow() {
   const programs = useRows(collections.programs);
   const tabs = useDocTabs();
   const activeDoc = useActiveDoc();
-  const activeList = useActiveList();
   const close = useCloseDoc();
 
-  // A document reached by URL (a pasted link, a reload of a closed tab) gets its tab.
+  // A document reached by URL (a pasted link, a reload of a closed tab) gets
+  // its tab; a list's tab is never a preview.
   const activeId = activeDoc ? docId(activeDoc) : null;
   useEffect(() => {
-    if (activeDoc) tabs.open(activeDoc, false);
+    if (activeDoc) tabs.open(activeDoc, activeDoc.kind === "list");
   }, [activeId]);
 
   const counts = {
@@ -50,6 +43,14 @@ export function TabRow() {
 
   const docTab = (ref: DocRef, preview: boolean): DocTab => {
     switch (ref.kind) {
+      case "list":
+        return {
+          id: docId(ref),
+          label: LIST_TABS[ref.list].label,
+          icon: LIST_TABS[ref.list].icon,
+          detail: String(counts[ref.list]),
+          preview,
+        };
       case "session": {
         const session = sessions.find((candidate) => candidate.key === ref.key);
         return {
@@ -76,29 +77,15 @@ export function TabRow() {
     }
   };
 
-  const items: DocTab[] = [
-    ...FIXED.map((fixed) => ({
-      id: `fixed:${fixed.id}`,
-      label: fixed.label,
-      icon: fixed.icon,
-      detail: String(counts[fixed.id]),
-      fixed: true,
-    })),
-    ...tabs.docs.map((doc) => docTab(doc.ref, doc.preview)),
-  ];
+  const items: DocTab[] = tabs.docs.map((doc) => docTab(doc.ref, doc.preview));
 
   const byId = (id: string) => tabs.docs.find((doc) => docId(doc.ref) === id)?.ref;
 
   return (
     <DocTabs
       tabs={items}
-      activeId={activeId ?? activeList}
+      activeId={activeId}
       onSelect={(id) => {
-        const fixed = FIXED.find((candidate) => `fixed:${candidate.id}` === id);
-        if (fixed) {
-          router.history.push(fixed.path);
-          return;
-        }
         const ref = byId(id);
         if (ref) router.history.push(docHref(ref));
       }}

@@ -5,7 +5,6 @@ import {
   fmtClock,
   fmtDuration,
   type Session,
-  type SessionState,
   useFlags,
   useNow,
   useRows,
@@ -27,12 +26,12 @@ import {
   SearchField,
   Section,
   Segmented,
-  type Tone,
   Toolbar,
   useElementSize,
 } from "~/ui";
 import { FlagHint } from "../common/FlagHint";
 import { SessionLabel } from "../common/SessionLabel";
+import { STATE_TONE } from "../common/StateWord";
 import { useOpenDoc } from "../nav";
 import { useSelection } from "../selection";
 import { sessionStrip } from "./strip";
@@ -40,16 +39,6 @@ import { sessionStrip } from "./strip";
 const DAY_MS = 24 * 3600 * 1000;
 const ROW_HEIGHT = 26;
 const HEADING_HEIGHT = 24;
-
-const STATE_TONE: Record<SessionState, Tone> = {
-  active: "ok",
-  completed: "done",
-  failed: "bad",
-  aborted: "bad",
-  negotiating: "neutral",
-  activating: "neutral",
-  ending: "neutral",
-};
 
 const isTerminal = (session: Session) =>
   session.state === "completed" || session.state === "failed" || session.state === "aborted";

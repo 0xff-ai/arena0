@@ -1,5 +1,8 @@
 import { createRootRoute, createRoute, createRouter, redirect } from "@tanstack/react-router";
 import { lazy } from "react";
+import { EmptyWorkspace } from "~/workspace/EmptyWorkspace";
+import { docHref } from "~/workspace/nav";
+import { firstDoc } from "~/workspace/tabs";
 import { Workspace } from "~/workspace/Workspace";
 
 export type SessionsSearch = {
@@ -60,12 +63,15 @@ const rootRoute = createRootRoute({ component: Workspace });
 
 export { rootRoute };
 
+// The root shows the left-most open tab, or an empty workspace once every tab is closed.
 const indexRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/",
   beforeLoad: () => {
-    throw redirect({ to: "/sessions", replace: true });
+    const first = firstDoc();
+    if (first !== null) throw redirect({ href: docHref(first), replace: true });
   },
+  component: EmptyWorkspace,
 });
 
 // Route components load on first use; each is a named export of its owner's file.

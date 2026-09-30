@@ -8,6 +8,7 @@ import {
   Evidence,
   expect,
   openApp,
+  openList,
   playFirstAllowed,
   test,
   watchConsole,
@@ -180,7 +181,8 @@ test("launch a session from its program, answer through the composer until it co
       ).toBeVisible();
     });
 
-    const receipts = page.getByRole("tab", { name: /Receipts\s*2/ });
+    // Both Hosts store a receipt once the session has ended.
+    const receipts = page.getByRole("treegrid", { name: "Receipts" }).getByRole("row").nth(1);
     let answers = 0;
     await evidence.check("answering through the composer accepts, closes and toasts", async () => {
       for (;;) {
@@ -341,7 +343,7 @@ test("an invalid answer is blocked and a draft survives switching tabs", async (
   await evidence.shots(page, "composer-invalid");
 
   await evidence.check("the draft is still there after switching tabs and back", async () => {
-    await page.getByRole("tab", { name: /^Programs/ }).click();
+    await openList(page, "Programs");
     await expect(page).toHaveURL(/\/programs$/);
     await page.getByRole("tab", { name: /Contract Net Allocation/ }).click();
     await expect(page).toHaveURL(/\/s\//);

@@ -763,10 +763,8 @@ function FieldSection() {
 function TabsSection() {
   const [sub, setSub] = useState<"steps" | "view" | "negotiation" | "query" | "evidence">("steps");
   const [tabs, setTabs] = useState<DocTab[]>([
-    { id: "sessions", label: "Sessions", icon: Icons.session, fixed: true },
-    { id: "offers", label: "Offers", icon: Icons.offer, fixed: true },
-    { id: "receipts", label: "Receipts", icon: Icons.receipt, fixed: true },
-    { id: "programs", label: "Programs", icon: Icons.program, fixed: true },
+    { id: "sessions", label: "Sessions", icon: Icons.session, detail: "3" },
+    { id: "offers", label: "Offers", icon: Icons.offer, detail: "0" },
     { id: "s1", label: "vickrey-auction", icon: Icons.session, detail: "c7e1fd7c", tone: "warn" },
     { id: "s2", label: "chess", icon: Icons.session, detail: "5f2c81d0", preview: true },
     { id: "r1", label: "receipt", icon: Icons.receipt, detail: "a1b2c3d4" },
@@ -779,7 +777,7 @@ function TabsSection() {
     <Sec
       id="tabs"
       title="SubTabs, DocTabs"
-      note="Document tabs: preview tabs are italic, double-click pins, middle-click closes, fixed tabs have no close."
+      note="Document tabs: preview tabs are italic, double-click pins, middle-click closes, and every tab, lists included, can be closed."
     >
       <Demo title="SubTabs" className="block">
         <SubTabs

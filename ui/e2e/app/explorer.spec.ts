@@ -48,20 +48,41 @@ test("explorer, signals and timeline follow the live daemon", async ({ page, are
     async () => {
       await expect(receipts.getByRole("row", { name: /Receipt .* on host-01/ })).toHaveCount(1);
       await expect(receipts.getByRole("row", { name: /Receipt .* on host-02/ })).toHaveCount(1);
-      await expect(receipts.getByRole("row", { name: /All receipts/ })).toBeVisible();
     },
   );
   await evidence.check(
-    "the Explorer has Hosts, Programs and Receipts and no sessions",
+    "the Explorer lists Hosts, Offers, Sessions, Programs and Receipts in that order",
     async () => {
-      await expect(explorer.getByRole("treegrid")).toHaveCount(3);
+      await expect(explorer.getByRole("treegrid")).toHaveCount(5);
       await expect(explorer.getByRole("heading", { level: 3 })).toHaveText([
         /Hosts/,
+        /Offers/,
+        /Sessions/,
         /Programs/,
         /Receipts/,
       ]);
     },
   );
+  await evidence.check("Sessions lists the chess session first, with its state", async () => {
+    const sessions = explorer.getByRole("treegrid", { name: "Sessions" });
+    await expect(sessions.getByRole("row")).toHaveCount(2);
+    await expect(sessions.getByRole("row").first()).toHaveAccessibleName(/Chess .* · active/);
+    await expect(sessions.getByRole("img", { name: "completed" })).toHaveCount(1);
+  });
+  // Host rows keep their sparkline and hover action, so programs stand for the icon-less rows.
+  await evidence.check("program rows have no icon and receipt rows keep theirs", async () => {
+    await expect(programs.locator("svg")).toHaveCount(0);
+    await expect(receipts.getByRole("row").first().locator("svg")).toHaveCount(1);
+  });
+  await evidence.check("the focus button opens a list tab, and the tab closes", async () => {
+    await explorer.getByRole("button", { name: "Open Receipts" }).click();
+    await expect(page).toHaveURL(/\/receipts$/);
+    const tab = page.getByRole("tab", { name: /^Receipts/ });
+    await expect(tab).toBeVisible();
+    await tab.click({ button: "middle" });
+    await expect(tab).toHaveCount(0);
+    await expect(page).toHaveURL(/\/sessions$/);
+  });
   await evidence.shots(page, "workspace-overview");
 
   await evidence.check("Enter on a Host opens its document tab", async () => {

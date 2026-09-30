@@ -1,6 +1,6 @@
 // Live list documents: sessions, offers, receipts and programs against a real
 // `arena0 ui`. Evidence goes to e2e/artifacts/app-lists/.
-import { Evidence, expect, openApp, seed, test, watchConsole } from "../harness";
+import { Evidence, expect, openApp, openList, seed, test, watchConsole } from "../harness";
 
 const evidence = new Evidence("app-lists");
 test.use({ suite: "app-lists" });
@@ -91,7 +91,7 @@ test("the list documents show what the daemon holds", async ({ page, arena }) =>
   await evidence.check(
     "Receipts lists one per Host per completed session, filters, opens",
     async () => {
-      await page.getByRole("tab", { name: /^Receipts/ }).click();
+      await openList(page, "Receipts");
       const receipts = page.getByRole("grid", { name: "Receipts" });
       // The chess session may end with stop reports of its own, so count the completed sessions'.
       const of = (program: RegExp) => dataRows(receipts).filter({ hasText: program });
@@ -110,7 +110,7 @@ test("the list documents show what the daemon holds", async ({ page, arena }) =>
   );
 
   await evidence.check("Programs lists the bundled programs and starts a session", async () => {
-    await page.getByRole("tab", { name: /^Programs/ }).click();
+    await openList(page, "Programs");
     const programs = page.getByRole("grid", { name: "Programs" });
     for (const name of [
       "chess",
@@ -132,7 +132,7 @@ test("the list documents show what the daemon holds", async ({ page, arena }) =>
     await evidence.shots(page, "programs");
     await page.getByRole("button", { name: "New chess session" }).click();
     await expect(page).toHaveURL(/\/programs\/[0-9a-f]+\?launch=true$/);
-    await page.getByRole("tab", { name: /^Programs/ }).click();
+    await openList(page, "Programs");
   });
 
   await evidence.check("Remove asks first, then the program is gone", async () => {
@@ -149,7 +149,7 @@ test("the list documents show what the daemon holds", async ({ page, arena }) =>
   });
 
   await evidence.check("Offers shows the empty state", async () => {
-    await page.getByRole("tab", { name: /^Offers/ }).click();
+    await openList(page, "Offers");
     await expect(page.getByText("No offers seen")).toBeVisible();
   });
   await evidence.shots(page, "offers-empty");

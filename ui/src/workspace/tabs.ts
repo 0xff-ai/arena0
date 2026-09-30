@@ -1,6 +1,11 @@
 import { useSyncExternalStore } from "react";
 
+/** The lists the workspace shows as documents, in Explorer order. */
+export const LISTS = ["offers", "sessions", "programs", "receipts"] as const;
+export type ListName = (typeof LISTS)[number];
+
 export type DocRef =
+  | { kind: "list"; list: ListName }
   | { kind: "session"; key: string }
   | { kind: "program"; hash: string }
   | { kind: "host"; id: string }
@@ -15,6 +20,8 @@ const KEY = "arena0.tabs";
 
 export function docId(ref: DocRef): string {
   switch (ref.kind) {
+    case "list":
+      return `list:${ref.list}`;
     case "session":
       return `session:${ref.key}`;
     case "program":
@@ -50,6 +57,9 @@ function isString(value: unknown): value is string {
 function parseRef(value: unknown): DocRef | null {
   if (typeof value !== "object" || value === null) return null;
   const r = value as Record<string, unknown>;
+  if (r.kind === "list" && LISTS.includes(r.list as ListName)) {
+    return { kind: "list", list: r.list as ListName };
+  }
   if (r.kind === "session" && isString(r.key)) return { kind: "session", key: r.key };
   if (r.kind === "program" && isString(r.hash)) return { kind: "program", hash: r.hash };
   if (r.kind === "host" && isString(r.id)) return { kind: "host", id: r.id };
@@ -59,8 +69,11 @@ function parseRef(value: unknown): DocRef | null {
   return null;
 }
 
+// A browser that never stored tabs starts on the sessions list.
+const FIRST_RUN: DocTab[] = [{ ref: { kind: "list", list: "sessions" }, preview: false }];
+
 function parse(raw: string | null): DocTab[] {
-  if (raw === null) return [];
+  if (raw === null) return FIRST_RUN;
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -97,8 +110,14 @@ function indexOf(docs: DocTab[], ref: DocRef): number {
   return docs.findIndex((doc) => docId(doc.ref) === id);
 }
 
+/** The left-most open document, where the workspace root goes; null when every tab is closed. */
+export function firstDoc(): DocRef | null {
+  return snapshot()[0]?.ref ?? null;
+}
+
 /**
- * Open documents, persisted in localStorage. At most one is a preview: opening
+ * Open documents, persisted in localStorage. Lists are documents too: every
+ * tab can be closed. At most one is a preview: opening
  * another document unpinned replaces it in place, and pinning (or opening
  * pinned) keeps it. The active tab is not stored; it follows the route.
  */
