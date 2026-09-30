@@ -466,16 +466,6 @@ fn secure(mut response: HttpResponse) -> HttpResponse {
 
 async fn asset(uri: Uri) -> HttpResponse {
     let path = uri.path().trim_start_matches('/');
-    if ui_assets::find("index.html").is_none() {
-        return secure(
-            (
-                StatusCode::NOT_FOUND,
-                [(header::CONTENT_TYPE, "text/plain")],
-                "this arena0 was built without the web UI; run `just build-ui` and rebuild",
-            )
-                .into_response(),
-        );
-    }
     let (found, cache) = match ui_assets::find(path) {
         Some(found) if path.starts_with("assets/") => {
             (found, "public, max-age=31536000, immutable")
@@ -486,19 +476,28 @@ async fn asset(uri: Uri) -> HttpResponse {
         {
             return secure(StatusCode::NOT_FOUND.into_response());
         }
-        None => (
-            ui_assets::find("index.html").expect("index exists"),
-            "no-cache",
-        ),
+        None => match ui_assets::find("index.html") {
+            Some(index) => (index, "no-cache"),
+            // Only debug builds get here: release builds do not compile without the UI.
+            None => {
+                return secure(
+                    (
+                        StatusCode::NOT_FOUND,
+                        [(header::CONTENT_TYPE, "text/plain")],
+                        "ui/dist has no web UI; run `just build-ui`",
+                    )
+                        .into_response(),
+                );
+            }
+        },
     };
-    let (bytes, content_type) = found;
     secure(
         (
             [
-                (header::CONTENT_TYPE, content_type),
+                (header::CONTENT_TYPE, found.metadata.mimetype()),
                 (header::CACHE_CONTROL, cache),
             ],
-            Body::from(bytes),
+            Body::from(found.data),
         )
             .into_response(),
     )

@@ -115,9 +115,10 @@ HTTP server. The browser uses the same daemon API and observes daemon events;
 presentation does not own durable execution state. See [HTTP API](api/http.md)
 for the endpoints and their access rules.
 
-`ui/` contains the React workspace and its TanStack DB replica. The build script
-`crates/arena0-daemon/build.rs` embeds `ui/dist` at Rust build time; build the UI
-before compiling a daemon that must serve it.
+`ui/` contains the React workspace and its TanStack DB replica. Release builds of
+`arena0-daemon` embed `ui/dist` (`src/ui_assets.rs`) and fail to compile without
+it; debug builds read `ui/dist` from disk on each request. Build the UI before
+compiling a release daemon.
 
 ## Responsibility and state ownership
 

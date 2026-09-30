@@ -17,7 +17,7 @@ build-release: build-programs build-ui
 build-linux-release: build-ui
     ./scripts/build-linux-release.sh
 
-# Build the web UI into ui/dist (embedded by arena0-daemon at compile time).
+# Build the web UI into ui/dist (release daemons embed it; debug daemons read it from disk).
 build-ui:
     cd ui && pnpm install --frozen-lockfile && pnpm build
 

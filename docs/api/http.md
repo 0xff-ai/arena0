@@ -57,5 +57,6 @@ keeps its original ownership record.
 Hashed `/assets/*` files use
 `Cache-Control: public, max-age=31536000, immutable`; the index uses
 `no-cache`. Static responses carry the existing CSP, no-sniff, no-referrer,
-and frame-denial headers. A build without UI assets returns 404 text:
-`this arena0 was built without the web UI; run \`just build-ui\` and rebuild`.
+and frame-denial headers. Release builds do not compile without the UI; a
+debug build with no `ui/dist` returns 404 text:
+`ui/dist has no web UI; run \`just build-ui\``.

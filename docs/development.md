@@ -71,8 +71,9 @@ checks Rust; `check-ui test-ui` adds the browser checks and live suites.
 Use Node 22 or newer and enable Corepack (`corepack enable`) to select the pnpm
 version pinned in `ui/package.json`.
 
-- `just build-ui` installs locked dependencies and builds `ui/dist`, which
-  `crates/arena0-daemon/build.rs` embeds when the Rust executable is built.
+- `just build-ui` installs locked dependencies and builds `ui/dist`. Release
+  builds embed it and fail without it; debug builds serve it from disk, so a
+  new UI build shows up without recompiling the daemon.
 - `just ui-types` regenerates `ui/src/api/types.gen.ts`; run it after changing
   the daemon’s browser API types.
 - `just check-ui` checks generated type freshness, lint, and TypeScript types.

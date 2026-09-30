@@ -5,8 +5,7 @@
 //! `just build-programs` produces). A missing blob fails the build: a binary
 //! without its shipped programs is broken by design, not worth a warning.
 
-use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::{env, fs};
 
 /// Wasm file stems for each shipped program.
@@ -52,65 +51,19 @@ fn main() {
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     fs::write(out.join("embedded_programs.rs"), code).unwrap();
-    println!("cargo:rerun-if-env-changed=ARENA0_UI_DIST");
-    println!("cargo:rerun-if-changed=build.rs");
-    let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
-    let dist = std::env::var_os("ARENA0_UI_DIST")
-        .map_or_else(|| manifest.join("../../ui/dist"), PathBuf::from);
-    println!("cargo:rerun-if-changed={}", dist.display());
 
-    let mut files = Vec::new();
-    if dist.join("index.html").is_file() {
-        collect(&dist, &dist, &mut files);
-    }
-    files.sort();
-
-    let mut table = String::from("pub(crate) static ASSETS: &[(&str, &[u8], &str)] = &[\n");
-    for (relative, absolute) in &files {
-        let absolute = absolute.canonicalize().expect("canonical asset path");
-        writeln!(
-            table,
-            "    ({relative:?}, include_bytes!({:?}), {:?}),",
-            absolute.display().to_string(),
-            content_type(relative),
-        )
-        .expect("write to string");
-    }
-    table.push_str("];\n");
-    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("out dir")).join("assets.rs");
-    std::fs::write(out, table).expect("write assets table");
-}
-
-fn collect(root: &Path, directory: &Path, files: &mut Vec<(String, PathBuf)>) {
-    for entry in std::fs::read_dir(directory).expect("read dist directory") {
-        let path = entry.expect("dist entry").path();
-        if path.is_dir() {
-            collect(root, &path, files);
-        } else {
-            let relative = path
-                .strip_prefix(root)
-                .expect("inside dist")
-                .components()
-                .map(|part| part.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("/");
-            files.push((relative, path));
+    // Release builds embed `ui/dist` (src/ui_assets.rs). The embed only needs
+    // the folder to exist, so an empty or half-written one would ship a daemon
+    // without its UI. Debug builds read the folder at request time instead.
+    if env::var_os("CARGO_CFG_DEBUG_ASSERTIONS").is_none() {
+        let index = repo.join("ui/dist/index.html");
+        println!("cargo::rerun-if-changed={}", index.display());
+        if !index.is_file() {
+            panic!(
+                "missing web UI at {}. Build it first (`just build-ui`).",
+                index.display()
+            );
         }
     }
-}
-
-fn content_type(path: &str) -> &'static str {
-    match path.rsplit_once('.').map(|(_, extension)| extension) {
-        Some("html") => "text/html; charset=utf-8",
-        Some("js" | "mjs") => "text/javascript; charset=utf-8",
-        Some("css") => "text/css; charset=utf-8",
-        Some("json" | "map") => "application/json",
-        Some("svg") => "image/svg+xml",
-        Some("png") => "image/png",
-        Some("woff") => "font/woff",
-        Some("woff2") => "font/woff2",
-        Some("ico") => "image/x-icon",
-        Some("txt") => "text/plain; charset=utf-8",
-        _ => "application/octet-stream",
-    }
+    println!("cargo:rerun-if-changed=build.rs");
 }
