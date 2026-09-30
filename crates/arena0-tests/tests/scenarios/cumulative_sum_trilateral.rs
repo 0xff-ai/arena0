@@ -22,7 +22,7 @@ async fn cumulative_sum_trilateral_runs_and_verifies() {
         .params(encode_params(3));
     let mut run = arena.run().await;
 
-    // The contributions table renders every seat and the running total in both
+    // The contributions table renders every participant and the running total in both
     // color depths, with no escape sequences in mono.
     let view = run
         .view(

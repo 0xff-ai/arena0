@@ -1,8 +1,8 @@
-//! End-to-end check of a `--human` seat through the real binary: the seat is
+//! End-to-end check of a `--human` participant through the real binary: it is
 //! answered from piped stdin at the inline prompt, never a full-screen UI.
 //!
 //! Ways this can fail, decided before the test was written:
-//! - the seat never reads stdin, so the run stalls (caught by the deadline);
+//! - the participant never reads stdin, so the run stalls (caught by the deadline);
 //! - stdin ends before the program stops asking, so the run errors with
 //!   "stdin closed before the callout was answered";
 //! - an answer the program's schema rejects is re-prompted forever instead of
@@ -37,7 +37,7 @@ fn arena0d_binary() -> PathBuf {
 }
 
 #[test]
-fn human_seat_is_answered_from_piped_stdin_and_the_receipt_is_printed() {
+fn human_participant_is_answered_from_piped_stdin_and_the_receipt_is_printed() {
     let _ = arena0d_binary();
     let home = tempfile::tempdir().expect("temporary arena0 home");
     let mut child = Command::new(env!("CARGO_BIN_EXE_arena0"))

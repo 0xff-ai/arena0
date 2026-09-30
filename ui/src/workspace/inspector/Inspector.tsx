@@ -10,9 +10,9 @@ import {
   useHostCounts,
   useNow,
   useRows,
-  useSeats,
   useSession,
   useSessionSteps,
+  useYourHosts,
 } from "~/model";
 import { useCollections } from "~/sync";
 import {
@@ -70,14 +70,14 @@ function SessionInspector(props: { sessionKey: string }) {
   const composer = useComposer();
   const openDoc = useOpenDoc();
   const hosts = useRows(useCollections().hosts).map((host) => host.id);
-  const [seats] = useSeats(hosts);
+  const [yourHosts] = useYourHosts(hosts);
   if (session === null)
     return <EmptyState icon={Icons.session} title="This session no longer exists" />;
 
   const latest = steps.filter((row) => row.step === session.latestStep);
   const first = latest[0];
   const diverged = new Set(latest.map((row) => row.post_state)).size > 1;
-  const mine = session.callouts.find((callout) => seats.has(callout.host));
+  const mine = session.callouts.find((callout) => yourHosts.has(callout.host));
   const writer = session.participants.find((p) => p.peerId === session.writer);
 
   return (
@@ -130,7 +130,7 @@ function SessionInspector(props: { sessionKey: string }) {
                 <ParticipantDot
                   index={participant.index}
                   state={LIFECYCLE_DOT[participant.execution.lifecycle]}
-                  you={participant.host !== null && seats.has(participant.host)}
+                  you={participant.host !== null && yourHosts.has(participant.host)}
                 />
                 <span className="text-muted">{participant.execution.lifecycle}</span>
               </>

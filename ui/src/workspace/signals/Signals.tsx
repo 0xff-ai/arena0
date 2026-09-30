@@ -9,7 +9,7 @@ import {
   type Session,
   useNow,
   useRows,
-  useSeats,
+  useYourHosts,
 } from "~/model";
 import { type ActivityRow, type CalloutRow, useCollections } from "~/sync";
 import { Dot, EmptyState, Icons, List, ParticipantChip, Segmented, SubTabs, Switch } from "~/ui";
@@ -38,8 +38,8 @@ export function Signals() {
   const problems = useProblems();
   const callouts = useRows(collections.callouts);
   const hosts = useRows(collections.hosts);
-  const [seats] = useSeats(hosts.map((host) => host.id));
-  const needs = callouts.filter((callout) => seats.has(callout.host));
+  const [yourHosts] = useYourHosts(hosts.map((host) => host.id));
+  const needs = callouts.filter((callout) => yourHosts.has(callout.host));
   const tier2 = problems.sessions.reduce((n, entry) => n + entry.flags.length, 0);
 
   return (
@@ -55,7 +55,7 @@ export function Signals() {
         ]}
       />
       <div className="min-h-0 flex-1">
-        {tab === "needs" && <NeedsInput callouts={needs} seats={[...seats]} />}
+        {tab === "needs" && <NeedsInput callouts={needs} yourHosts={[...yourHosts]} />}
         {tab === "problems" && <Problems />}
         {tab === "activity" && <Activity />}
       </div>
@@ -73,7 +73,7 @@ function useSessionOfExecution() {
   return byExecution;
 }
 
-function NeedsInput(props: { callouts: CalloutRow[]; seats: string[] }) {
+function NeedsInput(props: { callouts: CalloutRow[]; yourHosts: string[] }) {
   const now = useNow();
   const open = useOpenDoc();
   const composer = useComposer();
@@ -99,7 +99,7 @@ function NeedsInput(props: { callouts: CalloutRow[]; seats: string[] }) {
         <EmptyState
           icon={Icons.callout}
           title="Nothing needs you"
-          body={`Seats: ${props.seats.join(", ") || "none"}`}
+          body={`Your participants: ${props.yourHosts.join(", ") || "none"}`}
         />
       }
     >

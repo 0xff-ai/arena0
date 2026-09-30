@@ -361,7 +361,7 @@ function BadgeSection() {
           ending · 1 peer unconfirmed
         </Badge>
         <Badge tone="accent" icon={Icons.you}>
-          your seat
+          your participant
         </Badge>
         <Badge>ABI 25</Badge>
       </Demo>
@@ -488,7 +488,7 @@ function PopoverSection() {
                 Filter
               </Heading>
               <TextField label="Program" placeholder="vickrey-auction" mono />
-              <Checkbox defaultSelected>Only sessions on my seats</Checkbox>
+              <Checkbox defaultSelected>Only sessions with my participants</Checkbox>
               <div className="flex justify-end gap-2">
                 <Button size="sm" variant="ghost" slot="close">
                   Cancel
@@ -724,7 +724,7 @@ function FieldSection() {
           <NumberField label="Budget" defaultValue={500} isDisabled className="max-w-56" />
         </Demo>
         <Demo title="Checkbox, Switch, Select" className="flex-col items-stretch">
-          <Checkbox>Only my seats</Checkbox>
+          <Checkbox>Only my participants</Checkbox>
           <Checkbox defaultSelected>Include completed</Checkbox>
           <Checkbox isIndeterminate>Some programs</Checkbox>
           <Checkbox isDisabled defaultSelected>
@@ -738,7 +738,7 @@ function FieldSection() {
             Disabled on
           </Switch>
           <Select
-            label="Seat host"
+            label="Participant host"
             value={host}
             onChange={setHost}
             items={[
@@ -1361,7 +1361,7 @@ function ParticipantSection() {
         {[0, 1, 2, 3, 4, 5, 7].map((index) => (
           <ParticipantChip key={index} index={index} label={`host-0${(index % 4) + 1}`} />
         ))}
-        <ParticipantChip index={1} label="host-03" you title="P1 · host-03 · your seat" />
+        <ParticipantChip index={1} label="host-03" you title="P1 · host-03 · your participant" />
         <ParticipantChip index={2} label="agent-636f6465783a3031396133663265" />
       </Demo>
       <Demo title="ParticipantDot · active, done, bad, idle, you">

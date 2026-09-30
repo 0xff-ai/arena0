@@ -8,9 +8,9 @@ import {
   shortHash,
   useFlags,
   useRows,
-  useSeats,
   useSession,
   useSessions,
+  useYourHosts,
 } from "~/model";
 import { type DaemonError, useCall, useCollections } from "~/sync";
 import {
@@ -160,11 +160,11 @@ function Actions(props: { session: Session }) {
   const { session } = props;
   const composer = useComposer();
   const hosts = useRows(useCollections().hosts).map((host) => host.id);
-  const [seats] = useSeats(hosts);
+  const [yourHosts] = useYourHosts(hosts);
   const withdraw = useCall("withdraw");
   const terminate = useCall("terminate");
   const [confirm, setConfirm] = useState<"terminate" | "withdraw" | null>(null);
-  const mine = session.callouts.find((callout) => seats.has(callout.host));
+  const mine = session.callouts.find((callout) => yourHosts.has(callout.host));
 
   // Each local Host runs its own execution, so ending the session is one call per Host that is still going.
   const live = session.executions.filter((e) => !TERMINAL.has(e.lifecycle));

@@ -15,7 +15,7 @@ export function sessionStrip(
   session: Session,
   steps: StepRow[],
   flags: Flag[],
-  seats: ReadonlySet<string>,
+  yourHosts: ReadonlySet<string>,
   now: number,
 ): { spans: StripSpan[]; marks: StripMark[] } {
   const spans: StripSpan[] = [];
@@ -62,11 +62,11 @@ export function sessionStrip(
     });
   }
 
-  // The flag names the oldest callout of Hosts outside the seats, so only that one is "long".
+  // The flag names the oldest callout of Hosts whose participants are not yours, so only that one is "long".
   const longWait = flags.some((flag) => flag.kind === "long-wait" && flag.tier === 2);
-  const oldestTheirs = session.callouts.find((callout) => !seats.has(callout.host));
+  const oldestTheirs = session.callouts.find((callout) => !yourHosts.has(callout.host));
   for (const callout of session.callouts) {
-    const kind = seats.has(callout.host)
+    const kind = yourHosts.has(callout.host)
       ? "waiting-you"
       : longWait && callout === oldestTheirs
         ? "waiting-long"

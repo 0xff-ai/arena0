@@ -10,8 +10,8 @@ import {
   shortHash,
   useNow,
   useRows,
-  useSeats,
   useSessionSteps,
+  useYourHosts,
 } from "~/model";
 import { type RecordRow, type StepRow, useCollections } from "~/sync";
 import {
@@ -225,7 +225,7 @@ function Tail(props: { session: Session; hasTerminalStep: boolean; nextStep: num
   const now = useNow();
   const composer = useComposer();
   const hosts = useRows(useCollections().hosts).map((host) => host.id);
-  const [seats] = useSeats(hosts);
+  const [yourHosts] = useYourHosts(hosts);
   const indexOf = (peerOrHost: { host?: string; peer?: string }) =>
     session.participants.find((p) =>
       peerOrHost.host !== undefined ? p.host === peerOrHost.host : p.peerId === peerOrHost.peer,
@@ -258,7 +258,7 @@ function Tail(props: { session: Session; hasTerminalStep: boolean; nextStep: num
           waiting on {index === undefined ? "" : `P${index} · `}
           {callout.host} · {callout.name} · {fmtDuration(now - callout.opened_ms)}
         </span>
-        {seats.has(callout.host) && (
+        {yourHosts.has(callout.host) && (
           <Button size="sm" variant="primary" onPress={() => composer.open(callout.key)}>
             Answer
           </Button>

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { fmtDuration, useNow, useRows, useSeats, useSessions } from "~/model";
+import { fmtDuration, useNow, useRows, useSessions, useYourHosts } from "~/model";
 import { type CalloutRow, DaemonError, OUTCOME_UNKNOWN, useCall, useCollections } from "~/sync";
 import {
   Button,
@@ -52,7 +52,7 @@ function Composer(props: { calloutKey: string }) {
   const callouts = useRows(collections.callouts);
   const hosts = useRows(collections.hosts);
   const { sessions } = useSessions();
-  const [seats] = useSeats(hosts.map((host) => host.id));
+  const [yourHosts] = useYourHosts(hosts.map((host) => host.id));
   const now = useNow();
   const answer = useCall("answer");
 
@@ -97,12 +97,12 @@ function Composer(props: { calloutKey: string }) {
     composer.close();
   }, [closing, calloutKey, step, composer]);
 
-  const seatCallouts = callouts
-    .filter((c) => seats.has(c.host))
+  const yourCallouts = callouts
+    .filter((c) => yourHosts.has(c.host))
     .sort((a, b) => a.opened_ms - b.opened_ms || (a.key < b.key ? -1 : 1));
-  const position = seatCallouts.findIndex((c) => c.key === calloutKey);
+  const position = yourCallouts.findIndex((c) => c.key === calloutKey);
   const neighbour = (offset: number) =>
-    seatCallouts[(position + offset + seatCallouts.length) % seatCallouts.length];
+    yourCallouts[(position + offset + yourCallouts.length) % yourCallouts.length];
 
   const elsewhere = phase === "elsewhere" || (gone && phase === "editing");
   const noInput = callout !== undefined && isNullSchema(callout.schema);
@@ -200,7 +200,7 @@ function Composer(props: { calloutKey: string }) {
           </>
         )}
         {callout === undefined && <span className="flex-1" />}
-        {seatCallouts.length > 1 && position >= 0 && (
+        {yourCallouts.length > 1 && position >= 0 && (
           <>
             <IconButton
               icon={Icons.chevronRight}
@@ -209,7 +209,7 @@ function Composer(props: { calloutKey: string }) {
               onPress={() => composer.open(neighbour(-1)?.key ?? calloutKey)}
             />
             <span className="shrink-0 font-mono text-xs text-subtle tabular">
-              {position + 1} of {seatCallouts.length}
+              {position + 1} of {yourCallouts.length}
             </span>
             <IconButton
               icon={Icons.chevronRight}

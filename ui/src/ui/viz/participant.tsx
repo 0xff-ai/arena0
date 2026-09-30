@@ -37,8 +37,8 @@ const stateWord = { active: "active", done: "done", bad: "failed", idle: "idle" 
 
 /**
  * A participant's colour as an 8 px dot. Active is solid, done is faded, idle
- * is hollow; a failed participant gets a `bad` ring and a seat you hold an
- * accent ring.
+ * is hollow; a failed participant gets a `bad` ring and a participant
+ * you answer for an accent ring.
  */
 export function ParticipantDot(props: {
   index: number;

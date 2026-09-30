@@ -326,8 +326,8 @@ pub mod prisoner_dilemma {
     }
 
     fn player_label(idx: usize, me: Option<usize>) -> String {
-        // Role first, seat index second (L047): the human always reads
-        // "you"/"opponent" first no matter which seat they hold.
+        // Role first, participant index second (L047): the human always reads
+        // "you"/"opponent" first no matter which participant they are.
         match me {
             Some(me) if idx == me => format!("you (P{idx})"),
             Some(_) => format!("opponent (P{idx})"),

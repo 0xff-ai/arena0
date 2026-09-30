@@ -1,5 +1,5 @@
 import { Button } from "react-aria-components";
-import { shortHash, useRows, useSeats, useSessions } from "~/model";
+import { shortHash, useRows, useSessions, useYourHosts } from "~/model";
 import { useCollections, useConnection, useDaemonInfo } from "~/sync";
 import { Dot, Icons } from "~/ui";
 import { shortSessionKey } from "./common/SessionLabel";
@@ -16,11 +16,11 @@ export function StatusBar() {
   const connection = useConnection();
   const hosts = useRows(collections.hosts);
   const callouts = useRows(collections.callouts);
-  const [seats] = useSeats(hosts.map((host) => host.id));
+  const [yourHosts] = useYourHosts(hosts.map((host) => host.id));
   const [, setSignalsTab] = useSignalsTab();
   const problems = useProblems();
 
-  const needsYou = callouts.filter((callout) => seats.has(callout.host)).length;
+  const needsYou = callouts.filter((callout) => yourHosts.has(callout.host)).length;
   const active = problems.all.filter((session) => session.state === "active").length;
   const gaps = hosts.reduce((total, host) => total + host.gaps, 0);
   const goToProblems = () => setSignalsTab("problems");
@@ -59,7 +59,7 @@ export function StatusBar() {
         <SelectionSummary />
       </span>
 
-      <span>seats: {seats.size === 0 ? "none" : [...seats].join(", ")}</span>
+      <span>your participants: {yourHosts.size === 0 ? "none" : [...yourHosts].join(", ")}</span>
       <span className={gaps > 0 ? "text-warn" : ""}>
         {gaps > 0 ? `${gaps} ${gaps === 1 ? "gap" : "gaps"}` : "no gaps"}
       </span>

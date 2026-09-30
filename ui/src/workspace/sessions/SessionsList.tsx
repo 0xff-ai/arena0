@@ -9,8 +9,8 @@ import {
   useFlags,
   useNow,
   useRows,
-  useSeats,
   useSessions,
+  useYourHosts,
 } from "~/model";
 import { type StepRow, useCollections } from "~/sync";
 import {
@@ -90,7 +90,7 @@ export function SessionsList() {
   const flags = useFlags(sessions);
   const hosts = useRows(collections.hosts);
   const steps = useRows(collections.steps);
-  const [seats] = useSeats(hosts.map((host) => host.id));
+  const [yourHosts] = useYourHosts(hosts.map((host) => host.id));
   const now = useNow();
   const [selection, select] = useSelection();
   const openDoc = useOpenDoc();
@@ -176,7 +176,7 @@ export function SessionsList() {
             title: "Participants",
             width: 96,
             minWidth: 96,
-            render: (session: Session) => <Participants session={session} seats={seats} />,
+            render: (session: Session) => <Participants session={session} yourHosts={yourHosts} />,
           },
         ]
       : []),
@@ -191,7 +191,7 @@ export function SessionsList() {
           session,
           own,
           flags.get(session.key) ?? [],
-          seats,
+          yourHosts,
           now,
         );
         return (
@@ -400,8 +400,8 @@ function stepsByExecution(steps: StepRow[]): Map<string, StepRow[]> {
   return groups;
 }
 
-function Participants(props: { session: Session; seats: ReadonlySet<string> }) {
-  const { session, seats } = props;
+function Participants(props: { session: Session; yourHosts: ReadonlySet<string> }) {
+  const { session, yourHosts } = props;
   const shown = session.participants.slice(0, 5);
   return (
     <span className="inline-flex items-center gap-2">
@@ -424,7 +424,7 @@ function Participants(props: { session: Session; seats: ReadonlySet<string> }) {
             key={participant.index}
             index={participant.index}
             state={state}
-            you={participant.host !== null && seats.has(participant.host)}
+            you={participant.host !== null && yourHosts.has(participant.host)}
           />
         );
       })}

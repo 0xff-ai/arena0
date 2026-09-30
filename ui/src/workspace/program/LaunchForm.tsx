@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { sessionKey, useRows, useSeats } from "~/model";
+import { sessionKey, useRows, useYourHosts } from "~/model";
 import { comparePeerIds, type ExecRef, type ProgramRow, useCall, useCollections } from "~/sync";
 import {
   Button,
@@ -17,7 +17,7 @@ import { useOpenDoc } from "../nav";
 
 type DriverKind = "you" | "external";
 
-interface SeatDraft {
+interface ParticipantDraft {
   host: string | null;
   kind: DriverKind;
 }
@@ -31,12 +31,13 @@ const isNullSchema = (schema: JsonLike): boolean =>
   typeof schema === "object" && schema !== null && !Array.isArray(schema) && schema.type === "null";
 
 /**
- * Starts a session: params, participant count and one seat per participant.
- * A seat's driver is whether its Host is in your Seats: each row starts from
- * the current Seats, and Launch writes the choices back, so the Answer button,
- * the composer and Needs input never offer an External seat's callouts.
+ * Starts a session: params, participant count and a Host and driver per
+ * participant. A participant's driver is whether its Host is one of yours:
+ * each row starts from your participants, and Launch writes the choices back,
+ * so the Answer button, the composer and Needs input never offer an External
+ * participant's callouts.
  * After `launch` replies it waits for the new executions to show up in the
- * replica, then opens the session (pinned) and, when a seat of yours has a
+ * replica, then opens the session (pinned) and, when a participant of yours has a
  * callout, the composer. Nothing outlives this component, so the navigation
  * happens while it is still mounted.
  */
@@ -49,28 +50,28 @@ export function LaunchForm(props: { program: ProgramRow }) {
   const openDoc = useOpenDoc();
   const composer = useComposer();
   const launch = useCall("launch");
-  const [yourSeats, setYourSeats] = useSeats(hosts.map((host) => host.id));
+  const [yourHosts, setYourHosts] = useYourHosts(hosts.map((host) => host.id));
 
-  // A seat needs a Host that holds the program.
+  // A participant needs a Host that holds the program.
   const capable = hosts.filter((host) => program.hosts.includes(host.id));
 
   const noParams = isNullSchema(program.schema.params);
   const [params, setParams] = useState<JsonLike | undefined>(undefined);
   const [count, setCount] = useState(program.participants.min);
-  const [seatDrafts, setSeatDrafts] = useState<Record<number, Partial<SeatDraft>>>({});
+  const [drafts, setDrafts] = useState<Record<number, Partial<ParticipantDraft>>>({});
   const [attempted, setAttempted] = useState(false);
   const [started, setStarted] = useState<ExecRef[] | null>(null);
 
-  const seatAt = (index: number): SeatDraft => {
-    const host = seatDrafts[index]?.host ?? capable[index]?.id ?? null;
-    const kind = host !== null && yourSeats.has(host) ? "you" : "external";
-    return { host, kind, ...seatDrafts[index] };
+  const draftAt = (index: number): ParticipantDraft => {
+    const host = drafts[index]?.host ?? capable[index]?.id ?? null;
+    const kind = host !== null && yourHosts.has(host) ? "you" : "external";
+    return { host, kind, ...drafts[index] };
   };
-  const seats = Array.from({ length: Number.isFinite(count) ? Math.max(0, count) : 0 }, (_, i) =>
-    seatAt(i),
+  const rows = Array.from({ length: Number.isFinite(count) ? Math.max(0, count) : 0 }, (_, i) =>
+    draftAt(i),
   );
-  const edit = (index: number, change: Partial<SeatDraft>) =>
-    setSeatDrafts((all) => ({ ...all, [index]: { ...all[index], ...change } }));
+  const edit = (index: number, change: Partial<ParticipantDraft>) =>
+    setDrafts((all) => ({ ...all, [index]: { ...all[index], ...change } }));
 
   const paramIssues = noParams || !attempted ? [] : validate(program.schema.params, params);
   const problems: string[] = [];
@@ -88,9 +89,9 @@ export function LaunchForm(props: { program: ProgramRow }) {
       `This program needs ${program.participants.min} Hosts and ${capable.length} hold it.`,
     );
   }
-  const chosen = seats.flatMap((seat) => (seat.host === null ? [] : [seat.host]));
-  if (seats.some((seat) => seat.host === null) || new Set(chosen).size !== chosen.length) {
-    problems.push("Every seat needs its own Host.");
+  const chosen = rows.flatMap((row) => (row.host === null ? [] : [row.host]));
+  if (rows.some((row) => row.host === null) || new Set(chosen).size !== chosen.length) {
+    problems.push("Every participant needs its own Host.");
   }
   const invalid = problems.length > 0 || paramIssues.length > 0;
 
@@ -104,13 +105,13 @@ export function LaunchForm(props: { program: ProgramRow }) {
     ) {
       return;
     }
-    const next = new Set(yourSeats);
-    for (const seat of seats) {
-      if (seat.host === null) continue;
-      if (seat.kind === "you") next.add(seat.host);
-      else next.delete(seat.host);
+    const next = new Set(yourHosts);
+    for (const row of rows) {
+      if (row.host === null) continue;
+      if (row.kind === "you") next.add(row.host);
+      else next.delete(row.host);
     }
-    setYourSeats([...next]);
+    setYourHosts([...next]);
     launch.mutate(
       { program: program.hash, params: body, hosts: chosen },
       { onSuccess: (reply) => setStarted(reply.execs) },
@@ -118,10 +119,10 @@ export function LaunchForm(props: { program: ProgramRow }) {
   }
 
   // The session opens once its executions are in the replica and, if you hold
-  // a seat, its first callout is too: the composer needs a callout row to
+  // a participant, its first callout is too: the composer needs a callout row to
   // open on. A session that ends first opens without one.
   const opened = useRef(false);
-  const youHosts = new Set(seats.filter((seat) => seat.kind === "you").map((seat) => seat.host));
+  const youHosts = new Set(rows.filter((row) => row.kind === "you").map((row) => row.host));
   const keys = new Set(started?.map((e) => `${e.host}/${e.exec_id}`));
   const mine = executions.filter((e) => keys.has(e.key));
   const firstCallout = callouts.find(
@@ -144,7 +145,7 @@ export function LaunchForm(props: { program: ProgramRow }) {
 
   const busy = launch.isPending || started !== null;
 
-  // The session numbers participants by sorted peer id, not by seat order.
+  // The session numbers participants by sorted peer id, not by row order.
   const peerOf = (host: string | null) => hosts.find((row) => row.id === host)?.peer_id;
   const peers = chosen.flatMap((host) => peerOf(host) ?? []).sort(comparePeerIds);
   const participantOf = (host: string | null): number | null => {
@@ -173,17 +174,17 @@ export function LaunchForm(props: { program: ProgramRow }) {
         className="w-40"
       />
       <div className="flex flex-col gap-1.5">
-        <div className="text-sm text-muted">Seats</div>
+        <div className="text-sm text-muted">Host and driver per participant</div>
         <div
           inert={busy}
           className="grid grid-cols-[3.5rem_10rem_auto_minmax(0,1fr)] items-center gap-x-3 gap-y-1.5"
         >
-          {seats.map((seat, index) => (
-            <SeatRow
+          {rows.map((row, index) => (
+            <ParticipantRow
               key={index}
               index={index}
-              participant={participantOf(seat.host)}
-              seat={seat}
+              participant={participantOf(row.host)}
+              draft={row}
               hosts={capable.map((host) => ({
                 id: host.id,
                 label: host.id,
@@ -213,36 +214,36 @@ export function LaunchForm(props: { program: ProgramRow }) {
   );
 }
 
-function SeatRow(props: {
+function ParticipantRow(props: {
   index: number;
-  /** The participant index this seat's Host will have; null until it has a Host. */
+  /** The participant index this row's Host will have; null until it has a Host. */
   participant: number | null;
-  seat: SeatDraft;
+  draft: ParticipantDraft;
   hosts: { id: string; label: string; detail?: string }[];
-  onChange: (change: Partial<SeatDraft>) => void;
+  onChange: (change: Partial<ParticipantDraft>) => void;
 }) {
-  const { index, seat } = props;
+  const { index, draft } = props;
   const n = index + 1;
   return (
     <>
-      <span data-testid={`seat-${n}-participant`} className="text-sm text-subtle">
+      <span data-testid={`participant-${n}-index`} className="text-sm text-subtle">
         {props.participant === null ? "—" : `P${props.participant}`}
       </span>
       <Select
-        placeholder={`Host for seat ${n}`}
+        placeholder={`Host for participant ${n}`}
         items={props.hosts}
-        value={seat.host}
+        value={draft.host}
         onChange={(host) => props.onChange({ host })}
       />
       <Segmented
-        label={`Driver for seat ${n}`}
+        label={`Driver for participant ${n}`}
         size="md"
         items={DRIVERS}
-        value={seat.kind}
+        value={draft.kind}
         onChange={(kind) => props.onChange({ kind })}
       />
       <span className="text-sm text-subtle">
-        {seat.kind === "you"
+        {draft.kind === "you"
           ? "You answer this Host's callouts here"
           : "An agent answers this Host's callouts, over MCP or the CLI"}
       </span>

@@ -30,8 +30,8 @@ export interface Flag {
 const FLOOR_MS = 60_000;
 
 /**
- * Flags for one session, tier 2 first. `stats` is per program hash, `seats`
- * the Hosts the user answers for, `hosts` keyed by Host id, and
+ * Flags for one session, tier 2 first. `stats` is per program hash, `yourHosts`
+ * the Hosts whose participants the user answers for, `hosts` keyed by Host id, and
  * `divergentStep` the result of `divergentStep(steps)` over the session's
  * steps.
  */
@@ -39,13 +39,13 @@ export function sessionFlags(
   session: Session,
   context: {
     stats: Map<string, ProgramStats>;
-    seats: ReadonlySet<string>;
+    yourHosts: ReadonlySet<string>;
     hosts: Map<string, HostRow>;
     divergentStep: number | null;
     now: number;
   },
 ): Flag[] {
-  const { seats, hosts, now } = context;
+  const { yourHosts, hosts, now } = context;
   const stats = context.stats.get(session.programHash);
   const p75 = stats?.p75 ?? null;
   // Above this a wait or silence is tier 2.
@@ -53,7 +53,7 @@ export function sessionFlags(
   const flags: Flag[] = [];
 
   // Callouts are oldest first, so `find` takes the longest wait.
-  const mine = session.callouts.find((c) => seats.has(c.host));
+  const mine = session.callouts.find((c) => yourHosts.has(c.host));
   if (mine !== undefined) {
     const wait = now - mine.opened_ms;
     flags.push({
@@ -65,7 +65,7 @@ export function sessionFlags(
     });
   }
 
-  const theirs = session.callouts.find((c) => !seats.has(c.host));
+  const theirs = session.callouts.find((c) => !yourHosts.has(c.host));
   if (theirs !== undefined) {
     const wait = now - theirs.opened_ms;
     const tier = wait > slow ? 2 : p75 !== null && wait > p75 ? 1 : null;

@@ -305,8 +305,8 @@ pub mod rock_paper_scissors {
     }
 
     fn player_label(idx: usize, me: Option<usize>) -> String {
-        // Role first, seat index second: the human always reads "you"/"opponent"
-        // first no matter which seat they hold (L047).
+        // Role first, participant index second: the human always reads "you"/"opponent"
+        // first no matter which participant they are (L047).
         match me {
             Some(me) if idx == me => format!("you (P{idx})"),
             Some(_) => format!("opponent (P{idx})"),

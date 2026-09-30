@@ -102,7 +102,7 @@ const needsRow = (page: Page): Locator =>
     .filter({ hasText: "host-01" })
     .first();
 
-/** Open the oldest callout of a seat from the Needs input list, as a user does. */
+/** Open the oldest callout of a participant of yours from the Needs input list, as a user does. */
 async function openFirstCallout(page: Page): Promise<void> {
   await needsRow(page).dblclick();
   await expect(composerOf(page)).toBeVisible();
@@ -121,28 +121,35 @@ test("launch a session from its program, answer through the composer until it co
     await page.getByRole("main").getByRole("button", { name: "New session" }).click();
     await expect(page).toHaveURL(/launch=true/);
 
-    await evidence.check("the launch form offers two participants and two Host seats", async () => {
-      await expect(page.getByRole("textbox", { name: "Participants" })).toHaveValue("2");
-      await expect(page.getByRole("button", { name: /Host for seat 1/ })).toContainText("host-01");
-      await expect(page.getByRole("button", { name: /Host for seat 2/ })).toContainText("host-02");
-    });
+    await evidence.check(
+      "the launch form offers two participants, each on its own Host",
+      async () => {
+        await expect(page.getByRole("textbox", { name: "Participants" })).toHaveValue("2");
+        await expect(page.getByRole("button", { name: /Host for participant 1/ })).toContainText(
+          "host-01",
+        );
+        await expect(page.getByRole("button", { name: /Host for participant 2/ })).toContainText(
+          "host-02",
+        );
+      },
+    );
 
-    const seat1 = page.getByRole("radiogroup", { name: "Driver for seat 1" });
-    const seat2 = page.getByRole("radiogroup", { name: "Driver for seat 2" });
-    await seat1.getByRole("radio", { name: "You" }).click();
-    await seat2.getByRole("radio", { name: "External" }).click();
+    const first = page.getByRole("radiogroup", { name: "Driver for participant 1" });
+    const second = page.getByRole("radiogroup", { name: "Driver for participant 2" });
+    await first.getByRole("radio", { name: "You" }).click();
+    await second.getByRole("radio", { name: "External" }).click();
     await evidence.shots(page, "launch-form");
     // Participants are numbered by sorted peer id, so either Host can be P0.
-    // Seat 1 holds host-01 and seat 2 host-02, as checked above.
+    // Row 1 holds host-01 and row 2 host-02, as checked above.
     const formIndex = {
-      "host-01": (await page.getByTestId("seat-1-participant").textContent())!.trim(),
-      "host-02": (await page.getByTestId("seat-2-participant").textContent())!.trim(),
+      "host-01": (await page.getByTestId("participant-1-index").textContent())!.trim(),
+      "host-02": (await page.getByTestId("participant-2-index").textContent())!.trim(),
     };
-    await evidence.check("the seat rows name two distinct participant indexes", async () => {
+    await evidence.check("the rows name two distinct participant indexes", async () => {
       expect(new Set(Object.values(formIndex))).toEqual(new Set(["P0", "P1"]));
     });
 
-    // Either Host can act first; start the external seat before waiting for ours.
+    // Either Host can act first; start the external participant before waiting for ours.
     const joined = page.waitForResponse((response) => {
       if (!response.url().endsWith("/rpc")) return false;
       const request = response.request().postDataJSON();
@@ -167,8 +174,10 @@ test("launch a session from its program, answer through the composer until it co
       await expect(composerOf(page)).toContainText("host-01");
     });
     await evidence.shots(page, "composer-open");
-    await evidence.check("External removes host-02 from your Seats", async () => {
-      await expect(page.getByRole("button", { name: /^Seats: host-01$/ })).toBeVisible();
+    await evidence.check("External removes host-02 from your participants", async () => {
+      await expect(
+        page.getByRole("button", { name: /^Your participants: host-01$/ }),
+      ).toBeVisible();
     });
 
     const receipts = page.getByRole("tab", { name: /Receipts\s*2/ });

@@ -165,7 +165,7 @@ pub(crate) struct CoordinatedRunArgs {
     pub(crate) program: String,
     pub(crate) params: Option<Value>,
     pub(crate) bindings: Vec<DriverBinding>,
-    /// Receives each seat's Host and execution once, after every seat's
+    /// Receives each participant's Host and execution once, after every participant's
     /// execution exists. Dropped unsent when the run ends before that.
     pub(crate) created: Option<tokio::sync::oneshot::Sender<Vec<(HostName, ExecId)>>>,
 }

@@ -3,7 +3,7 @@ import { useSyncExternalStore } from "react";
 import { type Collections, type StepRow, useCollections } from "../sync";
 import { useNow } from "./clock";
 import { divergentStep, type Flag, sessionFlags } from "./flags";
-import { useSeats } from "./prefs";
+import { useYourHosts } from "./prefs";
 import { deriveSessions, type Session } from "./session";
 import { programStats } from "./stats";
 
@@ -56,7 +56,7 @@ export function useFlags(sessions: Session[]): Map<string, Flag[]> {
   const steps = useRows(collections.steps);
   const hostRows = useRows(collections.hosts);
   const now = useNow();
-  const [seats] = useSeats(hostRows.map((host) => host.id));
+  const [yourHosts] = useYourHosts(hostRows.map((host) => host.id));
 
   const sessionOfExecution = new Map<string, string>();
   const programOf = new Map<string, string>();
@@ -83,7 +83,7 @@ export function useFlags(sessions: Session[]): Map<string, Flag[]> {
       session.key,
       sessionFlags(session, {
         stats,
-        seats,
+        yourHosts,
         hosts,
         divergentStep: divergentStep(stepsOfSession.get(session.key) ?? NO_STEPS),
         now,

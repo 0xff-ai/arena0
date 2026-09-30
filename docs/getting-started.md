@@ -34,7 +34,7 @@ prints help when its standard streams are not terminals.
 - **Explorer** (left): the local Hosts, the programs they hold, and the latest
   receipts. Import a program or a receipt, or add a Host, from its headers.
 - **Needs input, Problems, Activity** (below the Explorer): callouts waiting
-  on the Hosts you answer for (your seats), sessions that look wrong (a long
+  on your participants, sessions that look wrong (a long
   wait, a failure, a stop report instead of a receipt), and the daemon's
   activity log.
 - **Sessions** (centre): every session with its participants and a lifecycle
@@ -49,8 +49,8 @@ prints help when its standard streams are not terminals.
   session opens a launch form where each participant is You or an external client.
   Executable agents are configured through `arena0 run --agent`.
 
-Press Mod+K for the command palette. Seats (title bar) choose which callouts
-you answer here; they are not an access boundary.
+Press Mod+K for the command palette. Your participants (title bar) choose
+which Hosts' callouts you answer here; they are not an access boundary.
 
 ## Answer at the terminal
 
