@@ -197,6 +197,11 @@ pub enum HostRequest {
     ReceiptList,
     #[serde(rename = "receipt.verify")]
     ReceiptVerify { receipt: ReceiptRef },
+    /// Full verification: the addressed Host replays the receipt in its own
+    /// catalog copy of the program. `receipt.verify` stays light and never
+    /// loads Wasm.
+    #[serde(rename = "receipt.verify_full")]
+    ReceiptVerifyFull { receipt: ReceiptRef },
 }
 
 impl Request {
@@ -249,6 +254,7 @@ impl HostRequest {
             Self::ReceiptImport { .. } => "receipt.import",
             Self::ReceiptList => "receipt.list",
             Self::ReceiptVerify { .. } => "receipt.verify",
+            Self::ReceiptVerifyFull { .. } => "receipt.verify_full",
         }
     }
 }

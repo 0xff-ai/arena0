@@ -6,6 +6,7 @@
 mod chess_bilateral;
 mod contract_net_multiparty;
 mod cumulative_sum_trilateral;
+mod full_verification;
 mod prisoner_dilemma_bilateral;
 mod rock_paper_scissors_bilateral;
 mod sequential_count_multiparty;

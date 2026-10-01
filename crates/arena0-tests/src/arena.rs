@@ -17,9 +17,10 @@ use arena0_node::{
 use arena0_node::{ExecContext, NegotiationBook};
 use arena0_program::JsonBytes;
 use arena0_protocol::{
-    BlobHash, EventSource, ExecId, ExecutionAdmission, NegotiationEvent, NegotiationId, OfferData,
-    PeerId, PeerIdSource, ReceiptArtifact, SessionHash, SessionTermination, StateHash, TraceEntry,
-    View, Viewport,
+    AggregateAttestation, BlobHash, CHAIN_START, EventSource, ExecId, ExecutionAdmission,
+    ExecutionBinding, NegotiationEvent, NegotiationId, OfferData, PeerId, PeerIdSource,
+    ReceiptArtifact, ReceiptBody, SessionHash, SessionTermination, SignerSet, StateHash,
+    StepCommitment, TraceEntry, View, Viewport,
 };
 use arena0_sandbox::Program;
 use arena0_store::{Store, StoreHandle};
@@ -500,6 +501,11 @@ impl Arena {
                 .execution_key(&execution_salt_for(i), &exec_id, &negotiation_id)
                 .expect("execution key");
             let (node_committed, execution_store) = negotiated.next().expect("committed execution");
+            // Retain the same durable key for test-only receipt recertification;
+            // the execution owns the independently derived capability below.
+            let receipt_execution_key = host
+                .execution_key(&execution_salt_for(i), &exec_id, &negotiation_id)
+                .expect("execution key");
             let context = ExecContext::new(
                 exec_id,
                 loaded,
@@ -513,6 +519,7 @@ impl Arena {
             let store_handle = store.handle().clone();
             participants.push(ParticipantHandle {
                 peer_id: node.peer_id,
+                execution_key: receipt_execution_key,
                 spawned,
                 exec_id,
                 _directory: directory,
@@ -616,6 +623,64 @@ pub struct Run {
 }
 
 impl Run {
+    /// Participant `participant`'s published receipt after `edit` changes its
+    /// trace and outcome bytes, re-certified so it still passes light
+    /// verification.
+    ///
+    /// Test-only forgery of what colluding participants could sign: every
+    /// entry's commitment is recomputed with `StepCommitment::for_entry`,
+    /// chained from `CHAIN_START`, and its agreement replaced by the N-of-N
+    /// aggregate of every participant's BLS signature over that commitment.
+    /// The header (activation and terminal) and params are kept. Panics if
+    /// the participant has no published receipt or the edited body fails
+    /// `ReceiptArtifact::new`.
+    pub fn recertified_receipt(
+        &self,
+        participant: usize,
+        edit: impl FnOnce(&mut Vec<TraceEntry>, &mut Vec<u8>),
+    ) -> ReceiptArtifact {
+        let artifact = self.receipt(participant);
+        let body = artifact.body();
+        let mut trace = body.trace().to_vec();
+        let mut outcome = body.outcome().to_vec();
+        edit(&mut trace, &mut outcome);
+        let binding = ExecutionBinding::new(body.header().activation.clone())
+            .expect("authenticated activation");
+        let mut participants = binding.participants().collect::<Vec<_>>();
+        // Signer bits index sorted participant keys, not creator-first tickets.
+        participants.sort();
+        let mut link = CHAIN_START;
+        for entry in &mut trace {
+            let commitment = StepCommitment::for_entry(binding.session_id(), entry, link);
+            let signing_bytes = commitment.signing_bytes();
+            let signatures = participants
+                .iter()
+                .map(|peer| {
+                    self.participants
+                        .iter()
+                        .find(|handle| handle.peer_id == *peer)
+                        .expect("committed participant")
+                        .execution_key
+                        .sign(&signing_bytes)
+                })
+                .collect::<Vec<_>>();
+            entry.agreement = AggregateAttestation::from_signatures(
+                SignerSet::full(participants.len()).expect("all participant signers"),
+                &signatures,
+            )
+            .expect("aggregate step signatures");
+            link = commitment.link_hash();
+        }
+        let body = ReceiptBody::new(
+            body.header().clone(),
+            outcome,
+            body.params().to_vec(),
+            trace,
+        )
+        .expect("edited receipt body");
+        ReceiptArtifact::new(body).expect("recertified receipt")
+    }
+
     /// The bytes of blob `hash` in the participant's blob store, exported
     /// through the store to a file in the participant's directory.
     pub async fn read_blob(&self, participant: usize, hash: BlobHash) -> Option<Vec<u8>> {
@@ -1125,6 +1190,7 @@ impl Expect<'_> {
 
 struct ParticipantHandle {
     peer_id: PeerId,
+    execution_key: ExecutionKey,
     spawned: SpawnedExec,
     exec_id: ExecId,
     _directory: TempDir,
