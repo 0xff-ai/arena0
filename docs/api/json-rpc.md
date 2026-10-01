@@ -381,6 +381,7 @@ and `ended` phases and their confirmation rules are specified in
 | `receipt.import` | `{receipt}` | `ReceiptList` |
 | `receipt.list` | — | `ReceiptList` |
 | `receipt.verify` | `{receipt}` | `Verified` |
+| `receipt.verify_full` | `{receipt}` | `VerifiedFull` |
 
 `ReceiptRef` has three externally tagged JSON forms:
 
@@ -403,14 +404,20 @@ require their matching older release; the current format and schema versions
 are listed with the
 [preserved invariants](../protocol-architecture.md#14-preserved-invariants).
 
-`receipt.verify` performs [portable verification](../protocol-architecture.md#11-receipts-and-verification)
-only, without loading or executing Wasm. `Verified` carries the receipt summary:
+`receipt.verify` performs [light verification](../protocol-architecture.md#11-receipts-and-verification)
+without loading or executing Wasm. `Verified` carries the receipt summary:
 `receipt_id`, `program_id`, `session_id`, the ordered `ensemble`, `steps`,
 `terminal`, and `outcome_borsh`. `terminal` is the receipt's own termination,
 `"Completed"` or `{"Stopped":{"cause":...}}` with the exact stop cause. The
 Host keeps outcome Borsh bytes opaque, so a completion carries authenticated
-`outcome_borsh` bytes and a stop carries `null`. There is no program execution
-endpoint.
+`outcome_borsh` bytes and a stop carries `null`.
+
+`receipt.verify_full` performs [full verification](../protocol-architecture.md#11-receipts-and-verification):
+the addressed Host replays the receipt in its catalog copy of the program.
+`VerifiedFull` carries `summary`, identical to `Verified`, and `outcome_json`,
+the program's JSON outcome for a completion and `null` for a stop. A program
+missing from the catalog is `NotFound`; an unsupported execution profile or a
+step the replay cannot reproduce is `Verification`.
 
 ## Daemon lifecycle and Host information
 

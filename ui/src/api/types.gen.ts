@@ -211,6 +211,17 @@ export type Fact = { label: string, value: Cell, };
 
 export type FileSource = { "path": string } | { "upload": string };
 
+export type FullReceiptSummary = { 
+/**
+ * Exactly the summary `receipt.verify` returns for the same artifact.
+ */
+summary: ReceiptSummary, 
+/**
+ * The program's JSON projection of the outcome: present exactly when the
+ * receipt records a completion, `null` for a stop.
+ */
+outcome_json: JsonValue | null, };
+
 export type HostInfo = { id: string, peer_id: string, user_agent: string | null, };
 
 export type HostRequest = { "method": "negotiation.offers" } | { "method": "host.info" } | { "method": "id.show" } | { "method": "program.list" } | { "method": "program.get", "params": { program: string, } } | { "method": "program.import", "params": { source: FileSource, } } | { "method": "blob.import", "params": { source: FileSource, } } | { "method": "blob.export", "params": { hash: string, path: string, } } | { "method": "blob.list" } | { "method": "program.remove", "params": { program: string, } } | { "method": "exec.new", "params": { 
@@ -253,7 +264,7 @@ query: JsonValue | null, } } | { "method": "exec.view", "params": { exec: string
  * Render the shared state after this agreed step. `None` renders the
  * latest state.
  */
-at_step: number | null, } } | { "method": "exec.trace", "params": { exec_id: string, from: number, to: number, } } | { "method": "exec.cancel_creation", "params": { exec_id: string, } } | { "method": "exec.withdraw", "params": { exec_id: string, } } | { "method": "exec.terminate", "params": { exec_id: string, reason: string, } } | { "method": "events.subscribe", "params": { filter: EventFilter, } } | { "method": "receipt.get", "params": { receipt: ReceiptRef, } } | { "method": "receipt.import", "params": { receipt: ReceiptArtifact, } } | { "method": "receipt.list" } | { "method": "receipt.verify", "params": { receipt: ReceiptRef, } };
+at_step: number | null, } } | { "method": "exec.trace", "params": { exec_id: string, from: number, to: number, } } | { "method": "exec.cancel_creation", "params": { exec_id: string, } } | { "method": "exec.withdraw", "params": { exec_id: string, } } | { "method": "exec.terminate", "params": { exec_id: string, reason: string, } } | { "method": "events.subscribe", "params": { filter: EventFilter, } } | { "method": "receipt.get", "params": { receipt: ReceiptRef, } } | { "method": "receipt.import", "params": { receipt: ReceiptArtifact, } } | { "method": "receipt.list" } | { "method": "receipt.verify", "params": { receipt: ReceiptRef, } } | { "method": "receipt.verify_full", "params": { receipt: ReceiptRef, } };
 
 export type HostStatus = { host: HostInfo, transport_key: string, programs: number, execs_active: number, };
 
@@ -491,7 +502,7 @@ session_id: string | null, exec_state: ExecLifecycle, queue_position: number | n
  * are numbered from 0, like trace entries). `None` renders the initial
  * state before step 0 is certified.
  */
-step: number | null, view: View, } } | { "Trace": Array<AgreedStep> } | { "Receipt": ReceiptArtifact } | { "ReceiptList": Array<ReceiptListEntry> } | { "Verified": ReceiptSummary } | { "DaemonInfo": DaemonInfo } | "Subscribed" | "ActivitySubscribed" | { "Hosts": Array<HostStatus> } | { "HostStatus": HostStatus } | { "HostOpened": HostInfo };
+step: number | null, view: View, } } | { "Trace": Array<AgreedStep> } | { "Receipt": ReceiptArtifact } | { "ReceiptList": Array<ReceiptListEntry> } | { "Verified": ReceiptSummary } | { "VerifiedFull": FullReceiptSummary } | { "DaemonInfo": DaemonInfo } | "Subscribed" | "ActivitySubscribed" | { "Hosts": Array<HostStatus> } | { "HostStatus": HostStatus } | { "HostOpened": HostInfo };
 
 export type RosterEntry = { participant: number, status: Cell, detail: string | null, };
 

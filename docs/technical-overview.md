@@ -277,9 +277,11 @@ sending its terminal evidence until its peers confirm the same conclusion; the
 `Open`/`Ending`/`Ended` end phase is specified in
 [Terminal evidence and publication](protocol-architecture.md#terminal-evidence-and-publication).
 
-Portable verification is the only verification boundary. It authenticates the
+Light verification authenticates the
 certified facts without loading or executing Wasm; the checks it performs are
 listed in [Receipts and verification](protocol-architecture.md#11-receipts-and-verification).
+Full verification also replays the program in a Host, as specified in
+[Receipts and verification](protocol-architecture.md#11-receipts-and-verification).
 Every format carries an explicit version, and decoders reject unsupported ones;
 the current versions are listed with the
 [preserved invariants](protocol-architecture.md#14-preserved-invariants).
