@@ -4184,8 +4184,38 @@ impl HostService {
     /// [`arena0_node::ReplayError`], is `Verification` carrying the error's
     /// message. The replay runs on a blocking thread, like `view_at_step`.
     async fn verify_full(&self, receipt: ReceiptRef) -> Response {
-        let _ = receipt;
-        todo!("STUB(FV2)")
+        let artifact = self.resolve_receipt(receipt).await?;
+        let activation = &artifact.body().header().activation;
+        if activation.offer().data().execution_profile
+            != arena0_program::ExecutionProfile::current().hash()
+        {
+            return Err(ApiError::new(
+                ApiErrorCode::Verification,
+                "execution profile is not supported by this runtime",
+            ));
+        }
+        let program = self
+            .catalog
+            .load_program(activation.offer().data().program_hash)
+            .await
+            .map_err(|error| ApiError::new(ApiErrorCode::NotFound, format!("{error}")))?;
+        let engine = Arc::clone(&self.engine);
+        tokio::task::spawn_blocking(move || {
+            let loaded = engine
+                .load(&program)
+                .map_err(|error| ApiError::new(ApiErrorCode::Internal, error.to_string()))?;
+            let verified = arena0_node::verify_full(&loaded, &artifact)
+                .map_err(|error| ApiError::new(ApiErrorCode::Verification, error.to_string()))?;
+            let outcome_json = verified.outcome_json.map(|json| {
+                serde_json::from_slice(json.as_bytes()).expect("JsonBytes contains validated JSON")
+            });
+            Ok(ResponseOk::VerifiedFull(arena0_api::FullReceiptSummary {
+                summary: artifact.summary(),
+                outcome_json,
+            }))
+        })
+        .await
+        .map_err(|error| ApiError::new(ApiErrorCode::Internal, error.to_string()))?
     }
 }
 

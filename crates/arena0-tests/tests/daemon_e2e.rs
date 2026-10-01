@@ -206,6 +206,149 @@ async fn daemon_hosts_play_and_verify() {
     );
 }
 
+// These surface checks cover routing, equality with light evidence, the live
+// outcome projection, and the missing-program error before replay starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn receipt_verify_full_replays_a_completed_session() {
+    let wasm = rps_wasm();
+    let d = daemon(&wasm).await;
+    let (exec_a, negotiation_id) = match ok(call(
+        &d.host_a,
+        &HostRequest::ExecNew {
+            exec_id: arena0_protocol::ExecId([0xa1; 32]),
+            program: d.program_id.to_string(),
+            params: Some(serde_json::Value::Null),
+            ensemble: EnsembleSpec::Create {
+                participant_count: 2,
+            },
+            blobs: vec![],
+        },
+    )
+    .await)
+    {
+        ResponseOk::ExecCreated {
+            exec_id,
+            negotiation_id: Some(id),
+            ..
+        } => (exec_id, id),
+        other => panic!("unexpected creator response: {other:?}"),
+    };
+    let exec_b = created(
+        call(
+            &d.host_b,
+            &HostRequest::ExecNew {
+                exec_id: arena0_protocol::ExecId([0xb1; 32]),
+                program: d.program_id.to_string(),
+                params: None,
+                ensemble: EnsembleSpec::Join {
+                    target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
+                },
+                blobs: vec![],
+            },
+        )
+        .await,
+    );
+    let (session_id, other_session) =
+        tokio::join!(drive(&d.host_a, exec_a), drive(&d.host_b, exec_b));
+    assert_eq!(session_id, other_session);
+
+    let ResponseOk::Next(NextEvent::Completed { outcome, .. }) =
+        ok(call(&d.host_a, &HostRequest::ExecNext { exec_id: exec_a }).await)
+    else {
+        panic!("expected completed execution");
+    };
+    assert!(outcome.is_some(), "RPS completion carries an outcome");
+    let ResponseOk::Verified(light) = ok(call(
+        &d.host_a,
+        &HostRequest::ReceiptVerify {
+            receipt: ReceiptRef::Produced(session_id),
+        },
+    )
+    .await) else {
+        panic!("expected light verification");
+    };
+    let ResponseOk::VerifiedFull(full) = ok(call(
+        &d.host_a,
+        &HostRequest::ReceiptVerifyFull {
+            receipt: ReceiptRef::Produced(session_id),
+        },
+    )
+    .await) else {
+        panic!("expected full verification");
+    };
+    assert_eq!(full.summary, light);
+    assert_eq!(full.outcome_json, outcome);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn receipt_verify_full_needs_the_program() {
+    let mut wasm = rps_wasm();
+    // An inert custom section gives this RPS copy a distinct content identity,
+    // so a normally bootstrapped third Host has never registered the program.
+    wasm.extend_from_slice(&[0, 5, 4, b'F', b'V', b'2', b'!']);
+    let d = daemon(&wasm).await;
+    let (exec_a, negotiation_id) = match ok(call(
+        &d.host_a,
+        &HostRequest::ExecNew {
+            exec_id: arena0_protocol::ExecId([0xa1; 32]),
+            program: d.program_id.to_string(),
+            params: Some(serde_json::Value::Null),
+            ensemble: EnsembleSpec::Create {
+                participant_count: 2,
+            },
+            blobs: vec![],
+        },
+    )
+    .await)
+    {
+        ResponseOk::ExecCreated {
+            exec_id,
+            negotiation_id: Some(id),
+            ..
+        } => (exec_id, id),
+        other => panic!("unexpected creator response: {other:?}"),
+    };
+    let exec_b = created(
+        call(
+            &d.host_b,
+            &HostRequest::ExecNew {
+                exec_id: arena0_protocol::ExecId([0xb1; 32]),
+                program: d.program_id.to_string(),
+                params: None,
+                ensemble: EnsembleSpec::Join {
+                    target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
+                },
+                blobs: vec![],
+            },
+        )
+        .await,
+    );
+    let (session_id, other_session) =
+        tokio::join!(drive(&d.host_a, exec_a), drive(&d.host_b, exec_b));
+    assert_eq!(session_id, other_session);
+
+    let ResponseOk::Receipt(artifact) = ok(call(
+        &d.host_a,
+        &HostRequest::ReceiptGet {
+            receipt: ReceiptRef::Produced(session_id),
+        },
+    )
+    .await) else {
+        panic!("expected receipt");
+    };
+    let other = daemon(&rps_wasm()).await;
+    let error = call(
+        &other.host_a,
+        &HostRequest::ReceiptVerifyFull {
+            receipt: ReceiptRef::Inline(artifact),
+        },
+    )
+    .await
+    .expect_err("unregistered program must fail");
+    assert_eq!(error.code, arena0_api::ApiErrorCode::NotFound);
+    assert!(error.message.contains(&d.program_id.to_string()), "{error}");
+}
+
 async fn assert_verified(target: &HostTarget, session_id: SessionHash) {
     let resp = ok(call(
         target,

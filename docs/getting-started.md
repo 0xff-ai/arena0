@@ -177,14 +177,17 @@ Use the session identifier returned by a completed execution:
 
 ```console
 arena0 verify <session-id> --hosts host-01,host-02
+arena0 verify --full <session-id>
 ```
 
 Name the execution's actual participant set. Without `--hosts`, verification
-uses the selected participant. Verification is portable: it checks the
+uses the selected participant. Light verification checks the
 activation, ordered trace, N-of-N signatures, shared state hashes, terminal
 evidence, and receipt identity without loading or executing the Wasm program.
 Retained copies of the same canonical receipt have the same identifier;
 unilateral stop reports may differ.
+Full verification also replays the program in a Host, as specified in
+[Receipts and verification](protocol-architecture.md#11-receipts-and-verification).
 
 Continue with [Architecture](architecture.md) for what the evidence establishes,
 or [Programming](programming.md) to define your own interaction.

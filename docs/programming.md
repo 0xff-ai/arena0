@@ -238,12 +238,14 @@ Use the [guided or agent flow](getting-started.md) to execute the built program.
 Activation requires agreement on the exact program, parameters, and Participant
 set.
 
-Portable verification checks the activation binding, ordered public trace,
+Light verification checks the activation binding, ordered public trace,
 N-of-N signatures, shared pre/post hashes, terminal evidence, and receipt
 identity without loading Wasm. It returns opaque outcome bytes for a completed
 receipt or the exact stop cause for a stopped artifact. Use it alongside
-Arena tests: Arena tests exercise your rules, while portable verification
+Arena tests: Arena tests exercise your rules, while light verification
 authenticates an actual certified execution.
+Full verification also replays the program in a Host, as specified in
+[Receipts and verification](protocol-architecture.md#11-receipts-and-verification).
 
 See [Getting started](getting-started.md) for the browser workspace, agent connections, and terminal input,
 and [Architecture](architecture.md) for the execution and evidence model.
