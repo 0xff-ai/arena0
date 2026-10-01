@@ -181,6 +181,11 @@ pub enum HostRequest {
     ReceiptList,
     #[serde(rename = "receipt.verify")]
     ReceiptVerify { receipt: ReceiptRef },
+    /// Full verification: the addressed Host replays the receipt in its own
+    /// catalog copy of the program. `receipt.verify` stays light and never
+    /// loads Wasm.
+    #[serde(rename = "receipt.verify_full")]
+    ReceiptVerifyFull { receipt: ReceiptRef },
 }
 
 /// The state `exec.await` blocks for: session established, or terminal.

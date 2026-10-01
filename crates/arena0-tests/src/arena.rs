@@ -616,6 +616,26 @@ pub struct Run {
 }
 
 impl Run {
+    /// Participant `participant`'s published receipt after `edit` changes its
+    /// trace and outcome bytes, re-certified so it still passes light
+    /// verification.
+    ///
+    /// Test-only forgery of what colluding participants could sign: every
+    /// entry's commitment is recomputed with `StepCommitment::for_entry`,
+    /// chained from `CHAIN_START`, and its agreement replaced by the N-of-N
+    /// aggregate of every participant's BLS signature over that commitment.
+    /// The header (activation and terminal) and params are kept. Panics if
+    /// the participant has no published receipt or the edited body fails
+    /// `ReceiptArtifact::new`.
+    pub fn recertified_receipt(
+        &self,
+        participant: usize,
+        edit: impl FnOnce(&mut Vec<TraceEntry>, &mut Vec<u8>),
+    ) -> ReceiptArtifact {
+        let _ = (participant, edit);
+        todo!("STUB(FV1)")
+    }
+
     /// The bytes of blob `hash` in the participant's blob store, exported
     /// through the store to a file in the participant's directory.
     pub async fn read_blob(&self, participant: usize, hash: BlobHash) -> Option<Vec<u8>> {

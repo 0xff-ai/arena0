@@ -17,7 +17,7 @@ pub use context::{
     ExecCommand, ExecContext, ExecError, HostExecutionStore, SessionMessage, SpawnedExec,
 };
 pub use ensemble::{Ensemble, EnsembleError};
-pub use execution::{ReplayError, replay_shared};
+pub use execution::{FullVerification, ReplayError, replay_shared, verify_full};
 pub use host::{Host, HostError};
 pub use machines::activation::{ActivatedSession, ActivatedSessionError};
 pub use machines::negotiation::{
