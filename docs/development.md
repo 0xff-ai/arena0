@@ -80,7 +80,9 @@ version pinned in `ui/package.json`.
 - `just test-ui` builds the required binaries and runs the live Playwright
   suites against Vite dev servers, so they test the UI source and need no
   `ui/dist`. Evidence goes to `ui/e2e/artifacts/`. The suites use
-  `/usr/bin/google-chrome`.
+  `/usr/bin/google-chrome`. The gallery and shell suites start their own Vite
+  server on `ARENA0_UI_TEST_PORT` (default 5173) and fail if the port is taken;
+  set it when `just ui-dev` or another server holds 5173.
 
 For development, run `just ui-dev`. It starts a daemon and a Vite server in front
 of it that reloads UI edits in place; open `http://127.0.0.1:5173/`, or
