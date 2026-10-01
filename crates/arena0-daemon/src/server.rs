@@ -2222,6 +2222,7 @@ impl HostService {
                     ))
                 }
                 HostRequest::ReceiptVerify { receipt } => self.verify(receipt).await,
+                HostRequest::ReceiptVerifyFull { receipt } => self.verify_full(receipt).await,
             }
         }
         .instrument(span)
@@ -4158,6 +4159,18 @@ impl HostService {
     async fn verify(&self, receipt: ReceiptRef) -> Response {
         let receipt = self.resolve_receipt(receipt).await?;
         Ok(ResponseOk::Verified(receipt.summary()))
+    }
+
+    /// Fully verify a receipt by replaying it in this Host's catalog copy of
+    /// the program the activation names.
+    ///
+    /// Errors: a program missing from the catalog is `NotFound` naming its
+    /// hash; an execution profile this runtime does not support, or any
+    /// [`arena0_node::ReplayError`], is `Verification` carrying the error's
+    /// message. The replay runs on a blocking thread, like `view_at_step`.
+    async fn verify_full(&self, receipt: ReceiptRef) -> Response {
+        let _ = receipt;
+        todo!("STUB(FV2)")
     }
 }
 

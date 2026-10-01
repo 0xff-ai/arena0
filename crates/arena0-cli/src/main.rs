@@ -193,6 +193,11 @@ enum Command {
         /// Verify every Host through these named local Hosts.
         #[arg(long, value_delimiter = ',', value_name = "HOSTS")]
         hosts: Vec<HostName>,
+        /// Also replay the receipt in the selected Host's copy of the program
+        /// (full verification). Needs the daemon, and the program in that
+        /// Host's catalog.
+        #[arg(long, conflicts_with = "hosts")]
+        full: bool,
     },
     /// Coordinate and verify one program across local Hosts.
     Run {
@@ -662,6 +667,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     if let Command::Verify {
         ref target,
         ref hosts,
+        ..
     } = command
         && !hosts.is_empty()
     {
@@ -679,7 +685,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // an explicit --host also bypasses context parsing altogether.
     let agent_context = match &command {
         Command::Stop => None,
-        Command::Verify { target, .. } if verify::is_path_target(Path::new(target), target) => None,
+        Command::Verify {
+            target,
+            full: false,
+            ..
+        } if verify::is_path_target(Path::new(target), target) => None,
         _ if host.is_some() => None,
         _ => context::AgentContext::from_env()?,
     };
@@ -687,7 +697,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let host = host
         .or_else(|| agent_context.as_ref().map(|context| context.host().clone()))
         .unwrap_or_default();
-    if let Command::Verify { ref target, .. } = command
+    // A full verification always goes through a Host, even for a file.
+    if let Command::Verify {
+        ref target,
+        full: false,
+        ..
+    } = command
         && verify::is_path_target(Path::new(target), target)
     {
         let palette = Palette::for_mode(mode);
@@ -728,6 +743,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Exec { command } => command.run(&ctx).await,
         Command::Watch { exec } => watch::watch(&ctx, exec).await,
         Command::Receipt { command } => command.run(&ctx).await,
+        Command::Verify {
+            target, full: true, ..
+        } => verify::verify_full(&ctx, target).await,
         Command::Verify { target, .. } => verify::verify(&ctx, target).await,
         Command::Run { .. } => unreachable!("coordinated run returned before client construction"),
         Command::Launch { .. } | Command::Ui(_) => {

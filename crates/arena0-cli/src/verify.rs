@@ -37,6 +37,18 @@ pub(crate) async fn verify(ctx: &Ctx, target: String) -> anyhow::Result<()> {
     }
 }
 
+/// Fully verify `target` through the selected Host.
+///
+/// A file path is read with [`read_receipt`] and sent inline; a receipt or
+/// session id resolves exactly as for light verification. The Host replays
+/// the receipt; the CLI never loads Wasm. Renders the light evidence with
+/// `verified (full)` as its first line and the program's JSON outcome in
+/// place of the "unavailable without the program" note.
+pub(crate) async fn verify_full(ctx: &Ctx, target: String) -> anyhow::Result<()> {
+    let _ = (ctx, target);
+    todo!("STUB(FV2)")
+}
+
 /// Verify every Host of one resident session through independently named
 /// local Hosts, then require their authenticated shared evidence to agree.
 pub(crate) async fn verify_hosts(
