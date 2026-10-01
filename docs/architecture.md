@@ -191,7 +191,7 @@ participant retains its own evidence for later inspection or verification.
 
 ## Verification
 
-Portable verification is the only verification boundary. It checks the
+Light verification checks the
 activation binding, signatures, the hash-linked trace, shared pre/post hashes,
 terminal evidence, and the receipt identity without loading the program; the
 [protocol architecture](protocol-architecture.md#11-receipts-and-verification)
@@ -199,6 +199,8 @@ lists the exact checks and format versions. A completed result includes
 authenticated opaque outcome bytes; a stopped result includes the exact stop
 cause. It authenticates certified facts and does not execute Wasm or claim to
 reproduce participant-specific state.
+Full verification also replays the program in a Host, as specified in
+[Receipts and verification](protocol-architecture.md#11-receipts-and-verification).
 
 ## Failure and trust
 
@@ -213,7 +215,7 @@ certified history across interruption. Recovery does not manufacture missing
 signatures or turn a unilateral observation into shared agreement.
 
 Signatures depend on key custody. Live execution depends on the exact program
-and its execution conditions, while portable verification authenticates the
+and its execution conditions, while light verification authenticates the
 resulting signed facts without rerunning the program. The current release runs
 all participants on one machine;
 separate identities and evidence do not protect them from compromise of that

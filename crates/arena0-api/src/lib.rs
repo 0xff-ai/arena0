@@ -153,6 +153,12 @@ mod tests {
                 },
                 "receipt.verify",
             ),
+            (
+                HostRequest::ReceiptVerifyFull {
+                    receipt: ReceiptRef::Produced(SessionHash([10u8; 32])),
+                },
+                "receipt.verify_full",
+            ),
         ];
         for (req, path) in cases {
             let json = serde_json::to_value(&req).unwrap();
