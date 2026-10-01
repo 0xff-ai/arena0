@@ -6,39 +6,39 @@ export type AbortOccurrence = { domain: [number, number, number, number, number,
 
 export type Activation = { version: number, prepared: PreparedActivation, aggregate: string, };
 
-export type ActivationInspection = { 
+export type ActivationInspection = {
 /**
  * Whether the permanent record is prepared or committed.
  */
-state: ActivationInspectionState, 
+state: ActivationInspectionState,
 /**
  * Negotiation identity fixed by the offer.
  */
-negotiation_id: string, 
+negotiation_id: string,
 /**
  * Session identity exists only after the activation certificate commits.
  */
-session_id: string | null, 
+session_id: string | null,
 /**
  * Commitment to the frozen offer terms.
  */
-offer_hash: string, 
+offer_hash: string,
 /**
  * Creator identity fixed by the offer.
  */
-creator: string, 
+creator: string,
 /**
  * Target participant count fixed by the offer.
  */
-target_size: number, 
+target_size: number,
 /**
  * Initial public state commitment fixed by the offer.
  */
-initial_state: string, 
+initial_state: string,
 /**
  * All selected participants in canonical activation order.
  */
-participants: Array<ActivationParticipant>, 
+participants: Array<ActivationParticipant>,
 /**
  * Offer params as JSON. Every participant of the offer signed them, so
  * they are public to the session's participants.
@@ -53,18 +53,18 @@ export type ActivityFrame = { boot_id: string, seq: number, ts: number, } & ({ "
 
 export type ActivityResult = { "kind": "ok" } | { "kind": "tool_error", "data": { code?: ApiErrorCode, } } | { "kind": "interrupted" };
 
-export type AggregateAttestation = { 
+export type AggregateAttestation = {
 /**
  * Aggregate of the signers' `StepCommitment` signatures. The separate
  * activation aggregate signs the `ActivationData` instead.
  */
-aggregate: string, 
+aggregate: string,
 /**
  * Which committed participants are in `aggregate`.
  */
 signers: SignerSet, };
 
-export type AgreedStep = { certified_at_ms: number, entry: TraceEntry, 
+export type AgreedStep = { certified_at_ms: number, entry: TraceEntry,
 /**
  * The step's message decoded with the program's Borsh message schema;
  * `None` for steps without a message (session start).
@@ -77,7 +77,7 @@ export type ApiErrorCode = "NotFound" | "BadRequest" | "CalloutNotPending" | "In
 
 export type AwaitState = "Active" | "Terminal";
 
-export type BlobEntry = { hash: string, length: number, 
+export type BlobEntry = { hash: string, length: number,
 /**
  * True for a path imported in place; false for an owned upload copy or
  * a file this Host received through execution.
@@ -90,19 +90,19 @@ export type BorshSchemaDocument = Array<number>;
 
 export type CalloutId = string;
 
-export type CalloutSchema = { 
+export type CalloutSchema = {
 /**
  * Machine-readable variant name.
  */
-name: string, 
+name: string,
 /**
  * Human-facing prompt describing what the agent should do.
  */
-prompt: string, 
+prompt: string,
 /**
  * Type of the context data sent with the callout request.
  */
-input: JsonSchemaDocument, 
+input: JsonSchemaDocument,
 /**
  * Type of the response the agent should return.
  */
@@ -112,7 +112,7 @@ export type Cell = { text: string, tone: Tone, participant?: number, };
 
 export type ColorDepth = "Mono" | "Ansi16" | "Ansi256" | "TrueColor";
 
-export type DaemonInfo = { version: string, abi_version: number, uptime_secs: number, socket: string, 
+export type DaemonInfo = { version: string, abi_version: number, uptime_secs: number, socket: string,
 /**
  * The daemon HTTP server, e.g. `http://127.0.0.1:43127`. MCP is at
  * `{http_url}/mcp`, the web UI at `{http_url}/`.
@@ -135,15 +135,15 @@ export type EventFrame = { host: HostInfo, boot_id: string, seq: number, ts: num
 
 export type EventKind = "session_started" | "message_received" | "input_received" | "timer_fired" | "direct_received";
 
-export type EventRecordSummary = { 
+export type EventRecordSummary = {
 /**
  * Authoritative local event position.
  */
-event_position: number, 
+event_position: number,
 /**
  * Public steps produced by this event, when any.
  */
-agreed_steps: Array<number>, event: EventKind, 
+agreed_steps: Array<number>, event: EventKind,
 /**
  * Size of the input payload, when the event has one. The payload is not
  * exposed.
@@ -160,15 +160,15 @@ export type ExecListEntry = { status: ExecStatus, activation: ActivationInspecti
 
 export type ExecOrigin = "request" | "recovery";
 
-export type ExecStatus = { 
+export type ExecStatus = {
 /**
  * Local end handshake; independent of receipt publication.
  */
-end: ExecEndStatus, exec_id: string, negotiation_id: string | null, program_id: ProgramHash, state: ExecStatusState, 
+end: ExecEndStatus, exec_id: string, negotiation_id: string | null, program_id: ProgramHash, state: ExecStatusState,
 /**
  * Local time the execution request was created, Unix milliseconds.
  */
-created_at_ms: number, 
+created_at_ms: number,
 /**
  * Local time of the execution's latest durable transition, Unix
  * milliseconds.
@@ -179,27 +179,27 @@ export type ExecStatusState = { "exec_state": "Negotiating", queue_position: num
 
 export type ExecutionFailureKind = "negotiation" | "host_stopped" | "program_aborted" | "runtime" | "invalid_guest_output";
 
-export type ExecutionInspection = { 
+export type ExecutionInspection = {
 /**
  * The ordinary lifecycle projection for this execution.
  */
-status: ExecStatus, 
+status: ExecStatus,
 /**
  * The durable activation evidence, when preparation has started.
  */
-activation: ActivationInspection | null, 
+activation: ActivationInspection | null,
 /**
  * The returned event-record window's first event position.
  */
-events_from: number, 
+events_from: number,
 /**
  * The bounded event-record projection.
  */
-events: Array<EventRecordSummary>, 
+events: Array<EventRecordSummary>,
 /**
  * Total event records currently durable for this execution.
  */
-events_total: number, 
+events_total: number,
 /**
  * Next event position available after this page, if more records exist.
  */
@@ -211,11 +211,11 @@ export type Fact = { label: string, value: Cell, };
 
 export type FileSource = { "path": string } | { "upload": string };
 
-export type FullReceiptSummary = { 
+export type FullReceiptSummary = {
 /**
  * Exactly the summary `receipt.verify` returns for the same artifact.
  */
-summary: ReceiptSummary, 
+summary: ReceiptSummary,
 /**
  * The program's JSON projection of the outcome: present exactly when the
  * receipt records a completion, `null` for a stop.
@@ -224,42 +224,42 @@ outcome_json: JsonValue | null, };
 
 export type HostInfo = { id: string, peer_id: string, user_agent: string | null, };
 
-export type HostRequest = { "method": "negotiation.offers" } | { "method": "host.info" } | { "method": "id.show" } | { "method": "program.list" } | { "method": "program.get", "params": { program: string, } } | { "method": "program.import", "params": { source: FileSource, } } | { "method": "blob.import", "params": { source: FileSource, } } | { "method": "blob.export", "params": { hash: string, path: string, } } | { "method": "blob.list" } | { "method": "program.remove", "params": { program: string, } } | { "method": "exec.new", "params": { 
+export type HostRequest = { "method": "negotiation.offers" } | { "method": "host.info" } | { "method": "id.show" } | { "method": "program.list" } | { "method": "program.get", "params": { program: string, } } | { "method": "program.import", "params": { source: FileSource, } } | { "method": "blob.import", "params": { source: FileSource, } } | { "method": "blob.export", "params": { hash: string, path: string, } } | { "method": "blob.list" } | { "method": "program.remove", "params": { program: string, } } | { "method": "exec.new", "params": {
 /**
  * Client-owned request identity. Knowing the id before transport lets
  * the caller clean up a creation whose response is delayed or lost.
  */
-exec_id: string, program: string, 
+exec_id: string, program: string,
 /**
  * Program params as JSON, validated against the program's `params`
  * schema.
  */
-params: JsonValue | null, ensemble: EnsembleSpec, 
+params: JsonValue | null, ensemble: EnsembleSpec,
 /**
  * Stored blobs this participant grants the execution to read, by
  * hash. Each must already be imported.
  */
-blobs: Array<string>, } } | { "method": "exec.list" } | { "method": "exec.status", "params": { exec_id: string, } } | { "method": "exec.inspect", "params": { exec_id: string, 
+blobs: Array<string>, } } | { "method": "exec.list" } | { "method": "exec.status", "params": { exec_id: string, } } | { "method": "exec.inspect", "params": { exec_id: string,
 /**
  * First event position to include. `None` selects the latest bounded
  * window, which is appropriate for live inspection UIs.
  */
-events_from: number | null, 
+events_from: number | null,
 /**
  * Non-zero maximum number of event summaries to return. The daemon
  * enforces its fixed upper bound before reading the store.
  */
-events_limit: number, } } | { "method": "exec.await", "params": { exec_id: string, until: AwaitState, } } | { "method": "exec.next", "params": { exec_id: string, } } | { "method": "exec.submit", "params": { exec_id: string, pending_id: CalloutId, 
+events_limit: number, } } | { "method": "exec.await", "params": { exec_id: string, until: AwaitState, } } | { "method": "exec.next", "params": { exec_id: string, } } | { "method": "exec.submit", "params": { exec_id: string, pending_id: CalloutId,
 /**
  * The answer as JSON, validated against the pending callout's `output`
  * schema.
  */
-answer: JsonValue | null, } } | { "method": "exec.query", "params": { exec_id: string, 
+answer: JsonValue | null, } } | { "method": "exec.query", "params": { exec_id: string,
 /**
  * The query request as JSON, validated against the program's query
  * request schema.
  */
-query: JsonValue | null, } } | { "method": "exec.view", "params": { exec: string, width: number, color: ColorDepth, 
+query: JsonValue | null, } } | { "method": "exec.view", "params": { exec: string, width: number, color: ColorDepth,
 /**
  * Render the shared state after this agreed step. `None` renders the
  * latest state.
@@ -268,7 +268,7 @@ at_step: number | null, } } | { "method": "exec.trace", "params": { exec_id: str
 
 export type HostStatus = { host: HostInfo, transport_key: string, programs: number, execs_active: number, };
 
-export type IdInfo = { peer_id: string, 
+export type IdInfo = { peer_id: string,
 /**
  * The persistent Ed25519 identity key used by the Host.
  * `peer_id` is derived from this key. The execution BLS key is minted per exec,
@@ -282,7 +282,7 @@ export type JsonSchemaDocument = number | string | boolean | Array<JsonValue> | 
 
 export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null;
 
-export type MessageSchema = { 
+export type MessageSchema = {
 /**
  * Borsh layout of the program's complete peer-message type.
  */
@@ -290,11 +290,11 @@ borsh: BorshSchemaDocument, };
 
 export type NegotiationStage = "gossiping" | "prepared";
 
-export type NegotiationTarget = { 
+export type NegotiationTarget = {
 /**
  * The Host that authored the offer.
  */
-creator: string, 
+creator: string,
 /**
  * The negotiation published by the creator.
  */
@@ -306,58 +306,58 @@ export type Offer = { data: OfferData, tickets: Array<string>, };
 
 export type OfferClosedReason = "complete" | "expired" | "unwatched";
 
-export type OfferData = { 
+export type OfferData = {
 /**
  * The fixed offer domain [`OFFER_DOMAIN`].
  */
-domain: [number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number], 
+domain: [number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number],
 /**
  * The offer format version [`OFFER_VERSION`].
  */
-version: number, 
+version: number,
 /**
  * Random, creator-chosen; spans re-offers.
  */
-negotiation_id: string, 
+negotiation_id: string,
 /**
  * Re-offer counter: a deserted offer is replaced by a new `offer_seq`.
  */
-offer_seq: number, 
+offer_seq: number,
 /**
  * Binds the offer to the creator (ed25519 does not recover keys).
  */
-creator: string, 
+creator: string,
 /**
  * The program's content hash.
  */
-program_hash: ProgramHash, 
+program_hash: ProgramHash,
 /**
  * Hash of the complete deterministic execution environment.
  */
-execution_profile: ExecutionProfileHash, 
+execution_profile: ExecutionProfileHash,
 /**
  * Exact agent-facing JSON parameter bytes, ≤ [`MAX_PARAMS_LEN`]. The
  * guest owns JSON decoding into its concrete parameter DTO.
  */
-params: JsonBytes, 
+params: JsonBytes,
 /**
  * The ensemble size the creator is collecting.
  */
-target_size: number, 
+target_size: number,
 /**
  * The program's initial state this offer activates.
  */
-initial_state: string, 
+initial_state: string,
 /**
  * Offer deadline in Unix milliseconds; past it, the offer is deserted.
  */
 deadline_unix_ms: number, };
 
-export type OpenOffer = { program_id: ProgramHash, negotiation_id: string, creator: string, offer_seq: number, target_size: number, 
+export type OpenOffer = { program_id: ProgramHash, negotiation_id: string, creator: string, offer_seq: number, target_size: number,
 /**
  * Offer params as JSON; every joiner signs these terms.
  */
-params: JsonValue, deadline_unix_ms: number, 
+params: JsonValue, deadline_unix_ms: number,
 /**
  * Local time this Host first saw this negotiation, Unix milliseconds.
  */
@@ -367,19 +367,19 @@ export type ParticipantCount = { "kind": "exact", count: number, } | { "kind": "
 
 export type PendingCalloutStatus = { pending_id: CalloutId, callout_index: number, name: string, prompt: string, schema: JsonSchemaDocument, context: JsonValue, };
 
-export type PhaseSchema = { 
+export type PhaseSchema = {
 /**
  * Machine-readable phase name, as reported by the turn projection.
  */
-name: string, 
+name: string,
 /**
  * Human-facing description of the phase.
  */
-description: string, 
+description: string,
 /**
  * Whether a new session starts in this phase.
  */
-is_default: boolean, 
+is_default: boolean,
 /**
  * Whether the session ends once it reaches this phase.
  */
@@ -391,31 +391,31 @@ export type ProgramDetail = { summary: ProgramSummary, schema: ProgramSchema, };
 
 export type ProgramHash = string;
 
-export type ProgramSchema = { 
+export type ProgramSchema = {
 /**
  * Schema for the program's persistent state.
  */
-state: StateSchema, 
+state: StateSchema,
 /**
  * Callout variants the program can request from agents.
  */
-callouts: Array<CalloutSchema>, 
+callouts: Array<CalloutSchema>,
 /**
  * Message types the program sends/receives between peers.
  */
-messages: Array<MessageSchema>, 
+messages: Array<MessageSchema>,
 /**
  * Schema for program initialization parameters.
  */
-params: JsonSchemaDocument, 
+params: JsonSchemaDocument,
 /**
  * Query endpoints the program exposes for read-only state inspection.
  */
-queries: Array<QuerySchema>, 
+queries: Array<QuerySchema>,
 /**
  * The program's derived terminal outcome.
  */
-outcome: JsonSchemaDocument, 
+outcome: JsonSchemaDocument,
 /**
  * Lifecycle phases the program declares, in declaration order. Empty when
  * the program declares none.
@@ -424,19 +424,19 @@ phases: Array<PhaseSchema>, };
 
 export type ProgramSummary = { program_hash: ProgramHash, name: string, display_name: string, version: string, description: string, participants: ParticipantCount, };
 
-export type QuerySchema = { 
+export type QuerySchema = {
 /**
  * Machine-readable query name.
  */
-name: string, 
+name: string,
 /**
  * Human-facing label for the query.
  */
-label: string, 
+label: string,
 /**
  * Type of the query request payload.
  */
-request: JsonSchemaDocument, 
+request: JsonSchemaDocument,
 /**
  * Type of the query response payload.
  */
@@ -454,31 +454,31 @@ export type ReceiptProvenance = "produced" | "imported" | "both";
 
 export type ReceiptRef = { "Produced": string } | { "Stored": string } | { "Inline": ReceiptArtifact };
 
-export type ReceiptSummary = { 
+export type ReceiptSummary = {
 /**
  * The content identity of the verified artifact.
  */
-receipt_id: string, 
+receipt_id: string,
 /**
  * The content-addressed program named by the activation.
  */
-program_id: ProgramHash, 
+program_id: ProgramHash,
 /**
  * The activation-derived session identity.
  */
-session_id: string, 
+session_id: string,
 /**
  * The canonical participant order used by signer bitmaps.
  */
-ensemble: Array<string>, 
+ensemble: Array<string>,
 /**
  * Number of contiguous certified trace entries.
  */
-steps: number, 
+steps: number,
 /**
  * The authenticated terminal classification and, for a stop, its cause.
  */
-terminal: ReceiptTermination, 
+terminal: ReceiptTermination,
 /**
  * Opaque stock-Borsh outcome bytes, present exactly for a completion.
  */
@@ -488,15 +488,15 @@ export type ReceiptTermination = "Completed" | { "Stopped": { cause: StopCause, 
 
 export type Request = { "method": "host.call", "params": { host: string, request: HostRequest, } } | { "method": "daemon.info" } | { "method": "daemon.stop" } | { "method": "hosts.list" } | { "method": "hosts.open", "params": { id: string | null, user_agent: string, } } | { "method": "activity.subscribe" };
 
-export type ResponseOk = "Ack" | { "Id": IdInfo } | { "Program": ProgramDetail } | { "ProgramList": Array<ProgramSummary> } | { "Offers": Array<OpenOffer> } | { "BlobImported": { hash: string, length: number, } } | { "BlobExported": { length: number, } } | { "BlobList": Array<BlobEntry> } | { "ExecCreated": { exec_id: string, 
+export type ResponseOk = "Ack" | { "Id": IdInfo } | { "Program": ProgramDetail } | { "ProgramList": Array<ProgramSummary> } | { "Offers": Array<OpenOffer> } | { "BlobImported": { hash: string, length: number, } } | { "BlobExported": { length: number, } } | { "BlobList": Array<BlobEntry> } | { "ExecCreated": { exec_id: string,
 /**
  * The selected negotiation, absent while an open Join is listening.
  */
-negotiation_id: string | null, 
+negotiation_id: string | null,
 /**
  * Absent until the N-of-N activation is durably stored.
  */
-session_id: string | null, exec_state: ExecLifecycle, queue_position: number | null, } } | { "ExecList": Array<ExecListEntry> } | { "Status": ExecStatus } | { "Inspection": ExecutionInspection } | { "Awaited": { exec_id: string, exec_state: ExecLifecycle, reason: string | null, } } | { "Next": NextEvent } | { "Query": { result: JsonValue, } } | { "ExecView": { 
+session_id: string | null, exec_state: ExecLifecycle, queue_position: number | null, } } | { "ExecList": Array<ExecListEntry> } | { "Status": ExecStatus } | { "Inspection": ExecutionInspection } | { "Awaited": { exec_id: string, exec_state: ExecLifecycle, reason: string | null, } } | { "Next": NextEvent } | { "Query": { result: JsonValue, } } | { "ExecView": {
 /**
  * Index of the latest agreed step applied to the rendered state (steps
  * are numbered from 0, like trace entries). `None` renders the initial
@@ -506,11 +506,11 @@ step: number | null, view: View, } } | { "Trace": Array<AgreedStep> } | { "Recei
 
 export type RosterEntry = { participant: number, status: Cell, detail: string | null, };
 
-export type SessionHeader = { 
+export type SessionHeader = {
 /**
  * The confirmed session activation: the offer and its exact ticket set.
  */
-activation: Activation, 
+activation: Activation,
 /**
  * The terminal classification and, for a stop, its authenticated cause.
  * Completion evidence is retained in the final certified trace entry.
@@ -519,24 +519,24 @@ terminal: ReceiptTermination, };
 
 export type SessionProgress = { "session_state": "Activated", session_id: string, } | { "session_state": "Started", session: SessionStatus, };
 
-export type SessionStatus = { session_id: string, step: number, 
+export type SessionStatus = { session_id: string, step: number,
 /**
  * The committed remote participants. This excludes the local Host and is
  * not a transport-liveness view.
  */
-peers: Array<string>, 
+peers: Array<string>,
 /**
  * The committed ensemble size, not the live transport stream count.
  */
-participants: number, pending_callout: PendingCalloutStatus | null, 
+participants: number, pending_callout: PendingCalloutStatus | null,
 /**
  * Whether this Host's locally produced artifact is durably available.
  */
-receipt_available: boolean, 
+receipt_available: boolean,
 /**
  * The participant allowed to author the next agreed message, if any.
  */
-writer: string | null, 
+writer: string | null,
 /**
  * The program's current phase name, for programs that declare phases.
  */
@@ -548,41 +548,41 @@ export type SignerSet = Array<number>;
 
 export type Slot = "Header" | "Agents" | "State" | "StatusBar";
 
-export type StateSchema = { 
+export type StateSchema = {
 /**
  * Type layout of the state.
  */
-schema: JsonSchemaDocument, 
+schema: JsonSchemaDocument,
 /**
  * Maximum serialized state size in bytes.
  */
 max_bytes: number, };
 
-export type StepCommitment = { 
+export type StepCommitment = {
 /**
  * Domain separation tag ([`STEP_COMMIT_DOMAIN`]).
  */
-domain: [number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number], 
+domain: [number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number],
 /**
  * Session this entry belongs to.
  */
-session_id: string, 
+session_id: string,
 /**
  * Canonical public position of the entry.
  */
-step: number, 
+step: number,
 /**
  * blake3 of the entry's canonical bytes ([`TraceEntry::entry_hash`]).
  */
-entry_hash: [number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number], 
+entry_hash: [number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number],
 /**
  * Shared state hash before the entry.
  */
-pre_state: string, 
+pre_state: string,
 /**
  * Shared state hash after the entry.
  */
-post_state: string, 
+post_state: string,
 /**
  * blake3 of the previous position's commitment signing bytes
  * ([`StepCommitment::link_hash`]); [`CHAIN_START`] at position 0.
@@ -591,29 +591,29 @@ link: [number, number, number, number, number, number, number, number, number, n
 
 export type StepCursor = { next_step: number, state_hash: string, chain_hash: [number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number], };
 
-export type StepEvent = { "SessionStarted": { 
+export type StepEvent = { "SessionStarted": {
 /**
  * Committed participant set in canonical order.
  */
-ensemble: Ensemble, } } | { "Message": { 
+ensemble: Ensemble, } } | { "Message": {
 /**
  * Authenticated author.
  */
-from: string, 
+from: string,
 /**
  * Opaque program payload.
  */
 data: Array<number>, } };
 
-export type StepTerminal = { "End": { 
+export type StepTerminal = { "End": {
 /**
  * Opaque outcome bytes.
  */
-outcome: Array<number>, } } | { "Abort": { 
+outcome: Array<number>, } } | { "Abort": {
 /**
  * Human-readable reason.
  */
-reason: string, } } | { "Fail": { 
+reason: string, } } | { "Fail": {
 /**
  * Human-readable reason.
  */
@@ -621,51 +621,51 @@ reason: string, } };
 
 export type StopCause = { "Authenticated": AbortOccurrence } | { "Shared": { kind: AbortKind, commitment: StepCommitment, reason: string, } };
 
-export type Ticket = { data: TicketData, 
+export type Ticket = { data: TicketData,
 /**
  * ed25519 over `TicketData`, verified with `data.signer`.
  */
 signature: string, };
 
-export type TicketAction = { "Active": { 
+export type TicketAction = { "Active": {
 /**
  * The per-execution BLS public key the activation aggregate verifies
  * against.
  */
-execution_bls: string, 
+execution_bls: string,
 /**
  * BLS over `BLS_BINDING_DOMAIN || OfferHash || signer || execution_bls`
  * with the dedicated binding ciphersuite: scope-bound possession
  * proof (stops copy-squatting and the rogue-key attack).
  */
-key_binding: string, 
+key_binding: string,
 /**
  * Issue timestamp in Unix milliseconds.
  */
-issued_at_unix_ms: number, 
+issued_at_unix_ms: number,
 /**
  * Validity window in milliseconds, capped at
  * [`MAX_TICKET_LIFETIME_MS`].
  */
 valid_for_ms: number, } } | "Withdrawn";
 
-export type TicketData = { 
+export type TicketData = {
 /**
  * The fixed ticket domain [`TICKET_DOMAIN`].
  */
-domain: [number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number], 
+domain: [number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number],
 /**
  * The ticket format version [`TICKET_VERSION`].
  */
-version: number, negotiation_id: string, 
+version: number, negotiation_id: string,
 /**
  * Which offer this ticket is for.
  */
-offer_seq: number, 
+offer_seq: number,
 /**
  * The ticket issuer's identity.
  */
-signer: string, 
+signer: string,
 /**
  * Monotonic current-head revision for this issuer.
  */
@@ -673,31 +673,31 @@ revision: number, action: TicketAction, };
 
 export type Tone = "normal" | "muted" | "good" | "warn" | "bad" | "highlight";
 
-export type TraceEntry = { 
+export type TraceEntry = {
 /**
  * Trace schema version.
  */
-trace_version: number, 
+trace_version: number,
 /**
  * Canonical agreed position.
  */
-step: number, 
+step: number,
 /**
  * The agreed event.
  */
-event: StepEvent, 
+event: StepEvent,
 /**
  * Shared state hash before the entry.
  */
-pre_state: string, 
+pre_state: string,
 /**
  * Shared state hash after the entry.
  */
-post_state: string, 
+post_state: string,
 /**
  * The terminal value when this step ended the session.
  */
-terminal: StepTerminal | null, 
+terminal: StepTerminal | null,
 /**
  * N-of-N agreement over the commitment.
  */
@@ -705,7 +705,7 @@ agreement: AggregateAttestation, };
 
 export type Uploaded = { upload: string, length: number, };
 
-export type View = { slots: { [key in Slot]?: string }, 
+export type View = { slots: { [key in Slot]?: string },
 /**
  * Typed blocks for rich clients. Text slots remain the portable
  * rendering; clients that do not understand a block ignore it.
