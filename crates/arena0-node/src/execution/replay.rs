@@ -11,7 +11,8 @@
 
 use arena0_program::{CallStatus, JsonBytes, SharedStateBytes};
 use arena0_protocol::{
-    ExecutionBinding, PeerId, ReceiptArtifact, StateHash, StepTerminal, TraceEntry,
+    ExecutionBinding, PeerId, ReceiptArtifact, ReceiptTermination, StateHash, StepTerminal,
+    TraceEntry,
 };
 use arena0_sandbox::{DispatchCall, LoadedProgram, SandboxError};
 
@@ -90,6 +91,18 @@ pub fn replay_shared(
                 actual,
             });
         }
+        let actual = result
+            .observations
+            .effects
+            .iter()
+            .find_map(StepTerminal::from_effect);
+        if actual != entry.terminal {
+            return Err(ReplayError::Terminal {
+                step,
+                expected: entry.terminal.clone(),
+                actual,
+            });
+        }
         instance
             .commit()
             .map_err(|source| ReplayError::Guest { step, source })?;
@@ -127,8 +140,38 @@ pub fn verify_full(
     program: &LoadedProgram,
     artifact: &ReceiptArtifact,
 ) -> Result<FullVerification, ReplayError> {
-    let _ = (program, artifact);
-    todo!("STUB(FV1)")
+    let body = artifact.body();
+    let binding = ExecutionBinding::new(body.header().activation.clone())
+        .expect("an authenticated receipt carries a valid activation");
+    assert_eq!(
+        program.program().hash(),
+        binding.program_hash(),
+        "verify_full needs the activation's program"
+    );
+    assert_eq!(
+        program.profile().hash(),
+        binding.execution_profile(),
+        "verify_full needs the activation's execution profile"
+    );
+    let ensemble = binding
+        .ensemble()
+        .expect("validated activation has a committed ensemble");
+    let local_peer = ensemble.peers()[0];
+    let shared = replay_shared(program, &binding, local_peer, body.trace())?;
+    match body.termination() {
+        ReceiptTermination::Completed => {
+            let projection = program
+                .outcome(&shared, &ensemble)
+                .map_err(|source| ReplayError::OutcomeProjection { source })?;
+            if projection.borsh.as_bytes() != body.outcome() {
+                return Err(ReplayError::Outcome);
+            }
+            Ok(FullVerification {
+                outcome_json: Some(projection.json),
+            })
+        }
+        ReceiptTermination::Stopped { .. } => Ok(FullVerification { outcome_json: None }),
+    }
 }
 
 /// Why a replay of agreed steps did not reproduce the agreed states.
