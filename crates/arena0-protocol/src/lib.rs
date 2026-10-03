@@ -117,4 +117,4 @@ pub use trace::{
     TRACE_FORMAT_VERSION, TraceEntry,
 };
 pub use verify::VerifyError;
-pub use view::{ColorDepth, Slot, View, Viewport};
+pub use view::{Block, Cell, ColorDepth, Fact, RosterEntry, Slot, Tone, View, ViewError, Viewport};

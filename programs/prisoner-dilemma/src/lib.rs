@@ -31,6 +31,9 @@ impl Choice {
     }
 }
 
+/// Table rows a view may carry; see [`arena0::types::View::validate`].
+const MAX_TABLE_ROWS: usize = 64;
+
 fn payoff(mine: Choice, theirs: Choice) -> (u32, u32) {
     match (mine, theirs) {
         (Choice::Cooperate, Choice::Cooperate) => (3, 3),
@@ -221,6 +224,54 @@ pub mod prisoner_dilemma {
                 current_round,
                 state.total_rounds
             )))
+            .block(rounds_block(state))
+            .block(totals_block(state))
+    }
+
+    /// Recorded rounds, keeping the latest ones when a long match exceeds the
+    /// table limit.
+    fn rounds_block(state: &Shared) -> Block {
+        let skipped = state.history.len().saturating_sub(MAX_TABLE_ROWS);
+        let rows = state
+            .history
+            .iter()
+            .enumerate()
+            .skip(skipped)
+            .map(|(index, [p0, p1])| {
+                let (pay0, pay1) = payoff(*p0, *p1);
+                vec![
+                    Cell::text((index + 1).to_string()),
+                    Cell::text(p0.glyph()).participant(0),
+                    Cell::text(p1.glyph()).participant(1),
+                    Cell::text(pay0.to_string()).participant(0),
+                    Cell::text(pay1.to_string()).participant(1),
+                ]
+            })
+            .collect();
+        Block::Table {
+            title: Some("Rounds".into()),
+            columns: ["Round", "P0", "P1", "Payoff P0", "Payoff P1"]
+                .map(String::from)
+                .to_vec(),
+            rows,
+        }
+    }
+
+    fn totals_block(state: &Shared) -> Block {
+        Block::Roster {
+            title: Some("Totals".into()),
+            entries: (0..2u8)
+                .map(|participant| RosterEntry {
+                    participant,
+                    status: Cell::text(format!(
+                        "{} points",
+                        state.scores[usize::from(participant)]
+                    ))
+                    .participant(participant),
+                    detail: None,
+                })
+                .collect(),
+        }
     }
 
     fn render_agents(state: &Shared, me: Option<usize>) -> String {
@@ -275,8 +326,8 @@ pub mod prisoner_dilemma {
     }
 
     fn player_label(idx: usize, me: Option<usize>) -> String {
-        // Role first, seat index second (L047): the human always reads
-        // "you"/"opponent" first no matter which seat they hold.
+        // Role first, participant index second (L047): the human always reads
+        // "you"/"opponent" first no matter which participant they are.
         match me {
             Some(me) if idx == me => format!("you (P{idx})"),
             Some(_) => format!("opponent (P{idx})"),

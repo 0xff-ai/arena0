@@ -10,7 +10,7 @@ use crate::{LocalStateBytes, SharedStateBytes};
 use crate::Capability;
 
 /// Current ABI version. A sandbox rejects modules declaring a different one.
-pub const ABI_VERSION: u32 = 24;
+pub const ABI_VERSION: u32 = 25;
 
 /// Wasm import module name for all arena0 host functions.
 pub const HOST_MODULE: &str = "arena0";
@@ -21,6 +21,8 @@ pub const MAX_CALL_PAYLOAD_BYTES: usize = crate::profile::MAX_INPUT_BYTES as usi
 pub const MAX_SESSION_CONTEXT_BYTES: usize = 1024 * 1024;
 /// Maximum UTF-8 bytes returned as the reason for a rejected input dispatch.
 pub const MAX_REJECTION_REASON_BYTES: usize = 1024;
+/// Maximum UTF-8 bytes in the phase name returned by the turn projection.
+pub const MAX_PHASE_NAME_BYTES: usize = 64;
 /// Maximum bytes in the JSON context of one derived open callout.
 pub const MAX_CALLOUT_CONTEXT_BYTES: usize = 64 * 1024;
 /// Host bytes a synchronous `sign` call adds around the guest payload: the
@@ -37,6 +39,8 @@ pub const VERIFY_RESULT_OVERHEAD_BYTES: usize = 8;
 
 /// Bounded, complete JSON bytes at an agent-facing request or projection boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(as = "Vec<u8>"))]
 pub struct JsonBytes(Vec<u8>);
 
 impl JsonBytes {
@@ -176,8 +180,9 @@ pub mod exports {
     pub const LOCAL_MEMORY: &str = "arena0_local";
     /// Produce the agent-facing terminal outcome.
     pub const OUTCOME: &str = "arena0_outcome";
-    /// Select the sole participant eligible to author the next program message.
-    pub const WRITER: &str = "arena0_writer";
+    /// Report the sole participant eligible to author the next program message
+    /// and the program's current phase.
+    pub const TURN: &str = "arena0_turn";
     /// Answer one agent-facing query.
     pub const QUERY: &str = "arena0_query";
     /// Produce one viewport projection.
@@ -527,25 +532,32 @@ pub struct OutcomeInput {
     pub session: Vec<u8>,
 }
 
-/// Read-only input for selecting the next program-message writer.
+/// Read-only input for the program's turn projection.
 ///
-/// Writer selection is deliberately a function of replicated state alone. The
-/// host invokes it before applying a candidate message so transport arrival
-/// order cannot choose between sibling state transitions.
+/// The turn is deliberately a function of replicated state alone. The host
+/// invokes it before applying a candidate message so transport arrival order
+/// cannot choose between sibling state transitions.
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct WriterInput {
+pub struct TurnInput {
     /// Explicit replicated state bytes.
     pub shared: SharedStateBytes,
 }
 
-/// Sole participant eligible to author the next program message.
+/// Who may author the next program message, and the program's current phase.
 ///
-/// `None` means that no program message is admissible from the current shared
-/// state. The host validates a returned index against the committed ensemble.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct WriterOutput {
-    /// Stable participant index in the committed ensemble.
+/// The host validates a returned participant index against the committed
+/// ensemble.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct TurnOutput {
+    /// Stable participant index in the committed ensemble; `None` means no
+    /// program message is admissible from this state.
     pub participant: Option<u8>,
+    /// The current phase's declared name, for programs that declare phases.
+    #[borsh(
+        serialize_with = "bounded::write_option_string::<MAX_PHASE_NAME_BYTES>",
+        deserialize_with = "bounded::read_option_string::<MAX_PHASE_NAME_BYTES>"
+    )]
+    pub phase: Option<String>,
 }
 
 impl OutcomeInput {
@@ -994,22 +1006,26 @@ mod tests {
             outcome_output
         );
 
-        let writer = WriterInput {
+        let turn = TurnInput {
             shared: shared.clone(),
         };
         assert_eq!(
-            borsh::from_slice::<WriterInput>(&borsh::to_vec(&writer).unwrap()).unwrap(),
-            writer
+            borsh::from_slice::<TurnInput>(&borsh::to_vec(&turn).unwrap()).unwrap(),
+            turn
         );
 
         for output in [
-            WriterOutput { participant: None },
-            WriterOutput {
+            TurnOutput {
+                participant: None,
+                phase: None,
+            },
+            TurnOutput {
                 participant: Some(3),
+                phase: Some("playing".into()),
             },
         ] {
             assert_eq!(
-                borsh::from_slice::<WriterOutput>(&borsh::to_vec(&output).unwrap()).unwrap(),
+                borsh::from_slice::<TurnOutput>(&borsh::to_vec(&output).unwrap()).unwrap(),
                 output
             );
         }

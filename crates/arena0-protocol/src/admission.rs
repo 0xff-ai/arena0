@@ -15,6 +15,7 @@ const ADMISSION_VERSION: u8 = 1;
 /// accepts before the local ticket is signed, so a retry cannot move the
 /// execution to another offer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct NegotiationTarget {
     /// The Host that authored the offer.
     pub creator: PeerId,

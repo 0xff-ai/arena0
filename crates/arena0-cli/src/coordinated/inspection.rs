@@ -176,6 +176,8 @@ mod tests {
                         state: ExecStatusState::Negotiating {
                             queue_position: None,
                         },
+                        created_at_ms: 0,
+                        updated_at_ms: 0,
                     },
                     activation: None,
                     events_from: from,
@@ -348,6 +350,8 @@ mod tests {
                     state: ExecStatusState::Negotiating {
                         queue_position: None,
                     },
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
                 },
                 activation: None,
                 events_from: events_from.unwrap_or(0),

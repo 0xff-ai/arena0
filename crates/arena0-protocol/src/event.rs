@@ -15,6 +15,7 @@ use crate::{Attachment, Ensemble, MAX_DIRECT_CONTROL_BYTES, PeerId, TimerPayload
 /// Kind of an [`Event`], for diagnostics that never expose its payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum EventKind {
     SessionStarted,
     MessageReceived,

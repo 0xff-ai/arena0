@@ -177,6 +177,21 @@ pub struct Ed25519Signature(pub [u8; 64]);
 /// arrays up to 32 bytes, so these are hand-rolled).
 macro_rules! hex_bytes {
     ($name:ident, $n:literal) => {
+        // Match the shared hex serializer, independent of the byte-array size.
+        #[cfg(feature = "ts")]
+        impl ts_rs::TS for $name {
+            type WithoutGenerics = Self;
+            type OptionInnerType = Self;
+
+            fn name(_: &ts_rs::Config) -> String {
+                "string".into()
+            }
+
+            fn inline(_: &ts_rs::Config) -> String {
+                "string".into()
+            }
+        }
+
         impl fmt::Debug for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 write!(f, "{}({}…)", stringify!($name), hex::encode(&self.0[..4]))

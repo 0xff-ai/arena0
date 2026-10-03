@@ -3,8 +3,8 @@
 use crate::call::DispatchKind;
 use arena0_program::{
     CallStatus, DispatchOutput, InitInput, JsonBytes, LocalStateBytes, OutcomeInput, OutcomeOutput,
-    QueryInput, QueryOutput, SharedStateBytes, StateFrameError, ViewInput, ViewOutput, WriterInput,
-    WriterOutput, abi,
+    QueryInput, QueryOutput, SharedStateBytes, StateFrameError, TurnInput, TurnOutput, ViewInput,
+    ViewOutput, abi,
 };
 use arena0_protocol::{Committed, Ensemble};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -16,7 +16,7 @@ use crate::call::{DispatchCall, DispatchParts, serialize};
 use crate::finalize::MUTABLE_GLOBAL_EXPORT_PREFIX;
 use crate::{
     CallObservations, DispatchCallResult, GuestOutcomeResult, GuestProjectionResult,
-    GuestWriterResult, InitializedState, SandboxError,
+    GuestTurnResult, InitializedState, SandboxError,
 };
 
 impl super::LoadedProgram {
@@ -123,21 +123,24 @@ impl super::LoadedProgram {
         Ok(resident)
     }
 
-    /// Execute the pure next-writer projection in a fresh guest instance.
-    pub fn writer(
+    /// Execute the pure turn projection in a fresh guest instance: who may
+    /// author the next program message, and the program's current phase.
+    pub fn turn(
         &self,
         shared: &SharedStateBytes,
         session: &Ensemble<Committed>,
-    ) -> Result<GuestWriterResult, SandboxError> {
+    ) -> Result<GuestTurnResult, SandboxError> {
         self.validate_shared_state(shared)?;
         let participant_count = session.len();
-        let input = WriterInput {
+        let input = TurnInput {
             shared: shared.clone(),
         };
-        let (output, fuel_used) = self.project::<WriterInput, WriterOutput>(
-            CallKind::Writer,
-            abi::exports::WRITER,
-            "writer",
+        // The bounded `TurnOutput` codec rejects an over-long phase name while
+        // decoding, so it surfaces as a deserialization failure.
+        let (output, fuel_used) = self.project::<TurnInput, TurnOutput>(
+            CallKind::Turn,
+            abi::exports::TURN,
+            "turn",
             input,
         )?;
         let writer = output.participant.map(arena0_protocol::Participant::new);
@@ -146,7 +149,11 @@ impl super::LoadedProgram {
                 "writer is outside the committed ensemble".into(),
             ));
         }
-        Ok(GuestWriterResult { writer, fuel_used })
+        Ok(GuestTurnResult {
+            writer,
+            phase: output.phase,
+            fuel_used,
+        })
     }
 
     /// Execute one read-only query in a fresh guest instance. `query_index`
@@ -802,6 +809,7 @@ mod resident_runtime_tests {
                 params: unit.clone(),
                 queries: Vec::new(),
                 outcome: unit,
+                phases: Vec::new(),
             },
         }
     }
@@ -828,7 +836,7 @@ mod resident_runtime_tests {
               (import "arena0" "state_write" (func $state_write (param i32 i32 i32)))
               {extra_imports}
               (memory (export "memory") 1)
-              (global (export "arena0_abi_version") i32 (i32.const 24))
+              (global (export "arena0_abi_version") i32 (i32.const 25))
               (global $counter (mut i32) (i32.const 0))
               (data (i32.const 1024) "sh")
               (data (i32.const 1100) "effect")
@@ -856,7 +864,7 @@ mod resident_runtime_tests {
                 call $pack)
               (func (export "arena0_dispatch") (param i32 i32) (result i64)
                 {body})
-              (func (export "arena0_writer") (param i32 i32) (result i64) i64.const 0)
+              (func (export "arena0_turn") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_query") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_view") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_outcome") (param i32 i32) (result i64) i64.const 0)
@@ -1030,7 +1038,7 @@ mod resident_runtime_tests {
               (memory (export "memory") 1 1024)
               (memory (export "arena0_shared") 65 65)
               (memory (export "arena0_local") 65 65)
-              (global (export "arena0_abi_version") i32 (i32.const 24))
+              (global (export "arena0_abi_version") i32 (i32.const 25))
               (data (i32.const 32768) "\00\00\00")
               (func $pack (param $ptr i32) (param $len i32) (result i64)
                 local.get $ptr
@@ -1055,7 +1063,7 @@ mod resident_runtime_tests {
                 i32.const 32768
                 i32.const 3
                 call $pack)
-              (func (export "arena0_writer") (param i32 i32) (result i64) i64.const 0)
+              (func (export "arena0_turn") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_query") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_view") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_outcome") (param i32 i32) (result i64) i64.const 0)
@@ -1072,7 +1080,7 @@ mod resident_runtime_tests {
               (memory (export "memory") 1 1024)
               (memory (export "arena0_shared") 65 65)
               (memory (export "arena0_local") 65 65)
-              (global (export "arena0_abi_version") i32 (i32.const 24))
+              (global (export "arena0_abi_version") i32 (i32.const 25))
               (data (i32.const 32768) "\00")
               (func (export "arena0_alloc") (param i32) (result i32)
                 {allocator_body})
@@ -1084,7 +1092,7 @@ mod resident_runtime_tests {
                 i32.const 1)
               (func (export "arena0_initialize") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_dispatch") (param i32 i32) (result i64) i64.const 0)
-              (func (export "arena0_writer") (param i32 i32) (result i64) i64.const 0)
+              (func (export "arena0_turn") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_query") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_view") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_outcome") (param i32 i32) (result i64) i64.const 0)
