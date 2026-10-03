@@ -1239,6 +1239,39 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{TcpListener, TcpStream, UnixStream};
     use tokio::time::timeout;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::prelude::*;
+
+    /// Observe only this supervisor's startup records. Installing the dispatch
+    /// on its task keeps parallel scenarios from satisfying our ready barrier.
+    struct McpReady(Arc<tokio::sync::Notify>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for McpReady {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "arena0::startup" {
+                return;
+            }
+            #[derive(Default)]
+            struct Stage(bool);
+            impl tracing::field::Visit for Stage {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "stage" && value == "mcp_ready" {
+                        self.0 = true;
+                    }
+                }
+                fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+            }
+            let mut stage = Stage::default();
+            event.record(&mut stage);
+            if stage.0 {
+                self.0.notify_one();
+            }
+        }
+    }
 
     struct TestDaemon {
         _homes: Vec<tempfile::TempDir>,
@@ -1386,7 +1419,30 @@ mod tests {
         assert_eq!(tools.len(), 12);
     }
 
+    /// The startup record follows recovery, listener binding and RUNNING.
+    /// An independent HTTP listener must not admit hello before this barrier.
+    async fn serve_ready(daemon: Arc<Daemon>) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(
+            McpReady(Arc::clone(&ready)).with_filter(tracing_subscriber::filter::filter_fn(
+                |metadata| metadata.target() == "arena0::startup",
+            )),
+        ));
+        let mut supervisor = tokio::spawn(daemon.serve().with_subscriber(dispatch));
+        tokio::select! {
+            _ = ready.notified() => {}
+            result = &mut supervisor => panic!("supervisor ended before listener readiness: {result:?}"),
+        }
+        supervisor
+    }
+
     async fn post_mcp(address: SocketAddr, body: &str) -> String {
+        read_mcp_response(send_mcp(address, body).await).await
+    }
+
+    /// Send without imposing a wall-clock bound on tool work. The caller can
+    /// observe the tool's completion before beginning its response-drain guard.
+    async fn send_mcp(address: SocketAddr, body: &str) -> TcpStream {
         let mut stream = TcpStream::connect(address)
             .await
             .expect("MCP test server should accept TCP connections");
@@ -1398,6 +1454,10 @@ mod tests {
             .write_all(request.as_bytes())
             .await
             .expect("write MCP request");
+        stream
+    }
+
+    async fn read_mcp_response(mut stream: TcpStream) -> String {
         let mut response = Vec::new();
         timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
             .await
@@ -1467,13 +1527,7 @@ mod tests {
     async fn activity_stream_correlation_survives_duplicate_mcp_request_ids() {
         let test = test_daemon().await;
         let socket = test._homes[0].path().join("arena0.sock");
-        let daemon_task = tokio::spawn(Arc::clone(&test.daemon).serve());
-        for _ in 0..100 {
-            if UnixStream::connect(&socket).await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let mut daemon_task = serve_ready(Arc::clone(&test.daemon)).await;
 
         let mut activity = subscribe_activity(&socket).await;
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -1481,7 +1535,7 @@ mod tests {
             .expect("bind MCP test listener");
         let address = listener.local_addr().expect("MCP listener address");
         let daemon = Arc::clone(&test.daemon);
-        let serving = tokio::spawn(async move {
+        let mut serving = tokio::spawn(async move {
             crate::http::serve(
                 Arc::clone(&daemon),
                 HttpConfig::new(address, None).unwrap(),
@@ -1492,25 +1546,27 @@ mod tests {
         });
 
         let (first, second) = tokio::join!(
-            post_mcp(
+            send_mcp(
                 address,
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hello","arguments":{"user_agent":"activity/1"}}}"#,
             ),
-            post_mcp(
+            send_mcp(
                 address,
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hello","arguments":{"user_agent":"activity/2"}}}"#,
             ),
         );
-        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
-        assert!(second.starts_with("HTTP/1.1 200"), "{second}");
-
-        let started_one = next_activity(&mut activity).await;
-        let finished_one = next_activity(&mut activity).await;
-        let started_two = next_activity(&mut activity).await;
-        let finished_two = next_activity(&mut activity).await;
         let mut starts = Vec::new();
         let mut finishes = Vec::new();
-        for frame in [started_one, finished_one, started_two, finished_two] {
+        // Fresh hello calls wait for serial Host provisioning, program
+        // bootstrap and recovery. That work has no five-second SLA. Wait on
+        // the four actual activity records, keeping both requests in flight;
+        // unexpected server termination fails the barrier immediately.
+        for _ in 0..4 {
+            let frame = tokio::select! {
+                frame = next_activity(&mut activity) => frame,
+                result = &mut daemon_task => panic!("supervisor ended during hello: {result:?}"),
+                result = &mut serving => panic!("HTTP server ended during hello: {result:?}"),
+            };
             match frame.data {
                 ActivityData::Started {
                     call_id,
@@ -1539,6 +1595,13 @@ mod tests {
             finishes.into_iter().collect::<BTreeSet<_>>(),
             "each finished frame closes one started call"
         );
+
+        // Finished is emitted after each tool returns. Preserve the existing
+        // EOF guard for draining completed HTTP replies, rather than timing
+        // the unrelated startup work whose duration depends on machine load.
+        let (first, second) = tokio::join!(read_mcp_response(first), read_mcp_response(second));
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        assert!(second.starts_with("HTTP/1.1 200"), "{second}");
 
         serving.abort();
         let _ = serving.await;
@@ -1665,20 +1728,16 @@ mod tests {
     }
 
     async fn next_activity(subscription: &mut ActivityTestSubscription) -> ActivityFrame {
-        timeout(
-            Duration::from_secs(5),
-            arena0_api::frame::read_frame::<_, ActivityFrame>(&mut subscription.read),
-        )
-        .await
-        .expect("activity frame timeout")
-        .expect("read activity frame")
-        .expect("activity stream closed")
+        arena0_api::frame::read_frame::<_, ActivityFrame>(&mut subscription.read)
+            .await
+            .expect("read activity frame")
+            .expect("activity stream closed")
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_mcp_clients_are_scoped_by_hello_tokens() {
         let test = test_daemon().await;
-        let supervisor = tokio::spawn(Arc::clone(&test.daemon).serve());
+        let supervisor = serve_ready(Arc::clone(&test.daemon)).await;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind MCP test listener");
