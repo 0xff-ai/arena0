@@ -33,64 +33,6 @@ pub(crate) struct DurableEnvelope {
     checksum: [u8; 32],
 }
 
-pub(crate) fn envelope(kind: EnvelopeKind, payload: &[u8]) -> Result<Vec<u8>, StoreError> {
-    let checksum = envelope_checksum(kind, payload);
-    let envelope = DurableEnvelope {
-        magic: ENVELOPE_MAGIC,
-        kind: kind.tag(),
-        version: ENVELOPE_VERSION,
-        payload: payload.to_vec(),
-        checksum,
-    };
-    borsh::to_vec(&envelope)
-        .map_err(|error| StoreError::Corruption(format!("durable envelope encode: {error}")))
-}
-
-pub(crate) fn open_envelope(
-    kind: EnvelopeKind,
-    encoded: &[u8],
-    max_payload: usize,
-) -> Result<Vec<u8>, StoreError> {
-    let max_encoded = max_payload
-        .checked_add(MAX_ENVELOPE_OVERHEAD)
-        .ok_or_else(|| StoreError::Corruption("durable envelope size bound overflow".into()))?;
-    if encoded.len() > max_encoded {
-        return Err(StoreError::Corruption(
-            "durable envelope exceeds bound".into(),
-        ));
-    }
-    let envelope: DurableEnvelope = borsh::from_slice(encoded)
-        .map_err(|error| StoreError::Corruption(format!("durable envelope decode: {error}")))?;
-    if envelope.magic != ENVELOPE_MAGIC
-        || envelope.kind != kind.tag()
-        || envelope.version != ENVELOPE_VERSION
-    {
-        return Err(StoreError::Corruption(
-            "durable envelope header is invalid".into(),
-        ));
-    }
-    if envelope.payload.len() > max_payload {
-        return Err(StoreError::Corruption(
-            "durable envelope payload exceeds bound".into(),
-        ));
-    }
-    if envelope.checksum != envelope_checksum(kind, &envelope.payload) {
-        return Err(StoreError::Corruption(
-            "durable envelope checksum mismatch".into(),
-        ));
-    }
-    Ok(envelope.payload)
-}
-
-pub(crate) fn envelope_checksum(kind: EnvelopeKind, payload: &[u8]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(ENVELOPE_DOMAIN);
-    hasher.update(&kind.tag().to_le_bytes());
-    hasher.update(&ENVELOPE_VERSION.to_le_bytes());
-    hasher.update(payload);
-    *hasher.finalize().as_bytes()
-}
-
 pub(crate) fn decode_borsh<T: BorshDeserialize>(
     bytes: &[u8],
     field: &str,
@@ -99,33 +41,16 @@ pub(crate) fn decode_borsh<T: BorshDeserialize>(
         .map_err(|error| StoreError::Corruption(format!("{field} decode: {error}")))
 }
 
-pub(crate) fn activation_bytes(activation: &Activation) -> Result<Vec<u8>, StoreError> {
-    borsh::to_vec(activation)
-        .map_err(|error| StoreError::Corruption(format!("activation encode: {error}")))
-}
-
-pub(crate) fn prepared_activation_bytes(
-    activation: &PreparedActivation,
-) -> Result<Vec<u8>, StoreError> {
-    borsh::to_vec(activation)
-        .map_err(|error| StoreError::Corruption(format!("prepared activation encode: {error}")))
-}
-
 pub(crate) fn state_bytes(state: &ExecutionState) -> Result<Vec<u8>, StoreError> {
     state.encode().map_err(StoreError::Protocol)
 }
 
-pub(crate) fn event_bytes(event: &Event<Vec<u8>>) -> Result<Vec<u8>, StoreError> {
-    borsh::to_vec(event).map_err(|error| StoreError::Corruption(format!("event encode: {error}")))
-}
-
-pub(crate) fn effects_bytes(effects: &[Effect]) -> Result<Vec<u8>, StoreError> {
-    borsh::to_vec(effects)
-        .map_err(|error| StoreError::Corruption(format!("effects encode: {error}")))
-}
-
 pub(crate) fn decode_execution_salt(encoded: &[u8]) -> Result<ExecutionSalt, StoreError> {
-    let payload = Zeroizing::new(open_envelope(EnvelopeKind::ExecutionSalt, encoded, 32)?);
+    let payload = Zeroizing::new(DurableEnvelope::open(
+        EnvelopeKind::ExecutionSalt,
+        encoded,
+        32,
+    )?);
     let bytes: [u8; 32] = payload.as_slice().try_into().map_err(|_| {
         StoreError::Corruption("execution salt must contain exactly 32 bytes".into())
     })?;
@@ -137,44 +62,6 @@ pub(crate) fn decode_execution_salt(encoded: &[u8]) -> Result<ExecutionSalt, Sto
 pub(crate) fn max_program_bytes() -> Result<usize, StoreError> {
     usize::try_from(arena0_program::PROGRAM_MAX_LEN)
         .map_err(|_| StoreError::InvalidConfiguration("program size bound does not fit usize"))
-}
-
-pub(crate) fn prepared_activation_record(
-    execution_id: ExecId,
-    prepared: PreparedActivation,
-    updated_at_ms: u64,
-) -> ActivationRecord {
-    ActivationRecord {
-        execution_id,
-        state: ActivationRecordState::Prepared { evidence: prepared },
-        updated_at_ms,
-    }
-}
-
-pub(crate) fn committed_activation_record(
-    execution_id: ExecId,
-    activation: Activation,
-    updated_at_ms: u64,
-) -> Result<ActivationRecord, StoreError> {
-    let prepared = activation.prepared().clone();
-    Ok(ActivationRecord {
-        execution_id,
-        state: ActivationRecordState::Committed {
-            evidence: prepared,
-            activation: Box::new(activation),
-        },
-        updated_at_ms,
-    })
-}
-
-pub(crate) fn parse_activation_status(value: &str) -> Result<ActivationRecordStatus, StoreError> {
-    match value {
-        "prepared" => Ok(ActivationRecordStatus::Prepared),
-        "committed" => Ok(ActivationRecordStatus::Committed),
-        other => Err(StoreError::Corruption(format!(
-            "unknown activation status {other}"
-        ))),
-    }
 }
 
 pub(crate) fn lifecycle_tag(lifecycle: ExecLifecycle) -> i64 {
@@ -283,5 +170,38 @@ pub(crate) fn decode_end(tag: i64, bytes: &[u8]) -> Result<arena0_protocol::EndP
         _ => Err(StoreError::Corruption(
             "invalid end phase projection".into(),
         )),
+    }
+}
+
+/// Retain the stored field name in corruption diagnostics; protocol-validated state encoding uses its own boundary.
+pub(crate) fn encode_borsh<T: BorshSerialize + ?Sized>(
+    value: &T,
+    field: &str,
+) -> Result<Vec<u8>, StoreError> {
+    let _ = (value, field);
+    todo!("STUB(store)")
+}
+
+impl DurableEnvelope {
+    /// Encode the current store envelope without changing its domain, kind, version, or checksum preimage.
+    pub(crate) fn seal(kind: EnvelopeKind, payload: &[u8]) -> Result<Vec<u8>, StoreError> {
+        let _ = (kind, payload);
+        todo!("STUB(store)")
+    }
+
+    /// Reject oversized envelopes before decoding, then authenticate the header, payload bound, and checksum.
+    pub(crate) fn open(
+        kind: EnvelopeKind,
+        encoded: &[u8],
+        max_payload: usize,
+    ) -> Result<Vec<u8>, StoreError> {
+        let _ = (kind, encoded, max_payload);
+        todo!("STUB(store)")
+    }
+
+    /// Commit the envelope domain, kind, version, and exact payload bytes in their existing order.
+    fn checksum(kind: EnvelopeKind, payload: &[u8]) -> [u8; 32] {
+        let _ = (kind, payload);
+        todo!("STUB(store)")
     }
 }

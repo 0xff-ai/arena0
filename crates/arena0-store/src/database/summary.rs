@@ -56,7 +56,8 @@ fn exec_summary_row(row: &rusqlite::Row<'_>) -> Result<ExecSummaryRow, StoreErro
         .get::<_, Option<String>>(5)?
         .map(|status| {
             Ok::<_, StoreError>(ActivationIndex {
-                committed: parse_activation_status(&status)? == ActivationRecordStatus::Committed,
+                committed: ActivationRecordStatus::parse(&status)?
+                    == ActivationRecordStatus::Committed,
                 session_id: SessionHash(array32(&row.get::<_, Vec<u8>>(6)?, "activation session")?),
                 updated_at_ms: sqlite_i64(row.get(7)?)?,
                 facts: decode_borsh(&row.get::<_, Vec<u8>>(8)?, "activation facts")?,

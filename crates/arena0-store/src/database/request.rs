@@ -74,7 +74,7 @@ impl Database {
                     execution_id.0.to_vec(),
                     program_hash.as_bytes().to_vec(),
                     params_bytes,
-                    envelope(EnvelopeKind::ExecutionAdmission, &admission_bytes)?,
+                    DurableEnvelope::seal(EnvelopeKind::ExecutionAdmission, &admission_bytes)?,
                     sqlite_u64(created_at_ms)?,
                     grants_bytes,
                     admission.negotiation_id().map(|id| id.0.to_vec()),
@@ -150,7 +150,7 @@ impl Database {
                 "UPDATE exec_requests SET admission = ?1, negotiation_id = ?3
                  WHERE execution_id = ?2 AND failure IS NULL",
                 params![
-                    envelope(EnvelopeKind::ExecutionAdmission, &admission_bytes)?,
+                    DurableEnvelope::seal(EnvelopeKind::ExecutionAdmission, &admission_bytes)?,
                     execution_id.0.to_vec(),
                     admission.negotiation_id().map(|id| id.0.to_vec()),
                 ],
@@ -195,7 +195,7 @@ impl Database {
                 negotiation_id,
             )| {
                 let admission: ExecutionAdmission = decode_borsh(
-                    &open_envelope(
+                    &DurableEnvelope::open(
                         EnvelopeKind::ExecutionAdmission,
                         &admission,
                         MAX_ADMISSION_BYTES,
@@ -384,7 +384,7 @@ impl Database {
             }
             let _ = sqlite_i64(created_at_ms)?;
             let admission: ExecutionAdmission = decode_borsh(
-                &open_envelope(
+                &DurableEnvelope::open(
                     EnvelopeKind::ExecutionAdmission,
                     &admission_bytes,
                     MAX_ADMISSION_BYTES,

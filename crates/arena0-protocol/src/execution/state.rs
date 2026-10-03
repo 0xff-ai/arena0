@@ -631,7 +631,7 @@ impl ExecutionState {
         {
             return Err(ProtocolError::InvalidTerminalStatus);
         }
-        validate_callout_dispatch(self, event, pending_id)?;
+        self.validate_callout_dispatch(event, pending_id)?;
         // The same budget the sandbox enforced at emission; checked again here so release builds never stage or install an over-budget result.
         check_effect_budget(effects)?;
         let agreed_event = matches!(
@@ -683,7 +683,7 @@ impl ExecutionState {
                 }
             }
             let status = ExecutionStatus::active();
-            let next_callout = next_open_callout(self, event, event_position, &status, callout);
+            let next_callout = self.next_open_callout(event, event_position, &status, callout);
             self.install_dispatch(
                 event_position,
                 shared_state,
@@ -758,8 +758,8 @@ impl ExecutionState {
         } else {
             None
         };
-        let status = proposal_status(&entry, &commitment, terminal_outcome)?;
-        let next_callout = next_open_callout(self, event, event_position, &status, callout);
+        let status = ExecutionStatus::from_proposal_entry(&entry, &commitment, terminal_outcome)?;
+        let next_callout = self.next_open_callout(event, event_position, &status, callout);
         let proposal = SharedProposal::new(
             entry,
             shared_state,
@@ -1324,67 +1324,6 @@ fn indexed_dispatch_effects(effects: &[Effect]) -> Result<Vec<(u32, Effect)>, Pr
         .collect()
 }
 
-fn validate_callout_dispatch(
-    state: &ExecutionState,
-    event: &Event<Vec<u8>>,
-    pending_id: Option<CalloutId>,
-) -> Result<(), ProtocolError> {
-    let answer = matches!(event, Event::InputReceived { .. });
-    if !answer {
-        if pending_id.is_some() {
-            return Err(ProtocolError::CalloutMismatch);
-        }
-        return Ok(());
-    }
-    let answer_id = pending_id.ok_or(ProtocolError::CalloutMismatch)?;
-    let open = state
-        .callout
-        .as_ref()
-        .ok_or(ProtocolError::CalloutMismatch)?;
-    if open.id != answer_id {
-        return Err(ProtocolError::CalloutMismatch);
-    }
-    let Event::InputReceived { callout_index, .. } = event else {
-        return Err(ProtocolError::CalloutMismatch);
-    };
-    if *callout_index != open.callout_index {
-        return Err(ProtocolError::CalloutMismatch);
-    }
-    Ok(())
-}
-
-/// Derive the open callout installed with a dispatch result.
-///
-/// A terminal result has none. Otherwise the program's request keeps the
-/// current identity for a non-answer event when it repeats the same index and context, replaces it
-/// with a fresh event-position identity when it differs, and withdraws it when
-/// the program asks nothing. An accepted answer consumes its identity, even
-/// when the resulting question has the same index and context.
-fn next_open_callout(
-    state: &ExecutionState,
-    event: &Event<Vec<u8>>,
-    event_position: u64,
-    status: &ExecutionStatus,
-    callout: Option<CalloutRequest>,
-) -> Option<OpenCallout> {
-    if !matches!(status, ExecutionStatus::Active) {
-        return None;
-    }
-    let request = callout?;
-    if let Some(current) = &state.callout
-        && !matches!(event, Event::InputReceived { .. })
-        && current.callout_index == request.callout_index
-        && current.context == request.context
-    {
-        return Some(current.clone());
-    }
-    Some(OpenCallout {
-        id: callout_id(state.execution_id, event_position),
-        callout_index: request.callout_index,
-        context: request.context,
-    })
-}
-
 /// Append every broadcast effect to the durable outgoing queue.
 ///
 /// The sandbox already enforces the queue bound against the committed length;
@@ -1419,37 +1358,6 @@ fn validate_outgoing(outgoing: &[Vec<u8>]) -> Result<(), ProtocolError> {
         )?;
     }
     Ok(())
-}
-
-fn proposal_status(
-    entry: &TraceEntry,
-    commitment: &StepCommitment,
-    terminal_outcome: Option<TerminalOutcome>,
-) -> Result<ExecutionStatus, ProtocolError> {
-    if let Some(terminal) = &entry.terminal {
-        match terminal {
-            StepTerminal::End {
-                outcome: effect_outcome,
-            } => {
-                let outcome = terminal_outcome.ok_or(ProtocolError::TerminalOutcomeRequired)?;
-                if outcome.borsh() != effect_outcome.as_slice() {
-                    return Err(ProtocolError::OutcomeProjectionMismatch);
-                }
-                return Ok(ExecutionStatus::Certified { outcome });
-            }
-            StepTerminal::Abort { .. } | StepTerminal::Fail { .. } => {
-                if terminal_outcome.is_some() {
-                    return Err(ProtocolError::TerminalOutcomeMismatch);
-                }
-                return ExecutionStatus::from_shared_entry(entry, commitment.clone())?
-                    .ok_or(ProtocolError::InvalidTerminalStatus);
-            }
-        }
-    }
-    if terminal_outcome.is_some() {
-        return Err(ProtocolError::TerminalOutcomeMismatch);
-    }
-    Ok(ExecutionStatus::active())
 }
 
 #[cfg(test)]
@@ -3376,5 +3284,29 @@ mod tests {
             bad_status.validate_recovered().unwrap_err(),
             ProtocolError::InvalidTerminalStatus
         );
+    }
+}
+
+impl ExecutionState {
+    /// Match an answer to the committed open callout; non-answer events cannot consume an ID.
+    fn validate_callout_dispatch(
+        &self,
+        event: &Event<Vec<u8>>,
+        pending_id: Option<CalloutId>,
+    ) -> Result<(), ProtocolError> {
+        let _ = (event, pending_id);
+        todo!("STUB(protocol)")
+    }
+
+    /// Keep a repeated unanswered callout identity; accepted answers consume it, and terminal results withdraw it.
+    fn next_open_callout(
+        &self,
+        event: &Event<Vec<u8>>,
+        event_position: u64,
+        status: &ExecutionStatus,
+        callout: Option<CalloutRequest>,
+    ) -> Option<OpenCallout> {
+        let _ = (event, event_position, status, callout);
+        todo!("STUB(protocol)")
     }
 }

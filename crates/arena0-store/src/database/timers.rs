@@ -23,7 +23,7 @@ impl Database {
         let mut timers = Vec::new();
         let mut response_bytes = 0;
         while let Some(row) = rows.next()? {
-            let payload = open_envelope(
+            let payload = DurableEnvelope::open(
                 EnvelopeKind::Timer,
                 &row.get::<_, Vec<u8>>(2)?,
                 MAX_TIMER_RECORD_BYTES,
@@ -97,7 +97,7 @@ impl Database {
                 "timer payload exceeds store bound".into(),
             ));
         }
-        let payload = envelope(EnvelopeKind::Timer, &payload)?;
+        let payload = DurableEnvelope::seal(EnvelopeKind::Timer, &payload)?;
         let existing = self
             .connection
             .query_row(

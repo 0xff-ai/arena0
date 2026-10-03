@@ -34,14 +34,8 @@ impl DaemonClient {
         if let Ok(id) = prefix.parse::<ExecId>() {
             return Ok(id);
         }
-        let ResponseOk::Resolved(result) = self
-            .call_host(
-                host,
-                &HostRequest::Resolve {
-                    kind: arena0_api::RefKind::Exec,
-                    reference: prefix.into(),
-                },
-            )
+        let Some(result) = self
+            .request_resolution(host, arena0_api::RefKind::Exec, prefix)
             .await?
         else {
             bail!("unexpected response to resolve");
@@ -50,10 +44,7 @@ impl DaemonClient {
             arena0_api::Resolved::Exec { exec_id } => Ok(exec_id),
             arena0_api::Resolved::None => bail!("no execution matches '{prefix}'"),
             arena0_api::Resolved::Ambiguous { candidates, .. } => {
-                let candidates = candidates
-                    .into_iter()
-                    .map(|id| id[..8.min(id.len())].to_owned())
-                    .collect::<Vec<_>>();
+                let candidates = short_candidates(candidates);
                 bail!(
                     "'{prefix}' is ambiguous; candidates: {}",
                     candidates.join(", ")
@@ -73,14 +64,8 @@ impl DaemonClient {
         if let Ok(id) = prefix.parse::<SessionHash>() {
             return Ok(id);
         }
-        let ResponseOk::Resolved(result) = self
-            .call_host(
-                host,
-                &HostRequest::Resolve {
-                    kind: arena0_api::RefKind::Session,
-                    reference: prefix.into(),
-                },
-            )
+        let Some(result) = self
+            .request_resolution(host, arena0_api::RefKind::Session, prefix)
             .await?
         else {
             bail!("unexpected response to resolve");
@@ -89,10 +74,7 @@ impl DaemonClient {
             arena0_api::Resolved::Session { session_id } => Ok(session_id),
             arena0_api::Resolved::None => bail!("no session matches '{prefix}'"),
             arena0_api::Resolved::Ambiguous { candidates, .. } => {
-                let candidates = candidates
-                    .into_iter()
-                    .map(|id| id[..8.min(id.len())].to_owned())
-                    .collect::<Vec<_>>();
+                let candidates = short_candidates(candidates);
                 bail!(
                     "'{prefix}' is ambiguous; candidates: {}",
                     candidates.join(", ")
@@ -109,14 +91,8 @@ impl DaemonClient {
         host: &HostName,
         prefix: &str,
     ) -> Result<arena0_api::ReceiptListEntry, ResolveError> {
-        let ResponseOk::Resolved(result) = self
-            .call_host(
-                host,
-                &HostRequest::Resolve {
-                    kind: arena0_api::RefKind::Receipt,
-                    reference: prefix.into(),
-                },
-            )
+        let Some(result) = self
+            .request_resolution(host, arena0_api::RefKind::Receipt, prefix)
             .await?
         else {
             return Err(ResolveError::UnexpectedResponse);
@@ -128,10 +104,7 @@ impl DaemonClient {
             }),
             arena0_api::Resolved::Ambiguous { candidates, .. } => Err(ResolveError::Ambiguous {
                 reference: prefix.into(),
-                candidates: candidates
-                    .into_iter()
-                    .map(|id| id[..8.min(id.len())].to_owned())
-                    .collect(),
+                candidates: short_candidates(candidates),
             }),
             _ => Err(ResolveError::UnexpectedResponse),
         }
@@ -365,4 +338,23 @@ mod tests {
         ));
         assert!(crate::proto::is_connect_error(&error));
     }
+}
+
+impl DaemonClient {
+    /// Preserve socket errors and their complete anyhow chain; None distinguishes a wrong success payload from a missing indexed reference.
+    async fn request_resolution(
+        &self,
+        host: &HostName,
+        kind: arena0_api::RefKind,
+        reference: &str,
+    ) -> anyhow::Result<Option<arena0_api::Resolved>> {
+        let _ = (host, kind, reference);
+        todo!("STUB(client-guests)")
+    }
+}
+
+/// Retain the existing eight-character ambiguity labels; these are diagnostics, not lookup IDs.
+fn short_candidates(candidates: Vec<String>) -> Vec<String> {
+    let _ = candidates;
+    todo!("STUB(client-guests)")
 }

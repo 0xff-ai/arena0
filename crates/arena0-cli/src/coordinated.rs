@@ -604,14 +604,12 @@ impl Coordinator {
     ) -> anyhow::Result<Vec<HostTerminal>> {
         let mut jobs = JoinSet::new();
         for (index, participant) in self.participants.iter().enumerate() {
-            let client = participant.client.clone();
-            let host = participant.host.clone();
-            let exec_id = participant.exec_id;
-            let driver = participant.driver.clone();
+            let participant = participant.clone();
             let cancelled = cancelled.clone();
             let progress = self.progress.clone();
             jobs.spawn(async move {
-                drive_to_terminal(host, client, exec_id, driver, cancelled, progress)
+                participant
+                    .drive_to_terminal(cancelled, progress)
                     .await
                     .map(|terminal| (index, terminal))
             });
@@ -647,10 +645,8 @@ impl Coordinator {
     async fn verify_receipts(&self, session_id: SessionHash) -> anyhow::Result<Vec<HostEvidence>> {
         let mut jobs = JoinSet::new();
         for participant in &self.participants {
-            let client = participant.client.clone();
-            let peer_id = participant.peer_id;
-            let host = participant.host.clone();
-            jobs.spawn(async move { verify_one_receipt(host, client, session_id, peer_id).await });
+            let participant = participant.clone();
+            jobs.spawn(async move { participant.verify_receipt(session_id).await });
         }
 
         let mut evidence = Vec::with_capacity(self.participants.len());
@@ -1179,80 +1175,6 @@ async fn await_activation(
     Ok(expected)
 }
 
-async fn drive_to_terminal(
-    host: HostName,
-    client: DaemonClient,
-    exec_id: ExecId,
-    driver: DriverSpec,
-    mut cancelled: watch::Receiver<bool>,
-    progress: RunProgress,
-) -> anyhow::Result<HostTerminal> {
-    if driver == DriverSpec::External {
-        let await_terminal = async {
-            loop {
-                match client
-                    .call_host_raw(
-                        &host,
-                        &HostRequest::ExecAwait {
-                            exec_id,
-                            until: AwaitState::Terminal,
-                        },
-                    )
-                    .await?
-                {
-                    Ok(ResponseOk::Awaited { .. }) => break,
-                    Err(error) if error.code == ApiErrorCode::Timeout => continue,
-                    Err(error) => return Err(error.into()),
-                    other => bail!("unexpected exec.await response: {other:?}"),
-                }
-            }
-            match client
-                .call_host(&host, &HostRequest::ExecNext { exec_id })
-                .await?
-            {
-                ResponseOk::Next(NextEvent::Completed {
-                    session_id,
-                    outcome,
-                }) => Ok(HostTerminal::Completed {
-                    session_id,
-                    outcome,
-                }),
-                ResponseOk::Next(NextEvent::Failed { reason }) => {
-                    Ok(HostTerminal::Failed { reason })
-                }
-                other => bail!("unexpected terminal exec.next response: {other:?}"),
-            }
-        };
-        return tokio::select! {
-            result = await_terminal => result,
-            () = wait_for_cancel(&mut cancelled) => bail!("coordinated run cancelled while observing {exec_id}"),
-        };
-    }
-    let mut driver = ActiveDriver::start(driver)?;
-    let result = drive_loop(
-        &host,
-        &client,
-        exec_id,
-        &mut driver,
-        &mut cancelled,
-        &progress,
-    )
-    .await;
-    let cleanup = if result.is_ok() {
-        driver.finish().await
-    } else {
-        driver.abort().await
-    };
-    match (result, cleanup) {
-        (Ok(terminal), Ok(())) => Ok(terminal),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(cleanup)) => Err(cleanup.context("close executable driver after terminal")),
-        (Err(error), Err(cleanup)) => {
-            Err(error.context(format!("executable-driver cleanup failed: {cleanup:#}")))
-        }
-    }
-}
-
 async fn drive_loop(
     host: &HostName,
     client: &DaemonClient,
@@ -1543,42 +1465,6 @@ where
                 std::io::stderr().flush().ok();
             }
         }
-    }
-}
-
-async fn verify_one_receipt(
-    host: HostName,
-    client: DaemonClient,
-    session_id: SessionHash,
-    peer_id: PeerId,
-) -> anyhow::Result<HostEvidence> {
-    let mut last_error = None;
-    for attempt in 0..RECEIPT_RETRY_ATTEMPTS {
-        match client
-            .call_host_raw(
-                &host,
-                &HostRequest::ReceiptVerify {
-                    receipt: ReceiptRef::Produced(session_id),
-                },
-            )
-            .await?
-        {
-            Ok(ResponseOk::Verified(summary)) => {
-                return Ok(HostEvidence { peer_id, summary });
-            }
-            Ok(other) => bail!("unexpected receipt.verify response: {other:?}"),
-            Err(error) if error.code == ApiErrorCode::NotFound => {
-                last_error = Some(error);
-                if attempt + 1 < RECEIPT_RETRY_ATTEMPTS {
-                    tokio::time::sleep(RECEIPT_RETRY_DELAY).await;
-                }
-            }
-            Err(error) => bail!("receipt verification failed: {error}"),
-        }
-    }
-    match last_error {
-        Some(error) => Err(anyhow!(error)),
-        None => bail!("receipt verification never completed"),
     }
 }
 
@@ -2071,14 +1957,14 @@ mod tests {
         let (_cancel, cancelled) = watch::channel(false);
         let result = tokio::time::timeout(
             Duration::from_secs(3),
-            drive_to_terminal(
-                host("host-01"),
-                DaemonClient::new(socket),
-                exec_id,
-                DriverSpec::Executable(first_allowed_agent()),
-                cancelled,
-                test_progress(),
-            ),
+            LocalParticipant {
+                host: host("host-01"),
+                client: DaemonClient::new(socket),
+                exec_id: exec_id,
+                driver: DriverSpec::Executable(first_allowed_agent()),
+                peer_id: PeerId([0; 32]),
+            }
+            .drive_to_terminal(cancelled, test_progress()),
         )
         .await
         .unwrap()
@@ -2138,14 +2024,14 @@ mod tests {
         let (_cancel, cancelled) = watch::channel(false);
         let result = tokio::time::timeout(
             Duration::from_secs(3),
-            drive_to_terminal(
-                host("host-01"),
-                DaemonClient::new(socket),
-                exec_id,
-                DriverSpec::Executable(first_allowed_agent()),
-                cancelled,
-                test_progress(),
-            ),
+            LocalParticipant {
+                host: host("host-01"),
+                client: DaemonClient::new(socket),
+                exec_id: exec_id,
+                driver: DriverSpec::Executable(first_allowed_agent()),
+                peer_id: PeerId([0; 32]),
+            }
+            .drive_to_terminal(cancelled, test_progress()),
         )
         .await
         .unwrap()
@@ -2196,14 +2082,14 @@ mod tests {
         let (_cancel, cancelled) = watch::channel(false);
         let result = tokio::time::timeout(
             Duration::from_secs(3),
-            drive_to_terminal(
-                host("host-01"),
-                DaemonClient::new(socket),
-                exec_id,
-                DriverSpec::External,
-                cancelled,
-                test_progress(),
-            ),
+            LocalParticipant {
+                host: host("host-01"),
+                client: DaemonClient::new(socket),
+                exec_id: exec_id,
+                driver: DriverSpec::External,
+                peer_id: PeerId([0; 32]),
+            }
+            .drive_to_terminal(cancelled, test_progress()),
         )
         .await
         .unwrap()
@@ -2955,5 +2841,23 @@ mod tests {
             .to_string()
             .contains("disagrees")
         );
+    }
+}
+
+impl LocalParticipant {
+    /// Drive or observe this participant using its selected driver; coordinator owns cancellation and task joining. External drivers await terminal state without consuming callouts.
+    async fn drive_to_terminal(
+        self,
+        cancelled: watch::Receiver<bool>,
+        progress: RunProgress,
+    ) -> anyhow::Result<HostTerminal> {
+        let _ = (cancelled, progress);
+        todo!("STUB(cli)")
+    }
+
+    /// Verify this participant's produced receipt, retrying only publication lag; preserve bounded retries and attach its authenticated peer identity.
+    async fn verify_receipt(self, session_id: SessionHash) -> anyhow::Result<HostEvidence> {
+        let _ = session_id;
+        todo!("STUB(cli)")
     }
 }

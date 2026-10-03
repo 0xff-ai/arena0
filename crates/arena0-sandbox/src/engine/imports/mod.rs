@@ -97,6 +97,7 @@ impl CallerExt for Caller<'_, HostState> {
     ) -> Result<Vec<u8>, wasmtime::Error> {
         let max = self.data().profile.limits.max_host_bytes;
         self.data_mut()
+            .scope
             .ledger
             .copy_bytes(len as usize, max)
             .map_err(wasmtime::Error::new)?;
@@ -115,6 +116,7 @@ impl CallerExt for Caller<'_, HostState> {
     fn begin_import(&mut self, _name: &str) -> Result<(), wasmtime::Error> {
         let max_calls = self.data().profile.limits.max_host_calls;
         self.data_mut()
+            .scope
             .ledger
             .host_call(max_calls)
             .map_err(wasmtime::Error::new)
@@ -144,7 +146,7 @@ impl CallerExt for Caller<'_, HostState> {
                 "send_direct: only available in local handlers",
             ));
         }
-        let queue = &self.data().effect_queue;
+        let queue = &self.data().scope.effect_queue;
         if effect.is_lifecycle() {
             if self.data().dispatch != DispatchKind::Agreed {
                 return Err(wasmtime::Error::msg(format!(
@@ -177,6 +179,7 @@ impl CallerExt for Caller<'_, HostState> {
         // reject an effect the guest already emitted.
         arena0_protocol::execution::check_effect_budget(
             self.data()
+                .scope
                 .effect_queue
                 .iter()
                 .chain(std::iter::once(&effect)),
@@ -186,6 +189,7 @@ impl CallerExt for Caller<'_, HostState> {
             .map_err(|error| wasmtime::Error::msg(format!("effect encoding failed: {error}")))?;
         let profile = self.data().profile.clone();
         self.data_mut()
+            .scope
             .ledger
             .effect(
                 bytes.len(),
@@ -193,7 +197,7 @@ impl CallerExt for Caller<'_, HostState> {
                 profile.limits.max_effects_per_dispatch,
             )
             .map_err(wasmtime::Error::new)?;
-        self.data_mut().effect_queue.push(effect);
+        self.data_mut().scope.effect_queue.push(effect);
         Ok(())
     }
 }

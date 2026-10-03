@@ -237,7 +237,7 @@ impl ExecutionStatus {
             }
             Self::Stopped { cause } | Self::StoppedPublished { cause, .. } => {
                 cause.validate()?;
-                validate_cause_binding(cause, binding, agreed)?;
+                cause.validate_binding(binding, agreed)?;
                 if matches!(self, Self::StoppedPublished { receipt_id, .. } if *receipt_id == ReceiptId::from_bytes([0; 32]))
                 {
                     return Err(ProtocolError::InvalidTerminalStatus);
@@ -246,36 +246,6 @@ impl ExecutionStatus {
             }
         }
     }
-}
-
-pub(crate) fn validate_cause_binding(
-    cause: &StopCause,
-    binding: &ExecutionBinding,
-    agreed: StepCursor,
-) -> Result<(), ProtocolError> {
-    match cause {
-        StopCause::Authenticated(occurrence) => {
-            if occurrence.session_id() != binding.session_id()
-                || *occurrence.coordinate() != agreed
-                || !binding.is_participant(occurrence.sender())
-                || !occurrence
-                    .verify_signature()
-                    .map_err(|_| ProtocolError::InvalidTerminalStatus)?
-            {
-                return Err(ProtocolError::InvalidTerminalStatus);
-            }
-        }
-        StopCause::Shared { commitment, .. } => {
-            if !commitment.is_bound_to(binding.session_id())
-                || commitment.step.checked_add(1) != Some(agreed.next_step())
-                || commitment.post_state != agreed.state_hash()
-                || commitment.link_hash() != agreed.chain_hash()
-            {
-                return Err(ProtocolError::InvalidTerminalStatus);
-            }
-        }
-    }
-    Ok(())
 }
 
 fn ensure_reason(reason: &str) -> Result<(), ProtocolError> {
@@ -329,5 +299,28 @@ mod tests {
                 *cause
             );
         }
+    }
+}
+
+impl ExecutionStatus {
+    /// Project proposed terminal evidence without accepting an outcome that disagrees with the agreed entry.
+    pub(super) fn from_proposal_entry(
+        entry: &TraceEntry,
+        commitment: &StepCommitment,
+        terminal_outcome: Option<TerminalOutcome>,
+    ) -> Result<Self, ProtocolError> {
+        let _ = (entry, commitment, terminal_outcome);
+        todo!("STUB(protocol)")
+    }
+}
+impl StopCause {
+    /// Authenticate this stop at the committed session cursor; shared stops must bind the exact certified step.
+    pub(crate) fn validate_binding(
+        &self,
+        binding: &ExecutionBinding,
+        agreed: StepCursor,
+    ) -> Result<(), ProtocolError> {
+        let _ = (binding, agreed);
+        todo!("STUB(protocol)")
     }
 }

@@ -315,7 +315,7 @@ fn validate_stopped_receipt(
                     reason,
                 },
             )?;
-            super::status::validate_cause_binding(cause, binding, cursor)
+            cause.validate_binding(binding, cursor)
         }
     }
 }

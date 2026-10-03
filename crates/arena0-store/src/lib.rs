@@ -2039,3 +2039,32 @@ fn decode_user_agent(bytes: Vec<u8>) -> Result<String, StoreError> {
 
 #[cfg(test)]
 mod tests;
+
+impl ActivationRecord {
+    /// Retain prepared evidence as the sole resumable activation candidate for this local execution.
+    pub(crate) fn new_prepared(
+        execution_id: ExecId,
+        prepared: PreparedActivation,
+        updated_at_ms: u64,
+    ) -> Self {
+        let _ = (execution_id, prepared, updated_at_ms);
+        todo!("STUB(store)")
+    }
+
+    /// Project validated committed evidence; constructing this in-memory record performs no I/O and cannot fail.
+    pub(crate) fn new_committed(
+        execution_id: ExecId,
+        activation: Activation,
+        updated_at_ms: u64,
+    ) -> Self {
+        let _ = (execution_id, activation, updated_at_ms);
+        todo!("STUB(store)")
+    }
+}
+impl ActivationRecordStatus {
+    /// Parse only the current SQLite status tags; unknown stored tags are corruption, never a fallback state.
+    pub(crate) fn parse(value: &str) -> Result<Self, StoreError> {
+        let _ = value;
+        todo!("STUB(store)")
+    }
+}

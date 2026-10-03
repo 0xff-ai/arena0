@@ -79,13 +79,7 @@ impl super::LoadedProgram {
                 "arena0_prepare established {observed_work_bytes} work-memory bytes; maximum is {max_work_bytes}"
             )));
         }
-        instance.store.data_mut().limits = StoreLimitsBuilder::new()
-            .memory_size(observed_work_bytes)
-            .table_elements(self.profile.limits.max_table_elements as usize)
-            .instances(self.profile.limits.max_instances as usize)
-            .tables(self.profile.limits.max_tables as usize)
-            .memories(self.profile.limits.max_memories as usize)
-            .build();
+        instance.store.data_mut().limits = super::store_limits(&self.profile, observed_work_bytes);
         let baseline_work = work.data(&instance.store).to_vec();
         let mut globals = Vec::new();
         for export in self.module.exports() {
@@ -253,9 +247,7 @@ impl super::LoadedProgram {
                 dispatch,
             },
         )?;
-        let (output, fuel_used) = call_export(
-            &mut instance.store,
-            &instance.instance,
+        let (output, fuel_used) = Guest::new(&mut instance.store, &instance.instance).call_export(
             &self.profile,
             export,
             &bytes,
@@ -280,73 +272,6 @@ fn encode_envelope<T: BorshSerialize>(value: &T, max_bytes: u64) -> Result<Vec<u
         )));
     }
     Ok(bytes)
-}
-
-/// Decode one call output against the profile limit.
-///
-/// This is the single output-direction bound check shared by the fresh
-/// (`decode_result`) and resident (`decode_resident_result`) paths.
-/// Run one guest export on an encoded call envelope: copy it into a guest
-/// allocation, call `export`, decode the returned envelope, then zero and
-/// release the input. Returns the output and the fuel the call used.
-fn call_export<O: BorshDeserialize>(
-    store: &mut Store<super::HostState>,
-    instance: &Instance,
-    profile: &arena0_program::ExecutionProfile,
-    export: &str,
-    bytes: &[u8],
-) -> Result<(O, u64), SandboxError> {
-    let bytes_len = u32::try_from(bytes.len())
-        .map_err(|_| SandboxError::InputLimitExceeded("call input length overflows u32".into()))?;
-    let max_host = profile.limits.max_host_bytes;
-    let (input_ptr, (output_ptr, output_len)) = {
-        let mut guest = Guest::new(store, instance);
-        let input_ptr = guest.alloc(bytes_len)?;
-        guest.write_mem_charged(input_ptr, bytes, max_host)?;
-        (
-            input_ptr,
-            guest.call_pair_return(export, input_ptr, bytes_len)?,
-        )
-    };
-    let output = decode_output(
-        store,
-        instance,
-        output_ptr,
-        output_len,
-        profile.limits.max_call_envelope_bytes,
-        max_host,
-    )?;
-    let mut guest = Guest::new(store, instance);
-    guest.zero_mem(input_ptr, bytes_len)?;
-    guest.dealloc(input_ptr, bytes_len)?;
-    let per_call = profile.fuel.per_call;
-    let fuel_used = per_call.saturating_sub(store.get_fuel().unwrap_or(per_call));
-    Ok((output, fuel_used))
-}
-
-fn decode_output<O: BorshDeserialize>(
-    store: &mut Store<super::HostState>,
-    instance: &Instance,
-    ptr: u32,
-    len: u32,
-    max_envelope: u64,
-    max_host: u64,
-) -> Result<O, SandboxError> {
-    if len as usize > max_envelope as usize {
-        return Err(SandboxError::OutputLimitExceeded {
-            size: len as u64,
-            max: max_envelope,
-        });
-    }
-    let bytes = {
-        let mut guest = Guest::new(store, instance);
-        let bytes = guest.read_mem_charged(ptr, len, max_host)?;
-        guest.zero_mem(ptr, len)?;
-        guest.dealloc(ptr, len)?;
-        bytes
-    };
-    borsh::from_slice(&bytes)
-        .map_err(|error| SandboxError::DeserializationFailed(error.to_string()))
 }
 
 fn projection_result(
@@ -532,21 +457,16 @@ impl ProgramInstance {
         // Host custody and the received attachment belong to this dispatch. Rollback
         // clears them and staged changes; the next entry resets the counters
         // before installing a new view, identity, and queue snapshot.
-        self.store.data_mut().signer.install(signer);
-        self.store.data_mut().verifier = verifier;
-        self.store.data_mut().blobs = blobs;
-        self.store.data_mut().attachment = attachment;
-        self.store.data_mut().direct_queued = direct_queued;
-        self.store.data_mut().peer_id = Some(peer_id);
-        self.store.data_mut().session = Some(session);
-        let (output, fuel_used) = call_export::<DispatchOutput>(
-            &mut self.store,
-            &self.instance,
-            &self.profile,
-            abi::exports::DISPATCH,
-            &bytes,
-        )
-        .or_else(|error| self.rollback_error(error))?;
+        self.store.data_mut().scope.signer.install(signer);
+        self.store.data_mut().scope.verifier = verifier;
+        self.store.data_mut().scope.blobs = blobs;
+        self.store.data_mut().scope.attachment = attachment;
+        self.store.data_mut().scope.direct_queued = direct_queued;
+        self.store.data_mut().scope.peer_id = Some(peer_id);
+        self.store.data_mut().scope.session = Some(session);
+        let (output, fuel_used) = Guest::new(&mut self.store, &self.instance)
+            .call_export::<DispatchOutput>(&self.profile, abi::exports::DISPATCH, &bytes)
+            .or_else(|error| self.rollback_error(error))?;
         if output.status == CallStatus::Accepted
             && let Some(callout) = &output.callout
             && let Err(error) =
@@ -595,7 +515,7 @@ impl ProgramInstance {
             .resident_payloads()
             .or_else(|error| self.rollback_error(error))?;
         Ok(DispatchCallResult {
-            blobs: std::mem::take(&mut self.store.data_mut().staged_blobs),
+            blobs: std::mem::take(&mut self.store.data_mut().scope.staged_blobs),
             status: output.status,
             reason: output.reason,
             callout: output.callout,
