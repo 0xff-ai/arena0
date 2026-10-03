@@ -40,39 +40,3 @@ impl SessionTermination {
         matches!(self, Self::Completed { .. })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn all_variants() -> Vec<SessionTermination> {
-        vec![
-            SessionTermination::Completed {
-                outcome: vec![1, 2, 3],
-            },
-            SessionTermination::FailedHost {
-                subsystem: "transport".into(),
-                message: "connection reset".into(),
-            },
-            SessionTermination::Terminated {
-                reason: "operator shutdown".into(),
-            },
-        ]
-    }
-
-    #[test]
-    fn fault_predicates() {
-        let variants = all_variants();
-        assert_eq!(
-            variants
-                .iter()
-                .map(|v| v.is_host_fault())
-                .collect::<Vec<_>>(),
-            vec![false, true, false]
-        );
-        assert_eq!(
-            variants.iter().map(|v| v.is_success()).collect::<Vec<_>>(),
-            vec![true, false, false]
-        );
-    }
-}

@@ -1307,6 +1307,62 @@ impl ExecutionState {
         }
         Ok(())
     }
+
+    /// Match an answer to the committed open callout; non-answer events cannot consume an ID.
+    fn validate_callout_dispatch(
+        &self,
+        event: &Event<Vec<u8>>,
+        pending_id: Option<CalloutId>,
+    ) -> Result<(), ProtocolError> {
+        let answer = matches!(event, Event::InputReceived { .. });
+        if !answer {
+            if pending_id.is_some() {
+                return Err(ProtocolError::CalloutMismatch);
+            }
+            return Ok(());
+        }
+        let answer_id = pending_id.ok_or(ProtocolError::CalloutMismatch)?;
+        let open = self
+            .callout
+            .as_ref()
+            .ok_or(ProtocolError::CalloutMismatch)?;
+        if open.id != answer_id {
+            return Err(ProtocolError::CalloutMismatch);
+        }
+        let Event::InputReceived { callout_index, .. } = event else {
+            return Err(ProtocolError::CalloutMismatch);
+        };
+        if *callout_index != open.callout_index {
+            return Err(ProtocolError::CalloutMismatch);
+        }
+        Ok(())
+    }
+
+    /// Keep a repeated unanswered callout identity; accepted answers consume it, and terminal results withdraw it.
+    fn next_open_callout(
+        &self,
+        event: &Event<Vec<u8>>,
+        event_position: u64,
+        status: &ExecutionStatus,
+        callout: Option<CalloutRequest>,
+    ) -> Option<OpenCallout> {
+        if !matches!(status, ExecutionStatus::Active) {
+            return None;
+        }
+        let request = callout?;
+        if let Some(current) = &self.callout
+            && !matches!(event, Event::InputReceived { .. })
+            && current.callout_index == request.callout_index
+            && current.context == request.context
+        {
+            return Some(current.clone());
+        }
+        Some(OpenCallout {
+            id: callout_id(self.execution_id, event_position),
+            callout_index: request.callout_index,
+            context: request.context,
+        })
+    }
 }
 
 fn indexed_dispatch_effects(effects: &[Effect]) -> Result<Vec<(u32, Effect)>, ProtocolError> {
@@ -3284,29 +3340,5 @@ mod tests {
             bad_status.validate_recovered().unwrap_err(),
             ProtocolError::InvalidTerminalStatus
         );
-    }
-}
-
-impl ExecutionState {
-    /// Match an answer to the committed open callout; non-answer events cannot consume an ID.
-    fn validate_callout_dispatch(
-        &self,
-        event: &Event<Vec<u8>>,
-        pending_id: Option<CalloutId>,
-    ) -> Result<(), ProtocolError> {
-        let _ = (event, pending_id);
-        todo!("STUB(protocol)")
-    }
-
-    /// Keep a repeated unanswered callout identity; accepted answers consume it, and terminal results withdraw it.
-    fn next_open_callout(
-        &self,
-        event: &Event<Vec<u8>>,
-        event_position: u64,
-        status: &ExecutionStatus,
-        callout: Option<CalloutRequest>,
-    ) -> Option<OpenCallout> {
-        let _ = (event, event_position, status, callout);
-        todo!("STUB(protocol)")
     }
 }
