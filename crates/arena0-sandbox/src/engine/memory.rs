@@ -59,6 +59,7 @@ impl<'a> Guest<'a> {
     ) -> Result<Vec<u8>, SandboxError> {
         self.store
             .data_mut()
+            .scope
             .ledger
             .copy_bytes(len as usize, max_host_bytes)?;
         self.read_mem(ptr, len)
@@ -105,6 +106,7 @@ impl<'a> Guest<'a> {
     ) -> Result<(), SandboxError> {
         self.store
             .data_mut()
+            .scope
             .ledger
             .copy_bytes(bytes.len(), max_host_bytes)?;
         self.write_mem(offset, bytes)
@@ -232,5 +234,30 @@ mod tests {
     fn packed_result_decodes_bounded_unsigned_halves() {
         let packed = (0x1234_i64 << 32) | 0x5678;
         assert_eq!(unpack_i64(packed).unwrap(), (0x1234, 0x5678));
+    }
+}
+
+impl Guest<'_> {
+    /// Charge input/output copies, decode the envelope, then zero and free successful call allocations; the caller disposes or restores the instance on error.
+    pub(super) fn call_export<O: borsh::BorshDeserialize>(
+        &mut self,
+        profile: &arena0_program::ExecutionProfile,
+        export: &str,
+        bytes: &[u8],
+    ) -> Result<(O, u64), SandboxError> {
+        let _ = (profile, export, bytes);
+        todo!("STUB(sandbox)")
+    }
+
+    /// Bound the returned envelope before copying; charge host bytes and zero/release the output before deserializing it.
+    pub(super) fn decode_output<O: borsh::BorshDeserialize>(
+        &mut self,
+        ptr: u32,
+        len: u32,
+        max_envelope: u64,
+        max_host: u64,
+    ) -> Result<O, SandboxError> {
+        let _ = (ptr, len, max_envelope, max_host);
+        todo!("STUB(sandbox)")
     }
 }

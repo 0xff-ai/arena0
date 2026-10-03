@@ -1,13 +1,6 @@
 use super::*;
-
-fn encode_facts(facts: &ActivationFacts) -> Result<Vec<u8>, StoreError> {
-    borsh::to_vec(facts)
-        .map_err(|error| StoreError::Corruption(format!("activation facts encode: {error}")))
-}
-
-// Own the record's envelope decoding and index checks together, so timed
-// reads and transactional reads reject the same inconsistent evidence.
-fn decode_activation_record(
+/// Raw SQLite activation columns; decoding validates envelopes and every denormalized index together.
+struct RawActivationRow {
     execution_id: ExecId,
     session_bytes: Vec<u8>,
     status: String,
@@ -15,74 +8,12 @@ fn decode_activation_record(
     committed_bytes: Option<Vec<u8>>,
     updated_at_ms: i64,
     facts_bytes: Vec<u8>,
-) -> Result<ActivationRecord, StoreError> {
-    let payload = open_envelope(
-        EnvelopeKind::PreparedActivation,
-        &prepared_bytes,
-        MAX_ACTIVATION_BYTES,
-    )?;
-    let prepared: PreparedActivation = decode_borsh(&payload, "prepared activation")?;
-    prepared
-        .validate()
-        .map_err(|error| StoreError::Corruption(format!("prepared activation: {error}")))?;
-    let facts: ActivationFacts = decode_borsh(&facts_bytes, "activation facts")?;
-    let expected = ActivationFacts::of(&prepared);
-    if facts != expected {
-        return Err(StoreError::Corruption(
-            "activation facts do not match decoded activation".into(),
-        ));
+}
+impl RawActivationRow {
+    /// Consume one row only after checking its status, session and facts against authenticated evidence.
+    fn decode(self) -> Result<ActivationRecord, StoreError> {
+        todo!("STUB(store)")
     }
-    let status = parse_activation_status(&status)?;
-    let session_id = SessionHash(array32(&session_bytes, "activation session")?);
-    if prepared.session_hash() == SessionHash([0; 32]) {
-        return Err(StoreError::Corruption(
-            "activation has zero session identity".into(),
-        ));
-    }
-    if prepared.session_hash() != session_id {
-        return Err(StoreError::Corruption(
-            "activation session index does not match prepared evidence".into(),
-        ));
-    }
-    let committed = committed_bytes
-        .map(|bytes| {
-            let payload = open_envelope(EnvelopeKind::Activation, &bytes, MAX_ACTIVATION_BYTES)?;
-            let activation: Activation = decode_borsh(&payload, "activation")?;
-            activation
-                .validate()
-                .map_err(|error| StoreError::Corruption(format!("activation: {error}")))?;
-            if !prepared.matches(&activation) {
-                return Err(StoreError::Corruption(
-                    "committed activation does not match prepared evidence".into(),
-                ));
-            }
-            Ok(activation)
-        })
-        .transpose()?;
-    if matches!(status, ActivationRecordStatus::Prepared) != committed.is_none() {
-        return Err(StoreError::Corruption(
-            "activation status and committed evidence disagree".into(),
-        ));
-    }
-    let state = match (status, committed) {
-        (ActivationRecordStatus::Prepared, None) => {
-            ActivationRecordState::Prepared { evidence: prepared }
-        }
-        (ActivationRecordStatus::Committed, Some(activation)) => ActivationRecordState::Committed {
-            evidence: prepared,
-            activation: Box::new(activation),
-        },
-        _ => {
-            return Err(StoreError::Corruption(
-                "activation status and committed evidence disagree".into(),
-            ));
-        }
-    };
-    Ok(ActivationRecord {
-        execution_id,
-        state,
-        updated_at_ms: sqlite_i64(updated_at_ms)?,
-    })
 }
 
 impl Database {
@@ -106,8 +37,8 @@ impl Database {
         prepared: PreparedActivation,
         now_ms: u64,
     ) -> Result<PrepareActivationOutcome, StoreError> {
-        let incoming = prepared_activation_record(execution_id, prepared.clone(), now_ms);
-        let encoded = prepared_activation_bytes(&prepared)?;
+        let incoming = ActivationRecord::new_prepared(execution_id, prepared.clone(), now_ms);
+        let encoded = encode_borsh(&prepared, "prepared activation")?;
         self.ensure_program_registered(prepared.offer().data().program_hash)?;
         let existing = self.load_activation_in_transaction(execution_id)?;
         let Some(existing) = existing else {
@@ -121,9 +52,9 @@ impl Database {
                 params![
                     execution_id.0.to_vec(),
                     prepared.session_hash().0.to_vec(),
-                    envelope(EnvelopeKind::PreparedActivation, &encoded)?,
+                    DurableEnvelope::seal(EnvelopeKind::PreparedActivation, &encoded)?,
                     sqlite_u64(now_ms)?,
-                    encode_facts(&facts)?,
+                    encode_borsh(&facts, "activation facts")?,
                 ],
             )?;
             self.record_change(ChangeKey::Exec(execution_id));
@@ -191,7 +122,7 @@ impl Database {
         activation: Activation,
         now_ms: u64,
     ) -> Result<CommitActivationOutcome, StoreError> {
-        let incoming = committed_activation_record(execution_id, activation.clone(), now_ms)?;
+        let incoming = ActivationRecord::new_committed(execution_id, activation.clone(), now_ms);
         let Some(existing) = self.load_activation_in_transaction(execution_id)? else {
             return Err(StoreError::ActivationNotFound(execution_id));
         };
@@ -224,7 +155,7 @@ impl Database {
                 incoming: Box::new(incoming),
             });
         }
-        let encoded = activation_bytes(&activation)?;
+        let encoded = encode_borsh(&activation, "activation")?;
         let facts = ActivationFacts::of(activation.prepared());
         let changed = self.connection.execute(
             "UPDATE activation_records SET status = 'committed', committed_activation = ?2,
@@ -232,9 +163,9 @@ impl Database {
              WHERE execution_id = ?3 AND status = 'prepared'",
             params![
                 sqlite_u64(now_ms)?,
-                envelope(EnvelopeKind::Activation, &encoded)?,
+                DurableEnvelope::seal(EnvelopeKind::Activation, &encoded)?,
                 execution_id.0.to_vec(),
-                encode_facts(&facts)?,
+                encode_borsh(&facts, "activation facts")?,
             ],
         )?;
         if changed != 1 {
@@ -286,7 +217,7 @@ impl Database {
                 facts_bytes,
             )| {
                 super::integrity::timed_decode("decode.activation", || {
-                    decode_activation_record(
+                    RawActivationRow {
                         execution_id,
                         session_bytes,
                         status,
@@ -294,7 +225,8 @@ impl Database {
                         committed_bytes,
                         updated_at_ms,
                         facts_bytes,
-                    )
+                    }
+                    .decode()
                 })
             },
         )
@@ -311,8 +243,8 @@ impl Database {
         let (envelope_kind, existing_bytes, incoming_bytes) = match kind {
             ActivationConflictKind::Prepared => (
                 EnvelopeKind::PreparedActivation,
-                prepared_activation_bytes(existing.prepared())?,
-                prepared_activation_bytes(incoming.prepared())?,
+                encode_borsh(existing.prepared(), "prepared activation")?,
+                encode_borsh(incoming.prepared(), "prepared activation")?,
             ),
             ActivationConflictKind::Committed => {
                 let existing_activation = existing.activation().ok_or_else(|| {
@@ -327,8 +259,8 @@ impl Database {
                 })?;
                 (
                     EnvelopeKind::Activation,
-                    activation_bytes(existing_activation)?,
-                    activation_bytes(incoming_activation)?,
+                    encode_borsh(existing_activation, "activation")?,
+                    encode_borsh(incoming_activation, "activation")?,
                 )
             }
         };
@@ -342,8 +274,8 @@ impl Database {
                     ActivationConflictKind::Prepared => "prepared",
                     ActivationConflictKind::Committed => "committed",
                 },
-                envelope(envelope_kind, &existing_bytes)?,
-                envelope(envelope_kind, &incoming_bytes)?,
+                DurableEnvelope::seal(envelope_kind, &existing_bytes)?,
+                DurableEnvelope::seal(envelope_kind, &incoming_bytes)?,
                 sqlite_u64(now_ms)?,
             ],
         )?;
@@ -390,8 +322,8 @@ impl Database {
                 .ok_or_else(|| {
                     StoreError::Corruption("activation conflict has no owning activation".into())
                 })?;
-            let existing = open_envelope(kind, &existing, MAX_ACTIVATION_BYTES)?;
-            let incoming = open_envelope(kind, &incoming, MAX_ACTIVATION_BYTES)?;
+            let existing = DurableEnvelope::open(kind, &existing, MAX_ACTIVATION_BYTES)?;
+            let incoming = DurableEnvelope::open(kind, &incoming, MAX_ACTIVATION_BYTES)?;
             match kind {
                 EnvelopeKind::PreparedActivation => {
                     let existing: PreparedActivation =

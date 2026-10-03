@@ -27,7 +27,7 @@ impl ReadDb {
             )
             .optional()?
             .ok_or_else(|| StoreError::Corruption("agreed step has no stored state".into()))?;
-        let bytes = open_envelope(
+        let bytes = DurableEnvelope::open(
             EnvelopeKind::StepState,
             &stored,
             arena0_program::MAX_SHARED_STATE_BYTES,

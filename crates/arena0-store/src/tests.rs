@@ -2721,7 +2721,8 @@ async fn persisted_zero_execution_salt_is_store_corruption() {
     store.shutdown().await.expect("shutdown");
 
     let connection = Connection::open(&path).expect("inspect");
-    let encoded = envelope(EnvelopeKind::ExecutionSalt, &[0; 32]).expect("salt envelope");
+    let encoded =
+        DurableEnvelope::seal(EnvelopeKind::ExecutionSalt, &[0; 32]).expect("salt envelope");
     connection
         .execute(
             "UPDATE execution_salts SET salt = ?1 WHERE execution_id = ?2",
@@ -3108,21 +3109,22 @@ async fn registry_remove_retains_content_and_reactivate_is_exact() {
 
 #[test]
 fn envelopes_reject_wrong_kind_oversize_and_tampering() {
-    let encoded = envelope(EnvelopeKind::Program, b"x").expect("encode");
+    let encoded = DurableEnvelope::seal(EnvelopeKind::Program, b"x").expect("encode");
     assert!(matches!(
-        open_envelope(EnvelopeKind::ExecutionState, &encoded, 8),
+        DurableEnvelope::open(EnvelopeKind::ExecutionState, &encoded, 8),
         Err(StoreError::Corruption(_))
     ));
     assert!(matches!(
-        open_envelope(EnvelopeKind::Program, &encoded, 0),
+        DurableEnvelope::open(EnvelopeKind::Program, &encoded, 0),
         Err(StoreError::Corruption(_))
     ));
 
-    let mut tampered = envelope(EnvelopeKind::ExecutionState, b"state").expect("encode");
+    let mut tampered =
+        DurableEnvelope::seal(EnvelopeKind::ExecutionState, b"state").expect("encode");
     let last = tampered.len() - 1;
     tampered[last] ^= 0x80;
     assert!(matches!(
-        open_envelope(EnvelopeKind::ExecutionState, &tampered, 64),
+        DurableEnvelope::open(EnvelopeKind::ExecutionState, &tampered, 64),
         Err(StoreError::Corruption(_))
     ));
 }
@@ -5221,7 +5223,7 @@ fn focus_resolve_sources_use_index_searches() {
             } else {
                 vec![vec![0u8; 32]]
             };
-            for statement in database::resolve_statements(space, bounded, 8) {
+            for statement in space.statements(bounded, 8) {
                 let details = sql
                     .prepare(&format!("EXPLAIN QUERY PLAN {statement}"))
                     .unwrap()
@@ -5303,7 +5305,7 @@ async fn focus_step_states_are_certified_post_states_and_damage_is_rejected() {
         );
     }
     let sql = Connection::open(&path).unwrap();
-    let wrong = envelope(EnvelopeKind::StepState, &[99]).unwrap();
+    let wrong = DurableEnvelope::seal(EnvelopeKind::StepState, &[99]).unwrap();
     sql.execute(
         "UPDATE step_states SET shared_state = ?1 WHERE execution_id = ?2 AND step = 1",
         params![wrong, id.0.as_slice()],

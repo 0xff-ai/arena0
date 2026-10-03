@@ -28,6 +28,9 @@ pub use keys::NodeKeys;
 #[cfg(not(target_arch = "wasm32"))]
 pub use keys::{BLS_BINDING_DOMAIN, key_binding_message, verify_key_binding};
 
+/// Canonical text codecs shared by program and protocol identifiers.
+pub mod id;
+
 use core::fmt;
 
 use borsh::{BorshDeserialize, BorshSerialize};

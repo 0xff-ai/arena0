@@ -261,8 +261,7 @@ pub struct SendHandle {
     pub(crate) remote: PeerId,
     pub(crate) connection_id: u64,
     pub(crate) stream_id: u64,
-    pub(crate) proto: StreamProtocol,
-    pub(crate) session_hash: Option<SessionHash>,
+    pub(crate) binding: StreamBinding,
     pub(crate) tx: mpsc::Sender<StreamPacket>,
     pub(crate) state: Arc<StreamState>,
 }
@@ -295,24 +294,24 @@ impl SendHandle {
 
     /// Which protocol this stream carries.
     pub const fn proto(&self) -> StreamProtocol {
-        self.proto
+        self.binding.proto()
     }
 
     /// The execution session bound at stream open, or `None` for fetch
     /// streams.
     #[must_use]
     pub const fn session_hash(&self) -> Option<SessionHash> {
-        self.session_hash
+        self.binding.session_hash()
     }
 
     /// Send an [`arena0_protocol::ExecFrame`] on an `Exec` stream.
     pub async fn send_exec(&self, msg: &DomainExecFrame) -> Result<(), TransportError> {
-        self.validate_exec_route(msg)?;
-        if self.proto != StreamProtocol::Exec {
+        self.binding.validate_exec_route(msg)?;
+        if self.binding.proto() != StreamProtocol::Exec {
             return Err(TransportError::ProtocolMismatch(format!(
                 "sent {:?} frame on a {:?} stream",
                 StreamProtocol::Exec,
-                self.proto
+                self.binding.proto()
             )));
         }
         let frame = Codec::new(StreamProtocol::Exec.max_frame_body()).encode(msg)?;
@@ -360,10 +359,10 @@ impl SendHandle {
         expected: StreamProtocol,
         msg: &T,
     ) -> Result<(), TransportError> {
-        if self.proto != expected {
+        if self.binding.proto() != expected {
             return Err(TransportError::ProtocolMismatch(format!(
                 "sent {expected:?} frame on a {:?} stream",
-                self.proto
+                self.binding.proto()
             )));
         }
         let frame = Codec::new(expected.max_frame_body()).encode(msg)?;
@@ -392,15 +391,6 @@ impl SendHandle {
             }
         }
     }
-
-    fn validate_exec_route(&self, frame: &DomainExecFrame) -> Result<(), TransportError> {
-        let Some(session_hash) = self.session_hash else {
-            return Err(TransportError::ProtocolMismatch(
-                "execution handle has no session binding".into(),
-            ));
-        };
-        validate_exec_route(frame, session_hash)
-    }
 }
 
 /// Handle to the inbound (recv) side of a unidirectional stream.
@@ -411,8 +401,7 @@ pub struct RecvHandle {
     pub(crate) remote: PeerId,
     pub(crate) connection_id: u64,
     pub(crate) stream_id: u64,
-    pub(crate) proto: StreamProtocol,
-    pub(crate) session_hash: Option<SessionHash>,
+    pub(crate) binding: StreamBinding,
     pub(crate) rx: Mutex<mpsc::Receiver<StreamPacket>>,
     pub(crate) state: Arc<StreamState>,
 }
@@ -445,14 +434,14 @@ impl RecvHandle {
 
     /// Which protocol this stream carries.
     pub const fn proto(&self) -> StreamProtocol {
-        self.proto
+        self.binding.proto()
     }
 
     /// The execution session bound at stream open, or `None` for fetch
     /// streams.
     #[must_use]
     pub const fn session_hash(&self) -> Option<SessionHash> {
-        self.session_hash
+        self.binding.session_hash()
     }
 
     /// Receive the next [`arena0_protocol::ExecFrame`] on an `Exec` stream.
@@ -467,7 +456,7 @@ impl RecvHandle {
             .decode::<DomainExecFrame>(&packet.bytes)
         {
             Ok(frame) => {
-                if let Err(error) = self.validate_exec_route(&frame) {
+                if let Err(error) = self.binding.validate_exec_route(&frame) {
                     let _ = responsibility.send(Err(ExecDeliveryFailure::Rejected));
                     return Err(error);
                 }
@@ -499,10 +488,10 @@ impl RecvHandle {
     }
 
     async fn recv_packet(&self, expected: StreamProtocol) -> Result<StreamPacket, TransportError> {
-        if self.proto != expected {
+        if self.binding.proto() != expected {
             return Err(TransportError::ProtocolMismatch(format!(
                 "received {expected:?} frame on a {:?} stream",
-                self.proto
+                self.binding.proto()
             )));
         }
         if self.state.is_closed() {
@@ -525,15 +514,6 @@ impl RecvHandle {
             return Err(TransportError::ConnectionClosed);
         }
         Ok(packet)
-    }
-
-    fn validate_exec_route(&self, frame: &DomainExecFrame) -> Result<(), TransportError> {
-        let Some(session_hash) = self.session_hash else {
-            return Err(TransportError::ProtocolMismatch(
-                "execution handle has no session binding".into(),
-            ));
-        };
-        validate_exec_route(frame, session_hash)
     }
 }
 
@@ -651,4 +631,26 @@ pub trait Transport: Send {
 
     /// Gracefully shut down the transport. Default is a no-op.
     async fn close(&self) {}
+}
+
+/// A stream's protocol and session are one fact: fetch has no session; execution always does.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StreamBinding {
+    Fetch,
+    Exec(SessionHash),
+}
+impl StreamBinding {
+    /// The codec family selected before touching a channel.
+    pub(crate) const fn proto(self) -> StreamProtocol {
+        panic!("STUB(transport)")
+    }
+    /// Expose execution binding to existing public handle getters.
+    pub(crate) const fn session_hash(self) -> Option<SessionHash> {
+        panic!("STUB(transport)")
+    }
+    /// Reject fetch before sending and verify any session-bearing execution evidence.
+    fn validate_exec_route(self, frame: &DomainExecFrame) -> Result<(), TransportError> {
+        let _ = frame;
+        panic!("STUB(transport)")
+    }
 }

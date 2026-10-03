@@ -32,6 +32,7 @@ pub(crate) fn register_always_available(
                 let max = caller.data().profile.limits.max_host_bytes;
                 caller
                     .data_mut()
+                    .scope
                     .ledger
                     .copy_bytes(32, max)
                     .map_err(wasmtime::Error::new)?;
@@ -62,6 +63,7 @@ pub(crate) fn register_always_available(
                 let max = caller.data().profile.limits.max_host_bytes;
                 caller
                     .data_mut()
+                    .scope
                     .ledger
                     .copy_bytes(32, max)
                     .map_err(wasmtime::Error::new)?;
@@ -91,6 +93,7 @@ pub(crate) fn register_always_available(
                 let max = caller.data().profile.limits.max_host_bytes;
                 caller
                     .data_mut()
+                    .scope
                     .ledger
                     .copy_bytes(4 * n as usize, max)
                     .map_err(wasmtime::Error::new)?;
@@ -128,7 +131,7 @@ pub(crate) fn register_always_available(
              out_ptr: u32,
              out_cap: u32| {
                 caller.begin_import(imports::VERIFY)?;
-                let verifier = caller.data().verifier.clone().ok_or_else(|| {
+                let verifier = caller.data().scope.verifier.clone().ok_or_else(|| {
                     wasmtime::Error::msg("verify is only available in dispatches")
                 })?;
                 let fuel = caller.data().profile.fuel.verify;
@@ -148,6 +151,7 @@ pub(crate) fn register_always_available(
                 let max = caller.data().profile.limits.max_host_bytes;
                 caller
                     .data_mut()
+                    .scope
                     .ledger
                     .copy_bytes(encoded.len(), max)
                     .map_err(wasmtime::Error::new)?;
@@ -207,6 +211,7 @@ pub(crate) fn register_always_available(
                 let max_host_bytes = caller.data().profile.limits.max_host_bytes;
                 caller
                     .data_mut()
+                    .scope
                     .ledger
                     .copy_bytes(len as usize, max_host_bytes)
                     .map_err(wasmtime::Error::new)?;
@@ -255,6 +260,7 @@ pub(crate) fn register_always_available(
                 let max_host_bytes = caller.data().profile.limits.max_host_bytes;
                 caller
                     .data_mut()
+                    .scope
                     .ledger
                     .copy_bytes(host_bytes, max_host_bytes)
                     .map_err(wasmtime::Error::new)?;
@@ -276,6 +282,7 @@ pub(crate) fn register_always_available(
                 let profile = caller.data().profile.clone();
                 caller
                     .data_mut()
+                    .scope
                     .ledger
                     .log(
                         message.len(),
@@ -288,6 +295,7 @@ pub(crate) fn register_always_available(
                     .ok_or_else(|| wasmtime::Error::msg("invalid log level ABI tag"))?;
                 caller
                     .data_mut()
+                    .scope
                     .logs
                     .push((format!("{log_level:?}"), message));
                 Ok(())
@@ -311,11 +319,13 @@ pub(crate) fn register_always_available(
                 }
                 caller
                     .data_mut()
+                    .scope
                     .ledger
                     .copy_bytes(len as usize, profile.limits.max_host_bytes)
                     .map_err(wasmtime::Error::new)?;
                 caller
                     .data_mut()
+                    .scope
                     .ledger
                     .random(profile.limits.max_random_draws)
                     .map_err(wasmtime::Error::new)?;
@@ -329,7 +339,7 @@ pub(crate) fn register_always_available(
                     return Err(wasmtime::Error::msg("random: write out of bounds"));
                 }
                 let mut bytes = vec![0u8; len as usize];
-                caller.data_mut().entropy.fill(&mut bytes);
+                caller.data_mut().scope.entropy.fill(&mut bytes);
                 let data = work_mem.data_mut(&mut caller);
                 data[start..end].copy_from_slice(&bytes);
                 Ok(())
@@ -448,8 +458,8 @@ mod tests {
             &memory.data(&store)[..32],
             &arena0_crypto::hash(arena0_crypto::HashAlgorithm::Blake3, b"abc")
         );
-        assert_eq!(store.data().ledger.host_bytes, 2 * (3 + 32));
-        assert!(store.data().effect_queue.is_empty());
+        assert_eq!(store.data().scope.ledger.host_bytes, 2 * (3 + 32));
+        assert!(store.data().scope.effect_queue.is_empty());
     }
 
     #[test]
@@ -492,15 +502,15 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(actual, arena0_crypto::permutation([7; 32], n).unwrap());
         }
-        let copied = store.data().ledger.host_bytes;
+        let copied = store.data().scope.ledger.host_bytes;
         let before = memory.data(&store).to_vec();
         let error = run
             .call(&mut store, arena0_program::profile::MAX_PERMUTATION_LEN + 1)
             .unwrap_err();
         assert!(format!("{error:?}").contains("length exceeds maximum"));
-        assert_eq!(store.data().ledger.host_bytes, copied);
+        assert_eq!(store.data().scope.ledger.host_bytes, copied);
         assert_eq!(memory.data(&store), before);
-        assert!(store.data().effect_queue.is_empty());
+        assert!(store.data().scope.effect_queue.is_empty());
     }
 
     #[test]
@@ -535,7 +545,7 @@ mod tests {
             .unwrap();
         let error = run.call(&mut store, ()).unwrap_err();
         assert!(format!("{error:?}").contains("verify is only available in dispatches"));
-        assert_eq!(store.data().ledger.host_bytes, 0);
+        assert_eq!(store.data().scope.ledger.host_bytes, 0);
         assert_eq!(&memory.data(&store)[64..192], &[0; 128]);
     }
 
@@ -591,7 +601,7 @@ mod tests {
             Ok(b"payload".to_vec()),
             Err(arena0_protocol::VerifyError::BadSignature),
         ] {
-            store.data_mut().verifier = Some(std::sync::Arc::new(Verifier(result.clone())));
+            store.data_mut().scope.verifier = Some(std::sync::Arc::new(Verifier(result.clone())));
             let len = run.call(&mut store, 128).unwrap();
             let decoded: Result<Vec<u8>, arena0_protocol::VerifyError> =
                 borsh::from_slice(&memory.data(&store)[64..64 + len as usize]).unwrap();
@@ -599,6 +609,6 @@ mod tests {
             let error = run.call(&mut store, 0).unwrap_err();
             assert!(format!("{error:?}").contains("result exceeds output capacity"));
         }
-        assert!(store.data().effect_queue.is_empty());
+        assert!(store.data().scope.effect_queue.is_empty());
     }
 }

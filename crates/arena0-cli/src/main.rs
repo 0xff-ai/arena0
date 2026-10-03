@@ -723,11 +723,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Status => status(&ctx, host_selected).await,
         Command::Stop => stop(&ctx).await,
         Command::Identity => identity(&ctx).await,
-        Command::Program { command } => program(&ctx, command).await,
-        Command::Blob(command) => blob(&ctx, command).await,
-        Command::Exec { command } => execution(&ctx, command).await,
+        Command::Program { command } => command.run(&ctx).await,
+        Command::Blob(command) => command.run(&ctx).await,
+        Command::Exec { command } => command.run(&ctx).await,
         Command::Watch { exec } => watch::watch(&ctx, exec).await,
-        Command::Receipt { command } => receipt(&ctx, command).await,
+        Command::Receipt { command } => command.run(&ctx).await,
         Command::Verify { target, .. } => verify::verify(&ctx, target).await,
         Command::Run { .. } => unreachable!("coordinated run returned before client construction"),
         Command::Launch { .. } | Command::Ui(_) => {
@@ -1129,65 +1129,6 @@ fn id_json(info: &arena0_client::api::IdInfo) -> Value {
     })
 }
 
-async fn blob(ctx: &Ctx, command: BlobCommand) -> anyhow::Result<()> {
-    match command {
-        BlobCommand::Import { file } => {
-            let path = std::fs::canonicalize(&file)
-                .with_context(|| format!("resolve {}", file.display()))?;
-            let ResponseOk::BlobImported { hash, length } = ctx
-                .call(&HostRequest::BlobImport {
-                    source: arena0_client::api::FileSource::Path(path),
-                })
-                .await?
-            else {
-                bail!("unexpected response to blob.import");
-            };
-            if ctx.mode.is_json() {
-                ui::print_json(&json!({ "hash": hash, "length": length }));
-            } else {
-                println!("{hash} {length}");
-            }
-        }
-        BlobCommand::List => {
-            let ResponseOk::BlobList(blobs) = ctx.call(&HostRequest::BlobList).await? else {
-                bail!("unexpected response to blob.list");
-            };
-            if ctx.mode.is_json() {
-                ui::print_json(&json!(blobs));
-            } else {
-                for blob in blobs {
-                    println!(
-                        "{} {} {}",
-                        blob.hash,
-                        blob.length,
-                        if blob.linked { "linked" } else { "received" }
-                    );
-                }
-            }
-        }
-        BlobCommand::Export { hash, file } => {
-            let hash = hash.parse::<arena0_client::protocol::BlobHash>()?;
-            let path = std::path::absolute(&file)
-                .with_context(|| format!("resolve {}", file.display()))?;
-            let ResponseOk::BlobExported { length } = ctx
-                .call(&HostRequest::BlobExport {
-                    hash,
-                    path: path.clone(),
-                })
-                .await?
-            else {
-                bail!("unexpected response to blob.export");
-            };
-            if ctx.mode.is_json() {
-                ui::print_json(&json!({ "file": path, "length": length }));
-            } else {
-                println!("wrote {length} bytes to {}", path.display());
-            }
-        }
-    }
-    Ok(())
-}
-
 /// `YYYY-MM-DDTHH:MM:SSZ` for a Unix millisecond time, computed from the day
 /// count (no timezone crate). Sub-second precision is dropped.
 fn rfc3339_utc_seconds(unix_ms: u64) -> String {
@@ -1216,74 +1157,6 @@ fn rfc3339_utc_seconds(unix_ms: u64) -> String {
     )
 }
 
-async fn program(ctx: &Ctx, command: ProgramCommand) -> anyhow::Result<()> {
-    let response = match command {
-        ProgramCommand::List => ctx.call(&HostRequest::ProgramList).await?,
-        ProgramCommand::Show { program } => ctx.call(&HostRequest::ProgramGet { program }).await?,
-        ProgramCommand::Import { file } => {
-            let source = arena0_client::api::FileSource::Path(
-                std::fs::canonicalize(&file)
-                    .with_context(|| format!("resolve {}", file.display()))?,
-            );
-            ctx.call(&HostRequest::ProgramImport { source }).await?
-        }
-        ProgramCommand::Remove { program } => {
-            ctx.call(&HostRequest::ProgramRemove { program }).await?
-        }
-    };
-    match response {
-        ResponseOk::ProgramList(list) => {
-            if ctx.mode.is_json() {
-                ui::print_json(&json!({
-                    "programs": list.iter().map(program_json).collect::<Vec<_>>()
-                }));
-            } else {
-                let rows = list
-                    .iter()
-                    .map(|summary| {
-                        vec![
-                            summary.name.clone(),
-                            summary.program_hash.fmt_short().to_string(),
-                            summary.participants.to_string(),
-                            summary.version.clone(),
-                        ]
-                    })
-                    .collect::<Vec<_>>();
-                print!(
-                    "{}",
-                    ui::render_table(
-                        &["PROGRAM", "ID", "PARTICIPANTS", "VERSION"],
-                        &rows,
-                        ctx.palette,
-                        ctx.viewport().width,
-                    )
-                );
-            }
-        }
-        ResponseOk::Program(detail) => {
-            if ctx.mode.is_json() {
-                ui::print_json(&json!({
-                    "summary": program_json(&detail.summary),
-                    "schema": detail.schema,
-                }));
-            } else {
-                println!("{} ({})", detail.summary.display_name, detail.summary.name);
-                println!("  id           {}", detail.summary.program_hash);
-                println!("  participants {}", detail.summary.participants);
-                println!("  version      {}", detail.summary.version);
-                println!("  description  {}", detail.summary.description);
-                println!(
-                    "  schema       {}",
-                    serde_json::to_string_pretty(&detail.schema)?
-                );
-            }
-        }
-        ResponseOk::Ack => print_ack(ctx),
-        other => bail!("unexpected program response: {other:?}"),
-    }
-    Ok(())
-}
-
 fn program_json(summary: &arena0_client::api::ProgramSummary) -> Value {
     json!({
         "program_id": summary.program_hash.to_string(),
@@ -1293,292 +1166,6 @@ fn program_json(summary: &arena0_client::api::ProgramSummary) -> Value {
         "description": summary.description,
         "participants": summary.participants,
     })
-}
-
-async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
-    match command {
-        ExecCommand::Create {
-            program,
-            participants,
-            join,
-            param,
-            blobs,
-        } => {
-            let ensemble = ensemble_spec(ctx, &program, participants, join.as_deref()).await?;
-            let params = answer::assemble_params(&param).map_err(anyhow::Error::msg)?;
-            let exec_id = ExecId(rand::random());
-            let created = ctx
-                .call_raw(&HostRequest::ExecNew {
-                    exec_id,
-                    program,
-                    params,
-                    ensemble,
-                    blobs,
-                })
-                .await;
-            let created = match created {
-                Ok(Ok(created)) => created,
-                Ok(Err(error)) => return Err(error.into()),
-                Err(error) => {
-                    return match ctx.call(&HostRequest::ExecCancelCreation { exec_id })
-                        .await
-                    {
-                        Ok(ResponseOk::Ack) => Err(error.context(format!(
-                            "exec.new failed; requested execution {exec_id} was cancelled"
-                        ))),
-                        Ok(other) => Err(error.context(format!(
-                            "exec.new failed; unexpected cleanup response for {exec_id}: {other:?}"
-                        ))),
-                        Err(cleanup) => Err(error.context(format!(
-                            "exec.new failed; cleanup for requested execution {exec_id} was incomplete: {cleanup:#}"
-                        ))),
-                    };
-                }
-            };
-            match created {
-                ResponseOk::ExecCreated {
-                    exec_id: returned_exec_id,
-                    negotiation_id,
-                    session_id,
-                    exec_state,
-                    queue_position,
-                } => {
-                    if returned_exec_id != exec_id {
-                        return match ctx.call(&HostRequest::ExecCancelCreation { exec_id })
-                            .await
-                        {
-                            Ok(ResponseOk::Ack) => Err(anyhow!(
-                                "Host returned ExecId {returned_exec_id}, requested {exec_id}; the requested id was withdrawn"
-                            )),
-                            Ok(other) => Err(anyhow!(
-                                "Host returned ExecId {returned_exec_id}, requested {exec_id}; cleanup returned {other:?}"
-                            )),
-                            Err(error) => Err(error.context(format!(
-                                "Host returned ExecId {returned_exec_id}, requested {exec_id}; cleanup failed"
-                            ))),
-                        };
-                    }
-                    if ctx.mode.is_json() {
-                        ui::print_json(&json!({
-                            "exec_id": returned_exec_id.to_string(),
-                            "negotiation_id": negotiation_id.map(|id| id.to_string()),
-                            "session_id": session_id.map(|id| id.to_string()),
-                            "exec_state": exec_state,
-                            "queue_position": queue_position,
-                        }));
-                    } else {
-                        let negotiation = negotiation_id.map_or_else(
-                            || "waiting for offer".to_owned(),
-                            |id| id.fmt_short().to_string(),
-                        );
-                        println!(
-                            "created exec {}  negotiation {}  state {:?}",
-                            returned_exec_id.fmt_short(),
-                            negotiation,
-                            exec_state
-                        );
-                    }
-                }
-                other => bail!("unexpected response to exec.create: {other:?}"),
-            }
-        }
-        ExecCommand::List => {
-            let ResponseOk::ExecList(list) = ctx.call(&HostRequest::ExecList).await? else {
-                bail!("unexpected response to exec.list");
-            };
-            if ctx.mode.is_json() {
-                ui::print_json(&json!({
-                    "executions": list
-                }));
-            } else {
-                let rows = list
-                    .iter()
-                    .map(|status| {
-                        vec![
-                            status.exec_id.fmt_short().to_string(),
-                            status.program_id.fmt_short().to_string(),
-                            ui::lifecycle_label(status.lifecycle).to_owned(),
-                            status
-                                .step
-                                .map_or_else(|| "-".into(), |step| step.to_string()),
-                        ]
-                    })
-                    .collect::<Vec<_>>();
-                print!(
-                    "{}",
-                    ui::render_table(
-                        &["EXEC", "PROGRAM", "STATE", "STEP"],
-                        &rows,
-                        ctx.palette,
-                        ctx.viewport().width,
-                    )
-                );
-            }
-        }
-        ExecCommand::Status { exec_id } => {
-            let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
-            let ResponseOk::Status(status) = ctx.call(&HostRequest::ExecStatus { exec_id }).await?
-            else {
-                bail!("unexpected response to exec.status");
-            };
-            render_exec_status(ctx, &status);
-        }
-        ExecCommand::Await { exec_id, until } => {
-            let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
-            let until = parse_await_state(&until)?;
-            match ctx.call(&HostRequest::ExecAwait { exec_id, until }).await? {
-                ResponseOk::Awaited {
-                    exec_id,
-                    exec_state,
-                    reason,
-                } => {
-                    if ctx.mode.is_json() {
-                        ui::print_json(&json!({
-                            "exec_id": exec_id.to_string(),
-                            "exec_state": exec_state,
-                            "reason": reason,
-                        }));
-                    } else {
-                        println!("{}  {:?}", exec_id.fmt_short(), exec_state);
-                        if let Some(reason) = reason {
-                            println!("  reason: {reason}");
-                        }
-                    }
-                }
-                other => bail!("unexpected response to exec.await: {other:?}"),
-            }
-        }
-        ExecCommand::Drive { exec_id } => {
-            let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
-            let completed = run::drive_loop(ctx, exec_id).await?;
-            if ctx.mode.is_json() {
-                ui::print_json(&json!({
-                    "session_id": completed.session_id.to_string(),
-                    "outcome": completed.outcome,
-                }));
-            } else {
-                println!(
-                    "completed  session={}  outcome={}",
-                    completed.session_id.fmt_short(),
-                    completed
-                        .outcome
-                        .as_ref()
-                        .map(answer::describe_outcome)
-                        .unwrap_or_else(|| "(none)".into())
-                );
-            }
-        }
-        ExecCommand::Next { exec_id } => {
-            let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
-            match ctx.call(&HostRequest::ExecNext { exec_id }).await? {
-                ResponseOk::Next(event) => render_next(ctx, &event),
-                other => bail!("unexpected response to exec.next: {other:?}"),
-            }
-        }
-        ExecCommand::Submit {
-            exec_id,
-            pending_id,
-            answer,
-        } => {
-            let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
-            let answer = answer.map(|answer| answer::scalar(&answer));
-            match ctx
-                .call(&HostRequest::ExecSubmit {
-                    exec_id,
-                    pending_id,
-                    answer,
-                })
-                .await?
-            {
-                ResponseOk::Ack => print_ack(ctx),
-                other => bail!("unexpected response to exec.submit: {other:?}"),
-            }
-        }
-        ExecCommand::Query { exec_id, input } => {
-            let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
-            let query: Value = serde_json::from_str(&input).context("query must be valid JSON")?;
-            match ctx
-                .call(&HostRequest::ExecQuery {
-                    exec_id,
-                    query: Some(query),
-                })
-                .await?
-            {
-                ResponseOk::Query { result } => {
-                    if ctx.mode.is_json() {
-                        ui::print_json(&json!({ "result": result }));
-                    } else {
-                        println!("{}", serde_json::to_string_pretty(&result)?);
-                    }
-                }
-                other => bail!("unexpected response to exec.query: {other:?}"),
-            }
-        }
-        ExecCommand::View { exec_id, step } => {
-            let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
-            let viewport = ctx.viewport();
-            match ctx
-                .call(&HostRequest::ExecView {
-                    exec: exec_id,
-                    width: viewport.width,
-                    color: viewport.color,
-                    at_step: step,
-                })
-                .await?
-            {
-                ResponseOk::ExecView { step, view } => {
-                    if ctx.mode.is_json() {
-                        ui::print_json(&json!({ "step": step, "view": view }));
-                    } else {
-                        print!("{}", ui::render_view_summary(&view, ctx.palette));
-                    }
-                }
-                other => bail!("unexpected response to exec.view: {other:?}"),
-            }
-        }
-        ExecCommand::Trace { exec_id, from, to } => {
-            let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
-            match ctx
-                .call(&HostRequest::ExecTrace { exec_id, from, to })
-                .await?
-            {
-                ResponseOk::Trace(steps) => {
-                    if ctx.mode.is_json() {
-                        ui::print_json(&json!({ "steps": steps }));
-                    } else {
-                        for step in steps {
-                            println!(
-                                "step {}  certified {}  {} -> {}",
-                                step.entry.step,
-                                rfc3339_utc_seconds(step.certified_at_ms),
-                                step.entry.pre_state,
-                                step.entry.post_state
-                            );
-                        }
-                    }
-                }
-                other => bail!("unexpected response to exec.trace: {other:?}"),
-            }
-        }
-        ExecCommand::Withdraw { exec_id } => {
-            let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
-            match ctx.call(&HostRequest::ExecWithdraw { exec_id }).await? {
-                ResponseOk::Ack => print_ack(ctx),
-                other => bail!("unexpected response to exec.withdraw: {other:?}"),
-            }
-        }
-        ExecCommand::Terminate { exec_id, reason } => {
-            let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
-            match ctx
-                .call(&HostRequest::ExecTerminate { exec_id, reason })
-                .await?
-            {
-                ResponseOk::Ack => print_ack(ctx),
-                other => bail!("unexpected response to exec.terminate: {other:?}"),
-            }
-        }
-    }
-    Ok(())
 }
 
 async fn ensemble_spec(
@@ -1690,104 +1277,6 @@ fn render_next(ctx: &Ctx, event: &NextEvent) {
         }
         NextEvent::Failed { reason } => println!("failed: {reason}"),
     }
-}
-
-async fn receipt(ctx: &Ctx, command: ReceiptCommand) -> anyhow::Result<()> {
-    match command {
-        ReceiptCommand::Get { session, out } => {
-            let receipt = ctx
-                .client()
-                .resolve_receipt_ref(&ctx.host, &session)
-                .await?;
-            let ResponseOk::Receipt(receipt) =
-                ctx.call(&HostRequest::ReceiptGet { receipt }).await?
-            else {
-                bail!("unexpected response to receipt.get");
-            };
-            if let Some(path) = out {
-                std::fs::write(&path, serde_json::to_vec_pretty(&receipt)?)
-                    .with_context(|| format!("write {}", path.display()))?;
-                if ctx.mode.is_json() {
-                    ui::print_json(&json!({
-                        "wrote": path.display().to_string(),
-                        "receipt_id": receipt.receipt_id(),
-                    }));
-                } else {
-                    println!("wrote {}", path.display());
-                }
-            } else if ctx.mode.is_json() {
-                ui::print_json(&serde_json::to_value(&*receipt)?);
-            } else {
-                render_receipt(&receipt);
-            }
-        }
-        ReceiptCommand::Import { file } => {
-            let bytes = std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
-            let receipt: arena0_client::protocol::ReceiptArtifact =
-                serde_json::from_slice(&bytes).context("receipt must be valid JSON")?;
-            match ctx
-                .call(&HostRequest::ReceiptImport {
-                    receipt: Box::new(receipt),
-                })
-                .await?
-            {
-                ResponseOk::ReceiptList(entries) => {
-                    if ctx.mode.is_json() {
-                        ui::print_json(&json!({ "receipts": entries }));
-                    } else {
-                        println!("imported receipt");
-                    }
-                }
-                other => bail!("unexpected response to receipt.import: {other:?}"),
-            }
-        }
-        ReceiptCommand::List => match ctx.call(&HostRequest::ReceiptList).await? {
-            ResponseOk::ReceiptList(entries) => {
-                if ctx.mode.is_json() {
-                    ui::print_json(&json!({ "receipts": entries }));
-                } else {
-                    let rows = entries
-                        .iter()
-                        .map(|entry| {
-                            vec![
-                                entry.receipt_id[..8.min(entry.receipt_id.len())].to_string(),
-                                entry.session_id.fmt_short().to_string(),
-                                format!("{:?}", entry.kind),
-                                entry.program_id.fmt_short().to_string(),
-                                if entry.completed {
-                                    "completed"
-                                } else {
-                                    "stopped"
-                                }
-                                .into(),
-                            ]
-                        })
-                        .collect::<Vec<_>>();
-                    print!(
-                        "{}",
-                        ui::render_table(
-                            &["RECEIPT", "SESSION", "KIND", "PROGRAM", "STATE"],
-                            &rows,
-                            ctx.palette,
-                            ctx.viewport().width,
-                        )
-                    );
-                }
-            }
-            other => bail!("unexpected response to receipt.list: {other:?}"),
-        },
-        ReceiptCommand::Verify { session } => {
-            let receipt = ctx
-                .client()
-                .resolve_receipt_ref(&ctx.host, &session)
-                .await?;
-            match ctx.call(&HostRequest::ReceiptVerify { receipt }).await? {
-                ResponseOk::Verified(summary) => render_verified(ctx, &summary),
-                other => bail!("unexpected response to receipt.verify: {other:?}"),
-            }
-        }
-    }
-    Ok(())
 }
 
 fn render_receipt(receipt: &arena0_client::protocol::ReceiptArtifact) {
@@ -1970,5 +1459,37 @@ mod tests {
         assert!(parse_agent_binding("host-02=./agent.py").is_ok());
         assert!(parse_agent_binding("host-02").is_err());
         assert!(parse_agent_binding("host-02=").is_err());
+    }
+}
+
+impl BlobCommand {
+    /// Dispatch this parsed command using the invocation context; retain its output, resolution, errors, and cancellation behavior.
+    async fn run(self, ctx: &Ctx) -> anyhow::Result<()> {
+        let _ = ctx;
+        todo!("STUB(cli)")
+    }
+}
+
+impl ProgramCommand {
+    /// Dispatch this parsed command using the invocation context; retain its output, resolution, errors, and cancellation behavior.
+    async fn run(self, ctx: &Ctx) -> anyhow::Result<()> {
+        let _ = ctx;
+        todo!("STUB(cli)")
+    }
+}
+
+impl ExecCommand {
+    /// Dispatch this parsed command using the invocation context; retain its output, resolution, errors, and cancellation behavior.
+    async fn run(self, ctx: &Ctx) -> anyhow::Result<()> {
+        let _ = ctx;
+        todo!("STUB(cli)")
+    }
+}
+
+impl ReceiptCommand {
+    /// Dispatch this parsed command using the invocation context; retain its output, resolution, errors, and cancellation behavior.
+    async fn run(self, ctx: &Ctx) -> anyhow::Result<()> {
+        let _ = ctx;
+        todo!("STUB(cli)")
     }
 }

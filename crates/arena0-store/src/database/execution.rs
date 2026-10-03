@@ -141,7 +141,7 @@ impl Database {
                 self.host_id.0.to_vec(),
                 state.producer().0.to_vec(),
                 state.binding().session_id().0.to_vec(),
-                envelope(EnvelopeKind::ExecutionState, &bytes)?,
+                DurableEnvelope::seal(EnvelopeKind::ExecutionState, &bytes)?,
                 sqlite_u64(state.version().get())?,
                 lifecycle_tag(state.lifecycle()),
                 sqlite_u64(state.agreed_step())?,
@@ -317,7 +317,7 @@ impl Database {
             producer,
             session_id,
         } = row;
-        let state_payload = open_envelope(
+        let state_payload = DurableEnvelope::open(
             EnvelopeKind::ExecutionState,
             &state_bytes,
             arena0_protocol::MAX_EXECUTION_STATE_BYTES,
@@ -462,8 +462,8 @@ impl Database {
                 self.insert_event_record(
                     execution_id,
                     event_position,
-                    &event_bytes(&event)?,
-                    &effects_bytes(&effects)?,
+                    &encode_borsh(&event, "event")?,
+                    &encode_borsh(&effects, "effects")?,
                 )?;
                 if next.pending_shared().is_none() {
                     self.persist_effects(
@@ -612,12 +612,12 @@ impl Database {
         let mut records = Vec::new();
         while let Some(row) = rows.next()? {
             let position = sqlite_i64(row.get::<_, i64>(0)?)?;
-            let event_payload = open_envelope(
+            let event_payload = DurableEnvelope::open(
                 EnvelopeKind::EventRecord,
                 &row.get::<_, Vec<u8>>(1)?,
                 arena0_protocol::MAX_EXECUTION_STATE_BYTES,
             )?;
-            let effects_payload = open_envelope(
+            let effects_payload = DurableEnvelope::open(
                 EnvelopeKind::Effects,
                 &row.get::<_, Vec<u8>>(2)?,
                 arena0_protocol::MAX_RECEIPT_BYTES,
@@ -752,7 +752,7 @@ impl Database {
                 ));
             }
             let entry: arena0_protocol::TraceEntry = decode_borsh(
-                &open_envelope(
+                &DurableEnvelope::open(
                     EnvelopeKind::AgreedStep,
                     &artifact,
                     arena0_protocol::MAX_TRACE_ENTRY_BYTES,
@@ -840,8 +840,8 @@ impl Database {
             params![
                 execution_id.0.to_vec(),
                 sqlite_u64(event_position)?,
-                envelope(EnvelopeKind::EventRecord, event)?,
-                envelope(EnvelopeKind::Effects, effects)?,
+                DurableEnvelope::seal(EnvelopeKind::EventRecord, event)?,
+                DurableEnvelope::seal(EnvelopeKind::Effects, effects)?,
                 dispatch_digest(event, effects).to_vec(),
             ],
         )?;
@@ -869,7 +869,7 @@ impl Database {
                 sqlite_u64(entry.step)?,
                 sqlite_u64(origin_event_position)?,
                 sqlite_u64(version.get())?,
-                envelope(EnvelopeKind::AgreedStep, &bytes)?,
+                DurableEnvelope::seal(EnvelopeKind::AgreedStep, &bytes)?,
                 entry.entry_hash().to_vec(),
                 sqlite_u64(now_ms)?,
                 entry.post_state.0.to_vec(),
@@ -882,7 +882,7 @@ impl Database {
             params![
                 execution_id.0.as_slice(),
                 sqlite_u64(entry.step)?,
-                envelope(EnvelopeKind::StepState, shared_state.as_bytes())?
+                DurableEnvelope::seal(EnvelopeKind::StepState, shared_state.as_bytes())?
             ],
         )?;
         self.connection.execute(
@@ -916,7 +916,7 @@ impl Database {
                     terminal_reason = ?15, outcome_json = ?16
              WHERE execution_id = ?7 AND version = ?8",
             params![
-                envelope(EnvelopeKind::ExecutionState, &bytes)?,
+                DurableEnvelope::seal(EnvelopeKind::ExecutionState, &bytes)?,
                 sqlite_u64(next.version().get())?,
                 lifecycle_tag(next.lifecycle()),
                 sqlite_u64(next.agreed_step())?,
@@ -958,12 +958,12 @@ impl Database {
             count = count
                 .checked_add(1)
                 .ok_or_else(|| StoreError::Corruption("event count overflow".into()))?;
-            let event_payload = open_envelope(
+            let event_payload = DurableEnvelope::open(
                 EnvelopeKind::EventRecord,
                 &row.get::<_, Vec<u8>>(1)?,
                 arena0_protocol::MAX_EXECUTION_STATE_BYTES,
             )?;
-            let effects_payload = open_envelope(
+            let effects_payload = DurableEnvelope::open(
                 EnvelopeKind::Effects,
                 &row.get::<_, Vec<u8>>(2)?,
                 arena0_protocol::MAX_RECEIPT_BYTES,
@@ -1038,7 +1038,7 @@ impl Database {
                 return Err(StoreError::Corruption("timer id is not 32 bytes".into()));
             }
             let _ = sqlite_i64(row.get::<_, i64>(1)?)?;
-            let payload = open_envelope(
+            let payload = DurableEnvelope::open(
                 EnvelopeKind::Timer,
                 &row.get::<_, Vec<u8>>(2)?,
                 MAX_TIMER_RECORD_BYTES,

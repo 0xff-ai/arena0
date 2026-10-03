@@ -23,36 +23,6 @@ pub struct IdMatches {
     pub total: u64,
 }
 
-/// The count and page statements `resolve_ids` runs for `space`: `bounded`
-/// selects `id >= ?1 AND id < ?2` versus the open `id >= ?1` (all-f prefix).
-pub(crate) fn resolve_statements(space: IdSpace, bounded: bool, limit: i64) -> [String; 2] {
-    let bound = if bounded {
-        ">= ?1 AND {id} < ?2"
-    } else {
-        ">= ?1"
-    };
-    let source = match space {
-        IdSpace::Exec => format!(
-            "SELECT execution_id AS id FROM exec_requests WHERE execution_id {}",
-            bound.replace("{id}", "execution_id")
-        ),
-        IdSpace::Receipt => format!(
-            "SELECT receipt_id AS id FROM receipts WHERE receipt_id {}",
-            bound.replace("{id}", "receipt_id")
-        ),
-        IdSpace::Session => {
-            let bound = bound.replace("{id}", "session_id");
-            format!("SELECT session_id AS id FROM activation_records WHERE session_id {bound} AND status = 'committed'
-                    UNION SELECT session_id AS id FROM executions WHERE session_id {bound}
-                    UNION SELECT session_id AS id FROM receipts WHERE session_id {bound}")
-        }
-    };
-    [
-        format!("SELECT COUNT(*) FROM ({source})"),
-        format!("SELECT id FROM ({source}) ORDER BY id LIMIT {limit}"),
-    ]
-}
-
 impl ReadDb {
     /// Ids in `space` whose lowercase hex starts with `prefix` (1..=64
     /// lowercase hex characters; the caller validates). Uses a primary-key or
@@ -97,7 +67,7 @@ impl ReadDb {
         let result = (|| {
             let limit = i64::try_from(limit)
                 .map_err(|_| StoreError::InvalidConfiguration("id limit is too large"))?;
-            let [count, page] = super::resolve_statements(space, upper.is_some(), limit);
+            let [count, page] = space.statements(upper.is_some(), limit);
             let parameters = if let Some(upper) = upper {
                 vec![lo.as_slice(), upper]
             } else {
@@ -122,5 +92,13 @@ impl ReadDb {
         })();
         self.connection.execute_batch("ROLLBACK")?;
         result
+    }
+}
+
+impl IdSpace {
+    /// Count and page the same index union; bounded selects an exclusive upper bound and the caller owns the read transaction.
+    pub(crate) fn statements(self, bounded: bool, limit: i64) -> [String; 2] {
+        let _ = (bounded, limit);
+        todo!("STUB(store)")
     }
 }
