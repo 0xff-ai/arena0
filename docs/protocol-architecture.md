@@ -867,9 +867,18 @@ not create Participants. Subagents acting as separate Participants require
 distinct contexts. Context resolution belongs to each CLI invocation, not the
 shared daemon process.
 
-`exec.list`, `exec.status`, and immediately available `exec.next` results read
-the durable execution record. Completed, aborted, and failed executions
-therefore remain observable after their live driver is removed and after a
+List reads (`exec.list`, `receipt.list`, and `hosts.list` counters) serve the
+store's index columns, written in the same transaction as the enveloped records
+they index. They open no receipt or activation envelope and verify no
+certificate; an `exec.list` turn-memo miss may decode only a nonterminal
+execution's state, once per new agreed step. Single-item reads (`exec.status`,
+`exec.inspect`, `exec.view`, `exec.trace`, and `receipt.get`), import, and
+`receipt.verify` still decode and validate. Opening a store and startup recovery
+validate only unfinished executions. Finished executions are archived: neither
+startup nor background work validates them; single-item reads decode and
+validate an archived execution when it is opened. Immediately available `exec.next` results
+also read the durable execution record. Completed, aborted, and failed
+executions remain observable after their live driver is removed and after a
 daemon restart. A nonterminal execution that cannot be truthfully resumed is
 durably marked failed during startup. A prepared, uncommitted activation stays
 eligible for activation recovery. Public terminal status does not retire an

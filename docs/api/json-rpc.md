@@ -252,9 +252,22 @@ Terminal states retain their result: `Completed` carries `outcome` (JSON or
 `Failed` carries an optional `reason`. A failed request's reason takes precedence
 over its execution's terminal cause when both exist.
 
-`exec.list` returns `ExecList` entries shaped as `{status, activation}`. `status`
-has the same shape as `exec.status`; `activation` is `null` until preparation
-starts, then carries the same durable activation facts as `exec.inspect`.
+`exec.list` returns `ExecList` entries as `ExecSummary`: `exec_id`,
+`negotiation_id`, `program_id`, `lifecycle`, `session_id`, `step`,
+`last_step_at_ms`, `participants`, `peers`, `pending_callout`,
+`receipt_available`, `turn`, `phase`, `end`, `reason`, `outcome`,
+`activation`, `created_at_ms`, and `updated_at_ms`. The lifecycle and session
+facts match `exec.status`; `activation` matches `exec.inspect` and is `null`
+until preparation starts. An open `pending_callout` contains `pending_id`,
+`callout_index`, `name`, and the persisted local `opened_at_ms`; its prompt,
+schema, and context remain in `exec.status`. `step`, `last_step_at_ms`, and
+`participants` are `null` before an execution aggregate exists. `turn` and
+`phase` are `null` for terminal executions in both list and status.
+`last_step_at_ms` is also `null` before the first agreed step. `reason` is
+populated for aborted or failed executions; `outcome` is completed program
+JSON. List reads use durable index columns. A non-terminal execution's first
+list projection at a new step may decode its state to fill the turn memo;
+terminal entries never need this decode.
 
 The top-level `end` object reports local confirmation of the terminal result:
 `{"phase":"open","unconfirmed":[]}`, `{"phase":"ending","unconfirmed":["<peer-id>"]}`,
