@@ -61,9 +61,15 @@ async fn status_carries_callout_details_and_terminal_facts() {
         };
         let entry = entries
             .iter()
-            .find(|entry| entry.status.exec_id == exec_id)
+            .find(|entry| entry.exec_id == exec_id)
             .unwrap();
-        assert_eq!(entry.status.pending_callout(), Some(&expected));
+        let summary = entry
+            .pending_callout
+            .as_ref()
+            .expect("pending callout summary");
+        assert_eq!(summary.pending_id, expected.pending_id);
+        assert_eq!(summary.callout_index, expected.callout_index);
+        assert_eq!(summary.name, expected.name);
         let ResponseOk::Inspection(inspection) = ok(call(
             host,
             &HostRequest::ExecInspect {
@@ -178,10 +184,10 @@ async fn end_progress_events_follow_the_handshake() {
         let end = tokio::time::timeout(LIVE_EXECUTION_TIMEOUT, async {
             loop {
                 let frame = read_event(events).await;
-                if let EventData::SessionEndProgress { phase, unconfirmed } = frame.data {
-                    if phase == arena0_api::ExecEndPhase::Ended {
-                        break arena0_api::ExecEndStatus { phase, unconfirmed };
-                    }
+                if let EventData::SessionEndProgress { phase, unconfirmed } = frame.data
+                    && phase == arena0_api::ExecEndPhase::Ended
+                {
+                    break arena0_api::ExecEndStatus { phase, unconfirmed };
                 }
             }
         })
