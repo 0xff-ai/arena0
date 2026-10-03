@@ -632,6 +632,7 @@ pub(crate) enum StreamBinding {
     Fetch,
     Exec(SessionHash),
 }
+
 impl StreamBinding {
     /// The codec family selected before touching a channel.
     pub(crate) const fn proto(self) -> StreamProtocol {
@@ -640,6 +641,7 @@ impl StreamBinding {
             Self::Exec(_) => StreamProtocol::Exec,
         }
     }
+
     /// Expose execution binding to existing public handle getters.
     pub(crate) const fn session_hash(self) -> Option<SessionHash> {
         match self {
@@ -647,6 +649,7 @@ impl StreamBinding {
             Self::Exec(session_hash) => Some(session_hash),
         }
     }
+
     /// Reject fetch before sending and verify any session-bearing execution evidence.
     fn validate_exec_route(self, frame: &DomainExecFrame) -> Result<(), TransportError> {
         match self {

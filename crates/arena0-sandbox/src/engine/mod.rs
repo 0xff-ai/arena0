@@ -189,6 +189,7 @@ pub(crate) struct DispatchScope {
     pub peer_id: Option<arena0_protocol::PeerId>,
     pub session: Option<arena0_protocol::Ensemble<arena0_protocol::Committed>>,
 }
+
 impl DispatchScope {
     /// Start empty observations and budgets with no execution capabilities installed.
     fn new() -> Self {
@@ -208,6 +209,7 @@ impl DispatchScope {
         }
     }
 }
+
 /// Apply immutable engine limits with the caller-selected work-memory ceiling.
 /// Resident preparation supplies its observed capacity; fresh calls use the profile ceiling.
 fn store_limits(profile: &ExecutionProfile, memory_size: usize) -> StoreLimits {
@@ -219,6 +221,7 @@ fn store_limits(profile: &ExecutionProfile, memory_size: usize) -> StoreLimits {
         .memories(profile.limits.max_memories as usize)
         .build()
 }
+
 impl HostState {
     pub(crate) fn new(
         profile: ExecutionProfile,
