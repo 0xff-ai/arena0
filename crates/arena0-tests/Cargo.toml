@@ -26,3 +26,4 @@ wat.workspace = true
 
 [dev-dependencies]
 borsh.workspace = true
+tracing.workspace = true

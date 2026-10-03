@@ -1388,19 +1388,18 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
             };
             if ctx.mode.is_json() {
                 ui::print_json(&json!({
-                    "executions": list.iter().map(|entry| exec_json(&entry.status)).collect::<Vec<_>>()
+                    "executions": list
                 }));
             } else {
                 let rows = list
                     .iter()
                     .map(|status| {
-                        let status = &status.status;
                         vec![
                             status.exec_id.fmt_short().to_string(),
                             status.program_id.fmt_short().to_string(),
-                            ui::lifecycle_label(status.lifecycle()).to_owned(),
+                            ui::lifecycle_label(status.lifecycle).to_owned(),
                             status
-                                .step()
+                                .step
                                 .map_or_else(|| "-".into(), |step| step.to_string()),
                         ]
                     })

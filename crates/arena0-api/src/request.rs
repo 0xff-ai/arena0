@@ -183,6 +183,58 @@ pub enum HostRequest {
     ReceiptVerify { receipt: ReceiptRef },
 }
 
+impl Request {
+    /// The daemon-level JSON-RPC wire method used to attribute request work.
+    #[must_use]
+    pub fn method(&self) -> &'static str {
+        match self {
+            Self::Host { .. } => "host.call",
+            Self::DaemonInfo => "daemon.info",
+            Self::DaemonStop => "daemon.stop",
+            Self::HostsList => "hosts.list",
+            Self::HostsOpen { .. } => "hosts.open",
+            Self::ActivitySubscribe => "activity.subscribe",
+        }
+    }
+}
+
+impl HostRequest {
+    /// The JSON-RPC wire method, also used to attribute work to request spans.
+    #[must_use]
+    pub fn method(&self) -> &'static str {
+        match self {
+            Self::NegotiationOffers => "negotiation.offers",
+            Self::Info => "host.info",
+            Self::IdShow => "id.show",
+            Self::ProgramList => "program.list",
+            Self::ProgramGet { .. } => "program.get",
+            Self::ProgramImport { .. } => "program.import",
+            Self::BlobImport { .. } => "blob.import",
+            Self::BlobExport { .. } => "blob.export",
+            Self::BlobList => "blob.list",
+            Self::ProgramRemove { .. } => "program.remove",
+            Self::ExecNew { .. } => "exec.new",
+            Self::ExecList => "exec.list",
+            Self::ExecStatus { .. } => "exec.status",
+            Self::ExecInspect { .. } => "exec.inspect",
+            Self::ExecAwait { .. } => "exec.await",
+            Self::ExecNext { .. } => "exec.next",
+            Self::ExecSubmit { .. } => "exec.submit",
+            Self::ExecQuery { .. } => "exec.query",
+            Self::ExecView { .. } => "exec.view",
+            Self::ExecTrace { .. } => "exec.trace",
+            Self::ExecCancelCreation { .. } => "exec.cancel_creation",
+            Self::ExecWithdraw { .. } => "exec.withdraw",
+            Self::ExecTerminate { .. } => "exec.terminate",
+            Self::EventsSubscribe { .. } => "events.subscribe",
+            Self::ReceiptGet { .. } => "receipt.get",
+            Self::ReceiptImport { .. } => "receipt.import",
+            Self::ReceiptList => "receipt.list",
+            Self::ReceiptVerify { .. } => "receipt.verify",
+        }
+    }
+}
+
 /// The state `exec.await` blocks for: session established, or terminal.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]

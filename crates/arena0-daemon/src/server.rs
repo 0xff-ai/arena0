@@ -1994,219 +1994,240 @@ impl HostService {
     /// Dispatch one non-streaming request to its handler. The single method table
     /// both transports share.
     pub(crate) async fn dispatch(self: &Arc<Self>, req: HostRequest) -> Response {
-        match req {
-            HostRequest::Info => self.host_status().await.map(ResponseOk::HostStatus),
-            HostRequest::IdShow => Ok(ResponseOk::Id(self.keystore.info())),
-            HostRequest::NegotiationOffers => Ok(ResponseOk::Offers(
-                self.offers.list(unix_time_ms(), &self.events),
-            )),
+        let span = tracing::debug_span!("host_request", host = %self.name, method = req.method());
+        async {
+            match req {
+                HostRequest::Info => self.host_status().await.map(ResponseOk::HostStatus),
+                HostRequest::IdShow => Ok(ResponseOk::Id(self.keystore.info())),
+                HostRequest::NegotiationOffers => Ok(ResponseOk::Offers(
+                    self.offers.list(unix_time_ms(), &self.events),
+                )),
 
-            HostRequest::ProgramList => self
-                .catalog
-                .list()
-                .await
-                .map(ResponseOk::ProgramList)
-                .map_err(|error| {
-                    ApiError::new(ApiErrorCode::Storage, format!("list programs: {error}"))
-                }),
-            HostRequest::ProgramGet { program } => {
-                let program_id = self.resolve_program(&program).await?;
-                match self.catalog.detail(program_id).await.map_err(|error| {
-                    ApiError::new(ApiErrorCode::Storage, format!("get program: {error}"))
-                })? {
-                    Some(detail) => Ok(ResponseOk::Program(Box::new(detail))),
-                    None => Err(ApiError::new(ApiErrorCode::NotFound, "no such program")),
-                }
-            }
-            HostRequest::ProgramImport {
-                source: FileSource::Upload(_),
-            }
-            | HostRequest::BlobImport {
-                source: FileSource::Upload(_),
-            } => {
-                unreachable!("Daemon::handle resolves process-owned uploads before Host dispatch")
-            }
-            HostRequest::ProgramImport {
-                source: FileSource::Path(path),
-            } => {
-                let wasm = tokio::fs::read(path).await.map_err(|error| {
-                    ApiError::new(ApiErrorCode::BadRequest, format!("read program: {error}"))
-                })?;
-                let (id, _) = self
+                HostRequest::ProgramList => self
                     .catalog
-                    .import(wasm, &self.engine, unix_time_ms())
+                    .list()
                     .await
-                    .map_err(catalog_api_error)?;
-                self.watch_offers(id).await;
-                self.catalog
-                    .detail(id)
+                    .map(ResponseOk::ProgramList)
+                    .map_err(|error| {
+                        ApiError::new(ApiErrorCode::Storage, format!("list programs: {error}"))
+                    }),
+                HostRequest::ProgramGet { program } => {
+                    let program_id = self.resolve_program(&program).await?;
+                    match self.catalog.detail(program_id).await.map_err(|error| {
+                        ApiError::new(ApiErrorCode::Storage, format!("get program: {error}"))
+                    })? {
+                        Some(detail) => Ok(ResponseOk::Program(Box::new(detail))),
+                        None => Err(ApiError::new(ApiErrorCode::NotFound, "no such program")),
+                    }
+                }
+                HostRequest::ProgramImport {
+                    source: FileSource::Upload(_),
+                }
+                | HostRequest::BlobImport {
+                    source: FileSource::Upload(_),
+                } => {
+                    unreachable!(
+                        "Daemon::handle resolves process-owned uploads before Host dispatch"
+                    )
+                }
+                HostRequest::ProgramImport {
+                    source: FileSource::Path(path),
+                } => {
+                    let wasm = tokio::fs::read(path).await.map_err(|error| {
+                        ApiError::new(ApiErrorCode::BadRequest, format!("read program: {error}"))
+                    })?;
+                    let (id, _) = self
+                        .catalog
+                        .import(wasm, &self.engine, unix_time_ms())
+                        .await
+                        .map_err(catalog_api_error)?;
+                    self.watch_offers(id).await;
+                    self.catalog
+                        .detail(id)
+                        .await
+                        .map_err(|error| {
+                            ApiError::new(
+                                ApiErrorCode::Storage,
+                                format!("get imported program: {error}"),
+                            )
+                        })?
+                        .map(|detail| ResponseOk::Program(Box::new(detail)))
+                        .ok_or_else(|| {
+                            ApiError::new(ApiErrorCode::Internal, "imported program vanished")
+                        })
+                }
+                HostRequest::BlobImport {
+                    source: FileSource::Path(path),
+                } => {
+                    let (hash, length) = self.store.link_blob(path).await.map_err(|error| {
+                        let code = match error {
+                            arena0_store::StoreError::BlobTooLarge { .. }
+                            | arena0_store::StoreError::Io(_) => ApiErrorCode::BadRequest,
+                            _ => ApiErrorCode::Storage,
+                        };
+                        ApiError::new(code, format!("import blob: {error}"))
+                    })?;
+                    Ok(ResponseOk::BlobImported { hash, length })
+                }
+                HostRequest::BlobExport { hash, path } => self
+                    .store
+                    .export_blob(hash, path)
                     .await
                     .map_err(|error| {
-                        ApiError::new(
-                            ApiErrorCode::Storage,
-                            format!("get imported program: {error}"),
-                        )
+                        let code = match error {
+                            arena0_store::StoreError::Io(_)
+                            | arena0_store::StoreError::BlobUnreadable(_) => {
+                                ApiErrorCode::BadRequest
+                            }
+                            _ => ApiErrorCode::Storage,
+                        };
+                        ApiError::new(code, format!("export blob: {error}"))
                     })?
-                    .map(|detail| ResponseOk::Program(Box::new(detail)))
-                    .ok_or_else(|| {
-                        ApiError::new(ApiErrorCode::Internal, "imported program vanished")
+                    .map(|length| ResponseOk::BlobExported { length })
+                    .ok_or_else(|| ApiError::new(ApiErrorCode::NotFound, "no such blob")),
+                HostRequest::BlobList => self
+                    .store
+                    .list_blobs()
+                    .await
+                    .map(|blobs| {
+                        ResponseOk::BlobList(
+                            blobs
+                                .into_iter()
+                                .map(|blob| arena0_api::BlobEntry {
+                                    hash: blob.hash,
+                                    length: blob.length,
+                                    linked: blob.linked,
+                                })
+                                .collect(),
+                        )
                     })
-            }
-            HostRequest::BlobImport {
-                source: FileSource::Path(path),
-            } => {
-                let (hash, length) = self.store.link_blob(path).await.map_err(|error| {
-                    let code = match error {
-                        arena0_store::StoreError::BlobTooLarge { .. }
-                        | arena0_store::StoreError::Io(_) => ApiErrorCode::BadRequest,
-                        _ => ApiErrorCode::Storage,
+                    .map_err(|error| {
+                        ApiError::new(ApiErrorCode::Storage, format!("list blobs: {error}"))
+                    }),
+                HostRequest::ProgramRemove { program } => {
+                    let program_id = self.resolve_program(&program).await?;
+                    let removed = self
+                        .catalog
+                        .remove(program_id, unix_time_ms())
+                        .await
+                        .map_err(|error| {
+                            ApiError::new(ApiErrorCode::Storage, format!("remove program: {error}"))
+                        })?;
+                    if matches!(removed, arena0_store::ProgramRemoveOutcome::Removed) {
+                        self.unwatch_offers(program_id);
+                        Ok(ResponseOk::Ack)
+                    } else {
+                        Err(ApiError::new(ApiErrorCode::NotFound, "no such program"))
+                    }
+                }
+
+                HostRequest::ExecNew {
+                    exec_id,
+                    program,
+                    params,
+                    ensemble,
+                    blobs,
+                } => {
+                    self.new_exec(exec_id, program, params, ensemble, blobs)
+                        .await
+                }
+                HostRequest::ExecList => self.exec_list().await.map(ResponseOk::ExecList),
+                HostRequest::ExecStatus { exec_id } => {
+                    self.exec_status(exec_id).await.map(ResponseOk::Status)
+                }
+                HostRequest::ExecInspect {
+                    exec_id,
+                    events_from,
+                    events_limit,
+                } => self
+                    .exec_inspect(exec_id, events_from, events_limit)
+                    .await
+                    .map(ResponseOk::Inspection),
+                HostRequest::ExecAwait { exec_id, until } => {
+                    let status = self.exec_status(exec_id).await?;
+                    let lifecycle = if satisfies(status.lifecycle(), until) {
+                        status.lifecycle()
+                    } else if let Some(entry) = self.execs.get(&exec_id) {
+                        let deadline = Instant::now() + NEGOTIATION_TIMEOUT;
+                        entry.await_state(until, deadline).await?
+                    } else {
+                        return Err(ApiError::new(
+                            ApiErrorCode::Execution,
+                            "execution has no live driver",
+                        ));
                     };
-                    ApiError::new(code, format!("import blob: {error}"))
-                })?;
-                Ok(ResponseOk::BlobImported { hash, length })
-            }
-            HostRequest::BlobExport { hash, path } => self
-                .store
-                .export_blob(hash, path)
-                .await
-                .map_err(|error| {
-                    let code = match error {
-                        arena0_store::StoreError::Io(_)
-                        | arena0_store::StoreError::BlobUnreadable(_) => ApiErrorCode::BadRequest,
-                        _ => ApiErrorCode::Storage,
-                    };
-                    ApiError::new(code, format!("export blob: {error}"))
-                })?
-                .map(|length| ResponseOk::BlobExported { length })
-                .ok_or_else(|| ApiError::new(ApiErrorCode::NotFound, "no such blob")),
-            HostRequest::BlobList => self
-                .store
-                .list_blobs()
-                .await
-                .map(|blobs| {
-                    ResponseOk::BlobList(
-                        blobs
+                    Ok(ResponseOk::Awaited {
+                        exec_id,
+                        exec_state: lifecycle,
+                        reason: self
+                            .store
+                            .load_execution_request(exec_id)
+                            .await
+                            .map_err(|error| {
+                                ApiError::new(ApiErrorCode::Storage, error.to_string())
+                            })?
+                            .and_then(|request| request.failure().map(str::to_owned)),
+                    })
+                }
+                HostRequest::ExecNext { exec_id } => self.next(exec_id).await.map(ResponseOk::Next),
+                HostRequest::ExecSubmit {
+                    exec_id,
+                    pending_id,
+                    answer,
+                } => self.submit(exec_id, pending_id, answer).await,
+                HostRequest::ExecQuery { exec_id, query } => self.query(exec_id, query).await,
+                HostRequest::ExecView {
+                    exec,
+                    width,
+                    color,
+                    at_step,
+                } => self.view(exec, width, color, at_step).await,
+                HostRequest::ExecTrace { exec_id, from, to } => {
+                    self.trace(exec_id, from, to).await.map(ResponseOk::Trace)
+                }
+                HostRequest::ExecCancelCreation { exec_id } => {
+                    self.withdraw_or_cancel_creation(exec_id).await
+                }
+                HostRequest::ExecWithdraw { exec_id } => self.withdraw_negotiation(exec_id).await,
+                HostRequest::ExecTerminate { exec_id, reason } => match self.execs.get(&exec_id) {
+                    Some(entry) => entry.terminate(reason).await.map(|()| ResponseOk::Ack),
+                    None => Err(ApiError::new(ApiErrorCode::NotFound, "no such execution")),
+                },
+
+                // `events.subscribe` is handled by the daemon connection loop, not here.
+                HostRequest::EventsSubscribe { .. } => Err(ApiError::new(
+                    ApiErrorCode::BadRequest,
+                    "events.subscribe must be the only method on its connection",
+                )),
+                HostRequest::ReceiptGet { receipt } => Ok(ResponseOk::Receipt(Box::new(
+                    self.resolve_receipt(receipt).await?,
+                ))),
+                HostRequest::ReceiptImport { receipt } => self.import_receipt(*receipt).await,
+                HostRequest::ReceiptList => {
+                    let receipts = self
+                        .store
+                        .list_receipt_summaries(4_096)
+                        .await
+                        .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
+                    Ok(ResponseOk::ReceiptList(
+                        receipts
                             .into_iter()
-                            .map(|blob| arena0_api::BlobEntry {
-                                hash: blob.hash,
-                                length: blob.length,
-                                linked: blob.linked,
+                            .map(|row| arena0_api::ReceiptListEntry {
+                                receipt_id: row.receipt_id.to_string(),
+                                session_id: row.session_id,
+                                kind: row.kind,
+                                program_id: row.program_hash,
+                                completed: row.completed,
+                                provenance: row.provenance,
                             })
                             .collect(),
-                    )
-                })
-                .map_err(|error| {
-                    ApiError::new(ApiErrorCode::Storage, format!("list blobs: {error}"))
-                }),
-            HostRequest::ProgramRemove { program } => {
-                let program_id = self.resolve_program(&program).await?;
-                let removed = self
-                    .catalog
-                    .remove(program_id, unix_time_ms())
-                    .await
-                    .map_err(|error| {
-                        ApiError::new(ApiErrorCode::Storage, format!("remove program: {error}"))
-                    })?;
-                if matches!(removed, arena0_store::ProgramRemoveOutcome::Removed) {
-                    self.unwatch_offers(program_id);
-                    Ok(ResponseOk::Ack)
-                } else {
-                    Err(ApiError::new(ApiErrorCode::NotFound, "no such program"))
+                    ))
                 }
+                HostRequest::ReceiptVerify { receipt } => self.verify(receipt).await,
             }
-
-            HostRequest::ExecNew {
-                exec_id,
-                program,
-                params,
-                ensemble,
-                blobs,
-            } => {
-                self.new_exec(exec_id, program, params, ensemble, blobs)
-                    .await
-            }
-            HostRequest::ExecList => self.exec_list().await.map(ResponseOk::ExecList),
-            HostRequest::ExecStatus { exec_id } => {
-                self.exec_status(exec_id).await.map(ResponseOk::Status)
-            }
-            HostRequest::ExecInspect {
-                exec_id,
-                events_from,
-                events_limit,
-            } => self
-                .exec_inspect(exec_id, events_from, events_limit)
-                .await
-                .map(ResponseOk::Inspection),
-            HostRequest::ExecAwait { exec_id, until } => {
-                let status = self.exec_status(exec_id).await?;
-                let lifecycle = if satisfies(status.lifecycle(), until) {
-                    status.lifecycle()
-                } else if let Some(entry) = self.execs.get(&exec_id) {
-                    let deadline = Instant::now() + NEGOTIATION_TIMEOUT;
-                    entry.await_state(until, deadline).await?
-                } else {
-                    return Err(ApiError::new(
-                        ApiErrorCode::Execution,
-                        "execution has no live driver",
-                    ));
-                };
-                Ok(ResponseOk::Awaited {
-                    exec_id,
-                    exec_state: lifecycle,
-                    reason: self
-                        .store
-                        .load_execution_request(exec_id)
-                        .await
-                        .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
-                        .and_then(|request| request.failure().map(str::to_owned)),
-                })
-            }
-            HostRequest::ExecNext { exec_id } => self.next(exec_id).await.map(ResponseOk::Next),
-            HostRequest::ExecSubmit {
-                exec_id,
-                pending_id,
-                answer,
-            } => self.submit(exec_id, pending_id, answer).await,
-            HostRequest::ExecQuery { exec_id, query } => self.query(exec_id, query).await,
-            HostRequest::ExecView {
-                exec,
-                width,
-                color,
-                at_step,
-            } => self.view(exec, width, color, at_step).await,
-            HostRequest::ExecTrace { exec_id, from, to } => {
-                self.trace(exec_id, from, to).await.map(ResponseOk::Trace)
-            }
-            HostRequest::ExecCancelCreation { exec_id } => {
-                self.withdraw_or_cancel_creation(exec_id).await
-            }
-            HostRequest::ExecWithdraw { exec_id } => self.withdraw_negotiation(exec_id).await,
-            HostRequest::ExecTerminate { exec_id, reason } => match self.execs.get(&exec_id) {
-                Some(entry) => entry.terminate(reason).await.map(|()| ResponseOk::Ack),
-                None => Err(ApiError::new(ApiErrorCode::NotFound, "no such execution")),
-            },
-
-            // `events.subscribe` is handled by the daemon connection loop, not here.
-            HostRequest::EventsSubscribe { .. } => Err(ApiError::new(
-                ApiErrorCode::BadRequest,
-                "events.subscribe must be the only method on its connection",
-            )),
-            HostRequest::ReceiptGet { receipt } => Ok(ResponseOk::Receipt(Box::new(
-                self.resolve_receipt(receipt).await?,
-            ))),
-            HostRequest::ReceiptImport { receipt } => self.import_receipt(*receipt).await,
-            HostRequest::ReceiptList => {
-                let receipts = self
-                    .store
-                    .list_receipts(4_096)
-                    .await
-                    .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
-                Ok(ResponseOk::ReceiptList(
-                    receipts.into_iter().map(receipt_list_entry).collect(),
-                ))
-            }
-            HostRequest::ReceiptVerify { receipt } => self.verify(receipt).await,
         }
+        .instrument(span)
+        .await
     }
 
     /// Resolve a program handle / short hash / full id to a `ProgramHash`.
@@ -2226,25 +2247,168 @@ impl HostService {
         }
     }
 
-    async fn exec_list(&self) -> Result<Vec<arena0_api::ExecListEntry>, ApiError> {
-        let requests = self
+    async fn exec_list(&self) -> Result<Vec<arena0_api::ExecSummary>, ApiError> {
+        let rows = self
             .store
-            .list_execution_requests(4_096)
+            .list_exec_summaries(4_096)
             .await
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
-        let mut statuses = Vec::with_capacity(requests.len());
-        for request in requests {
-            let exec_id = request.execution_id();
-            let status = self.project_exec_status(exec_id).await?;
-            let activation = self
-                .store
-                .load_activation(exec_id)
-                .await
-                .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
-                .map(project_activation_inspection);
-            statuses.push(arena0_api::ExecListEntry { status, activation });
+        let mut statuses = Vec::with_capacity(rows.len());
+        for row in rows {
+            statuses.push(self.project_exec_summary(row).await?);
         }
         Ok(statuses)
+    }
+
+    /// Build one `exec.list` entry from its store summary row (see
+    /// `arena0_api::ExecSummary` for the field-by-field equivalence with
+    /// `exec.status`). Decodes no receipt and no activation record. The only
+    /// non-column inputs: the callout `name` from the program schema
+    /// (`self.catalog.schema`, cached by hash), and `writer`/`phase` from
+    /// `self.turns` for non-terminal executions. A turn-memo miss loads that
+    /// execution's state once (as `project_turn` does) and memoizes it, so
+    /// only the first list after a daemon start decodes, and only
+    /// non-terminal executions; terminal executions never decode.
+    async fn project_exec_summary(
+        &self,
+        row: arena0_store::ExecSummaryRow,
+    ) -> Result<arena0_api::ExecSummary, ApiError> {
+        let execution = row.execution.as_ref();
+        let lifecycle = project_lifecycle(
+            row.request_failure.is_some(),
+            row.activation.is_some(),
+            execution.map(|execution| execution.lifecycle),
+        );
+        let session_execution = execution.filter(|_| lifecycle_has_session(lifecycle));
+        let activation = row
+            .activation
+            .as_ref()
+            .map(activation_index_inspection)
+            .transpose()?;
+        let committed_session = row
+            .activation
+            .as_ref()
+            .and_then(|activation| activation.committed.then_some(activation.session_id));
+        let session_id = match lifecycle {
+            ExecLifecycle::Negotiating => None,
+            _ => execution
+                .map(|execution| execution.session_id)
+                .or(committed_session),
+        };
+        let turn = if let Some(execution) =
+            session_execution.filter(|execution| !execution.lifecycle.is_terminal())
+        {
+            // Drop the memo lock before an async store or sandbox operation.
+            // A memo is usable only for the step captured by this index row.
+            let memo = self
+                .turns
+                .lock()
+                .expect("turn memo")
+                .get(&row.execution_id)
+                .filter(|(step, _)| *step == execution.agreed_step)
+                .map(|(_, turn)| turn.clone());
+            match memo {
+                Some(turn) => turn,
+                None => {
+                    let state = self
+                        .store
+                        .load_execution(row.execution_id)
+                        .await
+                        .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
+                        .ok_or_else(|| {
+                            ApiError::new(ApiErrorCode::Storage, "execution summary has no state")
+                        })?;
+                    self.project_turn(row.execution_id, &state).await?
+                }
+            }
+        } else {
+            Turn {
+                writer: None,
+                phase: None,
+            }
+        };
+        let pending_callout =
+            if let Some(callout) = session_execution.and_then(|execution| execution.callout) {
+                let schema = self
+                    .catalog
+                    .schema(row.program_hash)
+                    .await
+                    .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
+                    .ok_or_else(|| {
+                        ApiError::new(ApiErrorCode::Storage, "execution program schema is missing")
+                    })?;
+                let index = usize::try_from(callout.callout_index)
+                    .map_err(|_| ApiError::new(ApiErrorCode::Storage, "callout index overflow"))?;
+                let declaration = schema.callouts.get(index).ok_or_else(|| {
+                    ApiError::new(ApiErrorCode::Storage, "callout index out of range")
+                })?;
+                Some(arena0_api::CalloutSummary {
+                    pending_id: callout.id,
+                    callout_index: callout.callout_index,
+                    name: declaration.name.clone(),
+                    opened_at_ms: callout.opened_at_ms,
+                })
+            } else {
+                None
+            };
+        let outcome = execution
+            .and_then(|execution| execution.outcome_json.as_deref())
+            .map(serde_json::from_slice)
+            .transpose()
+            .map_err(|_| {
+                ApiError::new(ApiErrorCode::Storage, "execution outcome is invalid JSON")
+            })?;
+        let reason = match lifecycle {
+            ExecLifecycle::Failed => row
+                .request_failure
+                .clone()
+                .or_else(|| execution.and_then(|execution| execution.terminal_reason.clone())),
+            ExecLifecycle::Aborted => {
+                execution.and_then(|execution| execution.terminal_reason.clone())
+            }
+            _ => None,
+        };
+        let peers: Vec<PeerId> = session_execution
+            .map(|execution| {
+                execution
+                    .participant_ids
+                    .iter()
+                    .copied()
+                    .filter(|peer| *peer != self.peer_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(arena0_api::ExecSummary {
+            exec_id: row.execution_id,
+            negotiation_id: row.negotiation_id,
+            program_id: row.program_hash,
+            lifecycle,
+            session_id,
+            step: session_execution.map(|execution| execution.agreed_step),
+            last_step_at_ms: session_execution.and_then(|execution| execution.last_step_at_ms),
+            participants: session_execution.map(|execution| execution.participants),
+            peers,
+            pending_callout,
+            receipt_available: session_execution
+                .is_some_and(|execution| execution.receipt_produced),
+            writer: turn.writer,
+            phase: turn.phase,
+            end: execution
+                .map(|execution| arena0_api::ExecEndStatus::from(&execution.end))
+                .unwrap_or_default(),
+            reason,
+            outcome,
+            activation,
+            created_at_ms: row.created_at_ms,
+            updated_at_ms: execution
+                .map(|execution| execution.updated_at_ms)
+                .or_else(|| {
+                    row.activation
+                        .as_ref()
+                        .map(|activation| activation.updated_at_ms)
+                })
+                .unwrap_or(row.created_at_ms),
+        })
     }
 
     async fn exec_status(&self, exec_id: ExecId) -> Result<ExecStatus, ApiError> {
@@ -2328,25 +2492,40 @@ impl HostService {
             .load_execution(exec_id)
             .await
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
-        let receipt_available = if let Some(state) = &state {
-            self.store
-                .load_receipt(state.binding().session_id())
-                .await
-                .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
-                .is_some()
-        } else {
-            false
-        };
+        let receipt_available = self
+            .store
+            .exec_summary(exec_id)
+            .await
+            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
+            .and_then(|row| row.execution)
+            .is_some_and(|execution| execution.receipt_produced);
         let execution_updated_at_ms = self
             .store
             .execution_updated_at_ms(exec_id)
             .await
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
+        let lifecycle = project_lifecycle(
+            request.failure().is_some(),
+            activation.is_some(),
+            state
+                .as_ref()
+                .map(arena0_protocol::execution::ExecutionState::lifecycle),
+        );
         let turn = match &state {
-            Some(state) => Some(self.project_turn(exec_id, state).await?),
+            Some(state) if lifecycle_has_session(lifecycle) && !state.lifecycle().is_terminal() => {
+                Some(self.project_turn(exec_id, state).await?)
+            }
+            Some(_) => Some(Turn {
+                writer: None,
+                phase: None,
+            }),
             None => None,
         };
-        let callout = if let Some(open) = state.as_ref().and_then(|state| state.callout()) {
+        let callout = if let Some(open) = state
+            .as_ref()
+            .filter(|_| lifecycle_has_session(lifecycle))
+            .and_then(|state| state.callout())
+        {
             let schema = self
                 .catalog
                 .schema(request.program_hash())
@@ -2424,32 +2603,19 @@ impl HostService {
         Ok(turn)
     }
 
-    async fn active_execution_count(&self) -> Result<usize, ApiError> {
-        let executions = self
-            .store
-            .list_executions(4_096)
-            .await
-            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
-        Ok(executions
-            .iter()
-            .filter(|state| !state.lifecycle().is_terminal())
-            .count())
-    }
-
     pub(crate) async fn host_status(&self) -> Result<HostStatus, ApiError> {
-        let programs = self
-            .catalog
-            .list()
-            .await
-            .map_err(|error| {
-                ApiError::new(ApiErrorCode::Storage, format!("list programs: {error}"))
-            })?
-            .len();
+        let programs = self.store.count_programs().await.map_err(|error| {
+            ApiError::new(ApiErrorCode::Storage, format!("list programs: {error}"))
+        })?;
         Ok(HostStatus {
             host: self.host_info(),
             transport_key: AgentPubKey(self.peer_id.0),
             programs,
-            execs_active: self.active_execution_count().await?,
+            execs_active: self
+                .store
+                .count_active_executions()
+                .await
+                .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?,
         })
     }
 
@@ -3878,6 +4044,19 @@ fn parse_view(
     Ok(view)
 }
 
+/// Whether the published lifecycle exposes a started SessionStatus. Failed
+/// executions expose one only if an aggregate exists; callers apply this rule
+/// to their optional aggregate, preserving activation-only session identities.
+fn lifecycle_has_session(lifecycle: ExecLifecycle) -> bool {
+    matches!(
+        lifecycle,
+        ExecLifecycle::Active
+            | ExecLifecycle::Completed
+            | ExecLifecycle::Aborted
+            | ExecLifecycle::Failed
+    )
+}
+
 fn project_exec_status_facts(
     peer_id: PeerId,
     request: ExecutionRequest,
@@ -3923,10 +4102,19 @@ fn project_exec_status_facts(
         .and_then(|record| record.is_committed().then(|| record.session_id()));
     let lifecycle = project_lifecycle(
         request.failure().is_some(),
-        activation.as_ref(),
-        state.as_ref(),
+        activation.is_some(),
+        state
+            .as_ref()
+            .map(arena0_protocol::execution::ExecutionState::lifecycle),
     );
+    let session = state
+        .as_ref()
+        .filter(|_| lifecycle_has_session(lifecycle))
+        .map(session_status);
     let state = match (lifecycle, state) {
+        (ExecLifecycle::Waiting, _) => {
+            unreachable!("project_lifecycle publishes Waiting as Active")
+        }
         (ExecLifecycle::Negotiating, _) => ExecStatusState::Negotiating {
             queue_position: None,
         },
@@ -3935,18 +4123,18 @@ fn project_exec_status_facts(
                 .map(|state| state.binding().session_id())
                 .or(committed_session),
         },
-        (ExecLifecycle::Waiting | ExecLifecycle::Active, Some(state)) => ExecStatusState::Active {
-            session: session_status(&state),
+        (ExecLifecycle::Active, Some(_)) => ExecStatusState::Active {
+            session: session.expect("active aggregate has a session"),
         },
         (ExecLifecycle::Completed, Some(state)) => ExecStatusState::Completed {
-            session: session_status(&state),
+            session: session.expect("completed aggregate has a session"),
             outcome: state
                 .terminal_outcome_json()
                 .map(serde_json::from_slice)
                 .transpose()?,
         },
         (ExecLifecycle::Aborted, Some(state)) => ExecStatusState::Aborted {
-            session: session_status(&state),
+            session: session.expect("aborted aggregate has a session"),
             reason: state
                 .status()
                 .terminal_cause()
@@ -3962,7 +4150,7 @@ fn project_exec_status_facts(
                     .map(|cause| cause.reason().to_owned())
             }),
             session: Some(SessionProgress::Started {
-                session: session_status(&state),
+                session: session.expect("failed aggregate has a session"),
             }),
         },
         (ExecLifecycle::Failed, None) => ExecStatusState::Failed {
@@ -4002,6 +4190,37 @@ fn empty_execution_inspection(
         events_total: 0,
         events_next: None,
     }
+}
+
+/// The activation projection mapped from `ActivationIndex::facts`; decodes nothing.
+fn activation_index_inspection(
+    index: &arena0_store::ActivationIndex,
+) -> Result<ActivationInspection, ApiError> {
+    let facts = &index.facts;
+    Ok(ActivationInspection {
+        state: if index.committed {
+            ActivationInspectionState::Committed
+        } else {
+            ActivationInspectionState::Prepared
+        },
+        negotiation_id: facts.negotiation_id,
+        session_id: index.committed.then_some(index.session_id),
+        offer_hash: facts.offer_hash,
+        creator: facts.creator,
+        target_size: facts.target_size,
+        initial_state: facts.initial_state,
+        participants: facts
+            .participants
+            .iter()
+            .map(|&(peer_id, ticket_hash)| ActivationParticipant {
+                peer_id,
+                ticket_hash,
+            })
+            .collect(),
+        params: serde_json::from_slice(&facts.params).map_err(|_| {
+            ApiError::new(ApiErrorCode::Storage, "activation params are invalid JSON")
+        })?,
+    })
 }
 
 fn project_activation_inspection(record: ActivationRecord) -> ActivationInspection {
@@ -5225,7 +5444,7 @@ mod tests {
         match daemon.dispatch(HostRequest::ExecList).await {
             Ok(ResponseOk::ExecList(statuses)) => {
                 assert_eq!(statuses.len(), 1);
-                assert_eq!(statuses[0].status.exec_id, exec_id);
+                assert_eq!(statuses[0].exec_id, exec_id);
             }
             other => panic!("expected exec.list, got {other:?}"),
         }
@@ -5427,6 +5646,122 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn activating_summary_matches_status_before_actor_activation() {
+        let (_dir, store, daemon, peer) = test_daemon();
+        let wasm =
+            std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "../../programs/target/wasm32-unknown-unknown/release/rock_paper_scissors.wasm",
+            ))
+            .expect("built rock_paper_scissors guest; run `just build-programs`");
+        let program = Program::try_from(wasm.clone()).unwrap();
+        let (program_hash, _) = store.handle().register_program(wasm, 1).await.unwrap();
+        let shared = daemon
+            .engine
+            .load(&program)
+            .unwrap()
+            .initialize(JsonBytes::try_new(b"null".to_vec()).unwrap())
+            .unwrap()
+            .shared;
+        let exec_id = ExecId([0xD4; 32]);
+        let TwoPartyActivation {
+            prepared,
+            activation,
+            ..
+        } = two_party_activation(
+            &daemon,
+            peer,
+            program_hash,
+            NegotiationId([0xD5; 32]),
+            &shared,
+        );
+        // Commit the aggregate without starting an actor. This holds the real
+        // durable interval before next.activate() without racing task scheduling.
+        let mut writer = record_prepared(&daemon, exec_id, prepared).await;
+        commit_execution(
+            &mut writer,
+            activation,
+            peer,
+            shared,
+            LocalStateBytes::try_new(Vec::new()).unwrap(),
+        )
+        .await;
+        drop(writer);
+
+        let ResponseOk::ExecList(entries) = daemon.dispatch(HostRequest::ExecList).await.unwrap()
+        else {
+            panic!("expected execution list");
+        };
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        let ResponseOk::Status(status) = daemon
+            .dispatch(HostRequest::ExecStatus { exec_id })
+            .await
+            .unwrap()
+        else {
+            panic!("expected status");
+        };
+        let ResponseOk::Inspection(inspection) = daemon
+            .dispatch(HostRequest::ExecInspect {
+                exec_id,
+                events_from: None,
+                events_limit: 16,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected inspection");
+        };
+        assert_eq!(status.lifecycle(), ExecLifecycle::Activating);
+        assert!(status.session_id().is_some());
+        assert!(status.session().is_none());
+        assert_eq!(entry.exec_id, status.exec_id);
+        assert_eq!(entry.negotiation_id, status.negotiation_id);
+        assert_eq!(entry.program_id, status.program_id);
+        assert_eq!(entry.lifecycle, status.lifecycle());
+        assert_eq!(entry.session_id, status.session_id());
+        assert_eq!(entry.created_at_ms, status.created_at_ms);
+        assert_eq!(entry.updated_at_ms, status.updated_at_ms);
+        assert_eq!(entry.end, status.end);
+        assert_eq!(entry.activation, inspection.activation);
+        let session = status.session();
+        assert_eq!(entry.step, session.map(|session| session.step));
+        assert_eq!(
+            entry.participants,
+            session.map(|session| session.participants)
+        );
+        assert_eq!(
+            entry.peers,
+            session
+                .map(|session| session.peers.clone())
+                .unwrap_or_default()
+        );
+        assert_eq!(
+            entry.receipt_available,
+            session.is_some_and(|session| session.receipt_available)
+        );
+        assert_eq!(entry.writer, session.and_then(|session| session.writer));
+        assert_eq!(
+            entry.phase,
+            session.and_then(|session| session.phase.clone())
+        );
+        assert_eq!(
+            entry.pending_callout.as_ref().map(|callout| (
+                callout.pending_id,
+                callout.callout_index,
+                callout.name.as_str()
+            )),
+            status.pending_callout().map(|callout| (
+                callout.pending_id,
+                callout.callout_index,
+                callout.name.as_str()
+            ))
+        );
+        assert_eq!(entry.last_step_at_ms, None);
+        assert_eq!(entry.reason, None);
+        assert_eq!(entry.outcome, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn certified_execution_is_active_until_its_receipt_is_published() {
         use arena0_protocol::{Effect, Event, ParticipantStepSignature, TerminalOutcome};
         use arena0_store::{Change, TransitionRecord};
@@ -5562,7 +5897,8 @@ mod tests {
         }
         assert_eq!(
             daemon
-                .active_execution_count()
+                .store
+                .count_active_executions()
                 .await
                 .expect("active execution count"),
             1
