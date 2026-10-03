@@ -9,9 +9,13 @@ mod receipt;
 mod recovery;
 mod registry;
 mod request;
+mod resolve;
+mod step_state;
 mod summary;
 mod timers;
 
+pub(crate) use resolve::resolve_statements;
+pub use resolve::{IdMatches, IdSpace};
 pub(crate) use summary::ReadDb;
 
 pub(super) struct Database {
@@ -19,11 +23,26 @@ pub(super) struct Database {
     _lock: OwnerLock,
     host_id: PeerId,
     transaction_poison: Option<String>,
+    // The writer holds Inner.db before locking this log; readers of the log
+    // never take the writer lock. Publishing after COMMIT preserves its order.
+    pub(super) changes: Arc<StdMutex<changes::ChangeLog>>,
+    pending: Vec<ChangeKey>,
     /// Owned received files, created at open with mode 0o700 on Unix.
     blob_dir: PathBuf,
 }
 
 impl Database {
+    /// Record that the open transaction wrote the summary row `key`. Every
+    /// write path that changes a row a summary read returns calls this inside
+    /// its transaction; `commit_result` publishes the recorded keys to the
+    /// store's change log after `COMMIT` succeeds, and a rollback discards
+    /// them. Duplicate keys within one transaction publish once.
+    pub(super) fn record_change(&mut self, key: crate::ChangeKey) {
+        if !self.pending.contains(&key) {
+            self.pending.push(key);
+        }
+    }
+
     /// Park the actual writer with a transaction open, solely to prove read
     /// connections can serve committed snapshots independently of its mutex.
     #[cfg(test)]
@@ -78,6 +97,8 @@ impl Database {
             _lock: lock,
             host_id: config.host_id,
             transaction_poison: None,
+            changes: Arc::new(StdMutex::new(changes::ChangeLog::new())),
+            pending: Vec::new(),
             blob_dir: PathBuf::from(blob_dir),
         };
         database.bind_metadata()?;
@@ -253,14 +274,49 @@ mod tests {
                 params![vec![0xff_u8; 32], vec![1_u8]],
             )
             .expect("deferred foreign-key violation");
+        database.record_change(ChangeKey::Exec(ExecId([0xff; 32])));
 
         assert!(database.commit_result(()).is_err());
+        assert_eq!(*database.changes.lock().unwrap().subscribe().borrow(), 0);
         assert!(!database.is_poisoned());
         let count: i64 = database
             .connection
             .query_row("SELECT COUNT(*) FROM execution_salts", [], |row| row.get(0))
             .expect("rolled-back rows");
         assert_eq!(count, 0);
+
+        let first = ChangeKey::Exec(ExecId([1; 32]));
+        let second = ChangeKey::Exec(ExecId([2; 32]));
+        database
+            .transaction(|db| {
+                db.record_change(first);
+                db.record_change(first);
+                Ok(())
+            })
+            .unwrap();
+        let failed: Result<(), StoreError> = database.transaction(|db| {
+            db.record_change(ChangeKey::Exec(ExecId([3; 32])));
+            db.connection.execute(
+                "INSERT INTO execution_salts (execution_id, salt, created_at_ms) VALUES (?1, ?2, 1)",
+                params![vec![0xff_u8; 32], vec![1_u8]],
+            )?;
+            Ok(())
+        });
+        assert!(failed.is_err());
+        assert_eq!(*database.changes.lock().unwrap().subscribe().borrow(), 1);
+        database
+            .transaction(|db| {
+                db.record_change(second);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            database.changes.lock().unwrap().since(0),
+            Catchup::Keys {
+                head: 2,
+                keys: vec![first, second]
+            }
+        );
 
         let rollback: Result<(), StoreError> =
             database.rollback_result(StoreError::Corruption("test failure".into()));

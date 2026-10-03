@@ -35,25 +35,30 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
+mod changes;
 mod codec;
 mod database;
 mod summary;
+pub use changes::{CHANGE_RING, Catchup, ChangeKey};
 pub use summary::{
     ActivationFacts, ActivationIndex, CalloutIndex, ExecSummaryRow, ExecutionIndex,
-    ReceiptSummaryRow,
+    ReceiptSummaryRow, StepTimesRow,
 };
 mod lock;
 use codec::*;
 use database::Database;
+pub use database::{IdMatches, IdSpace};
 use lock::{
     OwnerLock, acquire_process_lock, configure_connection, initialize_schema, prepare_database_file,
 };
 
+// Version 14 indexes each agreed step's post-state hash for compact sync reads.
+// Version 13 indexes execution session ids for prefix resolution.
 // Version 12 adds transactionally maintained summary indexes and activation facts.
 // Version 11 stamps each agreed step with its local certification time.
 // Version 10 gives each database its own blob directory. Older partial rows
 // reconstruct paths in a shared directory and cannot be reopened under this layout.
-const SCHEMA_VERSION: u64 = 12;
+const SCHEMA_VERSION: u64 = 15;
 const ENVELOPE_VERSION: u16 = 2;
 const ENVELOPE_MAGIC: [u8; 8] = *b"AR0STOR1";
 const ENVELOPE_DOMAIN: &[u8] = b"arena0/store-envelope/v2";
@@ -817,6 +822,12 @@ struct Inner {
     closed: AtomicBool,
     execution_claims: StdMutex<HashSet<ExecId>>,
     host_id: PeerId,
+    /// Random hex id of this open store's lifetime (design §3.2); the Host's
+    /// event bus reports the same id as its `boot_id`.
+    boot_id: String,
+    /// Shared with `Database`, which publishes into it on `COMMIT` while the
+    /// writer mutex is held. Lock order: `db` before `changes`.
+    changes: Arc<StdMutex<changes::ChangeLog>>,
 }
 
 impl std::fmt::Debug for Inner {
@@ -909,6 +920,7 @@ impl Store {
 
     fn open_reserved(config: StoreConfig, lock: OwnerLock) -> Result<Self, StoreError> {
         let db = Database::open(&config, lock)?;
+        let changes = Arc::clone(&db.changes);
         let readers = (0..READ_CONNECTIONS)
             .map(|_| database::ReadDb::open(&config.path, config.busy_timeout).map(StdMutex::new))
             .collect::<Result<Vec<_>, _>>()?;
@@ -920,6 +932,11 @@ impl Store {
                 closed: AtomicBool::new(false),
                 execution_claims: StdMutex::new(HashSet::new()),
                 host_id: config.host_id,
+                boot_id: rand::random::<[u8; 16]>()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+                changes,
             }),
         };
         Ok(Self { handle })
@@ -1581,6 +1598,92 @@ impl StoreHandle {
         limit: usize,
     ) -> Result<Vec<ReceiptSummaryRow>, StoreError> {
         self.run_read(move |db| db.list_receipt_summaries(limit))
+            .await
+    }
+
+    /// The id of this open store's lifetime: random, minted at open, 32 hex
+    /// characters. A `seq` is meaningful only together with this id.
+    #[must_use]
+    pub fn boot_id(&self) -> &str {
+        &self.inner.boot_id
+    }
+
+    /// Watch this store's published head: the `seq` of the last committed
+    /// change (0 before any). The receiver's current value is the head at
+    /// subscription; it changes once per committed transaction that recorded
+    /// changes. Read what changed with [`changes_since`](Self::changes_since).
+    #[must_use]
+    pub fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.inner
+            .changes
+            .lock()
+            .expect("change log lock")
+            .subscribe()
+    }
+
+    /// What a reader that has applied every change up to `seq` (of this
+    /// lifetime) must fetch to be current. Never blocks on the writer.
+    #[must_use]
+    pub fn changes_since(&self, seq: u64) -> Catchup {
+        self.inner
+            .changes
+            .lock()
+            .expect("change log lock")
+            .since(seq)
+    }
+
+    /// Certification times and post-state hashes of this execution's agreed
+    /// steps `from..`, from index columns on the read pool; empty arrays when
+    /// there are none. Decodes no step artifact.
+    pub async fn list_step_times(
+        &self,
+        exec_id: ExecId,
+        from: u64,
+    ) -> Result<StepTimesRow, StoreError> {
+        self.run_read(move |db| db.list_step_times(exec_id, from))
+            .await
+    }
+
+    /// One receipt's summary row from index columns; `None` when absent.
+    pub async fn receipt_summary(
+        &self,
+        receipt_id: ReceiptId,
+    ) -> Result<Option<ReceiptSummaryRow>, StoreError> {
+        self.run_read(move |db| db.receipt_summary(receipt_id))
+            .await
+    }
+
+    /// One blob's record; `None` when this Host has no such blob.
+    /// Uses the writer connection, like `list_blobs`.
+    pub async fn blob_record(
+        &self,
+        hash: arena0_protocol::BlobHash,
+    ) -> Result<Option<BlobRecord>, StoreError> {
+        self.run(move |db| db.blob_record(hash)).await
+    }
+
+    /// Ids in `space` starting with the lowercase hex `prefix`, at most
+    /// `limit` of them plus the total match count, by an indexed range scan on
+    /// the read pool (`ReadDb::resolve_ids`).
+    pub async fn resolve_ids(
+        &self,
+        space: IdSpace,
+        prefix: String,
+        limit: usize,
+    ) -> Result<IdMatches, StoreError> {
+        self.run_read(move |db| db.resolve_ids(space, &prefix, limit))
+            .await
+    }
+
+    /// The shared state after agreed step `step` of `execution_id`, read from
+    /// the read pool (`ReadDb::step_state`). Callers ask only for steps the
+    /// execution has agreed; steps are append-only, so the row exists.
+    pub async fn step_state(
+        &self,
+        execution_id: ExecId,
+        step: u64,
+    ) -> Result<SharedStateBytes, StoreError> {
+        self.run_read(move |db| db.step_state(execution_id, step))
             .await
     }
 

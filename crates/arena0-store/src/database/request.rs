@@ -86,6 +86,7 @@ impl Database {
                     params![execution_id.0.as_slice(), hash.0.as_slice()],
                 )?;
             }
+            store.record_change(ChangeKey::Exec(execution_id));
             Ok(ExecutionRequestOutcome::Created)
         })
     }
@@ -154,6 +155,7 @@ impl Database {
                     admission.negotiation_id().map(|id| id.0.to_vec()),
                 ],
             )?;
+            store.record_change(ChangeKey::Exec(execution_id));
             Ok(AdmissionBindingOutcome::Bound)
         })
     }
@@ -298,6 +300,7 @@ impl Database {
                          AND failure IS NULL",
                         params![reason, execution_id.0.to_vec()],
                     )?;
+                    store.record_change(ChangeKey::Exec(execution_id));
                     Ok(ExecutionRequestFailureOutcome::Recorded)
                 }
             }

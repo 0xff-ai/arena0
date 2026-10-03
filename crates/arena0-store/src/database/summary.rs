@@ -26,6 +26,31 @@ const EXEC_SUMMARY_SELECT: &str =
 FROM exec_requests q LEFT JOIN activation_records a USING (execution_id)
 LEFT JOIN executions e USING (execution_id)";
 
+const RECEIPT_SUMMARY_SELECT: &str =
+    "SELECT receipt_id, session_id, kind, program_hash, completed, stored_at_ms,
+            EXISTS (SELECT 1 FROM receipt_imports i WHERE i.receipt_id = r.receipt_id),
+            EXISTS (SELECT 1 FROM receipt_productions p WHERE p.receipt_id = r.receipt_id)
+     FROM receipts r";
+
+fn receipt_summary_row(row: &rusqlite::Row<'_>) -> Result<ReceiptSummaryRow, StoreError> {
+    let kind = match row.get::<_, String>(2)?.as_str() {
+        "receipt" => arena0_protocol::ReceiptKind::Receipt,
+        "stop_report" => arena0_protocol::ReceiptKind::StopReport,
+        _ => return Err(StoreError::Corruption("unknown receipt kind".into())),
+    };
+    Ok(ReceiptSummaryRow {
+        receipt_id: ReceiptId::from_bytes(array32(&row.get::<_, Vec<u8>>(0)?, "receipt id")?),
+        session_id: SessionHash(array32(&row.get::<_, Vec<u8>>(1)?, "receipt session")?),
+        kind,
+        program_hash: ProgramHash(array32(&row.get::<_, Vec<u8>>(3)?, "program hash")?),
+        completed: row.get(4)?,
+        provenance: ReceiptProvenance::from_facts(row.get(6)?, row.get(7)?).ok_or_else(|| {
+            StoreError::Corruption("receipt artifact has no provenance fact".into())
+        })?,
+        stored_at_ms: sqlite_i64(row.get(5)?)?,
+    })
+}
+
 fn exec_summary_row(row: &rusqlite::Row<'_>) -> Result<ExecSummaryRow, StoreError> {
     let activation = row
         .get::<_, Option<String>>(5)?
@@ -192,35 +217,58 @@ impl ReadDb {
     ) -> Result<Vec<ReceiptSummaryRow>, StoreError> {
         let limit = i64::try_from(limit)
             .map_err(|_| StoreError::InvalidConfiguration("receipt limit is too large"))?;
-        let mut statement = self.connection.prepare(
-            "SELECT receipt_id, session_id, kind, program_hash, completed, stored_at_ms,
-                    EXISTS (SELECT 1 FROM receipt_imports i WHERE i.receipt_id = r.receipt_id),
-                    EXISTS (SELECT 1 FROM receipt_productions p WHERE p.receipt_id = r.receipt_id)
-             FROM receipts r ORDER BY receipt_id LIMIT ?1",
-        )?;
+        let mut statement = self.connection.prepare(&format!(
+            "{RECEIPT_SUMMARY_SELECT} ORDER BY receipt_id LIMIT ?1"
+        ))?;
         let mut rows = statement.query(params![limit])?;
         let mut receipts = Vec::new();
         while let Some(row) = rows.next()? {
-            let kind = match row.get::<_, String>(2)?.as_str() {
-                "receipt" => arena0_protocol::ReceiptKind::Receipt,
-                "stop_report" => arena0_protocol::ReceiptKind::StopReport,
-                _ => return Err(StoreError::Corruption("unknown receipt kind".into())),
-            };
-            receipts.push(ReceiptSummaryRow {
-                receipt_id: ReceiptId::from_bytes(array32(
-                    &row.get::<_, Vec<u8>>(0)?,
-                    "receipt id",
-                )?),
-                session_id: SessionHash(array32(&row.get::<_, Vec<u8>>(1)?, "receipt session")?),
-                kind,
-                program_hash: ProgramHash(array32(&row.get::<_, Vec<u8>>(3)?, "program hash")?),
-                completed: row.get(4)?,
-                provenance: ReceiptProvenance::from_facts(row.get(6)?, row.get(7)?).ok_or_else(
-                    || StoreError::Corruption("receipt artifact has no provenance fact".into()),
-                )?,
-                stored_at_ms: sqlite_i64(row.get(5)?)?,
-            });
+            receipts.push(receipt_summary_row(row)?);
         }
         Ok(receipts)
+    }
+
+    pub(crate) fn receipt_summary(
+        &self,
+        id: ReceiptId,
+    ) -> Result<Option<ReceiptSummaryRow>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("{RECEIPT_SUMMARY_SELECT} WHERE receipt_id = ?1"))?;
+        let mut rows = statement.query(params![id.as_bytes().to_vec()])?;
+        rows.next()?.map(receipt_summary_row).transpose()
+    }
+
+    pub(crate) fn list_step_times(
+        &self,
+        exec_id: ExecId,
+        from: u64,
+    ) -> Result<StepTimesRow, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT step, certified_at_ms, post_state FROM agreed_steps WHERE execution_id = ?1 AND step >= ?2 ORDER BY step")?;
+        let mut rows = statement.query(params![exec_id.0.to_vec(), sqlite_u64(from)?])?;
+        let mut times = StepTimesRow {
+            exec_id,
+            from_step: from,
+            certified_at_ms: Vec::new(),
+            post_state: Vec::new(),
+        };
+        let mut expected = from;
+        let mut response_bytes = 0;
+        while let Some(row) = rows.next()? {
+            if sqlite_i64(row.get(0)?)? != expected {
+                return Err(StoreError::Corruption(
+                    "agreed step times are not gapless".into(),
+                ));
+            }
+            account_response(&mut response_bytes, 40)?;
+            times.certified_at_ms.push(sqlite_i64(row.get(1)?)?);
+            times.post_state.push(arena0_protocol::StateHash(array32(
+                &row.get::<_, Vec<u8>>(2)?,
+                "step post-state",
+            )?));
+            expected += 1;
+        }
+        Ok(times)
     }
 }

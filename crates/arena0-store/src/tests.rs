@@ -25,6 +25,24 @@ async fn linking_hashes_the_file_in_place() {
     let first = directory.path().join("first");
     std::fs::write(&first, &bytes).unwrap();
     let (hash, length) = shared.link_blob(first.clone()).await.unwrap();
+    assert_eq!(
+        shared.changes_since(0),
+        Catchup::Keys {
+            head: 1,
+            keys: vec![ChangeKey::Blob(hash)]
+        }
+    );
+    assert_eq!(
+        shared.blob_record(hash).await.unwrap(),
+        shared.list_blobs().await.unwrap().into_iter().next()
+    );
+    assert!(
+        shared
+            .blob_record(arena0_protocol::BlobHash([0xff; 32]))
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(hash.0, *blake3::hash(&bytes).as_bytes());
     assert_eq!(length, bytes.len() as u64);
     assert_eq!(
@@ -117,6 +135,31 @@ async fn linking_hashes_the_file_in_place() {
         assert!(matches!(shared.link_blob(invalid).await,
             Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidInput));
     }
+    let owned_source = directory.path().join("owned-source");
+    std::fs::write(&owned_source, b"owned").unwrap();
+    let before_copy = *shared.subscribe_changes().borrow();
+    let (owned, _) = shared.copy_blob(owned_source.clone()).await.unwrap();
+    assert!(
+        matches!(shared.changes_since(before_copy), Catchup::Keys { keys, .. } if keys == vec![ChangeKey::Blob(owned)])
+    );
+    assert_eq!(
+        shared.blob_record(owned).await.unwrap(),
+        shared
+            .list_blobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.hash == owned)
+    );
+    let after_copy = *shared.subscribe_changes().borrow();
+    shared.copy_blob(owned_source).await.unwrap();
+    assert_eq!(
+        shared.changes_since(after_copy),
+        Catchup::Keys {
+            head: after_copy,
+            keys: vec![]
+        }
+    );
     store.shutdown().await.unwrap();
 }
 
@@ -291,6 +334,7 @@ async fn received_blob_is_durable_with_its_transition() {
         None,
     )
     .unwrap();
+    let head = *shared.subscribe_changes().borrow();
     writer
         .persist(TransitionRecord {
             expected: before.version(),
@@ -319,6 +363,19 @@ async fn received_blob_is_durable_with_its_transition() {
         .await
         .unwrap();
     assert_eq!(writer.load_execution().await.unwrap().unwrap(), next);
+    assert!(
+        matches!(shared.changes_since(head), Catchup::Keys { keys, .. }
+        if keys == vec![ChangeKey::Exec(execution_id)])
+    );
+    assert_eq!(
+        shared.blob_record(hash).await.unwrap(),
+        shared
+            .list_blobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.hash == hash)
+    );
     assert_eq!(
         shared.blob_partial_blocking(execution_id, hash).unwrap(),
         Some(BlobPartial {
@@ -398,6 +455,7 @@ async fn received_blob_is_durable_with_its_transition() {
         None,
     )
     .unwrap();
+    let head = *shared.subscribe_changes().borrow();
     writer
         .persist(TransitionRecord {
             expected: before.version(),
@@ -428,6 +486,19 @@ async fn received_blob_is_durable_with_its_transition() {
             written: 6,
             committed: true
         })
+    );
+    assert!(
+        matches!(shared.changes_since(head), Catchup::Keys { keys, .. }
+        if keys.iter().copied().collect::<std::collections::BTreeSet<_>>() == std::collections::BTreeSet::from([ChangeKey::Exec(execution_id), ChangeKey::Blob(hash)]))
+    );
+    assert_eq!(
+        shared.blob_record(hash).await.unwrap(),
+        shared
+            .list_blobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.hash == hash)
     );
     assert_eq!(
         shared.blob_granted_blocking(execution_id, hash).unwrap(),
@@ -1264,6 +1335,16 @@ async fn summary_equivalence_through_callouts_publication_and_import() {
         .register_program(fixture.program.clone(), 1)
         .await
         .unwrap();
+    assert_eq!(
+        handle.changes_since(0),
+        Catchup::Keys {
+            head: 1,
+            keys: vec![ChangeKey::Program(hash)]
+        }
+    );
+    let previous_head = std::cell::Cell::new(1);
+    let previous_step = std::cell::Cell::new(0);
+    let produced = std::cell::Cell::new(false);
     let mut writer = handle.claim_execution(id).unwrap();
     writer
         .create_execution_request(
@@ -1276,6 +1357,59 @@ async fn summary_equivalence_through_callouts_publication_and_import() {
         .await
         .unwrap();
     let check = async |last_step_at_ms: Option<u64>| {
+        let mut expected = std::collections::BTreeSet::from([ChangeKey::Exec(id)]);
+        let times = handle.list_step_times(id, 0).await.unwrap();
+        assert_eq!(times.from_step, 0);
+        assert_eq!(times.exec_id, id);
+        if let Some(state) = handle.load_execution(id).await.unwrap() {
+            let trace = handle
+                .read_agreed_steps(id, 0, state.agreed_step())
+                .await
+                .unwrap();
+            assert_eq!(
+                times.certified_at_ms,
+                trace.iter().map(|s| s.certified_at_ms).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                times.post_state,
+                trace.iter().map(|s| s.entry.post_state).collect::<Vec<_>>()
+            );
+            for step in previous_step.get()..state.agreed_step() {
+                expected.insert(ChangeKey::Step { exec_id: id, step });
+            }
+            previous_step.set(state.agreed_step());
+            let tail = handle.list_step_times(id, 1).await.unwrap();
+            assert_eq!(tail.from_step, 1);
+            assert_eq!(
+                tail.certified_at_ms,
+                times
+                    .certified_at_ms
+                    .iter()
+                    .skip(1)
+                    .copied()
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                tail.post_state,
+                times.post_state.iter().skip(1).copied().collect::<Vec<_>>()
+            );
+            if let Some(receipt) = handle
+                .load_receipt(state.binding().session_id())
+                .await
+                .unwrap()
+                && !produced.replace(true)
+            {
+                expected.insert(ChangeKey::Receipt(receipt.receipt.receipt_id()));
+            }
+        }
+        let Catchup::Keys { head, keys } = handle.changes_since(previous_head.get()) else {
+            panic!("recent changes require no snapshot")
+        };
+        assert_eq!(
+            keys.into_iter().collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+        previous_head.set(head);
         let row = handle.exec_summary(id).await.unwrap().unwrap();
         let request = handle.load_execution_request(id).await.unwrap().unwrap();
         assert_eq!(row.execution_id, id);
@@ -1574,7 +1708,85 @@ async fn summary_equivalence_through_callouts_publication_and_import() {
     assert_eq!(summary.program_hash, receipt.body().header().program_hash());
     assert!(summary.completed);
     assert_eq!(summary.provenance, ReceiptProvenance::Produced);
+    assert_eq!(
+        handle.receipt_summary(summary.receipt_id).await.unwrap(),
+        Some(summary.clone())
+    );
     assert_eq!(summary.stored_at_ms, 17);
+    let before_import = *handle.subscribe_changes().borrow();
+    handle.import_receipt(receipt.clone(), 19).await.unwrap();
+    assert!(
+        matches!(handle.changes_since(before_import), Catchup::Keys { keys, .. } if keys == vec![ChangeKey::Receipt(receipt.receipt_id())])
+    );
+    assert_eq!(
+        handle
+            .receipt_summary(receipt.receipt_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .provenance,
+        ReceiptProvenance::Both
+    );
+    let after_import = *handle.subscribe_changes().borrow();
+    handle.import_receipt(receipt.clone(), 19).await.unwrap();
+    assert_eq!(
+        handle.changes_since(after_import),
+        Catchup::Keys {
+            head: after_import,
+            keys: vec![]
+        }
+    );
+    assert!(
+        handle
+            .receipt_summary(ReceiptId::from_bytes([0xff; 32]))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let sql = Connection::open(&path).unwrap();
+    let post_state = handle.list_step_times(id, 0).await.unwrap().post_state[0];
+    sql.execute(
+        "UPDATE agreed_steps SET post_state = ?1 WHERE step = 0",
+        params![vec![0xff_u8; 32]],
+    )
+    .unwrap();
+    assert!(matches!(
+        handle.read_agreed_steps(id, 0, 1).await,
+        Err(StoreError::Corruption(_))
+    ));
+    sql.execute(
+        "UPDATE agreed_steps SET post_state = ?1 WHERE step = 0",
+        params![post_state.0.to_vec()],
+    )
+    .unwrap();
+    // Damage the index without breaking the state row's foreign key: both
+    // copies of the key move together, while the certified trace stays intact.
+    sql.execute_batch(
+        "BEGIN; PRAGMA defer_foreign_keys = ON;
+         UPDATE agreed_steps SET step = step + 10;
+         UPDATE step_states SET step = step + 10; COMMIT;",
+    )
+    .unwrap();
+    assert!(matches!(
+        handle.list_step_times(id, 0).await,
+        Err(StoreError::Corruption(_))
+    ));
+    sql.execute_batch(
+        "BEGIN; PRAGMA defer_foreign_keys = ON;
+         UPDATE agreed_steps SET step = step - 10;
+         UPDATE step_states SET step = step - 10; COMMIT;",
+    )
+    .unwrap();
+    assert!(
+        handle
+            .list_step_times(id, 100)
+            .await
+            .unwrap()
+            .post_state
+            .is_empty()
+    );
+    drop(sql);
+    previous_head.set(after_import);
     let imported = Store::open(StoreConfig::new(
         directory.path().join("import.sqlite"),
         other_peer(&fixture),
@@ -1585,6 +1797,13 @@ async fn summary_equivalence_through_callouts_publication_and_import() {
         .import_receipt(receipt.clone(), 19)
         .await
         .unwrap();
+    assert_eq!(
+        imported.handle().changes_since(0),
+        Catchup::Keys {
+            head: 1,
+            keys: vec![ChangeKey::Receipt(receipt.receipt_id())]
+        }
+    );
     let foreign = imported
         .handle()
         .list_receipt_summaries(8)
@@ -1610,6 +1829,9 @@ async fn summary_equivalence_through_callouts_publication_and_import() {
             .is_none()
     );
     handle.remove_program(hash, 20).await.unwrap();
+    assert!(
+        matches!(handle.changes_since(previous_head.get()), Catchup::Keys { keys, .. } if keys == vec![ChangeKey::Program(hash)])
+    );
     assert_eq!(handle.count_programs().await.unwrap(), 0);
     drop(writer);
     store.shutdown().await.unwrap();
@@ -2685,10 +2907,15 @@ async fn open_join_target_binding_is_compare_and_set_and_durable() {
         .expect("request");
     assert_eq!(request.negotiation_id(), None);
     assert_eq!(request.admission().target(), None);
+    let before_bind = *store.handle().subscribe_changes().borrow();
     assert_eq!(
         writer.bind_join_target(target).await.expect("bind target"),
         AdmissionBindingOutcome::Bound
     );
+    assert!(
+        matches!(store.handle().changes_since(before_bind), Catchup::Keys { keys, .. } if keys == vec![ChangeKey::Exec(execution_id)])
+    );
+    let after_bind = *store.handle().subscribe_changes().borrow();
     assert_eq!(
         store
             .handle()
@@ -2710,6 +2937,13 @@ async fn open_join_target_binding_is_compare_and_set_and_durable() {
             .expect("conflicting target result"),
         AdmissionBindingOutcome::Conflict
     );
+    assert_eq!(
+        store.handle().changes_since(after_bind),
+        Catchup::Keys {
+            head: after_bind,
+            keys: vec![]
+        }
+    );
     let request = writer
         .load_execution_request()
         .await
@@ -2727,12 +2961,16 @@ async fn open_join_target_binding_is_compare_and_set_and_durable() {
         .create_execution_request(hash, None, ExecutionAdmission::join_open(), &[], 3)
         .await
         .expect("failed request");
+    let before_failure = *store.handle().subscribe_changes().borrow();
     assert_eq!(
         failed_writer
             .record_execution_request_failure("negotiation unavailable")
             .await
             .expect("record failure"),
         ExecutionRequestFailureOutcome::Recorded
+    );
+    assert!(
+        matches!(store.handle().changes_since(before_failure), Catchup::Keys { keys, .. } if keys == vec![ChangeKey::Exec(failed_execution_id)])
     );
     assert!(matches!(
         failed_writer.bind_join_target(target).await,
@@ -4869,4 +5107,222 @@ async fn stale_transition_writes_neither_state_nor_side_rows() {
     drop(connection);
     drop(writer);
     store.shutdown().await.unwrap();
+}
+
+// Prefix bounds must include the whole final nibble, carry across 0xff bytes,
+// retain an all-f prefix's open upper bound, and distinguish a full id.
+#[test]
+fn focus_resolve_prefix_ranges_and_totals() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("ranges.sqlite");
+    let sql = Connection::open(&path).unwrap();
+    sql.execute_batch(include_str!("../schema.sql")).unwrap();
+    let mut ids = Vec::new();
+    for (first, second) in [
+        (0xaa, 0xef),
+        (0xab, 0xc0),
+        (0xab, 0xcf),
+        (0xab, 0xd0),
+        (0xff, 0xff),
+    ] {
+        let mut id = [0; 32];
+        id[0] = first;
+        id[1] = second;
+        sql.execute(
+            "INSERT INTO programs (program_hash, wasm, imported_at_ms) VALUES (?1, X'', 0)",
+            params![id.as_slice()],
+        )
+        .unwrap();
+        sql.execute("INSERT INTO exec_requests (execution_id, program_hash, admission, grants, created_at_ms) VALUES (?1, ?1, X'', X'', 0)", params![id.as_slice()]).unwrap();
+        ids.push(id);
+    }
+    let db = database::ReadDb::open(&path, Duration::from_secs(1)).unwrap();
+    let matches = db.resolve_ids(IdSpace::Exec, "abc", 1).unwrap();
+    assert_eq!(matches.total, 2);
+    assert_eq!(matches.ids, vec![ids[1]]);
+    assert_eq!(
+        db.resolve_ids(IdSpace::Exec, "ab", 8).unwrap().ids,
+        ids[1..4]
+    );
+    assert_eq!(
+        db.resolve_ids(IdSpace::Exec, "f", 8).unwrap().ids,
+        vec![ids[4]]
+    );
+    assert_eq!(
+        db.resolve_ids(IdSpace::Exec, &ExecId(ids[2]).to_string(), 8)
+            .unwrap()
+            .ids,
+        vec![ids[2]]
+    );
+    assert_eq!(db.resolve_ids(IdSpace::Exec, "ac", 8).unwrap().total, 0);
+    assert!(
+        db.resolve_ids(IdSpace::Exec, "a", 0)
+            .unwrap()
+            .ids
+            .is_empty()
+    );
+    // All three session sources participate; prepared-only activations do
+    // not, and a session present in two sources contributes only one match.
+    for (index, status) in [(0, "committed"), (1, "prepared")] {
+        let session = if index == 0 { ids[1] } else { ids[4] };
+        let committed = if status == "committed" {
+            Some(vec![])
+        } else {
+            None
+        };
+        sql.execute("INSERT INTO activation_records (execution_id, session_id, status, prepared_activation, committed_activation, facts, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, X'', ?4, X'', 0, 0)", params![ids[index].as_slice(), session.as_slice(), status, committed]).unwrap();
+    }
+    sql.execute("INSERT INTO executions (execution_id, host_id, producer, session_id, state, end_phase, end_unconfirmed, participant_ids, participants, version, lifecycle, agreed_step, event_position, created_at_ms, updated_at_ms) VALUES (?1, ?1, ?1, ?2, X'', 0, X'', X'', 2, 0, 0, 0, 0, 0, 0)", params![ids[0].as_slice(), ids[2].as_slice()]).unwrap();
+    for index in [1, 3] {
+        sql.execute("INSERT INTO receipts (receipt_id, session_id, kind, artifact, program_hash, completed, stored_at_ms) VALUES (?1, ?1, 'receipt', X'', ?1, 1, 0)", params![ids[index].as_slice()]).unwrap();
+    }
+    assert_eq!(
+        db.resolve_ids(IdSpace::Session, "abc", 8).unwrap(),
+        IdMatches {
+            ids: vec![ids[1], ids[2]],
+            total: 2
+        }
+    );
+    assert_eq!(
+        db.resolve_ids(IdSpace::Session, "ab", 8).unwrap().ids,
+        ids[1..4]
+    );
+    assert_eq!(
+        db.resolve_ids(IdSpace::Receipt, "abc", 8).unwrap().ids,
+        vec![ids[1]]
+    );
+    assert_eq!(db.resolve_ids(IdSpace::Session, "f", 8).unwrap().total, 0);
+    // An all-f full id has no finite upper bound, not an empty range.
+    let all_f = [255u8; 32];
+    sql.execute("INSERT INTO receipts (receipt_id, session_id, kind, artifact, program_hash, completed, stored_at_ms) VALUES (?1, ?1, 'stop_report', X'', ?2, 0, 0)", params![all_f.as_slice(), ids[0].as_slice()]).unwrap();
+    assert_eq!(
+        db.resolve_ids(IdSpace::Receipt, &ExecId(all_f).to_string(), 8)
+            .unwrap()
+            .ids,
+        vec![all_f]
+    );
+}
+
+#[test]
+fn focus_resolve_sources_use_index_searches() {
+    let sql = Connection::open_in_memory().unwrap();
+    sql.execute_batch(include_str!("../schema.sql")).unwrap();
+    let tables = sql
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table'")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    for space in [IdSpace::Exec, IdSpace::Receipt, IdSpace::Session] {
+        for bounded in [true, false] {
+            let parameters = if bounded {
+                vec![vec![0u8; 32], vec![255u8; 32]]
+            } else {
+                vec![vec![0u8; 32]]
+            };
+            for statement in database::resolve_statements(space, bounded, 8) {
+                let details = sql
+                    .prepare(&format!("EXPLAIN QUERY PLAN {statement}"))
+                    .unwrap()
+                    .query_map(rusqlite::params_from_iter(parameters.iter()), |row| {
+                        row.get::<_, String>(3)
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                // UNION result scans consume indexed matches, not stored tables.
+                for detail in &details {
+                    let scanned = detail
+                        .strip_prefix("SCAN ")
+                        .and_then(|rest| rest.split_whitespace().next());
+                    assert!(
+                        !scanned.is_some_and(|name| tables.iter().any(|table| table == name)),
+                        "{space:?}, bounded={bounded}: {statement}: {detail}"
+                    );
+                }
+                assert!(
+                    details.iter().any(|detail| detail.starts_with("SEARCH ")
+                        && (detail.contains("INDEX") || detail.contains("PRIMARY KEY"))),
+                    "{space:?}, bounded={bounded}: {statement}: {details:?}"
+                );
+            }
+        }
+    }
+}
+
+// Failure cases: missing atomic write, an off-by-one post-state, a valid
+// envelope carrying wrong bytes, and a missing row escaping trace validation.
+#[tokio::test]
+async fn focus_step_states_are_certified_post_states_and_damage_is_rejected() {
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("step-states.sqlite");
+    let id = ExecId([0x71; 32]);
+    let store = create_execution(&path, &fixture, id).await;
+    let handle = store.handle();
+    let mut writer = handle.claim_execution(id).unwrap();
+    for step in 0..3u8 {
+        let state = writer.load_execution().await.unwrap().unwrap();
+        let event = if step == 0 {
+            session_started_event(&fixture)
+        } else {
+            Event::MessageReceived {
+                from: other_peer(&fixture),
+                msg: vec![step],
+            }
+        };
+        let staged = dispatch_record(
+            &mut writer,
+            state.version(),
+            event,
+            SharedStateBytes::try_new(vec![step + 1]).unwrap(),
+            state.local_state().clone(),
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            10 + u64::from(step) * 3,
+        )
+        .await
+        .unwrap();
+        let expected = staged.pending_shared().unwrap().shared_state().clone();
+        sign_step(
+            &store,
+            &fixture,
+            id,
+            &mut writer,
+            11 + u64::from(step) * 3,
+            12 + u64::from(step) * 3,
+        )
+        .await;
+        assert_eq!(
+            handle.step_state(id, u64::from(step)).await.unwrap(),
+            expected
+        );
+    }
+    let sql = Connection::open(&path).unwrap();
+    let wrong = envelope(EnvelopeKind::StepState, &[99]).unwrap();
+    sql.execute(
+        "UPDATE step_states SET shared_state = ?1 WHERE execution_id = ?2 AND step = 1",
+        params![wrong, id.0.as_slice()],
+    )
+    .unwrap();
+    assert!(matches!(handle.step_state(id, 1).await,
+        Err(StoreError::Corruption(message)) if message == "stored step state does not match its post-state"));
+    assert_eq!(handle.step_state(id, 2).await.unwrap().as_bytes(), &[3]);
+    sql.execute(
+        "DELETE FROM step_states WHERE execution_id = ?1 AND step = 1",
+        params![id.0.as_slice()],
+    )
+    .unwrap();
+    assert!(matches!(handle.step_state(id, 1).await,
+        Err(StoreError::Corruption(message)) if message == "agreed step has no stored state"));
+    drop(writer);
+    store.shutdown().await.unwrap();
+    assert!(
+        matches!(Store::open(StoreConfig::new(&path, fixture.producer)),
+        Err(StoreError::Corruption(message)) if message == "step states do not match agreed trace")
+    );
 }
