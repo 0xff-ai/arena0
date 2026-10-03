@@ -9,10 +9,82 @@ struct RawActivationRow {
     updated_at_ms: i64,
     facts_bytes: Vec<u8>,
 }
+/// Own the record's envelope decoding and index checks together, so timed
+/// reads and transactional reads reject the same inconsistent evidence.
 impl RawActivationRow {
     /// Consume one row only after checking its status, session and facts against authenticated evidence.
     fn decode(self) -> Result<ActivationRecord, StoreError> {
-        todo!("STUB(store)")
+        let payload = DurableEnvelope::open(
+            EnvelopeKind::PreparedActivation,
+            &self.prepared_bytes,
+            MAX_ACTIVATION_BYTES,
+        )?;
+        let prepared: PreparedActivation = decode_borsh(&payload, "prepared activation")?;
+        prepared
+            .validate()
+            .map_err(|error| StoreError::Corruption(format!("prepared activation: {error}")))?;
+        let facts: ActivationFacts = decode_borsh(&self.facts_bytes, "activation facts")?;
+        let expected = ActivationFacts::of(&prepared);
+        if facts != expected {
+            return Err(StoreError::Corruption(
+                "activation facts do not match decoded activation".into(),
+            ));
+        }
+        let status = ActivationRecordStatus::parse(&self.status)?;
+        let session_id = SessionHash(array32(&self.session_bytes, "activation session")?);
+        if prepared.session_hash() == SessionHash([0; 32]) {
+            return Err(StoreError::Corruption(
+                "activation has zero session identity".into(),
+            ));
+        }
+        if prepared.session_hash() != session_id {
+            return Err(StoreError::Corruption(
+                "activation session index does not match prepared evidence".into(),
+            ));
+        }
+        let committed = self
+            .committed_bytes
+            .map(|bytes| {
+                let payload =
+                    DurableEnvelope::open(EnvelopeKind::Activation, &bytes, MAX_ACTIVATION_BYTES)?;
+                let activation: Activation = decode_borsh(&payload, "activation")?;
+                activation
+                    .validate()
+                    .map_err(|error| StoreError::Corruption(format!("activation: {error}")))?;
+                if !prepared.matches(&activation) {
+                    return Err(StoreError::Corruption(
+                        "committed activation does not match prepared evidence".into(),
+                    ));
+                }
+                Ok(activation)
+            })
+            .transpose()?;
+        if matches!(status, ActivationRecordStatus::Prepared) != committed.is_none() {
+            return Err(StoreError::Corruption(
+                "activation status and committed evidence disagree".into(),
+            ));
+        }
+        let state = match (status, committed) {
+            (ActivationRecordStatus::Prepared, None) => {
+                ActivationRecordState::Prepared { evidence: prepared }
+            }
+            (ActivationRecordStatus::Committed, Some(activation)) => {
+                ActivationRecordState::Committed {
+                    evidence: prepared,
+                    activation: Box::new(activation),
+                }
+            }
+            _ => {
+                return Err(StoreError::Corruption(
+                    "activation status and committed evidence disagree".into(),
+                ));
+            }
+        };
+        Ok(ActivationRecord {
+            execution_id: self.execution_id,
+            state,
+            updated_at_ms: sqlite_i64(self.updated_at_ms)?,
+        })
     }
 }
 
@@ -196,41 +268,20 @@ impl Database {
                  FROM activation_records WHERE execution_id = ?1",
                 params![execution_id.0.to_vec()],
                 |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                        row.get::<_, Option<Vec<u8>>>(3)?,
-                        row.get::<_, i64>(4)?,
-                        row.get::<_, Vec<u8>>(5)?,
-                    ))
+                    Ok(RawActivationRow {
+                        execution_id,
+                        session_bytes: row.get(0)?,
+                        status: row.get(1)?,
+                        prepared_bytes: row.get(2)?,
+                        committed_bytes: row.get(3)?,
+                        updated_at_ms: row.get(4)?,
+                        facts_bytes: row.get(5)?,
+                    })
                 },
             )
             .optional()?;
-        row.map(
-            |(
-                session_bytes,
-                status,
-                prepared_bytes,
-                committed_bytes,
-                updated_at_ms,
-                facts_bytes,
-            )| {
-                super::integrity::timed_decode("decode.activation", || {
-                    RawActivationRow {
-                        execution_id,
-                        session_bytes,
-                        status,
-                        prepared_bytes,
-                        committed_bytes,
-                        updated_at_ms,
-                        facts_bytes,
-                    }
-                    .decode()
-                })
-            },
-        )
-        .transpose()
+        row.map(|row| super::integrity::timed_decode("decode.activation", || row.decode()))
+            .transpose()
     }
 
     pub(super) fn record_activation_conflict(
