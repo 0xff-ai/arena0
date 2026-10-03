@@ -1114,11 +1114,8 @@ impl Daemon {
 
     pub(crate) async fn host_statuses(&self) -> Result<Vec<HostStatus>, ApiError> {
         let services = self.services();
-        let mut statuses = Vec::with_capacity(services.len());
-        for (_, service) in services {
-            statuses.push(service.host_status().await?);
-        }
-        Ok(statuses)
+        futures::future::try_join_all(services.iter().map(|(_, service)| service.host_status()))
+            .await
     }
 
     pub(crate) fn daemon_info(&self) -> Result<DaemonInfo, ApiError> {
@@ -1143,112 +1140,127 @@ impl Daemon {
 
     /// Answer one non-streaming request. HTTP callers cannot name local paths.
     pub(crate) async fn handle(&self, request: Request, caller: Caller) -> Response {
-        match request {
-            Request::DaemonStop if caller == Caller::Http => Err(ApiError::new(
-                ApiErrorCode::BadRequest,
-                "daemon.stop is accepted only on the local socket",
-            )),
-            Request::ActivitySubscribe
-            | Request::Host {
-                request: HostRequest::EventsSubscribe { .. },
-                ..
-            } => Err(ApiError::new(
-                ApiErrorCode::BadRequest,
-                "subscriptions need their own socket connection or GET /events",
-            )),
-            Request::Host { host, mut request } => {
-                if caller == Caller::Http
-                    && matches!(
-                        &request,
+        use tracing::Instrument as _;
+
+        let span = tracing::debug_span!("daemon_request", method = request.method());
+        async {
+            match request {
+                Request::DaemonStop if caller == Caller::Http => Err(ApiError::new(
+                    ApiErrorCode::BadRequest,
+                    "daemon.stop is accepted only on the local socket",
+                )),
+                Request::ActivitySubscribe
+                | Request::Host {
+                    request: HostRequest::EventsSubscribe { .. },
+                    ..
+                } => Err(ApiError::new(
+                    ApiErrorCode::BadRequest,
+                    "subscriptions need their own socket connection or GET /events",
+                )),
+                Request::Host { host, mut request } => {
+                    if caller == Caller::Http
+                        && matches!(
+                            &request,
+                            HostRequest::ProgramImport {
+                                source: FileSource::Path(_)
+                            } | HostRequest::BlobImport {
+                                source: FileSource::Path(_)
+                            } | HostRequest::BlobExport { .. }
+                        )
+                    {
+                        return Err(ApiError::new(
+                            ApiErrorCode::BadRequest,
+                            "paths are accepted only on the local socket",
+                        ));
+                    }
+                    let host = host.parse::<HostName>().map_err(|error| {
+                        ApiError::new(
+                            ApiErrorCode::BadRequest,
+                            format!("invalid Host name: {error}"),
+                        )
+                    })?;
+                    let service = self.service(host.as_str()).ok_or_else(|| {
+                        ApiError::new(ApiErrorCode::NotFound, format!("unknown Host '{host}'"))
+                    })?;
+                    // Uploads belong to the process Home, not to any one Host. Resolve
+                    // them here so a single upload can be imported into several Hosts.
+                    match &request {
                         HostRequest::ProgramImport {
-                            source: FileSource::Path(_)
-                        } | HostRequest::BlobImport {
-                            source: FileSource::Path(_)
-                        } | HostRequest::BlobExport { .. }
-                    )
-                {
-                    return Err(ApiError::new(
-                        ApiErrorCode::BadRequest,
-                        "paths are accepted only on the local socket",
-                    ));
-                }
-                let host = host.parse::<HostName>().map_err(|error| {
-                    ApiError::new(
-                        ApiErrorCode::BadRequest,
-                        format!("invalid Host name: {error}"),
-                    )
-                })?;
-                let service = self.service(host.as_str()).ok_or_else(|| {
-                    ApiError::new(ApiErrorCode::NotFound, format!("unknown Host '{host}'"))
-                })?;
-                // Uploads belong to the process Home, not to any one Host. Resolve
-                // them here so a single upload can be imported into several Hosts.
-                match &request {
-                    HostRequest::ProgramImport {
-                        source: FileSource::Upload(hash),
-                    } => {
-                        let path = self.home.uploads_dir().join(format!("{hash}.wasm"));
-                        if !path.try_exists().map_err(|error| {
-                            ApiError::new(ApiErrorCode::Storage, error.to_string())
-                        })? {
+                            source: FileSource::Upload(hash),
+                        } => {
+                            let path = self.home.uploads_dir().join(format!("{hash}.wasm"));
+                            if !path.try_exists().map_err(|error| {
+                                ApiError::new(ApiErrorCode::Storage, error.to_string())
+                            })? {
+                                let binary = self.home.uploads_dir().join(format!("{hash}.bin"));
+                                if binary.try_exists().map_err(|error| {
+                                    ApiError::new(ApiErrorCode::Storage, error.to_string())
+                                })? {
+                                    return Err(ApiError::new(
+                                        ApiErrorCode::BadRequest,
+                                        format!("upload {hash} was not sent as application/wasm"),
+                                    ));
+                                }
+                                return Err(ApiError::new(
+                                    ApiErrorCode::NotFound,
+                                    "no such upload",
+                                ));
+                            }
+                            request = HostRequest::ProgramImport {
+                                source: FileSource::Path(path),
+                            };
+                        }
+                        HostRequest::BlobImport {
+                            source: FileSource::Upload(hash),
+                        } => {
                             let binary = self.home.uploads_dir().join(format!("{hash}.bin"));
-                            if binary.try_exists().map_err(|error| {
+                            let path = if binary.try_exists().map_err(|error| {
+                                ApiError::new(ApiErrorCode::Storage, error.to_string())
+                            })? {
+                                binary
+                            } else {
+                                self.home.uploads_dir().join(format!("{hash}.wasm"))
+                            };
+                            if !path.try_exists().map_err(|error| {
                                 ApiError::new(ApiErrorCode::Storage, error.to_string())
                             })? {
                                 return Err(ApiError::new(
-                                    ApiErrorCode::BadRequest,
-                                    format!("upload {hash} was not sent as application/wasm"),
+                                    ApiErrorCode::NotFound,
+                                    "no such upload",
                                 ));
                             }
-                            return Err(ApiError::new(ApiErrorCode::NotFound, "no such upload"));
+                            let (hash, length) =
+                                service.store.copy_blob(path).await.map_err(|error| {
+                                    let code = match error {
+                                        arena0_store::StoreError::BlobTooLarge { .. }
+                                        | arena0_store::StoreError::Io(_) => {
+                                            ApiErrorCode::BadRequest
+                                        }
+                                        _ => ApiErrorCode::Storage,
+                                    };
+                                    ApiError::new(code, format!("import blob: {error}"))
+                                })?;
+                            return Ok(ResponseOk::BlobImported { hash, length });
                         }
-                        request = HostRequest::ProgramImport {
-                            source: FileSource::Path(path),
-                        };
+                        _ => {}
                     }
-                    HostRequest::BlobImport {
-                        source: FileSource::Upload(hash),
-                    } => {
-                        let binary = self.home.uploads_dir().join(format!("{hash}.bin"));
-                        let path = if binary.try_exists().map_err(|error| {
-                            ApiError::new(ApiErrorCode::Storage, error.to_string())
-                        })? {
-                            binary
-                        } else {
-                            self.home.uploads_dir().join(format!("{hash}.wasm"))
-                        };
-                        if !path.try_exists().map_err(|error| {
-                            ApiError::new(ApiErrorCode::Storage, error.to_string())
-                        })? {
-                            return Err(ApiError::new(ApiErrorCode::NotFound, "no such upload"));
-                        }
-                        let (hash, length) =
-                            service.store.copy_blob(path).await.map_err(|error| {
-                                let code = match error {
-                                    arena0_store::StoreError::BlobTooLarge { .. }
-                                    | arena0_store::StoreError::Io(_) => ApiErrorCode::BadRequest,
-                                    _ => ApiErrorCode::Storage,
-                                };
-                                ApiError::new(code, format!("import blob: {error}"))
-                            })?;
-                        return Ok(ResponseOk::BlobImported { hash, length });
-                    }
-                    _ => {}
+                    service.dispatch(request).await
                 }
-                service.dispatch(request).await
-            }
-            Request::DaemonInfo => self.daemon_info().map(ResponseOk::DaemonInfo),
-            Request::HostsList => self.host_statuses().await.map(ResponseOk::Hosts),
-            Request::HostsOpen { id, user_agent } => self
-                .open_host(id, user_agent)
-                .await
-                .map(ResponseOk::HostOpened)
-                .map_err(|error| ApiError::new(ApiErrorCode::BadRequest, error.to_string())),
-            Request::DaemonStop => {
-                self.stop_requested.notify_one();
-                Ok(ResponseOk::Ack)
+                Request::DaemonInfo => self.daemon_info().map(ResponseOk::DaemonInfo),
+                Request::HostsList => self.host_statuses().await.map(ResponseOk::Hosts),
+                Request::HostsOpen { id, user_agent } => self
+                    .open_host(id, user_agent)
+                    .await
+                    .map(ResponseOk::HostOpened)
+                    .map_err(|error| ApiError::new(ApiErrorCode::BadRequest, error.to_string())),
+                Request::DaemonStop => {
+                    self.stop_requested.notify_one();
+                    Ok(ResponseOk::Ack)
+                }
             }
         }
+        .instrument(span)
+        .await
     }
 
     async fn serve_conn(self: Arc<Self>, stream: UnixStream) -> anyhow::Result<()> {
