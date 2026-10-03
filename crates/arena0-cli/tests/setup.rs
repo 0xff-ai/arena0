@@ -8,9 +8,12 @@ use std::process::{Command, Output, Stdio};
 
 use serde_json::Value;
 
+#[path = "support/copy_fixture.rs"]
+mod copy_fixture;
+
 fn copy_binary(directory: &Path) -> PathBuf {
     let destination = directory.join("arena0 runner ' $() `touch setup-injected` '");
-    fs::copy(env!("CARGO_BIN_EXE_arena0"), &destination).expect("copy arena0 binary");
+    copy_fixture::copy_executable(Path::new(env!("CARGO_BIN_EXE_arena0")), &destination);
     let mut permissions = fs::metadata(&destination)
         .expect("copied binary metadata")
         .permissions();
