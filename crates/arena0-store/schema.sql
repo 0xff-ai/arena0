@@ -103,6 +103,9 @@ CREATE TABLE executions (
         OR (callout_id IS NOT NULL AND callout_index IS NOT NULL AND callout_opened_at_ms IS NOT NULL))
 ) STRICT;
 
+-- `resolve` looks session prefixes up by range (design §3.4).
+CREATE INDEX executions_session ON executions (session_id);
+
 -- One immutable local dispatch record per event position. The event and
 -- effects are opaque program records; shared/local memory ownership remains
 -- in the execution aggregate or its pending proposal. Proposal and agreed
@@ -127,8 +130,22 @@ CREATE TABLE agreed_steps (
     -- The local time this Host stored the step. A local observation: it is
     -- not part of `artifact`, so receipts and trace hashes never carry it.
     certified_at_ms INTEGER NOT NULL CHECK (certified_at_ms >= 0),
+    post_state BLOB NOT NULL CHECK (length(post_state) = 32),
     PRIMARY KEY (execution_id, step),
     FOREIGN KEY (execution_id) REFERENCES executions(execution_id)
+) STRICT;
+
+-- Each agreed step's shared post-state, written in the same transaction as
+-- its `agreed_steps` row so historical views read it instead of replaying the
+-- trace. A `StepState` envelope of the shared state bytes; their state hash is
+-- that row's `post_state`, which readers check. A local copy: never part of a
+-- receipt or a trace hash.
+CREATE TABLE step_states (
+    execution_id BLOB NOT NULL CHECK (length(execution_id) = 32),
+    step INTEGER NOT NULL CHECK (step >= 0),
+    shared_state BLOB NOT NULL,
+    PRIMARY KEY (execution_id, step),
+    FOREIGN KEY (execution_id, step) REFERENCES agreed_steps(execution_id, step)
 ) STRICT;
 
 CREATE TABLE receipts (

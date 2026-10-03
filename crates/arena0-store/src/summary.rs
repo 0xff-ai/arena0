@@ -137,3 +137,17 @@ pub struct ReceiptSummaryRow {
     pub provenance: ReceiptProvenance,
     pub stored_at_ms: u64,
 }
+
+/// One execution's agreed steps `from_step..` as parallel arrays, read from
+/// `agreed_steps` index columns (design §3.7, ruling 3: compact step arrays).
+/// `certified_at_ms[i]` and `post_state[i]` belong to step `from_step + i`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepTimesRow {
+    pub exec_id: ExecId,
+    pub from_step: u64,
+    /// Local time this Host stored each step (`agreed_steps.certified_at_ms`).
+    pub certified_at_ms: Vec<u64>,
+    /// Each step's post-state hash (`agreed_steps.post_state`), written from
+    /// the step's entry in the same transaction as its artifact.
+    pub post_state: Vec<StateHash>,
+}
