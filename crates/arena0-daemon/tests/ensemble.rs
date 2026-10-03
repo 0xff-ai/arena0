@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arena0_api::{ApiErrorCode, EnsembleSpec, HostRequest, Request, Response, ResponseOk};
-use arena0_daemon::{Daemon, McpConfig};
+use arena0_daemon::{Daemon, HttpConfig};
 use arena0_program::ParticipantCount;
 use tempfile::TempDir;
 use tokio::io::BufReader;
@@ -56,7 +56,7 @@ async fn start(
     let home = arena0_home::Home::from_root(home_dir.path().to_path_buf()).unwrap();
     let daemon = Daemon::start(
         names.iter().map(|name| name.parse().unwrap()).collect(),
-        McpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap(),
+        HttpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap(),
         arena0_test_engine::shared_test_engine(),
         home,
         true,
@@ -142,12 +142,14 @@ async fn id_show_returns_the_host_identity() {
 async fn shared_unix_api_classifies_program_input_errors() {
     let (home, daemon, serving) = start(&["host-01", "host-02"]).await;
     let socket = home.path().join("arena0.sock");
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), b"Cargo.toml").unwrap();
     let invalid_program = call(
         &socket,
         &host(
             "host-01",
             HostRequest::ProgramImport {
-                wasm: b"Cargo.toml".to_vec(),
+                source: arena0_api::FileSource::Path(file.path().to_path_buf()),
             },
         ),
     )

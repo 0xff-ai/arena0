@@ -516,8 +516,17 @@ impl ExecutionActor {
         next: ExecutionState,
         change: Change,
     ) -> Result<(), ExecError> {
+        let previous_end = self.state.end_phase().clone();
         let result =
             persist_transition(&mut self.context.store, &mut self.state, next, change).await;
+        if result.is_ok() && self.state.end_phase() != &previous_end {
+            let _ = self
+                .messages
+                .send(crate::context::SessionMessage::EndChanged {
+                    end: self.state.end_phase().clone(),
+                })
+                .await;
+        }
         self.resync_on_error(result).await
     }
 

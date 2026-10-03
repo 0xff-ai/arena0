@@ -11,6 +11,29 @@ use std::io::Write;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 
 impl Database {
+    /// The owned file for a copied blob: `<blob_dir>/own-<hash hex>`.
+    pub(crate) fn owned_path(&self, hash: BlobHash) -> PathBuf {
+        self.blob_dir
+            .join(format!("own-{}", blake3::Hash::from_bytes(hash.0).to_hex()))
+    }
+
+    /// Publish an owned copy without replacing an existing blob's ownership.
+    pub(crate) fn insert_owned_blob(
+        &mut self,
+        hash: BlobHash,
+        length: u64,
+        path: &Path,
+    ) -> Result<bool, StoreError> {
+        let path = path.to_str().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "blob path is not UTF-8")
+        })?;
+        Ok(self.connection.execute(
+            "INSERT INTO blobs (hash, length, path, linked) VALUES (?1, ?2, ?3, 0)
+             ON CONFLICT(hash) DO NOTHING",
+            params![hash.0.as_slice(), sqlite_u64(length)?, path],
+        )? != 0)
+    }
+
     pub(crate) fn create_blob_tables(connection: &Connection) -> Result<(), StoreError> {
         connection.execute_batch(
             // `blobs`: every blob this Host can read. `path` is the linked
@@ -68,9 +91,12 @@ impl Database {
         }
         for entry in std::fs::read_dir(&self.blob_dir)? {
             let entry = entry?;
-            if entry.file_name().as_encoded_bytes().starts_with(b"recv-")
-                && !entry.file_type()?.is_dir()
-                && !retained.contains(&entry.path())
+            let name = entry.file_name();
+            if !entry.file_type()?.is_dir()
+                && (name.as_encoded_bytes().starts_with(b"copy-")
+                    || ((name.as_encoded_bytes().starts_with(b"recv-")
+                        || name.as_encoded_bytes().starts_with(b"own-"))
+                        && !retained.contains(&entry.path())))
             {
                 std::fs::remove_file(entry.path())?;
             }

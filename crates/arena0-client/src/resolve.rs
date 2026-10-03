@@ -77,14 +77,14 @@ impl DaemonClient {
         let ResponseOk::ExecList(list) = self.call_host(host, &HostRequest::ExecList).await? else {
             bail!("unexpected response to exec.list");
         };
-        let hexes: Vec<String> = list.iter().map(|s| s.exec_id.to_string()).collect();
+        let hexes: Vec<String> = list.iter().map(|s| s.status.exec_id.to_string()).collect();
         match resolve_prefix(prefix, &hexes) {
-            PrefixOutcome::Unique(i) => Ok(list[i].exec_id),
+            PrefixOutcome::Unique(i) => Ok(list[i].status.exec_id),
             PrefixOutcome::None => bail!("no execution matches '{prefix}'"),
             PrefixOutcome::Ambiguous(hits) => {
                 let cands: Vec<String> = hits
                     .iter()
-                    .map(|&i| list[i].exec_id.fmt_short().to_string())
+                    .map(|&i| list[i].status.exec_id.fmt_short().to_string())
                     .collect();
                 bail!("'{prefix}' is ambiguous; candidates: {}", cands.join(", "))
             }
@@ -108,7 +108,7 @@ impl DaemonClient {
             sessions.extend(list.iter().map(|e| e.session_id));
         }
         if let ResponseOk::ExecList(list) = self.call_host(host, &HostRequest::ExecList).await? {
-            sessions.extend(list.iter().filter_map(arena0_api::ExecStatus::session_id));
+            sessions.extend(list.iter().filter_map(|entry| entry.status.session_id()));
         }
         sessions.sort_by_key(|s| s.0);
         sessions.dedup();

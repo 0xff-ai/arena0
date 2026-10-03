@@ -21,6 +21,180 @@ use common::{
 use tokio::io::BufReader;
 use tokio::net::{UnixStream, unix::OwnedReadHalf, unix::OwnedWriteHalf};
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_carries_callout_details_and_terminal_facts() {
+    let d = daemon(&rps_wasm()).await;
+    let (a, b) = launch_pair(&d, Some(serde_json::Value::Null), None).await;
+    let (from_a, _) = next_from_either(&d.host_a, a, &d.host_b, b).await;
+    let (host, exec_id) = if from_a {
+        (&d.host_a, a)
+    } else {
+        (&d.host_b, b)
+    };
+    {
+        let ResponseOk::Next(NextEvent::Callout {
+            pending_id,
+            callout_index,
+            name,
+            prompt,
+            schema,
+            context,
+        }) = ok(call(host, &HostRequest::ExecNext { exec_id }).await)
+        else {
+            panic!("expected callout");
+        };
+        let expected = arena0_api::PendingCalloutStatus {
+            pending_id,
+            callout_index,
+            name,
+            prompt,
+            schema,
+            context,
+        };
+        let ResponseOk::Status(status) = ok(call(host, &HostRequest::ExecStatus { exec_id }).await)
+        else {
+            panic!("expected status");
+        };
+        assert_eq!(status.pending_callout(), Some(&expected));
+        let ResponseOk::ExecList(entries) = ok(call(host, &HostRequest::ExecList).await) else {
+            panic!("expected list");
+        };
+        let entry = entries
+            .iter()
+            .find(|entry| entry.status.exec_id == exec_id)
+            .unwrap();
+        assert_eq!(entry.status.pending_callout(), Some(&expected));
+        let ResponseOk::Inspection(inspection) = ok(call(
+            host,
+            &HostRequest::ExecInspect {
+                exec_id,
+                events_from: None,
+                events_limit: 16,
+            },
+        )
+        .await) else {
+            panic!("expected inspection");
+        };
+        assert!(entry.activation.is_some());
+        assert_eq!(entry.activation, inspection.activation);
+    }
+    tokio::join!(drive(&d.host_a, a), drive(&d.host_b, b));
+    for (host, exec_id) in [(&d.host_a, a), (&d.host_b, b)] {
+        let ResponseOk::Next(NextEvent::Completed { outcome, .. }) =
+            ok(call(host, &HostRequest::ExecNext { exec_id }).await)
+        else {
+            panic!("expected completion");
+        };
+        let ResponseOk::Status(status) = ok(call(host, &HostRequest::ExecStatus { exec_id }).await)
+        else {
+            panic!("expected status");
+        };
+        let arena0_api::ExecStatusState::Completed {
+            outcome: actual, ..
+        } = status.state
+        else {
+            panic!("expected completed status");
+        };
+        assert_eq!(actual, outcome);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aborted_status_carries_reason() {
+    let d = daemon(&rps_wasm()).await;
+    let (a, _) = launch_pair(&d, Some(serde_json::Value::Null), None).await;
+    await_active(&d.host_a, a).await;
+    let reason = "API termination reason";
+    ok(call(
+        &d.host_a,
+        &HostRequest::ExecTerminate {
+            exec_id: a,
+            reason: reason.into(),
+        },
+    )
+    .await);
+    ok(call(
+        &d.host_a,
+        &HostRequest::ExecAwait {
+            exec_id: a,
+            until: AwaitState::Terminal,
+        },
+    )
+    .await);
+    let ResponseOk::Status(status) =
+        ok(call(&d.host_a, &HostRequest::ExecStatus { exec_id: a }).await)
+    else {
+        panic!("expected status");
+    };
+    match status.state {
+        arena0_api::ExecStatusState::Aborted { reason: actual, .. }
+        | arena0_api::ExecStatusState::Failed {
+            reason: Some(actual),
+            ..
+        } => assert_eq!(actual, reason),
+        other => panic!("expected abort with reason, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trace_decodes_messages() {
+    let d = daemon(&rps_wasm()).await;
+    let (a, b) = complete_session(&d, Some(serde_json::Value::Null), None).await;
+    for (host, exec_id) in [(&d.host_a, a), (&d.host_b, b)] {
+        let ResponseOk::Trace(steps) = ok(call(
+            host,
+            &HostRequest::ExecTrace {
+                exec_id,
+                from: 0,
+                to: u64::MAX,
+            },
+        )
+        .await) else {
+            panic!("expected trace");
+        };
+        assert_eq!(steps[0].entry.step, 0);
+        assert_eq!(steps[0].message, None);
+        let mut messages = 0;
+        for step in steps {
+            if matches!(step.entry.event, arena0_protocol::StepEvent::Message { .. }) {
+                messages += 1;
+                assert!(matches!(
+                    step.message,
+                    Some(arena0_api::DecodedMessage::Json(_))
+                ));
+            }
+        }
+        assert!(messages > 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn end_progress_events_follow_the_handshake() {
+    let d = daemon(&rps_wasm()).await;
+    let (mut events_a, _write_a) = subscribe_events(&d.host_a).await;
+    let (mut events_b, _write_b) = subscribe_events(&d.host_b).await;
+    let (a, b) = complete_session(&d, Some(serde_json::Value::Null), None).await;
+    for (host, exec_id, events) in [(&d.host_a, a, &mut events_a), (&d.host_b, b, &mut events_b)] {
+        let end = tokio::time::timeout(LIVE_EXECUTION_TIMEOUT, async {
+            loop {
+                let frame = read_event(events).await;
+                if let EventData::SessionEndProgress { phase, unconfirmed } = frame.data {
+                    if phase == arena0_api::ExecEndPhase::Ended {
+                        break arena0_api::ExecEndStatus { phase, unconfirmed };
+                    }
+                }
+            }
+        })
+        .await
+        .expect("end handshake progress");
+        let ResponseOk::Status(status) = ok(call(host, &HostRequest::ExecStatus { exec_id }).await)
+        else {
+            panic!("expected status");
+        };
+        assert_eq!(end, status.end);
+    }
+}
+
 async fn next_from_either(
     target_a: &HostTarget,
     exec_a: ExecId,
@@ -35,6 +209,224 @@ async fn next_from_either(
         response = &mut next_a => (true, response),
         response = &mut next_b => (false, response),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn offers_list_open_offers_from_other_hosts() {
+    let d = daemon(&rps_wasm()).await;
+    let (mut events, _write) = subscribe_events(&d.host_b).await;
+    let (_, negotiation_id) = create_on_host_a(&d).await;
+    tokio::time::timeout(LIVE_EXECUTION_TIMEOUT, async {
+        loop {
+            if let EventData::OfferSeen {
+                program_id,
+                negotiation_id: seen,
+                creator,
+                ..
+            } = read_event(&mut events).await.data
+                && seen == negotiation_id
+            {
+                assert_eq!(program_id, d.program_id);
+                assert_eq!(creator, d.peer_a);
+                break;
+            }
+        }
+    })
+    .await
+    .expect("Host b discovers a's offer without a Join");
+    let ResponseOk::Offers(offers) = ok(call(&d.host_b, &HostRequest::NegotiationOffers).await)
+    else {
+        panic!("expected open offers");
+    };
+    let offer = offers
+        .iter()
+        .find(|offer| offer.negotiation_id == negotiation_id)
+        .expect("announced offer is listed");
+    assert_eq!(offer.program_id, d.program_id);
+    assert_eq!(offer.creator, d.peer_a);
+    assert_eq!(offer.target_size, 2);
+    assert_eq!(offer.params, serde_json::Value::Null);
+    assert!(offer.first_seen_ms < offer.deadline_unix_ms);
+    let ResponseOk::Offers(own) = ok(call(&d.host_a, &HostRequest::NegotiationOffers).await) else {
+        panic!("expected open offers");
+    };
+    assert!(
+        !own.iter()
+            .any(|offer| offer.negotiation_id == negotiation_id)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn joined_offer_closes_as_complete() {
+    let d = daemon(&rps_wasm()).await;
+    let (mut events, _write) = subscribe_events(&d.host_b).await;
+    let (_, negotiation_id) = create_on_host_a(&d).await;
+    tokio::time::timeout(LIVE_EXECUTION_TIMEOUT, async {
+        loop {
+            if matches!(read_event(&mut events).await.data, EventData::OfferSeen { negotiation_id: seen, .. } if seen == negotiation_id) { break; }
+        }
+    }).await.expect("offer discovered");
+    let ResponseOk::Offers(offers) = ok(call(&d.host_b, &HostRequest::NegotiationOffers).await)
+    else {
+        panic!("expected open offers");
+    };
+    let offer = offers
+        .iter()
+        .find(|offer| offer.negotiation_id == negotiation_id)
+        .expect("listed target");
+    created(
+        call(
+            &d.host_b,
+            &HostRequest::ExecNew {
+                exec_id: ExecId([0xb1; 32]),
+                program: offer.program_id.to_string(),
+                params: Some(offer.params.clone()),
+                ensemble: EnsembleSpec::Join {
+                    target: Some(NegotiationTarget::new(offer.creator, offer.negotiation_id)),
+                },
+                blobs: vec![],
+            },
+        )
+        .await,
+    );
+    tokio::time::timeout(LIVE_EXECUTION_TIMEOUT, async {
+        loop {
+            if let EventData::OfferClosed {
+                program_id,
+                negotiation_id: closed,
+                creator,
+                reason,
+            } = read_event(&mut events).await.data
+                && closed == negotiation_id
+            {
+                assert_eq!(program_id, d.program_id);
+                assert_eq!(creator, d.peer_a);
+                assert_eq!(reason, arena0_api::OfferClosedReason::Complete);
+                assert_eq!(serde_json::to_value(reason).unwrap(), "complete");
+                break;
+            }
+        }
+    })
+    .await
+    .expect("joined offer closes");
+    let ResponseOk::Offers(offers) = ok(call(&d.host_b, &HostRequest::NegotiationOffers).await)
+    else {
+        panic!("expected open offers");
+    };
+    assert!(
+        !offers
+            .iter()
+            .any(|offer| offer.negotiation_id == negotiation_id)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn imported_program_is_watched() {
+    let d = daemon(&rps_wasm()).await;
+    let wasm = cumulative_sum_wasm();
+    let program_id = common::import(&d.host_a, &wasm).await;
+    let ResponseOk::ProgramList(programs) = ok(call(&d.host_b, &HostRequest::ProgramList).await)
+    else {
+        panic!("expected programs");
+    };
+    // Builds may seed this example at startup. Ensure this test exercises a
+    // newly imported catalog membership rather than an existing watcher.
+    if programs
+        .iter()
+        .any(|program| program.program_hash == program_id)
+    {
+        ok(call(
+            &d.host_b,
+            &HostRequest::ProgramRemove {
+                program: program_id.to_string(),
+            },
+        )
+        .await);
+    }
+    let (mut events, _write) = subscribe_events(&d.host_b).await;
+    assert_eq!(common::import(&d.host_b, &wasm).await, program_id);
+    let params = serde_json::json!({"target_size": 2});
+    let ResponseOk::ExecCreated {
+        negotiation_id: Some(negotiation_id),
+        ..
+    } = ok(call(
+        &d.host_a,
+        &HostRequest::ExecNew {
+            exec_id: ExecId([0xa2; 32]),
+            program: program_id.to_string(),
+            params: Some(params.clone()),
+            ensemble: EnsembleSpec::Create {
+                participant_count: 2,
+            },
+            blobs: vec![],
+        },
+    )
+    .await)
+    else {
+        panic!("expected creator");
+    };
+    tokio::time::timeout(LIVE_EXECUTION_TIMEOUT, async {
+        loop {
+            if matches!(read_event(&mut events).await.data, EventData::OfferSeen { negotiation_id: seen, .. } if seen == negotiation_id) { break; }
+        }
+    }).await.expect("import starts offer discovery");
+    let ResponseOk::Offers(offers) = ok(call(&d.host_b, &HostRequest::NegotiationOffers).await)
+    else {
+        panic!("expected open offers");
+    };
+    let offer = offers
+        .iter()
+        .find(|offer| offer.negotiation_id == negotiation_id)
+        .expect("imported program offer");
+    assert_eq!(offer.program_id, program_id);
+    assert_eq!(offer.creator, d.peer_a);
+    assert_eq!(offer.params, params);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removed_program_is_unwatched() {
+    let d = daemon(&rps_wasm()).await;
+    let (mut events, _write) = subscribe_events(&d.host_b).await;
+    let (_, negotiation_id) = create_on_host_a(&d).await;
+    tokio::time::timeout(LIVE_EXECUTION_TIMEOUT, async {
+        loop {
+            if matches!(read_event(&mut events).await.data, EventData::OfferSeen { negotiation_id: seen, .. } if seen == negotiation_id) { break; }
+        }
+    }).await.expect("offer discovered");
+    assert_eq!(
+        ok(call(
+            &d.host_b,
+            &HostRequest::ProgramRemove {
+                program: d.program_id.to_string()
+            }
+        )
+        .await),
+        ResponseOk::Ack
+    );
+    tokio::time::timeout(LIVE_EXECUTION_TIMEOUT, async {
+        loop {
+            if let EventData::OfferClosed {
+                program_id,
+                negotiation_id: closed,
+                creator,
+                reason,
+            } = read_event(&mut events).await.data
+                && closed == negotiation_id
+            {
+                assert_eq!(program_id, d.program_id);
+                assert_eq!(creator, d.peer_a);
+                assert_eq!(reason, arena0_api::OfferClosedReason::Unwatched);
+                break;
+            }
+        }
+    })
+    .await
+    .expect("removed program's offer closes");
+    let ResponseOk::Offers(offers) = ok(call(&d.host_b, &HostRequest::NegotiationOffers).await)
+    else {
+        panic!("expected open offers");
+    };
+    assert!(!offers.iter().any(|offer| offer.program_id == d.program_id));
 }
 
 /// `exec.new` returns immediately in `Negotiating`; `exec.await` blocks for `Active`
@@ -1374,7 +1766,7 @@ async fn blobs_link_grant_and_export_by_hash() {
     let ResponseOk::BlobImported { hash, length } = ok(call(
         &d.host_a,
         &HostRequest::BlobImport {
-            path: first.clone(),
+            source: arena0_api::FileSource::Path(first.clone()),
         },
     )
     .await) else {
@@ -1391,7 +1783,13 @@ async fn blobs_link_grant_and_export_by_hash() {
     let second = files.path().join("second.bin");
     std::fs::write(&second, &bytes).unwrap();
     assert_eq!(
-        ok(call(&d.host_a, &HostRequest::BlobImport { path: second }).await),
+        ok(call(
+            &d.host_a,
+            &HostRequest::BlobImport {
+                source: arena0_api::FileSource::Path(second)
+            }
+        )
+        .await),
         ResponseOk::BlobImported { hash, length }
     );
     std::fs::remove_file(&first).unwrap();
@@ -1399,7 +1797,7 @@ async fn blobs_link_grant_and_export_by_hash() {
     let missing = call(
         &d.host_a,
         &HostRequest::BlobImport {
-            path: files.path().join("absent.bin"),
+            source: arena0_api::FileSource::Path(files.path().join("absent.bin")),
         },
     )
     .await
@@ -1659,25 +2057,27 @@ async fn blob_list_reports_imported_blobs() {
     ] {
         let path = files.path().join(name);
         std::fs::write(&path, &bytes).unwrap();
-        expected.push(arena0_api::BlobEntry {
-            hash: arena0_protocol::BlobHash(arena0_crypto::hash(
-                arena0_crypto::HashAlgorithm::Blake3,
-                &bytes,
-            )),
-            length: bytes.len() as u64,
-            path: std::fs::canonicalize(&path).unwrap(),
-            linked: true,
-        });
+        expected.push((
+            path,
+            arena0_api::BlobEntry {
+                hash: arena0_protocol::BlobHash(arena0_crypto::hash(
+                    arena0_crypto::HashAlgorithm::Blake3,
+                    &bytes,
+                )),
+                length: bytes.len() as u64,
+                linked: true,
+            },
+        ));
     }
     // Import the greater hash first, so listing in insertion order would
     // differ from the required hash order.
-    expected.sort_by_key(|entry| std::cmp::Reverse(entry.hash.0));
-    for entry in &expected {
+    expected.sort_by_key(|(_, entry)| std::cmp::Reverse(entry.hash.0));
+    for (path, entry) in &expected {
         assert_eq!(
             ok(call(
                 &d.host_a,
                 &HostRequest::BlobImport {
-                    path: entry.path.clone()
+                    source: arena0_api::FileSource::Path(path.clone())
                 }
             )
             .await),
@@ -1687,11 +2087,11 @@ async fn blob_list_reports_imported_blobs() {
             }
         );
     }
-    expected.sort_by_key(|entry| entry.hash.0);
+    expected.sort_by_key(|(_, entry)| entry.hash.0);
 
     assert_eq!(
         ok(call(&d.host_a, &HostRequest::BlobList).await),
-        ResponseOk::BlobList(expected)
+        ResponseOk::BlobList(expected.into_iter().map(|(_, entry)| entry).collect())
     );
     assert_eq!(
         ok(call(&d.host_b, &HostRequest::BlobList).await),

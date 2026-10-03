@@ -12,12 +12,12 @@ use arena0_sandbox::WasmtimeEngine;
 
 use crate::paths::wasmtime_cache_dir;
 use crate::startup::{StartupStage, StartupTimeline};
-use crate::{Daemon, McpConfig};
+use crate::{Daemon, HttpConfig};
 
 /// Open every Host namespace, start their shared local Ensemble, and serve the
 /// shared daemon socket until one service stops, fails, or the process receives
 /// Ctrl-C.
-pub async fn run(names: Vec<HostName>, bootstrap: bool, mcp: McpConfig) -> anyhow::Result<()> {
+pub async fn run(names: Vec<HostName>, bootstrap: bool, mcp: HttpConfig) -> anyhow::Result<()> {
     let timeline = Arc::new(StartupTimeline::new(
         names.len(),
         crate::assets::PROGRAMS.len(),

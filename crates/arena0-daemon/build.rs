@@ -51,4 +51,6 @@ fn main() {
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     fs::write(out.join("embedded_programs.rs"), code).unwrap();
+
+    println!("cargo:rerun-if-changed=build.rs");
 }

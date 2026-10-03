@@ -969,6 +969,90 @@ fn open_blob_file(path: &Path) -> std::io::Result<File> {
 }
 
 impl StoreHandle {
+    /// Copy a file into the store as an owned blob, hashing while copying.
+    /// Existing content retains its record and ownership. Files over
+    /// `MAX_BLOB_BYTES` fail with `BlobTooLarge`.
+    pub async fn copy_blob(
+        &self,
+        source: PathBuf,
+    ) -> Result<(arena0_protocol::BlobHash, u64), StoreError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let directory = {
+                let guard = inner.db.lock().map_err(|_| StoreError::Closed)?;
+                let db = guard.as_ref().ok_or(StoreError::Closed)?;
+                if db.is_poisoned() {
+                    return Err(StoreError::Closed);
+                }
+                db.blob_dir().to_path_buf()
+            };
+            let mut source = open_blob_file(&source)?;
+            let length = source.metadata()?.len();
+            if length > arena0_protocol::MAX_BLOB_BYTES {
+                return Err(StoreError::BlobTooLarge { length });
+            }
+            let temporary = directory.join(format!("copy-{:016x}", rand::random::<u64>()));
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            // The blocking task owns cleanup even if its async caller disappears.
+            // Bound memory independently of file size and check growth after admission.
+            let result = (|| {
+                let mut buffer = [0; 64 * 1024];
+                let mut hasher = blake3::Hasher::new();
+                let mut length = 0;
+                loop {
+                    let count = source.read(&mut buffer)?;
+                    if count == 0 {
+                        break;
+                    }
+                    length += count as u64;
+                    if length > arena0_protocol::MAX_BLOB_BYTES {
+                        return Err(StoreError::BlobTooLarge { length });
+                    }
+                    output.write_all(&buffer[..count])?;
+                    hasher.update(&buffer[..count]);
+                }
+                output.sync_all()?;
+                let hash = arena0_protocol::BlobHash(*hasher.finalize().as_bytes());
+                let mut guard = inner.db.lock().map_err(|_| StoreError::Closed)?;
+                let db = guard.as_mut().ok_or(StoreError::Closed)?;
+                if db.is_poisoned() {
+                    return Err(StoreError::Closed);
+                }
+                if let Some((_, existing_length)) = db.blob_location(hash)? {
+                    std::fs::remove_file(&temporary)?;
+                    return Ok((hash, existing_length));
+                }
+                let owned = db.owned_path(hash);
+                std::fs::rename(&temporary, &owned)?;
+                File::open(&directory)?.sync_all()?;
+                db.insert_owned_blob(hash, length, &owned)?;
+                Ok((hash, length))
+            })();
+            if result.is_err() {
+                match std::fs::remove_file(&temporary) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            result
+        })
+        .await
+        .map_err(|_| StoreError::Closed)?
+    }
+
+    /// The file and length a stored blob reads from; `None` when not stored.
+    pub async fn blob_file(
+        &self,
+        hash: arena0_protocol::BlobHash,
+    ) -> Result<Option<(PathBuf, u64)>, StoreError> {
+        self.run(move |db| db.blob_location(hash)).await
+    }
+
     /// Link a daemon-local file as a blob: canonicalize `path`, stream the file
     /// once through BLAKE3, and record `(hash, length, path)` as a linked blob.
     /// The file is neither copied nor read whole into memory. Linking content the
