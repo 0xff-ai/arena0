@@ -549,8 +549,86 @@ impl LocalTransport {
         peer: &PeerId,
         binding: StreamBinding,
     ) -> Result<SendHandle, TransportError> {
-        let _ = (peer, binding);
-        todo!("STUB(transport)")
+        if self.closed.is_closed() {
+            return Err(TransportError::ConnectionClosed);
+        }
+        if *peer == self.peer_id {
+            return Err(TransportError::connection_failed(std::io::Error::other(
+                "cannot open stream to self",
+            )));
+        }
+
+        let connection_id = self.network.next_conn_id();
+        let stream_id = self.network.next_stream_id();
+        let cap = self.network.inner.channel_capacity;
+        let proto = binding.proto();
+
+        let (tx, rx) = mpsc::channel(cap);
+        let state = Arc::new(StreamState::new());
+
+        let send_handle = SendHandle {
+            local: self.peer_id,
+            remote: *peer,
+            connection_id,
+            stream_id,
+            binding,
+            tx,
+            state: Arc::clone(&state),
+        };
+        let recv_handle = RecvHandle {
+            local: *peer,
+            remote: self.peer_id,
+            connection_id,
+            stream_id,
+            binding,
+            rx: Mutex::new(rx),
+            state: Arc::clone(&state),
+        };
+
+        if !self
+            .network
+            .register_stream(self.peer_id, &self.registration, &state)
+            || self.closed.is_closed()
+        {
+            state.close();
+            return Err(TransportError::ConnectionClosed);
+        }
+
+        // Register the shared state before handing the receiver to the remote
+        // endpoint. A concurrent remote close must be able to close a stream
+        // even while this bounded inbound queue is backpressured.
+        let (remote_tx, remote_registration) = match self.network.inbound_sender(peer, proto) {
+            Ok(sender) => sender,
+            Err(error) => {
+                state.close();
+                return Err(error);
+            }
+        };
+        if !self
+            .network
+            .register_stream(*peer, &remote_registration, &state)
+        {
+            state.close();
+            return Err(TransportError::ConnectionClosed);
+        }
+        let payload = match binding {
+            StreamBinding::Exec(session_hash) => InboundPayload::Exec(AcceptedExecStream::new(
+                ExecStreamMetadata::new(session_hash, self.peer_id),
+                recv_handle,
+            )),
+            StreamBinding::Fetch => InboundPayload::Fetch(recv_handle),
+        };
+        if remote_tx.send(payload).await.is_err() {
+            state.close();
+            return Err(TransportError::connection_failed(std::io::Error::other(
+                "remote peer is gone",
+            )));
+        }
+        if state.is_closed() {
+            return Err(TransportError::ConnectionClosed);
+        }
+
+        Ok(send_handle)
     }
 
     fn close_sync(&self) {

@@ -466,6 +466,33 @@ fn frame_digest(frame: &ExecFrame) -> Result<[u8; 32], ExecError> {
     Ok(*blake3::hash(&bytes).as_bytes())
 }
 
+impl SendLane {
+    /// Protocol evidence preempts direct traffic; each traffic class keeps its own retry clock, and ending suppresses direct delivery.
+    fn next(
+        &self,
+        frames: &[([u8; 32], ExecFrame)],
+        direct_head: Option<&DirectEntry>,
+        ending: bool,
+        now: Instant,
+    ) -> Option<Pick> {
+        if self.retry_at.is_none_or(|deadline| now >= deadline)
+            && let Some(index) = frames.iter().position(|(digest, _)| {
+                !self.acked.contains(digest) && (ending || !self.rejected.contains(digest))
+            })
+        {
+            return Some(Pick::Protocol(index));
+        }
+        if !ending
+            && direct_head.is_some()
+            && self.direct_retry_at.is_none_or(|deadline| now >= deadline)
+        {
+            Some(Pick::Direct)
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,19 +578,5 @@ mod tests {
             Some(Pick::Direct)
         );
         assert_eq!(lane.next(&frames(), None, false, Instant::now()), None);
-    }
-}
-
-impl SendLane {
-    /// Protocol evidence preempts direct traffic; each traffic class keeps its own retry clock, and ending suppresses direct delivery.
-    fn next(
-        &self,
-        frames: &[([u8; 32], ExecFrame)],
-        direct_head: Option<&DirectEntry>,
-        ending: bool,
-        now: Instant,
-    ) -> Option<Pick> {
-        let _ = (frames, direct_head, ending, now);
-        todo!("STUB(transport)")
     }
 }

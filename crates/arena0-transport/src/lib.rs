@@ -307,13 +307,6 @@ impl SendHandle {
     /// Send an [`arena0_protocol::ExecFrame`] on an `Exec` stream.
     pub async fn send_exec(&self, msg: &DomainExecFrame) -> Result<(), TransportError> {
         self.binding.validate_exec_route(msg)?;
-        if self.binding.proto() != StreamProtocol::Exec {
-            return Err(TransportError::ProtocolMismatch(format!(
-                "sent {:?} frame on a {:?} stream",
-                StreamProtocol::Exec,
-                self.binding.proto()
-            )));
-        }
         let frame = Codec::new(StreamProtocol::Exec.max_frame_body()).encode(msg)?;
         let (responsibility, mut receipt) = oneshot::channel();
         self.send_packet(StreamPacket {
@@ -642,15 +635,27 @@ pub(crate) enum StreamBinding {
 impl StreamBinding {
     /// The codec family selected before touching a channel.
     pub(crate) const fn proto(self) -> StreamProtocol {
-        panic!("STUB(transport)")
+        match self {
+            Self::Fetch => StreamProtocol::Fetch,
+            Self::Exec(_) => StreamProtocol::Exec,
+        }
     }
     /// Expose execution binding to existing public handle getters.
     pub(crate) const fn session_hash(self) -> Option<SessionHash> {
-        panic!("STUB(transport)")
+        match self {
+            Self::Fetch => None,
+            Self::Exec(session_hash) => Some(session_hash),
+        }
     }
     /// Reject fetch before sending and verify any session-bearing execution evidence.
     fn validate_exec_route(self, frame: &DomainExecFrame) -> Result<(), TransportError> {
-        let _ = frame;
-        panic!("STUB(transport)")
+        match self {
+            Self::Fetch => Err(TransportError::ProtocolMismatch(format!(
+                "sent {:?} frame on a {:?} stream",
+                StreamProtocol::Exec,
+                StreamProtocol::Fetch,
+            ))),
+            Self::Exec(session_hash) => validate_exec_route(frame, session_hash),
+        }
     }
 }
