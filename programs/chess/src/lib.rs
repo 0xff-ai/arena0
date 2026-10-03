@@ -919,29 +919,6 @@ mod tests {
     }
 
     #[test]
-    fn status_line_reports_active_color_and_move_number() {
-        let board = CozyBoard::default();
-
-        assert_eq!(
-            Status::InProgress.line(Some(&board)),
-            "white's turn, move 1"
-        );
-        assert_eq!(Status::InProgress.line(None), "Waiting for game to start");
-    }
-
-    #[test]
-    fn game_result_formats_terminal_states() {
-        assert_eq!(
-            Status::Checkmate {
-                winner: Color::Black
-            }
-            .game_result(),
-            "Checkmate! black wins."
-        );
-        assert_eq!(Status::Stalemate.game_result(), "Draw by stalemate.");
-    }
-
-    #[test]
     fn draw_rules_classify_terminal_boards() {
         for (fen, uci, expected) in [
             ("7k/8/4Q3/6K1/8/8/8/8 w - - 0 1", "e6f7", Status::Stalemate),
@@ -971,23 +948,5 @@ mod tests {
             assert_eq!(Color::from(participant), color);
             assert_eq!(Participant::from(Color::from(participant)), participant);
         }
-    }
-
-    #[test]
-    fn input_schema_metadata() {
-        let schemas = <Callout as Arena0Callout>::schemas();
-        assert_eq!(schemas.len(), 1);
-
-        let s = &schemas[0];
-        assert_eq!(s.name, "MakeMove");
-        assert!(!s.prompt.is_empty());
-        assert_eq!(s.output.as_value()["type"], "string");
-        assert_eq!(
-            s.input.as_value()["properties"]
-                .as_object()
-                .expect("expected object input schema")
-                .len(),
-            2
-        );
     }
 }

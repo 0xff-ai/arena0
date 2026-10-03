@@ -20,6 +20,22 @@ pub struct Params {
     pub result_length: u64,
 }
 
+impl Params {
+    /// Bind input_sender to the agreed bilateral ensemble; input goes to the other participant and result returns with the original hashes and bounds.
+    pub fn transfers(
+        &self,
+        ensemble: &Ensemble<Committed>,
+    ) -> Result<(Transfer, Transfer), ProgramFault> {
+        let sender = ensemble
+            .participant_of(&self.input_sender)
+            .ok_or_else(|| anyhow!("input_sender is not a participant"))?;
+        let other = Participant::new(1 - sender.as_u8());
+        let input = Transfer::new(0, sender, other, self.input_hash, self.input_length)?;
+        let result = Transfer::new(1, other, sender, self.result_hash, self.result_length)?;
+        Ok((input, result))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,16 +357,5 @@ pub mod verified_transfer {
             input: shared.input.status().unwrap_or(TransferStatus::Failed),
             result: shared.result.status().unwrap_or(TransferStatus::Failed),
         }
-    }
-}
-
-impl Params {
-    /// Bind input_sender to the agreed bilateral ensemble; input goes to the other participant and result returns with the original hashes and bounds.
-    pub fn transfers(
-        &self,
-        ensemble: &Ensemble<Committed>,
-    ) -> Result<(Transfer, Transfer), ProgramFault> {
-        let _ = ensemble;
-        todo!("STUB(client-guests)")
     }
 }

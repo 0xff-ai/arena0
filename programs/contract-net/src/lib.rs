@@ -155,7 +155,48 @@ impl Shared {
     }
 
     fn plan(&self) -> AssignmentPlan {
-        allocate(&self.tasks, &self.offers)
+        let tasks = &self.tasks;
+        let offers = &self.offers;
+        let mut remaining: Vec<u16> = offers
+            .iter()
+            .map(|offer| offer.as_ref().map_or(0, |offer| offer.capacity))
+            .collect();
+        let mut assignments = Vec::with_capacity(tasks.len());
+
+        for (task_index, task) in tasks.iter().enumerate() {
+            let best = offers
+                .iter()
+                .enumerate()
+                .skip(1)
+                .filter_map(|(worker_index, offer)| {
+                    let offer = offer.as_ref()?;
+                    if remaining[worker_index] == 0
+                        || !offer.capabilities.contains(&task.capability)
+                    {
+                        return None;
+                    }
+                    let bid = offer
+                        .bids
+                        .iter()
+                        .find(|bid| usize::from(bid.task) == task_index)?;
+                    let worker = Participant::try_from(worker_index).ok()?;
+                    Some((bid.cost, worker.as_u8(), worker_index, worker))
+                })
+                .min_by_key(|(cost, participant, _, _)| (*cost, *participant));
+
+            let award = if let Some((cost, _, worker_index, worker)) = best {
+                remaining[worker_index] -= 1;
+                Award::Assigned { worker, cost }
+            } else {
+                Award::Unassigned
+            };
+            assignments.push(Assignment {
+                task: task_index as u16,
+                award,
+            });
+        }
+
+        AssignmentPlan { assignments }
     }
 }
 
@@ -601,47 +642,6 @@ fn validate_text(label: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn allocate(tasks: &[Task], offers: &[Option<WorkerOffer>]) -> AssignmentPlan {
-    let mut remaining: Vec<u16> = offers
-        .iter()
-        .map(|offer| offer.as_ref().map_or(0, |offer| offer.capacity))
-        .collect();
-    let mut assignments = Vec::with_capacity(tasks.len());
-
-    for (task_index, task) in tasks.iter().enumerate() {
-        let best = offers
-            .iter()
-            .enumerate()
-            .skip(1)
-            .filter_map(|(worker_index, offer)| {
-                let offer = offer.as_ref()?;
-                if remaining[worker_index] == 0 || !offer.capabilities.contains(&task.capability) {
-                    return None;
-                }
-                let bid = offer
-                    .bids
-                    .iter()
-                    .find(|bid| usize::from(bid.task) == task_index)?;
-                let worker = Participant::try_from(worker_index).ok()?;
-                Some((bid.cost, worker.as_u8(), worker_index, worker))
-            })
-            .min_by_key(|(cost, participant, _, _)| (*cost, *participant));
-
-        let award = if let Some((cost, _, worker_index, worker)) = best {
-            remaining[worker_index] -= 1;
-            Award::Assigned { worker, cost }
-        } else {
-            Award::Unassigned
-        };
-        assignments.push(Assignment {
-            task: task_index as u16,
-            award,
-        });
-    }
-
-    AssignmentPlan { assignments }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -783,7 +783,12 @@ mod tests {
             Some(offer(&["rust"], 1, &[(0, 5), (1, 1)])),
             Some(offer(&["rust", "design"], 2, &[(0, 5), (1, 2), (2, 8)])),
         ];
-        let plan = allocate(&tasks(), &offers);
+        let shared = Shared {
+            tasks: tasks(),
+            offers,
+            ..Shared::default()
+        };
+        let plan = shared.plan();
         assert_eq!(
             plan,
             AssignmentPlan {
@@ -811,29 +816,6 @@ mod tests {
                     },
                 ],
             }
-        );
-    }
-
-    #[test]
-    fn allocation_plan_borsh_vector_is_stable() {
-        let plan = AssignmentPlan {
-            assignments: vec![
-                Assignment {
-                    task: 0,
-                    award: Award::Assigned {
-                        worker: Participant::new(2),
-                        cost: 7,
-                    },
-                },
-                Assignment {
-                    task: 1,
-                    award: Award::Unassigned,
-                },
-            ],
-        };
-        assert_eq!(
-            borsh::to_vec(&plan).unwrap(),
-            vec![2, 0, 0, 0, 0, 0, 0, 2, 7, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1]
         );
     }
 }

@@ -154,6 +154,36 @@ impl DaemonClient {
             self.resolve_session(host, reference).await?,
         ))
     }
+
+    /// Preserve socket errors and their complete anyhow chain; None distinguishes a wrong success payload from a missing indexed reference.
+    async fn request_resolution(
+        &self,
+        host: &HostName,
+        kind: arena0_api::RefKind,
+        reference: &str,
+    ) -> anyhow::Result<Option<arena0_api::Resolved>> {
+        match self
+            .call_host(
+                host,
+                &HostRequest::Resolve {
+                    kind,
+                    reference: reference.into(),
+                },
+            )
+            .await?
+        {
+            ResponseOk::Resolved(result) => Ok(Some(result)),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Retain the existing eight-character ambiguity labels; these are diagnostics, not lookup IDs.
+fn short_candidates(candidates: Vec<String>) -> Vec<String> {
+    candidates
+        .into_iter()
+        .map(|id| id[..8.min(id.len())].to_owned())
+        .collect()
 }
 
 #[cfg(test)]
@@ -338,23 +368,4 @@ mod tests {
         ));
         assert!(crate::proto::is_connect_error(&error));
     }
-}
-
-impl DaemonClient {
-    /// Preserve socket errors and their complete anyhow chain; None distinguishes a wrong success payload from a missing indexed reference.
-    async fn request_resolution(
-        &self,
-        host: &HostName,
-        kind: arena0_api::RefKind,
-        reference: &str,
-    ) -> anyhow::Result<Option<arena0_api::Resolved>> {
-        let _ = (host, kind, reference);
-        todo!("STUB(client-guests)")
-    }
-}
-
-/// Retain the existing eight-character ambiguity labels; these are diagnostics, not lookup IDs.
-fn short_candidates(candidates: Vec<String>) -> Vec<String> {
-    let _ = candidates;
-    todo!("STUB(client-guests)")
 }
