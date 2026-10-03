@@ -192,7 +192,11 @@ outgoing queue, and its author later applies it through its own
 reset to the resident baseline. After an accepted dispatch, the read-only
 `callout` function derives at most one open callout from the resulting state
 image; that callout is stored with the image or staged proposal.
-Read-only initialization, writer, query, view, and outcome projections use
+The program's handlers decide who may send next from replicated state, so every
+participant knows the permitted sender. An authenticated message the program
+rejects fails the session for everyone. The Host trial-runs its outgoing queue
+head while active with no proposal staged; it does not select a sender.
+Read-only initialization, query, view, and outcome projections use
 fresh bounded instances and must not change guest state or emit effects.
 
 The synchronous `ctx.sign(...)` host call is available only to local
