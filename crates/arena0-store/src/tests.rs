@@ -1105,13 +1105,15 @@ async fn recovery_resumes_ending_and_skips_ended_with_unconfirmed_peers() {
         .execute("UPDATE executions SET end_phase = 1", [])
         .unwrap();
     drop(database);
+    let reopened = Store::open(StoreConfig::new(&path, fixture.producer)).unwrap();
     assert!(
         matches!(
-            Store::open(StoreConfig::new(&path, fixture.producer)),
+            reopened.handle().load_execution(execution_id).await,
             Err(StoreError::Corruption(_))
         ),
         "routing projections must agree with the authoritative end phase"
     );
+    reopened.shutdown().await.unwrap();
 }
 
 async fn load_published_receipt(store: &Store, fixture: &ActivationFixture) -> ReceiptArtifact {
@@ -1245,6 +1247,950 @@ fn activation_fixture_with_initial_state(initial_state: SharedStateBytes) -> Act
         program,
         producer,
     }
+}
+
+// These journeys compare the public column projection with independently
+// decoded records. Explicit times are supplied at the store boundary.
+#[tokio::test]
+async fn summary_equivalence_through_callouts_publication_and_import() {
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("summary.sqlite");
+    let id = ExecId([0xa1; 32]);
+    let store = Store::open(StoreConfig::new(&path, fixture.producer)).unwrap();
+    let handle = store.handle();
+    let hash = ProgramHash::of(&fixture.program);
+    handle
+        .register_program(fixture.program.clone(), 1)
+        .await
+        .unwrap();
+    let mut writer = handle.claim_execution(id).unwrap();
+    writer
+        .create_execution_request(
+            hash,
+            Some(JsonBytes::try_new(b"{}".to_vec()).unwrap()),
+            creator_admission(NegotiationId([0x11; 32])),
+            &[],
+            2,
+        )
+        .await
+        .unwrap();
+    let check = async |last_step_at_ms: Option<u64>| {
+        let row = handle.exec_summary(id).await.unwrap().unwrap();
+        let request = handle.load_execution_request(id).await.unwrap().unwrap();
+        assert_eq!(row.execution_id, id);
+        assert_eq!(row.program_hash, request.program_hash());
+        assert_eq!(row.negotiation_id, request.admission().negotiation_id());
+        assert_eq!(row.request_failure.as_deref(), request.failure());
+        assert_eq!(row.created_at_ms, request.created_at_ms());
+        let activation = handle.load_activation(id).await.unwrap();
+        assert_eq!(row.activation.is_some(), activation.is_some());
+        if let Some(activation) = activation {
+            let index = row.activation.unwrap();
+            let prepared = activation.prepared();
+            let offer = prepared.offer().data();
+            assert_eq!(index.committed, activation.is_committed());
+            assert_eq!(index.session_id, activation.session_id());
+            assert_eq!(index.updated_at_ms, activation.updated_at_ms());
+            assert_eq!(index.facts.negotiation_id, offer.negotiation_id);
+            assert_eq!(
+                index.facts.offer_hash,
+                arena0_protocol::OfferHash::of(offer)
+            );
+            assert_eq!(index.facts.creator, offer.creator);
+            assert_eq!(index.facts.target_size, offer.target_size);
+            assert_eq!(index.facts.initial_state, offer.initial_state);
+            assert_eq!(index.facts.params, offer.params.as_bytes());
+            assert_eq!(
+                index.facts.participants,
+                prepared
+                    .tickets()
+                    .iter()
+                    .map(|t| (t.data.signer, arena0_protocol::TicketHash::of(&t.data)))
+                    .collect::<Vec<_>>()
+            );
+        }
+        let state = handle.load_execution(id).await.unwrap();
+        assert_eq!(row.execution.is_some(), state.is_some());
+        if let Some(state) = state {
+            let index = row.execution.unwrap();
+            assert_eq!(index.session_id, state.binding().session_id());
+            assert_eq!(index.lifecycle, state.lifecycle());
+            assert_eq!(index.agreed_step, state.agreed_step());
+            assert_eq!(index.last_step_at_ms, last_step_at_ms);
+            assert_eq!(&index.end, state.end_phase());
+            assert_eq!(
+                index.participants,
+                state.binding().activation().tickets().len()
+            );
+            assert_eq!(
+                index.participant_ids,
+                state.binding().participants().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                index.callout.map(|c| (c.id, c.callout_index)),
+                state.callout().map(|c| (c.id, c.callout_index))
+            );
+            assert_eq!(
+                index.terminal_reason.as_deref(),
+                state.status().terminal_cause().map(|cause| cause.reason())
+            );
+            assert_eq!(
+                index.outcome_json.as_deref(),
+                if state.lifecycle() == ExecLifecycle::Completed {
+                    state.terminal_outcome_json()
+                } else {
+                    None
+                }
+            );
+            assert_eq!(
+                index.receipt_produced,
+                handle
+                    .load_receipt(state.binding().session_id())
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                index.updated_at_ms,
+                handle.execution_updated_at_ms(id).await.unwrap().unwrap()
+            );
+        }
+        assert_eq!(
+            handle.list_exec_summaries(8).await.unwrap(),
+            vec![handle.exec_summary(id).await.unwrap().unwrap()]
+        );
+    };
+    check(None).await;
+    writer
+        .prepare_activation(fixture.prepared.clone(), 3)
+        .await
+        .unwrap();
+    check(None).await;
+    writer
+        .commit_activation(fixture.activation.clone(), 4)
+        .await
+        .unwrap();
+    check(None).await;
+    writer
+        .create_execution(
+            fixture.activation.clone(),
+            fixture.producer,
+            SharedStateBytes::try_new(vec![0]).unwrap(),
+            LocalStateBytes::try_new(vec![]).unwrap(),
+            5,
+        )
+        .await
+        .unwrap();
+    check(None).await;
+    let active = activate_record(&mut writer, ExecutionVersion::ZERO, 6)
+        .await
+        .unwrap();
+    check(None).await;
+    assert_eq!(handle.count_active_executions().await.unwrap(), 1);
+    assert_eq!(handle.count_programs().await.unwrap(), 1);
+    dispatch_record(
+        &mut writer,
+        active.version(),
+        session_started_event(&fixture),
+        active.shared_state().clone(),
+        active.local_state().clone(),
+        vec![],
+        None,
+        None,
+        None,
+        Some(arena0_program::CalloutRequest {
+            callout_index: 0,
+            context: vec![1],
+        }),
+        7,
+    )
+    .await
+    .unwrap();
+    check(None).await;
+    let opened = sign_step(&store, &fixture, id, &mut writer, 8, 9).await;
+    check(Some(9)).await;
+    let first = handle
+        .exec_summary(id)
+        .await
+        .unwrap()
+        .unwrap()
+        .execution
+        .unwrap()
+        .callout
+        .unwrap();
+    assert_eq!(first.opened_at_ms, 9);
+    let sql = Connection::open(&path).unwrap();
+    for (column, value, original) in [
+        (
+            "callout_id",
+            i64::from_le_bytes((first.id.get() ^ 1).to_le_bytes()),
+            i64::from_le_bytes(first.id.get().to_le_bytes()),
+        ),
+        ("callout_index", 3, 0),
+    ] {
+        sql.execute(
+            &format!("UPDATE executions SET {column} = ?1"),
+            params![value],
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                handle.load_execution(id).await,
+                Err(StoreError::Corruption(_))
+            ),
+            "column {column}"
+        );
+        sql.execute(
+            &format!("UPDATE executions SET {column} = ?1"),
+            params![original],
+        )
+        .unwrap();
+    }
+    // Opening time is a column-owned observation, not state-derived data.
+    sql.execute("UPDATE executions SET callout_opened_at_ms = 1000", [])
+        .unwrap();
+    handle.load_execution(id).await.unwrap();
+    sql.execute("UPDATE executions SET callout_opened_at_ms = 9", [])
+        .unwrap();
+    drop(sql);
+    // A peer proposal retains the old callout until agreement. Its first
+    // signature changes the aggregate, while the opening time stays put.
+    dispatch_record(
+        &mut writer,
+        opened.version(),
+        Event::MessageReceived {
+            from: other_peer(&fixture),
+            msg: vec![2],
+        },
+        opened.shared_state().clone(),
+        opened.local_state().clone(),
+        vec![],
+        None,
+        None,
+        None,
+        Some(arena0_program::CalloutRequest {
+            callout_index: 1,
+            context: vec![2],
+        }),
+        10,
+    )
+    .await
+    .unwrap();
+    check(Some(9)).await;
+    assert_eq!(
+        handle
+            .exec_summary(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .execution
+            .unwrap()
+            .callout
+            .unwrap(),
+        first
+    );
+    let next_open = sign_step(&store, &fixture, id, &mut writer, 11, 12).await;
+    check(Some(12)).await;
+    let second = handle
+        .exec_summary(id)
+        .await
+        .unwrap()
+        .unwrap()
+        .execution
+        .unwrap()
+        .callout
+        .unwrap();
+    assert_ne!(second.id, first.id);
+    assert_eq!(second.opened_at_ms, 12);
+    // Answering is local and must not change the latest certification time.
+    let answered = dispatch_record(
+        &mut writer,
+        next_open.version(),
+        Event::InputReceived {
+            callout_index: 1,
+            data: vec![3],
+        },
+        next_open.shared_state().clone(),
+        next_open.local_state().clone(),
+        vec![],
+        None,
+        None,
+        Some(second.id),
+        None,
+        13,
+    )
+    .await
+    .unwrap();
+    check(Some(12)).await;
+    assert!(answered.callout().is_none());
+    dispatch_record(
+        &mut writer,
+        answered.version(),
+        Event::MessageReceived {
+            from: other_peer(&fixture),
+            msg: vec![4],
+        },
+        answered.shared_state().clone(),
+        answered.local_state().clone(),
+        vec![Effect::SessionEnd { outcome: vec![9] }],
+        Some(TerminalOutcome::new(vec![9], b"null".to_vec()).unwrap()),
+        None,
+        None,
+        None,
+        14,
+    )
+    .await
+    .unwrap();
+    check(Some(12)).await;
+    sign_step(&store, &fixture, id, &mut writer, 15, 16).await;
+    check(Some(16)).await;
+    publish_current(&store, &mut writer, id, 17).await.unwrap();
+    check(Some(16)).await;
+    assert_eq!(handle.count_active_executions().await.unwrap(), 0);
+    let state = writer.load_execution().await.unwrap().unwrap();
+    let mut ended = state.clone();
+    ended.expire_end().unwrap();
+    writer
+        .persist(TransitionRecord {
+            expected: state.version(),
+            next: ended,
+            change: Change::State,
+            now_ms: 18,
+        })
+        .await
+        .unwrap();
+    check(Some(16)).await;
+    let receipt = load_published_receipt(&store, &fixture).await;
+    let summary = handle
+        .list_receipt_summaries(8)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(summary.receipt_id, receipt.receipt_id());
+    assert_eq!(summary.session_id, receipt.body().header().session_hash());
+    assert_eq!(summary.kind, receipt.kind());
+    assert_eq!(summary.program_hash, receipt.body().header().program_hash());
+    assert!(summary.completed);
+    assert_eq!(summary.provenance, ReceiptProvenance::Produced);
+    assert_eq!(summary.stored_at_ms, 17);
+    let imported = Store::open(StoreConfig::new(
+        directory.path().join("import.sqlite"),
+        other_peer(&fixture),
+    ))
+    .unwrap();
+    imported
+        .handle()
+        .import_receipt(receipt.clone(), 19)
+        .await
+        .unwrap();
+    let foreign = imported
+        .handle()
+        .list_receipt_summaries(8)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        foreign,
+        ReceiptSummaryRow {
+            provenance: ReceiptProvenance::Imported,
+            stored_at_ms: 19,
+            ..summary
+        }
+    );
+    imported.shutdown().await.unwrap();
+    assert!(handle.list_exec_summaries(0).await.unwrap().is_empty());
+    assert!(
+        handle
+            .exec_summary(ExecId([0xff; 32]))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    handle.remove_program(hash, 20).await.unwrap();
+    assert_eq!(handle.count_programs().await.unwrap(), 0);
+    drop(writer);
+    store.shutdown().await.unwrap();
+    let reopened = Store::open(StoreConfig::new(&path, fixture.producer)).unwrap();
+    assert_eq!(
+        reopened
+            .handle()
+            .exec_summary(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .execution
+            .unwrap()
+            .last_step_at_ms,
+        Some(16)
+    );
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn summary_column_disagreement_is_rejected_on_single_item_reads() {
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("indexes.sqlite");
+    let id = ExecId([0xa2; 32]);
+    let store = create_execution(&path, &fixture, id).await;
+    certify_terminal(&store, &fixture, id).await;
+    let mut writer = store.handle().claim_execution(id).unwrap();
+    publish_current(&store, &mut writer, id, 12).await.unwrap();
+    drop(writer);
+    let sql = Connection::open(&path).unwrap();
+    for (column, value) in [
+        ("participants", "3"),
+        ("participant_ids", "x'00000000'"),
+        ("terminal_reason", "'wrong'"),
+        ("outcome_json", "x'00'"),
+        ("last_step_at_ms", "42"),
+    ] {
+        let old: rusqlite::types::Value = sql
+            .query_row(
+                &format!("SELECT {column} FROM executions WHERE execution_id = ?1"),
+                params![id.0.to_vec()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        sql.execute(
+            &format!("UPDATE executions SET {column} = {value} WHERE execution_id = ?1"),
+            params![id.0.to_vec()],
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                store.handle().load_execution(id).await,
+                Err(StoreError::Corruption(_))
+            ),
+            "column {column}"
+        );
+        sql.execute(
+            &format!("UPDATE executions SET {column} = ?1 WHERE execution_id = ?2"),
+            params![old, id.0.to_vec()],
+        )
+        .unwrap();
+    }
+    let facts: Vec<u8> = sql
+        .query_row(
+            "SELECT facts FROM activation_records WHERE execution_id = ?1",
+            params![id.0.to_vec()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut altered: ActivationFacts = borsh::from_slice(&facts).unwrap();
+    altered.target_size += 1;
+    sql.execute(
+        "UPDATE activation_records SET facts = ?1 WHERE execution_id = ?2",
+        params![borsh::to_vec(&altered).unwrap(), id.0.to_vec()],
+    )
+    .unwrap();
+    assert!(matches!(
+        store.handle().load_activation(id).await,
+        Err(StoreError::Corruption(_))
+    ));
+    sql.execute(
+        "UPDATE activation_records SET facts = ?1 WHERE execution_id = ?2",
+        params![facts, id.0.to_vec()],
+    )
+    .unwrap();
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn summary_stopped_receipts_keep_terminal_reason_and_import_provenance() {
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let id = ExecId([0xa5; 32]);
+    let store = create_execution(&directory.path().join("stop.sqlite"), &fixture, id).await;
+    let handle = store.handle();
+    let mut writer = handle.claim_execution(id).unwrap();
+    let state = writer.load_execution().await.unwrap().unwrap();
+    let unsigned = AbortOccurrence::unsigned(
+        fixture.activation.session_hash(),
+        fixture.producer,
+        AbortKind::Abort,
+        94,
+        "operator stopped",
+        state.step_cursor(),
+    )
+    .unwrap();
+    let keys = NodeKeys::from_secret(SecretKey::from_bytes([1; 32]));
+    let occurrence = unsigned
+        .clone()
+        .with_signature(keys.sign(&unsigned.signing_bytes().unwrap()))
+        .unwrap();
+    let stopped = stop_record(&mut writer, state.version(), occurrence, 7)
+        .await
+        .unwrap();
+    let summary = handle
+        .exec_summary(id)
+        .await
+        .unwrap()
+        .unwrap()
+        .execution
+        .unwrap();
+    assert_eq!(summary.lifecycle, ExecLifecycle::Aborted);
+    assert_eq!(summary.terminal_reason.as_deref(), Some("operator stopped"));
+    assert!(summary.outcome_json.is_none());
+    assert_eq!(summary.last_step_at_ms, None);
+    assert_eq!(
+        summary.participant_ids,
+        stopped.binding().participants().collect::<Vec<_>>()
+    );
+    assert!(!summary.receipt_produced);
+    assert_eq!(handle.count_active_executions().await.unwrap(), 0);
+    publication_record(&mut writer, stopped.version(), 8)
+        .await
+        .unwrap();
+    let receipt = load_published_receipt(&store, &fixture).await;
+    let row = handle
+        .list_receipt_summaries(8)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(row.receipt_id, receipt.receipt_id());
+    assert_eq!(row.session_id, receipt.body().header().session_hash());
+    assert_eq!(row.program_hash, receipt.body().header().program_hash());
+    assert_eq!(row.kind, arena0_protocol::ReceiptKind::StopReport);
+    assert!(!row.completed);
+    assert_eq!(row.provenance, ReceiptProvenance::Produced);
+    assert_eq!(row.stored_at_ms, 8);
+    assert!(
+        handle
+            .exec_summary(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .execution
+            .unwrap()
+            .receipt_produced
+    );
+    handle.import_receipt(receipt, 9).await.unwrap();
+    assert_eq!(
+        handle.list_receipt_summaries(8).await.unwrap()[0].provenance,
+        ReceiptProvenance::Both
+    );
+    let sql = Connection::open(directory.path().join("stop.sqlite")).unwrap();
+    sql.execute("UPDATE receipts SET completed = 1", [])
+        .unwrap();
+    assert!(matches!(
+        handle.load_receipt_by_id(row.receipt_id).await,
+        Err(StoreError::Corruption(_))
+    ));
+    sql.execute(
+        "UPDATE receipts SET completed = 0, program_hash = ?1",
+        params![[0x55u8; 32].to_vec()],
+    )
+    .unwrap();
+    assert!(matches!(
+        handle.load_receipt_by_id(row.receipt_id).await,
+        Err(StoreError::Corruption(_))
+    ));
+    drop(writer);
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn summary_readers_return_during_an_uncommitted_writer_transaction() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreConfig::new(
+        directory.path().join("reader.sqlite"),
+        host(9),
+    ))
+    .unwrap();
+    // The test-only hook parks the real writer. The timeout detects deadlock;
+    // synchronization and release use explicit gates, never elapsed time.
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let handle = store.handle().clone();
+    let parked = tokio::spawn(async move {
+        handle
+            .run(move |db| db.hold_write_transaction(ready_tx, release_rx))
+            .await
+    });
+    ready_rx.await.unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        store.handle().list_exec_summaries(8),
+    )
+    .await;
+    release_tx.send(()).unwrap();
+    parked.await.unwrap().unwrap();
+    assert!(result.unwrap().unwrap().is_empty());
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn review_negotiation_index_disagreement_rejects_request_reads_and_startup() {
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("negotiation-index.sqlite");
+    let id = ExecId([0xc1; 32]);
+    let store = create_execution(&path, &fixture, id).await;
+    let sql = Connection::open(&path).unwrap();
+    sql.execute(
+        "UPDATE exec_requests SET negotiation_id = zeroblob(32) WHERE execution_id = ?1",
+        params![id.0.to_vec()],
+    )
+    .unwrap();
+    drop(sql);
+    assert!(matches!(
+        store.handle().load_execution_request(id).await,
+        Err(StoreError::Corruption(_))
+    ));
+    store.shutdown().await.unwrap();
+    assert!(matches!(
+        Store::open(StoreConfig::new(&path, fixture.producer)),
+        Err(StoreError::Corruption(_))
+    ));
+}
+
+#[tokio::test]
+async fn review_archived_activation_corruption_is_rejected_only_when_read() {
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("activation-archive.sqlite");
+    let id = ExecId([0xc2; 32]);
+    let store = create_execution(&path, &fixture, id).await;
+    certify_terminal(&store, &fixture, id).await;
+    let mut writer = store.handle().claim_execution(id).unwrap();
+    publish_current(&store, &mut writer, id, 12).await.unwrap();
+    drop(writer);
+    store.shutdown().await.unwrap();
+    let sql = Connection::open(&path).unwrap();
+    sql.execute(
+        "UPDATE activation_records SET prepared_activation = x'00' WHERE execution_id = ?1",
+        params![id.0.to_vec()],
+    )
+    .unwrap();
+    drop(sql);
+    let reopened = Store::open(StoreConfig::new(&path, fixture.producer))
+        .expect("archived activation is validated when read");
+    assert!(matches!(
+        reopened.handle().load_activation(id).await,
+        Err(StoreError::Corruption(_))
+    ));
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn review_failed_request_admission_is_archived_at_open() {
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("failed-archive.sqlite");
+    let id = ExecId([0xc3; 32]);
+    let store = Store::open(StoreConfig::new(&path, fixture.producer)).unwrap();
+    store
+        .handle()
+        .register_program(fixture.program.clone(), 1)
+        .await
+        .unwrap();
+    let mut writer = store.handle().claim_execution(id).unwrap();
+    writer
+        .create_execution_request(
+            ProgramHash::of(&fixture.program),
+            Some(JsonBytes::try_new(b"{}".to_vec()).unwrap()),
+            creator_admission(NegotiationId([0x11; 32])),
+            &[],
+            2,
+        )
+        .await
+        .unwrap();
+    writer
+        .record_execution_request_failure("withdrawn")
+        .await
+        .unwrap();
+    drop(writer);
+    store.shutdown().await.unwrap();
+    let sql = Connection::open(&path).unwrap();
+    sql.execute(
+        "UPDATE exec_requests SET admission = x'00' WHERE execution_id = ?1",
+        params![id.0.to_vec()],
+    )
+    .unwrap();
+    drop(sql);
+    let reopened = Store::open(StoreConfig::new(&path, fixture.producer))
+        .expect("failed request without aggregate is archived");
+    assert!(matches!(
+        reopened.handle().load_execution_request(id).await,
+        Err(StoreError::Corruption(_))
+    ));
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn review_archived_execution_salt_is_checked_only_on_read() {
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("salt-archive.sqlite");
+    let id = ExecId([0xc4; 32]);
+    let store = create_execution(&path, &fixture, id).await;
+    let mut writer = store.handle().claim_execution(id).unwrap();
+    writer.load_or_create_execution_salt(6).await.unwrap();
+    drop(writer);
+    certify_terminal(&store, &fixture, id).await;
+    let mut writer = store.handle().claim_execution(id).unwrap();
+    publish_current(&store, &mut writer, id, 12).await.unwrap();
+    drop(writer);
+    store.shutdown().await.unwrap();
+    let sql = Connection::open(&path).unwrap();
+    sql.execute(
+        "UPDATE execution_salts SET salt = x'00' WHERE execution_id = ?1",
+        params![id.0.to_vec()],
+    )
+    .unwrap();
+    drop(sql);
+    let reopened = Store::open(StoreConfig::new(&path, fixture.producer))
+        .expect("archived per-execution salt is not decoded at open");
+    let mut writer = reopened.handle().claim_execution(id).unwrap();
+    assert!(matches!(
+        writer.load_or_create_execution_salt(13).await,
+        Err(StoreError::Corruption(_))
+    ));
+    drop(writer);
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn archived_execution_corruption_is_rejected_only_when_read() {
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("archive.sqlite");
+    let id = ExecId([0xb1; 32]);
+    let store = create_execution(&path, &fixture, id).await;
+    certify_terminal(&store, &fixture, id).await;
+    let mut writer = store.handle().claim_execution(id).unwrap();
+    publish_current(&store, &mut writer, id, 12).await.unwrap();
+    drop(writer);
+    assert_eq!(
+        store
+            .handle()
+            .load_execution(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .lifecycle(),
+        ExecLifecycle::Completed
+    );
+    let mut pending = store.handle().claim_execution(ExecId([0xb3; 32])).unwrap();
+    pending
+        .create_execution_request(
+            ProgramHash::of(&fixture.program),
+            Some(JsonBytes::try_new(b"{}".to_vec()).unwrap()),
+            creator_admission(NegotiationId([0x12; 32])),
+            &[],
+            13,
+        )
+        .await
+        .unwrap();
+    drop(pending);
+    let rows = store.handle().list_exec_summaries(8).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    store.shutdown().await.unwrap();
+    let sql = Connection::open(&path).unwrap();
+    let mut bytes: Vec<u8> = sql
+        .query_row(
+            "SELECT state FROM executions WHERE execution_id = ?1",
+            params![id.0.to_vec()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    sql.execute(
+        "UPDATE executions SET state = ?1 WHERE execution_id = ?2",
+        params![bytes, id.0.to_vec()],
+    )
+    .unwrap();
+    drop(sql);
+    let reopened = Store::open(StoreConfig::new(&path, fixture.producer))
+        .expect("archived state is validated when read");
+    assert!(matches!(
+        reopened.handle().load_execution(id).await,
+        Err(StoreError::Corruption(_))
+    ));
+    assert_eq!(
+        reopened.handle().list_exec_summaries(8).await.unwrap(),
+        rows
+    );
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn unfinished_execution_corruption_is_rejected_at_open() {
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("unfinished.sqlite");
+    let id = ExecId([0xb2; 32]);
+    let store = create_execution(&path, &fixture, id).await;
+    assert!(
+        !store
+            .handle()
+            .load_execution(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .lifecycle()
+            .is_terminal()
+    );
+    store.shutdown().await.unwrap();
+    let sql = Connection::open(&path).unwrap();
+    let mut bytes: Vec<u8> = sql
+        .query_row(
+            "SELECT state FROM executions WHERE execution_id = ?1",
+            params![id.0.to_vec()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    sql.execute(
+        "UPDATE executions SET state = ?1 WHERE execution_id = ?2",
+        params![bytes, id.0.to_vec()],
+    )
+    .unwrap();
+    drop(sql);
+    assert!(matches!(
+        Store::open(StoreConfig::new(&path, fixture.producer)),
+        Err(StoreError::Corruption(_))
+    ));
+}
+
+#[tokio::test]
+async fn summary_reads_emit_zero_decodes_but_detail_reads_are_counted() {
+    use tracing::Instrument;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::{Layer, layer::SubscriberExt};
+    type DecodeRecords = Vec<(String, Vec<String>)>;
+    #[derive(Clone)]
+    struct Counts(Arc<StdMutex<DecodeRecords>>);
+    impl<S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>> Layer<S>
+        for Counts
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "arena0::performance" {
+                return;
+            }
+            struct Operation(Option<String>);
+            impl tracing::field::Visit for Operation {
+                fn record_debug(
+                    &mut self,
+                    _field: &tracing::field::Field,
+                    _value: &dyn std::fmt::Debug,
+                ) {
+                }
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "operation" && value.starts_with("decode.") {
+                        self.0 = Some(value.to_owned());
+                    }
+                }
+            }
+            let mut operation = Operation(None);
+            event.record(&mut operation);
+            if let Some(operation) = operation.0 {
+                let scope = context
+                    .event_scope(event)
+                    .map(|scope| {
+                        scope
+                            .from_root()
+                            .map(|span| span.name().to_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.0.lock().unwrap().push((operation, scope));
+            }
+        }
+    }
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let id = ExecId([0xa3; 32]);
+    let store = create_execution(&directory.path().join("decode.sqlite"), &fixture, id).await;
+    certify_terminal(&store, &fixture, id).await;
+    let mut writer = store.handle().claim_execution(id).unwrap();
+    publish_current(&store, &mut writer, id, 12).await.unwrap();
+    drop(writer);
+    let counts = Counts(Arc::new(StdMutex::new(vec![])));
+    // tracing-core's single-dispatch optimization registers new callsites
+    // against the current thread's default. Parallel tests without a scoped
+    // subscriber can therefore cache Interest::never for our decode events.
+    // Keep a second registry alive so registration consults both registered
+    // dispatchers, while only this scenario's propagated subscriber counts.
+    let _callsite_registration = tracing::Dispatch::new(tracing_subscriber::registry());
+    let subscriber = tracing_subscriber::registry().with(counts.clone());
+    async {
+        let handle = store.handle();
+        assert_eq!(handle.list_exec_summaries(8).await.unwrap().len(), 1);
+        assert!(handle.exec_summary(id).await.unwrap().is_some());
+        assert_eq!(handle.list_receipt_summaries(8).await.unwrap().len(), 1);
+        assert_eq!(handle.count_active_executions().await.unwrap(), 0);
+        assert_eq!(handle.count_programs().await.unwrap(), 1);
+        assert!(counts.0.lock().unwrap().is_empty());
+        handle.load_execution(id).await.unwrap();
+        assert_eq!(
+            counts
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(operation, _)| operation.as_str())
+                .collect::<Vec<_>>(),
+            ["decode.execution_state"]
+        );
+        handle.load_activation(id).await.unwrap();
+        handle
+            .load_receipt(fixture.activation.session_hash())
+            .await
+            .unwrap();
+        let operations: Vec<_> = counts
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(operation, _)| operation.clone())
+            .collect();
+        assert_eq!(
+            operations,
+            [
+                "decode.execution_state",
+                "decode.activation",
+                "decode.receipt"
+            ]
+        );
+        counts.0.lock().unwrap().clear();
+        let (spanned, unspanned) = tokio::join!(
+            handle
+                .load_execution(id)
+                .instrument(tracing::info_span!("decode_request")),
+            handle.load_execution(id)
+        );
+        spanned.unwrap();
+        unspanned.unwrap();
+        let records = counts.0.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .all(|(operation, _)| operation == "decode.execution_state")
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|(_, scope)| scope.iter().any(|name| name == "decode_request"))
+                .count(),
+            1
+        );
+    }
+    .with_subscriber(subscriber)
+    .await;
+    store.shutdown().await.unwrap();
 }
 
 fn host(byte: u8) -> PeerId {
@@ -1744,6 +2690,16 @@ async fn open_join_target_binding_is_compare_and_set_and_durable() {
         AdmissionBindingOutcome::Bound
     );
     assert_eq!(
+        store
+            .handle()
+            .exec_summary(execution_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .negotiation_id,
+        Some(NegotiationId([0x76; 32])),
+    );
+    assert_eq!(
         writer.bind_join_target(target).await.expect("retry target"),
         AdmissionBindingOutcome::AlreadyBound
     );
@@ -2038,11 +2994,16 @@ async fn request_failure_cannot_compete_with_activation_authority() {
         )
         .expect("inject impossible lifecycle state");
     drop(connection);
+    // With no aggregate, the recorded failure archives this request at open.
+    // An explicit mutation still cannot compete with its activation authority.
+    let reopened = Store::open(StoreConfig::new(&path, fixture.producer)).unwrap();
+    let mut writer = reopened.handle().claim_execution(execution_id).unwrap();
     assert!(matches!(
-        Store::open(StoreConfig::new(&path, fixture.producer)),
-        Err(StoreError::Corruption(message))
-            if message.contains("failed execution request")
+        writer.record_execution_request_failure("late").await,
+        Err(StoreError::ExecutionLifecycleStarted(id)) if id == execution_id
     ));
+    drop(writer);
+    reopened.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -2337,6 +3298,20 @@ async fn activation_prepare_commit_is_idempotent_and_recoverable() {
     );
     let recovered = reopened.handle().load_execution(id).await.unwrap().unwrap();
     assert_eq!(recovered.callout().unwrap().context, vec![0xaa]);
+    assert_eq!(
+        reopened
+            .handle()
+            .exec_summary(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .execution
+            .unwrap()
+            .callout
+            .unwrap()
+            .opened_at_ms,
+        11,
+    );
     drop(writer);
     reopened.shutdown().await.expect("shutdown");
 }
@@ -3129,7 +4104,7 @@ async fn stopped_receipt_is_published_after_restart_and_verifies() {
 }
 
 #[tokio::test]
-async fn persisted_receipt_tampering_fails_closed_on_restart() {
+async fn archived_receipt_tampering_is_rejected_when_read_after_restart() {
     let fixture = activation_fixture();
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("store.sqlite");
@@ -3192,10 +4167,15 @@ async fn persisted_receipt_tampering_fails_closed_on_restart() {
         )
         .expect("tamper");
     drop(connection);
+    let reopened = Store::open(StoreConfig::new(&path, fixture.producer)).unwrap();
     assert!(matches!(
-        Store::open(StoreConfig::new(&path, fixture.producer)),
+        reopened
+            .handle()
+            .load_receipt_by_id(published.receipt_id())
+            .await,
         Err(StoreError::Corruption(_))
     ));
+    reopened.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -3226,7 +4206,29 @@ async fn unpublished_execution_rejects_terminal_projection_rows_on_restart() {
 }
 
 #[tokio::test]
-async fn published_receipts_require_receipt_and_production_rows_on_restart() {
+async fn terminal_execution_read_rejects_receipt_session_index_disagreement() {
+    let fixture = activation_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("receipt-session.sqlite");
+    let id = ExecId([0xc5; 32]);
+    let store = create_execution(&path, &fixture, id).await;
+    certify_terminal(&store, &fixture, id).await;
+    let mut writer = store.handle().claim_execution(id).unwrap();
+    publish_current(&store, &mut writer, id, 12).await.unwrap();
+    drop(writer);
+    let sql = Connection::open(&path).unwrap();
+    sql.execute("UPDATE receipts SET session_id = zeroblob(32)", [])
+        .unwrap();
+    drop(sql);
+    assert!(matches!(
+        store.handle().load_execution(id).await,
+        Err(StoreError::Corruption(_))
+    ));
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn review_published_execution_reads_require_receipt_rows() {
     let fixture = activation_fixture();
     let directory = tempfile::tempdir().expect("tempdir");
     for (byte, row, delete) in [
@@ -3265,10 +4267,40 @@ async fn published_receipts_require_receipt_and_production_rows_on_restart() {
             .execute(delete, rusqlite::params![execution_id.0.to_vec()])
             .expect("remove required publication row");
         drop(connection);
+        if row == "receipt-production" {
+            // The unchanged receipt registry validation still rejects an
+            // artifact with no provenance, independently of archive state.
+            assert!(matches!(
+                Store::open(StoreConfig::new(&path, fixture.producer)),
+                Err(StoreError::Corruption(_))
+            ));
+            continue;
+        }
+        let reopened = Store::open(StoreConfig::new(&path, fixture.producer)).unwrap();
         assert!(matches!(
-            Store::open(StoreConfig::new(&path, fixture.producer)),
+            reopened.handle().load_execution(execution_id).await,
             Err(StoreError::Corruption(_))
         ));
+        assert!(
+            reopened
+                .handle()
+                .load_receipt(fixture.activation.session_hash())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !reopened
+                .handle()
+                .exec_summary(execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .execution
+                .unwrap()
+                .receipt_produced
+        );
+        reopened.shutdown().await.unwrap();
     }
 }
 

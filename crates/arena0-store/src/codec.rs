@@ -188,6 +188,21 @@ pub(crate) fn lifecycle_tag(lifecycle: ExecLifecycle) -> i64 {
     }
 }
 
+pub(crate) fn lifecycle_from_tag(tag: i64) -> Result<ExecLifecycle, StoreError> {
+    match tag {
+        0 => Ok(ExecLifecycle::Negotiating),
+        1 => Ok(ExecLifecycle::Activating),
+        2 => Ok(ExecLifecycle::Waiting),
+        3 => Ok(ExecLifecycle::Active),
+        4 => Ok(ExecLifecycle::Completed),
+        5 => Ok(ExecLifecycle::Aborted),
+        7 => Ok(ExecLifecycle::Failed),
+        _ => Err(StoreError::Corruption(format!(
+            "unknown lifecycle tag {tag}"
+        ))),
+    }
+}
+
 pub(crate) fn bounded_reason(reason: String) -> Result<String, StoreError> {
     if reason.len() > MAX_ERROR_BYTES {
         return Err(StoreError::PayloadTooLarge {

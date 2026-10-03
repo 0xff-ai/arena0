@@ -1,9 +1,10 @@
 //! Authoritative per-Host SQLite persistence.
 //!
-//! [`Store`] owns one SQLite connection behind a mutex. [`StoreHandle`]
+//! [`Store`] owns one writer connection and a pool of read-only connections,
+//! each behind a mutex. [`StoreHandle`]
 //! is a cloneable asynchronous capability for registry and receipt-artifact
 //! operations plus read projections. Operations run on the blocking pool and
-//! serialize access to the connection.
+//! serialize mutations on the writer; summary reads use the reader pool.
 //!
 //! The store owns the SQLite transaction boundaries around flat event
 //! dispatches, shared proposals, signatures, terminal publication, and the
@@ -17,6 +18,7 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -35,6 +37,11 @@ use thiserror::Error;
 
 mod codec;
 mod database;
+mod summary;
+pub use summary::{
+    ActivationFacts, ActivationIndex, CalloutIndex, ExecSummaryRow, ExecutionIndex,
+    ReceiptSummaryRow,
+};
 mod lock;
 use codec::*;
 use database::Database;
@@ -42,10 +49,11 @@ use lock::{
     OwnerLock, acquire_process_lock, configure_connection, initialize_schema, prepare_database_file,
 };
 
+// Version 12 adds transactionally maintained summary indexes and activation facts.
 // Version 11 stamps each agreed step with its local certification time.
 // Version 10 gives each database its own blob directory. Older partial rows
 // reconstruct paths in a shared directory and cannot be reopened under this layout.
-const SCHEMA_VERSION: u64 = 11;
+const SCHEMA_VERSION: u64 = 12;
 const ENVELOPE_VERSION: u16 = 2;
 const ENVELOPE_MAGIC: [u8; 8] = *b"AR0STOR1";
 const ENVELOPE_DOMAIN: &[u8] = b"arena0/store-envelope/v2";
@@ -781,8 +789,9 @@ impl StoredReceipt {
 /// Execution mutations require an [`ExecutionStore`] claimed for the target
 /// execution, so cloning this handle cannot create a second live writer.
 ///
-/// Async operations run on the blocking pool; SQL access serializes on the
-/// connection mutex. Blob reads, hashing, linking, and export release the
+/// Async operations run on the blocking pool; mutations and decoded reads
+/// serialize on the writer mutex, and summary reads use independent readers.
+/// Blob reads, hashing, linking, and export release the
 /// mutex before file I/O. Appends retain it for their persist transaction.
 /// Dropping an operation's future does not cancel work already submitted to
 /// that pool; a lost response must be treated as an unknown outcome.
@@ -791,8 +800,21 @@ pub struct StoreHandle {
     inner: Arc<Inner>,
 }
 
+/// Read connections opened beside the writer. Four covers the browser's
+/// bounded read concurrency (eight in flight across all Hosts) without
+/// holding many file descriptors per Host; a reader is only busy for one
+/// index-column query.
+const READ_CONNECTIONS: usize = 4;
+
 struct Inner {
     db: StdMutex<Option<Database>>,
+    /// `READ_CONNECTIONS` read-only connections, opened after the writer has
+    /// migrated the database. Summary reads take any free one; they never
+    /// take `db`, so they never wait behind a write transaction.
+    readers: Vec<StdMutex<database::ReadDb>>,
+    next_reader: AtomicUsize,
+    // Readers must respect shutdown without taking the writer's mutex.
+    closed: AtomicBool,
     execution_claims: StdMutex<HashSet<ExecId>>,
     host_id: PeerId,
 }
@@ -877,16 +899,25 @@ impl Store {
         Ok(StoreReservation { path, lock })
     }
 
-    /// Open a database, acquire its process lock, and validate it.
+    /// Open a database, acquire its process lock, and validate unfinished
+    /// executions and store registries. Terminal aggregates and failed requests
+    /// without an aggregate are archived; their execution, request, and activation
+    /// evidence is validated when explicitly read.
     pub fn open(config: StoreConfig) -> Result<Self, StoreError> {
         Self::reserve(&config.path)?.open(config)
     }
 
     fn open_reserved(config: StoreConfig, lock: OwnerLock) -> Result<Self, StoreError> {
         let db = Database::open(&config, lock)?;
+        let readers = (0..READ_CONNECTIONS)
+            .map(|_| database::ReadDb::open(&config.path, config.busy_timeout).map(StdMutex::new))
+            .collect::<Result<Vec<_>, _>>()?;
         let handle = StoreHandle {
             inner: Arc::new(Inner {
                 db: StdMutex::new(Some(db)),
+                readers,
+                next_reader: AtomicUsize::new(0),
+                closed: AtomicBool::new(false),
                 execution_claims: StdMutex::new(HashSet::new()),
                 host_id: config.host_id,
             }),
@@ -908,11 +939,12 @@ impl Store {
     pub async fn shutdown(self) -> Result<(), StoreError> {
         let inner = Arc::clone(&self.handle.inner);
         tokio::task::spawn_blocking(move || {
-            inner
+            let mut db = inner
                 .db
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            inner.closed.store(true, Ordering::Release);
+            db.take();
         })
         .await
         .map_err(|_| StoreError::Closed)
@@ -1515,6 +1547,43 @@ impl StoreHandle {
         self.run(move |db| db.list_receipts(limit)).await
     }
 
+    /// Every execution request's summary row, in creation order, at most
+    /// `limit`. Reads index columns on a read connection; decodes nothing.
+    pub async fn list_exec_summaries(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ExecSummaryRow>, StoreError> {
+        self.run_read(move |db| db.list_exec_summaries(limit)).await
+    }
+
+    /// One execution's summary row. Reads index columns; decodes nothing.
+    pub async fn exec_summary(
+        &self,
+        execution_id: ExecId,
+    ) -> Result<Option<ExecSummaryRow>, StoreError> {
+        self.run_read(move |db| db.exec_summary(execution_id)).await
+    }
+
+    /// Count of executions whose lifecycle column is not terminal.
+    pub async fn count_active_executions(&self) -> Result<usize, StoreError> {
+        self.run_read(|db| db.count_active_executions()).await
+    }
+
+    /// Count of registered, non-removed programs.
+    pub async fn count_programs(&self) -> Result<usize, StoreError> {
+        self.run_read(|db| db.count_programs()).await
+    }
+
+    /// Every receipt's summary row in `receipt_id` order, at most `limit`.
+    /// Reads index columns; opens no artifact.
+    pub async fn list_receipt_summaries(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ReceiptSummaryRow>, StoreError> {
+        self.run_read(move |db| db.list_receipt_summaries(limit))
+            .await
+    }
+
     /// Load the optional durable Host user agent.
     pub async fn load_user_agent(&self) -> Result<Option<String>, StoreError> {
         self.run(move |db| db.load_user_agent()).await
@@ -1526,18 +1595,76 @@ impl StoreHandle {
         self.run(move |db| db.set_user_agent(value)).await
     }
 
+    /// Run `f` on a free read connection on the blocking pool. Waits only for
+    /// another reader, never for the writer.
+    async fn run_read<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&database::ReadDb) -> Result<T, StoreError> + Send + 'static,
+    ) -> Result<T, StoreError> {
+        let inner = Arc::clone(&self.inner);
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        // Decode records are attributed to the calling request's span.
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                span.in_scope(|| {
+                    if inner.closed.load(Ordering::Acquire) {
+                        return Err(StoreError::Closed);
+                    }
+                    let start =
+                        inner.next_reader.fetch_add(1, Ordering::Relaxed) % READ_CONNECTIONS;
+                    for offset in 0..READ_CONNECTIONS {
+                        match inner.readers[(start + offset) % READ_CONNECTIONS].try_lock() {
+                            Ok(reader) => {
+                                if inner.closed.load(Ordering::Acquire) {
+                                    return Err(StoreError::Closed);
+                                }
+                                return f(&reader);
+                            }
+                            Err(std::sync::TryLockError::WouldBlock) => {}
+                            Err(std::sync::TryLockError::Poisoned(_)) => {
+                                return Err(StoreError::Closed);
+                            }
+                        }
+                    }
+                    let reader = inner.readers[start]
+                        .lock()
+                        .map_err(|_| StoreError::Closed)?;
+                    if inner.closed.load(Ordering::Acquire) {
+                        return Err(StoreError::Closed);
+                    }
+                    f(&reader)
+                })
+            })
+        })
+        .await
+        .map_err(|_| StoreError::Closed)?
+    }
+
     async fn run<T: Send + 'static>(
         &self,
         f: impl FnOnce(&mut Database) -> Result<T, StoreError> + Send + 'static,
     ) -> Result<T, StoreError> {
         let inner = Arc::clone(&self.inner);
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        // Decode records are attributed to the calling request's span.
+        let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
-            let mut guard = inner.db.lock().map_err(|_| StoreError::Closed)?;
-            let db = guard.as_mut().ok_or(StoreError::Closed)?;
-            if db.is_poisoned() {
-                return Err(StoreError::Closed);
-            }
-            f(db)
+            tracing::dispatcher::with_default(&dispatch, || {
+                span.in_scope(|| {
+                    let mut guard = inner.db.lock().map_err(|_| StoreError::Closed)?;
+                    let db = guard.as_mut().ok_or(StoreError::Closed)?;
+                    if db.is_poisoned() {
+                        inner.closed.store(true, Ordering::Release);
+                        return Err(StoreError::Closed);
+                    }
+                    let result = f(db);
+                    if db.is_poisoned() {
+                        inner.closed.store(true, Ordering::Release);
+                    }
+                    result
+                })
+            })
         })
         .await
         .map_err(|_| StoreError::Closed)?
