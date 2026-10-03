@@ -4,6 +4,11 @@ This directory is the reference for the local `events.subscribe` method. It
 defines the event vocabulary, filter grammar, frame shape, and delivery
 semantics for the local Unix socket API.
 
+Browser clients can synchronize summary rows and resume from an applied
+cursor through the [HTTP `/sync` stream](../sync.md). That stream also
+forwards these semantic events as live observations after each Host is
+synced; the row cursor does not replay semantic events.
+
 ## Documents
 
 - [inventory.md](inventory.md) lists the 21 event tags and their payloads.
