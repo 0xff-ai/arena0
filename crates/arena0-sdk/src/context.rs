@@ -661,8 +661,8 @@ impl<Shared, M: EffectMode> Effects<'_, Shared, M> {
     ///
     /// The message is appended to this participant's durable outgoing queue. A
     /// later dispatch trial-runs the head while active with no staged proposal;
-    /// the author applies its own message through the same
-    /// `on_message` dispatch every receiver runs.
+    /// the author applies its own message through the same `on_message`
+    /// dispatch every receiver runs.
     ///
     /// In an agreed handler this cannot fail: an agreed handler never observes
     /// the local queue, and if the agreed step would overflow the queue the

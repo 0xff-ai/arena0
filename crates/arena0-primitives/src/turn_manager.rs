@@ -8,7 +8,6 @@ use arena0::prelude::*;
 /// order is authoritative and is serialized as part of shared state.
 /// Turn-managed handlers must reject messages from participants other than
 /// [`current`](Self::current), and queue broadcasts only for that participant.
-/// The program enforces this order from replicated state.
 #[arena0::primitive]
 #[derive(Default)]
 pub struct TurnManager {

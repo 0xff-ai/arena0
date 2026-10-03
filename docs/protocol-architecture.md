@@ -545,10 +545,9 @@ cannot reproduce as the author's exact `StepCommitment` is a divergence; the
 receiver compares commitments before it signs. The participant
 that detects it records a Host-signed `Fail` occurrence at the agreed cursor;
 its peers receive that occurrence as an `Abort` frame, failing the session for
-everyone. The program's handlers decide who may send next from replicated state;
-the Host does not project or validate a designated sender. Invalid frames with
-wrong session, pre-state, link, or stale position are dropped rather than treated
-as divergence. The guest ends or aborts a session
+everyone. The program's handlers decide from replicated state who may send
+next. Invalid frames with wrong session, pre-state, link, or stale position are
+dropped rather than treated as divergence. The guest ends or aborts a session
 with `Effect::SessionEnd`/`SessionAbort`; a unilateral occurrence travels as
 `ExecFrame::Abort`.
 

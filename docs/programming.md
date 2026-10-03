@@ -33,10 +33,9 @@ complete artifact participants will accept.
 
 Start with the permitted sequence of actions. In the minimal program, the
 first participant chooses, then the second chooses, and the program compares
-the values. The shared state records accepted choices. The program's handlers
-use that state to decide who may send next; `on_message` rejects a choice from
-anyone else. Every participant knows the next sender from replicated state.
-A peer message the program rejects fails the session for everyone.
+the values. The shared state records accepted choices, so every participant
+knows who may send next; `on_message` rejects a choice from anyone else. A peer
+message the program rejects fails the session for everyone.
 
 The SDK uses an actor-oriented model. Every session source produces one flat
 `Event`. Agreed handlers (`on_session_started`, `on_message`) receive a mutable

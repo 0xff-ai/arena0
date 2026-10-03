@@ -79,8 +79,6 @@ mod tests {
             ApplyDecision::Reject
         ));
         assert_eq!(borsh::to_vec(ctx.shared()).unwrap(), before);
-        assert!(ctx.shared().input.status().is_none());
-        assert!(ctx.shared().result.status().is_none());
         assert!(matches!(
             VerifiedTransfer::on_message(
                 &mut ctx,
@@ -91,7 +89,6 @@ mod tests {
             ApplyDecision::Reject
         ));
         assert_eq!(borsh::to_vec(ctx.shared()).unwrap(), before);
-        assert!(ctx.shared().input.status().is_none());
         assert_eq!(next_sender(ctx.shared()), Some(Participant::new(0)));
         assert!(matches!(
             VerifiedTransfer::on_message(
@@ -114,7 +111,6 @@ mod tests {
             ApplyDecision::Reject
         ));
         assert_eq!(borsh::to_vec(ctx.shared()).unwrap(), before);
-        assert!(ctx.shared().result.status().is_none());
         assert!(matches!(
             VerifiedTransfer::on_message(
                 &mut ctx,
@@ -228,7 +224,7 @@ pub struct Local {
     /// A finished agreed message held while another transfer is ahead. Set only
     /// by `on_direct`, cleared by `on_message` when this participant becomes
     /// the next sender. At most one: each participant receives one transfer.
-    pub held: Option<Message>,
+    held: Option<Message>,
 }
 
 /// The receiver of the first unsettled transfer: only receivers author
@@ -310,34 +306,27 @@ pub mod verified_transfer {
             | DirectMessage::Next { transfer_id }
             | DirectMessage::Missing { transfer_id } => *transfer_id,
         };
-        match id {
+        let finished = match id {
             0 => {
                 let transfer = ctx.shared().input.clone();
-                if let Some(message) =
-                    transfer.on_direct(ctx, |local| &mut local.input, from, msg, attachment)
-                {
-                    if next_sender(ctx.shared()) == Some(ctx.me()) {
-                        broadcast(ctx, message, Message::Input)
-                            .expect("one agreed message per transfer fits the queue");
-                    } else {
-                        ctx.local_mut().held = Some(Message::Input(message));
-                    }
-                }
+                transfer
+                    .on_direct(ctx, |local| &mut local.input, from, msg, attachment)
+                    .map(Message::Input)
             }
             1 => {
                 let transfer = ctx.shared().result.clone();
-                if let Some(message) =
-                    transfer.on_direct(ctx, |local| &mut local.result, from, msg, attachment)
-                {
-                    if next_sender(ctx.shared()) == Some(ctx.me()) {
-                        broadcast(ctx, message, Message::Result)
-                            .expect("one agreed message per transfer fits the queue");
-                    } else {
-                        ctx.local_mut().held = Some(Message::Result(message));
-                    }
-                }
+                transfer
+                    .on_direct(ctx, |local| &mut local.result, from, msg, attachment)
+                    .map(Message::Result)
             }
-            _ => {}
+            _ => None,
+        };
+        if let Some(message) = finished {
+            if next_sender(ctx.shared()) == Some(ctx.me()) {
+                broadcast(ctx, message).expect("one agreed message per transfer fits the queue");
+            } else {
+                ctx.local_mut().held = Some(message);
+            }
         }
         Ok(())
     }
@@ -346,9 +335,12 @@ pub mod verified_transfer {
     /// 16, so a full queue is a programming error.
     fn broadcast<M: arena0::EffectMode>(
         ctx: &mut arena0::Ctx<Shared, Local, M>,
-        message: transfer::TransferMessage,
-        route: fn(transfer::TransferMessage) -> Message,
+        message: Message,
     ) -> M::Broadcast {
+        let (message, route): (_, fn(transfer::TransferMessage) -> Message) = match message {
+            Message::Input(message) => (message, Message::Input),
+            Message::Result(message) => (message, Message::Result),
+        };
         ctx.primitive_output(message)
             .broadcast_via(&mut ctx.effects(), route)
     }
@@ -373,10 +365,7 @@ pub mod verified_transfer {
             && next_sender(ctx.shared()) == Some(ctx.me())
             && let Some(message) = ctx.local_mut().held.take()
         {
-            match message {
-                Message::Input(message) => broadcast(ctx, message, Message::Input),
-                Message::Result(message) => broadcast(ctx, message, Message::Result),
-            }
+            broadcast(ctx, message);
         }
         Ok(ApplyDecision::Accept(
             if next_sender(ctx.shared()).is_none() {

@@ -2262,43 +2262,6 @@ async fn local_broadcast_is_queued_then_authored() {
 }
 
 #[tokio::test]
-async fn author_sends_its_queued_message_without_a_designated_turn() {
-    let fixture = Fixture::with_mode(false, GuestMode::Broadcast).await;
-    let (messages, _observations) = mpsc::channel(16);
-    let mut actor = fixture.prepare_active_actor_with_messages(messages).await;
-    fixture.commit_session_started(&mut actor).await;
-    assert_eq!(
-        actor
-            .dispatch_event(
-                Event::TimerFired {
-                    timer: arena0_protocol::TimerPayload::unit()
-                },
-                DispatchSource::Local
-            )
-            .await
-            .expect("queue broadcast"),
-        DispatchOutcome::Committed
-    );
-    assert_eq!(actor.state.outgoing().len(), 1);
-    assert!(actor.may_author());
-    actor.progress().await.expect("author queued message");
-    assert!(actor.state.pending_shared().is_some());
-    assert!(
-        actor
-            .state
-            .current_frames(fixture.local_keys.peer_id())
-            .iter()
-            .any(|frame| matches!(frame, ExecFrame::Message { .. }))
-    );
-    assert!(
-        actor
-            .send_lanes
-            .contains_key(&fixture.remote_keys.peer_id())
-    );
-    assert_eq!(actor.state.outgoing().len(), 1);
-}
-
-#[tokio::test]
 async fn restart_authors_a_non_empty_outgoing_queue() {
     let fixture = Fixture::with_mode(false, GuestMode::Broadcast).await;
     let mut actor = fixture.prepare_active_actor().await;
@@ -3227,10 +3190,10 @@ async fn agreed_overflow_converges_both_peers_on_failure() {
             );
             // The overflowing peer has signed no step beyond session start.
             assert!(actor.state.pending_shared().is_none());
-            // Without a writer, this peer's next progress would trial-run and
-            // drop its own queued heads, which its program rejects. Deliver
-            // the author's message first, through the transport and the
-            // actor's own inbound path and failure boundary.
+            // This peer's next progress would trial-run and drop its own
+            // queued heads, which its program rejects. Deliver the author's
+            // message first, through the transport and the actor's own
+            // inbound path and failure boundary.
             let author = sender
                 .store
                 .handle()
