@@ -9,7 +9,10 @@ mod receipt;
 mod recovery;
 mod registry;
 mod request;
+mod summary;
 mod timers;
+
+pub(crate) use summary::ReadDb;
 
 pub(super) struct Database {
     connection: Connection,
@@ -21,6 +24,20 @@ pub(super) struct Database {
 }
 
 impl Database {
+    /// Park the actual writer with a transaction open, solely to prove read
+    /// connections can serve committed snapshots independently of its mutex.
+    #[cfg(test)]
+    pub(crate) fn hold_write_transaction(
+        &mut self,
+        ready: tokio::sync::oneshot::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> Result<(), StoreError> {
+        self.begin()?;
+        ready.send(()).unwrap();
+        release.recv().unwrap();
+        self.commit_result(())
+    }
+
     /// The store's owned-blob directory.
     pub(crate) fn blob_dir(&self) -> &Path {
         &self.blob_dir
@@ -143,7 +160,28 @@ impl Database {
         Ok(())
     }
 
+    /// An aggregate's terminal lifecycle owns archive status when it exists.
+    /// Without an aggregate, a recorded request failure makes it archived.
+    /// Startup uses columns only to decide which execution evidence to decode.
+    fn execution_is_archived(&self, execution_id: ExecId) -> Result<bool, StoreError> {
+        self.connection.query_row(
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM executions WHERE execution_id = ?1)
+             THEN EXISTS (SELECT 1 FROM executions WHERE execution_id = ?1 AND lifecycle IN (?2, ?3, ?4))
+             ELSE EXISTS (SELECT 1 FROM exec_requests WHERE execution_id = ?1 AND failure IS NOT NULL) END",
+            params![execution_id.0.to_vec(), lifecycle_tag(ExecLifecycle::Completed), lifecycle_tag(ExecLifecycle::Aborted), lifecycle_tag(ExecLifecycle::Failed)],
+            |row| row.get(0),
+        ).map_err(StoreError::Sqlite)
+    }
+
+    /// Validate unfinished execution evidence and the other store registries at open.
+    /// Terminal aggregates and failed requests without an aggregate are archived;
+    /// their request and activation evidence is validated when explicitly read.
     fn validate_database(&mut self) -> Result<(), StoreError> {
+        let terminal = [
+            ExecLifecycle::Completed,
+            ExecLifecycle::Aborted,
+            ExecLifecycle::Failed,
+        ];
         let mut after = None;
         loop {
             let after_bytes = after.map(|execution_id: ExecId| execution_id.0.to_vec());
@@ -151,10 +189,16 @@ impl Database {
                 let mut statement = self.connection.prepare(
                     "SELECT execution_id FROM executions
                      WHERE (?1 IS NULL OR execution_id > ?1)
+                     AND lifecycle NOT IN (?3, ?4, ?5)
                      ORDER BY execution_id LIMIT ?2",
                 )?;
-                let mut rows =
-                    statement.query(params![after_bytes, DATABASE_VALIDATION_PAGE_SIZE])?;
+                let mut rows = statement.query(params![
+                    after_bytes,
+                    DATABASE_VALIDATION_PAGE_SIZE,
+                    lifecycle_tag(terminal[0]),
+                    lifecycle_tag(terminal[1]),
+                    lifecycle_tag(terminal[2])
+                ])?;
                 let mut execution_ids = Vec::new();
                 while let Some(row) = rows.next()? {
                     execution_ids

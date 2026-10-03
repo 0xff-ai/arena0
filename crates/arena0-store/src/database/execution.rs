@@ -1,5 +1,49 @@
 use super::*;
 
+/// The `executions` summary columns a state determines (all but
+/// callout_opened_at_ms and last_step_at_ms, which are local observations).
+struct StateColumns {
+    participant_ids: Vec<u8>,
+    participants: i64,
+    callout_id: Option<i64>,
+    callout_index: Option<i64>,
+    terminal_reason: Option<String>,
+    outcome_json: Option<Vec<u8>>,
+}
+
+impl StateColumns {
+    fn of(state: &ExecutionState) -> Result<Self, StoreError> {
+        Ok(Self {
+            participant_ids: borsh::to_vec(&state.binding().participants().collect::<Vec<_>>())
+                .map_err(|error| {
+                    StoreError::Corruption(format!("participant index encode: {error}"))
+                })?,
+            participants: i64::try_from(state.binding().activation().tickets().len()).unwrap(),
+            callout_id: state
+                .callout()
+                .map(|c| i64::from_le_bytes(c.id.get().to_le_bytes())),
+            callout_index: state.callout().map(|c| i64::from(c.callout_index)),
+            terminal_reason: if matches!(
+                state.lifecycle(),
+                ExecLifecycle::Aborted | ExecLifecycle::Failed
+            ) {
+                state
+                    .status()
+                    .terminal_cause()
+                    .map(|cause| bounded_reason(cause.reason().to_owned()))
+                    .transpose()?
+            } else {
+                None
+            },
+            outcome_json: if state.lifecycle() == ExecLifecycle::Completed {
+                state.terminal_outcome_json().map(<[u8]>::to_vec)
+            } else {
+                None
+            },
+        })
+    }
+}
+
 impl Database {
     pub(crate) fn execution_end(
         &mut self,
@@ -82,12 +126,16 @@ impl Database {
         now_ms: u64,
     ) -> Result<(), StoreError> {
         let bytes = state_bytes(state)?;
+        let columns = StateColumns::of(state)?;
         self.connection.execute(
             "INSERT INTO executions
              (execution_id, host_id, producer, session_id, state,
               version, lifecycle, agreed_step, event_position,
-              created_at_ms, updated_at_ms, end_phase, end_unconfirmed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12)",
+              created_at_ms, updated_at_ms, end_phase, end_unconfirmed,
+              participant_ids, participants, callout_id, callout_index,
+              callout_opened_at_ms, terminal_reason, outcome_json, last_step_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12,
+                     ?13, ?14, ?15, ?16, ?17, ?18, ?19, NULL)",
             params![
                 state.execution_id().0.to_vec(),
                 self.host_id.0.to_vec(),
@@ -101,6 +149,13 @@ impl Database {
                 sqlite_u64(now_ms)?,
                 end_columns(state.end_phase())?.0,
                 end_columns(state.end_phase())?.1,
+                columns.participant_ids,
+                columns.participants,
+                columns.callout_id,
+                columns.callout_index,
+                state.callout().map(|_| sqlite_u64(now_ms)).transpose()?,
+                columns.terminal_reason,
+                columns.outcome_json,
             ],
         )?;
         Ok(())
@@ -228,7 +283,7 @@ impl Database {
                 requested: self.host_id,
             });
         }
-        self.decode_state_row(ExecutionIndexRow {
+        let state = self.decode_state_row(ExecutionIndexRow {
             execution_id,
             state_bytes,
             version,
@@ -237,8 +292,14 @@ impl Database {
             event_position,
             producer: peer_id_from_blob(&producer_bytes, "execution producer")?,
             session_id: SessionHash(array32(&session_bytes, "execution session")?),
-        })
-        .map(Some)
+        })?;
+        if state.lifecycle().is_terminal() {
+            // Archived aggregates bypass startup validation. An explicit
+            // decode still checks their atomic publication relation from
+            // columns. Trace and artifact content are validated on their reads.
+            self.validate_terminal_relation(&state)?;
+        }
+        Ok(Some(state))
     }
 
     pub(super) fn decode_state_row(
@@ -260,7 +321,9 @@ impl Database {
             &state_bytes,
             arena0_protocol::MAX_EXECUTION_STATE_BYTES,
         )?;
-        let state = ExecutionState::decode(&state_payload)?;
+        let state = super::integrity::timed_decode("decode.execution_state", || {
+            ExecutionState::decode(&state_payload).map_err(StoreError::Protocol)
+        })?;
         if state.execution_id() != execution_id
             || state.producer() != producer
             || state.binding().session_id() != session_id
@@ -298,6 +361,38 @@ impl Database {
         {
             return Err(StoreError::Corruption(
                 "execution scheduling index does not match state".into(),
+            ));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT participant_ids, participants, callout_id, callout_index,
+                    callout_opened_at_ms, terminal_reason, outcome_json, last_step_at_ms
+             FROM executions WHERE execution_id = ?1",
+        )?;
+        let mut rows = statement.query(params![state.execution_id().0.to_vec()])?;
+        let row = rows
+            .next()?
+            .ok_or_else(|| StoreError::Corruption("execution index disappeared".into()))?;
+        let expected = StateColumns::of(state)?;
+        let callout_id = row.get::<_, Option<i64>>(2)?;
+        let latest_certification = if let Some(step) = state.agreed_step().checked_sub(1) {
+            Some(self.connection.query_row(
+                "SELECT certified_at_ms FROM agreed_steps WHERE execution_id = ?1 AND step = ?2",
+                params![state.execution_id().0.to_vec(), sqlite_u64(step)?], |row| row.get::<_, i64>(0),
+            ).optional()?.ok_or_else(|| StoreError::Corruption("latest agreed step is missing".into()))?)
+        } else {
+            None
+        };
+        if row.get::<_, Vec<u8>>(0)? != expected.participant_ids
+            || row.get::<_, i64>(1)? != expected.participants
+            || callout_id != expected.callout_id
+            || row.get::<_, Option<i64>>(3)? != expected.callout_index
+            || row.get::<_, Option<i64>>(4)?.is_some() != callout_id.is_some()
+            || row.get::<_, Option<String>>(5)? != expected.terminal_reason
+            || row.get::<_, Option<Vec<u8>>>(6)? != expected.outcome_json
+            || row.get::<_, Option<i64>>(7)? != latest_certification
+        {
+            return Err(StoreError::Corruption(
+                "execution summary indexes do not match state".into(),
             ));
         }
         Ok(())
@@ -754,6 +849,10 @@ impl Database {
                 sqlite_u64(now_ms)?,
             ],
         )?;
+        self.connection.execute(
+            "UPDATE executions SET last_step_at_ms = ?2 WHERE execution_id = ?1",
+            params![execution_id.0.to_vec(), sqlite_u64(now_ms)?],
+        )?;
         Ok(())
     }
 
@@ -764,10 +863,16 @@ impl Database {
         now_ms: u64,
     ) -> Result<(), StoreError> {
         let bytes = state_bytes(next)?;
+        let columns = StateColumns::of(next)?;
         let changed = self.connection.execute(
             "UPDATE executions SET state = ?1,
                     version = ?2, lifecycle = ?3, agreed_step = ?4,
-                    event_position = ?5, updated_at_ms = ?6, end_phase = ?9, end_unconfirmed = ?10
+                    event_position = ?5, updated_at_ms = ?6, end_phase = ?9, end_unconfirmed = ?10,
+                    participant_ids = ?11, participants = ?12,
+                    callout_opened_at_ms = CASE WHEN ?13 IS NULL THEN NULL
+                        WHEN callout_id = ?13 THEN callout_opened_at_ms ELSE ?6 END,
+                    callout_id = ?13, callout_index = ?14,
+                    terminal_reason = ?15, outcome_json = ?16
              WHERE execution_id = ?7 AND version = ?8",
             params![
                 envelope(EnvelopeKind::ExecutionState, &bytes)?,
@@ -780,6 +885,12 @@ impl Database {
                 sqlite_u64(expected.get())?,
                 end_columns(next.end_phase())?.0,
                 end_columns(next.end_phase())?.1,
+                columns.participant_ids,
+                columns.participants,
+                columns.callout_id,
+                columns.callout_index,
+                columns.terminal_reason,
+                columns.outcome_json,
             ],
         )?;
         if changed != 1 {

@@ -180,8 +180,12 @@ impl Database {
             .prepare("SELECT execution_id, salt FROM execution_salts ORDER BY execution_id")?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
-            let _execution_id = ExecId(array32(&row.get::<_, Vec<u8>>(0)?, "salt execution")?);
-            decode_execution_salt(&row.get::<_, Vec<u8>>(1)?)?;
+            let execution_id = ExecId(array32(&row.get::<_, Vec<u8>>(0)?, "salt execution")?);
+            // Retain registry identity checks, but archive-owned evidence is
+            // decoded only by an explicit salt read.
+            if !self.execution_is_archived(execution_id)? {
+                decode_execution_salt(&row.get::<_, Vec<u8>>(1)?)?;
+            }
         }
         Ok(())
     }

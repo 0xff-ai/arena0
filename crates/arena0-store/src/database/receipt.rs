@@ -5,6 +5,8 @@ struct RawReceiptRow {
     session_id: Vec<u8>,
     kind: String,
     artifact: Vec<u8>,
+    program_hash: Vec<u8>,
+    completed: bool,
 }
 
 fn artifact_kind(receipt: &ReceiptArtifact) -> &'static str {
@@ -21,7 +23,7 @@ impl Database {
     ) -> Result<Option<RawReceiptRow>, StoreError> {
         self.connection
             .query_row(
-                "SELECT receipt_id, session_id, kind, artifact FROM receipts WHERE receipt_id = ?1",
+                "SELECT receipt_id, session_id, kind, artifact, program_hash, completed FROM receipts WHERE receipt_id = ?1",
                 params![receipt_id.as_bytes().to_vec()],
                 |row| {
                     Ok(RawReceiptRow {
@@ -29,6 +31,8 @@ impl Database {
                         session_id: row.get(1)?,
                         kind: row.get(2)?,
                         artifact: row.get(3)?,
+                        program_hash: row.get(4)?,
+                        completed: row.get(5)?,
                     })
                 },
             )
@@ -59,7 +63,8 @@ impl Database {
         let Some(row) = self.receipt_row_by_id(receipt_id)? else {
             return Ok(None);
         };
-        let (stored, _) = self.decode_stored_receipt(row)?;
+        let (stored, _) =
+            super::integrity::timed_decode("decode.receipt", || self.decode_stored_receipt(row))?;
         if stored.receipt_id != receipt_id {
             return Err(StoreError::Corruption(
                 "receipt id lookup returned a different artifact".into(),
@@ -88,6 +93,11 @@ impl Database {
         if receipt.receipt_id() != receipt_id
             || receipt.body().header().session_hash() != session_id
             || artifact_kind(&receipt) != row.kind
+            || receipt.body().header().program_hash().as_bytes().as_slice() != row.program_hash
+            || matches!(
+                receipt.body().termination(),
+                arena0_protocol::ReceiptTermination::Completed
+            ) != row.completed
         {
             return Err(StoreError::Corruption(
                 "receipt indexes do not match its artifact".into(),
@@ -257,7 +267,14 @@ impl Database {
                 ));
             }
         }
-        self.connection.execute("INSERT INTO receipts (receipt_id, session_id, kind, artifact, stored_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)", params![receipt_id.as_bytes().to_vec(), session_id.0.to_vec(), kind, envelope(EnvelopeKind::Receipt, &bytes)?, sqlite_u64(now_ms)?])?;
+        self.connection.execute(
+            "INSERT INTO receipts (receipt_id, session_id, kind, artifact, stored_at_ms, program_hash, completed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![receipt_id.as_bytes().to_vec(), session_id.0.to_vec(), kind,
+                envelope(EnvelopeKind::Receipt, &bytes)?, sqlite_u64(now_ms)?,
+                receipt.body().header().program_hash().as_bytes().to_vec(),
+                matches!(receipt.body().termination(), arena0_protocol::ReceiptTermination::Completed)],
+        )?;
         Ok(())
     }
 
@@ -299,13 +316,12 @@ impl Database {
         Ok(())
     }
 
-    /// Validate one execution's publication rows against its already
-    /// validated agreed `trace`. This is the only open-time decode of a
-    /// produced artifact; [`Self::validate_receipts`] skips produced rows.
-    pub(super) fn validate_terminal_rows(
-        &mut self,
+    /// Check the publication relation without reading trace or artifact blobs.
+    /// The aggregate owns the expected receipt id and session; receipt content
+    /// is validated separately when its artifact is explicitly decoded.
+    pub(super) fn validate_terminal_relation(
+        &self,
         state: &ExecutionState,
-        trace: &[arena0_protocol::TraceEntry],
     ) -> Result<(), StoreError> {
         let execution_id = state.execution_id();
         let production_count: i64 = self.connection.query_row(
@@ -318,6 +334,38 @@ impl Database {
                 "terminal publication rows do not match execution status".into(),
             ));
         }
+        let Some(receipt_id) = state.published_receipt_id() else {
+            return Ok(());
+        };
+        let matches: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM receipts r JOIN receipt_productions p USING (receipt_id)
+             WHERE r.receipt_id = ?1 AND r.session_id = ?2 AND p.execution_id = ?3)",
+            params![
+                receipt_id.as_bytes().to_vec(),
+                state.binding().session_id().0.to_vec(),
+                execution_id.0.to_vec()
+            ],
+            |row| row.get(0),
+        )?;
+        if !matches {
+            return Err(StoreError::Corruption(
+                "published receipt relation does not match execution state".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate one execution's publication rows against its already
+    /// validated agreed `trace`, including artifact content and outcome.
+    /// Startup uses this for unfinished execution projections; archived
+    /// aggregate reads use only [`Self::validate_terminal_relation`].
+    pub(super) fn validate_terminal_rows(
+        &mut self,
+        state: &ExecutionState,
+        trace: &[arena0_protocol::TraceEntry],
+    ) -> Result<(), StoreError> {
+        self.validate_terminal_relation(state)?;
+        let execution_id = state.execution_id();
         let Some(receipt_id) = state.published_receipt_id() else {
             return Ok(());
         };
@@ -401,8 +449,9 @@ impl Database {
             };
             let full_page = ids.len() == DATABASE_VALIDATION_PAGE_SIZE as usize;
             for receipt_id in ids {
-                // Produced artifacts were decoded with their execution by
-                // `validate_terminal_rows`, which requires this relation.
+                // Produced artifacts belong to archived executions. Their
+                // envelopes are validated on explicit receipt reads; registry
+                // validation here still requires provenance for other rows.
                 if self.receipt_production(receipt_id)?.is_some() {
                     continue;
                 }

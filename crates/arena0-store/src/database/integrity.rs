@@ -3,6 +3,21 @@ use std::time::Instant;
 
 const PERFORMANCE_TARGET: &str = "arena0::performance";
 
+/// Run one decode and emit its `arena0::performance` record (`operation`, success, elapsed_us).
+pub(super) fn timed_decode<T>(
+    operation: &'static str,
+    decode: impl FnOnce() -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    let started =
+        tracing::enabled!(target: PERFORMANCE_TARGET, tracing::Level::DEBUG).then(Instant::now);
+    let result = decode();
+    if let Some(started) = started {
+        tracing::debug!(target: PERFORMANCE_TARGET, operation, success = result.is_ok(),
+            elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+    }
+    result
+}
+
 impl Database {
     pub(crate) fn is_poisoned(&self) -> bool {
         self.transaction_poison.is_some()

@@ -31,6 +31,9 @@ CREATE TABLE exec_requests (
     -- params until the creator's authenticated offer is available.
     params BLOB CHECK (params IS NULL OR length(params) <= 1024),
     admission BLOB NOT NULL,
+    -- Request creation and bind_join_target write this projection from
+    -- admission.negotiation_id(), with the authoritative admission blob.
+    negotiation_id BLOB CHECK (negotiation_id IS NULL OR length(negotiation_id) = 32),
     grants BLOB NOT NULL,
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
     failure TEXT CHECK (failure IS NULL OR length(failure) <= 4096),
@@ -43,6 +46,9 @@ CREATE TABLE activation_records (
     status TEXT NOT NULL CHECK (status IN ('prepared', 'committed')),
     prepared_activation BLOB NOT NULL,
     committed_activation BLOB,
+    -- prepare_activation writes borsh ActivationFacts; commit_activation
+    -- rewrites them from its committed activation in the blob transaction.
+    facts BLOB NOT NULL,
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
     updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0),
     UNIQUE (session_id),
@@ -69,13 +75,32 @@ CREATE TABLE executions (
     state BLOB NOT NULL,
     end_phase INTEGER NOT NULL CHECK (end_phase IN (0, 1, 2)),
     end_unconfirmed BLOB NOT NULL,
+    -- insert_execution and persist_state derive these indexes from the state
+    -- stored in the same transaction, in canonical activation order.
+    participant_ids BLOB NOT NULL,
+    participants INTEGER NOT NULL CHECK (participants > 0),
+    -- callout_id preserves all u64 bits in a signed SQLite INTEGER.
+    callout_id INTEGER,
+    callout_index INTEGER CHECK (callout_index IS NULL OR callout_index BETWEEN 0 AND 4294967295),
+    -- A local observation owned only by this column, like certification time.
+    -- State contains no opening time: validation checks presence only.
+    -- persist_state keeps it for the same id, resets it for a new id and
+    -- clears it when the callout closes; insert_execution initializes it.
+    callout_opened_at_ms INTEGER CHECK (callout_opened_at_ms IS NULL OR callout_opened_at_ms >= 0),
+    terminal_reason TEXT CHECK (terminal_reason IS NULL OR length(CAST(terminal_reason AS BLOB)) <= 4096),
+    outcome_json BLOB CHECK (outcome_json IS NULL OR length(outcome_json) <= 65536),
+    -- insert_agreed_step copies its certified_at_ms in the same transaction;
+    -- state-only transitions retain it. NULL before step 0.
+    last_step_at_ms INTEGER CHECK (last_step_at_ms IS NULL OR last_step_at_ms >= 0),
     version INTEGER NOT NULL CHECK (version >= 0),
     lifecycle INTEGER NOT NULL CHECK (lifecycle >= 0),
     agreed_step INTEGER NOT NULL CHECK (agreed_step >= 0),
     event_position INTEGER NOT NULL CHECK (event_position >= 0),
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
     updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0),
-    FOREIGN KEY (execution_id) REFERENCES activation_records(execution_id)
+    FOREIGN KEY (execution_id) REFERENCES activation_records(execution_id),
+    CHECK ((callout_id IS NULL AND callout_index IS NULL AND callout_opened_at_ms IS NULL)
+        OR (callout_id IS NOT NULL AND callout_index IS NOT NULL AND callout_opened_at_ms IS NOT NULL))
 ) STRICT;
 
 -- One immutable local dispatch record per event position. The event and
@@ -113,6 +138,10 @@ CREATE TABLE receipts (
     session_id BLOB NOT NULL CHECK (length(session_id) = 32),
     kind TEXT NOT NULL CHECK (kind IN ('receipt', 'stop_report')),
     artifact BLOB NOT NULL,
+    -- insert_artifact derives these indexes from the authenticated artifact
+    -- for both local publication and import, in its insertion transaction.
+    program_hash BLOB NOT NULL CHECK (length(program_hash) = 32),
+    completed INTEGER NOT NULL CHECK (completed IN (0, 1)),
     stored_at_ms INTEGER NOT NULL CHECK (stored_at_ms >= 0)
 ) STRICT;
 
