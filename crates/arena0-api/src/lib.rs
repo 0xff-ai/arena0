@@ -19,6 +19,7 @@ mod events;
 mod http;
 mod request;
 mod response;
+mod sync;
 
 pub use activity::{ActivityData, ActivityFrame, ActivityResult};
 pub use arena0_protocol::{
@@ -31,15 +32,18 @@ pub use events::{
 };
 pub use http::Uploaded;
 pub use request::{
-    AwaitState, EnsembleSpec, FileSource, HostRequest, ProgramRefError, ReceiptRef, Request,
+    AwaitState, EnsembleSpec, FileSource, HostRequest, ProgramRefError, ReceiptRef, RefKind,
+    Request,
 };
 pub use response::{
     ActivationInspection, ActivationInspectionState, ActivationParticipant, AgreedStep, ApiError,
     ApiErrorCode, BlobEntry, CalloutSummary, DaemonInfo, DecodedMessage, EventRecordSummary,
     ExecEndPhase, ExecEndStatus, ExecStatus, ExecStatusState, ExecSummary, ExecutionInspection,
     HostInfo, HostStatus, IdInfo, NextEvent, OpenOffer, PendingCalloutStatus, ProgramDetail,
-    ProgramSummary, ReceiptListEntry, Response, ResponseOk, SessionProgress, SessionStatus,
+    ProgramSummary, ReceiptListEntry, RecordsPage, Resolved, Response, ResponseOk, SessionProgress,
+    SessionStatus,
 };
+pub use sync::{HostCursor, Observation, RowOp, StepTimes, SyncCursor, SyncFrame};
 
 #[cfg(test)]
 mod tests {

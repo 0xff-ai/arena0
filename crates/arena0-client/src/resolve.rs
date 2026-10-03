@@ -1,4 +1,4 @@
-//! Client-side id-prefix resolution for exec, session, and receipt ids.
+//! Daemon-side indexed resolution for exec, session, and receipt ids.
 
 use anyhow::bail;
 use arena0_api::{HostRequest, ReceiptRef, ResponseOk};
@@ -19,80 +19,52 @@ pub enum ResolveError {
         reference: String,
         candidates: Vec<String>,
     },
-    /// The daemon could not complete the receipt-list request.
+    /// The daemon could not complete the resolve request.
     #[error(transparent)]
     Request(#[from] anyhow::Error),
     /// The daemon returned a success payload for a different operation.
-    #[error("unexpected response to receipt.list")]
+    #[error("unexpected response to resolve")]
     UnexpectedResponse,
 }
 
-/// The outcome of matching a prefix against a set of full-hex candidates.
-#[derive(Debug, PartialEq, Eq)]
-pub enum PrefixOutcome {
-    /// Exactly one candidate matched, at this index.
-    Unique(usize),
-    /// No candidate started with the prefix.
-    None,
-    /// Several candidates started with the prefix, at these indices.
-    Ambiguous(Vec<usize>),
-}
-
-/// Resolve a (case-insensitive) hex prefix against full-hex `candidates`. A candidate
-/// matches when its lowercased form starts with the lowercased prefix. An exact full
-/// match short-circuits to that candidate even if it is also a prefix of another.
-#[must_use]
-pub fn resolve_prefix(prefix: &str, candidates: &[String]) -> PrefixOutcome {
-    let needle = prefix.trim().to_ascii_lowercase();
-    if needle.is_empty() {
-        return PrefixOutcome::None;
-    }
-    // Exact match wins outright.
-    if let Some(i) = candidates
-        .iter()
-        .position(|c| c.eq_ignore_ascii_case(&needle))
-    {
-        return PrefixOutcome::Unique(i);
-    }
-    let hits: Vec<usize> = candidates
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.to_ascii_lowercase().starts_with(&needle))
-        .map(|(i, _)| i)
-        .collect();
-    match hits.len() {
-        0 => PrefixOutcome::None,
-        1 => PrefixOutcome::Unique(hits[0]),
-        _ => PrefixOutcome::Ambiguous(hits),
-    }
-}
-
 impl DaemonClient {
-    /// Resolve an exec-id prefix against the daemon's execution list.
+    /// Resolve an execution prefix through the daemon's indexed lookup.
     pub async fn resolve_exec(&self, host: &HostName, prefix: &str) -> anyhow::Result<ExecId> {
-        // A full id parses directly, sparing a list fetch.
+        // Preserve the direct parse for full ids, including ids not resident here.
         if let Ok(id) = prefix.parse::<ExecId>() {
             return Ok(id);
         }
-        let ResponseOk::ExecList(list) = self.call_host(host, &HostRequest::ExecList).await? else {
-            bail!("unexpected response to exec.list");
+        let ResponseOk::Resolved(result) = self
+            .call_host(
+                host,
+                &HostRequest::Resolve {
+                    kind: arena0_api::RefKind::Exec,
+                    reference: prefix.into(),
+                },
+            )
+            .await?
+        else {
+            bail!("unexpected response to resolve");
         };
-        let hexes: Vec<String> = list.iter().map(|s| s.exec_id.to_string()).collect();
-        match resolve_prefix(prefix, &hexes) {
-            PrefixOutcome::Unique(i) => Ok(list[i].exec_id),
-            PrefixOutcome::None => bail!("no execution matches '{prefix}'"),
-            PrefixOutcome::Ambiguous(hits) => {
-                let cands: Vec<String> = hits
-                    .iter()
-                    .map(|&i| list[i].exec_id.fmt_short().to_string())
-                    .collect();
-                bail!("'{prefix}' is ambiguous; candidates: {}", cands.join(", "))
+        match result {
+            arena0_api::Resolved::Exec { exec_id } => Ok(exec_id),
+            arena0_api::Resolved::None => bail!("no execution matches '{prefix}'"),
+            arena0_api::Resolved::Ambiguous { candidates, .. } => {
+                let candidates = candidates
+                    .into_iter()
+                    .map(|id| id[..8.min(id.len())].to_owned())
+                    .collect::<Vec<_>>();
+                bail!(
+                    "'{prefix}' is ambiguous; candidates: {}",
+                    candidates.join(", ")
+                )
             }
+            _ => bail!("unexpected response to resolve"),
         }
     }
 
-    /// Resolve a session-id prefix against the sessions the daemon holds receipts for
-    /// (completed and imported), falling back to active executions.
+    /// Resolve a session prefix across committed activations, executions and
+    /// receipts through the daemon's indexed lookup.
     pub async fn resolve_session(
         &self,
         host: &HostName,
@@ -101,58 +73,67 @@ impl DaemonClient {
         if let Ok(id) = prefix.parse::<SessionHash>() {
             return Ok(id);
         }
-        let mut sessions: Vec<SessionHash> = Vec::new();
-        if let ResponseOk::ReceiptList(list) =
-            self.call_host(host, &HostRequest::ReceiptList).await?
-        {
-            sessions.extend(list.iter().map(|e| e.session_id));
-        }
-        if let ResponseOk::ExecList(list) = self.call_host(host, &HostRequest::ExecList).await? {
-            sessions.extend(list.iter().filter_map(|entry| entry.session_id));
-        }
-        sessions.sort_by_key(|s| s.0);
-        sessions.dedup();
-        let hexes: Vec<String> = sessions.iter().map(ToString::to_string).collect();
-        match resolve_prefix(prefix, &hexes) {
-            PrefixOutcome::Unique(i) => Ok(sessions[i]),
-            PrefixOutcome::None => bail!("no session matches '{prefix}'"),
-            PrefixOutcome::Ambiguous(hits) => {
-                let cands: Vec<String> = hits
-                    .iter()
-                    .map(|&i| sessions[i].fmt_short().to_string())
-                    .collect();
-                bail!("'{prefix}' is ambiguous; candidates: {}", cands.join(", "))
+        let ResponseOk::Resolved(result) = self
+            .call_host(
+                host,
+                &HostRequest::Resolve {
+                    kind: arena0_api::RefKind::Session,
+                    reference: prefix.into(),
+                },
+            )
+            .await?
+        else {
+            bail!("unexpected response to resolve");
+        };
+        match result {
+            arena0_api::Resolved::Session { session_id } => Ok(session_id),
+            arena0_api::Resolved::None => bail!("no session matches '{prefix}'"),
+            arena0_api::Resolved::Ambiguous { candidates, .. } => {
+                let candidates = candidates
+                    .into_iter()
+                    .map(|id| id[..8.min(id.len())].to_owned())
+                    .collect::<Vec<_>>();
+                bail!(
+                    "'{prefix}' is ambiguous; candidates: {}",
+                    candidates.join(", ")
+                )
             }
+            _ => bail!("unexpected response to resolve"),
         }
     }
 
-    /// Resolve a receipt-id prefix against the daemon's receipt list, returning the
-    /// matched entry (its session and producer are the verify/lookup key).
+    /// Resolve a resident receipt id or prefix to its list entry. Its session
+    /// and provenance determine whether it can be used as local publication.
     pub async fn resolve_receipt(
         &self,
         host: &HostName,
         prefix: &str,
     ) -> Result<arena0_api::ReceiptListEntry, ResolveError> {
-        let ResponseOk::ReceiptList(list) = self.call_host(host, &HostRequest::ReceiptList).await?
+        let ResponseOk::Resolved(result) = self
+            .call_host(
+                host,
+                &HostRequest::Resolve {
+                    kind: arena0_api::RefKind::Receipt,
+                    reference: prefix.into(),
+                },
+            )
+            .await?
         else {
             return Err(ResolveError::UnexpectedResponse);
         };
-        let hexes: Vec<String> = list.iter().map(|e| e.receipt_id.clone()).collect();
-        match resolve_prefix(prefix, &hexes) {
-            PrefixOutcome::Unique(i) => Ok(list[i].clone()),
-            PrefixOutcome::None => Err(ResolveError::NotFound {
+        match result {
+            arena0_api::Resolved::Receipt { entry } => Ok(entry),
+            arena0_api::Resolved::None => Err(ResolveError::NotFound {
                 reference: prefix.into(),
             }),
-            PrefixOutcome::Ambiguous(hits) => {
-                let cands: Vec<String> = hits
-                    .iter()
-                    .map(|&i| list[i].receipt_id[..8.min(list[i].receipt_id.len())].to_string())
-                    .collect();
-                Err(ResolveError::Ambiguous {
-                    reference: prefix.into(),
-                    candidates: cands,
-                })
-            }
+            arena0_api::Resolved::Ambiguous { candidates, .. } => Err(ResolveError::Ambiguous {
+                reference: prefix.into(),
+                candidates: candidates
+                    .into_iter()
+                    .map(|id| id[..8.min(id.len())].to_owned())
+                    .collect(),
+            }),
+            _ => Err(ResolveError::UnexpectedResponse),
         }
     }
 
@@ -206,36 +187,6 @@ impl DaemonClient {
 mod tests {
     use super::*;
 
-    fn ids() -> Vec<String> {
-        vec![
-            "7c1e0a1b2c3d4e5f".to_string(),
-            "a0b3ffee11223344".to_string(),
-            "7c1e99998888aaaa".to_string(),
-        ]
-    }
-
-    #[test]
-    fn prefixes_resolve_case_insensitively_with_exact_match_precedence() {
-        for (prefix, expected) in [
-            ("a0", PrefixOutcome::Unique(1)),
-            ("A0B3", PrefixOutcome::Unique(1)),
-            ("7c1e", PrefixOutcome::Ambiguous(vec![0, 2])),
-            ("dead", PrefixOutcome::None),
-            ("", PrefixOutcome::None),
-        ] {
-            assert_eq!(
-                resolve_prefix(prefix, &ids()),
-                expected,
-                "prefix: {prefix:?}"
-            );
-        }
-
-        let candidates = vec!["7c1e".to_string(), "7c1e0a1b".to_string()];
-        assert_eq!(
-            resolve_prefix("7c1e", &candidates),
-            PrefixOutcome::Unique(0)
-        );
-    }
     fn serve_responses(
         responses: Vec<(HostRequest, arena0_api::Response)>,
     ) -> (tempfile::TempDir, DaemonClient, tokio::task::JoinHandle<()>) {
@@ -284,8 +235,13 @@ mod tests {
         let mut entry = receipt(&"ab".repeat(32));
         entry.provenance = arena0_api::ReceiptProvenance::Both;
         let (_dir, client, task) = serve_responses(vec![(
-            HostRequest::ReceiptList,
-            Ok(ResponseOk::ReceiptList(vec![entry.clone()])),
+            HostRequest::Resolve {
+                kind: arena0_api::RefKind::Receipt,
+                reference: entry.receipt_id.clone(),
+            },
+            Ok(ResponseOk::Resolved(arena0_api::Resolved::Receipt {
+                entry: entry.clone(),
+            })),
         )]);
         assert_eq!(
             client
@@ -297,8 +253,13 @@ mod tests {
         task.await.unwrap();
         entry.provenance = arena0_api::ReceiptProvenance::Imported;
         let (_dir, client, task) = serve_responses(vec![(
-            HostRequest::ReceiptList,
-            Ok(ResponseOk::ReceiptList(vec![entry.clone()])),
+            HostRequest::Resolve {
+                kind: arena0_api::RefKind::Receipt,
+                reference: entry.receipt_id.clone(),
+            },
+            Ok(ResponseOk::Resolved(arena0_api::Resolved::Receipt {
+                entry: entry.clone(),
+            })),
         )]);
         assert!(
             client
@@ -315,20 +276,32 @@ mod tests {
     async fn only_a_missing_receipt_falls_back_to_session_resolution() {
         let responses = vec![
             (
-                HostRequest::ReceiptList,
-                Ok(ResponseOk::ReceiptList(vec![
-                    receipt("ab01"),
-                    receipt("ab02"),
-                ])),
+                HostRequest::Resolve {
+                    kind: arena0_api::RefKind::Receipt,
+                    reference: "ab".into(),
+                },
+                Ok(ResponseOk::Resolved(arena0_api::Resolved::Ambiguous {
+                    candidates: vec!["ab01".into(), "ab02".into()],
+                    matches: 2,
+                })),
             ),
             (
-                HostRequest::ReceiptList,
+                HostRequest::Resolve {
+                    kind: arena0_api::RefKind::Receipt,
+                    reference: "ab".into(),
+                },
                 Err(arena0_api::ApiError::new(
                     arena0_api::ApiErrorCode::Storage,
                     "unavailable",
                 )),
             ),
-            (HostRequest::ReceiptList, Ok(ResponseOk::Ack)),
+            (
+                HostRequest::Resolve {
+                    kind: arena0_api::RefKind::Receipt,
+                    reference: "ab".into(),
+                },
+                Ok(ResponseOk::Ack),
+            ),
         ];
         let (_dir, client, task) = serve_responses(responses);
 
@@ -365,8 +338,11 @@ mod tests {
     async fn missing_receipt_falls_back_to_local_session() {
         let session = SessionHash([1; 32]);
         let (_dir, client, task) = serve_responses(vec![(
-            HostRequest::ReceiptList,
-            Ok(ResponseOk::ReceiptList(vec![])),
+            HostRequest::Resolve {
+                kind: arena0_api::RefKind::Receipt,
+                reference: session.to_string(),
+            },
+            Ok(ResponseOk::Resolved(arena0_api::Resolved::None)),
         )]);
         let key = client
             .resolve_receipt_ref(&HostName::default(), &session.to_string())

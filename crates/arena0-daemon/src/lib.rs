@@ -25,6 +25,7 @@ mod schema;
 mod server;
 mod startup;
 mod store;
+mod sync;
 mod system_event;
 mod ui_assets;
 

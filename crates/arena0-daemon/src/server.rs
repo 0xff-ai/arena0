@@ -681,11 +681,13 @@ pub(crate) struct Events {
 }
 
 impl Events {
-    pub(crate) fn new(host: HostInfo) -> Self {
+    /// `boot_id` is the Host store's lifetime id (`StoreHandle::boot_id`), so
+    /// event frames and `/sync` cursors name the same Host lifetime.
+    pub(crate) fn new(host: HostInfo, boot_id: String) -> Self {
         let (events, _keepalive) = broadcast::channel(EVENT_BUS_CAP);
         Self {
             host: Arc::new(RwLock::new(host)),
-            boot_id: hex::encode(rand::random::<[u8; 16]>()),
+            boot_id,
             next_seq: Arc::new(AtomicU64::new(1)),
             events,
         }
@@ -1238,11 +1240,14 @@ impl HostService {
         let identity = runtime.identity_keys();
         let peer_id = runtime.peer_id();
         let execs = Arc::new(ExecutionHandles::new(store.clone()));
-        let events = Events::new(HostInfo {
-            id: name.clone(),
-            peer_id,
-            user_agent: None,
-        });
+        let events = Events::new(
+            HostInfo {
+                id: name.clone(),
+                peer_id,
+                user_agent: None,
+            },
+            store.boot_id().to_owned(),
+        );
         let tasks = JoinSet::new();
         let this = Arc::new(Self {
             name,
@@ -2090,16 +2095,7 @@ impl HostService {
                     .list_blobs()
                     .await
                     .map(|blobs| {
-                        ResponseOk::BlobList(
-                            blobs
-                                .into_iter()
-                                .map(|blob| arena0_api::BlobEntry {
-                                    hash: blob.hash,
-                                    length: blob.length,
-                                    linked: blob.linked,
-                                })
-                                .collect(),
-                        )
+                        ResponseOk::BlobList(blobs.into_iter().map(sync_blob_entry).collect())
                     })
                     .map_err(|error| {
                         ApiError::new(ApiErrorCode::Storage, format!("list blobs: {error}"))
@@ -2185,6 +2181,18 @@ impl HostService {
                 HostRequest::ExecTrace { exec_id, from, to } => {
                     self.trace(exec_id, from, to).await.map(ResponseOk::Trace)
                 }
+                HostRequest::ExecRecords {
+                    exec_id,
+                    from,
+                    limit,
+                } => self
+                    .exec_records(exec_id, from, limit)
+                    .await
+                    .map(ResponseOk::Records),
+                HostRequest::Resolve { kind, reference } => self
+                    .resolve(kind, &reference)
+                    .await
+                    .map(ResponseOk::Resolved),
                 HostRequest::ExecCancelCreation { exec_id } => {
                     self.withdraw_or_cancel_creation(exec_id).await
                 }
@@ -2210,17 +2218,7 @@ impl HostService {
                         .await
                         .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
                     Ok(ResponseOk::ReceiptList(
-                        receipts
-                            .into_iter()
-                            .map(|row| arena0_api::ReceiptListEntry {
-                                receipt_id: row.receipt_id.to_string(),
-                                session_id: row.session_id,
-                                kind: row.kind,
-                                program_id: row.program_hash,
-                                completed: row.completed,
-                                provenance: row.provenance,
-                            })
-                            .collect(),
+                        receipts.into_iter().map(sync_receipt_entry).collect(),
                     ))
                 }
                 HostRequest::ReceiptVerify { receipt } => self.verify(receipt).await,
@@ -2438,40 +2436,19 @@ impl HostService {
             .await
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
             .map(project_activation_inspection);
-        let page = match self
-            .store
-            .load_execution(exec_id)
-            .await
-            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
-        {
-            Some(_) => self
-                .store
-                .read_event_summaries(exec_id, events_from, events_limit)
-                .await
-                .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?,
-            None => {
-                return Ok(empty_execution_inspection(
-                    status,
-                    activation,
-                    events_from.unwrap_or(0),
-                ));
-            }
-        };
-        let events_from = page.from();
-        let events_total = page.total();
-        let events_next = page.next();
-        let events = page
-            .into_summaries()
-            .into_iter()
-            .map(project_event_record_summary)
-            .collect();
+        let page = self
+            .record_page(exec_id, events_from, events_limit as u16)
+            .await?;
+        if page.total == 0 {
+            return Ok(empty_execution_inspection(status, activation, page.from));
+        }
         Ok(ExecutionInspection {
             status,
             activation,
-            events_from,
-            events,
-            events_total,
-            events_next,
+            events_from: page.from,
+            events: page.records,
+            events_total: page.total,
+            events_next: page.next,
         })
     }
 
@@ -3875,10 +3852,146 @@ impl HostService {
         Ok(ResponseOk::ExecView { step, view })
     }
 
+    /// One page of local event records at positions `from..from + limit`
+    /// (bounded as `exec.inspect` bounds `events_limit`), read the way
+    /// `exec.inspect` reads its records, with no status or activation
+    /// projection: it decodes no execution state. `NotFound` for an unknown
+    /// execution; `BadRequest` for a limit of 0 or above the bound.
+    async fn exec_records(
+        &self,
+        exec_id: ExecId,
+        from: u64,
+        limit: u16,
+    ) -> Result<arena0_api::RecordsPage, ApiError> {
+        self.record_page(exec_id, Some(from), limit).await
+    }
+
+    /// Shared bounded record projection. A known request without active state
+    /// has an empty journal; existence and totals require no state or activation
+    /// decode. Payload envelopes are read only for records in this page.
+    async fn record_page(
+        &self,
+        exec_id: ExecId,
+        from: Option<u64>,
+        limit: u16,
+    ) -> Result<arena0_api::RecordsPage, ApiError> {
+        if limit == 0 || usize::from(limit) > MAX_EVENT_INSPECTION_RECORDS {
+            return Err(ApiError::new(
+                ApiErrorCode::BadRequest,
+                format!(
+                    "event inspection limit must be between 1 and {}",
+                    MAX_EVENT_INSPECTION_RECORDS
+                ),
+            ));
+        }
+        self.store
+            .load_execution_request(exec_id)
+            .await
+            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
+            .ok_or_else(|| ApiError::new(ApiErrorCode::NotFound, "no such execution"))?;
+        let page = match self
+            .store
+            .read_event_summaries(exec_id, from, usize::from(limit))
+            .await
+        {
+            Ok(page) => page,
+            Err(arena0_store::StoreError::ExecutionNotFound(_)) => {
+                return Ok(arena0_api::RecordsPage {
+                    from: from.unwrap_or(0),
+                    records: Vec::new(),
+                    total: 0,
+                    next: None,
+                });
+            }
+            Err(error) => return Err(ApiError::new(ApiErrorCode::Storage, error.to_string())),
+        };
+        Ok(arena0_api::RecordsPage {
+            from: page.from(),
+            total: page.total(),
+            next: page.next(),
+            records: page
+                .into_summaries()
+                .into_iter()
+                .map(project_event_record_summary)
+                .collect(),
+        })
+    }
+
+    /// Resolve `reference` as `kind` on this Host with the matching rule on
+    /// `Resolved` (indexed store lookup, `StoreHandle::resolve_ids`). A unique
+    /// receipt resolves to its `receipt.list` entry.
+    async fn resolve(
+        &self,
+        kind: arena0_api::RefKind,
+        reference: &str,
+    ) -> Result<arena0_api::Resolved, ApiError> {
+        use arena0_api::{RefKind, Resolved};
+        use arena0_store::IdSpace;
+        let needle = reference.trim().to_ascii_lowercase();
+        if needle.is_empty() || needle.len() > 64 || !needle.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Ok(Resolved::None);
+        }
+        let space = match kind {
+            RefKind::Exec => IdSpace::Exec,
+            RefKind::Session => IdSpace::Session,
+            RefKind::Receipt => IdSpace::Receipt,
+        };
+        let matches = self
+            .store
+            .resolve_ids(space, needle.clone(), 8)
+            .await
+            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
+        if matches.total == 0 {
+            return Ok(Resolved::None);
+        }
+        let exact = if needle.len() == 64 {
+            matches.ids.iter().find(|id| hex::encode(id) == needle)
+        } else {
+            None
+        };
+        let id = match exact.or_else(|| (matches.total == 1).then(|| &matches.ids[0])) {
+            Some(id) => *id,
+            None => {
+                return Ok(Resolved::Ambiguous {
+                    candidates: matches.ids.into_iter().map(hex::encode).collect(),
+                    matches: matches.total,
+                });
+            }
+        };
+        Ok(match kind {
+            RefKind::Exec => Resolved::Exec {
+                exec_id: ExecId(id),
+            },
+            RefKind::Session => Resolved::Session {
+                session_id: arena0_protocol::SessionHash(id),
+            },
+            RefKind::Receipt => {
+                let row = self
+                    .store
+                    .receipt_summary(arena0_protocol::ReceiptId(id))
+                    .await
+                    .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
+                    .ok_or_else(|| {
+                        ApiError::new(ApiErrorCode::Storage, "resolved receipt summary is missing")
+                    })?;
+                Resolved::Receipt {
+                    entry: arena0_api::ReceiptListEntry {
+                        receipt_id: row.receipt_id.to_string(),
+                        session_id: row.session_id,
+                        kind: row.kind,
+                        program_id: row.program_hash,
+                        completed: row.completed,
+                        provenance: row.provenance,
+                    },
+                }
+            }
+        })
+    }
+
     /// Render the shared state after agreed step `at_step` of a session that
-    /// has started, live or terminal. The store keeps only the latest shared
-    /// state, so this replays the agreed steps `0..=at_step` in a fresh
-    /// instance; the cost grows with `at_step`.
+    /// has started, live or terminal. Read the state stored atomically with the
+    /// agreed step, verifying its envelope and expected hash before rendering.
     async fn view_at_step(
         &self,
         exec_id: ExecId,
@@ -3898,31 +4011,52 @@ impl HostService {
                 format!("step {at_step} is beyond the latest agreed step {latest}"),
             ));
         }
-        let program = self.load_session_program(state).await?;
+        let program = async {
+            let started = StdInstant::now();
+            let result = self.load_session_program(state).await;
+            tracing::debug!(target: "arena0::performance", operation = "view.phase", phase = "program", elapsed_us = started.elapsed().as_micros() as u64);
+            result
+        }
+        .instrument(tracing::debug_span!(target: "arena0::performance", "view.program"))
+        .await?;
         let ensemble = state
             .binding()
             .ensemble()
             .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
         let ensemble_len = ensemble.len();
-        let binding = state.binding().clone();
-        let local_peer = state.producer();
-        // `at_step <= latest < u64::MAX`, so the exclusive bound cannot wrap.
-        let steps = self
-            .store
-            .read_trace(exec_id, 0, at_step + 1)
-            .await
-            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
+        let shared = async {
+            let started = StdInstant::now();
+            let result = self.store
+                .step_state(exec_id, at_step)
+                .await
+                .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()));
+            tracing::debug!(target: "arena0::performance", operation = "view.phase", phase = "state", elapsed_us = started.elapsed().as_micros() as u64);
+            result
+        }.instrument(tracing::debug_span!(target: "arena0::performance", "view.state")).await?;
         let engine = Arc::clone(&self.engine);
         fn execution_error(error: impl std::fmt::Display) -> ApiError {
             ApiError::new(ApiErrorCode::Execution, error.to_string())
         }
+        // Keep guest load/render work attributable to this request on the
+        // blocking pool, distinct from concurrent actor projections.
+        let request_span = tracing::Span::current();
         let projection = tokio::task::spawn_blocking(move || {
-            let program = engine.load(&program).map_err(execution_error)?;
-            let shared = arena0_node::replay_shared(&program, &binding, local_peer, &steps)
-                .map_err(execution_error)?;
-            program
+            let _request_guard = request_span.enter();
+            let program = tracing::debug_span!(target: "arena0::performance", "view.load").in_scope(|| {
+                let started = StdInstant::now();
+                let result = engine.load(&program).map_err(execution_error);
+                tracing::debug!(target: "arena0::performance", operation = "view.phase", phase = "load", elapsed_us = started.elapsed().as_micros() as u64);
+                result
+            })?;
+            let projection = tracing::debug_span!(target: "arena0::performance", "view.render").in_scope(|| {
+                let started = StdInstant::now();
+                let result = program
                 .view(&shared, &ensemble, viewport)
-                .map_err(execution_error)
+                .map_err(execution_error);
+                tracing::debug!(target: "arena0::performance", operation = "view.phase", phase = "render", elapsed_us = started.elapsed().as_micros() as u64);
+                result
+            })?;
+            Ok::<_, ApiError>(projection)
         })
         .await
         .map_err(|error| ApiError::new(ApiErrorCode::Internal, error.to_string()))??;
@@ -4559,6 +4693,255 @@ impl HostService {
 /// tickets while the session is live.
 const RELAY_CADENCE_MS: u64 = 2_000;
 
+/// `/sync` row projection (design §3.2). Rows are read from summary index
+/// columns through the store's read connections and projected with the same
+/// functions as the list reads, so a `/sync` row equals the matching
+/// `exec.list`, `receipt.list`, `program.list` and `blob.list` entry.
+impl HostService {
+    /// The current rows for `keys`, in key order, one op per distinct row:
+    /// - `Exec(id)`: `store.exec_summary(id)` through `project_exec_summary`;
+    /// - `Step { exec_id, step }`: all Step keys of one execution coalesce into
+    ///   one `StepTimes` from the smallest such step to its latest stored step
+    ///   (`store.list_step_times`), `state_prefix` = first four bytes of each
+    ///   post-state hash, big-endian;
+    /// - `Receipt(id)`: `store.receipt_summary(id)` mapped as `ReceiptList`;
+    /// - `Program(hash)`: `ProgramDetail` from the catalog (`catalog.detail`)
+    ///   when the program is active, else `ProgramRemoved`;
+    /// - `Blob(hash)`: `store.blob_record(hash)` mapped as `blob.list` does.
+    ///
+    /// A missing exec, step or receipt row for a published key is store
+    /// corruption (`ApiErrorCode::Storage`): those rows are never deleted.
+    pub(crate) async fn sync_rows(
+        &self,
+        keys: &[arena0_store::ChangeKey],
+    ) -> Result<Vec<arena0_api::RowOp>, ApiError> {
+        use arena0_api::RowOp;
+        use arena0_store::ChangeKey;
+        // Preserve first-key order while folding step ranges and duplicate
+        // identities. A later Step key can name an earlier step, so compute
+        // each execution's lower bound before projecting its first key.
+        let mut starts = std::collections::BTreeMap::new();
+        for key in keys {
+            if let ChangeKey::Step { exec_id, step } = key {
+                starts
+                    .entry(*exec_id)
+                    .and_modify(|range: &mut (u64, u64)| {
+                        range.0 = range.0.min(*step);
+                        range.1 = range.1.max(*step);
+                    })
+                    .or_insert((*step, *step));
+            }
+        }
+        // Membership, unlike detail, excludes removed programs. Fetch it
+        // once for the batch; using the catalog's display limit here could
+        // misclassify an active key beyond that limit as a removal. SQLite's
+        // LIMIT is signed, so cap the request at the target's valid maximum.
+        let active_programs: std::collections::BTreeSet<_> =
+            if keys.iter().any(|key| matches!(key, ChangeKey::Program(_))) {
+                self.store
+                    .list_programs(usize::try_from(i64::MAX).unwrap_or(usize::MAX))
+                    .await
+                    .map_err(|e| ApiError::new(ApiErrorCode::Storage, e.to_string()))?
+                    .into_iter()
+                    .collect()
+            } else {
+                std::collections::BTreeSet::new()
+            };
+        let mut seen = std::collections::BTreeSet::new();
+        let mut rows = Vec::new();
+        for key in keys {
+            let identity = match key {
+                ChangeKey::Step { exec_id, .. } => ChangeKey::Step {
+                    exec_id: *exec_id,
+                    step: starts[exec_id].0,
+                },
+                key => *key,
+            };
+            if !seen.insert(identity) {
+                continue;
+            }
+            let op = match identity {
+                ChangeKey::Exec(id) => {
+                    let row = self
+                        .store
+                        .exec_summary(id)
+                        .await
+                        .map_err(|e| ApiError::new(ApiErrorCode::Storage, e.to_string()))?
+                        .ok_or_else(|| {
+                            ApiError::new(
+                                ApiErrorCode::Storage,
+                                "published execution row is missing",
+                            )
+                        })?;
+                    RowOp::Exec(Box::new(self.project_exec_summary(row).await?))
+                }
+                ChangeKey::Step { exec_id, step } => {
+                    let row = self
+                        .store
+                        .list_step_times(exec_id, step)
+                        .await
+                        .map_err(|e| ApiError::new(ApiErrorCode::Storage, e.to_string()))?;
+                    if starts[&exec_id].1 - step >= row.certified_at_ms.len() as u64 {
+                        return Err(ApiError::new(
+                            ApiErrorCode::Storage,
+                            "published step row is missing",
+                        ));
+                    }
+                    RowOp::Steps(sync_step_times(row))
+                }
+                ChangeKey::Receipt(id) => {
+                    let row = self
+                        .store
+                        .receipt_summary(id)
+                        .await
+                        .map_err(|e| ApiError::new(ApiErrorCode::Storage, e.to_string()))?
+                        .ok_or_else(|| {
+                            ApiError::new(ApiErrorCode::Storage, "published receipt row is missing")
+                        })?;
+                    RowOp::Receipt(sync_receipt_entry(row))
+                }
+                ChangeKey::Program(hash) => {
+                    if active_programs.contains(&hash) {
+                        let detail = self
+                            .catalog
+                            .detail(hash)
+                            .await
+                            .map_err(|e| ApiError::new(ApiErrorCode::Storage, e.to_string()))?
+                            .ok_or_else(|| {
+                                ApiError::new(
+                                    ApiErrorCode::Storage,
+                                    "active program row is missing",
+                                )
+                            })?;
+                        RowOp::Program(Box::new(detail))
+                    } else {
+                        RowOp::ProgramRemoved { program_hash: hash }
+                    }
+                }
+                ChangeKey::Blob(hash) => {
+                    let row = self
+                        .store
+                        .blob_record(hash)
+                        .await
+                        .map_err(|e| ApiError::new(ApiErrorCode::Storage, e.to_string()))?
+                        .ok_or_else(|| {
+                            ApiError::new(ApiErrorCode::Storage, "published blob row is missing")
+                        })?;
+                    RowOp::Blob(sync_blob_entry(row))
+                }
+            };
+            rows.push(op);
+        }
+        Ok(rows)
+    }
+
+    /// Every row of this Host: `Exec` for every `exec.list` entry, `Steps` from
+    /// step 0 for every execution with at least one stored step, every
+    /// `Receipt`, every active `Program`, every `Blob`. Bounded by the same
+    /// limits as the list reads.
+    pub(crate) async fn sync_snapshot(&self) -> Result<Vec<arena0_api::RowOp>, ApiError> {
+        use arena0_api::RowOp;
+        let mut rows = Vec::new();
+        for exec in self.exec_list().await? {
+            if exec.step.is_some_and(|step| step > 0) {
+                let steps = self
+                    .store
+                    .list_step_times(exec.exec_id, 0)
+                    .await
+                    .map_err(|e| ApiError::new(ApiErrorCode::Storage, e.to_string()))?;
+                if steps.certified_at_ms.is_empty() {
+                    return Err(ApiError::new(
+                        ApiErrorCode::Storage,
+                        "execution's stored steps are missing",
+                    ));
+                }
+                rows.push(RowOp::Steps(sync_step_times(steps)));
+            }
+            rows.push(RowOp::Exec(Box::new(exec)));
+        }
+        rows.extend(
+            self.store
+                .list_receipt_summaries(4_096)
+                .await
+                .map_err(|e| ApiError::new(ApiErrorCode::Storage, e.to_string()))?
+                .into_iter()
+                .map(sync_receipt_entry)
+                .map(RowOp::Receipt),
+        );
+        for program in self
+            .catalog
+            .list()
+            .await
+            .map_err(|e| ApiError::new(ApiErrorCode::Storage, e.to_string()))?
+        {
+            let detail = self
+                .catalog
+                .detail(program.program_hash)
+                .await
+                .map_err(|e| ApiError::new(ApiErrorCode::Storage, e.to_string()))?
+                .ok_or_else(|| {
+                    ApiError::new(ApiErrorCode::Storage, "active program row is missing")
+                })?;
+            rows.push(RowOp::Program(Box::new(detail)));
+        }
+        rows.extend(
+            self.store
+                .list_blobs()
+                .await
+                .map_err(|e| ApiError::new(ApiErrorCode::Storage, e.to_string()))?
+                .into_iter()
+                .map(sync_blob_entry)
+                .map(RowOp::Blob),
+        );
+        Ok(rows)
+    }
+
+    /// This Host's open offers now, as an `Observation::Offers`, read the way
+    /// `negotiation.offers` reads them.
+    #[expect(
+        clippy::unused_async,
+        reason = "The committed sync projection API is asynchronous; offers are held in memory."
+    )]
+    pub(crate) async fn sync_offers(&self) -> Result<arena0_api::Observation, ApiError> {
+        Ok(arena0_api::Observation::Offers {
+            host: self.name.clone(),
+            offers: self.offers.list(unix_time_ms(), &self.events),
+        })
+    }
+}
+
+fn sync_receipt_entry(row: arena0_store::ReceiptSummaryRow) -> arena0_api::ReceiptListEntry {
+    arena0_api::ReceiptListEntry {
+        receipt_id: row.receipt_id.to_string(),
+        session_id: row.session_id,
+        kind: row.kind,
+        program_id: row.program_hash,
+        completed: row.completed,
+        provenance: row.provenance,
+    }
+}
+
+fn sync_blob_entry(blob: arena0_store::BlobRecord) -> arena0_api::BlobEntry {
+    arena0_api::BlobEntry {
+        hash: blob.hash,
+        length: blob.length,
+        linked: blob.linked,
+    }
+}
+
+fn sync_step_times(row: arena0_store::StepTimesRow) -> arena0_api::StepTimes {
+    arena0_api::StepTimes {
+        exec_id: row.exec_id,
+        from_step: row.from_step,
+        certified_at_ms: row.certified_at_ms,
+        state_prefix: row
+            .post_state
+            .into_iter()
+            .map(|hash| u32::from_be_bytes(hash.0[..4].try_into().expect("four-byte hash prefix")))
+            .collect(),
+    }
+}
+
 impl HostService {
     /// The post-commit relay: session-lived, re-emits the final offer and the
     /// exact tickets on the program topic and serves the convergence fetch from
@@ -5185,11 +5568,14 @@ mod tests {
 
     #[tokio::test]
     async fn host_event_projects_to_api_once() {
-        let feed = Events::new(HostInfo {
-            id: "paired".into(),
-            peer_id: PeerId([1; 32]),
-            user_agent: None,
-        });
+        let feed = Events::new(
+            HostInfo {
+                id: "paired".into(),
+                peer_id: PeerId([1; 32]),
+                user_agent: None,
+            },
+            "00112233445566778899aabbccddeeff".into(),
+        );
         let mut api_events = feed.subscribe();
         let event = HostEvent::Created {
             source: EventSource::Execution {

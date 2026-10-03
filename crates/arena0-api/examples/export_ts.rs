@@ -2,7 +2,10 @@
 //! `just client-types` writes the output to `npm/arena0-client/src/types.gen.ts`, and
 //! `just check-client` fails when that file is stale.
 
-use arena0_api::{ActivityFrame, ApiError, EventFrame, HostRequest, Request, ResponseOk, Uploaded};
+use arena0_api::{
+    ActivityFrame, ApiError, EventFrame, HostRequest, Request, ResponseOk, SyncCursor, SyncFrame,
+    Uploaded,
+};
 use ts_rs::{Config, TS, TypeVisitor};
 
 /// Collects the declaration of every exportable type reachable from the roots.
@@ -42,6 +45,8 @@ fn main() {
     collector.visit::<ApiError>();
     collector.visit::<EventFrame>();
     collector.visit::<ActivityFrame>();
+    collector.visit::<SyncFrame>();
+    collector.visit::<SyncCursor>();
     collector.visit::<Uploaded>();
     collector.visit::<serde_json::Value>();
 

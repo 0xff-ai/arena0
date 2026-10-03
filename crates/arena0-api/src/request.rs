@@ -158,6 +158,22 @@ pub enum HostRequest {
     },
     #[serde(rename = "exec.trace")]
     ExecTrace { exec_id: ExecId, from: u64, to: u64 },
+    /// One page of an execution's local event records from position `from`,
+    /// without projecting its status (design §3.3). `limit` is non-zero and
+    /// at most the daemon's inspection bound, as for `exec.inspect`.
+    #[serde(rename = "exec.records")]
+    ExecRecords {
+        exec_id: ExecId,
+        from: u64,
+        limit: u16,
+    },
+    /// Resolve a full id or a case-insensitive hex prefix of `kind` on this
+    /// Host by an indexed lookup. References are trimmed and lowercased;
+    /// empty, non-hex or longer-than-64-character references match nothing.
+    /// A resident full id wins; ambiguous prefixes return at most eight
+    /// candidates in id order and the full match count. Used by CLI, MCP and UI.
+    #[serde(rename = "resolve")]
+    Resolve { kind: RefKind, reference: String },
     /// Cancel a caller-owned creation when its `exec.new` response is
     /// ambiguous. Unlike `exec.withdraw`, this follows an activation race and
     /// stops the execution before acknowledging cleanup.
@@ -223,6 +239,8 @@ impl HostRequest {
             Self::ExecQuery { .. } => "exec.query",
             Self::ExecView { .. } => "exec.view",
             Self::ExecTrace { .. } => "exec.trace",
+            Self::ExecRecords { .. } => "exec.records",
+            Self::Resolve { .. } => "resolve",
             Self::ExecCancelCreation { .. } => "exec.cancel_creation",
             Self::ExecWithdraw { .. } => "exec.withdraw",
             Self::ExecTerminate { .. } => "exec.terminate",
@@ -255,6 +273,19 @@ pub enum EnsembleSpec {
     /// Join the first valid offer on the program topic, or one exact offer
     /// when `target` is supplied.
     Join { target: Option<NegotiationTarget> },
+}
+
+/// What a `resolve` reference names.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub enum RefKind {
+    /// An execution id (`exec_requests`).
+    Exec,
+    /// A session id: committed activations, execution aggregates and receipts.
+    Session,
+    /// A receipt content id.
+    Receipt,
 }
 
 /// Select exact stored evidence, this Host's session publication, or an inline artifact.
