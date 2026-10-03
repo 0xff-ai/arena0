@@ -7,8 +7,6 @@ use std::io::IsTerminal;
 use arena0_client::protocol::{ColorDepth, ExecLifecycle, Slot, View};
 use arena0_client::sanitize;
 use owo_colors::{OwoColorize, Style as OwoStyle};
-use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style as TuiStyle};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// The output mode chosen once by the global `--json` flag and honored everywhere.
@@ -27,142 +25,7 @@ impl Mode {
     }
 }
 
-/// Semantic ANSI styling shared by the full-screen workspace and run views.
-///
-/// Colors always use the terminal's default background. An explicit
-/// `ARENA0_THEME=dark|light` wins; otherwise `COLORFGBG` supplies a best-effort
-/// background hint. `NO_COLOR` disables colors while retaining text
-/// attributes that distinguish important states.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TuiPalette {
-    enabled: bool,
-    theme: ColorTheme,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ColorTheme {
-    Dark,
-    Light,
-}
-
-impl TuiPalette {
-    #[must_use]
-    pub(crate) fn detect() -> Self {
-        Self {
-            enabled: std::env::var_os("NO_COLOR").is_none(),
-            theme: ColorTheme::from_hints(
-                std::env::var("ARENA0_THEME").ok().as_deref(),
-                std::env::var("COLORFGBG").ok().as_deref(),
-            ),
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn strong(self) -> TuiStyle {
-        self.colored(
-            match self.theme {
-                ColorTheme::Dark => Color::LightBlue,
-                ColorTheme::Light => Color::Blue,
-            },
-            Modifier::BOLD,
-        )
-    }
-
-    #[must_use]
-    pub(crate) fn emphasis(self) -> TuiStyle {
-        self.colored(
-            match self.theme {
-                ColorTheme::Dark => Color::LightMagenta,
-                ColorTheme::Light => Color::Magenta,
-            },
-            Modifier::BOLD,
-        )
-    }
-
-    #[must_use]
-    pub(crate) fn muted(self) -> TuiStyle {
-        if self.enabled {
-            TuiStyle::default().fg(match self.theme {
-                ColorTheme::Dark => Color::Gray,
-                ColorTheme::Light => Color::DarkGray,
-            })
-        } else {
-            TuiStyle::default()
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn success(self) -> TuiStyle {
-        self.colored(
-            match self.theme {
-                ColorTheme::Dark => Color::LightGreen,
-                ColorTheme::Light => Color::Green,
-            },
-            Modifier::BOLD,
-        )
-    }
-
-    #[must_use]
-    pub(crate) fn input(self) -> TuiStyle {
-        self.colored(
-            match self.theme {
-                ColorTheme::Dark => Color::LightYellow,
-                ColorTheme::Light => Color::Rgb(128, 80, 0),
-            },
-            Modifier::BOLD,
-        )
-    }
-
-    #[must_use]
-    pub(crate) fn public(self) -> TuiStyle {
-        self.colored(
-            match self.theme {
-                ColorTheme::Dark => Color::LightCyan,
-                ColorTheme::Light => Color::Cyan,
-            },
-            Modifier::BOLD,
-        )
-    }
-
-    #[must_use]
-    pub(crate) fn error(self) -> TuiStyle {
-        self.colored(
-            match self.theme {
-                ColorTheme::Dark => Color::LightRed,
-                ColorTheme::Light => Color::Red,
-            },
-            Modifier::BOLD,
-        )
-    }
-
-    fn colored(self, color: Color, modifier: Modifier) -> TuiStyle {
-        let style = TuiStyle::default().add_modifier(modifier);
-        if self.enabled { style.fg(color) } else { style }
-    }
-}
-
-impl ColorTheme {
-    fn from_hints(explicit: Option<&str>, colorfgbg: Option<&str>) -> Self {
-        match explicit
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("light") => return Self::Light,
-            Some("dark") => return Self::Dark,
-            _ => {}
-        }
-        let background = colorfgbg
-            .and_then(|value| value.rsplit(';').next())
-            .and_then(|value| value.parse::<u8>().ok());
-        match background {
-            Some(7 | 9..=15) => Self::Light,
-            _ => Self::Dark,
-        }
-    }
-}
-
-/// Semantic styles for durable non-TUI human output.
+/// Semantic styles for durable human output.
 ///
 /// Every method is the identity function unless color is enabled, so JSON,
 /// redirected output, and `NO_COLOR` never carry terminal styling.
@@ -272,18 +135,6 @@ pub(crate) fn terminal_width() -> u16 {
         .filter(|w| *w > 0)
         .or_else(terminal_width_from_tty)
         .unwrap_or(80)
-}
-
-/// Center a bounded overlay while leaving a one-cell margin where possible.
-pub(crate) fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width.saturating_sub(2));
-    let height = height.min(area.height.saturating_sub(2));
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
 }
 
 /// Render every program-owned slot for command-style views.
@@ -565,22 +416,5 @@ mod tests {
         assert!(!Palette::from_capabilities(Mode::Human, false, false).enabled);
         assert!(!Palette::from_capabilities(Mode::Json, true, false).enabled);
         assert!(Palette::from_capabilities(Mode::Human, true, false).enabled);
-    }
-
-    #[test]
-    fn tui_theme_hints_select_light_and_dark_palettes() {
-        assert_eq!(
-            ColorTheme::from_hints(Some("light"), None),
-            ColorTheme::Light
-        );
-        assert_eq!(
-            ColorTheme::from_hints(Some("dark"), Some("0;15")),
-            ColorTheme::Dark
-        );
-        assert_eq!(
-            ColorTheme::from_hints(None, Some("0;15")),
-            ColorTheme::Light
-        );
-        assert_eq!(ColorTheme::from_hints(None, Some("15;0")), ColorTheme::Dark);
     }
 }

@@ -1,8 +1,7 @@
 //! Typed coordinated-run progress and its one inline terminal projection.
 //!
 //! The coordinator records real work here. Indicatif owns the transient stderr
-//! line, while Rattles supplies the spinner frames. Full-screen rendering stays
-//! in `tui` and machine results stay on stdout.
+//! line, while Rattles supplies the spinner frames. Machine results stay on stdout.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -19,19 +18,12 @@ const ANIMATION_DELAY: Duration = Duration::from_millis(200);
 pub(crate) enum ProgressMode {
     Interactive,
     Plain,
-    Hidden,
 }
 
 impl ProgressMode {
     #[must_use]
-    pub(crate) const fn for_run(
-        human_output: bool,
-        use_tui: bool,
-        streams_are_terminal: bool,
-    ) -> Self {
-        if use_tui {
-            Self::Hidden
-        } else if human_output && streams_are_terminal {
+    pub(crate) const fn for_run(human_output: bool, streams_are_terminal: bool) -> Self {
+        if human_output && streams_are_terminal {
             Self::Interactive
         } else {
             Self::Plain
@@ -251,7 +243,7 @@ impl RunProgress {
         inner.record_observation();
         if inner.mode == ProgressMode::Plain {
             eprintln!("{}", RunStage::Execution.label());
-        } else if inner.mode == ProgressMode::Interactive && inner.animation_ready {
+        } else if inner.animation_ready {
             inner.show_bar();
         }
     }
@@ -343,27 +335,14 @@ mod tests {
 
     #[test]
     fn modes_keep_animation_out_of_machine_and_nonterminal_runs() {
-        assert_eq!(
-            ProgressMode::for_run(true, false, true),
-            ProgressMode::Interactive
-        );
-        assert_eq!(
-            ProgressMode::for_run(false, false, true),
-            ProgressMode::Plain
-        );
-        assert_eq!(
-            ProgressMode::for_run(true, false, false),
-            ProgressMode::Plain
-        );
-        assert_eq!(
-            ProgressMode::for_run(true, true, true),
-            ProgressMode::Hidden
-        );
+        assert_eq!(ProgressMode::for_run(true, true), ProgressMode::Interactive);
+        assert_eq!(ProgressMode::for_run(false, true), ProgressMode::Plain);
+        assert_eq!(ProgressMode::for_run(true, false), ProgressMode::Plain);
     }
 
     #[tokio::test]
     async fn typed_state_distinguishes_counts_waiting_callout_and_terminal_results() {
-        let progress = RunProgress::new(ProgressMode::Hidden, Palette::plain());
+        let progress = RunProgress::new(ProgressMode::Plain, Palette::plain());
 
         progress
             .during(RunStage::Connecting, 2, async {
@@ -398,7 +377,7 @@ mod tests {
         );
 
         for terminal in [RunTerminalState::Failed, RunTerminalState::Cancelled] {
-            let progress = RunProgress::new(ProgressMode::Hidden, Palette::plain());
+            let progress = RunProgress::new(ProgressMode::Plain, Palette::plain());
             progress
                 .during(RunStage::Execution, 0, std::future::ready(()))
                 .await;
@@ -412,7 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_is_absorbing_while_active_work_drains() {
-        let progress = RunProgress::new(ProgressMode::Hidden, Palette::plain());
+        let progress = RunProgress::new(ProgressMode::Plain, Palette::plain());
         let worker_progress = progress.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (drain_tx, drain_rx) = tokio::sync::oneshot::channel();

@@ -8,6 +8,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
+use arena0_client::api::{HostRequest, ResponseOk};
 use arena0_client::proto::DaemonClient;
 use arena0_home::Home;
 use serde_json::Value;
@@ -15,7 +16,6 @@ use tokio::process::{Child, Command};
 
 use crate::context::AgentContext;
 use crate::local_daemon::LocalDaemon;
-use crate::workspace::{self, Exit};
 
 #[derive(Debug)]
 enum PaneManager {
@@ -29,8 +29,9 @@ enum Pane {
     Tmux(String),
 }
 
-/// Select a program and run one Codex Participant in each of two panes.
-pub(crate) async fn run() -> anyhow::Result<()> {
+/// Run one Codex Participant in each of two panes on the catalog program
+/// named by `program`.
+pub(crate) async fn run(program: &str) -> anyhow::Result<()> {
     if !std::io::stdin().is_terminal()
         || !std::io::stdout().is_terminal()
         || !std::io::stderr().is_terminal()
@@ -54,16 +55,24 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 
     eprintln!("preparing an isolated two-agent workspace");
     let daemon = LocalDaemon::connect_or_start(vec![left_host.clone(), right_host]).await?;
-    let selected = async {
+    let resolved = async {
         let client = DaemonClient::from_env()?;
-        let (programs, executions) = workspace::load(&client, &left_host).await?;
-        workspace::choose_agents(programs, executions).await
+        match client
+            .call_host(
+                &left_host,
+                &HostRequest::ProgramGet {
+                    program: program.to_owned(),
+                },
+            )
+            .await?
+        {
+            ResponseOk::Program(detail) => Ok(detail.summary.program_hash.to_string()),
+            other => bail!("unexpected program.get response: {other:?}"),
+        }
     }
     .await;
-    let program = match selected {
-        Ok(Exit::Agents(program)) => program,
-        Ok(Exit::Quit) => return crate::finish_with_daemon(Ok(()), daemon).await,
-        Ok(Exit::Launch(_)) => unreachable!("agent workspace returned an emulation launch"),
+    let program = match resolved {
+        Ok(program) => program,
         Err(error) => return crate::finish_with_daemon(Err(error), daemon).await,
     };
 
