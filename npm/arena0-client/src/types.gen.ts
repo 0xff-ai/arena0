@@ -243,6 +243,8 @@ export type Fact = { label: string, value: Cell, };
 
 export type FileSource = { "path": string } | { "upload": string };
 
+export type HostCursor = { boot_id: string, seq: number, };
+
 export type HostInfo = { id: string, peer_id: string, user_agent: string | null, };
 
 export type HostRequest = { "method": "negotiation.offers" } | { "method": "host.info" } | { "method": "id.show" } | { "method": "program.list" } | { "method": "program.get", "params": { program: string, } } | { "method": "program.import", "params": { source: FileSource, } } | { "method": "blob.import", "params": { source: FileSource, } } | { "method": "blob.export", "params": { hash: string, path: string, } } | { "method": "blob.list" } | { "method": "program.remove", "params": { program: string, } } | { "method": "exec.new", "params": { 
@@ -285,7 +287,7 @@ query: JsonValue | null, } } | { "method": "exec.view", "params": { exec: string
  * Render the shared state after this agreed step. `None` renders the
  * latest state.
  */
-at_step: number | null, } } | { "method": "exec.trace", "params": { exec_id: string, from: number, to: number, } } | { "method": "exec.cancel_creation", "params": { exec_id: string, } } | { "method": "exec.withdraw", "params": { exec_id: string, } } | { "method": "exec.terminate", "params": { exec_id: string, reason: string, } } | { "method": "events.subscribe", "params": { filter: EventFilter, } } | { "method": "receipt.get", "params": { receipt: ReceiptRef, } } | { "method": "receipt.import", "params": { receipt: ReceiptArtifact, } } | { "method": "receipt.list" } | { "method": "receipt.verify", "params": { receipt: ReceiptRef, } };
+at_step: number | null, } } | { "method": "exec.trace", "params": { exec_id: string, from: number, to: number, } } | { "method": "exec.records", "params": { exec_id: string, from: number, limit: number, } } | { "method": "resolve", "params": { kind: RefKind, reference: string, } } | { "method": "exec.cancel_creation", "params": { exec_id: string, } } | { "method": "exec.withdraw", "params": { exec_id: string, } } | { "method": "exec.terminate", "params": { exec_id: string, reason: string, } } | { "method": "events.subscribe", "params": { filter: EventFilter, } } | { "method": "receipt.get", "params": { receipt: ReceiptRef, } } | { "method": "receipt.import", "params": { receipt: ReceiptArtifact, } } | { "method": "receipt.list" } | { "method": "receipt.verify", "params": { receipt: ReceiptRef, } };
 
 export type HostStatus = { host: HostInfo, transport_key: string, programs: number, execs_active: number, };
 
@@ -322,6 +324,8 @@ creator: string,
 negotiation_id: string, };
 
 export type NextEvent = { "Callout": { pending_id: CalloutId, callout_index: number, name: string, prompt: string, schema: JsonSchemaDocument, context: JsonValue, } } | { "Completed": { session_id: string, outcome: JsonValue | null, } } | { "Failed": { reason: string, } };
+
+export type Observation = { "observed": "event" } & EventFrame | { "observed": "activity" } & ActivityFrame | { "observed": "offers", host: string, offers: Array<OpenOffer>, };
 
 export type Offer = { data: OfferData, tickets: Array<string>, };
 
@@ -507,7 +511,13 @@ outcome_borsh: Array<number> | null, };
 
 export type ReceiptTermination = "Completed" | { "Stopped": { cause: StopCause, } };
 
+export type RecordsPage = { from: number, records: Array<EventRecordSummary>, total: number, next: number | null, };
+
+export type RefKind = "exec" | "session" | "receipt";
+
 export type Request = { "method": "host.call", "params": { host: string, request: HostRequest, } } | { "method": "daemon.info" } | { "method": "daemon.stop" } | { "method": "hosts.list" } | { "method": "hosts.open", "params": { id: string | null, user_agent: string, } } | { "method": "activity.subscribe" };
+
+export type Resolved = { "resolved": "exec", exec_id: string, } | { "resolved": "session", session_id: string, } | { "resolved": "receipt", entry: ReceiptListEntry, } | { "resolved": "none" } | { "resolved": "ambiguous", candidates: Array<string>, matches: number, };
 
 export type ResponseOk = "Ack" | { "Id": IdInfo } | { "Program": ProgramDetail } | { "ProgramList": Array<ProgramSummary> } | { "Offers": Array<OpenOffer> } | { "BlobImported": { hash: string, length: number, } } | { "BlobExported": { length: number, } } | { "BlobList": Array<BlobEntry> } | { "ExecCreated": { exec_id: string, 
 /**
@@ -517,7 +527,7 @@ negotiation_id: string | null,
 /**
  * Absent until the N-of-N activation is durably stored.
  */
-session_id: string | null, exec_state: ExecLifecycle, queue_position: number | null, } } | { "ExecList": Array<ExecSummary> } | { "Status": ExecStatus } | { "Inspection": ExecutionInspection } | { "Awaited": { exec_id: string, exec_state: ExecLifecycle, reason: string | null, } } | { "Next": NextEvent } | { "Query": { result: JsonValue, } } | { "ExecView": { 
+session_id: string | null, exec_state: ExecLifecycle, queue_position: number | null, } } | { "ExecList": Array<ExecSummary> } | { "Records": RecordsPage } | { "Resolved": Resolved } | { "Status": ExecStatus } | { "Inspection": ExecutionInspection } | { "Awaited": { exec_id: string, exec_state: ExecLifecycle, reason: string | null, } } | { "Next": NextEvent } | { "Query": { result: JsonValue, } } | { "ExecView": { 
 /**
  * Index of the latest agreed step applied to the rendered state (steps
  * are numbered from 0, like trace entries). `None` renders the initial
@@ -526,6 +536,8 @@ session_id: string | null, exec_state: ExecLifecycle, queue_position: number | n
 step: number | null, view: View, } } | { "Trace": Array<AgreedStep> } | { "Receipt": ReceiptArtifact } | { "ReceiptList": Array<ReceiptListEntry> } | { "Verified": ReceiptSummary } | { "DaemonInfo": DaemonInfo } | "Subscribed" | "ActivitySubscribed" | { "Hosts": Array<HostStatus> } | { "HostStatus": HostStatus } | { "HostOpened": HostInfo };
 
 export type RosterEntry = { participant: number, status: Cell, detail: string | null, };
+
+export type RowOp = { "row": "exec" } & ExecSummary | { "row": "steps" } & StepTimes | { "row": "receipt" } & ReceiptListEntry | { "row": "program" } & ProgramDetail | { "row": "blob" } & BlobEntry | { "row": "program_removed", program_hash: ProgramHash, };
 
 export type SessionHeader = { 
 /**
@@ -640,7 +652,27 @@ reason: string, } } | { "Fail": {
  */
 reason: string, } };
 
+export type StepTimes = { exec_id: string, from_step: number, 
+/**
+ * Local time this Host stored each step, ms since the epoch.
+ */
+certified_at_ms: Array<number>, 
+/**
+ * First four bytes of each step's post-state hash, big-endian. Equal
+ * prefixes can hide a divergence with probability 2^-32; the session
+ * focus compares full hashes.
+ */
+state_prefix: Array<number>, };
+
 export type StopCause = { "Authenticated": AbortOccurrence } | { "Shared": { kind: AbortKind, commitment: StepCommitment, reason: string, } };
+
+export type SyncCursor = { [key in string]: HostCursor };
+
+export type SyncFrame = { "kind": "host", host: HostInfo, 
+/**
+ * As in `HostStatus`.
+ */
+transport_key: string, online: boolean, boot_id: string, } | { "kind": "reset", host: string, } | { "kind": "rows", host: string, seq: number, ops: Array<RowOp>, } | { "kind": "synced", host: string, seq: number, } | { "kind": "observed", observation: Observation, };
 
 export type Ticket = { data: TicketData, 
 /**
