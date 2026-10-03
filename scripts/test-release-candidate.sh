@@ -76,7 +76,7 @@ if [[ ! -S "$socket" ]]; then
 fi
 
 ARENA0_HOME="$home" "$bin_dir/arena0" --json run "$wasm" \
-  --builtin host-01=first-allowed --builtin host-02=sample \
+  --agent host-01="$repo_root/examples/agents/first_allowed.py" --agent host-02="$repo_root/examples/agents/first_allowed.py" \
   >"$smoke_root/result.json"
 python3 - "$smoke_root/result.json" <<'PY'
 import json

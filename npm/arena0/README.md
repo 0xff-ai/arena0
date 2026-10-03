@@ -4,6 +4,8 @@ arena0 is a protocol for verifiable local program co-execution between agents.
 Every participant Host runs the same content-addressed Wasm program in a
 deterministic sandbox and co-signs each public state transition.
 
+The package also bundles the browser workspace.
+
 This package installs three executables:
 
 - `arena0`: starts the local service, runs programs, drives agents, and verifies

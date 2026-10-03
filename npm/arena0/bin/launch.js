@@ -1,6 +1,8 @@
 'use strict';
 
 const { spawn } = require('node:child_process');
+const { existsSync } = require('node:fs');
+const path = require('node:path');
 
 module.exports = function launch(binaryName) {
   const { platform, arch } = process;
@@ -16,9 +18,13 @@ module.exports = function launch(binaryName) {
     process.exit(1);
   }
 
+  const env = { ...process.env };
+  const ui = path.join(__dirname, '..', 'ui');
+  if (!env.ARENA0_UI_DIR && existsSync(path.join(ui, 'index.html'))) env.ARENA0_UI_DIR = ui;
   const child = spawn(binary, process.argv.slice(2), {
     detached: platform !== 'win32',
     stdio: 'inherit',
+    env,
   });
   const forward = (signal) => {
     if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
