@@ -116,6 +116,33 @@ impl Database {
             .transpose()
     }
 
+    /// Every blob row, ordered by hash bytes.
+    pub(crate) fn list_blobs(&self) -> Result<Vec<BlobRecord>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT hash, length, path, linked FROM blobs ORDER BY hash")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(hash, length, path, linked)| {
+                Ok(BlobRecord {
+                    hash: BlobHash(array32(&hash, "blob hash")?),
+                    length: sqlite_i64(length)?,
+                    path: PathBuf::from(path),
+                    linked,
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn blob_granted(
         &self,
         execution_id: ExecId,

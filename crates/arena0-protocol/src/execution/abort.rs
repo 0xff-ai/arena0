@@ -22,6 +22,8 @@ pub const ABORT_OCCURRENCE_VERSION: u16 = 1;
 /// are the single definition used by both the Borsh and JSON encodings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(type = "0 | 1"))]
 pub enum AbortKind {
     /// Explicitly stop the execution without classifying it as a failure.
     Abort = 0x00,
@@ -84,6 +86,9 @@ impl<'de> Deserialize<'de> for AbortKind {
 /// check.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, BorshSerialize)]
 #[serde(remote = "Self")]
+// The manual Serialize impl delegates to this derived field layout unchanged;
+// TS derives that same layout, including the numeric AbortKind wire tag.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AbortOccurrence {
     domain: [u8; 24],
     version: u16,

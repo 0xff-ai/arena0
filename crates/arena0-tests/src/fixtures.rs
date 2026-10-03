@@ -488,6 +488,13 @@ pub fn shared_stop_program_wasm() -> Vec<u8> {
     ordering_program(OrderingBehavior::Fail)
 }
 
+/// A real two-participant ABI guest that accepts every shared event and
+/// renders `view_json` verbatim as its view, so a test can hand-write view
+/// output the Host must accept or reject. The session opens no callouts.
+pub fn view_program_wasm(view_json: &str) -> Vec<u8> {
+    guest_program(OrderingBehavior::Accept, 2, view_json.as_bytes())
+}
+
 enum OrderingBehavior {
     Accept,
     RejectMessage,
@@ -495,6 +502,12 @@ enum OrderingBehavior {
 }
 
 fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
+    guest_program(behavior, 3, b"null")
+}
+
+/// The view data starts at offset 32784 of the first memory page, so
+/// `view_json` must be shorter than 32 KiB.
+fn guest_program(behavior: OrderingBehavior, participants: u8, view_json: &[u8]) -> Vec<u8> {
     let unit = JsonSchemaDocument::unit();
     let definition = ProgramDefinition {
         metadata: ProgramMetadata {
@@ -504,7 +517,9 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
             author: None,
             capabilities: vec![Capability::Messaging],
             display_name: "Ordering fixture".into(),
-            participants: arena0_program::ParticipantCount::Exact { count: 3 },
+            participants: arena0_program::ParticipantCount::Exact {
+                count: participants,
+            },
         },
         schema: ProgramSchema {
             state: StateSchema {
@@ -516,6 +531,7 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
             params: unit.clone(),
             queries: Vec::new(),
             outcome: unit,
+            phases: Vec::new(),
         },
     };
     let metadata = definition.encode().expect("ordering metadata");
@@ -524,7 +540,14 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
     let rejected = wat_data(&[1, 0, 0]);
     let outcome = wat_data(&[0, 0, 0, 0, 4, 0, 0, 0, b'n', b'u', b'l', b'l']);
     let query = wat_data(&[0, 0, 0, 0, 4, 0, 0, 0, b'n', b'u', b'l', b'l']);
-    let view = wat_data(&[4, 0, 0, 0, b'n', b'u', b'l', b'l']);
+    // `ViewOutput` is the Borsh encoding of its JSON bytes: a u32 length, then the bytes.
+    let view_len = 4 + view_json.len();
+    let mut view = u32::try_from(view_json.len())
+        .expect("view JSON length")
+        .to_le_bytes()
+        .to_vec();
+    view.extend_from_slice(view_json);
+    let view = wat_data(&view);
     let metadata_data = wat_data(&metadata);
     let wat = format!(
         r#"
@@ -538,7 +561,7 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
           (data (i32.const 32772) "{rejected}")
           (data (i32.const 10240) "{outcome}")
           (data (i32.const 12288) "{query}")
-          (data (i32.const 14336) "{view}")
+          (data (i32.const 32784) "{view}")
           (data (i32.const 16384) "{metadata_data}")
           (func $pack (param $ptr i32) (param $len i32) (result i64)
             local.get $ptr
@@ -565,7 +588,7 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
           (func (export "arena0_query") (param i32 i32) (result i64)
             i32.const 12288 i32.const 12 call $pack)
           (func (export "arena0_view") (param i32 i32) (result i64)
-            i32.const 14336 i32.const 8 call $pack)
+            i32.const 32784 i32.const {view_len} call $pack)
           (func (export "arena0_metadata") (result i64)
             i32.const 16384 i32.const {metadata_len} call $pack))
         "#,
@@ -625,6 +648,7 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
         outcome = outcome,
         query = query,
         view = view,
+        view_len = view_len,
         metadata_data = metadata_data,
         metadata_len = metadata.len(),
     );

@@ -10,7 +10,7 @@ use crate::schema::ProgramSchema;
 /// Magic bytes at the start of every encoded program definition.
 pub const PROGRAM_DEFINITION_MAGIC: [u8; 4] = *b"A0MD";
 /// Version of the program-definition envelope and value-contract format.
-pub const PROGRAM_DEFINITION_VERSION: u32 = 1;
+pub const PROGRAM_DEFINITION_VERSION: u32 = 2;
 /// Maximum Wasm program size accepted by a Host registry.
 pub const PROGRAM_MAX_LEN: u64 = 64 * 1024 * 1024;
 
@@ -28,6 +28,8 @@ pub const PROGRAM_MAX_LEN: u64 = 64 * 1024 * 1024;
     Ord,
     Hash,
 )]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(type = "string", rename = "ProgramHash"))]
 pub struct Hash(pub [u8; 32]);
 
 impl Hash {
@@ -113,6 +115,7 @@ impl Hash {
     Eq,
 )]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ParticipantCount {
     /// The program requires one exact participant count.
     Exact { count: u8 },
@@ -196,7 +199,7 @@ pub struct ProgramDefinition {
 }
 
 impl ProgramDefinition {
-    /// Encode this definition with the `A0MD|v1|borsh` envelope.
+    /// Encode this definition with the `A0MD|v2|borsh` envelope.
     pub fn encode(&self) -> Result<Vec<u8>, ProgramDefinitionError> {
         let body = borsh::to_vec(self).map_err(ProgramDefinitionError::Encode)?;
         let mut bytes = Vec::with_capacity(8 + body.len());
@@ -206,7 +209,7 @@ impl ProgramDefinition {
         Ok(bytes)
     }
 
-    /// Decode one versioned `A0MD|v1|borsh` envelope.
+    /// Decode one versioned `A0MD|v2|borsh` envelope.
     pub fn decode(bytes: &[u8]) -> Result<Self, ProgramDefinitionError> {
         let Some((header, body)) = bytes.split_at_checked(8) else {
             return Err(ProgramDefinitionError::MissingHeader);
@@ -336,6 +339,7 @@ mod tests {
                 params: unit.clone(),
                 queries: Vec::new(),
                 outcome: unit,
+                phases: Vec::new(),
             },
         };
         let bytes = def.encode().unwrap();

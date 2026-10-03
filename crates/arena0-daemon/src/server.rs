@@ -1050,6 +1050,13 @@ async fn load_checked(
     Ok(loaded)
 }
 
+/// The program's turn at one agreed step, as the status projection reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Turn {
+    turn: Option<PeerId>,
+    phase: Option<String>,
+}
+
 /// The API operation owner for one Host.
 ///
 /// [`HostService`] owns one Host's execution supervisors and service tasks.
@@ -1076,6 +1083,11 @@ pub(crate) struct HostService {
     execs: Arc<ExecutionHandles>,
     /// Per-id rendezvous between caller-owned creation and cancellation.
     creation_states: StdMutex<CreationStates>,
+    /// Each execution's latest turn, read from its view, with the agreed step
+    /// it was computed at. A turn is a pure function of the agreed shared
+    /// state, so it is reused until the step changes; concurrent misses may
+    /// both compute it and the identical results overwrite each other.
+    turns: StdMutex<HashMap<ExecId, (u64, Turn)>>,
     negotiations_pending: AtomicUsize,
     /// Service tasks and negotiation drives. The runtime owns its accept path.
     tasks: TokioMutex<JoinSet<()>>,
@@ -1184,6 +1196,7 @@ impl HostService {
             owns_runtime,
             execs,
             creation_states: StdMutex::new(CreationStates::default()),
+            turns: StdMutex::new(HashMap::new()),
             negotiations_pending: AtomicUsize::new(0),
             tasks: TokioMutex::new(tasks),
             stopped: AtomicBool::new(false),
@@ -1958,6 +1971,26 @@ impl HostService {
                 })?
                 .map(|length| ResponseOk::BlobExported { length })
                 .ok_or_else(|| ApiError::new(ApiErrorCode::NotFound, "no such blob")),
+            HostRequest::BlobList => self
+                .store
+                .list_blobs()
+                .await
+                .map(|blobs| {
+                    ResponseOk::BlobList(
+                        blobs
+                            .into_iter()
+                            .map(|blob| arena0_api::BlobEntry {
+                                hash: blob.hash,
+                                length: blob.length,
+                                path: blob.path,
+                                linked: blob.linked,
+                            })
+                            .collect(),
+                    )
+                })
+                .map_err(|error| {
+                    ApiError::new(ApiErrorCode::Storage, format!("list blobs: {error}"))
+                }),
             HostRequest::ProgramRemove { program } => {
                 let program_id = self.resolve_program(&program).await?;
                 let removed = self
@@ -2027,7 +2060,12 @@ impl HostService {
                 answer,
             } => self.submit(exec_id, pending_id, answer).await,
             HostRequest::ExecQuery { exec_id, query } => self.query(exec_id, query).await,
-            HostRequest::ExecView { exec, width, color } => self.view(exec, width, color).await,
+            HostRequest::ExecView {
+                exec,
+                width,
+                color,
+                at_step,
+            } => self.view(exec, width, color, at_step).await,
             HostRequest::ExecTrace { exec_id, from, to } => {
                 self.trace(exec_id, from, to).await.map(ResponseOk::Trace)
             }
@@ -2183,8 +2221,85 @@ impl HostService {
         } else {
             false
         };
-        project_exec_status_facts(self.peer_id, request, activation, state, receipt_available)
-            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))
+        let execution_updated_at_ms = self
+            .store
+            .execution_updated_at_ms(exec_id)
+            .await
+            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
+        let turn = match &state {
+            Some(state) => Some(self.project_turn(exec_id, state).await?),
+            None => None,
+        };
+        project_exec_status_facts(
+            self.peer_id,
+            request,
+            activation,
+            state,
+            turn,
+            execution_updated_at_ms,
+            receipt_available,
+        )
+        .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))
+    }
+
+    /// Read the turn and phase from the program's view at the execution's
+    /// agreed step. A failed projection fails the status call rather than
+    /// reporting an empty turn.
+    async fn project_turn(
+        &self,
+        exec_id: ExecId,
+        state: &arena0_protocol::execution::ExecutionState,
+    ) -> Result<Turn, ApiError> {
+        let step = state.agreed_step();
+        if let Some((memo_step, turn)) = self.turns.lock().expect("turn memo").get(&exec_id)
+            && *memo_step == step
+        {
+            return Ok(turn.clone());
+        }
+        let program = self
+            .catalog
+            .load_program(state.binding().program_hash())
+            .await
+            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
+        let ensemble = state
+            .binding()
+            .ensemble()
+            .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
+        let shared = state.shared_state().clone();
+        let engine = Arc::clone(&self.engine);
+        // The turn and phase do not depend on the viewport; any fixed one
+        // serves.
+        let viewport = JsonBytes::try_new(
+            serde_json::to_vec(&Viewport {
+                width: 80,
+                color: arena0_protocol::ColorDepth::Mono,
+            })
+            .expect("viewport JSON"),
+        )
+        .expect("viewport fits");
+        let projection_ensemble = ensemble.clone();
+        let projection = tokio::task::spawn_blocking(move || {
+            engine
+                .load(&program)?
+                .view(&shared, &projection_ensemble, viewport)
+        })
+        .await
+        .map_err(|error| ApiError::new(ApiErrorCode::Internal, error.to_string()))?
+        .map_err(|error| {
+            ApiError::new(ApiErrorCode::Execution, format!("view projection: {error}"))
+        })?;
+        let view = parse_view(&projection, ensemble.len())?;
+        let turn = Turn {
+            turn: view
+                .turn
+                .and_then(|index| ensemble.peer_at(arena0_protocol::Participant::new(index))),
+            phase: view.phase,
+        };
+        self.turns
+            .lock()
+            .expect("turn memo")
+            .insert(exec_id, (step, turn.clone()));
+        Ok(turn)
     }
 
     async fn active_execution_count(&self) -> Result<usize, ApiError> {
@@ -3399,13 +3514,15 @@ impl HostService {
         })
     }
 
-    /// Render the program view from live or terminal shared state. Terminal
-    /// projection uses its durable snapshot after the execution actor exits.
+    /// Render the program view from live or terminal shared state, or, with
+    /// `at_step`, from the state after that agreed step. Terminal projection
+    /// uses its durable snapshot after the execution actor exits.
     async fn view(
         &self,
         exec_id: ExecId,
         width: u16,
         color: arena0_protocol::ColorDepth,
+        at_step: Option<u64>,
     ) -> Response {
         self.store
             .load_execution_request(exec_id)
@@ -3427,42 +3544,13 @@ impl HostService {
             .map_err(|error| ApiError::new(ApiErrorCode::BadRequest, error.to_string()))?;
         let viewport = JsonBytes::try_new(viewport)
             .map_err(|error| ApiError::new(ApiErrorCode::BadRequest, error.to_string()))?;
-        if state.lifecycle().is_terminal() {
-            if state.binding().execution_profile()
-                != arena0_program::ExecutionProfile::current().hash()
-            {
-                return Err(ApiError::new(
-                    ApiErrorCode::Execution,
-                    "execution profile is not supported by this runtime",
-                ));
-            }
-            let program = self
-                .catalog
-                .load_program(state.binding().program_hash())
-                .await
-                .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
-            let ensemble = state
-                .binding()
-                .ensemble()
-                .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
-            let engine = Arc::clone(&self.engine);
-            let step = state.agreed_step();
-            let shared = state.shared_state().clone();
-            let projection = tokio::task::spawn_blocking(move || {
-                engine.load(&program)?.view(&shared, &ensemble, viewport)
-            })
-            .await
-            .map_err(|error| ApiError::new(ApiErrorCode::Internal, error.to_string()))?
-            .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
-            let view = serde_json::from_slice(projection.output.as_bytes()).map_err(|error| {
-                ApiError::new(ApiErrorCode::Execution, format!("view projection: {error}"))
-            })?;
-            return Ok(ResponseOk::ExecView { step, view });
-        }
-        if !matches!(
-            state.lifecycle(),
-            ExecLifecycle::Active | ExecLifecycle::Waiting
-        ) {
+        let terminal = state.lifecycle().is_terminal();
+        if !terminal
+            && !matches!(
+                state.lifecycle(),
+                ExecLifecycle::Active | ExecLifecycle::Waiting
+            )
+        {
             return Err(ApiError::new(
                 ApiErrorCode::Execution,
                 format!(
@@ -3470,6 +3558,30 @@ impl HostService {
                     state.lifecycle()
                 ),
             ));
+        }
+        if let Some(at_step) = at_step {
+            return self.view_at_step(exec_id, &state, at_step, viewport).await;
+        }
+        if terminal {
+            let program = self.load_session_program(&state).await?;
+            let ensemble = state
+                .binding()
+                .ensemble()
+                .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
+            let ensemble_len = ensemble.len();
+            let engine = Arc::clone(&self.engine);
+            let step = state.agreed_step().checked_sub(1);
+            let shared = state.shared_state().clone();
+            let projection = tokio::task::spawn_blocking(move || {
+                engine.load(&program)?.view(&shared, &ensemble, viewport)
+            })
+            .await
+            .map_err(|error| ApiError::new(ApiErrorCode::Internal, error.to_string()))?
+            .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
+            return Ok(ResponseOk::ExecView {
+                step,
+                view: parse_view(&projection, ensemble_len)?,
+            });
         }
         let entry = self.execs.get(&exec_id).ok_or_else(|| {
             ApiError::new(ApiErrorCode::Execution, "execution has no live driver")
@@ -3479,21 +3591,107 @@ impl HostService {
         Ok(ResponseOk::ExecView { step, view })
     }
 
-    /// Read trace entries directly from the durable runtime journal.
+    /// Render the shared state after agreed step `at_step` of a session that
+    /// has started, live or terminal. The store keeps only the latest shared
+    /// state, so this replays the agreed steps `0..=at_step` in a fresh
+    /// instance; the cost grows with `at_step`.
+    async fn view_at_step(
+        &self,
+        exec_id: ExecId,
+        state: &arena0_protocol::execution::ExecutionState,
+        at_step: u64,
+        viewport: JsonBytes,
+    ) -> Response {
+        let Some(latest) = state.agreed_step().checked_sub(1) else {
+            return Err(ApiError::new(
+                ApiErrorCode::Execution,
+                "execution has no agreed step yet",
+            ));
+        };
+        if at_step > latest {
+            return Err(ApiError::new(
+                ApiErrorCode::BadRequest,
+                format!("step {at_step} is beyond the latest agreed step {latest}"),
+            ));
+        }
+        let program = self.load_session_program(state).await?;
+        let ensemble = state
+            .binding()
+            .ensemble()
+            .map_err(|error| ApiError::new(ApiErrorCode::Execution, error.to_string()))?;
+        let ensemble_len = ensemble.len();
+        let binding = state.binding().clone();
+        let local_peer = state.producer();
+        // `at_step <= latest < u64::MAX`, so the exclusive bound cannot wrap.
+        let steps = self
+            .store
+            .read_trace(exec_id, 0, at_step + 1)
+            .await
+            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
+        let engine = Arc::clone(&self.engine);
+        fn execution_error(error: impl std::fmt::Display) -> ApiError {
+            ApiError::new(ApiErrorCode::Execution, error.to_string())
+        }
+        let projection = tokio::task::spawn_blocking(move || {
+            let program = engine.load(&program).map_err(execution_error)?;
+            let shared = arena0_node::replay_shared(&program, &binding, local_peer, &steps)
+                .map_err(execution_error)?;
+            program
+                .view(&shared, &ensemble, viewport)
+                .map_err(execution_error)
+        })
+        .await
+        .map_err(|error| ApiError::new(ApiErrorCode::Internal, error.to_string()))??;
+        Ok(ResponseOk::ExecView {
+            step: Some(at_step),
+            view: parse_view(&projection, ensemble_len)?,
+        })
+    }
+
+    /// Load the program a started execution runs, refusing an execution
+    /// profile this runtime does not support.
+    async fn load_session_program(
+        &self,
+        state: &arena0_protocol::execution::ExecutionState,
+    ) -> Result<Program, ApiError> {
+        if state.binding().execution_profile() != arena0_program::ExecutionProfile::current().hash()
+        {
+            return Err(ApiError::new(
+                ApiErrorCode::Execution,
+                "execution profile is not supported by this runtime",
+            ));
+        }
+        self.catalog
+            .load_program(state.binding().program_hash())
+            .await
+            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))
+    }
+
+    /// Read agreed steps and their local certification times directly from
+    /// the durable runtime journal.
     async fn trace(
         &self,
         exec_id: ExecId,
         from: u64,
         to: u64,
-    ) -> Result<Vec<arena0_protocol::TraceEntry>, ApiError> {
+    ) -> Result<Vec<arena0_api::AgreedStep>, ApiError> {
         self.store
             .load_execution(exec_id)
             .await
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
             .ok_or_else(|| ApiError::new(ApiErrorCode::NotFound, "no such execution"))?;
         self.store
-            .read_trace(exec_id, from, to)
+            .read_agreed_steps(exec_id, from, to)
             .await
+            .map(|steps| {
+                steps
+                    .into_iter()
+                    .map(|step| arena0_api::AgreedStep {
+                        certified_at_ms: step.certified_at_ms,
+                        entry: step.entry,
+                    })
+                    .collect()
+            })
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))
     }
 
@@ -3535,17 +3733,41 @@ impl HostService {
     }
 }
 
+/// Decode a guest view projection into the protocol's [`View`](arena0_protocol::View)
+/// and check its blocks against the limits for a session of `participants`.
+/// The view is guest output, so a violation fails the request.
+fn parse_view(
+    projection: &arena0_sandbox::GuestProjectionResult,
+    participants: usize,
+) -> Result<arena0_protocol::View, ApiError> {
+    let view = serde_json::from_slice::<arena0_protocol::View>(projection.output.as_bytes())
+        .map_err(|error| {
+            ApiError::new(ApiErrorCode::Execution, format!("view projection: {error}"))
+        })?;
+    view.validate(participants).map_err(|error| {
+        ApiError::new(ApiErrorCode::Execution, format!("view projection: {error}"))
+    })?;
+    Ok(view)
+}
+
 fn project_exec_status_facts(
     peer_id: PeerId,
     request: ExecutionRequest,
     activation: Option<ActivationRecord>,
     state: Option<arena0_protocol::execution::ExecutionState>,
+    turn: Option<Turn>,
+    execution_updated_at_ms: Option<u64>,
     receipt_available: bool,
 ) -> anyhow::Result<ExecStatus> {
     let exec_id = request.execution_id();
     let program_id = request.program_hash();
     let negotiation_id = request.negotiation_id();
+    // `turn` accompanies `state`: the caller projects it for every execution
+    // aggregate, and only an aggregate yields a session status.
     let session_status = |state: &arena0_protocol::execution::ExecutionState| {
+        let turn = turn
+            .as_ref()
+            .expect("an execution aggregate is projected with its turn");
         let binding = state.binding();
         SessionStatus {
             session_id: binding.session_id(),
@@ -3560,6 +3782,8 @@ fn project_exec_status_facts(
                 callout_index: callout.callout_index,
             }),
             receipt_available,
+            turn: turn.turn,
+            phase: turn.phase.clone(),
         }
     };
 
@@ -3607,12 +3831,19 @@ fn project_exec_status_facts(
             anyhow::bail!("{lifecycle:?} execution {exec_id} has no execution aggregate")
         }
     };
+    // The latest durable transition is the most advanced record that exists:
+    // the execution row, else the activation record, else the request itself.
+    let updated_at_ms = execution_updated_at_ms
+        .or_else(|| activation.as_ref().map(ActivationRecord::updated_at_ms))
+        .unwrap_or_else(|| request.created_at_ms());
     Ok(ExecStatus {
         end,
         exec_id,
         negotiation_id,
         program_id,
         state,
+        created_at_ms: request.created_at_ms(),
+        updated_at_ms,
     })
 }
 
@@ -3635,6 +3866,8 @@ fn project_activation_inspection(record: ActivationRecord) -> ActivationInspecti
     let prepared = record.prepared();
     let offer = prepared.offer();
     let data = offer.data();
+    let params = serde_json::from_slice(data.params.as_bytes())
+        .expect("a loaded offer's params are validated JSON");
     ActivationInspection {
         state: match record.status() {
             ActivationRecordStatus::Prepared => ActivationInspectionState::Prepared,
@@ -3654,6 +3887,7 @@ fn project_activation_inspection(record: ActivationRecord) -> ActivationInspecti
                 ticket_hash: arena0_protocol::TicketHash::of(&ticket.data),
             })
             .collect(),
+        params,
     }
 }
 
@@ -4817,14 +5051,28 @@ mod tests {
         use arena0_store::{Change, TransitionRecord};
 
         let (_dir, store, daemon, peer) = test_daemon();
+        // The status projection asks the program for its turn, so the shared
+        // state must be one the real guest can decode.
+        let wasm =
+            std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "../../programs/target/wasm32-unknown-unknown/release/rock_paper_scissors.wasm",
+            ))
+            .expect("built rock_paper_scissors guest; run `just build-programs`");
+        let program = Program::try_from(wasm.clone()).expect("program");
         let (program_hash, _) = store
             .handle()
-            .register_program(vec![1, 2, 3], 1)
+            .register_program(wasm, 1)
             .await
             .expect("program");
+        let initial_shared = daemon
+            .engine
+            .load(&program)
+            .expect("load program")
+            .initialize(JsonBytes::try_new(b"null".to_vec()).expect("params"))
+            .expect("initialize program")
+            .shared;
         let execution_id = ExecId([0xB4; 32]);
         let negotiation_id = NegotiationId([0xB5; 32]);
-        let initial_shared = SharedStateBytes::try_new(vec![0]).expect("shared state");
         let TwoPartyActivation {
             other,
             producer_bls,
@@ -4837,7 +5085,7 @@ mod tests {
             &mut writer,
             activation,
             peer,
-            initial_shared,
+            initial_shared.clone(),
             LocalStateBytes::try_new(Vec::new()).expect("local state"),
         )
         .await;
@@ -4868,7 +5116,7 @@ mod tests {
         let mut next = state.clone();
         next.apply_dispatch(
             &event,
-            SharedStateBytes::try_new(vec![1]).expect("next shared"),
+            initial_shared.clone(),
             LocalStateBytes::try_new(Vec::new()).expect("local state"),
             &effects,
             Some(TerminalOutcome::new(Vec::new(), b"null".to_vec()).expect("outcome")),
@@ -5137,9 +5385,16 @@ mod tests {
             .await
             .expect("load prepared activation")
             .expect("prepared activation exists");
-        let prepared_status =
-            project_exec_status_facts(peer, request.clone(), Some(prepared_record), None, false)
-                .expect("project prepared status");
+        let prepared_status = project_exec_status_facts(
+            peer,
+            request.clone(),
+            Some(prepared_record),
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("project prepared status");
         assert!(matches!(
             prepared_status.state,
             ExecStatusState::Activating { session_id: None }
@@ -5178,9 +5433,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![peer, other]
         );
-        let committed_status =
-            project_exec_status_facts(peer, request, Some(committed_record.clone()), None, false)
-                .expect("project committed status");
+        let committed_status = project_exec_status_facts(
+            peer,
+            request,
+            Some(committed_record.clone()),
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("project committed status");
         assert!(matches!(
             committed_status.state,
             ExecStatusState::Activating {
@@ -5213,9 +5475,16 @@ mod tests {
             .await
             .expect("load failed request")
             .expect("failed request exists");
-        let failed_status =
-            project_exec_status_facts(peer, failed_request, Some(committed_record), None, false)
-                .expect("project post-commit failure");
+        let failed_status = project_exec_status_facts(
+            peer,
+            failed_request,
+            Some(committed_record),
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("project post-commit failure");
         assert!(matches!(
             failed_status.state,
             ExecStatusState::Failed {

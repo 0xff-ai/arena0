@@ -214,7 +214,8 @@ fn render_guest_view(
         area,
         format!(
             "Program view  guest output  Host {}  exact step {}",
-            snapshot.host, snapshot.step
+            snapshot.host,
+            snapshot.step_label()
         ),
         Some(&snapshot.view),
         focused,
@@ -277,7 +278,7 @@ fn render_inspector(frame: &mut Frame<'_>, state: &ScreenState, area: Rect) {
             Span::styled("Host ", state.palette.muted()),
             Span::styled(snapshot.host.to_string(), state.palette.strong()),
             Span::styled("    exact step ", state.palette.muted()),
-            Span::raw(snapshot.step.to_string()),
+            Span::raw(snapshot.step_label()),
         ]));
         for (slot, label) in [
             (Slot::Header, "Header"),

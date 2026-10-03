@@ -80,6 +80,7 @@ impl StepCertificate {
 
 /// Bounded portable evidence assembled from authoritative activation and trace rows.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ReceiptBody {
     header: SessionHeader,
     outcome: Vec<u8>,
@@ -278,6 +279,8 @@ impl StopReport {
 
 /// The portable artifact stored and exchanged by the receipt API.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(as = "ArtifactJson<ReceiptBody>"))]
 pub enum ReceiptArtifact {
     Receipt(Receipt),
     StopReport(StopReport),
@@ -289,6 +292,7 @@ pub enum ReceiptArtifact {
 /// guest to produce its JSON projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ReceiptSummary {
     /// The content identity of the verified artifact.
     pub receipt_id: ReceiptId,
@@ -309,6 +313,7 @@ pub struct ReceiptSummary {
 /// Whether an artifact proves unanimous agreement or reports a unilateral stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ReceiptKind {
     Receipt,
     StopReport,
@@ -321,6 +326,7 @@ pub enum ReceiptKind {
 /// instead of one operation overwriting the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ReceiptProvenance {
     /// The local Host produced this artifact.
     Produced,
@@ -358,6 +364,7 @@ impl ReceiptProvenance {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 struct ArtifactJson<T> {
     kind: ReceiptKind,
     body: T,

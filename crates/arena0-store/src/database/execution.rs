@@ -452,25 +452,25 @@ impl Database {
         Ok(ReceiptArtifact::new(body)?)
     }
 
-    pub(crate) fn read_trace(
+    pub(crate) fn read_agreed_steps(
         &mut self,
         execution_id: ExecId,
         from: u64,
         to: u64,
-    ) -> Result<Vec<arena0_protocol::TraceEntry>, StoreError> {
+    ) -> Result<Vec<AgreedStepRecord>, StoreError> {
         if from >= to {
             return Ok(Vec::new());
         }
         let state = self
             .load_execution_in_transaction(execution_id)?
             .ok_or(StoreError::ExecutionNotFound(execution_id))?;
-        let trace = self.load_agreed_trace_in_transaction(&state)?;
-        let end = to.min(trace.len() as u64);
+        let steps = self.load_agreed_steps_in_transaction(&state)?;
+        let end = to.min(steps.len() as u64);
         let start = usize::try_from(from.min(end))
             .map_err(|_| StoreError::Corruption("trace start overflows usize".into()))?;
         let end = usize::try_from(end)
             .map_err(|_| StoreError::Corruption("trace end overflows usize".into()))?;
-        Ok(trace[start..end].to_vec())
+        Ok(steps[start..end].to_vec())
     }
 
     pub(crate) fn read_event_summaries(
@@ -566,8 +566,22 @@ impl Database {
         &mut self,
         state: &ExecutionState,
     ) -> Result<Vec<arena0_protocol::TraceEntry>, StoreError> {
+        Ok(self
+            .load_agreed_steps_in_transaction(state)?
+            .into_iter()
+            .map(|step| step.entry)
+            .collect())
+    }
+
+    /// Every agreed step with its certification time, validated against the
+    /// execution cursor. The portable entry and the local time are read from
+    /// the same row.
+    pub(super) fn load_agreed_steps_in_transaction(
+        &mut self,
+        state: &ExecutionState,
+    ) -> Result<Vec<AgreedStepRecord>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT step, origin_event_position, version, artifact, entry_hash
+            "SELECT step, origin_event_position, version, artifact, entry_hash, certified_at_ms
              FROM agreed_steps WHERE execution_id = ?1 ORDER BY step",
         )?;
         let mut rows = statement.query(params![state.execution_id().0.to_vec()])?;
@@ -579,14 +593,17 @@ impl Database {
                 row.get::<_, i64>(2)?,
                 row.get::<_, Vec<u8>>(3)?,
                 row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, i64>(5)?,
             ));
         }
         drop(rows);
         drop(statement);
         let mut trace = Vec::with_capacity(raw.len());
         let mut trace_bytes = 0u64;
-        for (index, (step, origin_event_position, version, artifact, entry_hash)) in
-            raw.into_iter().enumerate()
+        for (
+            index,
+            (step, origin_event_position, version, artifact, entry_hash, certified_at_ms),
+        ) in raw.into_iter().enumerate()
         {
             let step = sqlite_i64(step)?;
             let expected_step = index as u64;
@@ -635,7 +652,10 @@ impl Database {
             trace_bytes += borsh::object_length(&entry)
                 .map_err(|error| StoreError::Corruption(format!("trace size: {error}")))?
                 as u64;
-            trace.push(entry);
+            trace.push(AgreedStepRecord {
+                certified_at_ms: sqlite_i64(certified_at_ms)?,
+                entry,
+            });
         }
         if trace.len() as u64 != state.agreed_step() || trace_bytes != state.trace_bytes() {
             return Err(StoreError::Corruption(
@@ -675,6 +695,7 @@ impl Database {
             proposal.event_position(),
             version,
             proposal.entry(),
+            now_ms,
         )?;
         self.persist_effects(
             execution_id,
@@ -714,13 +735,15 @@ impl Database {
         origin_event_position: u64,
         version: ExecutionVersion,
         entry: &arena0_protocol::TraceEntry,
+        now_ms: u64,
     ) -> Result<(), StoreError> {
         let bytes = borsh::to_vec(entry)
             .map_err(|error| StoreError::Corruption(format!("agreed entry encode: {error}")))?;
         self.connection.execute(
             "INSERT INTO agreed_steps
-             (execution_id, step, origin_event_position, version, artifact, entry_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (execution_id, step, origin_event_position, version, artifact, entry_hash,
+              certified_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 execution_id.0.to_vec(),
                 sqlite_u64(entry.step)?,
@@ -728,6 +751,7 @@ impl Database {
                 sqlite_u64(version.get())?,
                 envelope(EnvelopeKind::AgreedStep, &bytes)?,
                 entry.entry_hash().to_vec(),
+                sqlite_u64(now_ms)?,
             ],
         )?;
         Ok(())

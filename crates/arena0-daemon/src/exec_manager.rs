@@ -362,7 +362,7 @@ impl ExecutionHandle {
     pub(crate) async fn view(
         &self,
         viewport: arena0_program::JsonBytes,
-    ) -> Result<(u64, View), ApiError> {
+    ) -> Result<(Option<u64>, View), ApiError> {
         let (reply, rx) = oneshot::channel();
         self.running()?
             .send(ExecCommand::View { viewport, reply })

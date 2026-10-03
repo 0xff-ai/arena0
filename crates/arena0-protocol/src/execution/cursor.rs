@@ -83,6 +83,7 @@ impl fmt::Display for ExecutionVersion {
     Eq,
     Hash,
 )]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct StepCursor {
     next_step: u64,
     state_hash: StateHash,

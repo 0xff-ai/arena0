@@ -30,11 +30,11 @@ pub use events::{
 };
 pub use request::{AwaitState, EnsembleSpec, HostRequest, ProgramRefError, ReceiptRef, Request};
 pub use response::{
-    ActivationInspection, ActivationInspectionState, ActivationParticipant, ApiError, ApiErrorCode,
-    DaemonInfo, EventRecordSummary, ExecEndPhase, ExecEndStatus, ExecStatus, ExecStatusState,
-    ExecutionInspection, HostInfo, HostStatus, IdInfo, NextEvent, PendingCalloutStatus,
-    ProgramDetail, ProgramSummary, ReceiptListEntry, Response, ResponseOk, SessionProgress,
-    SessionStatus,
+    ActivationInspection, ActivationInspectionState, ActivationParticipant, AgreedStep, ApiError,
+    ApiErrorCode, BlobEntry, DaemonInfo, EventRecordSummary, ExecEndPhase, ExecEndStatus,
+    ExecStatus, ExecStatusState, ExecutionInspection, HostInfo, HostStatus, IdInfo, NextEvent,
+    PendingCalloutStatus, ProgramDetail, ProgramSummary, ReceiptListEntry, Response, ResponseOk,
+    SessionProgress, SessionStatus,
 };
 
 #[cfg(test)]
@@ -127,6 +127,7 @@ mod tests {
                     exec: ExecId([8u8; 32]),
                     width: 80,
                     color: ColorDepth::Ansi16,
+                    at_step: None,
                 },
                 "exec.view",
             ),
@@ -170,6 +171,7 @@ mod tests {
             exec: exec_id,
             width: 80,
             color: ColorDepth::Ansi16,
+            at_step: Some(3),
         };
         let exec_json = serde_json::to_value(&exec_request).unwrap();
         assert_eq!(exec_json["params"]["exec"], exec_id.to_string());
@@ -318,8 +320,12 @@ mod tests {
                         callout_index: 1,
                     }),
                     receipt_available: false,
+                    turn: None,
+                    phase: None,
                 },
             },
+            created_at_ms: 1_000,
+            updated_at_ms: 2_000,
         };
 
         let json = serde_json::to_value(&status).unwrap();

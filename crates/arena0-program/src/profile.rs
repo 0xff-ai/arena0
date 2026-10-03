@@ -446,6 +446,8 @@ impl Default for ExecutionProfile {
     Ord,
     Hash,
 )]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(type = "string"))]
 pub struct ExecutionProfileHash(pub [u8; 32]);
 
 impl ExecutionProfileHash {

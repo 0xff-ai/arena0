@@ -376,6 +376,12 @@ pub mod verified_transfer {
         ))
     }
 
+    fn view(shared: &Shared, _ensemble: &Ensemble, _vp: &Viewport) -> View {
+        View::new()
+            .state(format!("{shared:#?}"))
+            .turn(next_sender(shared))
+    }
+
     fn outcome(shared: &Shared) -> Outcome {
         Outcome {
             input: shared.input.status().unwrap_or(TransferStatus::Failed),

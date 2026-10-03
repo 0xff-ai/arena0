@@ -2586,6 +2586,7 @@ fn test_wasm(sender: Option<u8>, mode: GuestMode) -> Vec<u8> {
             params: unit.clone(),
             queries: Vec::new(),
             outcome: unit,
+            phases: Vec::new(),
         },
     };
     let metadata = definition.encode().expect("metadata");

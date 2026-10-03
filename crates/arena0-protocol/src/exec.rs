@@ -11,6 +11,7 @@ id_type!(
 
 /// The observable lifecycle of an execution, from negotiation through terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, valuable::Valuable)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ExecLifecycle {
     /// Negotiation is queued or running.
     Negotiating,

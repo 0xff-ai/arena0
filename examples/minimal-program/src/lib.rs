@@ -128,6 +128,7 @@ pub mod minimal_choice {
         };
 
         View::new()
+            .turn(next_sender(state))
             .header(vp.fit_text("Minimal choice"))
             .agents(vp.fit_text(agents))
             .state(vp.fit_text(format!("Choices received: {received} of 2")))
@@ -226,9 +227,8 @@ mod tests {
             choices: [Some(Choice::One), None],
             ..Default::default()
         };
-        let ensemble =
-            Ensemble::from_peers(vec![PeerId([1; 32]), PeerId([2; 32])])
-                .expect("valid view ensemble");
+        let ensemble = Ensemble::from_peers(vec![PeerId([1; 32]), PeerId([2; 32])])
+            .expect("valid view ensemble");
         let view = <minimal_choice::MinimalChoice as ProgramView>::view(
             &state,
             &ensemble,
