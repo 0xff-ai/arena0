@@ -14,10 +14,10 @@ struct StateColumns {
 impl StateColumns {
     fn of(state: &ExecutionState) -> Result<Self, StoreError> {
         Ok(Self {
-            participant_ids: borsh::to_vec(&state.binding().participants().collect::<Vec<_>>())
-                .map_err(|error| {
-                    StoreError::Corruption(format!("participant index encode: {error}"))
-                })?,
+            participant_ids: encode_borsh(
+                &state.binding().participants().collect::<Vec<_>>(),
+                "participant index",
+            )?,
             participants: i64::try_from(state.binding().activation().tickets().len()).unwrap(),
             callout_id: state
                 .callout()
@@ -857,8 +857,7 @@ impl Database {
         shared_state: &SharedStateBytes,
         now_ms: u64,
     ) -> Result<(), StoreError> {
-        let bytes = borsh::to_vec(entry)
-            .map_err(|error| StoreError::Corruption(format!("agreed entry encode: {error}")))?;
+        let bytes = encode_borsh(entry, "agreed entry")?;
         self.connection.execute(
             "INSERT INTO agreed_steps
              (execution_id, step, origin_event_position, version, artifact, entry_hash,

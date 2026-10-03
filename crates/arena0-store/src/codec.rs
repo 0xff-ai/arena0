@@ -178,15 +178,22 @@ pub(crate) fn encode_borsh<T: BorshSerialize + ?Sized>(
     value: &T,
     field: &str,
 ) -> Result<Vec<u8>, StoreError> {
-    let _ = (value, field);
-    todo!("STUB(store)")
+    borsh::to_vec(value).map_err(|error| StoreError::Corruption(format!("{field} encode: {error}")))
 }
 
 impl DurableEnvelope {
     /// Encode the current store envelope without changing its domain, kind, version, or checksum preimage.
     pub(crate) fn seal(kind: EnvelopeKind, payload: &[u8]) -> Result<Vec<u8>, StoreError> {
-        let _ = (kind, payload);
-        todo!("STUB(store)")
+        let checksum = Self::checksum(kind, payload);
+        let envelope = DurableEnvelope {
+            magic: ENVELOPE_MAGIC,
+            kind: kind.tag(),
+            version: ENVELOPE_VERSION,
+            payload: payload.to_vec(),
+            checksum,
+        };
+        borsh::to_vec(&envelope)
+            .map_err(|error| StoreError::Corruption(format!("durable envelope encode: {error}")))
     }
 
     /// Reject oversized envelopes before decoding, then authenticate the header, payload bound, and checksum.
@@ -195,13 +202,44 @@ impl DurableEnvelope {
         encoded: &[u8],
         max_payload: usize,
     ) -> Result<Vec<u8>, StoreError> {
-        let _ = (kind, encoded, max_payload);
-        todo!("STUB(store)")
+        let max_encoded = max_payload
+            .checked_add(MAX_ENVELOPE_OVERHEAD)
+            .ok_or_else(|| StoreError::Corruption("durable envelope size bound overflow".into()))?;
+        if encoded.len() > max_encoded {
+            return Err(StoreError::Corruption(
+                "durable envelope exceeds bound".into(),
+            ));
+        }
+        let envelope: DurableEnvelope = borsh::from_slice(encoded)
+            .map_err(|error| StoreError::Corruption(format!("durable envelope decode: {error}")))?;
+        if envelope.magic != ENVELOPE_MAGIC
+            || envelope.kind != kind.tag()
+            || envelope.version != ENVELOPE_VERSION
+        {
+            return Err(StoreError::Corruption(
+                "durable envelope header is invalid".into(),
+            ));
+        }
+        if envelope.payload.len() > max_payload {
+            return Err(StoreError::Corruption(
+                "durable envelope payload exceeds bound".into(),
+            ));
+        }
+        if envelope.checksum != Self::checksum(kind, &envelope.payload) {
+            return Err(StoreError::Corruption(
+                "durable envelope checksum mismatch".into(),
+            ));
+        }
+        Ok(envelope.payload)
     }
 
     /// Commit the envelope domain, kind, version, and exact payload bytes in their existing order.
     fn checksum(kind: EnvelopeKind, payload: &[u8]) -> [u8; 32] {
-        let _ = (kind, payload);
-        todo!("STUB(store)")
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(ENVELOPE_DOMAIN);
+        hasher.update(&kind.tag().to_le_bytes());
+        hasher.update(&ENVELOPE_VERSION.to_le_bytes());
+        hasher.update(payload);
+        *hasher.finalize().as_bytes()
     }
 }

@@ -5,7 +5,7 @@
 //! see the last committed snapshot and never block, or wait for, the
 //! execution actor's write transactions. Every method here reads index
 //! columns only (see `crate::summary`): no envelope is opened and no protocol
-//! value is decoded, so no method may call into `codec::open_envelope`,
+//! value is decoded, so no method may call into `DurableEnvelope::open`,
 //! `ExecutionState::decode`, `ReceiptArtifact::decode` or activation decoding.
 
 use super::*;

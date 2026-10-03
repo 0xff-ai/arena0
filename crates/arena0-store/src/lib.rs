@@ -2037,9 +2037,6 @@ fn decode_user_agent(bytes: Vec<u8>) -> Result<String, StoreError> {
     Ok(value)
 }
 
-#[cfg(test)]
-mod tests;
-
 impl ActivationRecord {
     /// Retain prepared evidence as the sole resumable activation candidate for this local execution.
     pub(crate) fn new_prepared(
@@ -2047,8 +2044,11 @@ impl ActivationRecord {
         prepared: PreparedActivation,
         updated_at_ms: u64,
     ) -> Self {
-        let _ = (execution_id, prepared, updated_at_ms);
-        todo!("STUB(store)")
+        Self {
+            execution_id,
+            state: ActivationRecordState::Prepared { evidence: prepared },
+            updated_at_ms,
+        }
     }
 
     /// Project validated committed evidence; constructing this in-memory record performs no I/O and cannot fail.
@@ -2057,14 +2057,29 @@ impl ActivationRecord {
         activation: Activation,
         updated_at_ms: u64,
     ) -> Self {
-        let _ = (execution_id, activation, updated_at_ms);
-        todo!("STUB(store)")
+        let prepared = activation.prepared().clone();
+        Self {
+            execution_id,
+            state: ActivationRecordState::Committed {
+                evidence: prepared,
+                activation: Box::new(activation),
+            },
+            updated_at_ms,
+        }
     }
 }
 impl ActivationRecordStatus {
     /// Parse only the current SQLite status tags; unknown stored tags are corruption, never a fallback state.
     pub(crate) fn parse(value: &str) -> Result<Self, StoreError> {
-        let _ = value;
-        todo!("STUB(store)")
+        match value {
+            "prepared" => Ok(ActivationRecordStatus::Prepared),
+            "committed" => Ok(ActivationRecordStatus::Committed),
+            other => Err(StoreError::Corruption(format!(
+                "unknown activation status {other}"
+            ))),
+        }
     }
 }
+
+#[cfg(test)]
+mod tests;
