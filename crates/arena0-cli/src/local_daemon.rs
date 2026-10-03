@@ -15,7 +15,11 @@ use tokio::process::{Child, Command};
 
 use crate::process::StderrCapture;
 
-const START_TIMEOUT: Duration = Duration::from_secs(15);
+// A cold daemon compiles every bundled program before its socket listens,
+// which takes seconds on an idle machine and far longer under load. A child
+// that exits fails startup at once (`await_ready`), so this bound only catches
+// a daemon that stays alive without ever listening.
+const START_TIMEOUT: Duration = Duration::from_secs(120);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_INTERVAL: Duration = Duration::from_millis(25);
 const STDERR_TAIL_BYTES: usize = 16 * 1024;
@@ -338,7 +342,8 @@ mod tests {
                     abi_version: 1,
                     uptime_secs: 0,
                     socket: "test.sock".to_owned(),
-                    mcp_endpoint: "127.0.0.1:0".to_owned(),
+                    http_url: "http://127.0.0.1:0".to_owned(),
+                    ui: false,
                 }))
             };
             write_frame(&mut write, &response).await?;

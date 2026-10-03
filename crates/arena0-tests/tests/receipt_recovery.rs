@@ -244,7 +244,7 @@ async fn recover_after(cut: CrashAfter) {
     });
 }
 
-/// A transport-only remote seat that acknowledges the producer's stream
+/// A transport-only remote participant that acknowledges the producer's stream
 /// responsibility. It deliberately does not apply the frame: receipt
 /// recovery owns the producer's durable terminal artifact, while this helper
 /// only prevents an absent remote actor from masking that delivery boundary.

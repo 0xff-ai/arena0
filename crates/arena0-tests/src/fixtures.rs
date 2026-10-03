@@ -131,7 +131,7 @@ pub fn encode_params(target_size: u32) -> Vec<u8> {
 }
 
 /// A single real Host execution plus raw local transports for the remaining
-/// seats. Adversarial integration tests use this to inject authenticated
+/// participants. Adversarial integration tests use this to inject authenticated
 /// frames while keeping program execution and persistence on the production
 /// boundaries.
 pub struct LiveExecution {
@@ -433,7 +433,7 @@ pub async fn complete_pending_shared(execution: &LiveExecution, cryptos: &[NodeK
     }
 }
 
-/// Consume producer-originated execution streams for raw participant seats.
+/// Consume producer-originated execution streams for raw participants.
 /// Each decoded delivery is acknowledged only through the transport receipt;
 /// no protocol or guest state is fabricated here.  The parent task owns all
 /// reader tasks so dropping [`LiveExecution`] cannot leak detached readers.
