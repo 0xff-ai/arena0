@@ -23,7 +23,7 @@ impl Database {
         let mut timers = Vec::new();
         let mut response_bytes = 0;
         while let Some(row) = rows.next()? {
-            let payload = open_envelope(
+            let payload = DurableEnvelope::open(
                 EnvelopeKind::Timer,
                 &row.get::<_, Vec<u8>>(2)?,
                 MAX_TIMER_RECORD_BYTES,
@@ -84,20 +84,18 @@ impl Database {
         timer: &TimerPayload,
         now_ms: u64,
     ) -> Result<(), StoreError> {
-        let label = borsh::to_vec(&(execution_id, event_position, ordinal))
-            .map_err(|error| StoreError::Corruption(format!("timer id encode: {error}")))?;
+        let label = encode_borsh(&(execution_id, event_position, ordinal), "timer id")?;
         let timer_id = TimerId::derive(&label);
         let deadline_ms = now_ms
             .checked_add(delay_ms)
             .ok_or_else(|| StoreError::Corruption("timer deadline overflows u64".into()))?;
-        let payload = borsh::to_vec(timer)
-            .map_err(|error| StoreError::Corruption(format!("timer payload encode: {error}")))?;
+        let payload = encode_borsh(timer, "timer payload")?;
         if payload.len() > MAX_TIMER_RECORD_BYTES {
             return Err(StoreError::Corruption(
                 "timer payload exceeds store bound".into(),
             ));
         }
-        let payload = envelope(EnvelopeKind::Timer, &payload)?;
+        let payload = DurableEnvelope::seal(EnvelopeKind::Timer, &payload)?;
         let existing = self
             .connection
             .query_row(

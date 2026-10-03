@@ -20,6 +20,22 @@ pub struct Params {
     pub result_length: u64,
 }
 
+impl Params {
+    /// Bind input_sender to the agreed bilateral ensemble; input goes to the other participant and result returns with the original hashes and bounds.
+    pub fn transfers(
+        &self,
+        ensemble: &Ensemble<Committed>,
+    ) -> Result<(Transfer, Transfer), ProgramFault> {
+        let sender = ensemble
+            .participant_of(&self.input_sender)
+            .ok_or_else(|| anyhow!("input_sender is not a participant"))?;
+        let other = Participant::new(1 - sender.as_u8());
+        let input = Transfer::new(0, sender, other, self.input_hash, self.input_length)?;
+        let result = Transfer::new(1, other, sender, self.result_hash, self.result_length)?;
+        Ok((input, result))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -35,13 +51,13 @@ mod tests {
             result_hash: BlobHash([3; 32]),
             result_length: 1,
         };
-        let (input, result) = transfers(&params, &ensemble).unwrap();
+        let (input, result) = params.transfers(&ensemble).unwrap();
         assert_eq!(input.sender(), Participant::new(1));
         assert_eq!(input.receiver(), Participant::new(0));
         assert_eq!(result.sender(), Participant::new(0));
         assert_eq!(result.receiver(), Participant::new(1));
         params.input_sender = PeerId([9; 32]);
-        assert!(transfers(&params, &ensemble).is_err());
+        assert!(params.transfers(&ensemble).is_err());
     }
 
     #[test]
@@ -165,21 +181,6 @@ mod tests {
     }
 }
 
-/// The two transfers of `params` in `ensemble`: `input` from `input_sender`
-/// to the other participant, `result` back.
-pub fn transfers(
-    params: &Params,
-    ensemble: &Ensemble<Committed>,
-) -> Result<(Transfer, Transfer), ProgramFault> {
-    let sender = ensemble
-        .participant_of(&params.input_sender)
-        .ok_or_else(|| anyhow!("input_sender is not a participant"))?;
-    let other = Participant::new(1 - sender.as_u8());
-    let input = Transfer::new(0, sender, other, params.input_hash, params.input_length)?;
-    let result = Transfer::new(1, other, sender, params.result_hash, params.result_length)?;
-    Ok((input, result))
-}
-
 #[arena0::message]
 pub enum Message {
     Input(transfer::TransferMessage),
@@ -255,7 +256,7 @@ pub mod verified_transfer {
         ctx: &mut Context<Shared, Local>,
     ) -> Result<arena0::ProgramTransition<VerifiedTransfer>, ProgramFault> {
         let params = ctx.shared().params.as_ref().expect("initialized params");
-        let (input, result) = transfers(params, ctx.ensemble())?;
+        let (input, result) = params.transfers(ctx.ensemble())?;
         input.start(ctx);
         result.start(ctx);
         ctx.mutate_shared(|shared| {

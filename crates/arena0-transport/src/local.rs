@@ -22,7 +22,7 @@ use crate::negotiation::canonical_bootstrap;
 use crate::negotiation::validate_fact_size;
 use crate::{
     AcceptedExecStream, ExecStreamMetadata, NegotiationTopic, ProgramTopicEvent, RecvHandle,
-    SendHandle, StreamState, Transport, TransportError,
+    SendHandle, StreamBinding, StreamState, Transport, TransportError,
 };
 
 const NEGOTIATION_EVENT_QUEUE_CAP: usize = 256;
@@ -543,13 +543,12 @@ impl LocalTransport {
         &self.peer_id
     }
 
+    /// Open one valid fetch or session-bound execution stream; register both endpoints before exposing the receiver, closing shared state on each failure.
     async fn open_stream(
         &self,
         peer: &PeerId,
-        proto: StreamProtocol,
-        session_hash: Option<SessionHash>,
+        binding: StreamBinding,
     ) -> Result<SendHandle, TransportError> {
-        debug_assert_eq!(proto == StreamProtocol::Exec, session_hash.is_some());
         if self.closed.is_closed() {
             return Err(TransportError::ConnectionClosed);
         }
@@ -562,6 +561,7 @@ impl LocalTransport {
         let connection_id = self.network.next_conn_id();
         let stream_id = self.network.next_stream_id();
         let cap = self.network.inner.channel_capacity;
+        let proto = binding.proto();
 
         let (tx, rx) = mpsc::channel(cap);
         let state = Arc::new(StreamState::new());
@@ -571,8 +571,7 @@ impl LocalTransport {
             remote: *peer,
             connection_id,
             stream_id,
-            proto,
-            session_hash,
+            binding,
             tx,
             state: Arc::clone(&state),
         };
@@ -581,8 +580,7 @@ impl LocalTransport {
             remote: self.peer_id,
             connection_id,
             stream_id,
-            proto,
-            session_hash,
+            binding,
             rx: Mutex::new(rx),
             state: Arc::clone(&state),
         };
@@ -613,15 +611,12 @@ impl LocalTransport {
             state.close();
             return Err(TransportError::ConnectionClosed);
         }
-        let payload = match (proto, session_hash) {
-            (StreamProtocol::Exec, Some(session_hash)) => {
-                InboundPayload::Exec(AcceptedExecStream::new(
-                    ExecStreamMetadata::new(session_hash, self.peer_id),
-                    recv_handle,
-                ))
-            }
-            (StreamProtocol::Fetch, None) => InboundPayload::Fetch(recv_handle),
-            _ => unreachable!("stream protocol and session metadata must agree"),
+        let payload = match binding {
+            StreamBinding::Exec(session_hash) => InboundPayload::Exec(AcceptedExecStream::new(
+                ExecStreamMetadata::new(session_hash, self.peer_id),
+                recv_handle,
+            )),
+            StreamBinding::Fetch => InboundPayload::Fetch(recv_handle),
         };
         if remote_tx.send(payload).await.is_err() {
             state.close();
@@ -912,12 +907,12 @@ impl Transport for LocalTransport {
         peer: &PeerId,
         session_hash: SessionHash,
     ) -> Result<SendHandle, TransportError> {
-        self.open_stream(peer, StreamProtocol::Exec, Some(session_hash))
+        self.open_stream(peer, StreamBinding::Exec(session_hash))
             .await
     }
 
     async fn open_fetch(&self, peer: &PeerId) -> Result<SendHandle, TransportError> {
-        self.open_stream(peer, StreamProtocol::Fetch, None).await
+        self.open_stream(peer, StreamBinding::Fetch).await
     }
 
     async fn accept_exec(&self) -> Result<AcceptedExecStream, TransportError> {

@@ -59,6 +59,7 @@ impl<'a> Guest<'a> {
     ) -> Result<Vec<u8>, SandboxError> {
         self.store
             .data_mut()
+            .scope
             .ledger
             .copy_bytes(len as usize, max_host_bytes)?;
         self.read_mem(ptr, len)
@@ -105,6 +106,7 @@ impl<'a> Guest<'a> {
     ) -> Result<(), SandboxError> {
         self.store
             .data_mut()
+            .scope
             .ledger
             .copy_bytes(bytes.len(), max_host_bytes)?;
         self.write_mem(offset, bytes)
@@ -208,6 +210,54 @@ impl<'a> Guest<'a> {
         self.instance
             .get_memory(&mut *self.store, exports::WORK_MEMORY)
             .ok_or_else(|| SandboxError::dispatch_failed("no 'memory' export"))
+    }
+
+    /// Charge input/output copies, decode the envelope, then zero and free successful call allocations; the caller disposes or restores the instance on error.
+    pub(super) fn call_export<O: borsh::BorshDeserialize>(
+        &mut self,
+        profile: &arena0_program::ExecutionProfile,
+        export: &str,
+        bytes: &[u8],
+    ) -> Result<(O, u64), SandboxError> {
+        let bytes_len = u32::try_from(bytes.len()).map_err(|_| {
+            SandboxError::InputLimitExceeded("call input length overflows u32".into())
+        })?;
+        let max_host = profile.limits.max_host_bytes;
+        let input_ptr = self.alloc(bytes_len)?;
+        self.write_mem_charged(input_ptr, bytes, max_host)?;
+        let (output_ptr, output_len) = self.call_pair_return(export, input_ptr, bytes_len)?;
+        let output = self.decode_output(
+            output_ptr,
+            output_len,
+            profile.limits.max_call_envelope_bytes,
+            max_host,
+        )?;
+        self.zero_mem(input_ptr, bytes_len)?;
+        self.dealloc(input_ptr, bytes_len)?;
+        let per_call = profile.fuel.per_call;
+        let fuel_used = per_call.saturating_sub(self.store.get_fuel().unwrap_or(per_call));
+        Ok((output, fuel_used))
+    }
+
+    /// Bound the returned envelope before copying; charge host bytes and zero/release the output before deserializing it.
+    pub(super) fn decode_output<O: borsh::BorshDeserialize>(
+        &mut self,
+        ptr: u32,
+        len: u32,
+        max_envelope: u64,
+        max_host: u64,
+    ) -> Result<O, SandboxError> {
+        if len as usize > max_envelope as usize {
+            return Err(SandboxError::OutputLimitExceeded {
+                size: len as u64,
+                max: max_envelope,
+            });
+        }
+        let bytes = self.read_mem_charged(ptr, len, max_host)?;
+        self.zero_mem(ptr, len)?;
+        self.dealloc(ptr, len)?;
+        borsh::from_slice(&bytes)
+            .map_err(|error| SandboxError::DeserializationFailed(error.to_string()))
     }
 }
 

@@ -29,19 +29,20 @@ impl Choice {
             Self::Defect => "\x1b[1;31m",
         }
     }
+
+    /// Return this game's canonical ordered payoff pair; the receiver owns the first score.
+    fn payoff(self, theirs: Self) -> (u32, u32) {
+        match (self, theirs) {
+            (Choice::Cooperate, Choice::Cooperate) => (3, 3),
+            (Choice::Cooperate, Choice::Defect) => (0, 5),
+            (Choice::Defect, Choice::Cooperate) => (5, 0),
+            (Choice::Defect, Choice::Defect) => (1, 1),
+        }
+    }
 }
 
 /// Table rows a view may carry; see [`arena0::types::View::validate`].
 const MAX_TABLE_ROWS: usize = 64;
-
-fn payoff(mine: Choice, theirs: Choice) -> (u32, u32) {
-    match (mine, theirs) {
-        (Choice::Cooperate, Choice::Cooperate) => (3, 3),
-        (Choice::Cooperate, Choice::Defect) => (0, 5),
-        (Choice::Defect, Choice::Cooperate) => (5, 0),
-        (Choice::Defect, Choice::Defect) => (1, 1),
-    }
-}
 
 #[arena0::message]
 pub enum Message {
@@ -120,15 +121,15 @@ impl CommitRevealLocalState<Choice> for Local {
 
 impl Shared {
     /// Score the completed round in ABSOLUTE participant order so every node runs
-    /// the identical state update. `payoff(a, b).0` is `a`'s points, so
-    /// `payoff(p0, p1)` yields `(p0_points, p1_points)` directly.
+    /// the identical state update. `a.payoff(b).0` is `a`'s points, so
+    /// `p0.payoff(p1)` yields `(p0_points, p1_points)` directly.
     fn score_round(&mut self) {
         let Some(vals) = self.commit_reveal.values() else {
             return;
         };
         let p0 = *vals[0];
         let p1 = *vals[1];
-        let (pts0, pts1) = payoff(p0, p1);
+        let (pts0, pts1) = p0.payoff(p1);
 
         self.scores[0] += pts0;
         self.scores[1] += pts1;
@@ -146,7 +147,7 @@ impl Shared {
         for (i, choices) in self.history.iter().enumerate() {
             let mine = choices[slot];
             let theirs = choices[1 - slot];
-            let (my_pts, their_pts) = payoff(mine, theirs);
+            let (my_pts, their_pts) = mine.payoff(theirs);
             history.push_str(&format!(
                 "R{}: you={mine} them={theirs} ({my_pts},{their_pts}). ",
                 i + 1,
@@ -238,7 +239,7 @@ pub mod prisoner_dilemma {
             .enumerate()
             .skip(skipped)
             .map(|(index, [p0, p1])| {
-                let (pay0, pay1) = payoff(*p0, *p1);
+                let (pay0, pay1) = p0.payoff(*p1);
                 vec![
                     Cell::text((index + 1).to_string()),
                     Cell::text(p0.glyph()).participant(0),
@@ -442,7 +443,7 @@ mod tests {
             (Choice::Defect, Choice::Cooperate, (5, 0)),
             (Choice::Defect, Choice::Defect, (1, 1)),
         ] {
-            assert_eq!(payoff(mine, theirs), expected);
+            assert_eq!(mine.payoff(theirs), expected);
         }
     }
 

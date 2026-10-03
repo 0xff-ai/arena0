@@ -26,7 +26,7 @@ impl Database {
         Ok(Some(RecoveryCandidate {
             cursor: RecoveryCursor::from_position(request.created_order()),
             request,
-            activation_status: Some(parse_activation_status(&status)?),
+            activation_status: Some(ActivationRecordStatus::parse(&status)?),
             session_id: Some(SessionHash(array32(&session, "wake session")?)),
             execution_present: true,
             program: program
@@ -74,7 +74,7 @@ impl Database {
                 .map(ProgramHash);
             let activation_status = row
                 .get::<_, Option<String>>(3)?
-                .map(|status| parse_activation_status(&status))
+                .map(|status| ActivationRecordStatus::parse(&status))
                 .transpose()?;
             let session_id = row
                 .get::<_, Option<Vec<u8>>>(4)?

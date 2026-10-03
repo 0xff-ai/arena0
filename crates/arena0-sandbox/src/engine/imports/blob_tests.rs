@@ -106,10 +106,10 @@ impl Fixture {
             DispatchKind::Local,
             Vec::new(),
         );
-        state.blobs = Some(Arc::new(view));
-        state.attachment = attachment;
-        state.peer_id = Some(PeerId([1; 32]));
-        state.session = Some(
+        state.scope.blobs = Some(Arc::new(view));
+        state.scope.attachment = attachment;
+        state.scope.peer_id = Some(PeerId([1; 32]));
+        state.scope.session = Some(
             Ensemble::<Committed>::from_peers(vec![PeerId([1; 32]), PeerId([2; 32])]).unwrap(),
         );
         let mut store = Store::new(&engine, state);
@@ -194,7 +194,7 @@ fn append_stages_after_durable_bytes_in_call_order() {
     assert_eq!(f.append(10, 1).unwrap(), 4);
     assert_eq!(f.append(11, 0).unwrap(), 3);
     assert_eq!(
-        f.store.data().staged_blobs,
+        f.store.data().scope.staged_blobs,
         vec![
             BlobChange::Append {
                 hash,
@@ -210,11 +210,11 @@ fn append_stages_after_durable_bytes_in_call_order() {
             },
         ]
     );
-    assert_eq!(f.store.data().attachment, Some(vec![2; 3]));
+    assert_eq!(f.store.data().scope.attachment, Some(vec![2; 3]));
     for attachment in [None, Some(Vec::new())] {
         let mut f = Fixture::new(View::default(), attachment);
         assert_eq!(f.append(10, 0).unwrap(), 4);
-        assert!(f.store.data().staged_blobs.is_empty());
+        assert!(f.store.data().scope.staged_blobs.is_empty());
     }
     let mut f = Fixture::new(
         View {
@@ -224,7 +224,7 @@ fn append_stages_after_durable_bytes_in_call_order() {
         Some(vec![2; 3]),
     );
     assert_eq!(f.append(10, 0).unwrap(), 3);
-    assert!(f.store.data().staged_blobs.is_empty());
+    assert!(f.store.data().scope.staged_blobs.is_empty());
 }
 
 #[test]
@@ -271,18 +271,18 @@ fn commit_hashes_durable_and_staged_bytes() {
             },
             BlobChange::Commit { hash },
         ];
-        assert_eq!(f.store.data().staged_blobs, expected);
+        assert_eq!(f.store.data().scope.staged_blobs, expected);
         assert_eq!(f.commit().unwrap(), 3);
         assert_eq!(f.append(4, 0).unwrap(), 3);
-        assert_eq!(f.store.data().staged_blobs, expected);
+        assert_eq!(f.store.data().scope.staged_blobs, expected);
     }
     let mut f = Fixture::new(View::default(), Some(vec![1]));
     assert_eq!(f.append(2, 0).unwrap(), 0);
     assert_eq!(f.commit().unwrap(), 5);
     assert_eq!(f.append(2, 0).unwrap(), 0);
-    let before = f.store.data().staged_blobs.clone();
+    let before = f.store.data().scope.staged_blobs.clone();
     assert_eq!(f.commit().unwrap(), 6);
-    assert_eq!(f.store.data().staged_blobs, before);
+    assert_eq!(f.store.data().scope.staged_blobs, before);
 }
 
 #[test]
@@ -392,7 +392,7 @@ fn blob_imports_trap_outside_local_dispatch() {
             0 => f.store.data_mut().call_kind = crate::engine::CallKind::Metadata,
             1 => f.store.data_mut().call_kind = crate::engine::CallKind::Initialize,
             2 => f.store.data_mut().dispatch = DispatchKind::Agreed,
-            3 => f.store.data_mut().blobs = None,
+            3 => f.store.data_mut().scope.blobs = None,
             _ => unreachable!(),
         }
         assert!(f.append(1, 0).is_err());
@@ -466,12 +466,12 @@ fn send_direct_checks_recipient_bounds_range_and_queue() {
         0
     );
     assert!(
-        matches!(&f.store.data().effect_queue[0], Effect::SendDirect { range: Some(r), .. } if *r == range)
+        matches!(&f.store.data().scope.effect_queue[0], Effect::SendDirect { range: Some(r), .. } if *r == range)
     );
-    f.store.data_mut().direct_queued = vec![(PeerId([2; 32]), MAX_DIRECT_QUEUE - 2)];
+    f.store.data_mut().scope.direct_queued = vec![(PeerId([2; 32]), MAX_DIRECT_QUEUE - 2)];
     assert_eq!(f.send(1, None).unwrap(), 0);
     assert_eq!(f.send(1, None).unwrap(), 1);
-    assert_eq!(f.store.data().effect_queue.len(), 2);
+    assert_eq!(f.store.data().scope.effect_queue.len(), 2);
     f.store.data_mut().dispatch = DispatchKind::Agreed;
     assert!(f.send(1, None).is_err());
 }

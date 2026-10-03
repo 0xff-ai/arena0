@@ -60,12 +60,6 @@ impl SignerSlot {
         self.calls = 0;
     }
 
-    /// Drop the signer so a later call kind cannot reuse it.
-    pub(crate) fn clear(&mut self) {
-        self.signer = None;
-        self.calls = 0;
-    }
-
     /// Borrow the installed signer.
     pub(crate) fn signer(&self) -> Option<Arc<dyn GuestSigner>> {
         self.signer.clone()

@@ -53,32 +53,6 @@ enum Pick {
     Direct,
 }
 
-/// Prefer eligible protocol evidence. Each traffic class owns its own retry
-/// clock, so a retryable direct refusal cannot stall shared agreement.
-fn next_send(
-    lane: &SendLane,
-    frames: &[([u8; 32], ExecFrame)],
-    direct_head: Option<&DirectEntry>,
-    ending: bool,
-    now: Instant,
-) -> Option<Pick> {
-    if lane.retry_at.is_none_or(|deadline| now >= deadline)
-        && let Some(index) = frames.iter().position(|(digest, _)| {
-            !lane.acked.contains(digest) && (ending || !lane.rejected.contains(digest))
-        })
-    {
-        return Some(Pick::Protocol(index));
-    }
-    if !ending
-        && direct_head.is_some()
-        && lane.direct_retry_at.is_none_or(|deadline| now >= deadline)
-    {
-        Some(Pick::Direct)
-    } else {
-        None
-    }
-}
-
 impl ExecutionActor {
     pub(super) async fn inbound(&mut self, delivery: ExecDelivery) -> Result<(), ExecError> {
         let source = delivery.source();
@@ -290,7 +264,7 @@ impl ExecutionActor {
                 continue;
             }
             let direct_head = self.state.direct_queue(peer).first();
-            let Some(pick) = next_send(lane, &frames, direct_head, ending, Instant::now()) else {
+            let Some(pick) = lane.next(&frames, direct_head, ending, Instant::now()) else {
                 continue;
             };
             let (sent, frame, entry) = match pick {
@@ -494,6 +468,33 @@ fn frame_digest(frame: &ExecFrame) -> Result<[u8; 32], ExecError> {
     Ok(*blake3::hash(&bytes).as_bytes())
 }
 
+impl SendLane {
+    /// Protocol evidence preempts direct traffic; each traffic class keeps its own retry clock, and ending suppresses direct delivery.
+    fn next(
+        &self,
+        frames: &[([u8; 32], ExecFrame)],
+        direct_head: Option<&DirectEntry>,
+        ending: bool,
+        now: Instant,
+    ) -> Option<Pick> {
+        if self.retry_at.is_none_or(|deadline| now >= deadline)
+            && let Some(index) = frames.iter().position(|(digest, _)| {
+                !self.acked.contains(digest) && (ending || !self.rejected.contains(digest))
+            })
+        {
+            return Some(Pick::Protocol(index));
+        }
+        if !ending
+            && direct_head.is_some()
+            && self.direct_retry_at.is_none_or(|deadline| now >= deadline)
+        {
+            Some(Pick::Direct)
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,13 +528,7 @@ mod tests {
     #[test]
     fn protocol_frames_preempt_direct_frames() {
         assert_eq!(
-            next_send(
-                &SendLane::default(),
-                &frames(),
-                Some(&head()),
-                false,
-                Instant::now()
-            ),
+            SendLane::default().next(&frames(), Some(&head()), false, Instant::now()),
             Some(Pick::Protocol(0))
         );
     }
@@ -546,18 +541,18 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            next_send(&lane, &frames(), Some(&head()), false, now),
+            lane.next(&frames(), Some(&head()), false, now),
             Some(Pick::Protocol(0))
         );
-        assert_eq!(next_send(&lane, &[], Some(&head()), false, now), None);
+        assert_eq!(lane.next(&[], Some(&head()), false, now), None);
         assert_eq!(
-            next_send(&lane, &[], Some(&head()), false, now + PROGRESS_INTERVAL),
+            lane.next(&[], Some(&head()), false, now + PROGRESS_INTERVAL),
             Some(Pick::Direct)
         );
         lane.direct_retry_at = None;
         lane.retry_at = Some(now + PROGRESS_INTERVAL);
         assert_eq!(
-            next_send(&lane, &frames(), Some(&head()), false, now),
+            lane.next(&frames(), Some(&head()), false, now),
             Some(Pick::Direct)
         );
     }
@@ -565,13 +560,7 @@ mod tests {
     #[test]
     fn no_direct_frames_while_ending() {
         assert_eq!(
-            next_send(
-                &SendLane::default(),
-                &[],
-                Some(&head()),
-                true,
-                Instant::now()
-            ),
+            SendLane::default().next(&[], Some(&head()), true, Instant::now()),
             None
         );
     }
@@ -581,18 +570,15 @@ mod tests {
         let mut lane = SendLane::default();
         lane.acked.insert([1; 32]);
         assert_eq!(
-            next_send(&lane, &frames(), Some(&head()), false, Instant::now()),
+            lane.next(&frames(), Some(&head()), false, Instant::now()),
             Some(Pick::Direct)
         );
         lane.acked.clear();
         lane.rejected.insert([1; 32]);
         assert_eq!(
-            next_send(&lane, &frames(), Some(&head()), false, Instant::now()),
+            lane.next(&frames(), Some(&head()), false, Instant::now()),
             Some(Pick::Direct)
         );
-        assert_eq!(
-            next_send(&lane, &frames(), None, false, Instant::now()),
-            None
-        );
+        assert_eq!(lane.next(&frames(), None, false, Instant::now()), None);
     }
 }

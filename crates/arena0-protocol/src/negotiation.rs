@@ -215,7 +215,7 @@ impl Activation {
 impl PreparedActivation {
     /// Validate and construct unsigned preparation evidence.
     pub fn new(offer: Offer, tickets: Vec<Ticket>) -> Result<Self, ActivationError> {
-        let activation_data = check_activation_structure(&offer, &tickets)?;
+        let activation_data = Self::activation_data_for(&offer, &tickets)?;
         let session_hash = SessionHash::of(&activation_data);
         Ok(Self {
             offer,
@@ -263,7 +263,7 @@ impl PreparedActivation {
     /// boundary. Normal code cannot construct an invalid value because all
     /// fields are private and [`Self::new`] is validating.
     pub fn validate(&self) -> Result<(), ActivationError> {
-        let activation_data = check_activation_structure(&self.offer, &self.tickets)?;
+        let activation_data = Self::activation_data_for(&self.offer, &self.tickets)?;
         if activation_data != self.activation_data
             || SessionHash::of(&self.activation_data) != self.session_hash
         {
@@ -280,78 +280,76 @@ impl PreparedActivation {
     }
 
     fn check_structure(&self) -> Result<(), ActivationError> {
-        check_activation_structure(&self.offer, &self.tickets).map(|_| ())
+        Self::activation_data_for(&self.offer, &self.tickets).map(|_| ())
     }
-}
 
-fn check_activation_structure(
-    offer: &Offer,
-    tickets: &[Ticket],
-) -> Result<ActivationData, ActivationError> {
-    offer.validate()?;
-    if !offer.is_complete() {
-        return Err(ActivationError::TicketSetMismatch);
-    }
-    if tickets.len() != offer.tickets.len() || tickets.len() != usize::from(offer.data.target_size)
-    {
-        return Err(ActivationError::TicketSetMismatch);
-    }
-    for (ticket, hash) in tickets.iter().zip(&offer.tickets) {
-        if TicketHash::of(&ticket.data) != *hash {
+    /// Validate the exact ordered active ticket set and its identity/key bindings before deriving activation data; preserve validation order.
+    fn activation_data_for(
+        offer: &Offer,
+        tickets: &[Ticket],
+    ) -> Result<ActivationData, ActivationError> {
+        offer.validate()?;
+        if !offer.is_complete() {
             return Err(ActivationError::TicketSetMismatch);
         }
-        ticket.validate().map_err(|error| {
-            ActivationError::InvalidTicket(TicketHash::of(&ticket.data), error.to_string())
-        })?;
-        if !matches!(ticket.data.action, TicketAction::Active { .. }) {
-            return Err(ActivationError::WithdrawnTicket(TicketHash::of(
-                &ticket.data,
-            )));
+        if tickets.len() != offer.tickets.len()
+            || tickets.len() != usize::from(offer.data.target_size)
+        {
+            return Err(ActivationError::TicketSetMismatch);
         }
-    }
-    if tickets.first().map(|ticket| ticket.data.signer) != Some(offer.data.creator) {
-        return Err(ActivationError::InvalidOrdering);
-    }
-    let mut seen = std::collections::HashSet::with_capacity(tickets.len());
-    for ticket in tickets {
-        if !seen.insert(ticket.data.signer) {
+        for (ticket, hash) in tickets.iter().zip(&offer.tickets) {
+            if TicketHash::of(&ticket.data) != *hash {
+                return Err(ActivationError::TicketSetMismatch);
+            }
+            ticket.validate().map_err(|error| {
+                ActivationError::InvalidTicket(TicketHash::of(&ticket.data), error.to_string())
+            })?;
+            if !matches!(ticket.data.action, TicketAction::Active { .. }) {
+                return Err(ActivationError::WithdrawnTicket(TicketHash::of(
+                    &ticket.data,
+                )));
+            }
+        }
+        if tickets.first().map(|ticket| ticket.data.signer) != Some(offer.data.creator) {
             return Err(ActivationError::InvalidOrdering);
         }
-    }
-    for pair in tickets[1..].windows(2) {
-        if pair[0].data.signer >= pair[1].data.signer {
-            return Err(ActivationError::InvalidOrdering);
-        }
-    }
-    let activation_data = ActivationData::new(OfferHash::of(&offer.data), offer.tickets.clone())?;
-    verify_activation_tickets(offer, tickets)?;
-    Ok(activation_data)
-}
-
-fn verify_activation_tickets(offer: &Offer, tickets: &[Ticket]) -> Result<(), ActivationError> {
-    let offer_hash = OfferHash::of(&offer.data);
-    for ticket in tickets {
-        let hash = TicketHash::of(&ticket.data);
-        match ticket.verify_for_offer(&offer_hash) {
-            Ok(()) => {}
-            Err(TicketVerificationError::IdentityMismatch) => {
-                return Err(ActivationError::InvalidTicket(
-                    hash,
-                    "identity signature mismatch".into(),
-                ));
-            }
-            Err(TicketVerificationError::KeyBindingMismatch) => {
-                return Err(ActivationError::InvalidTicket(
-                    hash,
-                    "key binding mismatch".into(),
-                ));
-            }
-            Err(error) => {
-                return Err(ActivationError::InvalidTicket(hash, error.to_string()));
+        let mut seen = std::collections::HashSet::with_capacity(tickets.len());
+        for ticket in tickets {
+            if !seen.insert(ticket.data.signer) {
+                return Err(ActivationError::InvalidOrdering);
             }
         }
+        for pair in tickets[1..].windows(2) {
+            if pair[0].data.signer >= pair[1].data.signer {
+                return Err(ActivationError::InvalidOrdering);
+            }
+        }
+        let activation_data =
+            ActivationData::new(OfferHash::of(&offer.data), offer.tickets.clone())?;
+        let offer_hash = OfferHash::of(&offer.data);
+        for ticket in tickets {
+            let hash = TicketHash::of(&ticket.data);
+            match ticket.verify_for_offer(&offer_hash) {
+                Ok(()) => {}
+                Err(TicketVerificationError::IdentityMismatch) => {
+                    return Err(ActivationError::InvalidTicket(
+                        hash,
+                        "identity signature mismatch".into(),
+                    ));
+                }
+                Err(TicketVerificationError::KeyBindingMismatch) => {
+                    return Err(ActivationError::InvalidTicket(
+                        hash,
+                        "key binding mismatch".into(),
+                    ));
+                }
+                Err(error) => {
+                    return Err(ActivationError::InvalidTicket(hash, error.to_string()));
+                }
+            }
+        }
+        Ok(activation_data)
     }
-    Ok(())
 }
 
 use borsh::{BorshDeserialize, BorshSerialize};

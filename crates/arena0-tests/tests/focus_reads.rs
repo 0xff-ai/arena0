@@ -511,19 +511,22 @@ async fn focus_reads_preserve_pages_views_and_matching_without_detail_work() {
             exec_id: ids[0].parse().unwrap()
         }
     );
-    // Session and receipt ambiguities need real published artifacts. At most
-    // seventeen sessions guarantee collisions in both first-nibble spaces.
-    // Use a fresh transport for this independent journey: the oracle restarts
-    // above exercise persisted reads, not renegotiation after peer shutdown.
     d.stop().await;
+}
+
+/// Prefix ambiguity must report the real published matches in sorted order.
+/// Seventeen completed sessions guarantee collisions in both first-nibble
+/// spaces. A fixed count keeps fixture work independent of random hash values;
+/// cumulative-sum publishes real receipts without unrelated human callouts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resolve_matches_real_session_and_receipt_prefix_collisions() {
     let mut d = Fixture::start().await;
     let ResponseOk::HostStatus(info) = ok(call(&d.a, &HostRequest::Info).await) else {
         panic!("host info");
     };
-    let rps = common::rps_wasm();
-    let rps_program = common::import(&d.a, &rps).await;
-    assert_eq!(common::import(&d.b, &rps).await, rps_program);
-    let mut proved = [false; 2];
+    let wasm = common::cumulative_sum_wasm();
+    let program = common::import(&d.a, &wasm).await;
+    assert_eq!(common::import(&d.b, &wasm).await, program);
     for index in 1..=17u8 {
         let exec_a = ExecId([0x80 + index; 32]);
         let exec_b = ExecId([0xc0 + index; 32]);
@@ -534,8 +537,8 @@ async fn focus_reads_preserve_pages_views_and_matching_without_detail_work() {
             &d.a,
             &HostRequest::ExecNew {
                 exec_id: exec_a,
-                program: rps_program.to_string(),
-                params: Some(Value::Null),
+                program: program.to_string(),
+                params: Some(serde_json::json!({ "target_size": 2 })),
                 ensemble: EnsembleSpec::Create {
                     participant_count: 2,
                 },
@@ -544,14 +547,14 @@ async fn focus_reads_preserve_pages_views_and_matching_without_detail_work() {
         )
         .await)
         else {
-            panic!("RPS creator");
+            panic!("creator");
         };
         created(
             call(
                 &d.b,
                 &HostRequest::ExecNew {
                     exec_id: exec_b,
-                    program: rps_program.to_string(),
+                    program: program.to_string(),
                     params: None,
                     ensemble: EnsembleSpec::Join {
                         target: Some(NegotiationTarget::new(info.host.peer_id, negotiation)),
@@ -566,47 +569,47 @@ async fn focus_reads_preserve_pages_views_and_matching_without_detail_work() {
                 tokio::join!(common::drive(&d.a, exec_a), common::drive(&d.b, exec_b))
             })
             .await
-            .expect("RPS session must complete within the live execution deadline");
+            .expect("session must complete within the live execution deadline");
         assert_eq!(session_a, session_b);
-        let ResponseOk::ReceiptList(entries) = ok(call(&d.a, &HostRequest::ReceiptList).await)
-        else {
-            panic!("published receipts");
-        };
-        for (space_index, kind) in [RefKind::Session, RefKind::Receipt].into_iter().enumerate() {
-            if proved[space_index] {
+    }
+    let mut proved = [false; 2];
+    let ResponseOk::ReceiptList(entries) = ok(call(&d.a, &HostRequest::ReceiptList).await) else {
+        panic!("published receipts");
+    };
+    assert_eq!(
+        entries.len(),
+        17,
+        "each completed session publishes a receipt"
+    );
+    for (space_index, kind) in [RefKind::Session, RefKind::Receipt].into_iter().enumerate() {
+        let mut ids = entries
+            .iter()
+            .map(|entry| match kind {
+                RefKind::Session => entry.session_id.to_string(),
+                RefKind::Receipt => entry.receipt_id.clone(),
+                RefKind::Exec => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 17, "published identifiers are distinct");
+        for nibble in "0123456789abcdef".chars() {
+            let matches = ids
+                .iter()
+                .filter(|id| id.starts_with(nibble))
+                .cloned()
+                .collect::<Vec<_>>();
+            if matches.len() < 2 {
                 continue;
             }
-            let mut ids = entries
-                .iter()
-                .map(|entry| match kind {
-                    RefKind::Session => entry.session_id.to_string(),
-                    RefKind::Receipt => entry.receipt_id.clone(),
-                    RefKind::Exec => unreachable!(),
-                })
-                .collect::<Vec<_>>();
-            ids.sort();
-            ids.dedup();
-            for nibble in "0123456789abcdef".chars() {
-                let matches = ids
-                    .iter()
-                    .filter(|id| id.starts_with(nibble))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if matches.len() < 2 {
-                    continue;
+            assert_eq!(
+                resolve(&d.a, kind, &nibble.to_string()).await,
+                Resolved::Ambiguous {
+                    candidates: matches.iter().take(8).cloned().collect(),
+                    matches: matches.len() as u64,
                 }
-                assert_eq!(
-                    resolve(&d.a, kind, &nibble.to_string()).await,
-                    Resolved::Ambiguous {
-                        candidates: matches.iter().take(8).cloned().collect(),
-                        matches: matches.len() as u64,
-                    }
-                );
-                proved[space_index] = true;
-                break;
-            }
-        }
-        if proved.iter().all(|done| *done) {
+            );
+            proved[space_index] = true;
             break;
         }
     }

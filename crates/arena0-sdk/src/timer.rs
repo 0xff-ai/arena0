@@ -12,6 +12,11 @@ pub(crate) fn duration_millis(delay: std::time::Duration) -> u64 {
 }
 
 /// Encode a typed timer value into the payload carried by traces and tests.
+///
+/// Timer serializers must be infallible; failures must not produce an empty payload.
+///
+/// # Panics
+/// Panics if the timer's serializer returns an error.
 #[must_use]
 pub fn timer_payload<T>(timer: T) -> TimerPayload
 where
@@ -19,7 +24,7 @@ where
 {
     TimerPayload {
         type_name: std::any::type_name::<T>().to_string(),
-        data: borsh::to_vec(&timer).unwrap_or_default(),
+        data: borsh::to_vec(&timer).expect("timer serialization"),
     }
 }
 
