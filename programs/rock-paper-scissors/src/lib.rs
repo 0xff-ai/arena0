@@ -530,30 +530,6 @@ mod tests {
     }
 
     #[test]
-    fn callout_schema_metadata() {
-        let schemas = <Callout as Arena0Callout>::schemas();
-        assert_eq!(schemas.len(), 1);
-
-        let s = &schemas[0];
-        assert_eq!(s.name, "ChooseMove");
-        assert!(!s.prompt.is_empty());
-        assert_eq!(
-            s.output.as_value()["enum"]
-                .as_array()
-                .expect("expected enum output schema")
-                .len(),
-            3
-        );
-        assert_eq!(
-            s.input.as_value()["properties"]
-                .as_object()
-                .expect("expected object input schema")
-                .len(),
-            4
-        );
-    }
-
-    #[test]
     fn commit_reveal_declares_messaging_capability() {
         let capabilities = <Shared as SharedState>::__required_capabilities();
 

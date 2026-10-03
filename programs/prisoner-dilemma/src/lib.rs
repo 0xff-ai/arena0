@@ -29,6 +29,16 @@ impl Choice {
             Self::Defect => "\x1b[1;31m",
         }
     }
+
+    /// Return this game's canonical ordered payoff pair; the receiver owns the first score.
+    fn payoff(self, theirs: Self) -> (u32, u32) {
+        match (self, theirs) {
+            (Choice::Cooperate, Choice::Cooperate) => (3, 3),
+            (Choice::Cooperate, Choice::Defect) => (0, 5),
+            (Choice::Defect, Choice::Cooperate) => (5, 0),
+            (Choice::Defect, Choice::Defect) => (1, 1),
+        }
+    }
 }
 
 /// Table rows a view may carry; see [`arena0::types::View::validate`].
@@ -485,13 +495,5 @@ mod tests {
                 .len(),
             3
         );
-    }
-}
-
-impl Choice {
-    /// Return this game's canonical ordered payoff pair; the receiver owns the first score.
-    fn payoff(self, theirs: Self) -> (u32, u32) {
-        let _ = theirs;
-        todo!("STUB(client-guests)")
     }
 }
