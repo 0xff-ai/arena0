@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Build artifacts are packed once; publication consumes those exact tarballs.
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -39,6 +39,42 @@ function verifyArtifacts(directory, selected, revision, version) {
   return dirty;
 }
 
+// The main package bundles the built web UI of the arena0-ui release pinned in
+// npm/ui.json ({name, version, integrity}); the launcher points the daemon at
+// it. ARENA0_UI_TARBALL names a local tarball of that release, else
+// `npm pack name@version` fetches it from the registry into a temporary
+// directory. The tarball's sha512 integrity must equal the pin (an empty or
+// malformed pin fails too) before anything is copied. Its package/dist/**
+// then becomes <mainPackageDir>/ui/**, which must hold ui/index.html.
+function bundleUi(mainPackageDir) {
+  const pin = json(join(root, 'npm/ui.json'));
+  const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+  if (pin.name !== '@0xff-ai/arena0-ui' || typeof pin.version !== 'string' || !semver.test(pin.version)
+      || typeof pin.integrity !== 'string' || !/^sha512-[A-Za-z0-9+/]+={0,2}$/.test(pin.integrity)) {
+    throw new Error('Invalid UI pin in npm/ui.json: require @0xff-ai/arena0-ui, a semver version and sha512 integrity');
+  }
+  const temporary = mkdtempSync(join(tmpdir(), 'arena0-ui-'));
+  try {
+    let tarball;
+    if (process.env.ARENA0_UI_TARBALL) {
+      tarball = resolve(process.env.ARENA0_UI_TARBALL);
+    } else {
+      const [packed] = JSON.parse(run('npm', ['pack', `${pin.name}@${pin.version}`, '--json', '--pack-destination', temporary]));
+      tarball = join(temporary, packed.filename);
+    }
+    const integrity = `sha512-${digest(tarball, 'sha512', 'base64')}`;
+    if (integrity !== pin.integrity) throw new Error(`UI integrity mismatch: expected ${pin.integrity}, got ${integrity}`);
+    const extracted = join(temporary, 'extracted');
+    mkdirSync(extracted);
+    run('tar', ['-xzf', tarball, '-C', extracted]);
+    const dist = join(extracted, 'package/dist');
+    if (!existsSync(join(dist, 'index.html'))) throw new Error('UI tarball is missing package/dist/index.html');
+    cpSync(dist, join(mainPackageDir, 'ui'), { recursive: true });
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+}
+
 function pack(artifactDirectory, outputDirectory, platform) {
   if (!artifactDirectory || !outputDirectory || (platform && !platforms.includes(platform))) {
     throw new Error('Usage: node npm/release.mjs pack <artifacts> <new-output-directory> [linux-x64|darwin-arm64]');
@@ -51,16 +87,18 @@ function pack(artifactDirectory, outputDirectory, platform) {
   const output = resolve(outputDirectory);
   if (existsSync(output)) throw new Error(`Output already exists: ${output}; choose a new directory to preserve packed artifacts.`);
   mkdirSync(output, { recursive: true });
-  const staging = mkdtempSync(join(tmpdir(), 'arena0-npm-stage-'));
+  let staging;
   const packages = [];
   try {
+    staging = mkdtempSync(join(tmpdir(), 'arena0-npm-stage-'));
     for (const target of selected) {
       process.stdout.write(run(process.execPath, [join(root, 'npm/assemble.mjs'), target, resolve(artifactDirectory, target), version, staging]));
     }
+    bundleUi(join(staging, 'arena0'));
     for (const packageName of [...selected.map(target => `arena0-${target}`), 'arena0']) {
       const [packed] = JSON.parse(run('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', output, join(staging, packageName)]));
       const expectedFiles = packageName === 'arena0'
-        ? ['bin/arena0.js', 'bin/arena0d.js', 'bin/cargo-arena0.js', 'bin/launch.js', 'examples/minimal-program/Cargo.toml', 'examples/minimal-program/src/lib.rs', 'examples/minimal-program/README.md', 'examples/minimal-program/rust-toolchain.toml']
+        ? ['bin/arena0.js', 'bin/arena0d.js', 'bin/cargo-arena0.js', 'bin/launch.js', 'examples/minimal-program/Cargo.toml', 'examples/minimal-program/src/lib.rs', 'examples/minimal-program/README.md', 'examples/minimal-program/rust-toolchain.toml', 'ui/index.html']
         : binaries.map(binary => `bin/${binary}`);
       expectedFiles.push('package.json', 'README.md', 'LICENSE-APACHE', 'LICENSE-MIT');
       for (const file of expectedFiles) {
@@ -75,8 +113,11 @@ function pack(artifactDirectory, outputDirectory, platform) {
       console.log(`Packed ${packed.name}@${version}: ${packed.size} bytes`);
     }
     writeFileSync(join(output, 'manifest.json'), JSON.stringify({ revision, version, dirty, platforms: selected, packages }, null, 2) + '\n');
+  } catch (error) {
+    rmSync(output, { recursive: true, force: true });
+    throw error;
   } finally {
-    rmSync(staging, { recursive: true, force: true });
+    if (staging) rmSync(staging, { recursive: true, force: true });
   }
   console.log(`Packed release: ${output}`);
 }

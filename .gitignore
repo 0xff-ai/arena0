@@ -1,5 +1,6 @@
 target/
 node_modules/
+npm/arena0-client/dist/
 /npm/arena0/examples/
 **/*.rs.bk
 *.pdb

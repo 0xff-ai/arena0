@@ -33,42 +33,43 @@ public transition and retain signed evidence of the execution.
 
 ## Install and run
 
-<!--
-```bash
+```console
 npm install --global @0xff-ai/arena0
 
 # run either:
-# 1. a local sandbox for manual testing
+# 1. the browser workspace for manual testing
 arena0
 
-# 2. two Codex agents in an temp workspace, preloaded with the arena0 skill,
+# 2. two Codex agents in a temp workspace, preloaded with the arena0 skill,
 # ready to play chess, rock-paper-scissors, or Prisoner's Dilemma with each other
 # launches in tmux or herdr
-arena0 launch --agents
+arena0 launch --agents chess
 ```
 
-Run `arena0` instead to open the local workspace for human input and built-in
-policies.
--->
+The package supports macOS 14 or newer on Apple silicon and Linux x64 with
+glibc 2.35 or newer. The browser workspace lives in
+[arena0-ui](https://github.com/0xff-ai/arena0-ui) and ships inside the npm package.
+To build from source instead, with Rust installed:
 
 ```console
 git clone https://github.com/0xff-ai/arena0.git
 cd arena0
 make
-
-# run either:
-# 1. a local sandbox for manual testing
-arena0
-
-# 2. two Codex agents in an temp workspace, preloaded with the arena0 skill,
-# ready to play chess, rock-paper-scissors, or Prisoner's Dilemma with each other
-# launches in tmux or herdr
-arena0 launch --agents
 ```
+
+A source build has no browser workspace; bare `arena0` explains how to get one.
+Set `ARENA0_UI_DIR=/path/to/arena0-ui/dist` to serve a local browser workspace build.
+
+With the browser workspace installed, bare `arena0` opens it on a terminal,
+as does `arena0 ui`.
+It starts a daemon when none runs; Ctrl-C stops only the daemon it started.
+Use `arena0 ui --attach` to observe a running daemon.
+`arena0 launch PROGRAM` runs headlessly; `arena0 run PROGRAM --human HOST`
+answers callouts at the terminal prompt.
 
 ## Demos
 
-Run `arena0 launch --agents` to start two autonomous Codex participants in
+Run `arena0 launch --agents PROGRAM` to start two autonomous Codex participants in
 adjacent panes. Each participant discovers its peer, retains its execution ID,
 prints the program-authored view before every answer, and verifies the shared
 receipt when the interaction completes.
@@ -140,8 +141,8 @@ Smaller examples: [Cumulative sum](programs/cumulative-sum) · [Sequential count
 - **Universal agreement:** the protocol requires N-of-N agreement to advance the program at every state transition. Lighter p2p consensus models are also being studied.
 - **Signed, verifiable evidence:** each participant produces the same canonical receipt if the program completes, or an authenticated unilateral stop report if it stops unilaterally.
 - **Portable verification:** proofs can be verified without access to the arena0 program itself.
-- **Human and agent interfaces:** participate through interactive input, built-in policies, executable agents, or the local CLI.
-- **Inspectable execution:** follow program state, messages, agreement, and activity through the tracing subsystem and the TUI.
+- **Human and agent interfaces:** participate through interactive input, executable agents, external clients, or the local CLI.
+- **Inspectable execution:** inspect daemon facts through the browser workspace and follow activity through the tracing subsystem.
 - **Composable programs:** bundled examples and SDK primitives cover auctions, work allocation, games, commit-reveal, turn-taking, and voting.
 
 ## Roadmap
@@ -202,7 +203,7 @@ networks, identity providers, and application services.
 ## Documentation
 
 - [Architecture](docs/architecture.md): programs, participants, agreement, effects, and execution evidence.
-- [Getting started](docs/getting-started.md): install, run, connect agents, monitor, and verify.
+- [Getting started](docs/getting-started.md): install, run, connect agents, open the browser workspace, and verify.
 - [Programming](docs/programming.md): SDK, state machines, primitives, schemas, and tests.
 - [Contributing](docs/contributing.md): repository setup, development checks, and change rules.
 - [Technical overview](docs/technical-overview.md): implementation structure and ownership.

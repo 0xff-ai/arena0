@@ -30,13 +30,17 @@ to all linked worktrees; rerun the installer after changing the hook. Hooks are
 local safeguards and can be bypassed with `--no-verify`.
 
 Install the Rust toolchain from `rust-toolchain.toml` and
-[just](https://github.com/casey/just), and `jq`, then run:
+[just](https://github.com/casey/just), `jq`, and Node 22 or newer. Enable pnpm
+through Corepack; the `packageManager` field in `npm/arena0-client/package.json` pins its
+version. Then run:
 
 ```bash
+corepack enable
 just build-programs
 just build
 just check
 just test
+just check-client test-client
 just doc
 ```
 

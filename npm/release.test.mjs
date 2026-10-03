@@ -1,16 +1,34 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-function fixture(t) {
+function fixture(t, ui = false) {
   const root = mkdtempSync(join(tmpdir(), 'arena0-release-test-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   for (const dir of ['npm', 'bin', 'packed']) mkdirSync(join(root, dir));
   copyFileSync(new URL('./release.mjs', import.meta.url), join(root, 'npm/release.mjs'));
+  // Match assemble.mjs's authored inputs; local builds and staged artifacts
+  // must not enter fixtures or make their disk usage depend on the checkout.
+  copyFileSync(new URL('./assemble.mjs', import.meta.url), join(root, 'npm/assemble.mjs'));
+  for (const pkg of ['arena0', 'arena0-darwin-arm64', 'arena0-linux-x64']) {
+    mkdirSync(join(root, 'npm', pkg));
+    for (const file of ['package.json', 'README.md']) {
+      copyFileSync(new URL(`./${pkg}/${file}`, import.meta.url), join(root, 'npm', pkg, file));
+    }
+  }
+  mkdirSync(join(root, 'npm/arena0/bin'));
+  for (const file of ['arena0.js', 'arena0d.js', 'cargo-arena0.js', 'launch.js']) {
+    copyFileSync(new URL(`./arena0/bin/${file}`, import.meta.url), join(root, 'npm/arena0/bin', file));
+  }
+  mkdirSync(join(root, 'examples/minimal-program/src'), { recursive: true });
+  for (const file of ['examples/minimal-program/Cargo.toml', 'examples/minimal-program/README.md',
+    'examples/minimal-program/rust-toolchain.toml', 'examples/minimal-program/src/lib.rs', 'LICENSE-APACHE', 'LICENSE-MIT']) {
+    cpSync(new URL(`../${file}`, import.meta.url), join(root, file));
+  }
   writeFileSync(join(root, 'Cargo.toml'), '[workspace.package]\nversion = "1.2.3"\n');
   for (const args of [['init', '-q'], ['add', '.'], ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture']]) {
     assert.equal(spawnSync('git', args, { cwd: root }).status, 0);
@@ -24,10 +42,35 @@ function fixture(t) {
     manifest.packages.push({ name: `@0xff-ai/arena0${suffix}`, filename,
       integrity: `sha512-${createHash('sha512').update(bytes).digest('base64')}` });
   }
-  // All registry commands in this suite hit this executable, never npm.
+  if (ui) {
+    const dir = join(root, 'dist/darwin-arm64'); mkdirSync(dir, { recursive: true });
+    const artifact = { platform: 'darwin-arm64', version: '1.2.3', revision, dirty: false, binaries: {} };
+    for (const binary of ['arena0', 'arena0d', 'cargo-arena0']) {
+      writeFileSync(join(dir, binary), binary);
+      artifact.binaries[binary] = createHash('sha256').update(binary).digest('hex');
+    }
+    writeFileSync(join(dir, 'manifest.json'), JSON.stringify(artifact));
+    mkdirSync(join(root, 'ui-source/package/dist/assets'), { recursive: true });
+    writeFileSync(join(root, 'ui-source/package/package.json'), JSON.stringify({ name: '@0xff-ai/arena0-ui', version: '0.1.0' }));
+    if (ui !== 'missing index') writeFileSync(join(root, 'ui-source/package/dist/index.html'), '<script src="assets/app.js"></script>');
+    writeFileSync(join(root, 'ui-source/package/dist/assets/app.js'), 'console.log("fixture")');
+    assert.equal(spawnSync('tar', ['-czf', join(root, 'ui.tgz'), '-C', join(root, 'ui-source'), 'package']).status, 0);
+    writeFileSync(join(root, 'npm/ui.json'), JSON.stringify({ name: '@0xff-ai/arena0-ui', version: '0.1.0',
+      integrity: `sha512-${createHash('sha512').update(readFileSync(join(root, 'ui.tgz'))).digest('base64')}` }));
+  }
+  // Registry operations are simulated; local package packing uses the real npm.
   writeFileSync(join(root, 'bin/npm'), `#!${process.execPath}\nconst fs = require('node:fs');
     const args = process.argv.slice(2);
     fs.appendFileSync(process.env.CALL_LOG, JSON.stringify(args) + '\\n');
+    if (args[0] === 'pack') {
+      if (args[1].startsWith('@0xff-ai/arena0-ui@')) {
+        fs.copyFileSync(process.env.UI_FIXTURE, require('node:path').join(args[args.indexOf('--pack-destination') + 1], 'ui.tgz'));
+        console.log(JSON.stringify([{ filename: 'ui.tgz' }]));
+      } else {
+        const result = require('node:child_process').spawnSync('npm', args, { env: { ...process.env, PATH: process.env.REAL_PATH }, stdio: 'inherit' });
+        process.exitCode = result.status ?? 1;
+      }
+    }
     if (args[0] === 'view') {
       const responses = JSON.parse(process.env.VIEW_RESPONSES || '{}');
       const response = responses[args[1]];
@@ -40,10 +83,53 @@ function fixture(t) {
     save() { writeFileSync(join(root, 'packed/manifest.json'), JSON.stringify(manifest)); },
     run(args = ['publish', join(root, 'packed')], env = {}) {
       return spawnSync(process.execPath, [join(root, 'npm/release.mjs'), ...args], { encoding: 'utf8',
-        env: { ...process.env, PATH: `${root}/bin:${process.env.PATH}`, CALL_LOG: join(root, 'calls.jsonl'), VIEW_RESPONSES: '{}', ...env } });
+        env: { ...process.env, ARENA0_UI_TARBALL: '', REAL_PATH: process.env.PATH, UI_FIXTURE: join(root, 'ui.tgz'), PATH: `${root}/bin:${process.env.PATH}`, CALL_LOG: join(root, 'calls.jsonl'), VIEW_RESPONSES: '{}', ...env } });
     },
     calls() { return existsSync(join(root, 'calls.jsonl')) ? readFileSync(join(root, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) : []; },
   };
+}
+
+for (const local of [true, false]) {
+  test(`packing bundles the pinned UI from ${local ? 'a local tarball' : 'npm'}`, t => {
+    const f = fixture(t, true);
+    const output = join(f.root, 'candidate');
+    const result = f.run(['pack', join(f.root, 'dist'), output, 'darwin-arm64'], local ? { ARENA0_UI_TARBALL: join(f.root, 'ui.tgz') } : {});
+    assert.equal(result.status, 0, result.stderr);
+    const manifest = JSON.parse(readFileSync(join(output, 'manifest.json')));
+    const listing = spawnSync('tar', ['-tzf', join(output, manifest.packages.at(-1).filename)], { encoding: 'utf8' });
+    assert.equal(listing.status, 0, listing.stderr);
+    assert.ok(listing.stdout.split('\n').includes('package/ui/index.html'));
+    assert.ok(listing.stdout.split('\n').includes('package/ui/assets/app.js'));
+    const downloads = f.calls().filter(args => args[1] === '@0xff-ai/arena0-ui@0.1.0');
+    assert.equal(downloads.length, local ? 0 : 1);
+    if (!local) {
+      assert.deepEqual(downloads[0].slice(0, 4), ['pack', '@0xff-ai/arena0-ui@0.1.0', '--json', '--pack-destination']);
+      assert.equal(downloads[0].length, 5);
+      assert.ok(!existsSync(downloads[0][4]), 'download directory is removed');
+    }
+  });
+}
+
+for (const problem of ['integrity mismatch', 'empty integrity', 'missing index']) {
+  test(`UI ${problem} removes the packing output`, t => {
+    const f = fixture(t, problem);
+    const pinPath = join(f.root, 'npm/ui.json');
+    const pin = JSON.parse(readFileSync(pinPath));
+    const actual = pin.integrity;
+    if (problem === 'integrity mismatch') pin.integrity = 'sha512-different';
+    if (problem === 'empty integrity') pin.integrity = '';
+    writeFileSync(pinPath, JSON.stringify(pin));
+    const output = join(f.root, 'candidate');
+    const result = f.run(['pack', join(f.root, 'dist'), output, 'darwin-arm64'], problem === 'empty integrity' ? {} : { ARENA0_UI_TARBALL: join(f.root, 'ui.tgz') });
+    assert.notEqual(result.status, 0);
+    assert.ok(!existsSync(output));
+    if (problem === 'integrity mismatch') {
+      assert.ok(result.stderr.includes(pin.integrity));
+      assert.ok(result.stderr.includes(actual));
+    }
+    if (problem === 'missing index') assert.match(result.stderr, /index\.html/);
+    if (problem === 'empty integrity') assert.deepEqual(f.calls(), []);
+  });
 }
 
 test('default publication mode dry-runs the exact tarballs, platforms before wrapper', t => {

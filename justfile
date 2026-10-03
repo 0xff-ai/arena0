@@ -17,6 +17,21 @@ build-release: build-programs
 build-linux-release:
     ./scripts/build-linux-release.sh
 
+# Regenerate the TypeScript client's wire types from crates/arena0-api.
+client-types:
+    cargo run --quiet --locked -p arena0-api --features ts --example export_ts > npm/arena0-client/src/types.gen.ts
+
+# Check generated type freshness and the TypeScript client.
+check-client:
+    cargo run --quiet --locked -p arena0-api --features ts --example export_ts | diff -u npm/arena0-client/src/types.gen.ts -
+    cd npm/arena0-client && pnpm install --frozen-lockfile && pnpm typecheck
+
+# Exercise the built client against this checkout's real daemon.
+test-client: build-programs
+    cargo build --locked -p arena0d
+    cd npm/arena0-client && pnpm install --frozen-lockfile && pnpm build
+    node --test --experimental-eventsource npm/arena0-client/test/client.test.mjs
+
 # Run host and program tests (programs wasm first so integration tests do not skip).
 # The doctest line covers the crate doc-tests (incl. the arena0-sdk compile_fail
 # doctest), which `cargo nextest run` does not run by default.
@@ -77,7 +92,7 @@ audit:
     cargo audit --file programs/Cargo.lock
 
 # All local gates for a release-facing change.
-release-check: audit check test doc build-release
+release-check: audit check check-client test doc test-client build-release
 
 # Start the default two-Host local Ensemble.
 dev: build-programs

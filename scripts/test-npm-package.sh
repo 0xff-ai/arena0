@@ -38,7 +38,12 @@ fi
 # macOS /tmp and caller-provided prefixes may contain symlink ancestors.
 smoke_root=$(cd "$smoke_root" && pwd -P)
 service_pid=
+ui_pid=
 cleanup() {
+  if [[ -n "$ui_pid" ]]; then
+    kill -INT "$ui_pid" 2>/dev/null || true
+    wait "$ui_pid" || true
+  fi
   if [[ -n "$service_pid" ]]; then
     child_pid=$(pgrep -P "$service_pid" | head -n 1 || true)
     kill -TERM "$service_pid" 2>/dev/null || true
@@ -126,7 +131,7 @@ if [[ ! -S "$smoke_root/home/arena0.sock" ]]; then
 fi
 env -u ARENA0_CONTEXT -u CODEX_THREAD_ID -u ARENA0_SOCKET -u ARENA0_HOST \
   ARENA0_HOME="$smoke_root/home" "$bin_dir/arena0" --json run rock-paper-scissors \
-  --builtin host-01=sample --builtin host-02=sample \
+  --agent host-01="$repo_root/examples/agents/first_allowed.py" --agent host-02="$repo_root/examples/agents/first_allowed.py" \
   > "$smoke_root/interaction.json"
 node - "$smoke_root/interaction.json" <<'JS'
 const assert = require('node:assert/strict');
@@ -138,3 +143,39 @@ assert.equal(result.verified.receipts.length, 2);
 assert.equal(new Set(result.verified.receipts.map(receipt => receipt.peer_id)).size, 2);
 JS
 echo "npm smoke test completed and verified both receipts of an interaction between two participants"
+
+# Bare `arena0` opens the browser workspace, so the installed daemon must serve
+# the UI the package bundles: the page and the script it loads. `--attach`
+# borrows the running service; Ctrl-C (SIGINT) leaves that service running.
+env -u ARENA0_CONTEXT -u CODEX_THREAD_ID -u ARENA0_SOCKET -u ARENA0_HOST \
+  ARENA0_HOME="$smoke_root/home" "$bin_dir/arena0" --json ui --attach --no-open \
+  > "$smoke_root/ui.json" 2> "$smoke_root/ui.log" &
+ui_pid=$!
+for ((attempt = 0; attempt < 200; attempt++)); do
+  if [[ -s "$smoke_root/ui.json" ]]; then break; fi
+  if ! kill -0 "$ui_pid" 2>/dev/null; then
+    cat "$smoke_root/ui.log" >&2
+    echo "installed arena0 ui exited before printing its URL" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+node - "$smoke_root/ui.json" <<'JS'
+const assert = require('node:assert/strict');
+(async () => {
+  const { url } = JSON.parse(require('node:fs').readFileSync(process.argv[2], 'utf8'));
+  const page = await fetch(url);
+  assert.equal(page.status, 200);
+  const html = await page.text();
+  assert.match(html, /<div id="root">/);
+  const script = html.match(/<script[^>]*\ssrc="([^"]+)"/);
+  assert.ok(script, 'the workspace page loads no script');
+  const asset = await fetch(new URL(script[1], url));
+  assert.equal(asset.status, 200);
+  assert.match(asset.headers.get('content-type') ?? '', /javascript/);
+})().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
+JS
+echo "npm smoke test served the browser workspace from the installed daemon"
