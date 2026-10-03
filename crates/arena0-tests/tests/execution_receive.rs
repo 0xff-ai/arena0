@@ -16,7 +16,7 @@ use arena0_protocol::{
 use arena0_tests::assert::wait_for_entry;
 use arena0_tests::fixtures::{
     LIVE_EXECUTION_TIMEOUT, LiveExecution, complete_pending_shared, establish_live_session,
-    message_frame, ordering_program_wasm, provider, spawn_live_execution,
+    ordering_program_wasm, provider, spawn_live_execution, step_message_frame,
 };
 use arena0_transport::Transport;
 
@@ -149,16 +149,8 @@ async fn contradictory_abort_cursors_leave_receiver_serving_other_peers() {
 async fn future_message_is_retried_after_public_head_catches_up() {
     let execution = harness(false).await;
     establish_session(&execution).await;
-    let source = execution.peer_ids[1];
 
-    let future = message_frame(
-        execution.session_hash,
-        source,
-        2,
-        execution.initial_state,
-        execution.agreed_link().await,
-        0xA2,
-    );
+    let future = step_message_frame(2, execution.agreed_link().await, Some(0xA2));
     assert!(matches!(
         execution.participant_stream(1).send_exec(&future).await,
         Err(arena0_transport::TransportError::ExecNotYet)
@@ -175,37 +167,32 @@ async fn future_message_is_retried_after_public_head_catches_up() {
         "future frame cannot advance the public head"
     );
 
+    let link = execution.agreed_link().await;
     execution
-        .send_from(
-            1,
-            &message_frame(
-                execution.session_hash,
-                source,
-                1,
-                execution.initial_state,
-                execution.agreed_link().await,
-                0xA1,
-            ),
-        )
+        .send_from(1, &step_message_frame(1, link, Some(0xA1)))
+        .await;
+    execution
+        .send_from(2, &step_message_frame(1, link, None))
         .await;
     complete_pending_shared(&execution, &cryptos()).await;
     let _ = wait_for_entry(&execution.store_handle, execution.exec_id, 1).await;
     // The retried frame binds the link after step 1.
-    let future = message_frame(
-        execution.session_hash,
-        source,
-        2,
-        execution.initial_state,
-        execution.agreed_link().await,
-        0xA2,
-    );
+    let future = step_message_frame(2, execution.agreed_link().await, Some(0xA2));
     execution.send_from(1, &future).await;
+    execution
+        .send_from(
+            2,
+            &step_message_frame(2, execution.agreed_link().await, None),
+        )
+        .await;
     complete_pending_shared(&execution, &cryptos()).await;
     let trace = wait_for_entry(&execution.store_handle, execution.exec_id, 2).await;
     let payloads = trace
         .iter()
         .filter_map(|entry| match &entry.event {
-            arena0_protocol::StepEvent::Message { data, .. } => data.first().copied(),
+            arena0_protocol::StepEvent::Messages { messages } => {
+                messages.first().map(|message| message.data[0])
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -216,23 +203,16 @@ async fn future_message_is_retried_after_public_head_catches_up() {
 async fn rejected_shared_message_fails_without_advancing_the_public_trace() {
     let mut execution = harness(true).await;
     establish_session(&execution).await;
-    let source = execution.peer_ids[1];
+    let link = execution.agreed_link().await;
     execution
-        .send_from(
-            1,
-            &message_frame(
-                execution.session_hash,
-                source,
-                1,
-                execution.initial_state,
-                execution.agreed_link().await,
-                0x01,
-            ),
-        )
+        .send_from(1, &step_message_frame(1, link, Some(0x01)))
+        .await;
+    execution
+        .send_from(2, &step_message_frame(1, link, None))
         .await;
     let reason = terminal_reason(&mut execution.spawned).await;
     assert!(
-        reason.starts_with("diverged at step 1: program rejected the writer message"),
+        reason.starts_with("diverged at step 1: program rejected the step"),
         "{reason}"
     );
     let trace = execution
@@ -260,36 +240,25 @@ async fn rejected_shared_message_fails_without_advancing_the_public_trace() {
 async fn duplicate_position_does_not_replace_the_first_public_entry() {
     let execution = harness(false).await;
     establish_session(&execution).await;
-    let source = execution.peer_ids[1];
+    let link = execution.agreed_link().await;
     execution
-        .send_from(
-            1,
-            &message_frame(
-                execution.session_hash,
-                source,
-                1,
-                execution.initial_state,
-                execution.agreed_link().await,
-                0x10,
-            ),
-        )
+        .send_from(1, &step_message_frame(1, link, Some(0x10)))
+        .await;
+    // A second, different payload from the same sender for the same step is
+    // conflict evidence while the step is still collecting, so delivery is
+    // refused and the held payload is untouched.
+    assert!(matches!(
+        execution
+            .participant_stream(1)
+            .send_exec(&step_message_frame(1, link, Some(0x20)))
+            .await,
+        Err(arena0_transport::TransportError::ExecConflict)
+    ));
+    execution
+        .send_from(2, &step_message_frame(1, link, None))
         .await;
     complete_pending_shared(&execution, &cryptos()).await;
     let _ = wait_for_entry(&execution.store_handle, execution.exec_id, 1).await;
-    execution
-        .send_from(
-            1,
-            &message_frame(
-                execution.session_hash,
-                source,
-                1,
-                execution.initial_state,
-                execution.agreed_link().await,
-                0x20,
-            ),
-        )
-        .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
     let trace = execution
         .store_handle
         .read_trace(execution.exec_id, 0, u64::MAX)
@@ -298,7 +267,9 @@ async fn duplicate_position_does_not_replace_the_first_public_entry() {
     let payloads = trace
         .iter()
         .filter_map(|entry| match &entry.event {
-            arena0_protocol::StepEvent::Message { data, .. } => data.first().copied(),
+            arena0_protocol::StepEvent::Messages { messages } => {
+                messages.first().map(|message| message.data[0])
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -309,19 +280,15 @@ async fn duplicate_position_does_not_replace_the_first_public_entry() {
 async fn non_participant_frame_is_rejected_without_mutating_execution() {
     let execution = harness(false).await;
     establish_session(&execution).await;
-    let outsider = *execution.transports[3].peer_id();
     let send = execution.transports[3]
         .open_exec(&execution.peer_ids[0], execution.session_hash)
         .await
         .expect("open outsider stream");
     let result = send
-        .send_exec(&message_frame(
-            execution.session_hash,
-            outsider,
+        .send_exec(&step_message_frame(
             1,
-            execution.initial_state,
             execution.agreed_link().await,
-            0xEE,
+            Some(0xEE),
         ))
         .await;
     assert!(
@@ -389,19 +356,16 @@ async fn participant_stream_closure_allows_reconnection_and_progress() {
         .open_exec(&execution.peer_ids[0], execution.session_hash)
         .await
         .unwrap();
-    let frame = message_frame(
-        execution.session_hash,
-        execution.peer_ids[1],
-        1,
-        execution.initial_state,
-        execution.agreed_link().await,
-        0x42,
-    );
+    let link = execution.agreed_link().await;
+    let frame = step_message_frame(1, link, Some(0x42));
     send.send_exec(&frame).await.expect("apply after reconnect");
+    execution
+        .send_from(2, &step_message_frame(1, link, None))
+        .await;
     complete_pending_shared(&execution, &cryptos()).await;
     let trace = wait_for_entry(&execution.store_handle, execution.exec_id, 1).await;
     assert!(
-        matches!(&trace[1].event, arena0_protocol::StepEvent::Message { data, .. } if data == &[0x42])
+        matches!(&trace[1].event, arena0_protocol::StepEvent::Messages { messages } if messages[0].data == [0x42])
     );
 }
 
@@ -510,18 +474,12 @@ async fn nonterminal_conflict_receipt_does_not_stop_progress_on_other_lane() {
         }
     });
     establish_session(&execution).await;
+    let link = execution.agreed_link().await;
     execution
-        .send_from(
-            1,
-            &message_frame(
-                execution.session_hash,
-                execution.peer_ids[1],
-                1,
-                execution.initial_state,
-                execution.agreed_link().await,
-                0xA1,
-            ),
-        )
+        .send_from(1, &step_message_frame(1, link, Some(0xA1)))
+        .await;
+    execution
+        .send_from(2, &step_message_frame(1, link, None))
         .await;
     complete_pending_shared(&execution, &cryptos()).await;
     let _ = wait_for_entry(&execution.store_handle, EXEC_ID, 1).await;

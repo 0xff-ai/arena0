@@ -65,11 +65,11 @@ fn contribution(value: u64) -> Vec<u8> {
     message
 }
 
-/// One peer's contribution message as an agreed `MessageReceived` event.
+/// One peer's contribution message as the one message of an agreed
+/// `MessagesReceived` step.
 fn contribution_event(from: PeerId, value: u64) -> Event<Vec<u8>> {
-    Event::MessageReceived {
-        from,
-        msg: contribution(value),
+    Event::MessagesReceived {
+        messages: vec![(from, contribution(value))],
     }
 }
 
@@ -157,7 +157,7 @@ fn sdk_guest_dispatch_has_exact_memories_and_rolls_back_rejected_state() {
     assert_eq!(&accepted_local, accepted_local_image);
 
     // Participant 0's slot is filled, so a message from that same participant
-    // is a validly encoded but deterministic wrong-writer reject. Its payload
+    // is a validly encoded but deterministic duplicate-sender reject. Its payload
     // is deliberately different from the committed state so the result proves
     // the resident checkpoint, not input equality, is restored.
     let rejected = resident
@@ -166,7 +166,7 @@ fn sdk_guest_dispatch_has_exact_memories_and_rolls_back_rejected_state() {
             session,
             contribution_event(peer0, 999),
         ))
-        .expect("wrong-writer dispatch should return rejected status");
+        .expect("duplicate-sender dispatch should return rejected status");
     assert_no_images(&rejected);
     assert_eq!(
         resident.committed_payloads(),
@@ -231,7 +231,7 @@ fn sdk_guest_repeated_allocations_preserve_commit_restore_and_rollback() {
         .expect("restore committed state");
 
     // Participant 0 has already contributed, so this valid message is a
-    // deterministic wrong-writer rejection. Its payload differs from the
+    // deterministic duplicate-sender rejection. Its payload differs from the
     // checkpoint and therefore proves restoration rather than input equality.
     let message = contribution(999);
     let rejected = resident
@@ -240,7 +240,7 @@ fn sdk_guest_repeated_allocations_preserve_commit_restore_and_rollback() {
             session.clone(),
             contribution_event(peer0, 999),
         ))
-        .expect("wrong-writer dispatch should reject");
+        .expect("duplicate-sender dispatch should reject");
     assert_no_images(&rejected);
 
     // Malformed generated-event bytes trap before the handler can commit; the
@@ -248,9 +248,8 @@ fn sdk_guest_repeated_allocations_preserve_commit_restore_and_rollback() {
     let fault = resident.dispatch(DispatchCall::new(
         peer0,
         session.clone(),
-        Event::MessageReceived {
-            from: peer0,
-            msg: vec![255],
+        Event::MessagesReceived {
+            messages: vec![(peer0, vec![255])],
         },
     ));
     assert!(fault.is_err(), "malformed guest message must trap");
@@ -262,9 +261,8 @@ fn sdk_guest_repeated_allocations_preserve_commit_restore_and_rollback() {
         .dispatch(DispatchCall::new(
             peer0,
             session,
-            Event::MessageReceived {
-                from: peer0,
-                msg: message,
+            Event::MessagesReceived {
+                messages: vec![(peer0, message)],
             },
         ))
         .expect("dispatch after trap should observe the restored checkpoint");

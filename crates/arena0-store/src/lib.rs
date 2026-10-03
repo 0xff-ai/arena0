@@ -42,9 +42,9 @@ use lock::{
     OwnerLock, acquire_process_lock, configure_connection, initialize_schema, prepare_database_file,
 };
 
-// Version 10 gives each database its own blob directory. Older partial rows
-// reconstruct paths in a shared directory and cannot be reopened under this layout.
-const SCHEMA_VERSION: u64 = 10;
+// Version 11 encodes the per-step message set in the durable `ExecutionState`.
+// Version 10 databases cannot be reopened under this layout.
+const SCHEMA_VERSION: u64 = 11;
 const ENVELOPE_VERSION: u16 = 2;
 const ENVELOPE_MAGIC: [u8; 8] = *b"AR0STOR1";
 const ENVELOPE_DOMAIN: &[u8] = b"arena0/store-envelope/v2";
@@ -541,7 +541,11 @@ impl EventRecordSummary {
         let bytes = |payload: &[u8]| Some(u64::try_from(payload.len()).unwrap_or(u64::MAX));
         let (event_kind, input_payload_bytes) = match event {
             Event::SessionStarted { .. } => (EventKind::SessionStarted, None),
-            Event::MessageReceived { msg, .. } => (EventKind::MessageReceived, bytes(msg)),
+            // A step's payload size is the sum of its messages.
+            Event::MessagesReceived { messages } => (
+                EventKind::MessagesReceived,
+                Some(messages.iter().map(|(_, msg)| msg.len() as u64).sum()),
+            ),
             Event::InputReceived { data, .. } => (EventKind::InputReceived, bytes(data)),
             Event::TimerFired { timer } => (EventKind::TimerFired, bytes(&timer.data)),
             Event::DirectReceived { msg, .. } => (EventKind::DirectReceived, bytes(msg)),

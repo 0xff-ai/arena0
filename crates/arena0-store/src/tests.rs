@@ -2375,9 +2375,8 @@ async fn stage_own_message_proposal(
     dispatch_record(
         writer,
         after_local.version(),
-        Event::MessageReceived {
-            from: fixture.producer,
-            msg: broadcast,
+        Event::MessagesReceived {
+            messages: vec![(fixture.producer, broadcast)],
         },
         after_local.shared_state().clone(),
         after_local.local_state().clone(),
@@ -2437,10 +2436,9 @@ async fn pending_proposal_exposes_frames_but_withholds_callout() {
     assert!(proposed.callout().is_none());
     assert!(proposed.pending_shared().is_some());
     assert!(
-        proposed
-            .current_frames(fixture.producer)
-            .iter()
-            .any(|frame| matches!(frame, ExecFrame::Message { data, .. } if data == &broadcast))
+        proposed.current_frames(fixture.producer).iter().any(
+            |frame| matches!(frame, ExecFrame::Message { data: Some(d), .. } if d == &broadcast)
+        )
     );
 
     let committed = sign_step(&store, &fixture, execution_id, &mut writer, 12, 13).await;
@@ -2590,9 +2588,8 @@ async fn portable_events_stage_agreement_without_shared_state_delta() {
     assert!(matches!(
         dispatch_record(&mut writer,
                 state.version(),
-                Event::MessageReceived {
-                    from: source,
-                    msg: data,
+                Event::MessagesReceived {
+                    messages: vec![(source, data)],
                 },
                 SharedStateBytes::try_new(vec![0]).expect("shared state"),
                 LocalStateBytes::try_new(Vec::new()).expect("local state"),
@@ -2619,7 +2616,10 @@ async fn portable_events_stage_agreement_without_shared_state_delta() {
     assert!(matches!(trace[0].event, StepEvent::SessionStarted { .. }));
     assert!(matches!(
         &trace[1].event,
-        StepEvent::Message { from, data } if *from == source && data == &[0x42, 0x43]
+        StepEvent::Messages { messages }
+            if messages.len() == 1
+                && messages[0].from == source
+                && messages[0].data == [0x42, 0x43]
     ));
     drop(writer);
     store.shutdown().await.expect("shutdown");
@@ -2680,9 +2680,8 @@ async fn terminal_agreement_clears_open_callout() {
     dispatch_record(
         &mut writer,
         after_waiting.version(),
-        Event::MessageReceived {
-            from: source,
-            msg: data,
+        Event::MessagesReceived {
+            messages: vec![(source, data)],
         },
         SharedStateBytes::try_new(vec![0]).expect("terminal shared state"),
         LocalStateBytes::try_new(Vec::new()).expect("terminal local state"),

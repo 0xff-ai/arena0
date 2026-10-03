@@ -992,16 +992,9 @@ mod tests {
 
     fn message_frame(byte: u8) -> ExecFrame {
         ExecFrame::Message {
-            commitment: arena0_protocol::StepCommitment {
-                domain: arena0_protocol::STEP_COMMIT_DOMAIN,
-                session_id: arena0_protocol::SessionHash([byte; 32]),
-                step: u64::from(byte),
-                entry_hash: [byte; 32],
-                pre_state: StateHash([byte.wrapping_add(1); 32]),
-                post_state: StateHash([byte.wrapping_add(3); 32]),
-                link: [byte.wrapping_add(4); 32],
-            },
-            data: vec![byte.wrapping_add(2)],
+            step: u64::from(byte),
+            link: [byte.wrapping_add(4); 32],
+            data: Some(vec![byte.wrapping_add(2)]),
         }
     }
 

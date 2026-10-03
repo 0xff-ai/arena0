@@ -10,14 +10,16 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 use crate::MAX_EFFECT_PAYLOAD_BYTES;
-use crate::{Attachment, Ensemble, MAX_DIRECT_CONTROL_BYTES, PeerId, TimerPayload};
+use crate::{
+    Attachment, Ensemble, MAX_DIRECT_CONTROL_BYTES, MAX_PARTICIPANTS, PeerId, TimerPayload,
+};
 
 /// Kind of an [`Event`], for diagnostics that never expose its payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
     SessionStarted,
-    MessageReceived,
+    MessagesReceived,
     InputReceived,
     TimerFired,
     DirectReceived,
@@ -36,12 +38,21 @@ pub enum Event<M = Vec<u8>> {
         /// Committed participant set in canonical order.
         ensemble: Ensemble,
     },
-    /// A broadcast message applied at a canonical agreed position.
+    /// The messages of one agreed step, applied together in one dispatch.
     ///
-    /// The event carries no trace coordinates: the author does not know its
-    /// post-state yet, and receivers reconstruct the same portable entry from
-    /// the frame. See [`crate::StepEvent`].
-    MessageReceived { from: PeerId, msg: M },
+    /// `messages` is non-empty, in ascending participant order, with at most
+    /// one message per participant: the non-empty step messages every
+    /// participant sent for this step. Every participant dispatches the same
+    /// list, so every participant computes the same post-state. The SDK
+    /// reorders it with `Program::canonicalize` before any handler runs. The
+    /// event carries no trace coordinates; see [`crate::StepEvent`].
+    MessagesReceived {
+        #[borsh(
+            serialize_with = "bounded::write_vec::<MAX_PARTICIPANTS, _>",
+            deserialize_with = "bounded::read_vec::<MAX_PARTICIPANTS, _>"
+        )]
+        messages: Vec<(PeerId, M)>,
+    },
     /// The controlling agent submitted input in response to a callout.
     InputReceived {
         callout_index: u32,
@@ -71,12 +82,14 @@ impl Event<Vec<u8>> {
     /// Decode the message payload from Borsh, converting `Event<Vec<u8>>` to `Event<M>`.
     ///
     /// Non-message variants pass through unchanged. Returns `Err` only when a
-    /// `MessageReceived` payload fails to deserialize.
+    /// `MessagesReceived` payload fails to deserialize.
     pub fn decode<M: BorshDeserialize>(self) -> Result<Event<M>, std::io::Error> {
         Ok(match self {
-            Self::MessageReceived { from, msg } => Event::MessageReceived {
-                from,
-                msg: borsh::from_slice(&msg)?,
+            Self::MessagesReceived { messages } => Event::MessagesReceived {
+                messages: messages
+                    .into_iter()
+                    .map(|(from, msg)| Ok((from, borsh::from_slice(&msg)?)))
+                    .collect::<Result<_, std::io::Error>>()?,
             },
             Self::SessionStarted { ensemble } => Event::SessionStarted { ensemble },
             Self::InputReceived {
@@ -113,9 +126,8 @@ mod tests {
             Event::SessionStarted {
                 ensemble: Ensemble::from_peers(vec![peer, PeerId([0u8; 32])]).expect("ensemble"),
             },
-            Event::MessageReceived {
-                from: peer,
-                msg: vec![1, 2, 3],
+            Event::MessagesReceived {
+                messages: vec![(peer, vec![1, 2, 3])],
             },
             Event::InputReceived {
                 callout_index: 0,
@@ -141,9 +153,8 @@ mod tests {
         let peer = PeerId([1; 32]);
         let ensemble = Ensemble::from_peers(vec![peer, PeerId([2; 32])]).expect("ensemble");
         let start: Event<Vec<u8>> = Event::SessionStarted { ensemble };
-        let message: Event<Vec<u8>> = Event::MessageReceived {
-            from: peer,
-            msg: Vec::new(),
+        let message: Event<Vec<u8>> = Event::MessagesReceived {
+            messages: vec![(peer, Vec::new())],
         };
         let timer: Event<Vec<u8>> = Event::TimerFired {
             timer: TimerPayload::unit(),

@@ -41,6 +41,43 @@ impl ExecutionActor {
         }
     }
 
+    /// Stop with this Host's `Fail` because `signature` is a peer's valid
+    /// signature over `conflicting`, a different commitment for the staged
+    /// step (`ExecutionState::stop_on_conflict`), even if this Host already
+    /// signed. The reason names the peer and the step. Persists the stopped
+    /// state; the normal progress path then publishes the receipt.
+    ///
+    /// `Ok(false)` without any change when the protocol refuses the evidence
+    /// (`ProtocolError::NoConflict`); the caller answers the frame `Rejected`.
+    pub(super) async fn fail_on_conflict(
+        &mut self,
+        conflicting: arena0_protocol::StepCommitment,
+        signature: arena0_protocol::ParticipantStepSignature,
+    ) -> Result<bool, ExecError> {
+        let peer = signature.participant();
+        let step = conflicting.step;
+        let occurrence = stop_occurrence(
+            &self.state,
+            &self.context.identity,
+            AbortKind::Fail,
+            0,
+            truncate_reason(
+                format!(
+                    "diverged at step {step}: participant {peer} signed a different commitment"
+                ),
+                arena0_protocol::MAX_TERMINAL_REASON_BYTES,
+            ),
+        )?;
+        let mut next = self.state.clone();
+        match next.stop_on_conflict(occurrence, &conflicting, signature) {
+            Ok(()) => {}
+            Err(arena0_protocol::ProtocolError::NoConflict { .. }) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+        self.persist(next, Change::State).await?;
+        Ok(true)
+    }
+
     /// Sign a stop over the actor's committed cursor and persist the result.
     async fn persist_abort(
         &mut self,
@@ -120,14 +157,14 @@ impl ExecutionActor {
     }
 }
 
-/// Compute the same authenticated stop for live actors and startup recovery.
-fn stopped_state(
+/// Build one authenticated stop occurrence over the committed cursor.
+fn stop_occurrence(
     state: &ExecutionState,
     identity: &NodeKeys,
     kind: AbortKind,
     code: u32,
     reason: String,
-) -> Result<ExecutionState, ExecError> {
+) -> Result<AbortOccurrence, ExecError> {
     if state.producer() != identity.peer_id() {
         return Err(ExecError::InvalidState(
             "failure signer is not the execution producer".into(),
@@ -142,7 +179,18 @@ fn stopped_state(
         state.step_cursor(),
     )?;
     let signature = identity.sign(&unsigned.signing_bytes()?);
-    let occurrence = unsigned.with_signature(signature)?;
+    Ok(unsigned.with_signature(signature)?)
+}
+
+/// Compute the same authenticated stop for live actors and startup recovery.
+fn stopped_state(
+    state: &ExecutionState,
+    identity: &NodeKeys,
+    kind: AbortKind,
+    code: u32,
+    reason: String,
+) -> Result<ExecutionState, ExecError> {
+    let occurrence = stop_occurrence(state, identity, kind, code, reason)?;
     let mut next = state.clone();
     next.stop(occurrence)?;
     Ok(next)

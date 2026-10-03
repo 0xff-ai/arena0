@@ -1609,9 +1609,11 @@ fn monitor_trace_detail_decodes_messages_and_scrolls_inspector() {
         .map(|step| TraceEntry {
             trace_version: arena0_client::protocol::TRACE_FORMAT_VERSION,
             step,
-            event: TraceEvent::Message {
-                from: PeerId([1; 32]),
-                data: (step as u32).to_le_bytes().to_vec(),
+            event: TraceEvent::Messages {
+                messages: vec![arena0_client::protocol::StepMessage {
+                    from: PeerId([1; 32]),
+                    data: (step as u32).to_le_bytes().to_vec(),
+                }],
             },
             pre_state: arena0_client::protocol::StateHash([step as u8; 32]),
             post_state: arena0_client::protocol::StateHash([(step + 1) as u8; 32]),
@@ -1639,7 +1641,7 @@ fn monitor_trace_detail_decodes_messages_and_scrolls_inspector() {
     let message = projection
         .host_trace(&first_host())
         .last()
-        .and_then(|entry| entry.message.as_ref())
+        .and_then(|entry| entry.messages.first())
         .expect("message projection");
     assert_eq!(
         message.as_ref().expect("decoded message"),
@@ -1868,9 +1870,17 @@ fn trace_label_shows_the_derived_message_id() {
     let entry = TraceEntry {
         trace_version: arena0_client::protocol::TRACE_FORMAT_VERSION,
         step: 1,
-        event: TraceEvent::Message {
-            from: PeerId([1; 32]),
-            data: vec![2],
+        event: TraceEvent::Messages {
+            messages: vec![
+                arena0_client::protocol::StepMessage {
+                    from: PeerId([1; 32]),
+                    data: vec![2],
+                },
+                arena0_client::protocol::StepMessage {
+                    from: PeerId([2; 32]),
+                    data: vec![3],
+                },
+            ],
         },
         pre_state: arena0_client::protocol::StateHash([0x11; 32]),
         post_state: arena0_client::protocol::StateHash([0x22; 32]),
@@ -1878,6 +1888,9 @@ fn trace_label_shows_the_derived_message_id() {
         agreement: arena0_client::protocol::AggregateAttestation::empty(),
     };
     let label = super::trace::trace_event_label(&entry, Some(session));
-    let id = entry.message_id(session).expect("message identity");
-    assert!(label.contains(&id.fmt_short().to_string()), "{label}");
+    let ids = entry.message_ids(session);
+    assert_eq!(ids.len(), 2);
+    for id in ids {
+        assert!(label.contains(&id.fmt_short().to_string()), "{label}");
+    }
 }

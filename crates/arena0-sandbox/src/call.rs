@@ -144,7 +144,7 @@ impl DispatchCall {
         let input = DispatchInput::try_new(peer_id.0, session_bytes, event_bytes)
             .map_err(|error| crate::SandboxError::input_limit(error.to_string()))?;
         let dispatch = match event {
-            Event::SessionStarted { .. } | Event::MessageReceived { .. } => DispatchKind::Agreed,
+            Event::SessionStarted { .. } | Event::MessagesReceived { .. } => DispatchKind::Agreed,
             Event::InputReceived { .. }
             | Event::TimerFired { .. }
             | Event::DirectReceived { .. } => DispatchKind::Local,

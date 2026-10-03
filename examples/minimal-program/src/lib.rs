@@ -70,7 +70,7 @@ pub struct Local {
     name = "minimal-choice",
     display_name = "Minimal Choice",
     version = "1.0.0",
-    description = "Two participants choose a small integer in public order",
+    description = "Two participants each choose a small integer",
     participants = 2,
     capabilities(auto)
 )]
@@ -84,14 +84,6 @@ pub mod minimal_choice {
     type Callout = super::Callout;
     type Input = super::Input;
     type Outcome = super::Outcome;
-
-    fn writer(state: &Shared) -> Option<Participant> {
-        state
-            .choices
-            .iter()
-            .position(Option::is_none)
-            .map(|index| Participant::try_from(index).expect("two choices fit Participant"))
-    }
 
     fn outcome(state: &Shared) -> Outcome {
         let choices = [
@@ -141,10 +133,12 @@ pub mod minimal_choice {
     }
 
     fn callout(ctx: &CalloutContext<Shared, Local>) -> Option<Callout> {
-        (!ctx.local().choice_pending && writer(ctx.shared()) == Some(ctx.me())).then(|| {
-            let previous = ctx.shared().choices.iter().flatten().next().copied();
-            callouts::Choose { previous }.into()
-        })
+        (!ctx.local().choice_pending && ctx.shared().choices[ctx.me().index()].is_none()).then(
+            || {
+                let previous = ctx.shared().choices.iter().flatten().next().copied();
+                callouts::Choose { previous }.into()
+            },
+        )
     }
 
     fn on_message(
@@ -152,18 +146,20 @@ pub mod minimal_choice {
         from: Participant,
         message: Message,
     ) -> MessageApply<MinimalChoice> {
-        if writer(ctx.shared()) != Some(from) {
+        if ctx.shared().choices[from.index()].is_some() {
             return Ok(ApplyDecision::Reject);
         }
         let Message::Choice(choice) = message;
         let transition = apply_choice(ctx.shared_mut(), from, choice);
-        ctx.mutate_local(|local| local.choice_pending = false);
+        if from == ctx.me() {
+            ctx.mutate_local(|local| local.choice_pending = false);
+        }
         Ok(ApplyDecision::Accept(transition))
     }
 
     fn on_input(ctx: &mut LocalContext<Shared, Local>, input: Input) -> arena0::anyhow::Result<()> {
-        if writer(ctx.shared()) != Some(ctx.me()) {
-            return Err(anyhow!("this participant does not own the next choice"));
+        if ctx.shared().choices[ctx.me().index()].is_some() {
+            return Err(anyhow!("this participant already chose"));
         }
         let Input::Choose(choice) = input;
         ctx.mutate_local(|local| local.choice_pending = true);
@@ -179,7 +175,7 @@ pub mod minimal_choice {
         choice: Choice,
     ) -> ProgramTransition<MinimalChoice> {
         state.choices[from.index()] = Some(choice);
-        if writer(state).is_none() {
+        if state.choices.iter().all(Option::is_some) {
             Transition::End
         } else {
             Transition::Stay
@@ -218,6 +214,51 @@ mod tests {
                 choices: [Choice::Two, Choice::Two],
             }
         ));
+    }
+
+    #[test]
+    fn either_participant_may_choose_first() {
+        // SAFETY: only the agreed-message handler runs; no host effects are applied.
+        let mut ctx =
+            unsafe { Context::__new(Shared::default(), Local::default(), PeerId([0; 32])) };
+        ctx.__set_participant(Participant::new(1));
+
+        // P1's choice is applied first and accepted; choices are per-participant,
+        // not ordered by a turn.
+        assert!(matches!(
+            minimal_choice::MinimalChoice::on_message(
+                &mut ctx,
+                Participant::new(1),
+                Message::Choice(Choice::Two),
+            )
+            .unwrap(),
+            ApplyDecision::Accept(Transition::Stay)
+        ));
+        assert_eq!(ctx.shared().choices, [None, Some(Choice::Two)]);
+
+        // A second choice from P1 is rejected.
+        assert!(matches!(
+            minimal_choice::MinimalChoice::on_message(
+                &mut ctx,
+                Participant::new(1),
+                Message::Choice(Choice::One),
+            )
+            .unwrap(),
+            ApplyDecision::Reject
+        ));
+        assert_eq!(ctx.shared().choices, [None, Some(Choice::Two)]);
+
+        // P0's choice fills the last slot and ends the session.
+        assert!(matches!(
+            minimal_choice::MinimalChoice::on_message(
+                &mut ctx,
+                Participant::new(0),
+                Message::Choice(Choice::Two),
+            )
+            .unwrap(),
+            ApplyDecision::Accept(Transition::End)
+        ));
+        assert_eq!(ctx.shared().choices, [Some(Choice::Two), Some(Choice::Two)]);
     }
 
     #[test]

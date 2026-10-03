@@ -236,14 +236,23 @@ fn render_inspector(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, focu
                 ),
                 state.palette.muted(),
             ));
-            if let Some(message) = &entry.message {
-                lines.push(Line::styled(
-                    match message {
-                        Ok(value) => format!("  decoded JSON  {}", crate::ui::compact_json(value)),
-                        Err(reason) => format!("  decoded JSON  unavailable: {reason}"),
-                    },
-                    state.palette.muted(),
-                ));
+            if let TraceEvent::Messages { messages } = &entry.entry.event {
+                for (message, decoded) in messages.iter().zip(&entry.messages) {
+                    lines.push(Line::styled(
+                        match decoded {
+                            Ok(value) => format!(
+                                "  {}  decoded JSON  {}",
+                                message.from.fmt_short(),
+                                crate::ui::compact_json(value)
+                            ),
+                            Err(reason) => format!(
+                                "  {}  decoded JSON  unavailable: {reason}",
+                                message.from.fmt_short()
+                            ),
+                        },
+                        state.palette.muted(),
+                    ));
+                }
             }
         } else {
             lines.push(Line::styled(
@@ -266,17 +275,29 @@ pub(super) fn trace_event_label(entry: &TraceEntry, session_id: Option<SessionHa
         TraceEvent::SessionStarted { ensemble } => {
             format!("session started  {} participants", ensemble.len())
         }
-        TraceEvent::Message { from, data } => {
-            // The message identity is derived from the entry, never stored.
-            match session_id.and_then(|session| entry.message_id(session)) {
-                Some(id) => format!(
-                    "message {} from {}  {} B",
-                    id.fmt_short(),
-                    from.fmt_short(),
-                    data.len()
-                ),
-                None => format!("message from {}  {} B", from.fmt_short(), data.len()),
-            }
+        TraceEvent::Messages { messages } => {
+            // Message identities are derived from the entry, never stored.
+            let ids = session_id.map(|session| entry.message_ids(session));
+            messages
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, message)| match ids.as_ref().and_then(|ids| ids.get(index)) {
+                        Some(id) => format!(
+                            "message {} from {}  {} B",
+                            id.fmt_short(),
+                            message.from.fmt_short(),
+                            message.data.len()
+                        ),
+                        None => format!(
+                            "message from {}  {} B",
+                            message.from.fmt_short(),
+                            message.data.len()
+                        ),
+                    },
+                )
+                .collect::<Vec<_>>()
+                .join("; ")
         }
     }
 }

@@ -6,9 +6,8 @@ use arena0::prelude::*;
 /// Construct with the canonical, distinct session participant order, then call
 /// `advance()` after each turn to rotate to the next participant. The supplied
 /// order is authoritative and is serialized as part of shared state.
-/// Turn-managed phases are single-writer: implement the program's `writer`
-/// function with [`current`](Self::current), so the runtime applies only the
-/// turn holder's broadcast next.
+/// A turn-managed phase accepts messages only from the current holder: its
+/// `on_message` rejects any sender for which `is_current(from)` is false.
 #[arena0::primitive]
 #[derive(Default)]
 pub struct TurnManager {
@@ -47,7 +46,7 @@ impl TurnManager {
 
     /// Whether `participant` has the current turn.
     #[must_use]
-    pub fn is_turn(&self, participant: Participant) -> bool {
+    pub fn is_current(&self, participant: Participant) -> bool {
         self.current() == participant
     }
 
@@ -81,7 +80,7 @@ mod tests {
     fn round_robin() {
         let mut tm = TurnManager::new(vec![participant(1), participant(2), participant(3)]);
         assert_eq!(tm.current(), participant(1));
-        assert!(tm.is_turn(participant(1)));
+        assert!(tm.is_current(participant(1)));
 
         tm.advance();
         assert_eq!(tm.current(), participant(2));

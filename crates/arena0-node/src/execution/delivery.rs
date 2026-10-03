@@ -128,38 +128,26 @@ impl ExecutionActor {
         }
         let step = self.state.agreed_step();
         match frame {
-            ExecFrame::Message { commitment, data } => {
-                if commitment.step < step {
-                    return Ok(None);
-                }
-                if commitment.step > step {
-                    return Ok(Some(NotYet));
-                }
-                if commitment.session_id != self.state.binding().session_id()
-                    || commitment.pre_state != self.state.agreed_state()
-                    || commitment.link != self.state.agreed_link()
-                    || self.writer_for_shared(self.state.shared_state(), &self.ensemble())?
-                        != Some(source)
+            ExecFrame::Message { step, link, data } => {
+                use arena0_protocol::StepMessageArrival;
+                match self
+                    .state
+                    .step_message_arrival(source, step, link, data.as_deref())
                 {
-                    return Ok(Some(Rejected));
+                    StepMessageArrival::Stale | StepMessageArrival::Duplicate => {
+                        return Ok(None);
+                    }
+                    StepMessageArrival::NotYet => return Ok(Some(NotYet)),
+                    StepMessageArrival::Rejected => return Ok(Some(Rejected)),
+                    StepMessageArrival::Conflict => return Ok(Some(Conflict)),
+                    StepMessageArrival::New => {}
                 }
-                if let Some(proposal) = self.state.pending_shared() {
-                    // Derive once per frame; the commitment is a pure
-                    // function of the staged entry and the agreed link.
-                    let staged = self.state.proposal_commitment();
-                    return Ok(
-                        if staged.as_ref() == Some(&commitment)
-                            && matches!(&proposal.entry().event,
-                                arena0_protocol::StepEvent::Message { from, data: staged }
-                                    if *from == source && *staged == data)
-                        {
-                            None
-                        } else {
-                            Some(Conflict)
-                        },
-                    );
-                }
-                self.apply_message(source, commitment, data).await?;
+                // New evidence: record it durably before the caller
+                // acknowledges. `inbound` then runs `progress`, which applies
+                // the step once every participant has answered.
+                let mut next = self.state.clone();
+                next.record_step_message(source, data)?;
+                self.persist(next, Change::State).await?;
             }
             ExecFrame::StepSignature {
                 commitment,
@@ -171,14 +159,31 @@ impl ExecutionActor {
                 if commitment.step > step {
                     return Ok(Some(NotYet));
                 }
-                let Some(proposal) = self.state.pending_shared() else {
+                if self.state.pending_shared().is_none() {
                     return Ok(Some(NotYet));
-                };
-                if self.state.proposal_commitment().as_ref() != Some(&commitment) {
-                    return Ok(Some(Rejected));
+                }
+                let staged = self
+                    .state
+                    .proposal_commitment()
+                    .expect("staged proposal has a commitment");
+                if staged != commitment {
+                    // A peer signed a different commitment for the staged
+                    // step. A valid signature is conflict evidence; anything
+                    // weaker is refused without changing local state.
+                    let signature =
+                        ParticipantStepSignature::new(source, commitment.step, signature);
+                    return Ok(if self.fail_on_conflict(commitment, signature).await? {
+                        None
+                    } else {
+                        Some(Rejected)
+                    });
                 }
                 let signature = ParticipantStepSignature::new(source, commitment.step, signature);
-                if proposal.signatures().contains(&signature) {
+                if self
+                    .state
+                    .pending_shared()
+                    .is_some_and(|proposal| proposal.signatures().contains(&signature))
+                {
                     return Ok(None);
                 }
                 let mut next = self.state.clone();
@@ -502,16 +507,9 @@ mod tests {
         vec![(
             [1; 32],
             ExecFrame::Message {
-                commitment: arena0_protocol::StepCommitment {
-                    domain: arena0_protocol::STEP_COMMIT_DOMAIN,
-                    session_id: arena0_protocol::SessionHash([2; 32]),
-                    step: 1,
-                    entry_hash: [3; 32],
-                    pre_state: arena0_protocol::StateHash([4; 32]),
-                    post_state: arena0_protocol::StateHash([5; 32]),
-                    link: [6; 32],
-                },
-                data: vec![],
+                step: 1,
+                link: [6; 32],
+                data: None,
             },
         )]
     }

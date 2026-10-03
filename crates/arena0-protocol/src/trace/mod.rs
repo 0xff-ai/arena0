@@ -12,8 +12,8 @@ pub use commitment::{
     AggregateAttestation, AttestationError, CHAIN_START, STEP_COMMIT_DOMAIN, SignerSet,
     StepCommitment, StepSig,
 };
-pub use entry::{StepEvent, StepTerminal, TraceEntry};
+pub use entry::{StepEvent, StepMessage, StepTerminal, TraceEntry};
 pub use header::{ReceiptTermination, SessionHeader};
 
 /// Trace schema version for state-machine step records.
-pub const TRACE_FORMAT_VERSION: u32 = 3;
+pub const TRACE_FORMAT_VERSION: u32 = 4;

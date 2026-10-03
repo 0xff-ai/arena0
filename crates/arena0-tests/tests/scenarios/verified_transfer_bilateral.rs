@@ -113,19 +113,22 @@ async fn transfer(sender: usize, input: Option<Input>, result: &[u8]) -> Run {
         );
         let mut counts = [0usize; 2];
         for entry in run.trace(participant) {
-            if let StepEvent::Message { from, data, .. } = entry.event {
-                let message: Message = borsh::from_slice(&data).expect("demo agreed message");
-                let (transfer, message, author, complete) = match message {
-                    Message::Input(message) => (0, message, receiver, input_complete),
-                    Message::Result(message) => (1, message, sender, true),
-                };
-                counts[transfer] += 1;
-                assert_eq!(
-                    from,
-                    run.peer_id(author),
-                    "transfer {transfer}'s receiver authors its outcome"
-                );
-                assert_eq!(matches!(message, TransferMessage::Complete), complete);
+            if let StepEvent::Messages { messages } = entry.event {
+                for step_message in &messages {
+                    let decoded: Message =
+                        borsh::from_slice(&step_message.data).expect("demo agreed message");
+                    let (transfer, message, author, complete) = match decoded {
+                        Message::Input(message) => (0, message, receiver, input_complete),
+                        Message::Result(message) => (1, message, sender, true),
+                    };
+                    counts[transfer] += 1;
+                    assert_eq!(
+                        step_message.from,
+                        run.peer_id(author),
+                        "transfer {transfer}'s receiver authors its outcome"
+                    );
+                    assert_eq!(matches!(message, TransferMessage::Complete), complete);
+                }
             }
         }
         assert_eq!(

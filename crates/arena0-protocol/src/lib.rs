@@ -81,8 +81,8 @@ pub use execution::{
     MAX_EFFECTS, MAX_EXECUTION_STATE_BYTES, MAX_PROOF_SIGNATURES, MAX_RECEIPT_BYTES,
     MAX_TRACE_ENTRY_BYTES, OpenCallout, ParticipantStepSignature, ProtocolError, Receipt,
     ReceiptArtifact, ReceiptBody, ReceiptId, ReceiptKind, ReceiptProvenance, ReceiptSummary,
-    ReceiptWork, SharedProposal, StepCertificate, StepCursor, StopCause, StopReport,
-    TerminalOutcome, TimerId, callout_id, validate_agreed_trace,
+    ReceiptWork, SharedProposal, StepCertificate, StepCursor, StepMessageArrival, StopCause,
+    StopReport, TerminalOutcome, TimerId, callout_id, validate_agreed_trace,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use fetch_frame::FetchFrame;
@@ -113,7 +113,7 @@ pub use timer::TimerPayload;
 #[cfg(not(target_arch = "wasm32"))]
 pub use trace::{
     AggregateAttestation, AttestationError, CHAIN_START, ReceiptTermination, STEP_COMMIT_DOMAIN,
-    SessionHeader, SignerSet, StepCommitment, StepEvent, StepSig, StepTerminal,
+    SessionHeader, SignerSet, StepCommitment, StepEvent, StepMessage, StepSig, StepTerminal,
     TRACE_FORMAT_VERSION, TraceEntry,
 };
 pub use verify::VerifyError;

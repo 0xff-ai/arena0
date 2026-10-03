@@ -369,7 +369,7 @@ fn public_detail(state: &ScreenState, step: u64, representative: &TraceEntry) ->
                 hosts.len()
             )
         }
-        TraceEvent::Message { from, data } => {
+        TraceEvent::Messages { messages } => {
             if status == "different" {
                 format!(
                     "public observations differ  observed {observed}/{}",
@@ -377,9 +377,12 @@ fn public_detail(state: &ScreenState, step: u64, representative: &TraceEntry) ->
                 )
             } else {
                 format!(
-                    "message from {}  {} B  observed {observed}/{}  {status}",
-                    from.fmt_short(),
-                    data.len(),
+                    "{} messages  {} B  observed {observed}/{}  {status}",
+                    messages.len(),
+                    messages
+                        .iter()
+                        .map(|message| message.data.len())
+                        .sum::<usize>(),
                     hosts.len()
                 )
             }
@@ -418,7 +421,7 @@ fn event_detail(state: &ScreenState, host: &HostName, event_position: u64) -> St
 pub(super) fn event_name(kind: EventKind) -> &'static str {
     match kind {
         EventKind::SessionStarted => "session started",
-        EventKind::MessageReceived => "message received",
+        EventKind::MessagesReceived => "messages received",
         EventKind::InputReceived => "input received",
         EventKind::TimerFired => "timer fired",
         EventKind::DirectReceived => "direct message received",

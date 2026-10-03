@@ -10,7 +10,7 @@ use crate::{LocalStateBytes, SharedStateBytes};
 use crate::Capability;
 
 /// Current ABI version. A sandbox rejects modules declaring a different one.
-pub const ABI_VERSION: u32 = 24;
+pub const ABI_VERSION: u32 = 25;
 
 /// Wasm import module name for all arena0 host functions.
 pub const HOST_MODULE: &str = "arena0";
@@ -176,8 +176,6 @@ pub mod exports {
     pub const LOCAL_MEMORY: &str = "arena0_local";
     /// Produce the agent-facing terminal outcome.
     pub const OUTCOME: &str = "arena0_outcome";
-    /// Select the sole participant eligible to author the next program message.
-    pub const WRITER: &str = "arena0_writer";
     /// Answer one agent-facing query.
     pub const QUERY: &str = "arena0_query";
     /// Produce one viewport projection.
@@ -525,27 +523,6 @@ pub struct OutcomeInput {
         deserialize_with = "bounded::read_bytes::<MAX_SESSION_CONTEXT_BYTES>"
     )]
     pub session: Vec<u8>,
-}
-
-/// Read-only input for selecting the next program-message writer.
-///
-/// Writer selection is deliberately a function of replicated state alone. The
-/// host invokes it before applying a candidate message so transport arrival
-/// order cannot choose between sibling state transitions.
-#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct WriterInput {
-    /// Explicit replicated state bytes.
-    pub shared: SharedStateBytes,
-}
-
-/// Sole participant eligible to author the next program message.
-///
-/// `None` means that no program message is admissible from the current shared
-/// state. The host validates a returned index against the committed ensemble.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct WriterOutput {
-    /// Stable participant index in the committed ensemble.
-    pub participant: Option<u8>,
 }
 
 impl OutcomeInput {
@@ -993,26 +970,6 @@ mod tests {
             borsh::from_slice::<OutcomeOutput>(&borsh::to_vec(&outcome_output).unwrap()).unwrap(),
             outcome_output
         );
-
-        let writer = WriterInput {
-            shared: shared.clone(),
-        };
-        assert_eq!(
-            borsh::from_slice::<WriterInput>(&borsh::to_vec(&writer).unwrap()).unwrap(),
-            writer
-        );
-
-        for output in [
-            WriterOutput { participant: None },
-            WriterOutput {
-                participant: Some(3),
-            },
-        ] {
-            assert_eq!(
-                borsh::from_slice::<WriterOutput>(&borsh::to_vec(&output).unwrap()).unwrap(),
-                output
-            );
-        }
     }
 
     #[test]

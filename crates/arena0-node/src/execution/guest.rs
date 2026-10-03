@@ -12,7 +12,7 @@ use arena0_crypto::{ExecutionKey, NodeKeys, SignScheme};
 use arena0_program::{CallStatus, JsonBytes, ProgramHash};
 use arena0_protocol::execution::GuestSignData;
 use arena0_protocol::{
-    CalloutId, Committed, Effect, Ensemble, Event, ExecLifecycle, ExecutionState, ExecutionStatus,
+    CalloutId, Effect, Event, ExecLifecycle, ExecutionState, ExecutionStatus,
     ParticipantStepSignature, PeerIdSource, SessionHash, SharedProposal, StepEvent,
     TerminalOutcome,
 };
@@ -31,12 +31,13 @@ pub(super) enum DispatchSource {
     Answer(CalloutId),
     /// A timer firing that consumes its durable timer identity.
     Timer(arena0_protocol::TimerId),
-    /// An authenticated peer message with the author's complete commitment.
-    PeerMessage {
-        commitment: arena0_protocol::StepCommitment,
-    },
-    /// This participant's own queued message.
-    OwnMessage,
+    /// The complete message set of the current agreed step
+    /// (`ExecutionState::step_set`), this participant's own message included
+    /// when it sent one.
+    Step,
+    /// The outgoing queue head alone as a one-message step, dry-run by
+    /// `check_own_message` against the agreed state; never persisted.
+    OwnCheck,
     /// A direct frame; its attachment is exposed only as Attachment(0) to the guest.
     Direct {
         from: arena0_protocol::PeerId,
@@ -64,13 +65,30 @@ pub(super) enum SubmitInputError {
 ///
 /// `Frozen` means that the durable execution boundary did not allow the
 /// event to run. `Rejected` discards candidate state and observations. The
-/// caller reports an input rejection or ends the session for a writer-message
-/// divergence, according to the event being dispatched.
+/// caller reports an input rejection or ends the session for a step the
+/// program rejects, according to the event being dispatched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum DispatchOutcome {
     Committed,
     Frozen,
     Rejected { reason: Option<String> },
+}
+
+/// The result of one dry-run dispatch, before any durable write.
+///
+/// `Accepted` carries the candidate successor state and the dispatch's blob
+/// and effect changes; the caller owns persistence and the resident commit.
+/// `Rejected` carries the program's bounded reason and touches no durable
+/// state.
+enum Evaluation {
+    Accepted {
+        next: ExecutionState,
+        blobs: Vec<arena0_protocol::execution::BlobChange>,
+        effects: Vec<Effect>,
+    },
+    Rejected {
+        reason: Option<String>,
+    },
 }
 
 impl From<ExecError> for SubmitInputError {
@@ -291,32 +309,81 @@ impl ExecutionActor {
         Ok(())
     }
 
-    /// Dispatch one peer message that `accept_frame` has already classified:
-    /// current step, bound to the agreed cursor, and authored by the current
-    /// writer, with no staged proposal. The receiver checks both advertised
-    /// frame hashes before it can sign the resulting proposal. The Host's own
-    /// messages go through `author_next_message` instead.
-    pub(super) async fn apply_message(
-        &mut self,
-        source: arena0_protocol::PeerId,
-        commitment: arena0_protocol::StepCommitment,
-        data: Vec<u8>,
-    ) -> Result<(), ExecError> {
-        let seq = commitment.step;
-        let outcome = self
-            .dispatch_event(
-                Event::MessageReceived {
-                    from: source,
-                    msg: data,
-                },
-                DispatchSource::PeerMessage { commitment },
-            )
-            .await?;
-        match outcome {
-            DispatchOutcome::Committed | DispatchOutcome::Frozen => Ok(()),
-            DispatchOutcome::Rejected { reason } => {
-                let mut message =
-                    format!("diverged at step {seq}: program rejected the writer message");
+    /// Advance the current agreed step from this participant's side.
+    ///
+    /// Runs only while active with no staged proposal and `agreed_step >= 1`
+    /// (step 0 is `SessionStarted`, dispatched locally by every participant).
+    /// 1. If this participant has no step message for the step yet: drop
+    ///    queue heads that [`Self::check_own_message`] rejects (each drop
+    ///    persisted with `drop_outgoing_head`, logged as today); then record
+    ///    `Some(head)` if the queue is non-empty, or `None` if it holds a
+    ///    peer's non-empty step message, or nothing otherwise. The record is
+    ///    persisted before `deliver_frames` can send it.
+    /// 2. If `step_set` is complete, dispatch it as one
+    ///    `Event::MessagesReceived` with [`DispatchSource::Step`]. A program
+    ///    rejection (or a handler trap) is a divergence:
+    ///    `ExecError::Diverged("diverged at step {s}: program rejected the
+    ///    step[: reason]")`, which the caller's failure boundary turns into
+    ///    this Host's `Fail`.
+    pub(super) async fn advance_step(&mut self) -> Result<(), ExecError> {
+        let me = self.context.identity.peer_id();
+        if self.state.agreed_step() == 0
+            || !matches!(self.state.status(), ExecutionStatus::Active)
+            || self.state.pending_shared().is_some()
+        {
+            return Ok(());
+        }
+        // 1. Answer the step once, dropping from the queue any head the
+        // program would reject for it. Each drop is durable before the next
+        // dry run, so recovery cannot resend a rejected message.
+        if !self
+            .state
+            .step_messages()
+            .iter()
+            .any(|(peer, _)| *peer == me)
+        {
+            while !self.state.outgoing().is_empty() && !self.check_own_message().await? {
+                let mut next = self.state.clone();
+                next.drop_outgoing_head()?;
+                self.persist(next, Change::State).await?;
+                tracing::error!(
+                    exec_id = %self.context.exec_id,
+                    "own queued message rejected by the program"
+                );
+            }
+            let record = if !self.state.outgoing().is_empty() {
+                Some(Some(self.state.outgoing()[0].clone()))
+            } else if self
+                .state
+                .step_messages()
+                .iter()
+                .any(|(peer, data)| *peer != me && data.is_some())
+            {
+                // A peer has something to say and this participant does not:
+                // answer `None` so the step can complete. An all-empty step is
+                // never produced by an honest Host, so a queue with nothing
+                // and no peer `Some` records nothing.
+                Some(None)
+            } else {
+                None
+            };
+            if let Some(data) = record {
+                let mut next = self.state.clone();
+                next.record_step_message(me, data)?;
+                self.persist(next, Change::State).await?;
+            }
+        }
+        // 2. Apply the complete step as one dispatch. A program rejection or
+        // a handler trap is this Host's divergence.
+        let Some(messages) = self.state.step_set() else {
+            return Ok(());
+        };
+        let step = self.state.agreed_step();
+        let event = Event::MessagesReceived { messages };
+        match self.dispatch_event(event, DispatchSource::Step).await {
+            Ok(DispatchOutcome::Committed | DispatchOutcome::Frozen) => Ok(()),
+            Ok(DispatchOutcome::Rejected { reason }) => {
+                let mut message = format!("diverged at step {step}: program rejected the step");
                 if let Some(reason) = reason {
                     message.push_str(": ");
                     message.push_str(&reason);
@@ -326,64 +393,40 @@ impl ExecutionActor {
                     arena0_protocol::MAX_TERMINAL_REASON_BYTES,
                 )))
             }
+            Err(error) => Err(error),
         }
     }
 
-    pub(super) fn writer_for_shared(
-        &self,
-        shared: &arena0_program::SharedStateBytes,
-        ensemble: &Ensemble<Committed>,
-    ) -> Result<Option<arena0_protocol::PeerId>, ExecError> {
-        let writer = self.context.program.writer(shared, ensemble)?.writer;
-        Ok(writer.and_then(|participant| ensemble.peer_at(participant)))
-    }
-
-    /// Whether this participant currently owns the next agreed message.
+    /// Dry-run the outgoing queue head alone against the agreed state, as
+    /// the one message of a step, and report whether it would be accepted.
     ///
-    /// True only while active, with no staged proposal, a non-empty outgoing
-    /// queue, and the `writer` projection selecting this participant.
-    pub(super) fn may_author(&self) -> Result<bool, ExecError> {
-        let state = &self.state;
-        if !matches!(state.status(), ExecutionStatus::Active)
-            || state.pending_shared().is_some()
-            || state.outgoing().is_empty()
-        {
-            return Ok(false);
-        }
-        Ok(
-            self.writer_for_shared(state.shared_state(), &self.ensemble())?
-                == Some(self.context.identity.peer_id()),
-        )
-    }
-
-    /// Author the oldest queued message through the same dispatch every
-    /// receiver runs, staging a proposal on acceptance.
-    ///
-    /// A message the program rejects is dropped from the durable queue and the
-    /// loop continues with the next one; it never reaches a peer.
-    pub(super) async fn author_next_message(&mut self) -> Result<(), ExecError> {
-        while self.may_author()? {
-            let event = Event::MessageReceived {
-                from: self.context.identity.peer_id(),
-                msg: self.state.outgoing()[0].clone(),
-            };
-            match self
-                .dispatch_event(event, DispatchSource::OwnMessage)
-                .await?
-            {
-                DispatchOutcome::Committed | DispatchOutcome::Frozen => return Ok(()),
-                DispatchOutcome::Rejected { .. } => {
-                    let mut next = self.state.clone();
-                    next.drop_outgoing_head()?;
-                    self.persist(next, Change::State).await?;
-                    tracing::error!(
-                        exec_id = %self.context.exec_id,
-                        "own queued message rejected by the program"
-                    );
-                }
-            }
-        }
-        Ok(())
+    /// Runs the same resident dispatch and `ExecutionState::apply_dispatch`
+    /// (on a clone) that a real step runs, with [`DispatchSource::OwnCheck`],
+    /// then restores the resident and persists nothing. `Ok(false)` for a program rejection, a handler trap,
+    /// or a protocol error that today's own-message path reports as a plain
+    /// rejection; the protocol errors that fail the session today
+    /// (`OutgoingQueueFull`, `ReceiptBudgetExhausted`) are returned as the
+    /// same `ExecError`s. Requires a non-empty queue and no staged proposal.
+    pub(super) async fn check_own_message(&mut self) -> Result<bool, ExecError> {
+        let event = Event::MessagesReceived {
+            messages: vec![(
+                self.context.identity.peer_id(),
+                self.state.outgoing()[0].clone(),
+            )],
+        };
+        let mut source = DispatchSource::OwnCheck;
+        let outgoing_len = self.state.outgoing().len().saturating_sub(1);
+        let evaluation = self.evaluate(&event, &mut source, outgoing_len).await;
+        // A trap drops the resident, so only a surviving candidate needs
+        // restoring. A discard failure drops the resident and masks the
+        // dry-run result, as on the real dispatch path.
+        let restored = if self.instance.is_some() {
+            self.discard_candidate()
+        } else {
+            Ok(())
+        };
+        restored?;
+        Ok(matches!(evaluation?, Evaluation::Accepted { .. }))
     }
 
     /// Apply one event through the resident dispatch and persist its result.
@@ -423,16 +466,28 @@ impl ExecutionActor {
             return Ok(DispatchOutcome::Frozen);
         }
 
-        // The sandbox bounds broadcasts against the committed queue. An
-        // own message authors the head it is about to pop, so it is not
-        // counted as already committed.
+        // The sandbox bounds broadcasts against the committed queue. A step
+        // that carries this participant's own message consumes the head it is
+        // about to pop, so that head is not counted as already committed; the
+        // own-message dry run stages the same head and discounts it too.
+        let me = self.context.identity.peer_id();
         let outgoing_len = match &source {
-            DispatchSource::OwnMessage => self.state.outgoing().len().saturating_sub(1),
+            DispatchSource::Step => {
+                if self
+                    .state
+                    .step_set()
+                    .is_some_and(|messages| messages.iter().any(|(peer, _)| *peer == me))
+                {
+                    self.state.outgoing().len().saturating_sub(1)
+                } else {
+                    self.state.outgoing().len()
+                }
+            }
+            DispatchSource::OwnCheck => self.state.outgoing().len().saturating_sub(1),
             DispatchSource::Local
             | DispatchSource::Answer(_)
             | DispatchSource::Direct { .. }
-            | DispatchSource::Timer(_)
-            | DispatchSource::PeerMessage { .. } => self.state.outgoing().len(),
+            | DispatchSource::Timer(_) => self.state.outgoing().len(),
         };
         let outcome = self.dispatch_inner(event, source, outgoing_len).await;
         match outcome {
@@ -461,17 +516,21 @@ impl ExecutionActor {
         }
     }
 
-    /// Run one checked event through the resident and persist the result.
+    /// Run one event through the resident and the protocol transition without
+    /// persisting anything.
     ///
-    /// The caller owns the single discard site; this function restores the
-    /// resident itself only on sandbox trap paths, where the sandbox has
-    /// already rolled back and the durable image is reloaded here.
-    async fn dispatch_inner(
+    /// Returns the candidate successor state, its blob changes and effects on
+    /// `Accepted`; the caller owns the durable write, the resident commit, and
+    /// the single `discard_candidate` site. A program rejection, a handler trap
+    /// and, for a local source, a protocol error all come back as `Rejected`.
+    /// A protocol error while applying an agreed step (`Step`) is a divergence,
+    /// except the two session-level failures mapped to their own errors.
+    async fn evaluate(
         &mut self,
-        event: Event<Vec<u8>>,
-        mut source: DispatchSource,
+        event: &Event<Vec<u8>>,
+        source: &mut DispatchSource,
         outgoing_len: usize,
-    ) -> Result<DispatchOutcome, ExecError> {
+    ) -> Result<Evaluation, ExecError> {
         let event_position = self.state.event_position();
         let call = {
             let mut call = DispatchCall::new(
@@ -484,10 +543,10 @@ impl ExecutionActor {
                 binding: self.state.binding().clone(),
             }));
             // Only local handlers may sign. `SessionStarted` is a
-            // pre-session dispatch and `MessageReceived` reproduces a
-            // peer's agreed result, so neither is offered a signer.
+            // pre-session dispatch and `MessagesReceived` reproduces the
+            // agreed step, so neither is offered a signer.
             if matches!(
-                &event,
+                event,
                 Event::InputReceived { .. }
                     | Event::TimerFired { .. }
                     | Event::DirectReceived { .. }
@@ -507,7 +566,7 @@ impl ExecutionActor {
                     execution_key: Arc::clone(&self.context.execution_key),
                 }));
             }
-            if let DispatchSource::Direct { attachment, .. } = &mut source
+            if let DispatchSource::Direct { attachment, .. } = source
                 && let Some(bytes) = attachment.take()
             {
                 call = call.with_attachment(bytes);
@@ -522,14 +581,14 @@ impl ExecutionActor {
                 // path that cannot prove its own rollback; the next use
                 // rebuilds it from the durable images.
                 self.instance = None;
-                let handler = match &event {
+                let handler = match event {
                     Event::InputReceived { .. } => Some("input"),
                     Event::DirectReceived { .. } => Some("direct"),
-                    Event::MessageReceived { .. } => Some("message"),
+                    Event::MessagesReceived { .. } => Some("message"),
                     _ => None,
                 };
                 if let Some(handler) = handler {
-                    return Ok(DispatchOutcome::Rejected {
+                    return Ok(Evaluation::Rejected {
                         reason: Some(super::truncate_reason(
                             format!("{handler} handler trapped: {error}"),
                             arena0_program::MAX_REJECTION_REASON_BYTES,
@@ -540,7 +599,7 @@ impl ExecutionActor {
             }
         };
         if result.status == CallStatus::Rejected {
-            return Ok(DispatchOutcome::Rejected {
+            return Ok(Evaluation::Rejected {
                 reason: result.reason,
             });
         }
@@ -560,22 +619,22 @@ impl ExecutionActor {
         // and clones nothing.
         let mut next = self.state.clone();
         if let Err(error) = next.apply_dispatch(
-            &event,
+            event,
             shared,
             local,
             &effects,
             terminal_outcome,
             match source {
-                DispatchSource::Answer(pending_id) => Some(pending_id),
+                DispatchSource::Answer(pending_id) => Some(*pending_id),
                 DispatchSource::Local
                 | DispatchSource::Direct { .. }
                 | DispatchSource::Timer(_)
-                | DispatchSource::PeerMessage { .. }
-                | DispatchSource::OwnMessage => None,
+                | DispatchSource::Step
+                | DispatchSource::OwnCheck => None,
             },
             result.callout,
         ) {
-            return match (&source, error) {
+            return match (&*source, error) {
                 // An agreed step whose broadcasts would overflow the local
                 // outgoing queue fails the session; the Host does not sign
                 // it. The failure boundary records the Host-signed `Fail`.
@@ -587,24 +646,22 @@ impl ExecutionActor {
                 (_, arena0_protocol::ProtocolError::ReceiptBudgetExhausted { step }) => {
                     Err(ExecError::ReceiptBudgetExhausted { step })
                 }
-                // A peer message the local program cannot apply is a
+                // An agreed step the local program cannot apply is a
                 // divergence, not an agent rejection.
-                (DispatchSource::PeerMessage { .. }, other) => {
-                    Err(ExecError::Diverged(super::truncate_reason(
-                        format!("diverged at step {}: {other}", self.state.agreed_step()),
-                        arena0_protocol::MAX_TERMINAL_REASON_BYTES,
-                    )))
-                }
-                // A local event or an authored own message is a plain
+                (DispatchSource::Step, other) => Err(ExecError::Diverged(super::truncate_reason(
+                    format!("diverged at step {}: {other}", self.state.agreed_step()),
+                    arena0_protocol::MAX_TERMINAL_REASON_BYTES,
+                ))),
+                // A local event or the own-message dry run is a plain
                 // rejection; the caller keeps the session live.
                 (
                     DispatchSource::Local
                     | DispatchSource::Answer(_)
                     | DispatchSource::Direct { .. }
                     | DispatchSource::Timer(_)
-                    | DispatchSource::OwnMessage,
+                    | DispatchSource::OwnCheck,
                     other,
-                ) => Ok(DispatchOutcome::Rejected {
+                ) => Ok(Evaluation::Rejected {
                     reason: Some(super::truncate_reason(
                         other.to_string(),
                         arena0_program::MAX_REJECTION_REASON_BYTES,
@@ -612,37 +669,45 @@ impl ExecutionActor {
                 }),
             };
         }
-        // The receiver rebuilds the entry itself; its commitment must equal
-        // the author's in every field. Compare before anything is persisted
-        // so recovery can never sign an incompatible proposal.
-        if let DispatchSource::PeerMessage { commitment } = &source {
-            let local = next
-                .proposal_commitment()
-                .expect("a peer dispatch stages a proposal");
-            if local != *commitment {
-                let cause = if local.post_state != commitment.post_state {
-                    "post-state mismatch"
-                } else if local.entry_hash != commitment.entry_hash {
-                    "entry mismatch"
-                } else if local.link != commitment.link {
-                    "link mismatch"
-                } else {
-                    "commitment mismatch"
-                };
-                return Err(ExecError::Diverged(super::truncate_reason(
-                    format!("diverged at step {}: {cause}", self.state.agreed_step()),
-                    arena0_protocol::MAX_TERMINAL_REASON_BYTES,
-                )));
-            }
-        }
-        let proposal_staged = next.pending_shared().is_some();
-        if let DispatchSource::Direct { from, seq, .. } = &source {
+        if let DispatchSource::Direct { from, seq, .. } = source {
             next.record_direct(*from, *seq)?;
         }
+        Ok(Evaluation::Accepted {
+            next,
+            blobs: result.blobs,
+            effects,
+        })
+    }
+
+    /// Run one checked event through the resident and persist the result.
+    ///
+    /// The caller owns the single discard site; `evaluate` drops the resident
+    /// itself only on sandbox trap paths, where the sandbox has already rolled
+    /// back and the next use rebuilds it from the durable images.
+    async fn dispatch_inner(
+        &mut self,
+        event: Event<Vec<u8>>,
+        mut source: DispatchSource,
+        outgoing_len: usize,
+    ) -> Result<DispatchOutcome, ExecError> {
+        let (next, blobs, effects, proposal_staged) =
+            match self.evaluate(&event, &mut source, outgoing_len).await? {
+                Evaluation::Rejected { reason } => {
+                    return Ok(DispatchOutcome::Rejected { reason });
+                }
+                Evaluation::Accepted {
+                    next,
+                    blobs,
+                    effects,
+                } => {
+                    let proposal_staged = next.pending_shared().is_some();
+                    (next, blobs, effects, proposal_staged)
+                }
+            };
         self.persist(
             next,
             Change::Dispatch {
-                blobs: result.blobs,
+                blobs,
                 event,
                 effects,
                 timer_id: match &source {
@@ -650,8 +715,8 @@ impl ExecutionActor {
                     DispatchSource::Local
                     | DispatchSource::Answer(_)
                     | DispatchSource::Direct { .. }
-                    | DispatchSource::PeerMessage { .. }
-                    | DispatchSource::OwnMessage => None,
+                    | DispatchSource::Step
+                    | DispatchSource::OwnCheck => None,
                 },
             },
         )

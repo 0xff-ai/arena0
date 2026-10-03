@@ -887,20 +887,25 @@ fn screen_layout(area: Rect, composer_height: u16) -> ScreenLayout {
 #[derive(Debug)]
 struct TraceViewEntry {
     entry: TraceEntry,
-    message: Option<Result<Value, String>>,
+    messages: Vec<Result<Value, String>>,
 }
 
 impl TraceViewEntry {
     fn new(entry: TraceEntry, schema: Result<&BorshSchemaDocument, &str>) -> Self {
-        let message = match &entry.event {
-            TraceEvent::SessionStarted { .. } => None,
-            TraceEvent::Message { data, .. } => Some(
-                schema
-                    .map_err(str::to_owned)
-                    .and_then(|schema| schema.decode_json(data).map_err(|error| error.to_string())),
-            ),
+        let messages = match &entry.event {
+            TraceEvent::SessionStarted { .. } => Vec::new(),
+            TraceEvent::Messages { messages } => messages
+                .iter()
+                .map(|message| {
+                    schema.map_err(str::to_owned).and_then(|schema| {
+                        schema
+                            .decode_json(&message.data)
+                            .map_err(|error| error.to_string())
+                    })
+                })
+                .collect(),
         };
-        Self { entry, message }
+        Self { entry, messages }
     }
 }
 

@@ -35,11 +35,6 @@ const REQUIRED_FUNC_EXPORTS: &[(&str, &[AbiType], Returns)] = &[
         Returns::Packed,
     ),
     (
-        abi::exports::WRITER,
-        &[AbiType::I32, AbiType::I32],
-        Returns::Packed,
-    ),
-    (
         abi::exports::OUTCOME,
         &[AbiType::I32, AbiType::I32],
         Returns::Packed,
@@ -159,7 +154,7 @@ pub(crate) fn validate_required_exports(module: &Module) -> Result<(), SandboxEr
     Ok(())
 }
 
-/// Verify the raw ABI-24 module exports all required functions and work memory
+/// Verify the raw ABI-25 module exports all required functions and work memory
 /// before the artifact finalizer adds the state memories.
 pub(crate) fn validate_raw_exports(module: &Module) -> Result<(), SandboxError> {
     validate_required_exports(module)?;
@@ -338,7 +333,7 @@ mod tests {
         let abi_version = if omitted == Some("arena0_abi_version") {
             ""
         } else {
-            r#"(global (export "arena0_abi_version") i32 (i32.const 24))"#
+            r#"(global (export "arena0_abi_version") i32 (i32.const 25))"#
         };
         let alloc = export(
             "arena0_alloc",
@@ -364,11 +359,6 @@ mod tests {
             "arena0_dispatch",
             r#"(func (export "arena0_dispatch") (param i32 i32) (result i64) i64.const 0)"#,
             r#"(func (export "arena0_dispatch") (param i32) (result i64) i64.const 0)"#,
-        );
-        let writer = export(
-            "arena0_writer",
-            r#"(func (export "arena0_writer") (param i32 i32) (result i64) i64.const 0)"#,
-            r#"(func (export "arena0_writer") (param i32) (result i64) i64.const 0)"#,
         );
         let outcome = export(
             "arena0_outcome",
@@ -402,7 +392,6 @@ mod tests {
               {prepare}
               {initialize}
               {dispatch}
-              {writer}
               {outcome}
               {query}
               {view}
@@ -425,7 +414,6 @@ mod tests {
             "arena0_prepare",
             "arena0_initialize",
             "arena0_dispatch",
-            "arena0_writer",
             "arena0_outcome",
             "arena0_query",
             "arena0_view",
@@ -448,7 +436,6 @@ mod tests {
             "arena0_prepare",
             "arena0_initialize",
             "arena0_dispatch",
-            "arena0_writer",
             "arena0_outcome",
             "arena0_query",
             "arena0_view",

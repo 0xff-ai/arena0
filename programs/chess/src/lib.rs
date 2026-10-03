@@ -233,11 +233,13 @@ pub mod chess {
         }
     }
 
-    fn writer(state: &Shared) -> Option<Participant> {
-        if state.phase() != Phase::Playing || state.status != Status::InProgress {
-            return None;
-        }
-        state.turns.as_ref().map(TurnManager::current)
+    fn can_move(state: &Shared, participant: Participant) -> bool {
+        state.phase() == Phase::Playing
+            && state.status == Status::InProgress
+            && state
+                .turns
+                .as_ref()
+                .is_some_and(|turns| turns.is_current(participant))
     }
 
     fn view(state: &Shared, _ensemble: &Ensemble, vp: &Viewport) -> View {
@@ -449,19 +451,12 @@ pub mod chess {
     /// Ask the participant whose turn it is for a legal move.
     fn callout(ctx: &CalloutContext<Shared, Local>) -> Option<Callout> {
         let state = ctx.shared();
-        if state.phase() != Phase::Playing || state.status != Status::InProgress {
+        if !can_move(state, ctx.me()) {
             return None;
         }
         // An answer already queued this participant's move; do not re-ask the
         // same question until the author's own message is applied.
         if ctx.local().move_pending {
-            return None;
-        }
-        let is_my_turn = state
-            .turns
-            .as_ref()
-            .is_some_and(|turns| turns.current() == ctx.me());
-        if !is_my_turn {
             return None;
         }
         let fen = state.fen.clone();
@@ -472,7 +467,7 @@ pub mod chess {
     fn on_input(ctx: &mut LocalContext<Shared, Local>, input: Input) -> arena0::anyhow::Result<()> {
         let Input::MakeMove(text) = input;
         let move_str = text.trim();
-        if writer(ctx.shared()) != Some(ctx.me()) {
+        if !can_move(ctx.shared(), ctx.me()) {
             return Err(anyhow!("this participant does not own the next move"));
         }
         // Validate the move against the committed board without mutating
@@ -491,7 +486,7 @@ pub mod chess {
         from: Participant,
         msg: Message,
     ) -> MessageApply<Chess> {
-        if writer(ctx.shared()) != Some(from) {
+        if !can_move(ctx.shared(), from) {
             return Ok(ApplyDecision::Reject);
         }
         let Message::Move(text) = msg;

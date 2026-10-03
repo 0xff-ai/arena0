@@ -199,14 +199,6 @@ pub mod vickrey_auction {
         }
     }
 
-    fn writer(state: &Shared) -> Option<Participant> {
-        match state.phase() {
-            Phase::Setup => None,
-            Phase::Bidding => state.bids.expected_writer(),
-            Phase::TieBreak => state.entropy.expected_writer(),
-        }
-    }
-
     fn view(state: &Shared, _ensemble: &Ensemble, vp: &Viewport) -> View {
         let mut agents = String::new();
         let mut body = String::new();
@@ -339,7 +331,7 @@ pub mod vickrey_auction {
     fn callout(ctx: &CalloutContext<Shared, Local>) -> Option<Callout> {
         (ctx.shared().phase() == Phase::Bidding
             && ctx.me().index() != 0
-            && ctx.shared().bids.is_writer(ctx.me())
+            && ctx.shared().bids.is_next(ctx.me())
             && ctx.shared().bids.needs_commit(&ctx.local().bids))
         .then(|| {
             callouts::SubmitBid {
@@ -357,7 +349,7 @@ pub mod vickrey_auction {
     ) -> MessageApply<VickreyAuction> {
         match message {
             Message::Bid(message) => {
-                if ctx.shared().phase() != Phase::Bidding || !ctx.shared().bids.is_writer(from) {
+                if ctx.shared().phase() != Phase::Bidding || !ctx.shared().bids.is_next(from) {
                     return Ok(ApplyDecision::Reject);
                 }
                 if ctx.bids().handle(from, message).is_err() {
@@ -375,8 +367,7 @@ pub mod vickrey_auction {
                 Ok(ApplyDecision::Accept(transition))
             }
             Message::Entropy(message) => {
-                if ctx.shared().phase() != Phase::TieBreak || !ctx.shared().entropy.is_writer(from)
-                {
+                if ctx.shared().phase() != Phase::TieBreak || !ctx.shared().entropy.is_next(from) {
                     return Ok(ApplyDecision::Reject);
                 }
                 if ctx.entropy().handle(from, message).is_err() {
@@ -394,7 +385,8 @@ pub mod vickrey_auction {
         }
     }
 
-    /// Queue the next owed bid commit or reveal when this node owns the writer.
+    /// Queue the next owed bid commit or reveal when this node owns the next
+    /// submission.
     fn queue_bid_action_if_due(ctx: &mut Context<Shared, Local>) -> arena0::anyhow::Result<()> {
         match ctx.bids().my_turn() {
             Some(MyTurn::Reveal(reveal)) => reveal.broadcast(&mut ctx.effects()),
@@ -409,7 +401,7 @@ pub mod vickrey_auction {
     }
 
     /// Queue the next owed entropy commit or reveal when this node owns the
-    /// writer.
+    /// next submission.
     fn queue_entropy_action_if_due(ctx: &mut Context<Shared, Local>) -> arena0::anyhow::Result<()> {
         match ctx.entropy().my_turn() {
             Some(MyTurn::Reveal(reveal)) => reveal.broadcast(&mut ctx.effects()),
@@ -435,7 +427,7 @@ pub mod vickrey_auction {
         if ctx.shared().phase() != Phase::Bidding {
             return Err(anyhow!("bidding is closed"));
         }
-        if !ctx.shared().bids.is_writer(ctx.me()) {
+        if !ctx.shared().bids.is_next(ctx.me()) {
             return Err(anyhow!("this participant does not own the next bid"));
         }
         ctx.bids().commit(amount)?.broadcast(&mut ctx.effects())?;
@@ -491,7 +483,7 @@ pub mod vickrey_auction {
     fn count_commits<T>(protocol: &CommitReveal<T>) -> usize {
         if protocol.phase() == commit_reveal::Phase::Idle {
             protocol
-                .expected_writer()
+                .next_participant()
                 .map_or(protocol.participant_count(), |participant| {
                     participant.index()
                 })
@@ -503,12 +495,12 @@ pub mod vickrey_auction {
     fn bid_status(protocol: &CommitReveal<u64>, index: usize) -> &'static str {
         match protocol.phase() {
             commit_reveal::Phase::Complete => "revealed",
-            commit_reveal::Phase::Revealing => match protocol.expected_writer() {
+            commit_reveal::Phase::Revealing => match protocol.next_participant() {
                 Some(expected) if expected.index() == index => "pending reveal",
                 Some(expected) if expected.index() < index => "waiting reveal",
                 _ => "revealed",
             },
-            commit_reveal::Phase::Idle => match protocol.expected_writer() {
+            commit_reveal::Phase::Idle => match protocol.next_participant() {
                 Some(expected) if expected.index() == index => "pending",
                 Some(expected) if expected.index() < index => "waiting",
                 _ => "committed",

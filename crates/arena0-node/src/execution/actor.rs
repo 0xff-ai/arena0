@@ -393,10 +393,11 @@ impl ExecutionActor {
                 }
             }
         };
-        if state.pending_shared().is_some() {
+        if state.pending_shared().is_none() {
+            self.advance_step().await?;
+        }
+        if self.state.pending_shared().is_some() {
             self.ensure_step_signature().await?;
-        } else if self.may_author()? {
-            self.author_next_message().await?;
         }
         self.announce_callout().await?;
         self.deliver_frames()?;

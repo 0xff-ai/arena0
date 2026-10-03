@@ -659,10 +659,10 @@ impl<Shared, M> std::fmt::Debug for Effects<'_, Shared, M> {
 impl<Shared, M: EffectMode> Effects<'_, Shared, M> {
     /// Broadcast a borsh-serialized message to every participant.
     ///
-    /// The message is appended to this participant's durable outgoing queue. A
-    /// later dispatch authors the head when the `writer` projection selects
-    /// this participant; the author applies its own message through the same
-    /// `on_message` dispatch every receiver runs.
+    /// The message is appended to this participant's durable outgoing queue;
+    /// the Host sends the queue head as this participant's step message for the
+    /// next agreed step, and every participant applies it through `on_message`
+    /// in that step's single dispatch.
     ///
     /// In an agreed handler this cannot fail: an agreed handler never observes
     /// the local queue, and if the agreed step would overflow the queue the

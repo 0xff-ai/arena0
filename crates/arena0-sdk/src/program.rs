@@ -13,9 +13,12 @@ pub type ProgramTransition<P> = Transition<<P as Program>::Phase>;
 
 /// The outcome of a shared message apply: accept (with a transition) or reject.
 ///
-/// `Reject` is a deterministic non-application: the host rolls the dispatch
-/// layer back, records no trace entry, and quarantines the message. It is not
-/// a fault — faults remain fatal abort edges.
+/// `Reject` declines the message deterministically. Every participant applies
+/// the same messages, so every participant reaches the same verdict: the
+/// dispatch rolls back, the step is not agreed, and every Host ends the
+/// session in `Fail`. A program that wants to ignore a message accepts it
+/// unchanged instead. A reject is not a fault; faults remain fatal abort
+/// edges.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyDecision<P> {
     /// Accept the message and apply the transition.
@@ -95,13 +98,14 @@ pub trait Program: Sized {
     /// [`Effect::SessionEnd`](crate::Effect::SessionEnd).
     fn outcome(shared: &Self::Shared) -> Self::Outcome;
 
-    /// Select the sole participant allowed to author the next agreed message.
+    /// Order the messages of one agreed step before they apply.
     ///
-    /// This is a pure function of replicated state. Returning `None` closes the
-    /// agreed-message boundary until another agreed event changes that state.
-    /// The host checks this result before invoking [`Self::on_message`], so
-    /// network arrival order cannot select between sibling message results.
-    fn writer(shared: &Self::Shared) -> Option<Participant>;
+    /// The Host hands every step's messages in ascending participant order,
+    /// at most one per participant; a step with one message is the common
+    /// case. This must be a pure function of `shared` and `messages`: every
+    /// participant runs it on the same inputs and must reach the same order.
+    /// The default keeps the Host's order.
+    fn canonicalize(_shared: &Self::Shared, _messages: &mut [(Participant, Self::Message)]) {}
 
     /// Session boundary handler. It receives the committed participant set as
     /// explicit input and may update both state values or emit effects.
@@ -112,15 +116,19 @@ pub trait Program: Sized {
         Ok(Transition::Stay)
     }
 
-    /// Message handler applied at the message's canonical agreed position.
-    /// Returns [`ApplyDecision::Accept`] to commit the dispatch result and transition
-    /// or [`ApplyDecision::Reject`] to decline it without a trace entry.
+    /// Message handler, called once per message of an agreed step in the
+    /// order [`Self::canonicalize`] chose, each call seeing the state the
+    /// previous one left. The program decides whether `from` may send this
+    /// message now. Returns [`ApplyDecision::Accept`] to apply it with a
+    /// transition, or [`ApplyDecision::Reject`] to decline it, which fails the
+    /// step. The default rejects: a program without this handler accepts no
+    /// messages.
     fn on_message(
         _ctx: &mut Context<Self::Shared, Self::Local>,
         _from: Participant,
         _msg: Self::Message,
     ) -> MessageApply<Self> {
-        Ok(ApplyDecision::Accept(Transition::Stay))
+        Ok(ApplyDecision::Reject)
     }
     /// Handler for a callout answer. An error rejects the answer and restores
     /// both state memories without ending the session. A local handler cannot
@@ -189,6 +197,44 @@ pub trait Program: Sized {
     fn __primitive_routes() -> Vec<PrimitiveRouteSchema> {
         <Self::Shared as SharedState>::__primitive_routes()
     }
+}
+
+/// Apply one agreed step's messages inside its single dispatch.
+///
+/// Called only by the generated dispatch glue for
+/// `Event::MessagesReceived`, with the senders already mapped to
+/// participants and the payloads decoded, in the Host's order. Runs
+/// [`Program::canonicalize`] on the context's shared state, then
+/// [`Program::on_message`] for each message in the resulting order:
+/// - a `Reject` rejects the whole step at once (`Ok(ApplyDecision::Reject)`);
+/// - `Transition::To` applies the phase immediately, so later messages see it;
+/// - the first `End` or `Abort` stops the fold; the remaining messages stay
+///   in the trace as inputs but are not applied, and the transition is
+///   returned for the glue to apply;
+/// - otherwise `Ok(ApplyDecision::Accept(Transition::Stay))`.
+///
+/// An `Err` from a handler is returned as is. All messages share the one
+/// dispatch's effect and fuel budgets.
+#[doc(hidden)]
+pub fn __apply_step<P: Program>(
+    ctx: &mut Context<P::Shared, P::Local>,
+    messages: Vec<(Participant, P::Message)>,
+) -> MessageApply<P> {
+    let mut messages = messages;
+    P::canonicalize(ctx.shared(), &mut messages);
+    for (from, msg) in messages {
+        match P::on_message(ctx, from, msg)? {
+            ApplyDecision::Reject => return Ok(ApplyDecision::Reject),
+            ApplyDecision::Accept(Transition::Stay) => {}
+            ApplyDecision::Accept(Transition::To(phase)) => {
+                P::__set_phase(ctx.shared_mut(), phase);
+            }
+            ApplyDecision::Accept(transition @ (Transition::End | Transition::Abort(_))) => {
+                return Ok(ApplyDecision::Accept(transition));
+            }
+        }
+    }
+    Ok(ApplyDecision::Accept(Transition::Stay))
 }
 
 /// Read-only query surface separated from transition handlers.

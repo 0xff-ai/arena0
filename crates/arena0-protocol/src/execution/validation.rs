@@ -10,7 +10,10 @@ use super::{
     AbortKind, ExecutionBinding, MAX_EFFECTS, MAX_RECEIPT_BYTES, MAX_TRACE_ENTRY_BYTES,
     ParticipantStepSignature, ProtocolError, ReceiptBody, SharedProposal, StepCursor, StopCause,
 };
-use crate::{MAX_TERMINAL_OUTCOME_BYTES, MAX_TERMINAL_REASON_BYTES, MAX_TIMER_PAYLOAD_BYTES};
+use crate::{
+    MAX_EFFECT_PAYLOAD_BYTES, MAX_TERMINAL_OUTCOME_BYTES, MAX_TERMINAL_REASON_BYTES,
+    MAX_TIMER_PAYLOAD_BYTES,
+};
 
 /// Validate an encoded value's total size without decoding it first.
 pub(crate) fn ensure_encoded(
@@ -432,12 +435,17 @@ pub(crate) fn validate_trace_entry(entry: &TraceEntry) -> Result<(), ProtocolErr
     )?;
     match &entry.event {
         StepEvent::SessionStarted { .. } => {}
-        StepEvent::Message { data, .. } => {
-            ensure_payload(
-                "message payload",
-                data.len(),
-                crate::MAX_EFFECT_PAYLOAD_BYTES,
-            )?;
+        StepEvent::Messages { messages } => {
+            if messages.is_empty() {
+                return Err(ProtocolError::InvalidStepMessages("empty step"));
+            }
+            for message in messages {
+                ensure_payload(
+                    "message payload",
+                    message.data.len(),
+                    MAX_EFFECT_PAYLOAD_BYTES,
+                )?;
+            }
         }
     }
     if let Some(terminal) = &entry.terminal {
@@ -483,11 +491,30 @@ pub(crate) fn validate_shared_entry(
                 return Err(ProtocolError::SessionStartMismatch);
             }
         }
-        StepEvent::Message { from, .. } => {
+        StepEvent::Messages { messages } => {
             if expected_step == 0 {
                 return Err(ProtocolError::MissingSessionStart);
             }
-            binding.participant_key(from)?;
+            // Participant indexes come from the same ensemble order signer
+            // bitmaps index, so a strictly ascending sequence is exactly the
+            // canonical, duplicate-free order the agreed step requires.
+            let ensemble = binding
+                .ensemble()
+                .map_err(|error| ProtocolError::InvalidCertificate(error.to_string()))?;
+            let mut previous: Option<usize> = None;
+            for message in messages {
+                binding.participant_key(&message.from)?;
+                let index = ensemble
+                    .participant_of(&message.from)
+                    .expect("participant_key accepted the sender")
+                    .index();
+                if previous.is_some_and(|prev| index <= prev) {
+                    return Err(ProtocolError::InvalidStepMessages(
+                        "not in ascending participant order",
+                    ));
+                }
+                previous = Some(index);
+            }
         }
     }
     Ok(())
@@ -605,4 +632,75 @@ pub(crate) fn single_lifecycle_effect<'a>(
 
 pub(crate) fn terminal_effect_count(entry: &TraceEntry) -> usize {
     usize::from(entry.terminal.is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_fixtures::fixture;
+    use super::*;
+    use crate::trace::{AggregateAttestation, TRACE_FORMAT_VERSION};
+    use crate::{PeerId, StepMessage};
+
+    fn entry(messages: Vec<StepMessage>) -> TraceEntry {
+        TraceEntry {
+            trace_version: TRACE_FORMAT_VERSION,
+            step: 1,
+            event: StepEvent::Messages { messages },
+            pre_state: StateHash([1; 32]),
+            post_state: StateHash([2; 32]),
+            terminal: None,
+            agreement: AggregateAttestation::empty(),
+        }
+    }
+
+    fn message(from: PeerId, data: u8) -> StepMessage {
+        StepMessage {
+            from,
+            data: vec![data],
+        }
+    }
+
+    #[test]
+    fn shared_step_rejects_empty_unordered_duplicate_and_foreign_senders() {
+        let fixture = fixture();
+        let binding = fixture.binding();
+        let first = fixture.participants[0].0;
+        let second = fixture.participants[1].0;
+        let foreign = PeerId([0xff; 32]);
+
+        assert_eq!(
+            validate_shared_entry(&binding, 1, &entry(Vec::new())).unwrap_err(),
+            ProtocolError::InvalidStepMessages("empty step")
+        );
+        assert_eq!(
+            validate_shared_entry(
+                &binding,
+                1,
+                &entry(vec![message(second, 1), message(first, 2)])
+            )
+            .unwrap_err(),
+            ProtocolError::InvalidStepMessages("not in ascending participant order")
+        );
+        assert_eq!(
+            validate_shared_entry(
+                &binding,
+                1,
+                &entry(vec![message(first, 1), message(first, 2)])
+            )
+            .unwrap_err(),
+            ProtocolError::InvalidStepMessages("not in ascending participant order")
+        );
+        assert_eq!(
+            validate_shared_entry(&binding, 1, &entry(vec![message(foreign, 1)])).unwrap_err(),
+            ProtocolError::UnknownParticipant {
+                participant: foreign
+            }
+        );
+        validate_shared_entry(
+            &binding,
+            1,
+            &entry(vec![message(first, 1), message(second, 2)]),
+        )
+        .expect("an ascending participant set is valid");
+    }
 }

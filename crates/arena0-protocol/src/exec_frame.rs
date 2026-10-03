@@ -2,8 +2,8 @@
 //!
 //! Execution streams carry one durable fact per frame. Session routing is
 //! established by the transport when the stream is opened, so the frame
-//! itself contains a message, a commitment signature or certificate, or an
-//! authenticated abort occurrence. The first Borsh byte is the frame kind;
+//! itself contains a step message, a commitment signature or certificate, or
+//! an authenticated abort occurrence. The first Borsh byte is the frame kind;
 //! [`arena0_wire::Codec`] adds the versioned length-prefixed envelope.
 
 use arena0_crypto::BlsSignature;
@@ -41,12 +41,16 @@ const MAX_EXEC_SIGNER_BYTES: usize = crate::MAX_PARTICIPANTS.div_ceil(8);
 /// Borsh size of a [`StepCommitment`]: domain, session, step, entry hash,
 /// pre/post state hashes, and chain link.
 const STEP_COMMITMENT_BYTES: usize = 24 + 32 + 8 + 32 + 32 + 32 + 32;
-/// The largest canonical frame body: a message with a maximal payload. Signature,
-/// certificate, and abort frames are bounded far below it. The exec stream's
-/// transport cap is exactly this bound.
+/// The largest canonical frame body: a step message with a maximal payload.
+/// Signature, certificate, and abort frames are bounded far below it. The exec
+/// stream's transport cap is exactly this bound.
 pub const MAX_EXEC_FRAME_BYTES: usize =
-    1 + STEP_COMMITMENT_BYTES + size_of::<u32>() + MAX_EFFECT_PAYLOAD_BYTES;
+    1 + size_of::<u64>() + 32 + 1 + size_of::<u32>() + MAX_EFFECT_PAYLOAD_BYTES;
 const _: () = assert!(MAX_EXEC_FRAME_BYTES == arena0_wire::MAX_EXEC_FRAME_BYTES);
+/// A signature frame (kind, commitment, BLS signature) is well below the
+/// message frame that sets the stream cap.
+const _: () =
+    assert!(1 + STEP_COMMITMENT_BYTES + size_of::<BlsSignature>() <= MAX_EXEC_FRAME_BYTES);
 
 /// A validated execution fact used by protocol machinery.
 ///
@@ -55,16 +59,21 @@ const _: () = assert!(MAX_EXEC_FRAME_BYTES == arena0_wire::MAX_EXEC_FRAME_BYTES)
 /// commitment, or an authenticated abort occurrence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecFrame {
-    /// Broadcast one program payload at an agreed trace position.
+    /// One participant's step message: its answer for one agreed step.
     ///
-    /// The commitment carries the author's step, pre/post shared hashes, entry
-    /// hash, and chain link. A receiver rebuilds the entry itself and compares
-    /// its own commitment before signing.
+    /// Every participant sends exactly one per step to every peer: `Some`
+    /// with the head of its outgoing queue, or `None` for "nothing from me".
+    /// `step` and `link` bind it to the agreed cursor the sender stands on.
+    /// A receiver holding all N step messages for its current step applies
+    /// the non-empty ones as one step and signs the result; there is no
+    /// separate per-message commitment to compare.
     Message {
-        /// The author's complete commitment for this message step.
-        commitment: StepCommitment,
-        /// Opaque guest payload, bounded like the trace's message event.
-        data: Vec<u8>,
+        /// The agreed step this message answers.
+        step: u64,
+        /// The chain link of the agreed cursor before `step`.
+        link: [u8; 32],
+        /// Opaque guest payload, bounded like the trace's step message.
+        data: Option<Vec<u8>>,
     },
     /// One participant's signature over one exact shared-state commitment.
     StepSignature {
@@ -102,10 +111,17 @@ pub enum ExecFrame {
 impl BorshSerialize for ExecFrame {
     fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
         match self {
-            Self::Message { commitment, data } => {
+            Self::Message { step, link, data } => {
                 BorshSerialize::serialize(&EXEC_KIND_MESSAGE, writer)?;
-                write_commitment(commitment, writer)?;
-                serialize_bounded_bytes(writer, data, MAX_EFFECT_PAYLOAD_BYTES, "exec.data")
+                BorshSerialize::serialize(step, writer)?;
+                BorshSerialize::serialize(link, writer)?;
+                match data {
+                    None => BorshSerialize::serialize(&0u8, writer),
+                    Some(data) => {
+                        BorshSerialize::serialize(&1u8, writer)?;
+                        serialize_bounded_bytes(writer, data, MAX_EFFECT_PAYLOAD_BYTES, "exec.data")
+                    }
+                }
             }
             Self::StepSignature {
                 commitment,
@@ -165,8 +181,22 @@ impl BorshDeserialize for ExecFrame {
     fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
         match u8::deserialize_reader(reader)? {
             EXEC_KIND_MESSAGE => Ok(Self::Message {
-                commitment: read_commitment(reader)?,
-                data: read_bounded_bytes(reader, MAX_EFFECT_PAYLOAD_BYTES, "exec.data")?,
+                step: u64::deserialize_reader(reader)?,
+                link: <[u8; 32]>::deserialize_reader(reader)?,
+                data: match u8::deserialize_reader(reader)? {
+                    0 => None,
+                    1 => Some(read_bounded_bytes(
+                        reader,
+                        MAX_EFFECT_PAYLOAD_BYTES,
+                        "exec.data",
+                    )?),
+                    tag => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid step message option tag {tag}"),
+                        ));
+                    }
+                },
             }),
             EXEC_KIND_STEP_SIGNATURE => Ok(Self::StepSignature {
                 commitment: read_commitment(reader)?,
@@ -256,8 +286,9 @@ mod tests {
     #[derive(BorshSerialize)]
     enum DerivedExecFrame {
         Message {
-            commitment: StepCommitment,
-            data: Vec<u8>,
+            step: u64,
+            link: [u8; 32],
+            data: Option<Vec<u8>>,
         },
         StepSignature {
             commitment: StepCommitment,
@@ -309,12 +340,14 @@ mod tests {
         vec![
             (
                 ExecFrame::Message {
-                    commitment: commitment(),
-                    data: vec![3, 4, 5],
+                    step: 8,
+                    link: [5; 32],
+                    data: Some(vec![3, 4, 5]),
                 },
                 DerivedExecFrame::Message {
-                    commitment: commitment(),
-                    data: vec![3, 4, 5],
+                    step: 8,
+                    link: [5; 32],
+                    data: Some(vec![3, 4, 5]),
                 },
             ),
             (
@@ -348,7 +381,9 @@ mod tests {
 
     fn message_body(len: usize) -> Vec<u8> {
         let mut body = vec![EXEC_KIND_MESSAGE];
-        body.extend(borsh::to_vec(&commitment()).unwrap());
+        body.extend_from_slice(&8u64.to_le_bytes());
+        body.extend_from_slice(&[5u8; 32]);
+        body.push(1);
         body.extend_from_slice(&u32::try_from(len).unwrap().to_le_bytes());
         body.resize(body.len() + len, 0);
         body
@@ -372,8 +407,9 @@ mod tests {
     fn largest_frames_fit_the_exec_stream_cap() {
         let stream = Codec::new(arena0_wire::StreamProtocol::Exec.max_frame_body());
         let message = ExecFrame::Message {
-            commitment: commitment(),
-            data: vec![0; MAX_EFFECT_PAYLOAD_BYTES],
+            step: 8,
+            link: [5; 32],
+            data: Some(vec![0; MAX_EFFECT_PAYLOAD_BYTES]),
         };
         assert_eq!(borsh::to_vec(&message).unwrap().len(), MAX_EXEC_FRAME_BYTES);
         let encoded = stream.encode(&message).unwrap();
@@ -397,8 +433,9 @@ mod tests {
     fn message_payload_is_bounded_like_the_trace_event() {
         assert!(borsh::from_slice::<ExecFrame>(&message_body(MAX_EFFECT_PAYLOAD_BYTES)).is_ok());
         let oversized = Codec::default().encode(&ExecFrame::Message {
-            commitment: commitment(),
-            data: vec![0; MAX_EFFECT_PAYLOAD_BYTES + 1],
+            step: 8,
+            link: [5; 32],
+            data: Some(vec![0; MAX_EFFECT_PAYLOAD_BYTES + 1]),
         });
         assert!(matches!(
             oversized,
@@ -425,11 +462,35 @@ mod tests {
 
     #[test]
     fn decode_rejects_oversized_message_before_allocating() {
-        let mut bytes = vec![EXEC_KIND_MESSAGE];
-        bytes.extend(borsh::to_vec(&commitment()).unwrap());
-        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        let mut bytes = message_body(0);
+        let length_at = 1 + size_of::<u64>() + 32 + 1;
+        bytes[length_at..length_at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
         let error = borsh::from_slice::<ExecFrame>(&bytes).expect_err("oversized data is invalid");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn step_message_round_trips_absent_and_present_payloads() {
+        for data in [None, Some(Vec::new()), Some(vec![1, 2, 3])] {
+            let frame = ExecFrame::Message {
+                step: 9,
+                link: [7; 32],
+                data,
+            };
+            let bytes = borsh::to_vec(&frame).expect("frame serializes");
+            assert_eq!(borsh::from_slice::<ExecFrame>(&bytes).unwrap(), frame);
+        }
+    }
+
+    #[test]
+    fn unknown_step_message_option_tag_is_rejected() {
+        let mut bytes = message_body(0);
+        let tag_at = 1 + size_of::<u64>() + 32;
+        bytes[tag_at] = 2;
+        assert_eq!(
+            borsh::from_slice::<ExecFrame>(&bytes).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]

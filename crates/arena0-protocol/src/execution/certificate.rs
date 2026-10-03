@@ -102,8 +102,8 @@ impl<'de> Deserialize<'de> for ReceiptBody {
     }
 }
 
-const RECEIPT_BODY_VERSION: u8 = 5;
-const RECEIPT_VERSION: u8 = 5;
+const RECEIPT_BODY_VERSION: u8 = 6;
+const RECEIPT_VERSION: u8 = 6;
 
 impl ReceiptBody {
     /// Assemble a receipt body from its portable proof fields.
@@ -214,7 +214,7 @@ impl ReceiptId {
             borsh::to_vec(body).map_err(|error| ProtocolError::Serialization(error.to_string()))?;
         ensure_payload("receipt body", bytes.len(), MAX_RECEIPT_BYTES)?;
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"arena0/receipt/v5");
+        hasher.update(b"arena0/receipt/v6");
         hasher.update(&[RECEIPT_VERSION]);
         hasher.update(&bytes);
         Ok(Self(*hasher.finalize().as_bytes()))
@@ -593,8 +593,8 @@ mod tests {
     use crate::{
         Activation, AggregateAttestation, CHAIN_START, Committed, Ensemble, Offer, OfferData,
         PreparedActivation, ReceiptBody, SessionHeader, SignerSet, StateHash, StepCommitment,
-        StepEvent, StepTerminal, TRACE_FORMAT_VERSION, Ticket, TicketAction, TicketData,
-        TraceEntry,
+        StepEvent, StepMessage, StepTerminal, TRACE_FORMAT_VERSION, Ticket, TicketAction,
+        TicketData, TraceEntry,
     };
     use crate::{PeerId, ReceiptTermination};
     use arena0_crypto::{BlsSignature, ExecutionKey, ExecutionSalt, NodeKeys, SecretKey};
@@ -730,9 +730,11 @@ mod tests {
             let mut second = TraceEntry {
                 trace_version: TRACE_FORMAT_VERSION,
                 step: 1,
-                event: StepEvent::Message {
-                    from: sender,
-                    data: msg,
+                event: StepEvent::Messages {
+                    messages: vec![StepMessage {
+                        from: sender,
+                        data: msg,
+                    }],
                 },
                 pre_state: first_post_state,
                 post_state: final_state,

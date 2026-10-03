@@ -100,9 +100,6 @@ impl TryFrom<usize> for Participant {
     }
 }
 
-/// The concurrency shape a program phase declares, fixing the canonical order
-/// in which broadcast messages enter the public trace.
-///
 impl Default for Participant {
     fn default() -> Self {
         Self::new(0)

@@ -9,7 +9,8 @@ use std::time::Instant;
 use crate::exec::ExecLifecycle;
 use crate::negotiation::Activation;
 use crate::trace::{
-    AggregateAttestation, StepCommitment, StepEvent, StepTerminal, TRACE_FORMAT_VERSION, TraceEntry,
+    AggregateAttestation, StepCommitment, StepEvent, StepMessage, StepTerminal,
+    TRACE_FORMAT_VERSION, TraceEntry,
 };
 use crate::{
     CalloutId, Effect, Event, ExecFrame, ExecId, OpenCallout, PeerId, StateHash, callout_id,
@@ -18,9 +19,9 @@ use crate::{
 use super::{
     ExecutionBinding, ExecutionStatus, ExecutionVersion, MAX_EFFECTS, MAX_EXECUTION_STATE_BYTES,
     MAX_PROOF_SIGNATURES, ParticipantStepSignature, ProtocolError, ReceiptArtifact, ReceiptId,
-    StepCursor, TerminalOutcome, check_effect_budget, ensure_encoded, ensure_payload,
-    single_lifecycle_effect, validate_effects, validate_proposal, validate_receipt_body,
-    verify_step_signature,
+    StepCursor, StepMessageArrival, TerminalOutcome, check_effect_budget, ensure_encoded,
+    ensure_payload, single_lifecycle_effect, validate_effects, validate_proposal,
+    validate_receipt_body, verify_step_signature,
 };
 
 /// A shared step waiting for N-of-N signatures.
@@ -242,9 +243,17 @@ pub struct ExecutionState {
     pub(crate) end_phase: super::EndPhase,
     /// Per-peer direct history is local progress, never an agreed commitment.
     pub(crate) direct: BTreeMap<PeerId, DirectLane>,
-    /// Local FIFO queue of authored messages. Never part of a commitment,
-    /// `StateHash`, or receipt.
+    /// Local FIFO queue of outgoing messages; the head is this participant's
+    /// next step message. Never part of a commitment, `StateHash`, or receipt.
     pub(crate) outgoing: Vec<Vec<u8>>,
+    /// Step messages held for `agreed_step`, this participant's own included,
+    /// in arrival order: `(sender, Some(payload))` or `(sender, None)` for
+    /// "nothing from me". Local collection evidence, never part of a
+    /// commitment, `StateHash`, or receipt. Non-empty only while active with
+    /// no staged proposal; staging the step or stopping clears it. A received
+    /// entry is durable before its acknowledgement, and the own entry is
+    /// durable before it is sent, so a restart loses nothing.
+    pub(crate) step_messages: Vec<(PeerId, Option<Vec<u8>>)>,
     pub(crate) shared_state: SharedStateBytes,
     pub(crate) local_state: LocalStateBytes,
     pub(crate) proposal: Option<SharedProposal>,
@@ -364,6 +373,7 @@ impl ExecutionState {
             end_phase: super::EndPhase::Open,
             direct: BTreeMap::new(),
             outgoing: Vec::new(),
+            step_messages: Vec::new(),
             shared_state,
             local_state,
             proposal: None,
@@ -508,6 +518,202 @@ impl ExecutionState {
         &self.outgoing
     }
 
+    /// Borrow the step messages held for the current agreed step.
+    #[must_use]
+    pub fn step_messages(&self) -> &[(PeerId, Option<Vec<u8>>)] {
+        &self.step_messages
+    }
+
+    /// Classify a step message from `from` for `step`, bound to `link`.
+    ///
+    /// `Stale` below the current agreed step, `NotYet` above it. At the
+    /// current step: `Rejected` when `from` is not a participant, `link` is
+    /// not the agreed link, or the execution is not active; otherwise the
+    /// message is compared with the one already held from `from`. While a
+    /// message step is staged, the held messages are derived from the staged
+    /// entry (`Some(data)` for a sender in the entry, `None` for any other
+    /// participant), so a staged step answers `Duplicate` or `Conflict` and
+    /// never `New`. While collecting, the held messages are
+    /// [`Self::step_messages`]; a sender with none there is `New`. Applies to
+    /// this participant's own message too.
+    #[must_use]
+    pub fn step_message_arrival(
+        &self,
+        from: PeerId,
+        step: u64,
+        link: [u8; 32],
+        data: Option<&[u8]>,
+    ) -> StepMessageArrival {
+        if step < self.agreed_step {
+            return StepMessageArrival::Stale;
+        }
+        if step > self.agreed_step {
+            return StepMessageArrival::NotYet;
+        }
+        if !self.binding.is_participant(from)
+            || link != self.agreed_link
+            || !matches!(self.status, ExecutionStatus::Active)
+        {
+            return StepMessageArrival::Rejected;
+        }
+        // While a message step is staged the held set is the staged entry:
+        // a participant absent from it sent "nothing" and is still held.
+        let held = if let Some(proposal) = &self.proposal {
+            match &proposal.entry.event {
+                StepEvent::Messages { messages } => Some(
+                    messages
+                        .iter()
+                        .find(|message| message.from == from)
+                        .map(|message| message.data.as_slice()),
+                ),
+                StepEvent::SessionStarted { .. } => return StepMessageArrival::NotYet,
+            }
+        } else {
+            self.step_messages
+                .iter()
+                .find(|(peer, _)| *peer == from)
+                .map(|(_, held)| held.as_deref())
+        };
+        match held {
+            None => StepMessageArrival::New,
+            Some(existing) if existing == data => StepMessageArrival::Duplicate,
+            Some(_) => StepMessageArrival::Conflict,
+        }
+    }
+
+    /// Record one step message for the current agreed step on the candidate
+    /// being persisted, own or received, and advance the version once.
+    ///
+    /// Errors with [`ProtocolError::InvalidStepMessage`] unless
+    /// [`Self::step_message_arrival`] would answer `New` for it at
+    /// `(agreed_step, agreed_link)`, and with `PayloadTooLarge` for a payload
+    /// over `MAX_EFFECT_PAYLOAD_BYTES`. The caller persists the result before
+    /// acknowledging a received message or sending its own.
+    pub fn record_step_message(
+        &mut self,
+        from: PeerId,
+        data: Option<Vec<u8>>,
+    ) -> Result<(), ProtocolError> {
+        if self.proposal.is_some() {
+            return Err(ProtocolError::InvalidStepMessage {
+                from,
+                reason: "not collecting",
+            });
+        }
+        if let Some(payload) = &data {
+            ensure_payload(
+                "step message",
+                payload.len(),
+                crate::MAX_EFFECT_PAYLOAD_BYTES,
+            )?;
+        }
+        match self.step_message_arrival(from, self.agreed_step, self.agreed_link, data.as_deref()) {
+            StepMessageArrival::New => {}
+            StepMessageArrival::Duplicate | StepMessageArrival::Conflict => {
+                return Err(ProtocolError::InvalidStepMessage {
+                    from,
+                    reason: "already held",
+                });
+            }
+            StepMessageArrival::Stale
+            | StepMessageArrival::NotYet
+            | StepMessageArrival::Rejected => {
+                return Err(ProtocolError::InvalidStepMessage {
+                    from,
+                    reason: "not collecting",
+                });
+            }
+        }
+        let mut next = self.clone();
+        next.step_messages.push((from, data));
+        next.bump_version()?;
+        *self = next;
+        Ok(())
+    }
+
+    /// The messages of the current step, once it is complete.
+    ///
+    /// `Some` only while active with no staged proposal, holding a step
+    /// message from every participant, at least one of them non-empty: the
+    /// non-empty ones as `(sender, payload)` in ascending participant order
+    /// (the activation's ensemble order). This is exactly the list the Host
+    /// dispatches as `Event::MessagesReceived`. `None` otherwise, including the
+    /// all-empty set an honest Host never produces.
+    #[must_use]
+    pub fn step_set(&self) -> Option<Vec<(PeerId, Vec<u8>)>> {
+        if !matches!(self.status, ExecutionStatus::Active) || self.proposal.is_some() {
+            return None;
+        }
+        let ensemble = self.binding.ensemble().ok()?;
+        if self.step_messages.len() != ensemble.len() {
+            return None;
+        }
+        // Iterating the ensemble yields ascending participant order and, with
+        // one held entry per participant, rejects strangers and duplicates.
+        let mut messages = Vec::new();
+        for peer in ensemble.peers() {
+            let (_, data) = self.step_messages.iter().find(|(from, _)| from == peer)?;
+            if let Some(payload) = data {
+                messages.push((*peer, payload.clone()));
+            }
+        }
+        if messages.is_empty() {
+            return None;
+        }
+        Some(messages)
+    }
+
+    /// Stop with this participant's own `occurrence` even though it may have
+    /// signed the staged proposal, because a peer signed a different
+    /// commitment for the same step.
+    ///
+    /// Requires a staged proposal and conflict evidence: `signature` is from a
+    /// participant other than this one, `conflicting` has this session, the
+    /// staged step, the agreed pre-state and the agreed link, differs from
+    /// the staged commitment, and `signature` verifies over it with the
+    /// signer's execution key. Otherwise [`ProtocolError::NoConflict`]. The
+    /// occurrence must be authenticated, from this participant, and at the
+    /// agreed cursor, as for [`Self::stop`]. On success the proposal, callout
+    /// and step messages are dropped and the status becomes stopped, exactly
+    /// as [`Self::stop`] does. Safe because an honest peer signs once per
+    /// step, so the commitment this participant signed can no longer certify.
+    pub fn stop_on_conflict(
+        &mut self,
+        occurrence: super::AbortOccurrence,
+        conflicting: &StepCommitment,
+        signature: ParticipantStepSignature,
+    ) -> Result<(), ProtocolError> {
+        let proposal = self
+            .proposal
+            .as_ref()
+            .ok_or(ProtocolError::SharedProposalMissing)?;
+        let participant = signature.participant();
+        let no_conflict = || ProtocolError::NoConflict { participant };
+        let staged = self.commitment_for(proposal);
+        if participant == self.producer
+            || !self.binding.is_participant(participant)
+            || conflicting.session_id != self.binding.session_id()
+            || conflicting.step != self.agreed_step
+            || conflicting.pre_state != self.agreed_state
+            || conflicting.link != self.agreed_link
+            || *conflicting == staged
+        {
+            return Err(no_conflict());
+        }
+        let key = self
+            .binding
+            .participant_key(&participant)
+            .map_err(|_| no_conflict())?;
+        if verify_step_signature(&key, conflicting, &signature).is_err() {
+            return Err(no_conflict());
+        }
+        self.validate_stop_occurrence(&occurrence)?;
+        if occurrence.sender() != self.producer {
+            return Err(ProtocolError::UnauthenticatedAbort);
+        }
+        self.stop_with(occurrence)
+    }
+
     /// Return the agreed-step cursor view.
     #[must_use]
     pub const fn step_cursor(&self) -> StepCursor {
@@ -600,9 +806,12 @@ impl ExecutionState {
     ///
     /// A local event installs immediately and may not change the agreed shared
     /// state. An agreed event always stages a proposal. Broadcasts are
-    /// appended to the outgoing queue, never staged as effects. The returned
-    /// frame is the establishing message an own-message dispatch delivers.
-    /// `callout` is the one request the program derived from the accepted
+    /// appended to the outgoing queue, never staged as effects. A
+    /// `MessagesReceived` event must hold a valid step message set (non-empty,
+    /// ascending participant order, unique participants); when it contains
+    /// this participant's own message, that message must equal the head of
+    /// the outgoing queue and is removed from it in the staged result.
+    /// Staging clears [`Self::step_messages`]. `callout` is the one request the program derived from the accepted
     /// post-state. The protocol owns the post-state hash: it is computed
     /// here exactly once and used for the local-event check, the entry, and
     /// the installed or staged state.
@@ -616,7 +825,7 @@ impl ExecutionState {
         terminal_outcome: Option<TerminalOutcome>,
         pending_id: Option<CalloutId>,
         callout: Option<CalloutRequest>,
-    ) -> Result<Option<ExecFrame>, ProtocolError> {
+    ) -> Result<(), ProtocolError> {
         if self.proposal.is_some() {
             return Err(ProtocolError::SharedProposalExists);
         }
@@ -636,7 +845,7 @@ impl ExecutionState {
         check_effect_budget(effects)?;
         let agreed_event = matches!(
             event,
-            Event::SessionStarted { .. } | Event::MessageReceived { .. }
+            Event::SessionStarted { .. } | Event::MessagesReceived { .. }
         );
 
         if agreed_event
@@ -694,23 +903,21 @@ impl ExecutionState {
                 next_callout,
             )?;
             self.direct = direct;
-            return Ok(None);
+            return Ok(());
         }
 
         let mut outgoing = self.outgoing.clone();
-        // The author dispatches the same two-field event a receiver builds from
-        // the frame; the entry is built from the shared coordinates here, so
-        // author and receivers produce byte-identical entries by construction.
-        let is_own_message =
-            matches!(event, Event::MessageReceived { from, .. } if *from == self.producer);
-        if is_own_message {
-            let Event::MessageReceived { msg, .. } = event else {
-                return Err(ProtocolError::InvalidTerminalStatus);
-            };
+        // A participant's own step message is the head of its outgoing queue:
+        // it pops there and then, before this step's broadcasts are appended,
+        // so the staged queue installs the post-step head. A set with no own
+        // message changes nothing.
+        if let Event::MessagesReceived { messages } = event
+            && let Some((_, own)) = messages.iter().find(|(from, _)| *from == self.producer)
+        {
             let Some(head) = outgoing.first() else {
                 return Err(ProtocolError::NotQueuedMessage);
             };
-            if head.as_slice() != msg.as_slice() {
+            if head.as_slice() != own.as_slice() {
                 return Err(ProtocolError::NotQueuedMessage);
             }
             outgoing.remove(0);
@@ -719,9 +926,14 @@ impl ExecutionState {
             Event::SessionStarted { ensemble } => StepEvent::SessionStarted {
                 ensemble: ensemble.clone(),
             },
-            Event::MessageReceived { from, msg } => StepEvent::Message {
-                from: *from,
-                data: msg.clone(),
+            Event::MessagesReceived { messages } => StepEvent::Messages {
+                messages: messages
+                    .iter()
+                    .map(|(from, data)| StepMessage {
+                        from: *from,
+                        data: data.clone(),
+                    })
+                    .collect(),
             },
             Event::InputReceived { .. }
             | Event::TimerFired { .. }
@@ -747,17 +959,6 @@ impl ExecutionState {
         };
         let commitment =
             StepCommitment::for_entry(self.binding.session_id(), &entry, self.agreed_link);
-        let establishing_frame = if is_own_message {
-            let Event::MessageReceived { msg, .. } = event else {
-                return Err(ProtocolError::InvalidTerminalStatus);
-            };
-            Some(ExecFrame::Message {
-                commitment: commitment.clone(),
-                data: msg.clone(),
-            })
-        } else {
-            None
-        };
         let status = proposal_status(&entry, &commitment, terminal_outcome)?;
         let next_callout = next_open_callout(self, event, event_position, &status, callout);
         let proposal = SharedProposal::new(
@@ -772,7 +973,7 @@ impl ExecutionState {
             Vec::new(),
         )?;
         self.stage_proposal(proposal)?;
-        Ok(establishing_frame)
+        Ok(())
     }
 
     /// Install one accepted dispatch that does not require shared agreement.
@@ -868,6 +1069,9 @@ impl ExecutionState {
         let mut next = self.clone();
         next.event_position = next_event_position;
         next.proposal = Some(proposal);
+        // The collected step messages became the staged entry; they must not
+        // outlive staging.
+        next.step_messages = Vec::new();
         next.bump_version()?;
         *self = next;
         Ok(())
@@ -878,6 +1082,16 @@ impl ExecutionState {
     pub fn drop_outgoing_head(&mut self) -> Result<(), ProtocolError> {
         if self.proposal.is_some() {
             return Err(ProtocolError::SharedProposalExists);
+        }
+        if self
+            .step_messages
+            .iter()
+            .any(|(from, data)| *from == self.producer && data.is_some())
+        {
+            return Err(ProtocolError::InvalidStepMessage {
+                from: self.producer,
+                reason: "own message already sent",
+            });
         }
         if self.outgoing.is_empty() {
             return Err(ProtocolError::NotQueuedMessage);
@@ -947,6 +1161,13 @@ impl ExecutionState {
 
     /// Frames that another participant may still need. Restart resends this
     /// durable evidence without creating new signatures.
+    ///
+    /// In send order: the last step certificate; then this participant's own
+    /// step message for the current step, if it has one (from the staged
+    /// entry while a message step is staged, else from
+    /// [`Self::step_messages`]); then its signature on the staged proposal;
+    /// then its authenticated stop. A peer therefore always receives the
+    /// certificate for `s - 1` before the step message for `s`.
     #[must_use]
     pub fn current_frames(&self, me: PeerId) -> Vec<ExecFrame> {
         let mut frames = Vec::new();
@@ -955,18 +1176,37 @@ impl ExecutionState {
                 certificate: certificate.clone(),
             });
         }
+        // Own step message: from the staged entry while a message step is
+        // staged (an absent sender sent "nothing" and still has a frame),
+        // otherwise from the collected step messages. A staged
+        // `SessionStarted` step has no step message at all.
+        let own_step_message = if let Some(proposal) = &self.proposal {
+            match &proposal.entry.event {
+                StepEvent::Messages { messages } => Some(
+                    messages
+                        .iter()
+                        .find(|message| message.from == me)
+                        .map(|message| message.data.clone()),
+                ),
+                StepEvent::SessionStarted { .. } => None,
+            }
+        } else {
+            self.step_messages
+                .iter()
+                .find(|(from, _)| *from == me)
+                .map(|(_, data)| data.clone())
+        };
+        if let Some(data) = own_step_message {
+            frames.push(ExecFrame::Message {
+                step: self.agreed_step,
+                link: self.agreed_link,
+                data,
+            });
+        }
         if let Some(proposal) = &self.proposal {
             // Derive once per call; the commitment is a pure function of the
             // staged entry and the agreed link.
             let commitment = self.commitment_for(proposal);
-            if let StepEvent::Message { from, data } = &proposal.entry.event
-                && *from == me
-            {
-                frames.push(ExecFrame::Message {
-                    commitment: commitment.clone(),
-                    data: data.clone(),
-                });
-            }
             if let Some(signature) = proposal
                 .signatures
                 .iter()
@@ -1047,6 +1287,25 @@ impl ExecutionState {
 
     /// Accept an authenticated stop at the current agreed cursor.
     pub fn stop(&mut self, occurrence: super::AbortOccurrence) -> Result<(), ProtocolError> {
+        self.validate_stop_occurrence(&occurrence)?;
+        if self.proposal.as_ref().is_some_and(|proposal| {
+            proposal
+                .signatures()
+                .iter()
+                .any(|signature| signature.participant() == occurrence.sender())
+        }) {
+            return Err(ProtocolError::SharedProposalSigned);
+        }
+        self.stop_with(occurrence)
+    }
+
+    /// Authenticate a stop occurrence against this execution's session,
+    /// cursor and terminal state. Shared by [`Self::stop`] and
+    /// [`Self::stop_on_conflict`].
+    fn validate_stop_occurrence(
+        &self,
+        occurrence: &super::AbortOccurrence,
+    ) -> Result<(), ProtocolError> {
         occurrence.validate_for_session(self.binding.session_id())?;
         if !self.binding.is_participant(occurrence.sender()) {
             return Err(ProtocolError::UnauthenticatedAbort);
@@ -1060,23 +1319,20 @@ impl ExecutionState {
         if self.status.is_terminal() {
             return Err(ProtocolError::AlreadyTerminal);
         }
-        if self.proposal.as_ref().is_some_and(|proposal| {
-            proposal
-                .signatures()
-                .iter()
-                .any(|signature| signature.participant() == occurrence.sender())
-        }) {
-            return Err(ProtocolError::SharedProposalSigned);
-        }
+        Ok(())
+    }
 
+    /// The common stop transition: drop the staged proposal, callout and
+    /// collected step messages, install the stopped status, and start the end
+    /// handshake. The occurrence must already be authenticated.
+    fn stop_with(&mut self, occurrence: super::AbortOccurrence) -> Result<(), ProtocolError> {
         let mut next = self.clone();
         next.proposal = None;
         next.callout = None;
+        next.step_messages = Vec::new();
         next.status = ExecutionStatus::stopped(occurrence)?;
         next.begin_end();
         next.bump_version()?;
-        // The occurrence was authenticated above and `stopped` builds the
-        // terminal status; no hashed or signed field changed.
         *self = next;
         Ok(())
     }
@@ -1220,6 +1476,33 @@ impl ExecutionState {
             });
         }
         validate_outgoing(&self.outgoing)?;
+        if !self.step_messages.is_empty() {
+            // Collected step messages are live local evidence: only an active,
+            // proposal-free execution at or past its first step may hold any.
+            if !matches!(self.status, ExecutionStatus::Active)
+                || self.proposal.is_some()
+                || self.agreed_step == 0
+                || self.step_messages.len() > self.binding.activation().tickets().len()
+            {
+                return Err(ProtocolError::InvalidStepMessage {
+                    from: self.producer,
+                    reason: "invalid recovered step message",
+                });
+            }
+            let mut seen: Vec<PeerId> = Vec::with_capacity(self.step_messages.len());
+            for (from, data) in &self.step_messages {
+                let payload_valid = data
+                    .as_ref()
+                    .is_none_or(|payload| payload.len() <= crate::MAX_EFFECT_PAYLOAD_BYTES);
+                if !self.binding.is_participant(*from) || seen.contains(from) || !payload_valid {
+                    return Err(ProtocolError::InvalidStepMessage {
+                        from: *from,
+                        reason: "invalid recovered step message",
+                    });
+                }
+                seen.push(*from);
+            }
+        }
         if self.direct.len() > crate::MAX_PARTICIPANTS {
             return Err(ProtocolError::CollectionTooLarge {
                 kind: "direct lanes",
@@ -1459,7 +1742,8 @@ mod tests {
     use crate::trace::{AggregateAttestation, CHAIN_START, TRACE_FORMAT_VERSION};
     use crate::{
         AbortKind, AbortOccurrence, Ensemble, Event, LocalStateBytes, OpenCallout,
-        SharedStateBytes, StateHash, StepEvent, StepTerminal, StopCause, TraceEntry, callout_id,
+        SharedStateBytes, StateHash, StepEvent, StepMessage, StepTerminal, StopCause, TraceEntry,
+        callout_id,
     };
     use arena0_crypto::{BlsSignature, NodeKeys, SecretKey};
 
@@ -1853,7 +2137,7 @@ mod tests {
             outcome: Option<TerminalOutcome>,
             pending_id: Option<CalloutId>,
             callout: Option<CalloutRequest>,
-        ) -> Result<Option<ExecFrame>, ProtocolError> {
+        ) -> Result<(), ProtocolError> {
             let result =
                 self.apply_dispatch(event, shared, local, effects, outcome, pending_id, callout);
             if result.is_ok() {
@@ -1942,8 +2226,8 @@ mod tests {
             Ensemble::from_peers(fixture.participants.iter().map(|(peer, _)| *peer).collect())
                 .expect("complete ensemble");
         let post_state = StateHash::of_shared(&shared_state);
-        // A remote sender keeps the built entry a peer message rather than an
-        // authored own message, which `apply_dispatch` requires to be queued.
+        // A remote sender keeps the built entry a step message rather than an
+        // own message, which `apply_dispatch` requires to be queued.
         let sender = fixture
             .participants
             .iter()
@@ -1956,9 +2240,11 @@ mod tests {
             event: if state.agreed_step() == 0 {
                 StepEvent::SessionStarted { ensemble }
             } else {
-                StepEvent::Message {
-                    from: sender,
-                    data: vec![0x01],
+                StepEvent::Messages {
+                    messages: vec![StepMessage {
+                        from: sender,
+                        data: vec![0x01],
+                    }],
                 }
             },
             pre_state: state.agreed_state(),
@@ -2289,9 +2575,8 @@ mod tests {
             )
             .unwrap();
         let before = state.clone();
-        let mismatched = Event::MessageReceived {
-            from: fixture.producer(),
-            msg: vec![0xbb],
+        let mismatched = Event::MessagesReceived {
+            messages: vec![(fixture.producer(), vec![0xbb])],
         };
         assert_eq!(
             state.sandbox_apply(
@@ -2307,11 +2592,10 @@ mod tests {
         );
         assert_eq!(state, before);
 
-        let matching = Event::MessageReceived {
-            from: fixture.producer(),
-            msg: vec![0xaa],
+        let matching = Event::MessagesReceived {
+            messages: vec![(fixture.producer(), vec![0xaa])],
         };
-        let frame = state
+        state
             .sandbox_apply(
                 &matching,
                 state.shared_state().clone(),
@@ -2321,9 +2605,7 @@ mod tests {
                 None,
                 None,
             )
-            .unwrap()
-            .expect("establishing frame");
-        assert!(matches!(frame, ExecFrame::Message { data, .. } if data == vec![0xaa]));
+            .unwrap();
         assert!(
             state
                 .pending_shared()
@@ -2348,9 +2630,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let matching = Event::MessageReceived {
-            from: fixture.producer(),
-            msg: vec![0xaa],
+        let matching = Event::MessagesReceived {
+            messages: vec![(fixture.producer(), vec![0xaa])],
         };
         state
             .sandbox_apply(
@@ -2363,7 +2644,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        // The committed queue still holds the authored head until the step is
+        // The committed queue still holds the outgoing head until the step is
         // certified; the proposal carries the post-dispatch queue.
         assert_eq!(state.outgoing(), &[vec![0xaa]]);
         assert_eq!(
@@ -2386,7 +2667,7 @@ mod tests {
     }
 
     #[test]
-    fn author_and_receiver_build_identical_entries_for_the_same_message() {
+    fn author_and_receiver_build_identical_entries_for_the_same_message_set() {
         let fixture = fixture();
         let author_peer = fixture.producer();
         let receiver_peer = fixture
@@ -2395,8 +2676,9 @@ mod tests {
             .map(|(peer, _)| *peer)
             .find(|peer| *peer != author_peer)
             .expect("a remote participant");
+        let messages = vec![(author_peer, vec![0xaa]), (receiver_peer, vec![0xdd])];
 
-        // The author queues the message, then applies its own message.
+        // The sender queues its own head, then applies the whole set.
         let mut author = started_state(&fixture);
         author
             .sandbox_apply(
@@ -2411,9 +2693,8 @@ mod tests {
             .unwrap();
         author
             .sandbox_apply(
-                &Event::MessageReceived {
-                    from: author_peer,
-                    msg: vec![0xaa],
+                &Event::MessagesReceived {
+                    messages: messages.clone(),
                 },
                 author.shared_state().clone(),
                 author.local_state().clone(),
@@ -2424,15 +2705,15 @@ mod tests {
             )
             .unwrap();
 
-        // A different participant applies the same message from a different
-        // local queue length. The entry must be byte-identical.
+        // The receiver applies the same set from its own queue; its own
+        // message is the one it sent.
         let mut receiver = started_state_as(&fixture, receiver_peer);
         receiver
             .sandbox_apply(
                 &local_timer_event(),
                 receiver.shared_state().clone(),
                 receiver.local_state().clone(),
-                &[Effect::Broadcast { data: vec![0xcc] }],
+                &[Effect::Broadcast { data: vec![0xdd] }],
                 None,
                 None,
                 None,
@@ -2440,9 +2721,8 @@ mod tests {
             .unwrap();
         receiver
             .sandbox_apply(
-                &Event::MessageReceived {
-                    from: author_peer,
-                    msg: vec![0xaa],
+                &Event::MessagesReceived {
+                    messages: messages.clone(),
                 },
                 receiver.shared_state().clone(),
                 receiver.local_state().clone(),
@@ -2591,8 +2871,8 @@ mod tests {
             .entry()
             .event
             .dispatch_event();
-            if let Event::MessageReceived { msg, .. } = &mut event {
-                *msg = vec![1; crate::MAX_EFFECT_PAYLOAD_BYTES];
+            if let Event::MessagesReceived { messages } = &mut event {
+                messages[0].1 = vec![1; crate::MAX_EFFECT_PAYLOAD_BYTES];
             }
             let before = state.clone();
             let result = state.sandbox_apply(
@@ -2682,7 +2962,9 @@ mod tests {
             .find(|peer| *peer != fixture.producer())
             .unwrap();
         let msg = vec![1u8];
-        let event = Event::MessageReceived { from: remote, msg };
+        let event = Event::MessagesReceived {
+            messages: vec![(remote, msg)],
+        };
         state
             .sandbox_apply(
                 &event,
@@ -3376,5 +3658,437 @@ mod tests {
             bad_status.validate_recovered().unwrap_err(),
             ProtocolError::InvalidTerminalStatus
         );
+    }
+
+    /// A signed authenticated abort at `state`'s agreed cursor.
+    fn signed_stop(state: &ExecutionState, fixture: &Fixture, peer: PeerId) -> AbortOccurrence {
+        let identity = fixture.identity(peer);
+        let unsigned = AbortOccurrence::unsigned(
+            fixture.activation.session_hash(),
+            peer,
+            AbortKind::Abort,
+            1,
+            "operator stop",
+            state.step_cursor(),
+        )
+        .expect("abort occurrence");
+        unsigned
+            .clone()
+            .with_signature(identity.sign(&unsigned.signing_bytes().expect("abort bytes")))
+            .expect("signed abort")
+    }
+
+    /// A started state (agreed step 1) with a valid proposal staged, plus that
+    /// proposal's commitment.
+    fn staged_state(fixture: &Fixture) -> (ExecutionState, StepCommitment) {
+        let mut state = started_state(fixture);
+        state
+            .stage_proposal(proposal_for(
+                fixture,
+                &state,
+                SharedStateBytes::try_new(vec![0x51]).expect("state"),
+                LocalStateBytes::try_new(vec![0x52]).expect("state"),
+            ))
+            .expect("stage proposal");
+        let commitment = state.proposal_commitment().expect("staged commitment");
+        (state, commitment)
+    }
+
+    #[test]
+    fn step_message_arrival_classifies_every_case() {
+        let fixture = fixture();
+        let producer = fixture.producer();
+        let other = fixture.participants[1].0;
+
+        // Stale below the agreed step, NotYet above it.
+        let stale = started_state(&fixture);
+        assert_eq!(
+            stale.step_message_arrival(producer, 0, stale.agreed_link(), None),
+            StepMessageArrival::Stale
+        );
+        assert_eq!(
+            stale.step_message_arrival(
+                producer,
+                stale.agreed_step() + 1,
+                stale.agreed_link(),
+                None
+            ),
+            StepMessageArrival::NotYet
+        );
+
+        // Non-participant, wrong link, and non-active status are rejected.
+        assert_eq!(
+            stale.step_message_arrival(
+                PeerId([0xff; 32]),
+                stale.agreed_step(),
+                stale.agreed_link(),
+                None
+            ),
+            StepMessageArrival::Rejected
+        );
+        assert_eq!(
+            stale.step_message_arrival(producer, stale.agreed_step(), [0xee; 32], None),
+            StepMessageArrival::Rejected
+        );
+        let stopped = terminal_state(
+            &fixture,
+            Effect::SessionAbort {
+                reason: "stop".into(),
+            },
+        );
+        assert_eq!(
+            stopped.step_message_arrival(
+                producer,
+                stopped.agreed_step(),
+                stopped.agreed_link(),
+                None
+            ),
+            StepMessageArrival::Rejected
+        );
+
+        // Collecting: nothing held is New; equal is Duplicate, different is
+        // Conflict, for `Some` and `None` payloads alike.
+        let mut collecting = started_state(&fixture);
+        assert_eq!(
+            collecting.step_message_arrival(
+                producer,
+                collecting.agreed_step(),
+                collecting.agreed_link(),
+                Some(&[1])
+            ),
+            StepMessageArrival::New
+        );
+        collecting
+            .record_step_message(producer, Some(vec![1]))
+            .unwrap();
+        assert_eq!(
+            collecting.step_message_arrival(
+                producer,
+                collecting.agreed_step(),
+                collecting.agreed_link(),
+                Some(&[1])
+            ),
+            StepMessageArrival::Duplicate
+        );
+        assert_eq!(
+            collecting.step_message_arrival(
+                producer,
+                collecting.agreed_step(),
+                collecting.agreed_link(),
+                Some(&[2])
+            ),
+            StepMessageArrival::Conflict
+        );
+        collecting.record_step_message(other, None).unwrap();
+        assert_eq!(
+            collecting.step_message_arrival(
+                other,
+                collecting.agreed_step(),
+                collecting.agreed_link(),
+                None
+            ),
+            StepMessageArrival::Duplicate
+        );
+        assert_eq!(
+            collecting.step_message_arrival(
+                other,
+                collecting.agreed_step(),
+                collecting.agreed_link(),
+                Some(&[1])
+            ),
+            StepMessageArrival::Conflict
+        );
+
+        // Staged `Messages`: the staged entry holds the set. A sender absent
+        // from it sent nothing and is still held.
+        let (staged, _) = staged_state(&fixture);
+        assert_eq!(
+            staged.step_message_arrival(
+                other,
+                staged.agreed_step(),
+                staged.agreed_link(),
+                Some(&[1])
+            ),
+            StepMessageArrival::Duplicate
+        );
+        assert_eq!(
+            staged.step_message_arrival(
+                other,
+                staged.agreed_step(),
+                staged.agreed_link(),
+                Some(&[2])
+            ),
+            StepMessageArrival::Conflict
+        );
+        assert_eq!(
+            staged.step_message_arrival(producer, staged.agreed_step(), staged.agreed_link(), None),
+            StepMessageArrival::Duplicate
+        );
+        assert_eq!(
+            staged.step_message_arrival(
+                producer,
+                staged.agreed_step(),
+                staged.agreed_link(),
+                Some(&[1])
+            ),
+            StepMessageArrival::Conflict
+        );
+
+        // Staged `SessionStarted` at step zero: no step messages exist.
+        let mut boundary = active_state(&fixture);
+        boundary
+            .stage_proposal(proposal_for(
+                &fixture,
+                &boundary,
+                boundary.shared_state().clone(),
+                boundary.local_state().clone(),
+            ))
+            .expect("stage step 0 SessionStarted proposal");
+        assert_eq!(
+            boundary.step_message_arrival(
+                producer,
+                boundary.agreed_step(),
+                boundary.agreed_link(),
+                None
+            ),
+            StepMessageArrival::NotYet
+        );
+    }
+
+    #[test]
+    fn recorded_step_messages_survive_encode_decode() {
+        let fixture = fixture();
+        let mut state = started_state(&fixture);
+        state
+            .record_step_message(fixture.producer(), Some(vec![1, 2]))
+            .unwrap();
+        state
+            .record_step_message(fixture.participants[1].0, None)
+            .unwrap();
+        let recovered = ExecutionState::decode(&state.encode().unwrap()).unwrap();
+        assert_eq!(recovered, state);
+        assert_eq!(recovered.step_messages(), state.step_messages());
+    }
+
+    #[test]
+    fn recovery_rejects_invalid_step_messages() {
+        let fixture = fixture();
+        let other = fixture.participants[1].0;
+        let invalid = || ProtocolError::InvalidStepMessage {
+            from: fixture.producer(),
+            reason: "invalid recovered step message",
+        };
+
+        let mut foreign = started_state(&fixture);
+        foreign.step_messages = vec![(PeerId([0xff; 32]), None)];
+        assert!(matches!(
+            foreign.validate_recovered(),
+            Err(ProtocolError::InvalidStepMessage { .. })
+        ));
+
+        let mut duplicated = started_state(&fixture);
+        duplicated.step_messages = vec![
+            (fixture.producer(), None),
+            (fixture.producer(), Some(vec![1])),
+        ];
+        assert!(matches!(
+            duplicated.validate_recovered(),
+            Err(ProtocolError::InvalidStepMessage { .. })
+        ));
+
+        let (mut staged, _) = staged_state(&fixture);
+        staged.step_messages = vec![(other, None)];
+        assert_eq!(staged.validate_recovered().unwrap_err(), invalid());
+
+        let mut boundary = active_state(&fixture);
+        boundary.step_messages = vec![(fixture.producer(), None)];
+        assert_eq!(boundary.validate_recovered().unwrap_err(), invalid());
+    }
+
+    #[test]
+    fn step_set_is_complete_only_with_every_participant() {
+        let fixture = fixture();
+        let first = fixture.participants[0].0;
+        let second = fixture.participants[1].0;
+
+        let mut incomplete = started_state(&fixture);
+        incomplete
+            .record_step_message(first, Some(vec![1]))
+            .unwrap();
+        assert!(incomplete.step_set().is_none());
+
+        let mut empty = started_state(&fixture);
+        empty.record_step_message(first, None).unwrap();
+        empty.record_step_message(second, None).unwrap();
+        assert!(empty.step_set().is_none());
+
+        let mut complete = started_state(&fixture);
+        complete.record_step_message(second, Some(vec![2])).unwrap();
+        complete.record_step_message(first, Some(vec![1])).unwrap();
+        assert_eq!(
+            complete.step_set(),
+            Some(vec![(first, vec![1]), (second, vec![2])])
+        );
+    }
+
+    #[test]
+    fn staging_clears_step_messages_and_frames_keep_the_own_message() {
+        let fixture = fixture();
+        let producer = fixture.producer();
+        let other = fixture.participants[1].0;
+        let mut state = started_state(&fixture);
+        state
+            .sandbox_apply(
+                &local_timer_event(),
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[Effect::Broadcast { data: vec![0xaa] }],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        state
+            .sandbox_apply(
+                &Event::MessagesReceived {
+                    messages: vec![(producer, vec![0xaa])],
+                },
+                state.shared_state().clone(),
+                state.local_state().clone(),
+                &[],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(state.step_messages().is_empty());
+        let own = state.current_frames(producer);
+        assert!(own.iter().any(|frame| matches!(
+            frame,
+            ExecFrame::Message { step, data: Some(data), .. }
+                if *step == state.agreed_step() && data == &vec![0xaa]
+        )));
+        // A participant absent from the staged set sent nothing, so its own
+        // step message frame is still sent with an absent payload.
+        let absent = state.current_frames(other);
+        assert!(absent.iter().any(|frame| matches!(
+            frame,
+            ExecFrame::Message { step, data: None, .. } if *step == state.agreed_step()
+        )));
+    }
+
+    #[test]
+    fn drop_outgoing_head_refuses_after_own_message_is_recorded() {
+        let fixture = fixture();
+        let mut state = started_state(&fixture);
+        state
+            .record_step_message(fixture.producer(), Some(vec![0xaa]))
+            .unwrap();
+        assert_eq!(
+            state.drop_outgoing_head().unwrap_err(),
+            ProtocolError::InvalidStepMessage {
+                from: fixture.producer(),
+                reason: "own message already sent",
+            }
+        );
+    }
+
+    #[test]
+    fn stop_on_conflict_stops_after_own_signature() {
+        let fixture = fixture();
+        let (mut state, staged) = staged_state(&fixture);
+        // The producer signs the staged commitment; a plain stop would refuse.
+        let (producer, producer_key) = &fixture.participants[0];
+        assert_eq!(*producer, fixture.producer());
+        state
+            .add_step_signature(ParticipantStepSignature::new(
+                *producer,
+                staged.step,
+                producer_key.sign(&staged.signing_bytes()),
+            ))
+            .unwrap();
+
+        let mut conflicting = staged.clone();
+        conflicting.entry_hash = [0xee; 32];
+        let (peer, key) = &fixture.participants[1];
+        let signature = ParticipantStepSignature::new(
+            *peer,
+            conflicting.step,
+            key.sign(&conflicting.signing_bytes()),
+        );
+        let occurrence = signed_stop(&state, &fixture, fixture.producer());
+        state
+            .stop_on_conflict(occurrence, &conflicting, signature)
+            .expect("conflict evidence stops the execution");
+        assert_valid(&state);
+        assert!(state.status().is_terminal());
+        assert!(state.pending_shared().is_none());
+        assert!(state.callout().is_none());
+        assert!(state.step_messages().is_empty());
+    }
+
+    #[test]
+    fn stop_on_conflict_requires_real_conflict() {
+        let fixture = fixture();
+        let (state, staged) = staged_state(&fixture);
+        let (peer, key) = &fixture.participants[1];
+        let occurrence = signed_stop(&state, &fixture, fixture.producer());
+        let before = state.clone();
+
+        let same =
+            ParticipantStepSignature::new(*peer, staged.step, key.sign(&staged.signing_bytes()));
+        assert_eq!(
+            state
+                .clone()
+                .stop_on_conflict(occurrence.clone(), &staged, same)
+                .unwrap_err(),
+            ProtocolError::NoConflict { participant: *peer }
+        );
+
+        let mut conflicting = staged.clone();
+        conflicting.entry_hash = [0xee; 32];
+        let bad = ParticipantStepSignature::new(
+            *peer,
+            conflicting.step,
+            key.sign(b"not the staged commitment"),
+        );
+        assert_eq!(
+            state
+                .clone()
+                .stop_on_conflict(occurrence.clone(), &conflicting, bad)
+                .unwrap_err(),
+            ProtocolError::NoConflict { participant: *peer }
+        );
+
+        let mut other_link = conflicting.clone();
+        other_link.link = [0xef; 32];
+        let linked = ParticipantStepSignature::new(
+            *peer,
+            other_link.step,
+            key.sign(&other_link.signing_bytes()),
+        );
+        assert_eq!(
+            state
+                .clone()
+                .stop_on_conflict(occurrence.clone(), &other_link, linked)
+                .unwrap_err(),
+            ProtocolError::NoConflict { participant: *peer }
+        );
+
+        let own = ParticipantStepSignature::new(
+            fixture.producer(),
+            conflicting.step,
+            fixture.participants[0].1.sign(&conflicting.signing_bytes()),
+        );
+        assert_eq!(
+            state
+                .clone()
+                .stop_on_conflict(occurrence, &conflicting, own)
+                .unwrap_err(),
+            ProtocolError::NoConflict {
+                participant: fixture.producer()
+            }
+        );
+        assert_eq!(state, before);
     }
 }

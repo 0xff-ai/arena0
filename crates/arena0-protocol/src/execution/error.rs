@@ -174,8 +174,30 @@ pub enum ProtocolError {
         /// Maximum queued message count.
         max: usize,
     },
-    /// An authored message is not the head of the durable outgoing queue.
-    #[error("authored message is not the head of the outgoing queue")]
+    /// A step message cannot be recorded: it is not for the current step and
+    /// link, its sender already has one, or the execution cannot collect
+    /// step messages now.
+    #[error("step message from {from} cannot be recorded: {reason}")]
+    InvalidStepMessage {
+        /// The step message's sender.
+        from: PeerId,
+        /// Which precondition failed.
+        reason: &'static str,
+    },
+    /// The messages of an agreed step are empty, out of participant order,
+    /// repeated, or name a non-participant.
+    #[error("invalid step message set: {0}")]
+    InvalidStepMessages(&'static str),
+    /// A signature offered as conflict evidence does not contradict the staged
+    /// step: same commitment, another cursor, or an invalid signature.
+    #[error("signature from {participant} is not conflict evidence for the staged step")]
+    NoConflict {
+        /// The signature's participant.
+        participant: PeerId,
+    },
+    /// A participant's own step message is not the head of the durable
+    /// outgoing queue.
+    #[error("step message is not the head of the outgoing queue")]
     NotQueuedMessage,
     /// A bounded opaque payload exceeded its limit.
     #[error("{kind} is {actual} bytes; maximum is {max}")]

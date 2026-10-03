@@ -341,16 +341,17 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                     };
                     (__Arena0Dispatch::Agreed(ctx), outcome.0, outcome.1)
                 }
-                ::arena0::Event::MessageReceived { from, msg } => {
+                ::arena0::Event::MessagesReceived { messages } => {
                     let mut ctx = __arena0_make_agreed_ctx(&input);
-                    let typed_msg: #message_ty = ::arena0::borsh::from_slice(&msg)
-                        .expect("message deserialization failed");
-                    let from = ctx.participant_for_peer(from);
-                    let outcome = match <#program_ty as ::arena0::Program>::on_message(
-                        &mut ctx,
-                        from,
-                        typed_msg,
-                    ) {
+                    let messages = messages
+                        .into_iter()
+                        .map(|(from, msg)| {
+                            let typed_msg: #message_ty = ::arena0::borsh::from_slice(&msg)
+                                .expect("message deserialization failed");
+                            (ctx.participant_for_peer(from), typed_msg)
+                        })
+                        .collect();
+                    let outcome = match ::arena0::__apply_step::<#program_ty>(&mut ctx, messages) {
                         Ok(::arena0::ApplyDecision::Accept(transition)) => {
                             ctx.__apply_transition::<#program_ty>(transition);
                             (::arena0::CallStatus::Accepted, None)
@@ -503,15 +504,6 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
             let json = ::arena0::serde_json::to_vec(&view)
                 .expect("view serialization failed");
             __arena0_write_result(&::arena0::ViewOutput { json })
-        }
-
-        #[unsafe(no_mangle)]
-        pub extern "C" fn arena0_writer(input_ptr: i32, input_len: i32) -> i64 {
-            let input: ::arena0::WriterInput = __arena0_read_input(input_ptr, input_len);
-            let shared = __arena0_restore_shared(&input.shared);
-            let participant = <#program_ty as ::arena0::Program>::writer(&shared)
-                .map(::arena0::Participant::as_u8);
-            __arena0_write_result(&::arena0::WriterOutput { participant })
         }
 
         #[unsafe(no_mangle)]

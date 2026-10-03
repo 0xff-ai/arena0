@@ -8,8 +8,8 @@ use arena0_crypto::NodeKeys;
 use arena0_protocol::{ExecId, NegotiationId};
 use arena0_tests::assert::wait_for_entry;
 use arena0_tests::fixtures::{
-    complete_pending_shared, establish_live_session, message_frame, ordering_program_wasm,
-    provider, spawn_live_execution,
+    complete_pending_shared, establish_live_session, ordering_program_wasm, provider,
+    spawn_live_execution, step_message_frame,
 };
 use arena0_transport::Transport;
 
@@ -32,16 +32,8 @@ async fn message_claiming_unflushed_agreement_stays_behind_the_edge() {
     )
     .await;
     establish_live_session(&execution, &participants).await;
-    let source = execution.peer_ids[1];
 
-    let frame = message_frame(
-        execution.session_hash,
-        source,
-        2,
-        execution.initial_state,
-        execution.agreed_link().await,
-        7,
-    );
+    let frame = step_message_frame(2, execution.agreed_link().await, Some(7));
     assert!(matches!(
         execution.participant_stream(1).send_exec(&frame).await,
         Err(arena0_transport::TransportError::ExecNotYet)
@@ -70,25 +62,18 @@ async fn ordered_message_passes_the_public_edge() {
     )
     .await;
     establish_live_session(&execution, &participants).await;
-    let source = execution.peer_ids[1];
+    let link = execution.agreed_link().await;
 
     execution
-        .send_from(
-            1,
-            &message_frame(
-                execution.session_hash,
-                source,
-                1,
-                execution.initial_state,
-                execution.agreed_link().await,
-                7,
-            ),
-        )
+        .send_from(1, &step_message_frame(1, link, Some(7)))
+        .await;
+    execution
+        .send_from(2, &step_message_frame(1, link, None))
         .await;
     complete_pending_shared(&execution, &participants).await;
     let trace = wait_for_entry(&execution.store_handle, execution.exec_id, 1).await;
     let message = trace.iter().find_map(|entry| match &entry.event {
-        arena0_protocol::StepEvent::Message { data, .. } => data.first().copied(),
+        arena0_protocol::StepEvent::Messages { messages } => messages.first().map(|m| m.data[0]),
         _ => None,
     });
     assert_eq!(message, Some(7));
@@ -106,19 +91,15 @@ async fn malformed_sender_frame_is_rejected_before_back_pressure_state() {
     )
     .await;
     establish_live_session(&execution, &participants).await;
-    let outsider = *execution.transports[3].peer_id();
     let stream = execution.transports[3]
         .open_exec(&execution.peer_ids[0], execution.session_hash)
         .await
         .expect("open outsider stream");
     let result = stream
-        .send_exec(&message_frame(
-            execution.session_hash,
-            outsider,
+        .send_exec(&step_message_frame(
             1,
-            execution.initial_state,
             execution.agreed_link().await,
-            7,
+            Some(7),
         ))
         .await;
     assert!(result.is_err());

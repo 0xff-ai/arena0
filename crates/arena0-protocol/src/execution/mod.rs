@@ -17,6 +17,7 @@ mod outcome;
 mod signing;
 mod state;
 mod status;
+mod step_message;
 #[cfg(test)]
 mod test_fixtures;
 mod timer;
@@ -59,6 +60,7 @@ pub use outcome::TerminalOutcome;
 pub use signing::GuestSignData;
 pub use state::{ExecutionState, SharedProposal, StepCertificate};
 pub use status::{ExecutionStatus, ReceiptWork, StopCause};
+pub use step_message::StepMessageArrival;
 pub use timer::TimerId;
 
 pub use validation::{check_effect_budget, validate_agreed_trace};

@@ -33,7 +33,6 @@ pub(crate) enum CallKind {
     Metadata,
     Initialize,
     Dispatch,
-    Writer,
     Query,
     View,
     Outcome,
@@ -488,7 +487,6 @@ mod tests {
         assert!(!CallKind::Prepare.allows_effects());
         assert!(!CallKind::Prepare.allows_state_io());
         assert!(!CallKind::Initialize.allows_effects());
-        assert!(!CallKind::Writer.allows_effects());
         assert!(!CallKind::Query.allows_effects());
         assert!(!CallKind::View.allows_effects());
         assert!(!CallKind::Outcome.allows_effects());

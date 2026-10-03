@@ -392,7 +392,14 @@ fn render_overview_trace(frame: &mut Frame<'_>, state: &ScreenState, area: Rect,
             let entry = &projected.entry;
             let event = match &entry.event {
                 TraceEvent::SessionStarted { .. } => "session started".to_owned(),
-                TraceEvent::Message { from, .. } => format!("message from {}", from.fmt_short()),
+                TraceEvent::Messages { messages } => format!(
+                    "messages from {}",
+                    messages
+                        .iter()
+                        .map(|message| message.from.fmt_short().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             };
             let equal = observed.iter().skip(1).all(|(_, other)| {
                 other.entry.pre_state == entry.pre_state
@@ -488,9 +495,14 @@ fn render_overview_wasm(frame: &mut Frame<'_>, state: &ScreenState, area: Rect, 
                 || "handler observation unavailable".to_owned(),
                 |entry| match &entry.entry.event {
                     TraceEvent::SessionStarted { .. } => "session started".to_owned(),
-                    TraceEvent::Message { from, .. } => {
-                        format!("message from {}", from.fmt_short())
-                    }
+                    TraceEvent::Messages { messages } => format!(
+                        "messages from {}",
+                        messages
+                            .iter()
+                            .map(|message| message.from.fmt_short().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
                 },
             );
         lines.push(Line::from(vec![

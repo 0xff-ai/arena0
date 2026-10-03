@@ -104,10 +104,6 @@ fn module_shell_generates_program_struct_and_impl() {
                 Ok(())
             }
 
-            fn writer(_shared: &Shared) -> Option<Participant> {
-                Some(Participant::new(0))
-            }
-
             fn on_message(
                 ctx: &mut Context,
                 _from: Participant,
@@ -134,37 +130,9 @@ fn module_shell_generates_program_struct_and_impl() {
     assert!(expanded.contains("impl :: arena0 :: ProgramView for Ping"));
     assert!(expanded.contains("type Shared = Shared"));
     assert!(expanded.contains("fn initialize"));
-    assert!(expanded.contains("fn writer"));
     assert!(expanded.contains("Capability :: Messaging"));
     assert!(expanded.contains("pub use ping :: *"));
     assert!(!expanded.contains("__Arena0Local"));
-}
-
-#[test]
-fn module_shell_requires_writer_for_program_messages() {
-    let item: Item = syn::parse_quote! {
-        pub mod ping {
-            use arena0::prelude::*;
-
-            #[arena0::state(max = 256)]
-            pub struct Shared {
-                round: u64,
-            }
-
-            pub enum Message { Ping }
-
-            fn on_message(
-                _ctx: &mut Context,
-                _from: Participant,
-                _message: Message,
-            ) -> MessageApply<Ping> {
-                Ok(ApplyDecision::Accept(Transition::Stay))
-            }
-        }
-    };
-
-    let error = expand_arena0_program_item(args(), item).unwrap_err();
-    assert!(error.to_string().contains("must define writer"));
 }
 
 #[test]

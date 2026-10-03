@@ -1,6 +1,9 @@
 //! Portable trace entries.
 
-use crate::{MAX_EFFECT_PAYLOAD_BYTES, MAX_TERMINAL_OUTCOME_BYTES, MAX_TERMINAL_REASON_BYTES};
+use crate::{
+    MAX_EFFECT_PAYLOAD_BYTES, MAX_PARTICIPANTS, MAX_TERMINAL_OUTCOME_BYTES,
+    MAX_TERMINAL_REASON_BYTES,
+};
 
 use crate::{Effect, Ensemble, Event, MessageId, PeerId, SessionHash, StateHash};
 use arena0_program::bounded;
@@ -22,17 +25,32 @@ pub enum StepEvent {
         /// Committed participant set in canonical order.
         ensemble: Ensemble,
     },
-    /// One participant's broadcast applied at this step.
-    Message {
-        /// Authenticated author.
-        from: PeerId,
-        /// Opaque program payload.
+    /// The messages applied together at this step.
+    ///
+    /// Non-empty, in ascending participant order, at most one per
+    /// participant. Participants that sent "nothing" for the step are absent,
+    /// and the program's canonical order is not recorded: the dispatch
+    /// re-derives it from these inputs.
+    Messages {
         #[borsh(
-            serialize_with = "bounded::write_bytes::<MAX_EFFECT_PAYLOAD_BYTES>",
-            deserialize_with = "bounded::read_bytes::<MAX_EFFECT_PAYLOAD_BYTES>"
+            serialize_with = "bounded::write_vec::<MAX_PARTICIPANTS, _>",
+            deserialize_with = "bounded::read_vec::<MAX_PARTICIPANTS, _>"
         )]
-        data: Vec<u8>,
+        messages: Vec<StepMessage>,
     },
+}
+
+/// One participant's message within an agreed step.
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct StepMessage {
+    /// Authenticated sender.
+    pub from: PeerId,
+    /// Opaque program payload.
+    #[borsh(
+        serialize_with = "bounded::write_bytes::<MAX_EFFECT_PAYLOAD_BYTES>",
+        deserialize_with = "bounded::read_bytes::<MAX_EFFECT_PAYLOAD_BYTES>"
+    )]
+    pub data: Vec<u8>,
 }
 
 /// The terminal value of one step, if that step ended the session.
@@ -82,9 +100,11 @@ impl StepEvent {
             Self::SessionStarted { ensemble } => Event::SessionStarted {
                 ensemble: ensemble.clone(),
             },
-            Self::Message { from, data } => Event::MessageReceived {
-                from: *from,
-                msg: data.clone(),
+            Self::Messages { messages } => Event::MessagesReceived {
+                messages: messages
+                    .iter()
+                    .map(|message| (message.from, message.data.clone()))
+                    .collect(),
             },
         }
     }
@@ -193,23 +213,31 @@ fn validate_version(version: u32) -> io::Result<()> {
 }
 
 impl TraceEntry {
-    /// The content identity of a message step, derived from the entry itself.
+    /// The content identity of each message in this step, in entry order,
+    /// derived from the entry itself with [`MessageId::derive`] over the
+    /// session, the message's sender and payload, and this entry's step,
+    /// pre-state and post-state.
     ///
-    /// `None` for the session boundary. Callers that need a message identity
+    /// Empty for the session boundary. Callers that need a message identity
     /// (logs, API projections, dedupe) derive it here instead of storing or
     /// transmitting it.
     #[must_use]
-    pub fn message_id(&self, session: SessionHash) -> Option<MessageId> {
+    pub fn message_ids(&self, session: SessionHash) -> Vec<MessageId> {
         match &self.event {
-            StepEvent::SessionStarted { .. } => None,
-            StepEvent::Message { from, data } => Some(MessageId::derive(
-                session,
-                *from,
-                self.step,
-                self.pre_state,
-                self.post_state,
-                data,
-            )),
+            StepEvent::SessionStarted { .. } => Vec::new(),
+            StepEvent::Messages { messages } => messages
+                .iter()
+                .map(|message| {
+                    MessageId::derive(
+                        session,
+                        message.from,
+                        self.step,
+                        self.pre_state,
+                        self.post_state,
+                        &message.data,
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -265,9 +293,11 @@ mod tests {
             StepEvent::SessionStarted {
                 ensemble: ensemble.clone(),
             },
-            StepEvent::Message {
-                from: PeerId([4; 32]),
-                data: vec![5, 6],
+            StepEvent::Messages {
+                messages: vec![StepMessage {
+                    from: PeerId([4; 32]),
+                    data: vec![5, 6],
+                }],
             },
         ] {
             assert_eq!(
@@ -289,9 +319,11 @@ mod tests {
                 terminal
             );
         }
-        let value = entry(StepEvent::Message {
-            from: PeerId([4; 32]),
-            data: vec![5],
+        let value = entry(StepEvent::Messages {
+            messages: vec![StepMessage {
+                from: PeerId([4; 32]),
+                data: vec![5],
+            }],
         });
         assert_eq!(
             TraceEntry::try_from_slice(&borsh::to_vec(&value).unwrap()).unwrap(),
@@ -300,23 +332,45 @@ mod tests {
     }
 
     #[test]
-    fn message_id_is_derived_from_the_entry_coordinates() {
-        let value = entry(StepEvent::Message {
-            from: PeerId([4; 32]),
-            data: vec![5],
+    fn message_ids_are_derived_from_the_entry_coordinates() {
+        let value = entry(StepEvent::Messages {
+            messages: vec![
+                StepMessage {
+                    from: PeerId([4; 32]),
+                    data: vec![5],
+                },
+                StepMessage {
+                    from: PeerId([6; 32]),
+                    data: vec![7],
+                },
+            ],
         });
         let session = SessionHash([9; 32]);
         assert_eq!(
-            value.message_id(session),
-            Some(MessageId::derive(
-                session,
-                PeerId([4; 32]),
-                0,
-                StateHash([1; 32]),
-                StateHash([2; 32]),
-                &[5],
-            ))
+            value.message_ids(session),
+            vec![
+                MessageId::derive(
+                    session,
+                    PeerId([4; 32]),
+                    0,
+                    StateHash([1; 32]),
+                    StateHash([2; 32]),
+                    &[5],
+                ),
+                MessageId::derive(
+                    session,
+                    PeerId([6; 32]),
+                    0,
+                    StateHash([1; 32]),
+                    StateHash([2; 32]),
+                    &[7],
+                ),
+            ]
         );
+        let boundary = entry(StepEvent::SessionStarted {
+            ensemble: Ensemble::from_peers(vec![PeerId([1; 32]), PeerId([2; 32])]).unwrap(),
+        });
+        assert!(boundary.message_ids(session).is_empty());
     }
 
     #[test]
@@ -360,9 +414,11 @@ mod tests {
 
     #[test]
     fn agreement_is_excluded_from_entry_hash() {
-        let value = entry(StepEvent::Message {
-            from: PeerId([4; 32]),
-            data: vec![5],
+        let value = entry(StepEvent::Messages {
+            messages: vec![StepMessage {
+                from: PeerId([4; 32]),
+                data: vec![5],
+            }],
         });
         let hash = value.entry_hash();
         let mut agreed = value.clone();

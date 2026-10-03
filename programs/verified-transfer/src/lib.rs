@@ -1,8 +1,8 @@
 //! Two simultaneous verified transfers in opposite directions. Each
 //! participant imports its file into its Host's blob store, grants it to the
 //! execution, and the params name both objects and who sends the input. Direct
-//! progress is local; each receiver authors its transfer's agreed result under
-//! one writer at a time.
+//! progress is local; each receiver authors its transfer's agreed result when
+//! it settles. Both results may land in one step, in any order.
 
 use arena0::prelude::*;
 use arena0_primitives::verified_transfer::{
@@ -45,7 +45,7 @@ mod tests {
     }
 
     #[test]
-    fn writer_is_the_receiver_of_the_first_unsettled_transfer() {
+    fn result_may_settle_before_input() {
         let shared = Shared {
             input: Transfer::new(
                 0,
@@ -67,36 +67,8 @@ mod tests {
         };
         // SAFETY: only pure agreed-message handlers run; no host effects are applied.
         let mut ctx = unsafe { Context::__new(shared, Local::default(), PeerId([0; 32])) };
-        assert_eq!(
-            VerifiedTransfer::writer(ctx.shared()),
-            Some(Participant::new(0))
-        );
-        assert!(
-            VerifiedTransfer::on_message(
-                &mut ctx,
-                Participant::new(1),
-                Message::Input(transfer::TransferMessage::Complete)
-            )
-            .is_err()
-        );
-        assert!(ctx.shared().input.status().is_none());
-        assert_eq!(
-            VerifiedTransfer::writer(ctx.shared()),
-            Some(Participant::new(0))
-        );
-        assert!(matches!(
-            VerifiedTransfer::on_message(
-                &mut ctx,
-                Participant::new(0),
-                Message::Input(transfer::TransferMessage::Complete)
-            )
-            .unwrap(),
-            ApplyDecision::Accept(Transition::Stay)
-        ));
-        assert_eq!(
-            VerifiedTransfer::writer(ctx.shared()),
-            Some(Participant::new(1))
-        );
+
+        // Only a transfer's receiver may settle it.
         assert!(
             VerifiedTransfer::on_message(
                 &mut ctx,
@@ -106,6 +78,8 @@ mod tests {
             .is_err()
         );
         assert!(ctx.shared().result.status().is_none());
+
+        // The result settles first: the input is still pending, so the session stays.
         assert!(matches!(
             VerifiedTransfer::on_message(
                 &mut ctx,
@@ -113,9 +87,23 @@ mod tests {
                 Message::Result(transfer::TransferMessage::Failed)
             )
             .unwrap(),
+            ApplyDecision::Accept(Transition::Stay)
+        ));
+        assert!(ctx.shared().input.status().is_none());
+        assert_eq!(ctx.shared().result.status(), Some(TransferStatus::Failed));
+
+        // Only after both transfers settle does the session end.
+        assert!(matches!(
+            VerifiedTransfer::on_message(
+                &mut ctx,
+                Participant::new(0),
+                Message::Input(transfer::TransferMessage::Complete)
+            )
+            .unwrap(),
             ApplyDecision::Accept(Transition::End)
         ));
-        assert_eq!(VerifiedTransfer::writer(ctx.shared()), None);
+        assert_eq!(ctx.shared().input.status(), Some(TransferStatus::Complete));
+        assert_eq!(ctx.shared().result.status(), Some(TransferStatus::Failed));
     }
 
     #[test]
@@ -240,15 +228,6 @@ pub mod verified_transfer {
         Ok(())
     }
 
-    /// The receiver of the first unsettled transfer: only receivers author
-    /// agreed messages.
-    fn writer(shared: &Shared) -> Option<Participant> {
-        [&shared.input, &shared.result]
-            .into_iter()
-            .find(|transfer| transfer.status().is_none())
-            .map(Transfer::receiver)
-    }
-
     /// Participant indexes follow the committed ensemble's sorted peers, so
     /// the roles are fixed here from `input_sender`, not at initialization.
     fn on_session_started(
@@ -344,11 +323,13 @@ pub mod verified_transfer {
                 Transfer::handle(ctx, |shared| &mut shared.result, from, message)?
             }
         }
-        Ok(ApplyDecision::Accept(if writer(ctx.shared()).is_none() {
-            Transition::End
-        } else {
-            Transition::Stay
-        }))
+        Ok(ApplyDecision::Accept(
+            if ctx.shared().input.status().is_some() && ctx.shared().result.status().is_some() {
+                Transition::End
+            } else {
+                Transition::Stay
+            },
+        ))
     }
 
     fn outcome(shared: &Shared) -> Outcome {
