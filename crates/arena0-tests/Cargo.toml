@@ -26,3 +26,5 @@ wat.workspace = true
 
 [dev-dependencies]
 borsh.workspace = true
+rusqlite.workspace = true
+tracing.workspace = true
