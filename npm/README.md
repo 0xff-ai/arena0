@@ -1,6 +1,7 @@
 # npm distribution
 
 arena0 ships as a wrapper package and two prebuilt-binary packages.
+The `@0xff-ai/arena0` package bundles the browser workspace.
 
 - `arena0/` is `@0xff-ai/arena0`, the package users install. Its launchers
   resolve the matching platform package and execute `arena0`, `arena0d`, or

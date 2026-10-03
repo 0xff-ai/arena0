@@ -1,0 +1,82 @@
+name: Release TypeScript client
+
+on:
+  push:
+    tags: ['client-v*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the client to npm
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # rust-toolchain.toml pins Rust and the guest wasm32 target, as in CI.
+      - name: Install toolchain
+        run: rustup show
+
+      - name: Install just
+        uses: taiki-e/install-action@84f5ac3124727fb3d284d4d22ee9ab3654fd09a6 # v2.87.7
+        with:
+          tool: just@1.58.0
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Check release versions
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          package = json.loads(Path('npm/arena0-client/package.json').read_text())['version']
+          workspace = Path('Cargo.toml').read_text().split('[workspace.package]', 1)[1].split('\n[', 1)[0]
+          cargo = re.search(r'^version\s*=\s*"([^"]+)"', workspace, re.MULTILINE).group(1)
+          if package != cargo:
+              raise SystemExit(f'client version {package} differs from Cargo workspace version {cargo}')
+          tag = os.environ['RELEASE_TAG']
+          if tag and tag != f'client-v{package}':
+              raise SystemExit(f'tag {tag} differs from client-v{package}')
+          PY
+
+      - name: Check and test client
+        run: just check-client test-client
+
+      - name: Build client
+        working-directory: npm/arena0-client
+        run: pnpm build
+
+      - name: Include licenses
+        run: cp LICENSE-APACHE LICENSE-MIT npm/arena0-client/
+
+      - name: Publish client
+        if: ${{ github.ref_type == 'tag' || inputs.publish == true }}
+        working-directory: npm/arena0-client
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
+
+      - name: Preview publication
+        if: ${{ github.ref_type != 'tag' && inputs.publish != true }}
+        working-directory: npm/arena0-client
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --dry-run
