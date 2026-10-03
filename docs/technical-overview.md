@@ -165,7 +165,7 @@ Each Host prepares its activation record before it signs. A Host starts executio
 
 Every agreed public transition binds the session, position, event, prior and
 next shared-state hashes, and the chain link. `SessionStarted` and
-`MessageReceived` are the portable trace events and the only events that change
+`MessagesReceived` are the portable trace events and the only events that change
 shared state or end the session; `InputReceived` and `TimerFired` are
 participant-specific events that change local state. Local state, effects, fuel, and
 entropy observations remain Host-local. The transition commits only after every
@@ -187,17 +187,18 @@ independent `arena0_shared` and `arena0_local` memories. Every session
 memories; local events may mutate only local memory. Each effect host call
 validates its effect when the guest emits it and queues it; the Host applies the
 queue only when the handler's result is accepted. A broadcast enters a bounded
-outgoing queue, and its author later applies it through its own
-`MessageReceived` dispatch like every other participant. Work memory, mutable globals, fuel, and per-dispatch observations
+outgoing queue; its head becomes this participant's message for the next
+agreed step, and every participant applies the step's messages through one
+`MessagesReceived` dispatch. Work memory, mutable globals, fuel, and per-dispatch observations
 reset to the resident baseline. After an accepted dispatch, the read-only
 `callout` function derives at most one open callout from the resulting state
 image; that callout is stored with the image or staged proposal.
-Read-only initialization, writer, query, view, and outcome projections use
+Read-only initialization, query, view, and outcome projections use
 fresh bounded instances and must not change guest state or emit effects.
 
 The synchronous `ctx.sign(...)` host call is available only to local
 `InputReceived` and `TimerFired` handlers. It is unavailable to
-`SessionStarted`, `MessageReceived`, and read-only projections, and returns the
+`SessionStarted`, `MessagesReceived`, and read-only projections, and returns the
 exact signed bytes with the signature. The sign capability still gates access.
 
 Content addressing binds an execution to exact Wasm bytes. The execution profile binds proof-relevant runtime configuration. Wasmtime compilation is cached within a process and in a persistent cache below the arena0 home.

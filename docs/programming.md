@@ -19,7 +19,7 @@ cargo arena0 build
 ```
 
 The [minimal program](../examples/minimal-program/src/lib.rs) lets two participants
-choose a number in public order. It includes concrete types, a program module,
+each choose a number, in any order. It includes concrete types, a program module,
 native unit tests for the outcome and the terminal view. Its manifest pins the
 released SDK version. In this repository it also points `arena0-sdk` at the
 local crate by path; the npm package ships the manifest without that path, so
@@ -31,10 +31,10 @@ complete artifact participants will accept.
 
 ## Define the interaction
 
-Start with the permitted sequence of actions. In the minimal program, the
-first participant chooses, then the second chooses, and the program compares
-the values. The shared state records accepted choices. `writer` selects the
-participant allowed to act next; `on_message` rejects a choice from anyone else.
+Start with the permitted actions. In the minimal program, each participant
+chooses once, in either order, and the program compares the values. The shared
+state records accepted choices; `on_message` rejects a second choice from the
+same participant.
 
 The SDK uses an actor-oriented model. Every session source produces one flat
 `Event`. Agreed handlers (`on_session_started`, `on_message`) receive a mutable
@@ -70,11 +70,14 @@ output schema, then the guest decodes it fallibly. `on_input` receives a
 `LocalContext` and returns a plain `anyhow::Result<()>`; an error rejects the
 answer without persisting state, keeps the same callout open, and returns the
 bounded reason as `InputRejected`. A local handler may update local state and
-emit effects, but it cannot change agreed shared state. When it owes the next
-shared action, it queues a program message; the author then applies its own
-message through the same `on_message` dispatch every receiver runs, and the
-receiver validates it against its own state before signing the advertised
-shared result.
+emit effects, but it cannot change agreed shared state. When it owes a shared
+action, it queues a program message. The Host sends it as this participant's
+message for the next agreed step, and every participant applies all of that
+step's messages through `on_message` in one dispatch before signing the shared
+result. Messages from several participants may land in the same step; they are
+applied in ascending participant order unless the program defines
+`canonicalize` to reorder them, and a rejection of any of them rejects the
+whole step.
 
 ## Handler lifecycle
 
@@ -82,7 +85,6 @@ The minimal program demonstrates the full path:
 
 | Handler | Responsibility |
 | --- | --- |
-| `writer` | Select who may author the next shared action. |
 | `on_session_started` | Initialize the active session through the same dispatch context. |
 | `on_input` | Validate the answer in a read-only-shared local context, update local state, and queue any message; return an error to reject it. |
 | `on_message` | Accept or reject the message and mutate either state. |
@@ -93,7 +95,7 @@ The minimal program demonstrates the full path:
 | `view` | Render the current program state without changing it. |
 
 When both choices have been accepted, the callback returns a terminal
-transition. `SessionStarted` and `MessageReceived` provide the portable public
+transition. `SessionStarted` and `MessagesReceived` provide the portable public
 agreement path; the protocol certifies the shared execution and terminal
 evidence. The program defines the outcome; it does not assemble its own receipt.
 
@@ -101,7 +103,7 @@ Guest signing is synchronous. In `InputReceived`, `TimerFired`, and
 `DirectReceived` handlers,
 `ctx.sign(scheme, payload)` returns a `Signed` value containing the exact signed
 bytes and signature. The call is unavailable during `SessionStarted`,
-`MessageReceived`, and read-only projections. Declaring the `Sign` capability is
+`MessagesReceived`, and read-only projections. Declaring the `Sign` capability is
 still required before a handler can use it. `ctx.verify(signed)` checks a
 `Signed` value from another participant of the session and returns its payload.
 

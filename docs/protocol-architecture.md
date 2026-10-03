@@ -386,7 +386,7 @@ contains them.
 Program import validates every required guest export before the artifact enters
 the Host's program catalog. The canonical list of names and signatures is
 `arena0_sandbox::validation::REQUIRED_FUNC_EXPORTS`, and the ABI is
-`ABI_VERSION = 24`.
+`ABI_VERSION = 25`.
 The execution profile is version 4 and binds the fixed shared/local memories,
 resident dispatch semantics, resource limits, and engine identity used by the
 Host. Activation carries its profile hash, so a Host rejects a different
@@ -417,7 +417,7 @@ Program import also uses this method to validate imports and exact export
 signatures and to verify the ABI value in a disposable bounded instance before
 registering the artifact in the Host's program catalog. `LoadedProgram` owns
 the immutable compiled module and its execution profile. Initialization and
-read-only `writer`, `query`, `view`, and `outcome` projections create fresh
+read-only `query`, `view`, and `outcome` projections create fresh
 bounded Wasm instances over explicit state snapshots. An active execution
 creates one resident `ProgramInstance`; it owns fixed `arena0_shared` and
 `arena0_local` memories and routes every session event through
@@ -435,11 +435,11 @@ execution path.
 
 After `SessionStarted`, each Host's `ExecutionActor` owns one resident
 `ProgramInstance`. Every session source supplies the same flat `Event` type to
-`arena0_dispatch`: activation supplies `SessionStarted`, an agreed protocol
-message supplies `MessageReceived`, an agent answer supplies `InputReceived`,
+`arena0_dispatch`: activation supplies `SessionStarted`, an agreed step of
+participant messages supplies `MessagesReceived`, an agent answer supplies `InputReceived`,
 and a timer supplies `TimerFired` with its typed payload.
 
-`SessionStarted` and `MessageReceived` are agreed events. Every participant
+`SessionStarted` and `MessagesReceived` are agreed events. Every participant
 applies them at the same position, and they are the only events that change
 shared state or end the session. `InputReceived` and `TimerFired` are local
 events. They may change local state, but a local dispatch that changes shared
@@ -457,7 +457,7 @@ queue with the candidate state.
 - `Broadcast` is available to every event. It appends the message to this
   participant's durable outgoing queue, which is bounded. The queue is local,
   so an agreed handler never observes it: in `SessionStarted` and
-  `MessageReceived` the call always succeeds, and if the agreed step would
+  `MessagesReceived` the call always succeeds, and if the agreed step would
   overflow the queue the Host fails the session with a Host-signed `Fail`
   instead of signing. In a local handler a full queue returns an error to the
   program and queues nothing.
@@ -467,15 +467,23 @@ queue with the candidate state.
   events, at most one per dispatch. A lifecycle effect from a local event, a
   second one, or one combined with `SetTimer` traps the dispatch.
 
-A participant authors the next agreed message only from its outgoing queue.
-When no proposal is staged and the `writer` projection over the agreed shared
-state selects this participant, the actor takes the oldest queued message and
-applies it through its own `MessageReceived` dispatch, exactly as every other
-participant will. If the result is accepted, the actor stages the proposal and
-sends the message frame carrying its complete `StepCommitment`. If its own program
-rejects the message, the actor removes it from the queue and records a local
-error; the message never reaches a peer. A local handler that wants to end the
-session queues a message whose agreed handler ends it.
+Every agreed step after `SessionStarted` is a step of participant messages.
+For each such step every participant sends every peer exactly one step
+message: the head of its outgoing queue, or "nothing from me". A participant
+sends "nothing" only while it holds a peer's message for the step, so an idle
+session sends no frames. Before it sends its head, the actor dry-runs that
+message alone against the agreed state; if its own program rejects it, the
+actor removes it from the queue and records a local error, and the message
+never reaches a peer. Received step messages and the participant's own are
+durable before they are acknowledged or sent. Once a participant holds a step
+message from every participant, it applies the non-empty ones, in ascending
+participant order, through one `MessagesReceived` dispatch, stages the
+proposal, and signs. Every participant builds the same entry from the same
+set, so no participant collects messages for another. The SDK applies the
+messages one at a time through `on_message` inside that dispatch, after the
+program's optional `canonicalize` hook has reordered them; a rejection of any
+message rejects the whole step. A local handler that wants to end the session
+queues a message whose agreed handler ends it.
 
 After an accepted dispatch, the program's read-only `callout` function derives
 at most one open callout from the resulting state image. The runtime stores that
@@ -488,7 +496,7 @@ proposal is staged.
 
 Guest signing is a synchronous host call available only during local
 `InputReceived` and `TimerFired` handlers. It is unavailable during
-`SessionStarted` and `MessageReceived` dispatches and during read-only
+`SessionStarted` and `MessagesReceived` dispatches and during read-only
 projections. The call signs a versioned, execution-bound `GuestSignData`
 preimage containing the domain, version, session, program hash, execution ID,
 event position, per-dispatch call ordinal, scheme, and payload. Ed25519 uses
@@ -515,22 +523,21 @@ failures restore both state memories and persist no effects.
 
 Shared-state steps exchange `arena0_protocol::ExecFrame` values. The protocol
 crate owns their bounded Borsh encoding, and `arena0-transport` frames them with
-`arena0-wire::Codec` for delivery. A message frame carries the message data,
-bounded like the trace's message event, and the author's complete
-`StepCommitment` for it. The author applies
-its own message through the same dispatch as every receiver. A step is accepted
-only when all selected participants sign the same `StepCommitment`.
+`arena0-wire::Codec` for delivery. A step message frame carries the step, the
+chain link it is bound to, and the optional message data, bounded like the
+trace's message event. A step is accepted only when all selected participants
+sign the same `StepCommitment`.
 
-`TraceEntry` format v3 is the portable public trace. Each entry records its
-step, the agreed `StepEvent` (`SessionStarted` or a message from one
-authenticated author), pre/post shared state hashes, an optional `StepTerminal`
+`TraceEntry` format v4 is the portable public trace. Each entry records its
+step, the agreed `StepEvent` (`SessionStarted`, or the step's messages in the
+order they were applied, each with its authenticated sender), pre/post shared state hashes, an optional `StepTerminal`
 (`End`, `Abort`, or `Fail`), and one aggregate agreement with a signer bitmap.
-The guest-facing dispatch event carries no trace coordinates, so the author and
-every receiver build the same entry from the agreed cursor and the message
-payload; a message's content identity is derived from the entry on demand.
+The guest-facing dispatch event carries no trace coordinates, so every
+participant builds the same entry from the agreed cursor and the step's
+messages; each message's content identity is derived from the entry on demand.
 Participant-specific events, local state, ordinary effects, fuel, and entropy
 observations remain in the Host's local store. The entry hash normalizes the
-aggregate out of its signed content; `StepCommitment` uses the v4 step-commit
+aggregate out of its signed content; `StepCommitment` uses the v5 step-commit
 domain and binds that entry hash, both shared hashes, and the chain link.
 
 A guest dispatch returns its state images, effects, and derived callout
@@ -541,13 +548,16 @@ one SQLite transaction. A failed version check or transaction leaves the
 proposed result uncommitted, and the actor restores the resident instance from
 the last committed images.
 
-An authenticated writer message that the receiving program rejects, traps, or
-cannot reproduce as the author's exact `StepCommitment` is a divergence; the
-receiver compares commitments before it signs. The participant
-that detects it records a Host-signed `Fail` occurrence at the agreed cursor;
-its peers receive that occurrence as an `Abort` frame. Invalid frames—wrong
-writer, wrong pre-state, or stale position—are dropped rather than treated as
-divergence. The guest ends or aborts a session
+A step that the program rejects or traps on is a divergence: every
+participant that applies it records a Host-signed `Fail` occurrence at the
+agreed cursor, and its peers receive that occurrence as an `Abort` frame. A
+participant that receives a peer's valid signature over a different
+commitment for its staged step also records `Fail`, even after signing: an
+honest peer signs once per step, so the commitment it signed can no longer be
+certified. Invalid frames—another chain link, a non-participant sender, or a
+stale step—are dropped rather than treated as divergence, and a second,
+different step message from the same sender for the same step is refused
+while the first is kept. The guest ends or aborts a session
 with `Effect::SessionEnd`/`SessionAbort`; a unilateral occurrence travels as
 `ExecFrame::Abort`.
 
@@ -566,8 +576,9 @@ but is never part of `StateHash`, a `StepCommitment`, or portable receipt bytes.
 The execution actor owns the complete execution state and is the only writer.
 There are no inbox or outbox tables. Under N-of-N agreement, the actor stages
 step `s + 1` only after it has certified step `s`, so the most a peer can lack
-from this participant is the certificate for its last agreed step, its staged
-message and signature, or its abort occurrence. Each item is already part of execution state.
+from this participant is the certificate for its last agreed step, its step
+message for the current step, its signature on the staged step, or its abort
+occurrence. Each item is already part of execution state.
 
 The actor sends those current frames to each peer independently and tracks
 acknowledgements in memory. A restart reloads execution state and resends the
@@ -576,7 +587,8 @@ aggregate certificate once it is available, so a participant never signs the
 same commitment again. A participant signs only after its proposal is durable.
 A receiver acknowledges a frame after applying it in its committed transition
 or deciding that it is a duplicate or stale frame. A frame that cannot yet be
-applied receives a retryable `not yet` response and is not stored. A message is
+applied receives a retryable `not yet` response and is not stored. A step
+message is acknowledged once it is durably recorded; the step it completes is
 applied once its proposal is durably staged. Each peer has its own bounded send
 lane and send deadline, so one unresponsive peer cannot stall the others.
 
@@ -782,8 +794,8 @@ never picks an arbitrary imported report. Each Host keeps its own database and
 proof evidence even when the canonical artifact is identical across Hosts.
 
 Portable verification is the only receipt verification boundary. It
-checks the activation binding, ordered v3 trace chain, full participant
-agreements, terminal evidence, and derived v5 receipt identity without loading
+checks the activation binding, ordered v4 trace chain, full participant
+agreements, terminal evidence, and derived v6 receipt identity without loading
 the program. Completion evidence is a final trace entry whose certified
 terminal value is `StepTerminal::End` and whose outcome bytes equal the
 receipt's outcome. A completed result includes authenticated opaque `outcome_borsh`
@@ -960,10 +972,10 @@ The public release guarantees:
 - canonical receipt identity, distinct unilateral stop reports, and local provenance;
 - the `Transport` seam without changing runtime or proof semantics.
 
-The current compatibility boundary is `ABI_VERSION = 24`, execution profile
-version 4, `TraceEntry` format 3, the v4 `StepCommitment` domain, receipt
-artifact and body version 5, the v5 `ReceiptId` domain, and store schema
-version 9. Decoders reject unsupported versions, and no format silently accepts
+The current compatibility boundary is `ABI_VERSION = 25`, execution profile
+version 4, `TraceEntry` format 4, the v5 `StepCommitment` domain, receipt
+artifact and body version 6, the v6 `ReceiptId` domain, and store schema
+version 11. Decoders reject unsupported versions, and no format silently accepts
 evidence from an earlier release.
 
 The public workspace has no remote discovery, addressing, relay, remote program

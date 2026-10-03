@@ -45,7 +45,7 @@ program still determines when that bid may be committed or revealed.
 Shared state contains the facts participants must agree on. Local state holds
 information used by one participant, such as an unrevealed bid and its salt.
 The program receives both through one dispatch context. Agreed events
-(`SessionStarted`, `MessageReceived`) may mutate both states and emit any
+(`SessionStarted`, `MessagesReceived`) may mutate both states and emit any
 `Effect`; local events (`InputReceived`, `TimerFired`) see shared state
 read-only, may not emit lifecycle effects, and may sign. Local state does not
 enter public state commitments. The program determines when
@@ -65,8 +65,8 @@ does not make a message a valid action.
 
 An agreed public transition applies one `Event` through the program's `Context`.
 Participants certify the resulting shared state before advancing. The portable
-`TraceEntry` records only the agreed `StepEvent` (`SessionStarted` or a message
-from one authenticated author), the pre/post shared-state hashes, an optional
+`TraceEntry` records only the agreed `StepEvent` (`SessionStarted`, or the
+step's messages, each with its authenticated sender), the pre/post shared-state hashes, an optional
 `StepTerminal` (`End`, `Abort`, or `Fail`), and the aggregate agreement.
 `StepCommitment` binds that entry and the preceding chain link;
 participant-specific events, local state, ordinary effects, fuel, and entropy
