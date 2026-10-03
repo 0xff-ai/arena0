@@ -531,6 +531,58 @@ fn reject_if_sign_scheme_disallowed(
     }
 }
 
+impl super::super::DispatchScope {
+    /// Require this dispatch's installed blob capability; no view survives reset.
+    fn blob_view(&self) -> Result<Arc<dyn BlobView>, wasmtime::Error> {
+        self.blobs
+            .clone()
+            .ok_or_else(|| wasmtime::Error::msg("blob view unavailable"))
+    }
+
+    /// Overlay durable partial state with staged append/commit operations in dispatch order without publishing any effect.
+    fn receive_state(&self, hash: BlobHash) -> Result<Receive, wasmtime::Error> {
+        let partial = self
+            .blob_view()?
+            .partial(hash)
+            .map_err(wasmtime::Error::msg)?;
+        let mut receive = Receive {
+            length: partial.as_ref().map(|p| p.length),
+            written: partial.as_ref().map_or(0, |p| p.written),
+            committed: partial.as_ref().is_some_and(|p| p.committed),
+            durable: partial.is_some(),
+        };
+        for change in &self.staged_blobs {
+            match change {
+                BlobChange::Append {
+                    hash: h,
+                    length,
+                    bytes,
+                    ..
+                } if *h == hash => {
+                    receive.length = Some(*length);
+                    receive.written += bytes.len() as u64;
+                }
+                BlobChange::Commit { hash: h } if *h == hash => receive.committed = true,
+                _ => {}
+            }
+        }
+        Ok(receive)
+    }
+
+    /// Project this dispatch's appended bytes in call order; durable bytes remain owned by the installed view.
+    fn staged_tail(&self, hash: BlobHash) -> Vec<u8> {
+        self.staged_blobs
+            .iter()
+            .filter_map(|change| match change {
+                BlobChange::Append { hash: h, bytes, .. } if *h == hash => Some(bytes.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -929,25 +981,5 @@ mod tests {
         );
         assert_eq!(call.call(&mut store, ()).unwrap(), 0);
         assert_eq!(store.data().scope.effect_queue.len(), 1);
-    }
-}
-
-impl super::super::DispatchScope {
-    /// Require this dispatch's installed blob capability; no view survives reset.
-    fn blob_view(&self) -> Result<Arc<dyn BlobView>, wasmtime::Error> {
-        let _ = ();
-        todo!("STUB(sandbox)")
-    }
-
-    /// Overlay durable partial state with staged append/commit operations in dispatch order without publishing any effect.
-    fn receive_state(&self, hash: BlobHash) -> Result<Receive, wasmtime::Error> {
-        let _ = hash;
-        todo!("STUB(sandbox)")
-    }
-
-    /// Project this dispatch's appended bytes in call order; durable bytes remain owned by the installed view.
-    fn staged_tail(&self, hash: BlobHash) -> Vec<u8> {
-        let _ = hash;
-        todo!("STUB(sandbox)")
     }
 }

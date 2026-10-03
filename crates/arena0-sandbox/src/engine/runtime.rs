@@ -8,7 +8,7 @@ use arena0_program::{
 };
 use arena0_protocol::{Committed, Ensemble};
 use borsh::{BorshDeserialize, BorshSerialize};
-use wasmtime::{Global, Instance, Memory, Store, StoreLimitsBuilder, Val};
+use wasmtime::{Global, Instance, Memory, Store, Val};
 
 use super::memory::Guest;
 use super::{CallKind, InstanceConfig, instantiate_module, max_output};

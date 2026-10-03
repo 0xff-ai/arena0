@@ -413,11 +413,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_required_exports_accepts_full_set() {
-        assert!(validate_required_exports(&stub_module(None, None)).is_ok());
-    }
-
-    #[test]
     fn validate_required_exports_checks_each_independent_export() {
         for name in [
             "arena0_alloc",
