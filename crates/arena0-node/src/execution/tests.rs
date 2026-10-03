@@ -2625,10 +2625,12 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
             params: unit.clone(),
             queries: Vec::new(),
             outcome: unit,
+            phases: Vec::new(),
         },
     };
     let metadata = definition.encode().expect("metadata");
-    let writer = writer.map_or_else(|| vec![0], |index| vec![1, index]);
+    // Borsh `TurnOutput { participant, phase: None }`.
+    let writer = writer.map_or_else(|| vec![0, 0], |index| vec![1, index, 0]);
     let extra_imports = match mode {
         GuestMode::Timer => {
             r#"(import "arena0" "set_timer" (func $set_timer (param i64 i32 i32 i32 i32)))"#
@@ -2931,7 +2933,7 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
           (import "arena0" "state_write" (func $state_write (param i32 i32 i32)))
           {extra_imports}
           (memory (export "memory") 1)
-          (global (export "arena0_abi_version") i32 (i32.const 24))
+          (global (export "arena0_abi_version") i32 (i32.const 25))
           (data (i32.const 1024) "\01")
           (data (i32.const 1030) "\02")
           (data (i32.const 1040) "\09")
@@ -3018,7 +3020,7 @@ fn test_wasm(writer: Option<u8>, mode: GuestMode) -> Vec<u8> {
             i32.const 32768
             i32.const 3
             call $pack)
-          (func (export "arena0_writer") (param i32 i32) (result i64)
+          (func (export "arena0_turn") (param i32 i32) (result i64)
             i32.const 2000
             i32.const {writer_len}
             call $pack)

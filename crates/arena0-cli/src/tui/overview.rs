@@ -282,7 +282,7 @@ pub(super) fn overview_program_content(state: &ScreenState) -> (String, String, 
             return (
                 format!(
                     "Program  step {}  INCOMPLETE {}/{}",
-                    snapshot.step,
+                    snapshot.step_label(),
                     scoped.len(),
                     scoped_hosts.len()
                 ),
@@ -306,7 +306,7 @@ pub(super) fn overview_program_content(state: &ScreenState) -> (String, String, 
                 .any(|pair| pair[0].1.view != pair[1].1.view)
         {
             return (
-                format!("Program  step {}  DIFFERENT", snapshot.step),
+                format!("Program  step {}  DIFFERENT", snapshot.step_label()),
                 scoped
                     .iter()
                     .map(|(host, candidate)| {
@@ -333,7 +333,7 @@ pub(super) fn overview_program_content(state: &ScreenState) -> (String, String, 
             } else {
                 host
             },
-            snapshot.step,
+            snapshot.step_label(),
             view_history_label(state)
         );
         let body = snapshot

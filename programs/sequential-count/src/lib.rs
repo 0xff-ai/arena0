@@ -126,6 +126,32 @@ pub mod sequential_count {
                 phase_label(state.phase()),
                 state.target_size
             )))
+            .block(Block::Progress {
+                label: "Count".into(),
+                value: u64::from(state.count),
+                max: u64::from(state.count_to),
+            })
+            .block(facts_block(state))
+    }
+
+    fn facts_block(state: &Shared) -> Block {
+        let mut items = vec![
+            Fact {
+                label: "Phase".into(),
+                value: Cell::text(phase_label(state.phase())),
+            },
+            Fact {
+                label: "Participants".into(),
+                value: Cell::text(state.target_size.to_string()),
+            },
+        ];
+        if let Some(current) = state.turns.as_ref().map(TurnManager::current) {
+            items.push(Fact {
+                label: "Current".into(),
+                value: Cell::text(format!("P{}", current.index())).participant(current.as_u8()),
+            });
+        }
+        Block::Facts { title: None, items }
     }
 
     fn render_agents(state: &Shared) -> String {

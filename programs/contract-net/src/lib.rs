@@ -354,6 +354,63 @@ pub mod contract_net {
             .agents(vp.fit_text(render_agents(state, ensemble)))
             .state(vp.fit_text(render_state(state)))
             .status_bar(vp.fit_text(render_status(state)))
+            .block(Block::Facts {
+                title: None,
+                items: vec![
+                    Fact {
+                        label: "Tasks".into(),
+                        value: Cell::text(state.tasks.len().to_string()),
+                    },
+                    Fact {
+                        label: "Phase".into(),
+                        value: Cell::text(render_status(state)),
+                    },
+                ],
+            })
+            .block(awards_block(state))
+    }
+
+    /// One row per task with the proposed worker and price; awarded rows are
+    /// `Good`.
+    fn awards_block(state: &Shared) -> Block {
+        let plan = state.agreement.proposal().map(|proposal| proposal.value);
+        let rows = state
+            .tasks
+            .iter()
+            .enumerate()
+            .map(|(index, task)| {
+                let award = plan
+                    .and_then(|plan| plan.assignments.get(index))
+                    .map(|a| &a.award);
+                let (bidder, price, status, tone) = match award {
+                    Some(Award::Assigned { worker, cost }) => (
+                        Cell::text(format!("P{}", worker.index()))
+                            .participant(worker.as_u8())
+                            .tone(Tone::Good),
+                        cost.to_string(),
+                        "assigned",
+                        Tone::Good,
+                    ),
+                    Some(Award::Unassigned) => {
+                        (Cell::text("-"), "-".to_owned(), "unassigned", Tone::Warn)
+                    }
+                    None => (Cell::text("-"), "-".to_owned(), "pending", Tone::Muted),
+                };
+                vec![
+                    Cell::text(task.name.clone()),
+                    bidder,
+                    Cell::text(price).tone(tone),
+                    Cell::text(status).tone(tone),
+                ]
+            })
+            .collect();
+        Block::Table {
+            title: Some("Awards".into()),
+            columns: ["Task", "Bidder", "Price", "Status"]
+                .map(String::from)
+                .to_vec(),
+            rows,
+        }
     }
 
     fn on_query(_shared: &Shared, _: ()) {}

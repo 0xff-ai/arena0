@@ -99,6 +99,9 @@ CREATE TABLE agreed_steps (
     version INTEGER NOT NULL CHECK (version >= 0),
     artifact BLOB NOT NULL,
     entry_hash BLOB NOT NULL CHECK (length(entry_hash) = 32),
+    -- The local time this Host stored the step. A local observation: it is
+    -- not part of `artifact`, so receipts and trace hashes never carry it.
+    certified_at_ms INTEGER NOT NULL CHECK (certified_at_ms >= 0),
     PRIMARY KEY (execution_id, step),
     FOREIGN KEY (execution_id) REFERENCES executions(execution_id)
 ) STRICT;

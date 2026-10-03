@@ -141,6 +141,9 @@ pub enum EnsembleError {
 /// participant-index bounds, and returns `Ensemble<Committed>`. The committed
 /// form is the only form that can start a session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+// Only committed ensembles cross JSON; the construction state has no wire form.
+#[cfg_attr(feature = "ts", ts(as = "Vec<PeerId>", concrete(State = Committed)))]
 pub struct Ensemble<State = Committed> {
     peers: Vec<PeerId>,
     _state: PhantomData<State>,

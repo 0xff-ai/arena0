@@ -8,10 +8,16 @@ use std::time::Duration;
 
 use arena0_api::{
     AwaitState, ColorDepth, EnsembleSpec, EventData, EventFilter, EventFrame, ExecLifecycle,
-    HostRequest, ReceiptArtifact, Request, Response, ResponseOk,
+    HostRequest, NextEvent, ReceiptArtifact, Request, Response, ResponseOk,
 };
-use arena0_protocol::{ExecId, NegotiationTarget, Slot};
-use common::{HostTarget, call, call_daemon, chess_wasm, created, daemon, drive, ok, rps_wasm};
+use arena0_protocol::{
+    Block, CalloutId, Cell, ExecId, Fact, NegotiationTarget, RosterEntry, Slot, Tone, View,
+};
+use arena0_tests::fixtures::{LIVE_EXECUTION_TIMEOUT, view_program_wasm};
+use common::{
+    DaemonHarness, HostTarget, call, call_daemon, chess_wasm, created, cumulative_sum_wasm, daemon,
+    drive, ok, prisoner_dilemma_wasm, rps_wasm, timer_dispatch_wasm,
+};
 use tokio::io::BufReader;
 use tokio::net::{UnixStream, unix::OwnedReadHalf, unix::OwnedWriteHalf};
 
@@ -617,6 +623,7 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
             exec: exec_a,
             width: 80,
             color: ColorDepth::Ansi16,
+            at_step: None,
         },
     )
     .await
@@ -660,6 +667,7 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
             exec: exec_a,
             width: 80,
             color: ColorDepth::Ansi16,
+            at_step: None,
         },
     )
     .await)
@@ -692,12 +700,17 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
                 exec,
                 width: 80,
                 color: ColorDepth::Ansi16,
+                at_step: None,
             },
         )
         .await)
         {
             ResponseOk::ExecView { step, view } => {
-                assert!(step > 0);
+                assert_eq!(
+                    step,
+                    Some(latest_agreed_step(socket, exec).await),
+                    "a latest view names the last agreed trace step"
+                );
                 assert!(
                     view.slots
                         .get(&Slot::Header)
@@ -719,11 +732,233 @@ async fn exec_view_distinguishes_negotiating_active_terminal_and_missing_executi
             exec: ExecId([0xFA; 32]),
             width: 80,
             color: ColorDepth::Ansi16,
+            at_step: None,
         },
     )
     .await
     .unwrap_err();
     assert_eq!(missing.code, arena0_api::ApiErrorCode::NotFound);
+}
+
+/// Create a two-participant execution on Host A; it stays negotiating until a
+/// joiner arrives.
+async fn create_on_host_a(d: &DaemonHarness) -> (ExecId, arena0_protocol::NegotiationId) {
+    match ok(call(
+        &d.host_a,
+        &HostRequest::ExecNew {
+            exec_id: ExecId([0xA1; 32]),
+            program: d.program_id.to_string(),
+            params: Some(serde_json::json!(null)),
+            ensemble: EnsembleSpec::Create {
+                participant_count: 2,
+            },
+            blobs: vec![],
+        },
+    )
+    .await)
+    {
+        ResponseOk::ExecCreated {
+            exec_id,
+            negotiation_id: Some(negotiation_id),
+            ..
+        } => (exec_id, negotiation_id),
+        other => panic!("unexpected creator response: {other:?}"),
+    }
+}
+
+async fn join_on_host_b(
+    d: &DaemonHarness,
+    negotiation_id: arena0_protocol::NegotiationId,
+) -> ExecId {
+    created(
+        call(
+            &d.host_b,
+            &HostRequest::ExecNew {
+                exec_id: ExecId([0xB1; 32]),
+                program: d.program_id.to_string(),
+                params: Some(serde_json::json!(null)),
+                ensemble: EnsembleSpec::Join {
+                    target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
+                },
+                blobs: vec![],
+            },
+        )
+        .await,
+    )
+}
+
+/// The next callout either participant has open and has not answered yet.
+async fn next_callout(
+    d: &DaemonHarness,
+    exec_a: ExecId,
+    exec_b: ExecId,
+    answered: Option<CalloutId>,
+) -> (&HostTarget, ExecId, CalloutId) {
+    loop {
+        let (is_a, next) = next_from_either(&d.host_a, exec_a, &d.host_b, exec_b).await;
+        match ok(next) {
+            ResponseOk::Next(NextEvent::Callout { pending_id, .. }) => {
+                if Some(pending_id) != answered {
+                    return if is_a {
+                        (&d.host_a, exec_a, pending_id)
+                    } else {
+                        (&d.host_b, exec_b, pending_id)
+                    };
+                }
+                // The answered callout is still projected until its step lands.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => panic!("expected a callout, got {other:?}"),
+        }
+    }
+}
+
+async fn view_at(target: &HostTarget, exec: ExecId, at_step: Option<u64>) -> Response {
+    call(
+        target,
+        &HostRequest::ExecView {
+            exec,
+            width: 80,
+            color: ColorDepth::Ansi16,
+            at_step,
+        },
+    )
+    .await
+}
+
+fn view_reply(response: Response) -> (Option<u64>, View) {
+    match ok(response) {
+        ResponseOk::ExecView { step, view } => (step, view),
+        other => panic!("unexpected view response: {other:?}"),
+    }
+}
+
+/// The step number of the last entry in the execution's agreed trace.
+async fn latest_agreed_step(target: &HostTarget, exec_id: ExecId) -> u64 {
+    let request = HostRequest::ExecTrace {
+        exec_id,
+        from: 0,
+        to: u64::MAX,
+    };
+    match ok(call(target, &request).await) {
+        ResponseOk::Trace(steps) => {
+            steps
+                .last()
+                .expect("a started session has step 0")
+                .entry
+                .step
+        }
+        other => panic!("unexpected trace response: {other:?}"),
+    }
+}
+
+/// A view at a past step is the replay of the agreed steps up to it, so it
+/// must be exactly the view the live Host rendered while that step was the
+/// latest one. Chess makes every step a different board, so a Host that
+/// ignored `at_step` and rendered its latest state would fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn past_view_equals_the_live_view_at_that_step() {
+    let d = daemon(&chess_wasm()).await;
+    let (exec_a, negotiation_id) = create_on_host_a(&d).await;
+    let exec_b = join_on_host_b(&d, negotiation_id).await;
+
+    // The session start plus fool's mate: five agreed steps. A callout opens
+    // only after the latest agreed step landed and nothing advances until it
+    // is answered, so each live view is a stable observation of one step.
+    let mut recorded: Vec<(u64, View)> = Vec::new();
+    let mut answered = None;
+    for chess_move in ["f2f3", "e7e5", "g2g4", "d8h4"] {
+        let (target, exec_id, pending_id) = next_callout(&d, exec_a, exec_b, answered).await;
+        let (step, view) = view_reply(view_at(target, exec_id, None).await);
+        recorded.push((step.expect("a callout follows an agreed step"), view));
+        ok(call(
+            target,
+            &HostRequest::ExecSubmit {
+                exec_id,
+                pending_id,
+                answer: Some(serde_json::json!(chess_move)),
+            },
+        )
+        .await);
+        answered = Some(pending_id);
+    }
+    for (target, exec_id) in [(&d.host_a, exec_a), (&d.host_b, exec_b)] {
+        ok(call(
+            target,
+            &HostRequest::ExecAwait {
+                exec_id,
+                until: AwaitState::Terminal,
+            },
+        )
+        .await);
+    }
+    let (step, terminal) = view_reply(view_at(&d.host_a, exec_a, None).await);
+    recorded.push((
+        step.expect("a completed session has agreed steps"),
+        terminal,
+    ));
+
+    let steps: Vec<u64> = recorded.iter().map(|(step, _)| *step).collect();
+    assert_eq!(steps, [0, 1, 2, 3, 4], "one recorded view per agreed step");
+    for (index, (_, view)) in recorded.iter().enumerate() {
+        assert!(
+            recorded[index + 1..].iter().all(|(_, other)| other != view),
+            "every step renders a different board"
+        );
+    }
+
+    for (target, exec_id) in [(&d.host_a, exec_a), (&d.host_b, exec_b)] {
+        for (step, live) in &recorded {
+            let (replayed_step, replayed) = view_reply(view_at(target, exec_id, Some(*step)).await);
+            assert_eq!(replayed_step, Some(*step));
+            assert_eq!(
+                &replayed, live,
+                "Host {} replayed step {step} differently from the live view",
+                target.name
+            );
+        }
+    }
+}
+
+/// Only agreed steps can be replayed, and only once a session has started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn past_view_rejects_future_steps() {
+    let d = daemon(&rps_wasm()).await;
+    let (exec_a, negotiation_id) = create_on_host_a(&d).await;
+
+    // Still negotiating: a past view fails exactly as a latest view does.
+    let latest = view_at(&d.host_a, exec_a, None).await.unwrap_err();
+    assert_eq!(latest.code, arena0_api::ApiErrorCode::Execution);
+    assert_eq!(
+        view_at(&d.host_a, exec_a, Some(0)).await.unwrap_err(),
+        latest
+    );
+
+    let exec_b = join_on_host_b(&d, negotiation_id).await;
+
+    // A live session: rock-paper-scissors opens callouts at the session start
+    // and nothing advances until one is answered.
+    let (target, exec_id, _) = next_callout(&d, exec_a, exec_b, None).await;
+    assert_future_step_rejected(target, exec_id).await;
+
+    let (_sa, _sb) = tokio::join!(drive(&d.host_a, exec_a), drive(&d.host_b, exec_b));
+    for (target, exec_id) in [(&d.host_a, exec_a), (&d.host_b, exec_b)] {
+        assert_future_step_rejected(target, exec_id).await;
+    }
+}
+
+async fn assert_future_step_rejected(target: &HostTarget, exec_id: ExecId) {
+    let latest = latest_agreed_step(target, exec_id).await;
+    let (step, _) = view_reply(view_at(target, exec_id, Some(latest)).await);
+    assert_eq!(step, Some(latest), "the latest agreed step can be replayed");
+    for beyond in [latest + 1, u64::MAX] {
+        let error = view_at(target, exec_id, Some(beyond)).await.unwrap_err();
+        assert_eq!(error.code, arena0_api::ApiErrorCode::BadRequest);
+        assert_eq!(
+            error.message,
+            format!("step {beyond} is beyond the latest agreed step {latest}")
+        );
+    }
 }
 
 /// `events.subscribe` delivers Negotiation, Step, and Terminal frames for a driven
@@ -1248,4 +1483,698 @@ async fn blobs_link_grant_and_export_by_hash() {
     .unwrap_err();
     assert_eq!(absent.code, arena0_api::ApiErrorCode::NotFound);
     assert!(!files.path().join("never.bin").exists());
+}
+
+/// Host A creates and Host B joins. The joiner passes `joiner_params`, so
+/// `None` exercises adopting the creator's terms.
+async fn launch_pair(
+    d: &common::DaemonHarness,
+    creator_params: Option<serde_json::Value>,
+    joiner_params: Option<serde_json::Value>,
+) -> (ExecId, ExecId) {
+    let (exec_a, negotiation_id) = match ok(call(
+        &d.host_a,
+        &HostRequest::ExecNew {
+            exec_id: ExecId([0xa1; 32]),
+            program: d.program_id.to_string(),
+            params: creator_params,
+            ensemble: EnsembleSpec::Create {
+                participant_count: 2,
+            },
+            blobs: vec![],
+        },
+    )
+    .await)
+    {
+        ResponseOk::ExecCreated {
+            exec_id,
+            negotiation_id: Some(negotiation_id),
+            ..
+        } => (exec_id, negotiation_id),
+        other => panic!("unexpected creator response: {other:?}"),
+    };
+    let exec_b = created(
+        call(
+            &d.host_b,
+            &HostRequest::ExecNew {
+                exec_id: ExecId([0xb1; 32]),
+                program: d.program_id.to_string(),
+                params: joiner_params,
+                ensemble: EnsembleSpec::Join {
+                    target: Some(NegotiationTarget::new(d.peer_a, negotiation_id)),
+                },
+                blobs: vec![],
+            },
+        )
+        .await,
+    );
+    (exec_a, exec_b)
+}
+
+/// Launch a pair and drive both Hosts to completion.
+async fn complete_session(
+    d: &common::DaemonHarness,
+    creator_params: Option<serde_json::Value>,
+    joiner_params: Option<serde_json::Value>,
+) -> (ExecId, ExecId) {
+    let (exec_a, exec_b) = launch_pair(d, creator_params, joiner_params).await;
+    let (session_a, session_b) = tokio::join!(drive(&d.host_a, exec_a), drive(&d.host_b, exec_b));
+    assert_eq!(session_a, session_b, "both Hosts completed one session");
+    (exec_a, exec_b)
+}
+
+/// Every participant's Host projects the offer params, including the joiner
+/// that submitted none and adopted the creator's terms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inspect_projects_offer_params() {
+    let d = daemon(&cumulative_sum_wasm()).await;
+    let params = serde_json::json!({ "target_size": 2 });
+    let (exec_a, exec_b) = complete_session(&d, Some(params.clone()), None).await;
+
+    for (host, exec_id) in [(&d.host_a, exec_a), (&d.host_b, exec_b)] {
+        let ResponseOk::Inspection(inspection) = ok(call(
+            host,
+            &HostRequest::ExecInspect {
+                exec_id,
+                events_from: None,
+                events_limit: 16,
+            },
+        )
+        .await) else {
+            panic!("expected Inspection from {}", host.name);
+        };
+        let activation = inspection
+            .activation
+            .unwrap_or_else(|| panic!("{} holds the activation", host.name));
+        assert_eq!(activation.params, params, "offer params on {}", host.name);
+    }
+}
+
+/// Agreed steps carry the local time this Host stored them, and the status
+/// carries the request's creation time and the latest durable transition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trace_and_status_carry_local_times() {
+    let d = daemon(&rps_wasm()).await;
+    let no_params = Some(serde_json::json!(null));
+    let (exec_a, exec_b) = complete_session(&d, no_params.clone(), no_params).await;
+    let after_run = arena0_node::unix_time_ms();
+
+    for (host, exec_id) in [(&d.host_a, exec_a), (&d.host_b, exec_b)] {
+        let ResponseOk::Status(status) = ok(call(host, &HostRequest::ExecStatus { exec_id }).await)
+        else {
+            panic!("expected Status from {}", host.name);
+        };
+        let ResponseOk::Trace(steps) = ok(call(
+            host,
+            &HostRequest::ExecTrace {
+                exec_id,
+                from: 0,
+                to: u64::MAX,
+            },
+        )
+        .await) else {
+            panic!("expected Trace from {}", host.name);
+        };
+        assert!(!steps.is_empty(), "a completed session agreed on steps");
+        assert!(
+            steps
+                .iter()
+                .enumerate()
+                .all(|(index, step)| step.entry.step == index as u64),
+            "{} returns the trace in step order",
+            host.name
+        );
+        assert!(
+            steps
+                .windows(2)
+                .all(|pair| pair[0].certified_at_ms <= pair[1].certified_at_ms),
+            "certification times never decrease by step on {}",
+            host.name
+        );
+        let first = steps.first().expect("non-empty").certified_at_ms;
+        let last = steps.last().expect("non-empty").certified_at_ms;
+        assert!(
+            status.created_at_ms <= first,
+            "{}: request created at {} after its first step at {first}",
+            host.name,
+            status.created_at_ms
+        );
+        assert!(
+            last <= after_run,
+            "{}: last step at {last} is after the run ended at {after_run}",
+            host.name
+        );
+        assert!(
+            status.created_at_ms <= status.updated_at_ms,
+            "{}: created {} after updated {}",
+            host.name,
+            status.created_at_ms,
+            status.updated_at_ms
+        );
+        assert!(
+            last <= status.updated_at_ms,
+            "{}: the latest transition ({}) predates the last step ({last})",
+            host.name,
+            status.updated_at_ms
+        );
+    }
+}
+
+/// `blob.list` reports every linked blob ordered by hash, and an empty Host
+/// reports none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blob_list_reports_imported_blobs() {
+    let d = daemon(&rps_wasm()).await;
+    assert_eq!(
+        ok(call(&d.host_a, &HostRequest::BlobList).await),
+        ResponseOk::BlobList(vec![]),
+        "a Host with no blobs lists none"
+    );
+
+    let files = tempfile::tempdir().expect("blob files");
+    let mut expected = Vec::new();
+    for (name, bytes) in [
+        ("short.bin", vec![1u8; 10]),
+        ("long.bin", (0..5_000u32).map(|i| (i % 253) as u8).collect()),
+    ] {
+        let path = files.path().join(name);
+        std::fs::write(&path, &bytes).unwrap();
+        expected.push(arena0_api::BlobEntry {
+            hash: arena0_protocol::BlobHash(arena0_crypto::hash(
+                arena0_crypto::HashAlgorithm::Blake3,
+                &bytes,
+            )),
+            length: bytes.len() as u64,
+            path: std::fs::canonicalize(&path).unwrap(),
+            linked: true,
+        });
+    }
+    // Import the greater hash first, so listing in insertion order would
+    // differ from the required hash order.
+    expected.sort_by_key(|entry| std::cmp::Reverse(entry.hash.0));
+    for entry in &expected {
+        assert_eq!(
+            ok(call(
+                &d.host_a,
+                &HostRequest::BlobImport {
+                    path: entry.path.clone()
+                }
+            )
+            .await),
+            ResponseOk::BlobImported {
+                hash: entry.hash,
+                length: entry.length
+            }
+        );
+    }
+    expected.sort_by_key(|entry| entry.hash.0);
+
+    assert_eq!(
+        ok(call(&d.host_a, &HostRequest::BlobList).await),
+        ResponseOk::BlobList(expected)
+    );
+    assert_eq!(
+        ok(call(&d.host_b, &HostRequest::BlobList).await),
+        ResponseOk::BlobList(vec![]),
+        "blobs are per Host"
+    );
+}
+
+async fn await_active(target: &HostTarget, exec_id: ExecId) {
+    ok(call(
+        target,
+        &HostRequest::ExecAwait {
+            exec_id,
+            until: AwaitState::Active,
+        },
+    )
+    .await);
+}
+
+async fn session_status(target: &HostTarget, exec_id: ExecId) -> arena0_api::SessionStatus {
+    let ResponseOk::Status(status) = ok(call(target, &HostRequest::ExecStatus { exec_id }).await)
+    else {
+        panic!("expected Status from {}", target.name);
+    };
+    status
+        .session()
+        .cloned()
+        .unwrap_or_else(|| panic!("{} reports no session: {:?}", target.name, status.state))
+}
+
+/// Wait until the agreed step at index `step` is durable on this Host. The
+/// step's trace entry and the execution's agreed-step cursor commit together,
+/// so a status read after this returns reflects the step.
+async fn read_until_step(reader: &mut BufReader<OwnedReadHalf>, step: u64) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if matches!(
+                read_event(reader).await.data,
+                EventData::SessionStep { step: agreed, .. } if agreed == step
+            ) {
+                return;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("agreed step {step} never arrived"));
+}
+
+/// `exec.status` names who may author the next agreed message and the
+/// program's phase, identically on every Host, and follows the session as it
+/// advances. A program that declares no writer reports `null`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_reports_the_writer_and_phase() {
+    let d = daemon(&chess_wasm()).await;
+    let (mut events_a, _events_a_write) = subscribe_events(&d.host_a).await;
+    let (mut events_b, _events_b_write) = subscribe_events(&d.host_b).await;
+    let no_params = Some(serde_json::json!(null));
+    let (exec_a, exec_b) = launch_pair(&d, no_params.clone(), no_params.clone()).await;
+    await_active(&d.host_a, exec_a).await;
+    await_active(&d.host_b, exec_b).await;
+
+    // The first mover is whoever the program asks for a move: the Host that
+    // holds the pending callout, an observation independent of `writer`.
+    let (mover_is_a, next) = next_from_either(&d.host_a, exec_a, &d.host_b, exec_b).await;
+    let (mover_target, mover_exec, mover, other_target, other_exec, other) = if mover_is_a {
+        (&d.host_a, exec_a, d.peer_a, &d.host_b, exec_b, d.peer_b)
+    } else {
+        (&d.host_b, exec_b, d.peer_b, &d.host_a, exec_a, d.peer_a)
+    };
+    let pending_id = match ok(next) {
+        ResponseOk::Next(arena0_api::NextEvent::Callout { pending_id, .. }) => pending_id,
+        other => panic!("expected the first mover's callout: {other:?}"),
+    };
+
+    let declared: Vec<String> = match ok(call(
+        &d.host_a,
+        &HostRequest::ProgramGet {
+            program: d.program_id.to_string(),
+        },
+    )
+    .await)
+    {
+        ResponseOk::Program(detail) => detail
+            .schema
+            .phases
+            .into_iter()
+            .map(|phase| phase.name)
+            .collect(),
+        other => panic!("expected the program detail: {other:?}"),
+    };
+
+    let before = session_status(mover_target, mover_exec).await;
+    for (target, exec_id) in [(mover_target, mover_exec), (other_target, other_exec)] {
+        let session = session_status(target, exec_id).await;
+        assert_eq!(
+            session.step, before.step,
+            "{} at the same step",
+            target.name
+        );
+        assert_eq!(
+            session.writer,
+            Some(mover),
+            "{} names the peer that moves first",
+            target.name
+        );
+        let phase = session.phase.unwrap_or_else(|| {
+            panic!(
+                "{} reports no phase for a program that declares them",
+                target.name
+            )
+        });
+        assert!(
+            declared.contains(&phase),
+            "{} reports {phase:?}, not one of {declared:?}",
+            target.name
+        );
+        // Chess leaves its default `setup` phase when the session starts.
+        assert_eq!(phase, "playing", "{}", target.name);
+    }
+
+    ok(call(
+        mover_target,
+        &HostRequest::ExecSubmit {
+            exec_id: mover_exec,
+            pending_id,
+            answer: Some(serde_json::json!("e2e4")),
+        },
+    )
+    .await);
+    let (mover_events, other_events) = if mover_is_a {
+        (&mut events_a, &mut events_b)
+    } else {
+        (&mut events_b, &mut events_a)
+    };
+    read_until_step(mover_events, before.step).await;
+    read_until_step(other_events, before.step).await;
+
+    for (target, exec_id) in [(mover_target, mover_exec), (other_target, other_exec)] {
+        let session = session_status(target, exec_id).await;
+        assert_eq!(
+            session.step,
+            before.step + 1,
+            "{} after one move",
+            target.name
+        );
+        assert_eq!(
+            session.writer,
+            Some(other),
+            "{} hands the move to the other peer",
+            target.name
+        );
+        assert_eq!(session.phase.as_deref(), Some("playing"), "{}", target.name);
+    }
+
+    // timer-dispatch declares a phase but no writer function.
+    let d = daemon(&timer_dispatch_wasm()).await;
+    let (exec_a, exec_b) = launch_pair(&d, no_params.clone(), no_params).await;
+    await_active(&d.host_a, exec_a).await;
+    await_active(&d.host_b, exec_b).await;
+    for (target, exec_id) in [(&d.host_a, exec_a), (&d.host_b, exec_b)] {
+        let session = session_status(target, exec_id).await;
+        assert_eq!(session.writer, None, "{}", target.name);
+        assert_eq!(session.phase.as_deref(), Some("waiting"), "{}", target.name);
+        let json = serde_json::to_value(&session).expect("session status JSON");
+        assert!(
+            json["writer"].is_null(),
+            "{}: writer is an explicit null on the wire: {json}",
+            target.name
+        );
+    }
+}
+
+/// `program.get` lists the phases a program declares, in declaration order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn program_schema_lists_declared_phases() {
+    let d = daemon(&prisoner_dilemma_wasm()).await;
+    let ResponseOk::Program(detail) = ok(call(
+        &d.host_a,
+        &HostRequest::ProgramGet {
+            program: d.program_id.to_string(),
+        },
+    )
+    .await) else {
+        panic!("expected the program detail");
+    };
+    let phase = |name: &str, description: &str, is_default: bool| arena0_program::PhaseSchema {
+        name: name.to_owned(),
+        description: description.to_owned(),
+        is_default,
+        is_terminal: false,
+    };
+    assert_eq!(
+        detail.schema.phases,
+        vec![
+            phase("setup", "Waiting for opponent", true),
+            phase("playing", "Round in progress", false),
+        ]
+    );
+}
+
+/// The cell of `board` on `square` (for example "e5"), located through the
+/// board's own labels so the check does not assume an orientation.
+fn board_cell<'a>(
+    cells: &'a [Cell],
+    row_labels: &[String],
+    col_labels: &[String],
+    square: &str,
+) -> &'a Cell {
+    let (file, rank) = square.split_at(1);
+    let row = row_labels.iter().position(|label| label == rank).unwrap();
+    let col = col_labels.iter().position(|label| label == file).unwrap();
+    &cells[row * col_labels.len() + col]
+}
+
+/// Chess renders a board and the side to move as typed blocks next to its
+/// text slots, and the blocks agree with the text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn views_carry_structured_blocks() {
+    let d = daemon(&chess_wasm()).await;
+    let (exec_a, negotiation_id) = create_on_host_a(&d).await;
+    let exec_b = join_on_host_b(&d, negotiation_id).await;
+
+    let mut answered = None;
+    for chess_move in ["e2e4", "e7e5"] {
+        let (target, exec_id, pending_id) = next_callout(&d, exec_a, exec_b, answered).await;
+        ok(call(
+            target,
+            &HostRequest::ExecSubmit {
+                exec_id,
+                pending_id,
+                answer: Some(serde_json::json!(chess_move)),
+            },
+        )
+        .await);
+        answered = Some(pending_id);
+    }
+    // White is to move again. A callout opens only after the latest agreed
+    // step landed, so this view observes the position after both moves.
+    let (target, exec_id, _) = next_callout(&d, exec_a, exec_b, answered).await;
+    let (_, view) = view_reply(view_at(target, exec_id, None).await);
+
+    let board = view
+        .blocks
+        .iter()
+        .find(|block| matches!(block, Block::Board { .. }))
+        .expect("a board block");
+    let Block::Board {
+        rows,
+        cols,
+        cells,
+        row_labels,
+        col_labels,
+        ..
+    } = board
+    else {
+        unreachable!("matched a board above");
+    };
+    assert_eq!((*rows, *cols, cells.len()), (8, 8, 64));
+    let cell = |square| board_cell(cells, row_labels, col_labels, square);
+
+    let pieces: Vec<&Cell> = cells.iter().filter(|cell| !cell.text.is_empty()).collect();
+    assert_eq!(pieces.len(), 32, "no piece was captured");
+    for owner in [0, 1] {
+        assert_eq!(
+            pieces
+                .iter()
+                .filter(|cell| cell.participant == Some(owner))
+                .count(),
+            16,
+            "participant {owner} owns sixteen pieces"
+        );
+    }
+    assert!(
+        cells
+            .iter()
+            .filter(|cell| cell.text.is_empty())
+            .all(|cell| cell.participant.is_none()),
+        "an empty square has no owner"
+    );
+
+    // Black's e7-e5 was the last move: its origin and destination are
+    // highlighted, and white's earlier e4 pawn is not.
+    let destination = cell("e5");
+    assert_eq!(destination.text, "\u{265f}");
+    assert_eq!(destination.participant, Some(1));
+    assert_eq!(destination.tone, Tone::Highlight);
+    assert_eq!(cell("e7").tone, Tone::Highlight);
+    let earlier = cell("e4");
+    assert_eq!(earlier.participant, Some(0));
+    assert_eq!(earlier.tone, Tone::Normal);
+    assert_eq!(
+        cells
+            .iter()
+            .filter(|cell| cell.tone == Tone::Highlight)
+            .count(),
+        2,
+        "only the last move's two squares are highlighted"
+    );
+
+    let facts = view
+        .blocks
+        .iter()
+        .find_map(|block| match block {
+            Block::Facts { items, .. } => Some(items),
+            _ => None,
+        })
+        .expect("a facts block");
+    let fact = |label: &str| {
+        &facts
+            .iter()
+            .find(|fact| fact.label == label)
+            .unwrap_or_else(|| panic!("no fact named {label}"))
+            .value
+    };
+    let to_move = fact("To move");
+    let move_number = fact("Move");
+    let status_bar = &view.slots[&Slot::StatusBar];
+    assert_eq!(
+        *status_bar,
+        format!("{}'s turn, move {}", to_move.text, move_number.text),
+        "the facts say what the status bar says"
+    );
+    assert_eq!(to_move.text, "white");
+    assert_eq!(to_move.participant, Some(0));
+}
+
+/// Start a session of the daemon's program on two Hosts and wait until its
+/// first agreed step is durable, so both a live view and a past view exist.
+async fn start_view_session(d: &DaemonHarness) -> ExecId {
+    let (mut events, _keep_open) = subscribe_events(&d.host_a).await;
+    let (exec_a, negotiation_id) = create_on_host_a(d).await;
+    join_on_host_b(d, negotiation_id).await;
+    tokio::time::timeout(LIVE_EXECUTION_TIMEOUT, async {
+        loop {
+            let frame = read_event(&mut events).await;
+            if frame.exec_id == Some(exec_a)
+                && matches!(frame.data, EventData::SessionStep { step: 0, .. })
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the session's first step is agreed");
+    exec_a
+}
+
+fn text_only(count: usize) -> Vec<Cell> {
+    vec![Cell::text(""); count]
+}
+
+/// The Host decodes a program's blocks as untrusted output. Blocks within the
+/// documented limits reach the client unchanged; each way to break a limit
+/// fails the view with an error naming it, on the live path and on the
+/// replayed past-step path, and never truncates or drops the block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn view_validation_rejects_oversized_blocks() {
+    let table = |rows: usize, columns: usize| Block::Table {
+        title: None,
+        columns: vec!["c".into(); columns],
+        rows: vec![text_only(columns); rows],
+    };
+    let board = |rows: u8, cols: u8, cells: usize| Block::Board {
+        title: None,
+        rows,
+        cols,
+        cells: text_only(cells),
+        row_labels: vec![],
+        col_labels: vec![],
+    };
+    let roster = |entries: usize, participant: u8| Block::Roster {
+        title: None,
+        entries: vec![
+            RosterEntry {
+                participant,
+                status: Cell::text("ready"),
+                detail: None,
+            };
+            entries
+        ],
+    };
+    let progress = || Block::Progress {
+        label: "p".into(),
+        value: 1,
+        max: 2,
+    };
+    let facts = |text: &str| Block::Facts {
+        title: None,
+        items: vec![Fact {
+            label: "f".into(),
+            value: Cell::text(text),
+        }],
+    };
+    let cases: Vec<(&str, Vec<Block>, &str)> = vec![
+        (
+            "board cells",
+            vec![board(2, 2, 3)],
+            "needs 4 cells but has 3",
+        ),
+        ("board size", vec![board(33, 1, 33)], "board is 33x1"),
+        (
+            "board labels",
+            vec![Block::Board {
+                title: None,
+                rows: 2,
+                cols: 1,
+                cells: text_only(2),
+                row_labels: vec!["1".into()],
+                col_labels: vec![],
+            }],
+            "1 row labels",
+        ),
+        ("table rows", vec![table(65, 1)], "65 rows"),
+        ("table columns", vec![table(1, 17)], "17 columns"),
+        ("roster entries", vec![roster(65, 0)], "65 entries"),
+        (
+            "block count",
+            (0..17).map(|_| progress()).collect(),
+            "17 blocks",
+        ),
+        ("text length", vec![facts(&"x".repeat(257))], "257 bytes"),
+        (
+            "participant",
+            vec![roster(1, 2)],
+            "participant 2 is outside the ensemble of 2",
+        ),
+        (
+            "cell participant",
+            vec![Block::Facts {
+                title: None,
+                items: vec![Fact {
+                    label: "f".into(),
+                    value: Cell::text("x").participant(2),
+                }],
+            }],
+            "participant 2 is outside the ensemble of 2",
+        ),
+    ];
+
+    // Each limit at its edge is accepted as written. The fixture holds one
+    // view of under 32 KiB, so the two 1024-cell edges get a session each.
+    let at_limits: Vec<(&str, Vec<Block>)> = vec![
+        ("table at limits", vec![table(64, 16)]),
+        ("board at limits", vec![board(32, 32, 1024)]),
+        (
+            "counts and text at limits",
+            std::iter::repeat_n(facts(&"x".repeat(256)), 15)
+                .chain([roster(64, 1)])
+                .collect(),
+        ),
+    ];
+    let rejected = cases
+        .into_iter()
+        .map(|(name, blocks, fragment)| (name, blocks, Some(fragment)));
+    let accepted = at_limits
+        .into_iter()
+        .map(|(name, blocks)| (name, blocks, None));
+    for (name, blocks, rejection) in accepted.chain(rejected) {
+        let mut view = View::new().header("fixture");
+        for block in &blocks {
+            view = view.block(block.clone());
+        }
+        let json = serde_json::to_string(&view).expect("view JSON");
+        let d = daemon(&view_program_wasm(&json)).await;
+        let exec = start_view_session(&d).await;
+        for at_step in [None, Some(0)] {
+            let reply = view_at(&d.host_a, exec, at_step).await;
+            match rejection {
+                None => assert_eq!(
+                    view_reply(reply).1,
+                    view,
+                    "{name} at {at_step:?}: blocks within the limits pass through"
+                ),
+                Some(fragment) => {
+                    let error = reply.unwrap_err();
+                    assert_eq!(error.code, arena0_api::ApiErrorCode::Execution, "{name}");
+                    assert!(
+                        error.message.contains(fragment),
+                        "{name} at {at_step:?}: `{}` does not name `{fragment}`",
+                        error.message
+                    );
+                }
+            }
+        }
+    }
 }

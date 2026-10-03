@@ -16,6 +16,7 @@ use super::commitment::AggregateAttestation;
 /// representable here. The type makes a non-agreed event in a portable entry
 /// unrepresentable, so no runtime shape check is needed.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum StepEvent {
     /// The session boundary at step 0.
     SessionStarted {
@@ -42,6 +43,7 @@ pub enum StepEvent {
 /// format, while `Effect`'s tags belong to the guest ABI. It is derived only
 /// through [`StepTerminal::from_effect`].
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum StepTerminal {
     /// Successful completion with opaque outcome bytes.
     End {
@@ -134,6 +136,7 @@ impl StepTerminal {
 /// agreement is a log join and is intentionally excluded from
 /// [`Self::entry_hash`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, BorshSerialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct TraceEntry {
     /// Trace schema version.
     pub trace_version: u32,

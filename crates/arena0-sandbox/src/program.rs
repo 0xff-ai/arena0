@@ -187,6 +187,7 @@ mod tests {
             params: unit.clone(),
             queries: Vec::new(),
             outcome: unit,
+            phases: Vec::new(),
         }
     }
 
@@ -212,8 +213,10 @@ mod tests {
 
         let mut wrong_magic = encoded.clone();
         wrong_magic[0] ^= 1;
+        let unsupported = arena0_program::PROGRAM_DEFINITION_VERSION + 1;
+        let unsupported_message = format!("unsupported program definition version {unsupported}");
         let mut unsupported_version = encoded.clone();
-        unsupported_version[4..8].copy_from_slice(&2u32.to_le_bytes());
+        unsupported_version[4..8].copy_from_slice(&unsupported.to_le_bytes());
         let mut definition = definition();
         definition.schema.params = JsonSchemaDocument::new(serde_json::json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -235,7 +238,7 @@ mod tests {
             (
                 "unsupported definition version",
                 Program::append_metadata(b"\0asm\x01\x00\x00\x00", &unsupported_version),
-                "unsupported program definition version 2",
+                &unsupported_message,
             ),
             (
                 "invalid JSON schema",
@@ -298,7 +301,7 @@ mod tests {
             r#"
             (module
               (memory (export "memory") 1)
-              (global (export "arena0_abi_version") i32 (i32.const 24))
+              (global (export "arena0_abi_version") i32 (i32.const 25))
               (data (i32.const 64) "{metadata_data}")
               (func $pack (param $ptr i32) (param $len i32) (result i64)
                 local.get $ptr
@@ -315,7 +318,7 @@ mod tests {
               (func (export "arena0_prepare") (result i32) i32.const 1)
               (func (export "arena0_initialize") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_dispatch") (param i32 i32) (result i64) i64.const 0)
-              (func (export "arena0_writer") (param i32 i32) (result i64) i64.const 0)
+              (func (export "arena0_turn") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_outcome") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_query") (param i32 i32) (result i64) i64.const 0)
               (func (export "arena0_view") (param i32 i32) (result i64) i64.const 0)

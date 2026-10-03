@@ -42,9 +42,10 @@ use lock::{
     OwnerLock, acquire_process_lock, configure_connection, initialize_schema, prepare_database_file,
 };
 
+// Version 11 stamps each agreed step with its local certification time.
 // Version 10 gives each database its own blob directory. Older partial rows
 // reconstruct paths in a shared directory and cannot be reopened under this layout.
-const SCHEMA_VERSION: u64 = 10;
+const SCHEMA_VERSION: u64 = 11;
 const ENVELOPE_VERSION: u16 = 2;
 const ENVELOPE_MAGIC: [u8; 8] = *b"AR0STOR1";
 const ENVELOPE_DOMAIN: &[u8] = b"arena0/store-envelope/v2";
@@ -458,6 +459,29 @@ pub enum ActivationRecordStatus {
 pub struct ActivationRecord {
     execution_id: ExecId,
     state: ActivationRecordState,
+    updated_at_ms: u64,
+}
+
+/// One agreed step with its local certification time.
+///
+/// The time is when this Host durably stored the step. It is a local
+/// observation and is never part of the portable [`TraceEntry`](arena0_protocol::TraceEntry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgreedStepRecord {
+    pub certified_at_ms: u64,
+    pub entry: arena0_protocol::TraceEntry,
+}
+
+/// One stored blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobRecord {
+    pub hash: arena0_protocol::BlobHash,
+    pub length: u64,
+    /// The file the blob reads from.
+    pub path: PathBuf,
+    /// True for a file imported in place, which this Host does not own; false
+    /// for a received file under the store's blob directory.
+    pub linked: bool,
 }
 
 /// A safe projection of one durable event record for local diagnostics.
@@ -630,6 +654,14 @@ impl ActivationRecord {
     #[must_use]
     pub const fn is_committed(&self) -> bool {
         matches!(self.status(), ActivationRecordStatus::Committed)
+    }
+
+    /// Local time of the record's latest durable change (preparation or
+    /// commitment), Unix milliseconds. For a conflicting candidate that was
+    /// never stored it is the time the conflict was observed.
+    #[must_use]
+    pub const fn updated_at_ms(&self) -> u64 {
+        self.updated_at_ms
     }
 }
 
@@ -1294,6 +1326,16 @@ impl StoreHandle {
         self.run(move |db| db.list_executions(limit)).await
     }
 
+    /// Local time of the execution's latest durable transition, Unix
+    /// milliseconds. `None` before the execution aggregate exists.
+    pub async fn execution_updated_at_ms(
+        &self,
+        execution_id: ExecId,
+    ) -> Result<Option<u64>, StoreError> {
+        self.run(move |db| db.execution_updated_at_ms(execution_id))
+            .await
+    }
+
     /// Read a bounded public trace range from the durable execution.
     ///
     /// The store validates the complete trace before selecting the requested
@@ -1305,8 +1347,29 @@ impl StoreHandle {
         from: u64,
         to: u64,
     ) -> Result<Vec<arena0_protocol::TraceEntry>, StoreError> {
-        self.run(move |db| db.read_trace(execution_id, from, to))
+        Ok(self
+            .read_agreed_steps(execution_id, from, to)
+            .await?
+            .into_iter()
+            .map(|step| step.entry)
+            .collect())
+    }
+
+    /// The agreed steps in `[from, to)` with their certification times,
+    /// after the same full-trace validation [`Self::read_trace`] performs.
+    pub async fn read_agreed_steps(
+        &self,
+        execution_id: ExecId,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<AgreedStepRecord>, StoreError> {
+        self.run(move |db| db.read_agreed_steps(execution_id, from, to))
             .await
+    }
+
+    /// Every stored blob, ordered by hash.
+    pub async fn list_blobs(&self) -> Result<Vec<BlobRecord>, StoreError> {
+        self.run(|db| db.list_blobs()).await
     }
 
     /// Read a bounded projection of durable local event records.
@@ -1543,7 +1606,7 @@ impl ExecutionStore {
     pub async fn execution_updated_at_ms(&self) -> Result<u64, StoreError> {
         let execution_id = self.execution_id;
         self.handle
-            .run(move |db| db.execution_updated_at_ms(execution_id))
+            .execution_updated_at_ms(execution_id)
             .await?
             .ok_or(StoreError::ExecutionNotFound(execution_id))
     }

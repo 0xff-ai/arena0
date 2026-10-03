@@ -53,6 +53,8 @@ pub const PREPARE_WINDOW_MS: u64 = 10_000;
 /// retained with the evidence so consumers cannot accidentally derive them
 /// from a different representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(as = "PreparedActivationSerde"))]
 pub struct PreparedActivation {
     offer: Offer,
     tickets: Vec<Ticket>,
@@ -63,6 +65,8 @@ pub struct PreparedActivation {
 /// A committed activation: prepared evidence plus the mandatory N-of-N
 /// collective signature over its exact activation preimage.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(as = "ActivationSerde"))]
 pub struct Activation {
     prepared: PreparedActivation,
     aggregate: BlsSignature,
@@ -590,6 +594,8 @@ pub(crate) fn verify_identity_signature(
 /// validated only on [`Activation`]; [`ActivationAnnouncement`] carries that
 /// signature for bounded gossip without the full ticket bodies.
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(as = "OfferSerde"))]
 pub struct Offer {
     data: OfferData,
     /// Creator ticket first, rest ascending `PeerId`; freezes at `target_size`.
@@ -604,6 +610,7 @@ struct OfferRaw {
 
 /// The signed offer body. `OfferHash = BLAKE3(Borsh(OfferData))`.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct OfferData {
     /// The fixed offer domain [`OFFER_DOMAIN`].
     pub domain: [u8; 24],
@@ -752,6 +759,7 @@ impl Offer {
 }
 
 #[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 struct OfferSerde {
     data: OfferData,
     tickets: Vec<TicketHash>,
@@ -786,6 +794,7 @@ const ACTIVATION_ENCODING_VERSION: u8 = 1;
 const ACTIVATION_ANNOUNCEMENT_ENCODING_VERSION: u8 = 1;
 
 #[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 struct PreparedActivationSerde {
     version: u8,
     offer: Offer,
@@ -843,6 +852,7 @@ impl BorshDeserialize for PreparedActivation {
 }
 
 #[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 struct ActivationSerde {
     version: u8,
     prepared: PreparedActivation,
@@ -1027,6 +1037,7 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
 
 /// A signed key certificate: "`signer` owns `execution_bls`" for one offer.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Ticket {
     pub data: TicketData,
     /// ed25519 over `TicketData`, verified with `data.signer`.
@@ -1055,6 +1066,7 @@ pub enum TicketVerificationError {
 
 /// The signed ticket body. `TicketHash = BLAKE3(Borsh(TicketData))`.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct TicketData {
     /// The fixed ticket domain [`TICKET_DOMAIN`].
     pub domain: [u8; 24],
@@ -1073,6 +1085,7 @@ pub struct TicketData {
 /// The ticket action. Validity lives only on `Active`: a withdrawal is a
 /// revision tombstone, not temporary consent.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum TicketAction {
     Active {
         /// The per-execution BLS public key the activation aggregate verifies

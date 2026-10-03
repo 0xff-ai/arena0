@@ -1173,7 +1173,8 @@ mod tests {
                 "messages": [],
                 "params": params,
                 "queries": [],
-                "outcome": unit
+                "outcome": unit,
+                "phases": []
             }
         }))
         .expect("program detail fixture")

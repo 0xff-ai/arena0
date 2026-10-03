@@ -17,10 +17,10 @@ pub mod state;
 pub use abi::{
     ABI_VERSION, AbiEnvelopeError, CallStatus, CalloutRequest, DispatchInput, DispatchOutput,
     HOST_MODULE, InitInput, InitializedState, JsonBytes, JsonBytesError, MAX_CALL_PAYLOAD_BYTES,
-    MAX_CALLOUT_CONTEXT_BYTES, MAX_REJECTION_REASON_BYTES, MAX_SESSION_CONTEXT_BYTES, OutcomeBytes,
-    OutcomeBytesError, OutcomeInput, OutcomeOutput, QueryInput, QueryOutput,
-    SIGN_RESULT_OVERHEAD_BYTES, StateMemoryKind, VERIFY_RESULT_OVERHEAD_BYTES, ViewInput,
-    ViewOutput, WriterInput, WriterOutput,
+    MAX_CALLOUT_CONTEXT_BYTES, MAX_PHASE_NAME_BYTES, MAX_REJECTION_REASON_BYTES,
+    MAX_SESSION_CONTEXT_BYTES, OutcomeBytes, OutcomeBytesError, OutcomeInput, OutcomeOutput,
+    QueryInput, QueryOutput, SIGN_RESULT_OVERHEAD_BYTES, StateMemoryKind, TurnInput, TurnOutput,
+    VERIFY_RESULT_OVERHEAD_BYTES, ViewInput, ViewOutput,
 };
 pub use id::IdParseError;
 pub use profile::{
@@ -42,7 +42,7 @@ pub use program::{
 };
 pub use schema::{
     BorshDiagnosticError, BorshSchemaDocument, BorshSchemaDocumentError, CalloutSchema,
-    JsonSchemaDocument, JsonSchemaDocumentError, MessageSchema, PrimitiveRouteSchema,
+    JsonSchemaDocument, JsonSchemaDocumentError, MessageSchema, PhaseSchema, PrimitiveRouteSchema,
     ProgramSchema, QuerySchema, StateSchema,
 };
 pub use state::{

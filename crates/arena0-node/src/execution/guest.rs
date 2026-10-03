@@ -93,10 +93,20 @@ struct DispatchSigner {
     execution_key: Arc<ExecutionKey>,
 }
 
-/// Per-dispatch verifier for the guest `verify` import, backed by the
-/// execution's binding.
-struct DispatchVerifier {
+/// Verifier for the guest `verify` import, backed by the execution's binding.
+///
+/// The actor and the past-step replay both give it to every dispatch, so an
+/// agreed handler that verifies a signature behaves the same in both.
+pub(super) struct DispatchVerifier {
     binding: arena0_protocol::ExecutionBinding,
+}
+
+impl DispatchVerifier {
+    pub(super) fn shared(binding: &arena0_protocol::ExecutionBinding) -> Arc<dyn GuestVerifier> {
+        Arc::new(Self {
+            binding: binding.clone(),
+        })
+    }
 }
 
 impl GuestVerifier for DispatchVerifier {
@@ -227,16 +237,22 @@ impl ExecutionActor {
     pub(super) fn view(
         &self,
         viewport: JsonBytes,
-    ) -> Result<(u64, arena0_protocol::View), ExecError> {
+    ) -> Result<(Option<u64>, arena0_protocol::View), ExecError> {
         let state = &self.state;
-        let projection =
-            self.context
-                .program
-                .view(state.shared_state(), &self.ensemble(), viewport)?;
-        let view = serde_json::from_slice(projection.output.as_bytes()).map_err(|error| {
-            ExecError::Unavailable(format!("view projection is not a View: {error}"))
-        })?;
-        Ok((state.agreed_step(), view))
+        let ensemble = self.ensemble();
+        let projection = self
+            .context
+            .program
+            .view(state.shared_state(), &ensemble, viewport)?;
+        let view = serde_json::from_slice::<arena0_protocol::View>(projection.output.as_bytes())
+            .map_err(|error| {
+                ExecError::Unavailable(format!("view projection is not a View: {error}"))
+            })?;
+        // The view is guest output: a violation fails this request and leaves
+        // the session running.
+        view.validate(ensemble.len())
+            .map_err(|error| ExecError::Unavailable(format!("view projection: {error}")))?;
+        Ok((state.agreed_step().checked_sub(1), view))
     }
 
     pub(super) async fn ensure_session_started(&mut self) -> Result<(), ExecError> {
@@ -334,7 +350,7 @@ impl ExecutionActor {
         shared: &arena0_program::SharedStateBytes,
         ensemble: &Ensemble<Committed>,
     ) -> Result<Option<arena0_protocol::PeerId>, ExecError> {
-        let writer = self.context.program.writer(shared, ensemble)?.writer;
+        let writer = self.context.program.turn(shared, ensemble)?.writer;
         Ok(writer.and_then(|participant| ensemble.peer_at(participant)))
     }
 
@@ -480,9 +496,7 @@ impl ExecutionActor {
                 event.clone(),
             )
             .with_outgoing_len(outgoing_len);
-            call = call.with_verifier(Arc::new(DispatchVerifier {
-                binding: self.state.binding().clone(),
-            }));
+            call = call.with_verifier(DispatchVerifier::shared(self.state.binding()));
             // Only local handlers may sign. `SessionStarted` is a
             // pre-session dispatch and `MessageReceived` reproduces a
             // peer's agreed result, so neither is offered a signer.

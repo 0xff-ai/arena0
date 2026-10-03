@@ -237,6 +237,18 @@ expires does not withdraw or finish the durable execution.
 
 ## 7. Negotiation and activation
 
+Every Host watches the negotiation topic for each program in its catalog,
+starting after recovery and updating subscriptions on import and removal.
+Watchers pair offers with the creator's authenticated Active ticket using the
+same structural checks as Join, excluding local and complete offers; a Join
+separately checks guest initialization before acceptance. The Host exposes a
+bounded, in-memory list through `negotiation.offers`, emitting Host-local events
+when entries are first seen or close. An offer leaves the list as complete only
+when every ticket it lists has been seen and verified; otherwise it stays until
+its deadline. Removed programs close their entries immediately; list requests
+and a five-second sweep remove expired entries. All watcher and sweep tasks
+stop with their Host.
+
 The offer is self-contained:
 
 ```text
@@ -339,6 +351,9 @@ prevents two processes from writing the same file. The actor supplies complete
 transition records; SQLite persists the execution aggregate, accepted event and
 occurrence identities, shared and local state images, effects, terminal
 records, active timers, and receipt artifacts in one authoritative transaction.
+Each agreed step row also records `certified_at_ms`, the local time the Host
+stored it. That time is a local observation kept outside the portable
+`TraceEntry`, so it never enters a receipt, a trace hash, or any commitment.
 The store does not receive individual effect commands or lease delivery work,
 and a failed transaction cannot change later reads.
 
@@ -365,6 +380,15 @@ never defines execution serialization and never participates in commitments,
 receipts, or portable verification. Other program Borsh values, including
 receipt params and outcomes, remain opaque bytes to the Host.
 
+Program metadata declares the program's phases (`ProgramSchema.phases`: name,
+description, default and terminal flags, in declaration order; empty when the
+program declares none). The read-only `arena0_turn` export projects the agreed
+shared state to a `TurnOutput`: the participant that may author the next
+program message (`None` when none may) and the declared name of the current
+phase. The Host validates the participant index against the committed ensemble
+and rejects a phase name over 64 bytes. Message admission uses the participant
+selection; the daemon also reports both in `exec.status`.
+
 Every cryptographic operation and every file-byte operation runs in the Host,
 for every program, and only when the program calls an import for it: the
 runtime itself moves program bytes without interpreting them. A program holds
@@ -386,7 +410,7 @@ contains them.
 Program import validates every required guest export before the artifact enters
 the Host's program catalog. The canonical list of names and signatures is
 `arena0_sandbox::validation::REQUIRED_FUNC_EXPORTS`, and the ABI is
-`ABI_VERSION = 24`.
+`ABI_VERSION = 25`.
 The execution profile is version 4 and binds the fixed shared/local memories,
 resident dispatch semantics, resource limits, and engine identity used by the
 Host. Activation carries its profile hash, so a Host rejects a different
@@ -417,12 +441,24 @@ Program import also uses this method to validate imports and exact export
 signatures and to verify the ABI value in a disposable bounded instance before
 registering the artifact in the Host's program catalog. `LoadedProgram` owns
 the immutable compiled module and its execution profile. Initialization and
-read-only `writer`, `query`, `view`, and `outcome` projections create fresh
+read-only `turn`, `query`, `view`, and `outcome` projections create fresh
 bounded Wasm instances over explicit state snapshots. An active execution
 creates one resident `ProgramInstance`; it owns fixed `arena0_shared` and
 `arena0_local` memories and routes every session event through
 `arena0_dispatch`. State memories survive dispatches, while work memory and
 mutable globals reset to the resident baseline for each dispatch.
+
+A view is the four text slots plus optional typed blocks (`facts`, `table`,
+`board`, `progress`, `roster`) that carry the same information for clients that
+can lay it out. Blocks are guest output, so the Host validates them wherever it
+decodes a view, for live, terminal, and past-step views alike: at most 16
+blocks; tables of at most 64 rows and 16 columns; boards of at most 32 by 32
+with exactly `rows * cols` cells and label lists that are empty or match;
+rosters of at most 64 entries; texts of at most 256 bytes; participant indices
+below the committed ensemble size. `View::validate` owns these limits. A
+violation fails the view request with an execution error naming the limit; it
+never truncates a block and never ends the session. Blocks are not part of any
+receipt: they are a projection of the agreed state, like the text slots.
 
 The daemon owns one shared `WasmtimeEngine` for program validation and execution
 loading, not a second program catalog. Each Host must first resolve the hash from
@@ -468,10 +504,10 @@ queue with the candidate state.
   second one, or one combined with `SetTimer` traps the dispatch.
 
 A participant authors the next agreed message only from its outgoing queue.
-When no proposal is staged and the `writer` projection over the agreed shared
-state selects this participant, the actor takes the oldest queued message and
-applies it through its own `MessageReceived` dispatch, exactly as every other
-participant will. If the result is accepted, the actor stages the proposal and
+When no proposal is staged and the `writer` selected by the `arena0_turn`
+projection over the agreed shared state is this participant, the actor takes
+the oldest queued message and applies it through its own `MessageReceived`
+dispatch, exactly as every other participant will. If the result is accepted, the actor stages the proposal and
 sends the message frame carrying its complete `StepCommitment`. If its own program
 rejects the message, the actor removes it from the queue and records a local
 error; the message never reaches a peer. A local handler that wants to end the
@@ -791,7 +827,7 @@ bytes. A stopped result includes the exact `StopCause`, preserving the
 distinction between an authenticated unilateral report and a shared N-of-N
 stop. Verification does not execute Wasm and stops at these checks.
 
-This release uses store schema version 10 and rejects earlier databases with an
+This release uses store schema version 11 and rejects earlier databases with an
 unsupported-schema error. It does not rewrite or delete old evidence. Version-1
 producer-sealed receipts are also rejected; they must be inspected with the
 matching older release. Automatic migration is not provided.
@@ -859,13 +895,14 @@ The CLI remains a Unix-socket client. `arena0 skill` prints the packaged,
 CLI agent instructions offline; `--json` wraps the same Markdown in a
 machine-readable response. `arena0 serve` replaces the CLI process
 with the installed `arena0d` executable and provides a persistent service for
-CLI and API clients. Bare `arena0` on a human terminal opens a local workspace;
-`arena0 run` provides the explicit scriptable grammar. These paths may start an
+CLI and API clients. Bare `arena0` on a human terminal and `arena0 ui` open the
+browser workspace; `arena0 run` provides the explicit scriptable grammar, with
+`--human HOST` answering callouts at the terminal prompt. These paths may start an
 installed `arena0d` child for the selected local Hosts and stop only that
 owned child when the command ends. The child still owns every Host, store,
 transport, sandbox, and runtime resource. The CLI owns only child-process
-supervision and typed socket clients. It reuses the shared endpoint and opens
-missing selected Hosts through the daemon's existing provisioning operation.
+supervision, browser opening, and typed socket clients. It reuses the shared
+endpoint and opens missing selected Hosts through the daemon's existing provisioning operation.
 It never stops a borrowed service.
 
 `arena0 run` creates an offer for the selected Host count and targets that offer
@@ -874,21 +911,19 @@ peers: another Host may join the shared program topic first. The runner checks
 the verified receipt ensemble against its selected Hosts and reports a
 mismatch rather than presenting that run as their shared result.
 
-`arena0 launch <program>` uses the same coordinated admission and receipt
-verification without opening the terminal interface. Omitting the program in
-a terminal opens the existing launcher; ambiguous references offer a choice
-there. Selections carry exact program hashes into coordinated admission. It
-supervises configured local drivers; unbound Hosts wait for independent
-clients. `arena0 launch --agents` opens a two-Participant program and harness
+`arena0 launch PROGRAM` uses the same coordinated admission and receipt
+verification headlessly. Program references resolve to exact program hashes
+before coordinated admission. It supervises configured local drivers; unbound Hosts wait for independent
+clients. `arena0 launch --agents PROGRAM` opens a two-participant program and harness
 selector, creates a private temporary home, and runs distinct Codex contexts in
 the current pane and a new right pane. The creator and open joiner use the same
-program-topic discovery as other agent clients. `arena0 monitor`
-attaches through the shared daemon socket and observes the complete daemon
-Ensemble. It owns subscriptions and presentation only, and detaching never
-stops the daemon or its executions. Executions are keyed by Host and local
-execution ID; negotiation and session identities group multiparty views.
+program-topic discovery as other agent clients. `arena0 ui --attach` opens the
+browser workspace served by the daemon’s loopback HTTP server and observes the
+complete daemon Ensemble. Ctrl-C closes the command without stopping the
+borrowed daemon or its executions. Executions are keyed
+by Host and local execution ID; negotiation and session identities group multiparty views.
 
-A monitor may submit one answer for the open callout through the ordinary
+The browser may submit one answer for the open callout through the ordinary
 `exec.submit` operation. The answer must name the exact open `CalloutId`;
 reading a callout grants no ownership or reservation. The execution actor
 serializes competing answers. A stale or losing submission reports
@@ -898,21 +933,16 @@ and a program rejection or input-handler trap returns `InputRejected` without
 ending the session. A lost submission response is an unknown outcome and must
 not trigger automatic resubmission.
 
-The workspace projects the typed program catalog and lets a human select one
-program, an admitted Host count, a CLI-local human control choice for one or
-all selected Hosts, and program parameters. Each Host remains an independent
-protocol actor; the choice only selects which
-callouts the shared terminal answers. Launching opens the focused full-screen
-run interface. Its persistent Host scope independently selects all Hosts, one
-Host, or a two-Host comparison for the execution lifecycle, guest-owned
-four-slot `View`, durable trace, Host-local event-record summaries, and redacted system
-events. Neither screen owns protocol or durable state. Bare `arena0` prints
-help instead of opening a terminal interface when any standard stream is not a
-terminal.
+The daemon HTTP interface exposes typed daemon facts and accepts browser
+requests. Each Host remains an independent protocol actor; presentation
+does not own protocol or durable state. `arena0 ui` starts a daemon when none
+runs, and Ctrl-C stops only the daemon it started. Bare `arena0`
+prints help when any standard stream is not a terminal; explicit `arena0 ui`
+opens the browser workspace without that terminal requirement.
 The global `--tmp` option scopes these client paths to one private temporary
 arena0 home and removes it after all command-owned processes have stopped. It
 does not apply to the process-replacing, persistent `arena0 serve` path or to
-`arena0 monitor`, which attaches to an existing home.
+`arena0 ui --attach`, which attaches to an existing home.
 
 ## 13. Events
 
@@ -960,10 +990,10 @@ The public release guarantees:
 - canonical receipt identity, distinct unilateral stop reports, and local provenance;
 - the `Transport` seam without changing runtime or proof semantics.
 
-The current compatibility boundary is `ABI_VERSION = 24`, execution profile
+The current compatibility boundary is `ABI_VERSION = 25`, execution profile
 version 4, `TraceEntry` format 3, the v4 `StepCommitment` domain, receipt
 artifact and body version 5, the v5 `ReceiptId` domain, and store schema
-version 9. Decoders reject unsupported versions, and no format silently accepts
+version 11. Decoders reject unsupported versions, and no format silently accepts
 evidence from an earlier release.
 
 The public workspace has no remote discovery, addressing, relay, remote program
