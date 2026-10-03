@@ -154,6 +154,12 @@ impl Home {
         &self.cache_dir
     }
 
+    /// Browser uploads waiting to be imported; cleared at every daemon start.
+    #[must_use]
+    pub fn uploads_dir(&self) -> PathBuf {
+        self.root.join("uploads")
+    }
+
     /// Parent directory for disposable arena0 homes.
     #[must_use]
     pub fn temporary_dir(&self) -> PathBuf {

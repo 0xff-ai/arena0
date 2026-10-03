@@ -16,6 +16,7 @@ pub mod frame;
 
 mod activity;
 mod events;
+mod http;
 mod request;
 mod response;
 
@@ -26,15 +27,18 @@ pub use arena0_protocol::{
 };
 pub use events::{
     EventData, EventFilter, EventFrame, ExecOrigin, ExecutionFailureKind, NegotiationStage,
-    SessionTerminal,
+    OfferClosedReason, SessionTerminal,
 };
-pub use request::{AwaitState, EnsembleSpec, HostRequest, ProgramRefError, ReceiptRef, Request};
+pub use http::Uploaded;
+pub use request::{
+    AwaitState, EnsembleSpec, FileSource, HostRequest, ProgramRefError, ReceiptRef, Request,
+};
 pub use response::{
     ActivationInspection, ActivationInspectionState, ActivationParticipant, AgreedStep, ApiError,
-    ApiErrorCode, BlobEntry, DaemonInfo, EventRecordSummary, ExecEndPhase, ExecEndStatus,
-    ExecStatus, ExecStatusState, ExecutionInspection, HostInfo, HostStatus, IdInfo, NextEvent,
-    PendingCalloutStatus, ProgramDetail, ProgramSummary, ReceiptListEntry, Response, ResponseOk,
-    SessionProgress, SessionStatus,
+    ApiErrorCode, BlobEntry, DaemonInfo, DecodedMessage, EventRecordSummary, ExecEndPhase,
+    ExecEndStatus, ExecListEntry, ExecStatus, ExecStatusState, ExecutionInspection, HostInfo,
+    HostStatus, IdInfo, NextEvent, OpenOffer, PendingCalloutStatus, ProgramDetail, ProgramSummary,
+    ReceiptListEntry, Response, ResponseOk, SessionProgress, SessionStatus,
 };
 
 #[cfg(test)]
@@ -318,6 +322,10 @@ mod tests {
                     pending_callout: Some(PendingCalloutStatus {
                         pending_id: CalloutId::new(11),
                         callout_index: 1,
+                        name: "Choose".into(),
+                        prompt: "Choose a value".into(),
+                        schema: arena0_program::JsonSchemaDocument::unit(),
+                        context: serde_json::Value::Null,
                     }),
                     receipt_available: false,
                     writer: None,
@@ -350,6 +358,7 @@ mod tests {
         ] {
             let mut terminal = status.clone();
             terminal.state = ExecStatusState::Completed {
+                outcome: None,
                 session: status.session().unwrap().clone(),
             };
             terminal.end = ExecEndStatus {
