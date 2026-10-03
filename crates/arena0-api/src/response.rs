@@ -85,6 +85,9 @@ pub enum ResponseOk {
     /// `receipt.verify`: the recovered structural and cryptographic evidence,
     /// not a bool.
     Verified(ReceiptSummary),
+    /// `receipt.verify_full`: the light summary plus what the replay
+    /// established.
+    VerifiedFull(FullReceiptSummary),
     DaemonInfo(DaemonInfo),
     /// The ack for `events.subscribe`; `EventFrame`s follow on the same connection.
     Subscribed,
@@ -707,4 +710,19 @@ pub enum Resolved {
         candidates: Vec<String>,
         matches: u64,
     },
+}
+
+/// The result of full receipt verification.
+///
+/// Returned only after the replay reproduced every agreed step, so its
+/// presence is the verdict; failures are `ApiError`s.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct FullReceiptSummary {
+    /// Exactly the summary `receipt.verify` returns for the same artifact.
+    pub summary: ReceiptSummary,
+    /// The program's JSON projection of the outcome: present exactly when the
+    /// receipt records a completion, `null` for a stop.
+    pub outcome_json: Option<Value>,
 }
