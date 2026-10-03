@@ -141,7 +141,7 @@ pub use arena0_program::{
     PROGRAM_DEFINITION_VERSION, PROGRAM_MAX_LEN, ParticipantCount, ParticipantCountError,
     PrimitiveRouteSchema, ProgramDefinition, ProgramDefinitionError, ProgramHash, ProgramMetadata,
     ProgramSchema, QueryInput, QueryOutput, QuerySchema, SharedStateBytes, StateBytesError,
-    StateSchema, ViewInput, ViewOutput, WriterInput, WriterOutput, abi,
+    StateSchema, ViewInput, ViewOutput, abi,
 };
 pub use arena0_protocol as types;
 pub use arena0_protocol::{

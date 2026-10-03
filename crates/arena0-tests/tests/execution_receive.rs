@@ -232,7 +232,7 @@ async fn rejected_shared_message_fails_without_advancing_the_public_trace() {
         .await;
     let reason = terminal_reason(&mut execution.spawned).await;
     assert!(
-        reason.starts_with("diverged at step 1: program rejected the writer message"),
+        reason.starts_with("diverged at step 1: program rejected the message"),
         "{reason}"
     );
     let trace = execution

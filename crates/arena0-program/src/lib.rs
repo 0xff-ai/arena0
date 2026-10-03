@@ -20,7 +20,7 @@ pub use abi::{
     MAX_CALLOUT_CONTEXT_BYTES, MAX_REJECTION_REASON_BYTES, MAX_SESSION_CONTEXT_BYTES, OutcomeBytes,
     OutcomeBytesError, OutcomeInput, OutcomeOutput, QueryInput, QueryOutput,
     SIGN_RESULT_OVERHEAD_BYTES, StateMemoryKind, VERIFY_RESULT_OVERHEAD_BYTES, ViewInput,
-    ViewOutput, WriterInput, WriterOutput,
+    ViewOutput,
 };
 pub use id::IdParseError;
 pub use profile::{

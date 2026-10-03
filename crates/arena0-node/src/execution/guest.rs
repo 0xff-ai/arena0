@@ -12,7 +12,7 @@ use arena0_crypto::{ExecutionKey, NodeKeys, SignScheme};
 use arena0_program::{CallStatus, JsonBytes, ProgramHash};
 use arena0_protocol::execution::GuestSignData;
 use arena0_protocol::{
-    CalloutId, Committed, Effect, Ensemble, Event, ExecLifecycle, ExecutionState, ExecutionStatus,
+    CalloutId, Effect, Event, ExecLifecycle, ExecutionState, ExecutionStatus,
     ParticipantStepSignature, PeerIdSource, SessionHash, SharedProposal, StepEvent,
     TerminalOutcome,
 };
@@ -64,7 +64,7 @@ pub(super) enum SubmitInputError {
 ///
 /// `Frozen` means that the durable execution boundary did not allow the
 /// event to run. `Rejected` discards candidate state and observations. The
-/// caller reports an input rejection or ends the session for a writer-message
+/// caller reports an input rejection or ends the session for a message
 /// divergence, according to the event being dispatched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum DispatchOutcome {
@@ -292,10 +292,10 @@ impl ExecutionActor {
     }
 
     /// Dispatch one peer message that `accept_frame` has already classified:
-    /// current step, bound to the agreed cursor, and authored by the current
-    /// writer, with no staged proposal. The receiver checks both advertised
-    /// frame hashes before it can sign the resulting proposal. The Host's own
-    /// messages go through `author_next_message` instead.
+    /// current step, bound to the agreed cursor, with no staged proposal. The
+    /// receiver checks both advertised frame hashes before it can sign the
+    /// resulting proposal. The Host's own messages go through
+    /// `author_next_message` instead.
     pub(super) async fn apply_message(
         &mut self,
         source: arena0_protocol::PeerId,
@@ -315,8 +315,7 @@ impl ExecutionActor {
         match outcome {
             DispatchOutcome::Committed | DispatchOutcome::Frozen => Ok(()),
             DispatchOutcome::Rejected { reason } => {
-                let mut message =
-                    format!("diverged at step {seq}: program rejected the writer message");
+                let mut message = format!("diverged at step {seq}: program rejected the message");
                 if let Some(reason) = reason {
                     message.push_str(": ");
                     message.push_str(&reason);
@@ -329,40 +328,24 @@ impl ExecutionActor {
         }
     }
 
-    pub(super) fn writer_for_shared(
-        &self,
-        shared: &arena0_program::SharedStateBytes,
-        ensemble: &Ensemble<Committed>,
-    ) -> Result<Option<arena0_protocol::PeerId>, ExecError> {
-        let writer = self.context.program.writer(shared, ensemble)?.writer;
-        Ok(writer.and_then(|participant| ensemble.peer_at(participant)))
-    }
-
-    /// Whether this participant currently owns the next agreed message.
-    ///
-    /// True only while active, with no staged proposal, a non-empty outgoing
-    /// queue, and the `writer` projection selecting this participant.
-    pub(super) fn may_author(&self) -> Result<bool, ExecError> {
+    /// Whether this participant can trial-run its next queued message: active,
+    /// with no staged proposal and a non-empty outgoing queue. The program's
+    /// own rules decide whether the message is accepted now.
+    pub(super) fn may_author(&self) -> bool {
         let state = &self.state;
-        if !matches!(state.status(), ExecutionStatus::Active)
-            || state.pending_shared().is_some()
-            || state.outgoing().is_empty()
-        {
-            return Ok(false);
-        }
-        Ok(
-            self.writer_for_shared(state.shared_state(), &self.ensemble())?
-                == Some(self.context.identity.peer_id()),
-        )
+        matches!(state.status(), ExecutionStatus::Active)
+            && state.pending_shared().is_none()
+            && !state.outgoing().is_empty()
     }
 
     /// Author the oldest queued message through the same dispatch every
     /// receiver runs, staging a proposal on acceptance.
     ///
-    /// A message the program rejects is dropped from the durable queue and the
-    /// loop continues with the next one; it never reaches a peer.
+    /// A message the program rejects is dropped from the durable queue and
+    /// logged as an error; the loop continues with the next one. It never
+    /// reaches a peer.
     pub(super) async fn author_next_message(&mut self) -> Result<(), ExecError> {
-        while self.may_author()? {
+        while self.may_author() {
             let event = Event::MessageReceived {
                 from: self.context.identity.peer_id(),
                 msg: self.state.outgoing()[0].clone(),

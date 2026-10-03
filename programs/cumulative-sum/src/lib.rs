@@ -74,16 +74,16 @@ pub struct Local {
 
 impl Shared {
     /// The participant whose contribution the current base is waiting for: the
-    /// first empty slot in the contributions buffer. Unique-writer rule: only
+    /// first empty slot in the contributions buffer. Sender-order rule: only
     /// that participant's message applies; any other sender is a deterministic
     /// reject (no sibling candidates at one position).
-    fn expected_writer(&self) -> Option<usize> {
+    fn next_slot(&self) -> Option<usize> {
         self.contributions.iter().position(Option::is_none)
     }
 
     /// Whether `participant` owns the first empty contribution slot.
-    fn is_writer(&self, participant: Participant) -> bool {
-        self.expected_writer() == Some(participant.index())
+    fn is_next(&self, participant: Participant) -> bool {
+        self.next_slot() == Some(participant.index())
     }
 
     fn display_total(&self) -> u64 {
@@ -116,12 +116,6 @@ pub mod cumulative_sum {
     /// Pure projection from final shared state.
     fn outcome(state: &Shared) -> Outcome {
         Outcome::Sum { total: state.total }
-    }
-
-    fn writer(state: &Shared) -> Option<Participant> {
-        state
-            .expected_writer()
-            .and_then(|index| Participant::try_from(index).ok())
     }
 
     fn view(state: &Shared, ensemble: &Ensemble, vp: &Viewport) -> View {
@@ -252,9 +246,9 @@ pub mod cumulative_sum {
         msg: Message,
     ) -> MessageApply<CumulativeSum> {
         let Message::Contribute { value } = msg;
-        // Unique-writer rule: only the expected writer's message applies;
+        // Sender-order rule: only the next sender's message applies;
         // anyone else is a deterministic reject (no sibling candidates).
-        if !ctx.shared().is_writer(from) {
+        if !ctx.shared().is_next(from) {
             return Ok(ApplyDecision::Reject);
         }
         let n = ctx.ensemble().len();
@@ -272,9 +266,9 @@ pub mod cumulative_sum {
     ///
     /// The shared slot is filled only when the author's own message is applied
     /// through [`on_message`], so the draw is deterministic per node and the
-    /// unique-writer rule holds at every position.
+    /// sender-order rule holds at every position.
     fn queue_contribution_if_due(ctx: &mut Context<Shared, Local>) -> arena0::anyhow::Result<()> {
-        if !ctx.shared().is_writer(ctx.me()) || ctx.local().sent {
+        if !ctx.shared().is_next(ctx.me()) || ctx.local().sent {
             return Ok(());
         }
         let mut buf = [0u8; 8];

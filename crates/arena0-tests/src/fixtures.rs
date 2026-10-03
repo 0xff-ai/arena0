@@ -472,9 +472,9 @@ impl Drop for LiveExecution {
 }
 
 /// Build a minimal real Wasm guest used by transport/ordering tests. It
-/// accepts every shared event, selects participant 1 as the next writer, and
-/// has no local side effects. The module still crosses the exact metadata,
-/// ABI, and fresh-instance sandbox boundary used by production guests.
+/// accepts every shared event and has no local side effects. The module still
+/// crosses the exact metadata, ABI, and fresh-instance sandbox boundary used by
+/// production guests.
 pub fn ordering_program_wasm(reject_shared: bool) -> Vec<u8> {
     ordering_program(if reject_shared {
         OrderingBehavior::RejectMessage
@@ -522,7 +522,6 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
     let init = wat_data(&[0, 0, 0, 0, 0, 0, 0, 0]);
     let accepted = wat_data(&[0, 0, 0]);
     let rejected = wat_data(&[1, 0, 0]);
-    let writer = wat_data(&[1, 1]);
     let outcome = wat_data(&[0, 0, 0, 0, 4, 0, 0, 0, b'n', b'u', b'l', b'l']);
     let query = wat_data(&[0, 0, 0, 0, 4, 0, 0, 0, b'n', b'u', b'l', b'l']);
     let view = wat_data(&[4, 0, 0, 0, b'n', b'u', b'l', b'l']);
@@ -533,11 +532,10 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
           (import "arena0" "broadcast" (func $broadcast (param i32 i32) (result i32)))
           {stop_import}
           (memory (export "memory") 1)
-          (global (export "arena0_abi_version") i32 (i32.const 24))
+          (global (export "arena0_abi_version") i32 (i32.const 25))
           (data (i32.const 2048) "{init}")
           (data (i32.const 32768) "{accepted}")
           (data (i32.const 32772) "{rejected}")
-          (data (i32.const 8192) "{writer}")
           (data (i32.const 10240) "{outcome}")
           (data (i32.const 12288) "{query}")
           (data (i32.const 14336) "{view}")
@@ -562,8 +560,6 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
           (func (export "arena0_initialize") (param i32 i32) (result i64)
             i32.const 2048 i32.const 8 call $pack)
           {dispatch_export}
-          (func (export "arena0_writer") (param i32 i32) (result i64)
-            i32.const 8192 i32.const 2 call $pack)
           (func (export "arena0_outcome") (param i32 i32) (result i64)
             i32.const 10240 i32.const 12 call $pack)
           (func (export "arena0_query") (param i32 i32) (result i64)
@@ -626,7 +622,6 @@ fn ordering_program(behavior: OrderingBehavior) -> Vec<u8> {
             r#"(func (export "arena0_dispatch") (param i32 i32) (result i64)
             i32.const 32768 i32.const 3 call $pack)"#
         },
-        writer = writer,
         outcome = outcome,
         query = query,
         view = view,

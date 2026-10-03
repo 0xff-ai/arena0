@@ -46,12 +46,6 @@ pub(super) fn expand_arena0_program_module(
         syn::parse_quote!(())
     };
 
-    if module_has_fn(items, "on_message") && !module_has_fn(items, "writer") {
-        return Err(Error::new(
-            module.span(),
-            "arena0::program modules with on_message must define writer(shared) -> Option<Participant> for agreed messages",
-        ));
-    }
     let local_ty = user_local_ty.clone();
     rewrite_bare_context_in_module(items, &shared_ty, &local_ty);
 
@@ -279,19 +273,6 @@ fn module_handler_methods(items: &[Item]) -> Result<Vec<TokenStream2>> {
                 #ensemble_binding: &::arena0::Ensemble,
             ) -> Result<::arena0::ProgramTransition<Self>, ::arena0::ProgramFault> {
                 #call
-            }
-        });
-    }
-    if module_has_fn(items, "writer") {
-        methods.push(quote! {
-            fn writer(shared: &Self::Shared) -> ::core::option::Option<::arena0::Participant> {
-                self::writer(shared)
-            }
-        });
-    } else {
-        methods.push(quote! {
-            fn writer(_shared: &Self::Shared) -> ::core::option::Option<::arena0::Participant> {
-                ::core::option::Option::None
             }
         });
     }

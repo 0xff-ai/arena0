@@ -386,7 +386,7 @@ contains them.
 Program import validates every required guest export before the artifact enters
 the Host's program catalog. The canonical list of names and signatures is
 `arena0_sandbox::validation::REQUIRED_FUNC_EXPORTS`, and the ABI is
-`ABI_VERSION = 24`.
+`ABI_VERSION = 25`.
 The execution profile is version 4 and binds the fixed shared/local memories,
 resident dispatch semantics, resource limits, and engine identity used by the
 Host. Activation carries its profile hash, so a Host rejects a different
@@ -417,7 +417,7 @@ Program import also uses this method to validate imports and exact export
 signatures and to verify the ABI value in a disposable bounded instance before
 registering the artifact in the Host's program catalog. `LoadedProgram` owns
 the immutable compiled module and its execution profile. Initialization and
-read-only `writer`, `query`, `view`, and `outcome` projections create fresh
+read-only `query`, `view`, and `outcome` projections create fresh
 bounded Wasm instances over explicit state snapshots. An active execution
 creates one resident `ProgramInstance`; it owns fixed `arena0_shared` and
 `arena0_local` memories and routes every session event through
@@ -468,9 +468,8 @@ queue with the candidate state.
   second one, or one combined with `SetTimer` traps the dispatch.
 
 A participant authors the next agreed message only from its outgoing queue.
-When no proposal is staged and the `writer` projection over the agreed shared
-state selects this participant, the actor takes the oldest queued message and
-applies it through its own `MessageReceived` dispatch, exactly as every other
+While active with no proposal staged, the actor takes the oldest queued message
+and applies it through its own `MessageReceived` dispatch, exactly as every other
 participant will. If the result is accepted, the actor stages the proposal and
 sends the message frame carrying its complete `StepCommitment`. If its own program
 rejects the message, the actor removes it from the queue and records a local
@@ -541,13 +540,14 @@ one SQLite transaction. A failed version check or transaction leaves the
 proposed result uncommitted, and the actor restores the resident instance from
 the last committed images.
 
-An authenticated writer message that the receiving program rejects, traps, or
+An authenticated message that the receiving program rejects, traps, or
 cannot reproduce as the author's exact `StepCommitment` is a divergence; the
 receiver compares commitments before it signs. The participant
 that detects it records a Host-signed `Fail` occurrence at the agreed cursor;
-its peers receive that occurrence as an `Abort` frame. Invalid frames—wrong
-writer, wrong pre-state, or stale position—are dropped rather than treated as
-divergence. The guest ends or aborts a session
+its peers receive that occurrence as an `Abort` frame, failing the session for
+everyone. The program's handlers decide from replicated state who may send
+next. Invalid frames with wrong session, pre-state, link, or stale position are
+dropped rather than treated as divergence. The guest ends or aborts a session
 with `Effect::SessionEnd`/`SessionAbort`; a unilateral occurrence travels as
 `ExecFrame::Abort`.
 
@@ -960,7 +960,7 @@ The public release guarantees:
 - canonical receipt identity, distinct unilateral stop reports, and local provenance;
 - the `Transport` seam without changing runtime or proof semantics.
 
-The current compatibility boundary is `ABI_VERSION = 24`, execution profile
+The current compatibility boundary is `ABI_VERSION = 25`, execution profile
 version 4, `TraceEntry` format 3, the v4 `StepCommitment` domain, receipt
 artifact and body version 5, the v5 `ReceiptId` domain, and store schema
 version 9. Decoders reject unsupported versions, and no format silently accepts

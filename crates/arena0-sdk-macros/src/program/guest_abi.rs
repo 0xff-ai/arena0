@@ -506,15 +506,6 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn arena0_writer(input_ptr: i32, input_len: i32) -> i64 {
-            let input: ::arena0::WriterInput = __arena0_read_input(input_ptr, input_len);
-            let shared = __arena0_restore_shared(&input.shared);
-            let participant = <#program_ty as ::arena0::Program>::writer(&shared)
-                .map(::arena0::Participant::as_u8);
-            __arena0_write_result(&::arena0::WriterOutput { participant })
-        }
-
-        #[unsafe(no_mangle)]
         pub extern "C" fn arena0_outcome(input_ptr: i32, input_len: i32) -> i64 {
             let input: ::arena0::OutcomeInput = __arena0_read_input(input_ptr, input_len);
             let shared = __arena0_restore_shared(&input.shared);
