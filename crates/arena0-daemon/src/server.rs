@@ -22,7 +22,7 @@ use arena0_api::{
     ExecutionInspection, HostInfo, NextEvent, PendingCalloutStatus, ProgramRefError, ReceiptRef,
     Response, ResponseOk, SessionProgress, SessionStatus, frame,
 };
-use arena0_api::{HostRequest, HostStatus};
+use arena0_api::{FileSource, HostRequest, HostStatus};
 use arena0_crypto::{AgentPubKey, ExecutionKey, NodeKeys};
 use arena0_node::{ActivatedSession, NegotiationBook};
 use arena0_node::{
@@ -55,9 +55,11 @@ use crate::exec_manager::{
     ExecutionHandle, ExecutionHandles, NEGOTIATION_TIMEOUT, Supervisor, project_durable_next,
     project_lifecycle, satisfies,
 };
+use crate::offers::{OFFER_SWEEP, OfferBook};
 use crate::schema;
 use crate::startup::{StartupStage, StartupTimeline};
 use crate::store::Keystore;
+use arena0_api::{OfferClosedReason, OpenOffer};
 use arena0_store::{
     ActivationRecord, ActivationRecordStatus, AdmissionBindingOutcome,
     EventRecordSummary as StoreEventRecordSummary, ExecutionRequest,
@@ -73,6 +75,8 @@ const EVENT_BUS_CAP: usize = 1024;
 const ACTIVITY_BUS_CAP: usize = 1024;
 const LOCAL_WITHDRAWAL_REASON: &str = "negotiation withdrawn locally";
 const CREATION_ARRIVAL_GRACE: Duration = Duration::from_secs(1);
+/// Bound independently arriving offer and creator-ticket facts per subscriber.
+const PENDING_FACTS: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CreationState {
@@ -361,6 +365,10 @@ enum ResumeCause {
 /// projection, so producers construct this value once.
 #[derive(Debug, Clone)]
 pub(crate) enum HostEvent {
+    SessionEndProgress {
+        source: EventSource,
+        end: arena0_api::ExecEndStatus,
+    },
     HostStopped {
         reason: Option<String>,
         uptime_secs: u64,
@@ -370,6 +378,12 @@ pub(crate) enum HostEvent {
         negotiation_id: NegotiationId,
         creator: PeerId,
         offer_seq: u64,
+    },
+    OfferClosed {
+        program_id: ProgramHash,
+        negotiation_id: NegotiationId,
+        creator: PeerId,
+        reason: OfferClosedReason,
     },
     Negotiation {
         source: EventSource,
@@ -427,6 +441,7 @@ impl HostEvent {
     fn source(&self) -> Option<&EventSource> {
         match self {
             Self::Negotiation { source, .. }
+            | Self::SessionEndProgress { source, .. }
             | Self::Created { source, .. }
             | Self::Failed { source, .. }
             | Self::SessionStarted { source, .. }
@@ -435,13 +450,14 @@ impl HostEvent {
             | Self::SessionCalloutAnswered { source, .. }
             | Self::SessionCompleted { source, .. }
             | Self::SessionAborted { source, .. } => Some(source),
-            Self::HostStopped { .. } | Self::OfferSeen { .. } => None,
+            Self::HostStopped { .. } | Self::OfferSeen { .. } | Self::OfferClosed { .. } => None,
         }
     }
 
     fn system_event(&self) -> Option<SystemEvent> {
         match self {
-            Self::HostStopped { .. } | Self::OfferSeen { .. } => None,
+            Self::SessionEndProgress { .. } => None,
+            Self::HostStopped { .. } | Self::OfferSeen { .. } | Self::OfferClosed { .. } => None,
             Self::Negotiation { source, event } => Some(SystemEvent::Negotiation {
                 source: source.clone(),
                 event: event.clone(),
@@ -557,6 +573,17 @@ impl HostEvent {
                 offer_seq: *offer_seq,
             },
             Self::Negotiation { event, .. } => negotiation_api_event(event),
+            Self::OfferClosed {
+                program_id,
+                negotiation_id,
+                creator,
+                reason,
+            } => EventData::OfferClosed {
+                program_id: *program_id,
+                negotiation_id: *negotiation_id,
+                creator: *creator,
+                reason: *reason,
+            },
             Self::Created {
                 source,
                 negotiation_id,
@@ -617,6 +644,10 @@ impl HostEvent {
                 terminal: arena0_api::SessionTerminal::Completed {
                     outcome: outcome.clone(),
                 },
+            },
+            Self::SessionEndProgress { end, .. } => EventData::SessionEndProgress {
+                phase: end.phase,
+                unconfirmed: end.unconfirmed.clone(),
             },
             Self::SessionAborted {
                 source,
@@ -1057,6 +1088,38 @@ struct Turn {
     phase: Option<String>,
 }
 
+/// Activity frames with a synthesized lag marker before the next frame after
+/// loss. The receiver and activity owner live for the subscription.
+pub(crate) fn activity_stream(
+    activity: Arc<Activity>,
+    rx: broadcast::Receiver<ActivityFrame>,
+) -> impl futures::Stream<Item = ActivityFrame> + Send + 'static {
+    futures::stream::unfold(
+        (activity, rx, None),
+        |(activity, mut rx, pending)| async move {
+            if let Some(frame) = pending {
+                return Some((frame, (activity, rx, None)));
+            }
+            let mut skipped = 0u64;
+            loop {
+                match rx.recv().await {
+                    Ok(frame) => {
+                        if skipped > 0 {
+                            let lagged = activity.lagged(frame.seq.saturating_sub(1), skipped);
+                            return Some((lagged, (activity, rx, Some(frame))));
+                        }
+                        return Some((frame, (activity, rx, None)));
+                    }
+                    Err(broadcast::error::RecvError::Lagged(count)) => {
+                        skipped = skipped.saturating_add(count)
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        },
+    )
+}
+
 /// The API operation owner for one Host.
 ///
 /// [`HostService`] owns one Host's execution supervisors and service tasks.
@@ -1069,10 +1132,11 @@ pub(crate) struct HostService {
     transport: Arc<dyn Transport + Sync>,
     keystore: Arc<Keystore>,
     catalog: ProgramCatalog,
-    store: StoreHandle,
+    pub(crate) store: StoreHandle,
     engine: Arc<WasmtimeEngine>,
     startup: Arc<StartupTimeline>,
     pub(crate) events: Events,
+    offers: Arc<OfferBook>,
     started: StdInstant,
     /// Protocol ingress, negotiation, and execution machinery shared with the
     /// greybox harness.
@@ -1191,6 +1255,7 @@ impl HostService {
             engine,
             startup,
             events,
+            offers: OfferBook::new(),
             started: StdInstant::now(),
             runtime,
             owns_runtime,
@@ -1399,6 +1464,22 @@ impl HostService {
             self.startup.host_progress(StartupStage::Failed, &self.name);
             return Err(error);
         }
+        // Discovery needs every registered hash, not parsed guest metadata or
+        // the UI's bounded catalog projection. The store still enforces its
+        // response-byte budget; exceeding it fails startup instead of silently
+        // leaving some programs unwatched. SQLite requires a signed limit.
+        for program_id in self.store.list_programs(isize::MAX as usize).await? {
+            self.watch_offers(program_id).await;
+        }
+        let offers = Arc::clone(&self.offers);
+        let events = self.events.clone();
+        self.tasks.lock().await.spawn(async move {
+            let mut sweep = tokio::time::interval(OFFER_SWEEP);
+            loop {
+                sweep.tick().await;
+                offers.expire(unix_time_ms(), &events);
+            }
+        });
         Ok(())
     }
 
@@ -1815,11 +1896,49 @@ impl HostService {
         Ok(())
     }
 
-    /// Stream matching event frames on a unix connection until the client hangs up.
-    pub(crate) async fn stream_events_unix<R, W>(
-        &self,
+    /// Matching events, with a lag marker before the next received frame after
+    /// loss. The owned receiver ends when the Host event channel closes.
+    pub(crate) fn event_stream(
+        self: &Arc<Self>,
         filter: EventFilter,
-        mut rx: broadcast::Receiver<EventFrame>,
+        rx: broadcast::Receiver<EventFrame>,
+    ) -> impl futures::Stream<Item = EventFrame> + Send + 'static {
+        let service = Arc::clone(self);
+        futures::stream::unfold(
+            (service, filter, rx, None),
+            |(service, filter, mut rx, pending)| async move {
+                if let Some(frame) = pending {
+                    return Some((frame, (service, filter, rx, None)));
+                }
+                let mut skipped = 0u64;
+                loop {
+                    match rx.recv().await {
+                        Ok(frame) => {
+                            if skipped > 0 {
+                                let lagged =
+                                    service.events.lagged(frame.seq.saturating_sub(1), skipped);
+                                let pending = filter.matches(&frame).then_some(frame);
+                                return Some((lagged, (service, filter, rx, pending)));
+                            }
+                            if filter.matches(&frame) {
+                                return Some((frame, (service, filter, rx, None)));
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(count)) => {
+                            skipped = skipped.saturating_add(count)
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    }
+                }
+            },
+        )
+    }
+
+    /// Stream matching events until EOF, retaining the socket's disconnect semantics.
+    pub(crate) async fn stream_events_unix<R, W>(
+        self: &Arc<Self>,
+        filter: EventFilter,
+        rx: broadcast::Receiver<EventFrame>,
         read: &mut R,
         write: &mut W,
     ) -> anyhow::Result<()>
@@ -1827,44 +1946,27 @@ impl HostService {
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
     {
-        let mut pending_skipped = 0u64;
+        use futures::StreamExt as _;
+        let stream = self.event_stream(filter, rx);
+        futures::pin_mut!(stream);
         let mut sink = [0u8; 256];
         loop {
             tokio::select! {
-                recv = rx.recv() => match recv {
-                    Ok(frame_msg) => {
-                        if pending_skipped > 0 {
-                            let lagged = self.events.lagged(
-                                frame_msg.seq.saturating_sub(1),
-                                pending_skipped,
-                            );
-                            frame::write_frame(write, &lagged).await?;
-                            pending_skipped = 0;
-                        }
-                        if filter.matches(&frame_msg) {
-                            frame::write_frame(write, &frame_msg).await?;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        pending_skipped = pending_skipped.saturating_add(skipped);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                message = stream.next() => match message {
+                    Some(message) => frame::write_frame(write, &message).await?,
+                    None => return Ok(()),
                 },
-                // Detect client disconnect: a subscriber sends nothing, so any read
-                // that returns 0 (EOF) or errors means the connection is gone.
                 n = read.read(&mut sink) => {
-                    if matches!(n, Ok(0) | Err(_)) {
-                        return Ok(());
-                    }
+                    if matches!(n, Ok(0) | Err(_)) { return Ok(()); }
                 }
             }
         }
     }
 
-    /// Stream daemon-wide MCP activity until the client hangs up.
+    /// Stream daemon-wide activity until the client hangs up.
     pub(crate) async fn stream_activity_unix<R, W>(
-        activity: &Activity,
-        mut rx: broadcast::Receiver<ActivityFrame>,
+        activity: &Arc<Activity>,
+        rx: broadcast::Receiver<ActivityFrame>,
         read: &mut R,
         write: &mut W,
     ) -> anyhow::Result<()>
@@ -1872,31 +1974,18 @@ impl HostService {
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
     {
-        let mut pending_skipped = 0u64;
+        use futures::StreamExt as _;
+        let stream = activity_stream(Arc::clone(activity), rx);
+        futures::pin_mut!(stream);
         let mut sink = [0u8; 256];
         loop {
             tokio::select! {
-                recv = rx.recv() => match recv {
-                    Ok(frame_msg) => {
-                        if pending_skipped > 0 {
-                            let lagged = activity.lagged(
-                                frame_msg.seq.saturating_sub(1),
-                                pending_skipped,
-                            );
-                            frame::write_frame(write, &lagged).await?;
-                            pending_skipped = 0;
-                        }
-                        frame::write_frame(write, &frame_msg).await?;
-                    }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        pending_skipped = pending_skipped.saturating_add(skipped);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                message = stream.next() => match message {
+                    Some(message) => frame::write_frame(write, &message).await?,
+                    None => return Ok(()),
                 },
                 n = read.read(&mut sink) => {
-                    if matches!(n, Ok(0) | Err(_)) {
-                        return Ok(());
-                    }
+                    if matches!(n, Ok(0) | Err(_)) { return Ok(()); }
                 }
             }
         }
@@ -1908,6 +1997,9 @@ impl HostService {
         match req {
             HostRequest::Info => self.host_status().await.map(ResponseOk::HostStatus),
             HostRequest::IdShow => Ok(ResponseOk::Id(self.keystore.info())),
+            HostRequest::NegotiationOffers => Ok(ResponseOk::Offers(
+                self.offers.list(unix_time_ms(), &self.events),
+            )),
 
             HostRequest::ProgramList => self
                 .catalog
@@ -1926,12 +2018,26 @@ impl HostService {
                     None => Err(ApiError::new(ApiErrorCode::NotFound, "no such program")),
                 }
             }
-            HostRequest::ProgramImport { wasm } => {
+            HostRequest::ProgramImport {
+                source: FileSource::Upload(_),
+            }
+            | HostRequest::BlobImport {
+                source: FileSource::Upload(_),
+            } => {
+                unreachable!("Daemon::handle resolves process-owned uploads before Host dispatch")
+            }
+            HostRequest::ProgramImport {
+                source: FileSource::Path(path),
+            } => {
+                let wasm = tokio::fs::read(path).await.map_err(|error| {
+                    ApiError::new(ApiErrorCode::BadRequest, format!("read program: {error}"))
+                })?;
                 let (id, _) = self
                     .catalog
                     .import(wasm, &self.engine, unix_time_ms())
                     .await
                     .map_err(catalog_api_error)?;
+                self.watch_offers(id).await;
                 self.catalog
                     .detail(id)
                     .await
@@ -1946,7 +2052,9 @@ impl HostService {
                         ApiError::new(ApiErrorCode::Internal, "imported program vanished")
                     })
             }
-            HostRequest::BlobImport { path } => {
+            HostRequest::BlobImport {
+                source: FileSource::Path(path),
+            } => {
                 let (hash, length) = self.store.link_blob(path).await.map_err(|error| {
                     let code = match error {
                         arena0_store::StoreError::BlobTooLarge { .. }
@@ -1982,7 +2090,6 @@ impl HostService {
                             .map(|blob| arena0_api::BlobEntry {
                                 hash: blob.hash,
                                 length: blob.length,
-                                path: blob.path,
                                 linked: blob.linked,
                             })
                             .collect(),
@@ -2001,6 +2108,7 @@ impl HostService {
                         ApiError::new(ApiErrorCode::Storage, format!("remove program: {error}"))
                     })?;
                 if matches!(removed, arena0_store::ProgramRemoveOutcome::Removed) {
+                    self.unwatch_offers(program_id);
                     Ok(ResponseOk::Ack)
                 } else {
                     Err(ApiError::new(ApiErrorCode::NotFound, "no such program"))
@@ -2017,7 +2125,7 @@ impl HostService {
                 self.new_exec(exec_id, program, params, ensemble, blobs)
                     .await
             }
-            HostRequest::ExecList => self.exec_statuses().await.map(ResponseOk::ExecList),
+            HostRequest::ExecList => self.exec_list().await.map(ResponseOk::ExecList),
             HostRequest::ExecStatus { exec_id } => {
                 self.exec_status(exec_id).await.map(ResponseOk::Status)
             }
@@ -2118,7 +2226,7 @@ impl HostService {
         }
     }
 
-    async fn exec_statuses(&self) -> Result<Vec<ExecStatus>, ApiError> {
+    async fn exec_list(&self) -> Result<Vec<arena0_api::ExecListEntry>, ApiError> {
         let requests = self
             .store
             .list_execution_requests(4_096)
@@ -2126,7 +2234,15 @@ impl HostService {
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?;
         let mut statuses = Vec::with_capacity(requests.len());
         for request in requests {
-            statuses.push(self.project_exec_status(request.execution_id()).await?);
+            let exec_id = request.execution_id();
+            let status = self.project_exec_status(exec_id).await?;
+            let activation = self
+                .store
+                .load_activation(exec_id)
+                .await
+                .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
+                .map(project_activation_inspection);
+            statuses.push(arena0_api::ExecListEntry { status, activation });
         }
         Ok(statuses)
     }
@@ -2230,14 +2346,35 @@ impl HostService {
             Some(state) => Some(self.project_turn(exec_id, state).await?),
             None => None,
         };
+        let callout = if let Some(open) = state.as_ref().and_then(|state| state.callout()) {
+            let schema = self
+                .catalog
+                .schema(request.program_hash())
+                .await
+                .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
+                .ok_or_else(|| {
+                    ApiError::new(ApiErrorCode::Storage, "execution program schema is missing")
+                })?;
+            Some(
+                crate::exec_manager::project_callout(
+                    open.id,
+                    open.callout_index,
+                    &open.context,
+                    &schema,
+                )
+                .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?,
+            )
+        } else {
+            None
+        };
         project_exec_status_facts(
             self.peer_id,
             request,
             activation,
-            state,
-            turn,
+            state.zip(turn),
             execution_updated_at_ms,
             receipt_available,
+            callout,
         )
         .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))
     }
@@ -2901,9 +3038,7 @@ impl HostService {
         let local_peer = self.peer_id;
         let expected_creator = target.map(|target| target.creator);
         let expected_negotiation = target.map(|target| target.negotiation_id);
-        let events = &self.events;
         let engine = Arc::clone(&self.engine);
-        const PENDING_FACTS: usize = 128;
         let mut pending_offers = HashMap::<(PeerId, NegotiationId, u64), Offer>::new();
         let mut pending_tickets = HashMap::<(PeerId, NegotiationId, u64), Ticket>::new();
         let mut retry_delays =
@@ -2962,15 +3097,10 @@ impl HostService {
             match frame.fact {
                 NegotiationFact::Offer(offer) => {
                     let data = offer.data();
-                    if offer.validate().is_err()
-                        || data.program_hash != program_id
-                        || data.creator == local_peer
+                    if !authenticated_offer(&offer, program_id, local_peer)
                         || expected_creator.is_some_and(|creator| data.creator != creator)
                         || expected_negotiation
                             .is_some_and(|negotiation_id| data.negotiation_id != negotiation_id)
-                        // A complete offer has already frozen its participant set;
-                        // a fresh Join cannot safely add itself to that evidence.
-                        || offer.is_complete()
                     {
                         continue;
                     }
@@ -2992,12 +3122,6 @@ impl HostService {
                                 creator = %data.creator,
                                 "accepted offer"
                             );
-                            events.emit(HostEvent::OfferSeen {
-                                program_id,
-                                negotiation_id: data.negotiation_id,
-                                creator: data.creator,
-                                offer_seq: data.offer_seq,
-                            });
                             return Ok((offer, ticket));
                         }
                         pending_tickets.remove(&key);
@@ -3036,12 +3160,6 @@ impl HostService {
                                 creator = %data.signer,
                                 "accepted offer"
                             );
-                            events.emit(HostEvent::OfferSeen {
-                                program_id,
-                                negotiation_id: data.negotiation_id,
-                                creator: data.signer,
-                                offer_seq: data.offer_seq,
-                            });
                             return Ok((offer, ticket));
                         }
                         pending_offers.remove(&key);
@@ -3675,11 +3793,20 @@ impl HostService {
         from: u64,
         to: u64,
     ) -> Result<Vec<arena0_api::AgreedStep>, ApiError> {
-        self.store
+        let state = self
+            .store
             .load_execution(exec_id)
             .await
             .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
             .ok_or_else(|| ApiError::new(ApiErrorCode::NotFound, "no such execution"))?;
+        let schema = self
+            .catalog
+            .schema(state.binding().program_hash())
+            .await
+            .map_err(|error| ApiError::new(ApiErrorCode::Storage, error.to_string()))?
+            .ok_or_else(|| {
+                ApiError::new(ApiErrorCode::Storage, "execution program schema is missing")
+            })?;
         self.store
             .read_agreed_steps(exec_id, from, to)
             .await
@@ -3688,6 +3815,22 @@ impl HostService {
                     .into_iter()
                     .map(|step| arena0_api::AgreedStep {
                         certified_at_ms: step.certified_at_ms,
+                        message: match &step.entry.event {
+                            arena0_protocol::StepEvent::Message { data, .. } => {
+                                Some(match schema.messages.first() {
+                                    Some(message) => match message.borsh.decode_json(data) {
+                                        Ok(value) => arena0_api::DecodedMessage::Json(value),
+                                        Err(error) => arena0_api::DecodedMessage::Undecodable {
+                                            error: error.to_string(),
+                                        },
+                                    },
+                                    None => arena0_api::DecodedMessage::Undecodable {
+                                        error: "program declares no message schema".to_owned(),
+                                    },
+                                })
+                            }
+                            _ => None,
+                        },
                         entry: step.entry,
                     })
                     .collect()
@@ -3754,16 +3897,16 @@ fn project_exec_status_facts(
     peer_id: PeerId,
     request: ExecutionRequest,
     activation: Option<ActivationRecord>,
-    state: Option<arena0_protocol::execution::ExecutionState>,
-    turn: Option<Turn>,
+    state: Option<(arena0_protocol::execution::ExecutionState, Turn)>,
     execution_updated_at_ms: Option<u64>,
     receipt_available: bool,
+    callout: Option<PendingCalloutStatus>,
 ) -> anyhow::Result<ExecStatus> {
+    let (state, turn) = state.unzip();
     let exec_id = request.execution_id();
     let program_id = request.program_hash();
     let negotiation_id = request.negotiation_id();
-    // `turn` accompanies `state`: the caller projects it for every execution
-    // aggregate, and only an aggregate yields a session status.
+    // `turn` is `Some` exactly when `state` is: they arrive as one pair.
     let session_status = |state: &arena0_protocol::execution::ExecutionState| {
         let turn = turn
             .as_ref()
@@ -3777,10 +3920,7 @@ fn project_exec_status_facts(
                 .filter(|peer| *peer != peer_id)
                 .collect(),
             participants: binding.activation().tickets().len(),
-            pending_callout: state.callout().map(|callout| PendingCalloutStatus {
-                pending_id: callout.id,
-                callout_index: callout.callout_index,
-            }),
+            pending_callout: callout.clone(),
             receipt_available,
             turn: turn.turn,
             phase: turn.phase.clone(),
@@ -3815,16 +3955,33 @@ fn project_exec_status_facts(
         },
         (ExecLifecycle::Completed, Some(state)) => ExecStatusState::Completed {
             session: session_status(&state),
+            outcome: state
+                .terminal_outcome_json()
+                .map(serde_json::from_slice)
+                .transpose()?,
         },
         (ExecLifecycle::Aborted, Some(state)) => ExecStatusState::Aborted {
             session: session_status(&state),
+            reason: state
+                .status()
+                .terminal_cause()
+                .context("aborted execution has no terminal cause")?
+                .reason()
+                .to_owned(),
         },
         (ExecLifecycle::Failed, Some(state)) => ExecStatusState::Failed {
+            reason: request.failure().map(str::to_owned).or_else(|| {
+                state
+                    .status()
+                    .terminal_cause()
+                    .map(|cause| cause.reason().to_owned())
+            }),
             session: Some(SessionProgress::Started {
                 session: session_status(&state),
             }),
         },
         (ExecLifecycle::Failed, None) => ExecStatusState::Failed {
+            reason: request.failure().map(str::to_owned),
             session: committed_session.map(|session_id| SessionProgress::Activated { session_id }),
         },
         (lifecycle, None) => {
@@ -3951,6 +4108,216 @@ fn negotiation_bootstrap(
 
 /// Subscribe to the one program-scoped negotiation topic.
 impl HostService {
+    /// Start watching this program unless it already has a discovery task.
+    pub(crate) async fn watch_offers(self: &Arc<Self>, program_id: ProgramHash) {
+        let mut tasks = self.tasks.lock().await;
+        let mut watchers = self.offers.watchers.lock().expect("offer watchers");
+        if watchers.contains_key(&program_id) {
+            return;
+        }
+        let service = Arc::clone(self);
+        let handle = tasks.spawn(async move {
+            let result: Result<(), ApiError> = async {
+                let bootstrap = negotiation_bootstrap(service.peer_id, None, std::iter::empty());
+                let mut topic = service
+                    .subscribe_negotiation(program_id, bootstrap.clone())
+                    .await?;
+                let mut pending_offers = HashMap::<(PeerId, NegotiationId, u64), Offer>::new();
+                let mut pending_tickets = HashMap::<(PeerId, NegotiationId, u64), Ticket>::new();
+                // Active tickets seen on this topic, bounded by PENDING_FACTS.
+                // Complete offers may arrive before or after their ticket facts.
+                let mut seen_tickets = HashMap::<TicketHash, Ticket>::new();
+                let mut pending_complete = HashMap::<(PeerId, NegotiationId), Offer>::new();
+                let mut retry_delays = Exponential::from_millis(100)
+                    .map(|delay| jitter(delay.min(Duration::from_secs(2))));
+                let mut retry_at =
+                    Instant::now() + retry_delays.next().expect("infinite retry iterator");
+                loop {
+                    let event = match timeout_at(retry_at, topic.recv()).await {
+                        Ok(event) => event.map_err(|error| {
+                            ApiError::new(ApiErrorCode::Negotiation, error.to_string())
+                        })?,
+                        Err(_) => {
+                            let _ = topic.join_peers(bootstrap.clone()).await;
+                            retry_at = Instant::now()
+                                + retry_delays.next().expect("infinite retry iterator");
+                            continue;
+                        }
+                    };
+                    let ProgramTopicEvent::Fact(fact) = event else {
+                        match event {
+                            ProgramTopicEvent::Joined
+                            | ProgramTopicEvent::NeighborUp(_)
+                            | ProgramTopicEvent::NeighborDown(_) => continue,
+                            ProgramTopicEvent::Lagged | ProgramTopicEvent::Closed => {
+                                let deadline = Instant::now() + Duration::from_secs(5);
+                                let _ = timeout_at(deadline, topic.close()).await;
+                                topic = timeout_at(
+                                    deadline,
+                                    service.subscribe_negotiation(program_id, bootstrap.clone()),
+                                )
+                                .await
+                                .map_err(|_| offer_timeout())??;
+                                continue;
+                            }
+                            ProgramTopicEvent::Fact(_) => unreachable!(),
+                        }
+                    };
+                    let Ok(frame) = NegotiationGossip::decode(&fact.bytes) else {
+                        continue;
+                    };
+                    if frame.program_id != program_id {
+                        continue;
+                    }
+                    // Abort is cooperative. Hold the registry lock through each
+                    // synchronous mutation so unwatch cannot clear the entries
+                    // and then race with a final insertion from an aborted task.
+                    let watchers = service.offers.watchers.lock().expect("offer watchers");
+                    if !watchers.contains_key(&program_id) {
+                        return Ok(());
+                    }
+                    let pair = match frame.fact {
+                        NegotiationFact::Offer(offer) => {
+                            let data = offer.data();
+                            if offer.is_complete()
+                                && offer.validate().is_ok()
+                                && data.program_hash == program_id
+                            {
+                                if data.creator == service.peer_id {
+                                    continue;
+                                }
+                                let key = (data.creator, data.negotiation_id);
+                                if complete_offer_is_proven(&offer, &seen_tickets) {
+                                    service.offers.close(
+                                        (program_id, data.creator, data.negotiation_id),
+                                        OfferClosedReason::Complete,
+                                        &service.events,
+                                    );
+                                    pending_complete.remove(&key);
+                                    pending_offers.retain(|key, _| {
+                                        key.0 != data.creator || key.1 != data.negotiation_id
+                                    });
+                                    pending_tickets.retain(|key, _| {
+                                        key.0 != data.creator || key.1 != data.negotiation_id
+                                    });
+                                } else {
+                                    if pending_complete.len() >= PENDING_FACTS
+                                        && let Some(key) = pending_complete.keys().next().copied()
+                                    {
+                                        pending_complete.remove(&key);
+                                    }
+                                    pending_complete.insert(key, offer);
+                                }
+                                continue;
+                            }
+                            if !authenticated_offer(&offer, program_id, service.peer_id) {
+                                continue;
+                            }
+                            let key = (data.creator, data.negotiation_id, data.offer_seq);
+                            if let Some(ticket) = pending_tickets.get(&key)
+                                && creator_ticket_matches(&offer, ticket)
+                            {
+                                pending_tickets.remove(&key);
+                                Some(offer)
+                            } else {
+                                if pending_offers.len() >= PENDING_FACTS
+                                    && let Some(key) = pending_offers.keys().next().copied()
+                                {
+                                    pending_offers.remove(&key);
+                                }
+                                pending_offers.insert(key, offer);
+                                None
+                            }
+                        }
+                        NegotiationFact::Ticket(ticket) => {
+                            let data = &ticket.data;
+                            if ticket.validate().is_err()
+                                || !matches!(data.action, TicketAction::Active { .. })
+                            {
+                                continue;
+                            }
+                            if seen_tickets.len() >= PENDING_FACTS
+                                && let Some(key) = seen_tickets.keys().next().copied()
+                            {
+                                seen_tickets.remove(&key);
+                            }
+                            seen_tickets.insert(TicketHash::of(data), ticket.clone());
+                            // The ticket identifies its signer, not the creator.
+                            // Recheck every pending offer for this negotiation.
+                            pending_complete.retain(|&(creator, negotiation_id), offer| {
+                                if negotiation_id != data.negotiation_id
+                                    || !complete_offer_is_proven(offer, &seen_tickets)
+                                {
+                                    return true;
+                                }
+                                service.offers.close(
+                                    (program_id, creator, negotiation_id),
+                                    OfferClosedReason::Complete,
+                                    &service.events,
+                                );
+                                pending_offers
+                                    .retain(|key, _| key.0 != creator || key.1 != negotiation_id);
+                                pending_tickets
+                                    .retain(|key, _| key.0 != creator || key.1 != negotiation_id);
+                                false
+                            });
+                            let key = (data.signer, data.negotiation_id, data.offer_seq);
+                            if let Some(offer) = pending_offers.get(&key)
+                                && creator_ticket_matches(offer, &ticket)
+                            {
+                                pending_offers.remove(&key)
+                            } else {
+                                if pending_tickets.len() >= PENDING_FACTS
+                                    && let Some(key) = pending_tickets.keys().next().copied()
+                                {
+                                    pending_tickets.remove(&key);
+                                }
+                                pending_tickets.insert(key, ticket);
+                                None
+                            }
+                        }
+                        NegotiationFact::ActivationSignature(_)
+                        | NegotiationFact::ActivationAnnouncement(_)
+                        | NegotiationFact::Counteroffer(_) => None,
+                    };
+                    if let Some(offer) = pair {
+                        let data = offer.data();
+                        let Ok(params) = serde_json::from_slice(data.params.as_bytes()) else {
+                            continue;
+                        };
+                        service.offers.insert(
+                            OpenOffer {
+                                program_id,
+                                negotiation_id: data.negotiation_id,
+                                creator: data.creator,
+                                offer_seq: data.offer_seq,
+                                target_size: data.target_size,
+                                params,
+                                deadline_unix_ms: data.deadline_unix_ms,
+                                first_seen_ms: unix_time_ms(),
+                            },
+                            &service.events,
+                        );
+                    }
+                }
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(%program_id, %error, "offer watcher stopped");
+            }
+        });
+        watchers.insert(program_id, handle);
+    }
+
+    /// Stop watching and close every local discovery entry for this program.
+    pub(crate) fn unwatch_offers(&self, program_id: ProgramHash) {
+        let mut watchers = self.offers.watchers.lock().expect("offer watchers");
+        if let Some(handle) = watchers.remove(&program_id) {
+            handle.abort();
+        }
+        self.offers.drop_program(program_id, &self.events);
+    }
+
     async fn subscribe_negotiation(
         &self,
         program_id: ProgramHash,
@@ -4146,6 +4513,35 @@ async fn wait_for_withdrawal(withdrawal: &mut watch::Receiver<bool>) {
             std::future::pending::<()>().await;
         }
     }
+}
+
+/// Structural eligibility shared by discovery and Join. Authentication still
+/// requires the creator's matching Active ticket; this alone proves no origin.
+fn authenticated_offer(offer: &Offer, program_id: ProgramHash, local_peer: PeerId) -> bool {
+    offer.validate().is_ok()
+        && offer.data().program_hash == program_id
+        && offer.data().creator != local_peer
+        // A complete offer has frozen its participant set and cannot admit a Join.
+        && !offer.is_complete()
+}
+
+/// True when `offer` is complete and every ticket it lists was seen, signs this
+/// exact offer body, and is Active; the first is the creator's ticket.
+fn complete_offer_is_proven(offer: &Offer, seen: &HashMap<TicketHash, Ticket>) -> bool {
+    let offer_hash = OfferHash::of(offer.data());
+    offer.is_complete()
+        && offer.validate().is_ok()
+        && offer.tickets().iter().all(|hash| {
+            seen.get(hash).is_some_and(|ticket| {
+                TicketHash::of(&ticket.data) == *hash
+                    && ticket.data.negotiation_id == offer.data().negotiation_id
+                    && matches!(ticket.data.action, TicketAction::Active { .. })
+                    && ticket.verify_for_offer(&offer_hash).is_ok()
+            })
+        })
+        // A structurally valid complete offer is nonempty, and the preceding
+        // check established that every listed hash is present in `seen`.
+        && creator_ticket_matches(offer, &seen[&offer.tickets()[0]])
 }
 
 /// Check the creator's Active ticket against the exact offer body and the
@@ -4844,7 +5240,7 @@ mod tests {
         match daemon.dispatch(HostRequest::ExecList).await {
             Ok(ResponseOk::ExecList(statuses)) => {
                 assert_eq!(statuses.len(), 1);
-                assert_eq!(statuses[0].exec_id, exec_id);
+                assert_eq!(statuses[0].status.exec_id, exec_id);
             }
             other => panic!("expected exec.list, got {other:?}"),
         }
@@ -5391,8 +5787,8 @@ mod tests {
             Some(prepared_record),
             None,
             None,
-            None,
             false,
+            None,
         )
         .expect("project prepared status");
         assert!(matches!(
@@ -5439,8 +5835,8 @@ mod tests {
             Some(committed_record.clone()),
             None,
             None,
-            None,
             false,
+            None,
         )
         .expect("project committed status");
         assert!(matches!(
@@ -5481,14 +5877,14 @@ mod tests {
             Some(committed_record),
             None,
             None,
-            None,
             false,
+            None,
         )
         .expect("project post-commit failure");
         assert!(matches!(
             failed_status.state,
             ExecStatusState::Failed {
-                session: Some(SessionProgress::Activated { session_id })
+                session: Some(SessionProgress::Activated { session_id }), ..
             } if session_id == activation.session_hash()
         ));
         let state = ExecutionState::new(

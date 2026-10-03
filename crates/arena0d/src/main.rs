@@ -2,7 +2,9 @@
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;
+use std::path::Path;
 
+use anyhow::Context as _;
 use arena0_home::HostName;
 use clap::Parser;
 
@@ -45,7 +47,13 @@ async fn main() -> anyhow::Result<()> {
         args.hosts
     };
     let bearer_token = std::env::var("ARENA0_MCP_TOKEN").ok();
-    let mcp = arena0_daemon::McpConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)), bearer_token)?;
+    let mcp = arena0_daemon::HttpConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)), bearer_token)?;
+    let mcp = match std::env::var_os("ARENA0_UI_DIR") {
+        Some(dir) if !dir.is_empty() => {
+            mcp.with_ui_dir(Path::new(&dir)).context("ARENA0_UI_DIR")?
+        }
+        _ => mcp,
+    };
     arena0_daemon::run(names, !args.no_bootstrap, mcp).await
 }
 

@@ -423,30 +423,18 @@ pub(crate) fn satisfies(lifecycle: ExecLifecycle, until: AwaitState) -> bool {
     }
 }
 
-/// The host-owned facts needed to project a durable callout at either output
-/// boundary. Keeping this host-local payload separate from [`NextEvent`] prevents
-/// the supervisor from matching a public API enum just to emit a host event.
-#[derive(Debug)]
-struct CalloutProjection {
-    pending_id: CalloutId,
-    callout_index: u32,
-    name: String,
-    prompt: String,
-    schema: arena0_program::JsonSchemaDocument,
-    context: serde_json::Value,
-}
-
-fn project_callout(
+/// Project the same durable callout facts for status, next, and host events.
+pub(crate) fn project_callout(
     pending_id: CalloutId,
     callout_index: u32,
     context: &[u8],
     schema: &ProgramSchema,
-) -> anyhow::Result<CalloutProjection> {
+) -> anyhow::Result<arena0_api::PendingCalloutStatus> {
     let callout = schema
         .callouts
         .get(usize::try_from(callout_index).context("callout index overflow")?)
         .context("callout index out of range")?;
-    Ok(CalloutProjection {
+    Ok(arena0_api::PendingCalloutStatus {
         pending_id,
         callout_index,
         name: callout.name.clone(),
@@ -678,10 +666,20 @@ impl Supervisor {
     /// store is read only for the trace entry, the callout's current state,
     /// and a failure's lifecycle.
     async fn handle_message(&mut self, message: SessionMessage) {
-        if self.replay {
+        if self.replay && !matches!(&message, SessionMessage::EndChanged { .. }) {
             return;
         }
         match message {
+            SessionMessage::EndChanged { end } => {
+                let Some(session) = self.session().await else {
+                    return;
+                };
+                let event = HostEvent::SessionEndProgress {
+                    source: session.source.clone(),
+                    end: arena0_api::ExecEndStatus::from(&end),
+                };
+                self.events.emit(event);
+            }
             SessionMessage::SessionStarted { .. } => {
                 let Some(session) = self.session().await else {
                     return;
@@ -721,7 +719,7 @@ impl Supervisor {
             }
             SessionMessage::CalloutRequested { pending_id, .. } => {
                 if let Ok(Some((source, projection))) = self.project_callout(pending_id).await {
-                    let CalloutProjection {
+                    let arena0_api::PendingCalloutStatus {
                         pending_id,
                         callout_index,
                         name,
@@ -796,7 +794,7 @@ impl Supervisor {
     async fn project_callout(
         &mut self,
         pending_id: CalloutId,
-    ) -> anyhow::Result<Option<(EventSource, CalloutProjection)>> {
+    ) -> anyhow::Result<Option<(EventSource, arena0_api::PendingCalloutStatus)>> {
         let Some(state) = self.entry.execution().await? else {
             return Ok(None);
         };

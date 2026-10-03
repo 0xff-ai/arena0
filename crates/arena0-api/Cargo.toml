@@ -8,6 +8,7 @@ description = "Shared wire types for the arena0 daemon's local socket: requests,
 publish.workspace = true
 
 [dependencies]
+ts-rs = { workspace = true, optional = true }
 arena0-crypto = { path = "../arena0-crypto" }
 arena0-program = { path = "../arena0-program" }
 arena0-protocol = { path = "../arena0-protocol" }
@@ -21,7 +22,12 @@ tokio = { workspace = true, optional = true }
 
 [features]
 default = []
+ts = ["dep:ts-rs", "arena0-crypto/ts", "arena0-program/ts", "arena0-protocol/ts"]
 io = ["dep:tokio"]
+
+[[example]]
+name = "export_ts"
+required-features = ["ts"]
 
 [lints]
 workspace = true

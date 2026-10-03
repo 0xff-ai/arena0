@@ -19,7 +19,7 @@ validates it once and dispatches through the authorized Host service. Program,
 execution, and receipt references contain no caller-selected Host. Admission
 targets and participant results use public `PeerId`s. MCP does not enumerate
 the daemon's Hosts or map other Participants to local Host names. Operator
-Unix API and monitor access remains daemon-wide.
+Unix API and browser workspace access remains daemon-wide.
 
 Host access uses HS256 JWTs with a dedicated 256-bit daemon signing key at
 `$ARENA0_HOME/mcp-signing.key`. Private, crash-safe persistence preserves that
@@ -33,7 +33,7 @@ endpoint access gate; it does not grant access to a named Host.
 
 `hello` with a valid token renews access to the same Host while preserving its
 identity and user agent. The daemon uses the default lifetime of 24 hours;
-embedded callers can configure a lifetime through `McpConfig`. Expiry and
+embedded callers can configure a lifetime through `HttpConfig`. Expiry and
 renewal times are UTC Unix seconds. Renewed credentials do not revoke earlier
 tokens; those remain valid until their own deadlines. Expired or invalid tokens
 cannot renew. There is

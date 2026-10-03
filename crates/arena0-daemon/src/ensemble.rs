@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use arena0_api::{
-    ApiError, DaemonInfo, HostInfo, HostRequest, HostStatus, Request, ResponseOk, frame,
+    ApiError, ApiErrorCode, DaemonInfo, FileSource, HostInfo, HostRequest, HostStatus, Request,
+    Response, ResponseOk, frame,
 };
 use arena0_crypto::NodeKeys;
 use arena0_home::{Home, HostName};
@@ -23,7 +24,7 @@ use arena0_sandbox::{Program, WasmtimeEngine};
 use arena0_store::{Store, StoreConfig};
 use tokio::io::BufReader;
 use tokio::net::{TcpListener, UnixStream};
-use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::assets::PROGRAMS;
@@ -44,25 +45,27 @@ const MAX_LOCAL_HOSTS: usize = 64;
 const OPEN_QUEUE_CAPACITY: usize = 16;
 const SERVE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Configuration for the daemon-owned MCP Streamable HTTP endpoint.
+/// Configuration for the daemon-owned loopback HTTP server.
 ///
 /// Phase 1 deliberately binds only to loopback. `bearer_token` protects the
 /// whole daemon ingress; it is separate from the per-Host JWT carried by MCP
 /// tool calls.
 #[derive(Clone)]
-pub struct McpConfig {
+pub struct HttpConfig {
     pub(crate) listen: SocketAddr,
     pub(crate) bearer_token: Option<String>,
     pub(crate) access_token_lifetime: Duration,
+    /// The built web UI the HTTP server serves at `/`; `None` serves the API only.
+    pub(crate) ui: Option<Arc<crate::ui_assets::UiDir>>,
 }
 
-impl McpConfig {
-    /// Configure one loopback MCP endpoint with the default one-day JWT life.
+impl HttpConfig {
+    /// Configure the HTTP server with the default one-day MCP JWT life.
     pub fn new(listen: SocketAddr, bearer_token: Option<String>) -> anyhow::Result<Self> {
         Self::with_access_token_lifetime(listen, bearer_token, DEFAULT_ACCESS_TOKEN_LIFETIME)
     }
 
-    /// Configure one loopback MCP endpoint and its JWT lifetime.
+    /// Configure the HTTP server and its MCP JWT lifetime.
     pub fn with_access_token_lifetime(
         listen: SocketAddr,
         bearer_token: Option<String>,
@@ -91,19 +94,39 @@ impl McpConfig {
             listen,
             bearer_token,
             access_token_lifetime,
+            ui: None,
         })
     }
 }
 
-impl std::fmt::Debug for McpConfig {
+impl HttpConfig {
+    /// Serve the web UI built into `dir` (an arena0-ui `dist` directory) at `/`.
+    ///
+    /// `arena0d` calls this with `ARENA0_UI_DIR`. Fails unless `dir` is a
+    /// directory holding an `index.html` file, so a daemon never starts
+    /// promising a UI it cannot serve. The files are read per request, so a
+    /// rebuilt UI shows up without a restart.
+    /// The caller must supply a trusted directory; asset reads follow
+    /// filesystem symlinks, including targets outside that directory.
+    pub fn with_ui_dir(self, dir: &std::path::Path) -> anyhow::Result<Self> {
+        let ui = crate::ui_assets::UiDir::open(dir)?;
+        Ok(Self {
+            ui: Some(Arc::new(ui)),
+            ..self
+        })
+    }
+}
+
+impl std::fmt::Debug for HttpConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("McpConfig")
+        f.debug_struct("HttpConfig")
             .field("listen", &self.listen)
             .field(
                 "bearer_token",
                 &self.bearer_token.as_ref().map(|_| "<redacted>"),
             )
             .field("access_token_lifetime", &self.access_token_lifetime)
+            .field("ui", &self.ui)
             .finish()
     }
 }
@@ -289,13 +312,21 @@ enum OpenedHost {
     Prepared(PreparedHost),
 }
 
+/// Who sent a request. HTTP callers never name daemon-local paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Caller {
+    Socket,
+    Http,
+}
+
 /// One-process owner of ready Hosts and serialized, supervised provisioning.
 pub struct Daemon {
     ensemble: Ensemble,
     hosts: RwLock<BTreeMap<HostName, HostSlot>>,
+    host_opened: broadcast::Sender<HostName>,
     _lease: HomeLease,
     socket: Arc<UnixSocket>,
-    home: Home,
+    pub(crate) home: Home,
     bootstrap_new_hosts: bool,
     engine: Arc<WasmtimeEngine>,
     mcp_auth: Arc<McpAuth>,
@@ -303,9 +334,9 @@ pub struct Daemon {
     open_requests: Mutex<Option<mpsc::Receiver<OpenRequest>>>,
     stop_requested: Notify,
     activity: Arc<Activity>,
-    mcp: McpConfig,
+    mcp: HttpConfig,
     shutdown: watch::Sender<bool>,
-    mcp_endpoint: RwLock<Option<SocketAddr>>,
+    http_address: RwLock<Option<SocketAddr>>,
     startup: Arc<StartupTimeline>,
     state: AtomicU8,
     finished: watch::Sender<bool>,
@@ -328,7 +359,7 @@ impl Daemon {
     /// the shared runtime. Other persisted namespaces are opened on demand.
     pub async fn start(
         names: Vec<HostName>,
-        mcp: McpConfig,
+        mcp: HttpConfig,
         engine: Arc<WasmtimeEngine>,
         home: Home,
         bootstrap_new_hosts: bool,
@@ -339,7 +370,7 @@ impl Daemon {
 
     pub(crate) async fn start_with_timeline(
         names: Vec<HostName>,
-        mcp: McpConfig,
+        mcp: HttpConfig,
         engine: Arc<WasmtimeEngine>,
         home: Home,
         bootstrap_new_hosts: bool,
@@ -369,7 +400,7 @@ impl Daemon {
 
     async fn construct(
         names: Vec<HostName>,
-        mcp: McpConfig,
+        mcp: HttpConfig,
         engine: Arc<WasmtimeEngine>,
         home: Home,
         bootstrap_new_hosts: bool,
@@ -377,6 +408,12 @@ impl Daemon {
     ) -> anyhow::Result<Arc<Self>> {
         validate_host_names(&names)?;
         let lease = HomeLease::acquire_home(&home)?;
+        match std::fs::remove_dir_all(home.uploads_dir()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        std::fs::create_dir_all(home.uploads_dir())?;
         let mcp_auth = Arc::new(
             McpAuth::load_or_create(&home.mcp_signing_key(), mcp.access_token_lifetime)
                 .context("load daemon MCP signing key")?,
@@ -486,6 +523,7 @@ impl Daemon {
         Ok(Arc::new(Self {
             ensemble,
             hosts: RwLock::new(ready),
+            host_opened: broadcast::channel(64).0,
             _lease: lease,
             socket: Arc::new(UnixSocket::new(home.socket())),
             home,
@@ -498,7 +536,7 @@ impl Daemon {
             activity,
             mcp,
             shutdown,
-            mcp_endpoint: RwLock::new(None),
+            http_address: RwLock::new(None),
             startup,
             state: AtomicU8::new(NEW),
             finished,
@@ -578,7 +616,7 @@ impl Daemon {
                 return Err(error.into());
             }
         };
-        let mcp_endpoint = match mcp_listener.local_addr().context("read bound MCP endpoint") {
+        let http_address = match mcp_listener.local_addr().context("read bound MCP endpoint") {
             Ok(endpoint) => endpoint,
             Err(error) => {
                 self.startup.progress(StartupStage::Failed);
@@ -587,9 +625,9 @@ impl Daemon {
             }
         };
         *self
-            .mcp_endpoint
+            .http_address
             .write()
-            .unwrap_or_else(|error| error.into_inner()) = Some(mcp_endpoint);
+            .unwrap_or_else(|error| error.into_inner()) = Some(http_address);
         let mcp_shutdown_rx = self.shutdown.subscribe();
         let mut mcp_task: Option<JoinHandle<anyhow::Result<()>>> = None;
         let mut unix_task: Option<JoinHandle<anyhow::Result<()>>> = None;
@@ -640,7 +678,7 @@ impl Daemon {
                         // Unix listener above was bound after it. Both are
                         // ready at this publication boundary; the accept
                         // tasks are spawned immediately below.
-                        self.startup.mcp_ready(mcp_endpoint);
+                        self.startup.mcp_ready(http_address);
                         true
                     } else {
                         false
@@ -650,7 +688,7 @@ impl Daemon {
                     let daemon = Arc::clone(&self);
                     let mcp = self.mcp.clone();
                     mcp_task = Some(tokio::spawn(async move {
-                        crate::mcp::serve(daemon, mcp, mcp_listener, mcp_shutdown_rx).await
+                        crate::http::serve(daemon, mcp, mcp_listener, mcp_shutdown_rx).await
                     }));
                     let handler_daemon = Arc::clone(&self);
                     let socket = Arc::clone(&self.socket);
@@ -959,7 +997,8 @@ impl Daemon {
             .unwrap_or_else(|error| error.into_inner());
         let published = self.state.load(Ordering::Acquire) == RUNNING;
         if published {
-            hosts.insert(id, slot);
+            hosts.insert(id.clone(), slot);
+            let _ = self.host_opened.send(id);
             drop(hosts);
             service.mark_published();
             let _ = reply.send(Ok(info));
@@ -1017,9 +1056,9 @@ impl Daemon {
     }
 
     #[cfg(test)]
-    pub(crate) fn mcp_endpoint(&self) -> Option<SocketAddr> {
+    pub(crate) fn http_address(&self) -> Option<SocketAddr> {
         *self
-            .mcp_endpoint
+            .http_address
             .read()
             .unwrap_or_else(|error| error.into_inner())
     }
@@ -1084,7 +1123,7 @@ impl Daemon {
 
     pub(crate) fn daemon_info(&self) -> Result<DaemonInfo, ApiError> {
         let endpoint = self
-            .mcp_endpoint
+            .http_address
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .unwrap_or(self.mcp.listen);
@@ -1093,8 +1132,123 @@ impl Daemon {
             abi_version: arena0_program::ABI_VERSION,
             uptime_secs: self.startup.elapsed().as_secs(),
             socket: self.home.socket().display().to_string(),
-            mcp_endpoint: format!("http://{endpoint}/mcp"),
+            http_url: format!("http://{endpoint}"),
+            ui: self.mcp.ui.is_some(),
         })
+    }
+
+    pub(crate) fn subscribe_host_opened(&self) -> broadcast::Receiver<HostName> {
+        self.host_opened.subscribe()
+    }
+
+    /// Answer one non-streaming request. HTTP callers cannot name local paths.
+    pub(crate) async fn handle(&self, request: Request, caller: Caller) -> Response {
+        match request {
+            Request::DaemonStop if caller == Caller::Http => Err(ApiError::new(
+                ApiErrorCode::BadRequest,
+                "daemon.stop is accepted only on the local socket",
+            )),
+            Request::ActivitySubscribe
+            | Request::Host {
+                request: HostRequest::EventsSubscribe { .. },
+                ..
+            } => Err(ApiError::new(
+                ApiErrorCode::BadRequest,
+                "subscriptions need their own socket connection or GET /events",
+            )),
+            Request::Host { host, mut request } => {
+                if caller == Caller::Http
+                    && matches!(
+                        &request,
+                        HostRequest::ProgramImport {
+                            source: FileSource::Path(_)
+                        } | HostRequest::BlobImport {
+                            source: FileSource::Path(_)
+                        } | HostRequest::BlobExport { .. }
+                    )
+                {
+                    return Err(ApiError::new(
+                        ApiErrorCode::BadRequest,
+                        "paths are accepted only on the local socket",
+                    ));
+                }
+                let host = host.parse::<HostName>().map_err(|error| {
+                    ApiError::new(
+                        ApiErrorCode::BadRequest,
+                        format!("invalid Host name: {error}"),
+                    )
+                })?;
+                let service = self.service(host.as_str()).ok_or_else(|| {
+                    ApiError::new(ApiErrorCode::NotFound, format!("unknown Host '{host}'"))
+                })?;
+                // Uploads belong to the process Home, not to any one Host. Resolve
+                // them here so a single upload can be imported into several Hosts.
+                match &request {
+                    HostRequest::ProgramImport {
+                        source: FileSource::Upload(hash),
+                    } => {
+                        let path = self.home.uploads_dir().join(format!("{hash}.wasm"));
+                        if !path.try_exists().map_err(|error| {
+                            ApiError::new(ApiErrorCode::Storage, error.to_string())
+                        })? {
+                            let binary = self.home.uploads_dir().join(format!("{hash}.bin"));
+                            if binary.try_exists().map_err(|error| {
+                                ApiError::new(ApiErrorCode::Storage, error.to_string())
+                            })? {
+                                return Err(ApiError::new(
+                                    ApiErrorCode::BadRequest,
+                                    format!("upload {hash} was not sent as application/wasm"),
+                                ));
+                            }
+                            return Err(ApiError::new(ApiErrorCode::NotFound, "no such upload"));
+                        }
+                        request = HostRequest::ProgramImport {
+                            source: FileSource::Path(path),
+                        };
+                    }
+                    HostRequest::BlobImport {
+                        source: FileSource::Upload(hash),
+                    } => {
+                        let binary = self.home.uploads_dir().join(format!("{hash}.bin"));
+                        let path = if binary.try_exists().map_err(|error| {
+                            ApiError::new(ApiErrorCode::Storage, error.to_string())
+                        })? {
+                            binary
+                        } else {
+                            self.home.uploads_dir().join(format!("{hash}.wasm"))
+                        };
+                        if !path.try_exists().map_err(|error| {
+                            ApiError::new(ApiErrorCode::Storage, error.to_string())
+                        })? {
+                            return Err(ApiError::new(ApiErrorCode::NotFound, "no such upload"));
+                        }
+                        let (hash, length) =
+                            service.store.copy_blob(path).await.map_err(|error| {
+                                let code = match error {
+                                    arena0_store::StoreError::BlobTooLarge { .. }
+                                    | arena0_store::StoreError::Io(_) => ApiErrorCode::BadRequest,
+                                    _ => ApiErrorCode::Storage,
+                                };
+                                ApiError::new(code, format!("import blob: {error}"))
+                            })?;
+                        return Ok(ResponseOk::BlobImported { hash, length });
+                    }
+                    _ => {}
+                }
+                service.dispatch(request).await
+            }
+            Request::DaemonInfo => self.daemon_info().map(ResponseOk::DaemonInfo),
+            Request::HostsList => self.host_statuses().await.map(ResponseOk::Hosts),
+            Request::HostsOpen { id, user_agent } => self
+                .open_host(id, user_agent)
+                .await
+                .map(ResponseOk::HostOpened)
+                .map_err(|error| ApiError::new(ApiErrorCode::BadRequest, error.to_string())),
+            Request::DaemonStop => {
+                self.stop_requested.notify_one();
+                Ok(ResponseOk::Ack)
+            }
+        }
     }
 
     async fn serve_conn(self: Arc<Self>, stream: UnixStream) -> anyhow::Result<()> {
@@ -1103,8 +1257,6 @@ impl Daemon {
         while let Some(request) = frame::read_frame::<_, Request>(&mut read).await? {
             match request {
                 Request::ActivitySubscribe => {
-                    // Register before acknowledging so no activity frame can
-                    // race between the ack and receiver creation.
                     let rx = self.activity.subscribe();
                     frame::write_frame(
                         &mut write,
@@ -1115,72 +1267,55 @@ impl Daemon {
                         .await?;
                     return Ok(());
                 }
-                Request::Host { host, request } => {
-                    let host = match host.parse::<HostName>() {
-                        Ok(host) => host,
-                        Err(error) => {
+                Request::Host {
+                    host,
+                    request: HostRequest::EventsSubscribe { filter },
+                } => {
+                    let service = host
+                        .parse::<HostName>()
+                        .map_err(|error| {
+                            ApiError::new(
+                                ApiErrorCode::BadRequest,
+                                format!("invalid Host name: {error}"),
+                            )
+                        })
+                        .and_then(|host| {
+                            self.service(host.as_str()).ok_or_else(|| {
+                                ApiError::new(
+                                    ApiErrorCode::NotFound,
+                                    format!("unknown Host '{host}'"),
+                                )
+                            })
+                        });
+                    match service {
+                        Ok(service) => {
+                            let rx = service.events.subscribe();
+                            let started = service.host_started_frame();
                             frame::write_frame(
                                 &mut write,
-                                &Err::<ResponseOk, _>(ApiError::new(
-                                    arena0_api::ApiErrorCode::BadRequest,
-                                    format!("invalid Host name: {error}"),
-                                )),
+                                &Ok::<_, ApiError>(ResponseOk::Subscribed),
                             )
                             .await?;
-                            continue;
+                            frame::write_frame(&mut write, &started).await?;
+                            service
+                                .stream_events_unix(filter, rx, &mut read, &mut write)
+                                .await?;
+                            return Ok(());
                         }
-                    };
-                    let Some(service) = self.service(host.as_str()) else {
-                        frame::write_frame(
-                            &mut write,
-                            &Err::<ResponseOk, _>(ApiError::new(
-                                arena0_api::ApiErrorCode::NotFound,
-                                format!("unknown Host '{host}'"),
-                            )),
-                        )
-                        .await?;
-                        continue;
-                    };
-                    if let HostRequest::EventsSubscribe { filter } = request {
-                        // Register before acknowledging so events after this
-                        // point cannot race between the ack and receiver setup.
-                        let rx = service.events.subscribe();
-                        let started = service.host_started_frame();
-                        frame::write_frame(&mut write, &Ok::<_, ApiError>(ResponseOk::Subscribed))
-                            .await?;
-                        frame::write_frame(&mut write, &started).await?;
-                        service
-                            .stream_events_unix(filter, rx, &mut read, &mut write)
-                            .await?;
-                        return Ok(());
+                        Err(error) => {
+                            frame::write_frame(&mut write, &Err::<ResponseOk, _>(error)).await?
+                        }
                     }
-                    let response = service.dispatch(request).await;
-                    frame::write_frame(&mut write, &response).await?;
-                }
-                Request::DaemonInfo => {
-                    let response = self.daemon_info().map(ResponseOk::DaemonInfo);
-                    frame::write_frame(&mut write, &response).await?;
-                }
-                Request::HostsList => {
-                    let response = self.host_statuses().await.map(ResponseOk::Hosts);
-                    frame::write_frame(&mut write, &response).await?;
-                }
-                Request::HostsOpen { id, user_agent } => {
-                    let response = self
-                        .open_host(id, user_agent)
-                        .await
-                        .map(ResponseOk::HostOpened)
-                        .map_err(|error| {
-                            ApiError::new(arena0_api::ApiErrorCode::BadRequest, error.to_string())
-                        });
-                    frame::write_frame(&mut write, &response).await?;
                 }
                 Request::DaemonStop => {
-                    // Write the acknowledgement before waking the supervisor;
-                    // the connection task never waits for its own listener.
+                    // The socket must acknowledge before waking its own supervisor.
                     frame::write_frame(&mut write, &Ok::<_, ApiError>(ResponseOk::Ack)).await?;
                     self.stop_requested.notify_one();
                     return Ok(());
+                }
+                request => {
+                    frame::write_frame(&mut write, &self.handle(request, Caller::Socket).await)
+                        .await?
                 }
             }
         }
@@ -1437,7 +1572,7 @@ mod construction_tests {
         let names = (0..=MAX_LOCAL_HOSTS)
             .map(HostName::for_local_index)
             .collect::<Vec<_>>();
-        let mcp = McpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        let mcp = HttpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap();
         let engine = shared_test_engine();
 
         let error = match Daemon::start(names.clone(), mcp, engine, home.clone(), true).await {
@@ -1458,7 +1593,7 @@ mod construction_tests {
         let home = Home::from_root(directory.path().to_owned()).unwrap();
         let engine = shared_test_engine();
         let names = vec!["first".parse().unwrap(), "second".parse().unwrap()];
-        let mcp = McpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        let mcp = HttpConfig::new("127.0.0.1:0".parse().unwrap(), None).unwrap();
         let starting = tokio::spawn(Daemon::start(
             names.clone(),
             mcp.clone(),
