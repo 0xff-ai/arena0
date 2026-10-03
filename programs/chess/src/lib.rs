@@ -233,7 +233,7 @@ pub mod chess {
         }
     }
 
-    fn writer(state: &Shared) -> Option<Participant> {
+    fn next_sender(state: &Shared) -> Option<Participant> {
         if state.phase() != Phase::Playing || state.status != Status::InProgress {
             return None;
         }
@@ -472,7 +472,7 @@ pub mod chess {
     fn on_input(ctx: &mut LocalContext<Shared, Local>, input: Input) -> arena0::anyhow::Result<()> {
         let Input::MakeMove(text) = input;
         let move_str = text.trim();
-        if writer(ctx.shared()) != Some(ctx.me()) {
+        if next_sender(ctx.shared()) != Some(ctx.me()) {
             return Err(anyhow!("this participant does not own the next move"));
         }
         // Validate the move against the committed board without mutating
@@ -491,7 +491,7 @@ pub mod chess {
         from: Participant,
         msg: Message,
     ) -> MessageApply<Chess> {
-        if writer(ctx.shared()) != Some(from) {
+        if next_sender(ctx.shared()) != Some(from) {
             return Ok(ApplyDecision::Reject);
         }
         let Message::Move(text) = msg;

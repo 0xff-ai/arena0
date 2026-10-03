@@ -6,7 +6,7 @@
 //! to their baseline.
 //!
 //! The ABI exports are `arena0_prepare`, `arena0_initialize`, `arena0_dispatch`,
-//! `arena0_writer`, `arena0_query`, `arena0_view`, `arena0_outcome`, and
+//! `arena0_query`, `arena0_view`, `arena0_outcome`, and
 //! `arena0_metadata`, plus
 //! `arena0_alloc`/`arena0_dealloc`; all result-bearing exports use the packed
 //! `(i32, i32) -> i64` pointer/length convention. Downstream execution callers
@@ -86,15 +86,6 @@ pub struct GuestOutcomeResult {
     pub borsh: OutcomeBytes,
     /// Stock-Serde JSON bytes exposed to agents.
     pub json: JsonBytes,
-    /// Fuel consumed by this projection.
-    pub fuel_used: u64,
-}
-
-/// Result of the read-only next-writer projection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GuestWriterResult {
-    /// Sole participant eligible to author the next program message.
-    pub writer: Option<arena0_protocol::Participant>,
     /// Fuel consumed by this projection.
     pub fuel_used: u64,
 }

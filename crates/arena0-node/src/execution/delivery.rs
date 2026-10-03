@@ -138,8 +138,6 @@ impl ExecutionActor {
                 if commitment.session_id != self.state.binding().session_id()
                     || commitment.pre_state != self.state.agreed_state()
                     || commitment.link != self.state.agreed_link()
-                    || self.writer_for_shared(self.state.shared_state(), &self.ensemble())?
-                        != Some(source)
                 {
                     return Ok(Some(Rejected));
                 }

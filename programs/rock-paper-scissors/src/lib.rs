@@ -174,10 +174,6 @@ pub mod rock_paper_scissors {
         }
     }
 
-    fn writer(state: &Shared) -> Option<Participant> {
-        state.commit_reveal.expected_writer()
-    }
-
     fn view(state: &Shared, _ensemble: &Ensemble, vp: &Viewport) -> View {
         let header = vp.fit_text(format!(
             "Rock-paper-scissors - round {} of {}",
@@ -286,7 +282,7 @@ pub mod rock_paper_scissors {
     }
 
     fn callout(ctx: &CalloutContext<Shared, Local>) -> Option<Callout> {
-        (ctx.shared().commit_reveal.is_writer(ctx.me())
+        (ctx.shared().commit_reveal.is_next(ctx.me())
             && ctx
                 .shared()
                 .commit_reveal
@@ -295,7 +291,7 @@ pub mod rock_paper_scissors {
     }
 
     fn on_input(ctx: &mut LocalContext<Shared, Local>, input: Input) -> arena0::anyhow::Result<()> {
-        if !ctx.shared().commit_reveal.is_writer(ctx.me()) {
+        if !ctx.shared().commit_reveal.is_next(ctx.me()) {
             return Err(anyhow!("this participant does not own the next choice"));
         }
         let Input::ChooseMove(choice) = input;
@@ -311,10 +307,10 @@ pub mod rock_paper_scissors {
         msg: Message,
     ) -> MessageApply<RockPaperScissors> {
         let Message::CommitReveal(msg) = msg;
-        // Unique-writer rule: only the participant whose action is next (the
+        // Sender-order rule: only the participant whose action is next (the
         // first missing commit, then the first missing reveal) may write;
         // any other sender is a deterministic reject.
-        if !ctx.shared().commit_reveal.is_writer(from) {
+        if !ctx.shared().commit_reveal.is_next(from) {
             return Ok(ApplyDecision::Reject);
         }
         if ctx.commit_reveal().handle(from, msg).is_err() {
@@ -337,7 +333,7 @@ pub mod rock_paper_scissors {
     }
 
     /// Queue the owed reveal once every commit is in, when this node owns the
-    /// next writer position.
+    /// next sender position.
     fn queue_reveal_if_due(ctx: &mut Context<Shared, Local>) {
         if let Some(MyTurn::Reveal(reveal)) = ctx.commit_reveal().my_turn() {
             reveal.broadcast(&mut ctx.effects());

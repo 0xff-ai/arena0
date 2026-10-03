@@ -127,7 +127,7 @@ pub struct Local {
 }
 
 impl Shared {
-    fn expected_offer_writer(&self) -> Option<Participant> {
+    fn next_offerer(&self) -> Option<Participant> {
         (1..self.offers.len())
             .find(|&index| self.offers[index].is_none())
             .and_then(|index| Participant::try_from(index).ok())
@@ -137,10 +137,10 @@ impl Shared {
         self.offers.len() > 1 && self.offers[1..].iter().all(Option::is_some)
     }
 
-    fn expected_writer(&self) -> Option<Participant> {
+    fn next_participant(&self) -> Option<Participant> {
         match self.phase() {
             Phase::CollectingOffers => self
-                .expected_offer_writer()
+                .next_offerer()
                 .or_else(|| self.all_offers_received().then_some(COORDINATOR)),
             Phase::ReviewingProposal => self
                 .agreement
@@ -149,9 +149,9 @@ impl Shared {
         }
     }
 
-    /// Whether `participant` is the unique writer the state waits for.
-    fn is_writer(&self, participant: Participant) -> bool {
-        self.expected_writer() == Some(participant)
+    /// Whether `participant` is the unique sender the state waits for.
+    fn is_next(&self, participant: Participant) -> bool {
+        self.next_participant() == Some(participant)
     }
 
     fn plan(&self) -> AssignmentPlan {
@@ -190,10 +190,6 @@ pub mod contract_net {
         }
     }
 
-    fn writer(state: &Shared) -> Option<Participant> {
-        state.expected_writer()
-    }
-
     fn initialize(shared: &mut Shared, params: Params) -> Result<(), ProgramFault> {
         params.validate().map_err(|error| anyhow!(error))?;
         shared.target_size = params.target_size;
@@ -220,7 +216,7 @@ pub mod contract_net {
     fn callout(ctx: &CalloutContext<Shared, Local>) -> Option<Callout> {
         (ctx.shared().phase() == Phase::CollectingOffers
             && ctx.me() != COORDINATOR
-            && ctx.shared().is_writer(ctx.me())
+            && ctx.shared().is_next(ctx.me())
             && !ctx.local().offer_sent)
             .then(|| {
                 let tasks = ctx.shared().tasks.clone();
@@ -237,7 +233,7 @@ pub mod contract_net {
     fn on_input(ctx: &mut LocalContext<Shared, Local>, input: Input) -> arena0::anyhow::Result<()> {
         let Input::SubmitOffer(offer) = input;
         if ctx.shared().phase() != Phase::CollectingOffers
-            || ctx.shared().expected_offer_writer() != Some(ctx.me())
+            || ctx.shared().next_offerer() != Some(ctx.me())
         {
             return Err(anyhow!("offer is not due from this participant"));
         }
@@ -294,7 +290,7 @@ pub mod contract_net {
         from: Participant,
         message: Message,
     ) -> MessageApply<ContractNet> {
-        if !ctx.shared().is_writer(from) {
+        if !ctx.shared().is_next(from) {
             return Ok(ApplyDecision::Reject);
         }
 

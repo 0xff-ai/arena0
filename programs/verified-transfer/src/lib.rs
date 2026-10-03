@@ -1,8 +1,8 @@
 //! Two simultaneous verified transfers in opposite directions. Each
 //! participant imports its file into its Host's blob store, grants it to the
 //! execution, and the params name both objects and who sends the input. Direct
-//! progress is local; each receiver authors its transfer's agreed result under
-//! one writer at a time.
+//! progress is local; receivers send their transfer's agreed message in transfer
+//! order.
 
 use arena0::prelude::*;
 use arena0_primitives::verified_transfer::{
@@ -45,7 +45,7 @@ mod tests {
     }
 
     #[test]
-    fn writer_is_the_receiver_of_the_first_unsettled_transfer() {
+    fn next_sender_is_the_receiver_of_the_first_unsettled_transfer() {
         let shared = Shared {
             input: Transfer::new(
                 0,
@@ -67,23 +67,32 @@ mod tests {
         };
         // SAFETY: only pure agreed-message handlers run; no host effects are applied.
         let mut ctx = unsafe { Context::__new(shared, Local::default(), PeerId([0; 32])) };
-        assert_eq!(
-            VerifiedTransfer::writer(ctx.shared()),
-            Some(Participant::new(0))
-        );
-        assert!(
+        assert_eq!(next_sender(ctx.shared()), Some(Participant::new(0)));
+        let before = borsh::to_vec(ctx.shared()).unwrap();
+        assert!(matches!(
+            VerifiedTransfer::on_message(
+                &mut ctx,
+                Participant::new(1),
+                Message::Result(transfer::TransferMessage::Complete)
+            )
+            .unwrap(),
+            ApplyDecision::Reject
+        ));
+        assert_eq!(borsh::to_vec(ctx.shared()).unwrap(), before);
+        assert!(ctx.shared().input.status().is_none());
+        assert!(ctx.shared().result.status().is_none());
+        assert!(matches!(
             VerifiedTransfer::on_message(
                 &mut ctx,
                 Participant::new(1),
                 Message::Input(transfer::TransferMessage::Complete)
             )
-            .is_err()
-        );
+            .unwrap(),
+            ApplyDecision::Reject
+        ));
+        assert_eq!(borsh::to_vec(ctx.shared()).unwrap(), before);
         assert!(ctx.shared().input.status().is_none());
-        assert_eq!(
-            VerifiedTransfer::writer(ctx.shared()),
-            Some(Participant::new(0))
-        );
+        assert_eq!(next_sender(ctx.shared()), Some(Participant::new(0)));
         assert!(matches!(
             VerifiedTransfer::on_message(
                 &mut ctx,
@@ -93,18 +102,18 @@ mod tests {
             .unwrap(),
             ApplyDecision::Accept(Transition::Stay)
         ));
-        assert_eq!(
-            VerifiedTransfer::writer(ctx.shared()),
-            Some(Participant::new(1))
-        );
-        assert!(
+        assert_eq!(next_sender(ctx.shared()), Some(Participant::new(1)));
+        let before = borsh::to_vec(ctx.shared()).unwrap();
+        assert!(matches!(
             VerifiedTransfer::on_message(
                 &mut ctx,
                 Participant::new(0),
                 Message::Result(transfer::TransferMessage::Failed)
             )
-            .is_err()
-        );
+            .unwrap(),
+            ApplyDecision::Reject
+        ));
+        assert_eq!(borsh::to_vec(ctx.shared()).unwrap(), before);
         assert!(ctx.shared().result.status().is_none());
         assert!(matches!(
             VerifiedTransfer::on_message(
@@ -115,7 +124,7 @@ mod tests {
             .unwrap(),
             ApplyDecision::Accept(Transition::End)
         ));
-        assert_eq!(VerifiedTransfer::writer(ctx.shared()), None);
+        assert_eq!(next_sender(ctx.shared()), None);
     }
 
     #[test]
@@ -216,6 +225,19 @@ pub struct Shared {
 pub struct Local {
     input: VerifiedTransferLocal,
     result: VerifiedTransferLocal,
+    /// A finished agreed message held while another transfer is ahead. Set only
+    /// by `on_direct`, cleared by `on_message` when this participant becomes
+    /// the next sender. At most one: each participant receives one transfer.
+    pub held: Option<Message>,
+}
+
+/// The receiver of the first unsettled transfer: only receivers author
+/// agreed messages.
+fn next_sender(shared: &Shared) -> Option<Participant> {
+    [&shared.input, &shared.result]
+        .into_iter()
+        .find(|transfer| transfer.status().is_none())
+        .map(Transfer::receiver)
 }
 
 #[arena0::program(
@@ -238,15 +260,6 @@ pub mod verified_transfer {
     fn initialize(shared: &mut Shared, params: Params) -> Result<(), ProgramFault> {
         shared.params = Some(params);
         Ok(())
-    }
-
-    /// The receiver of the first unsettled transfer: only receivers author
-    /// agreed messages.
-    fn writer(shared: &Shared) -> Option<Participant> {
-        [&shared.input, &shared.result]
-            .into_iter()
-            .find(|transfer| transfer.status().is_none())
-            .map(Transfer::receiver)
     }
 
     /// Participant indexes follow the committed ensemble's sorted peers, so
@@ -303,7 +316,12 @@ pub mod verified_transfer {
                 if let Some(message) =
                     transfer.on_direct(ctx, |local| &mut local.input, from, msg, attachment)
                 {
-                    broadcast(ctx, message, Message::Input);
+                    if next_sender(ctx.shared()) == Some(ctx.me()) {
+                        broadcast(ctx, message, Message::Input)
+                            .expect("one agreed message per transfer fits the queue");
+                    } else {
+                        ctx.local_mut().held = Some(Message::Input(message));
+                    }
                 }
             }
             1 => {
@@ -311,7 +329,12 @@ pub mod verified_transfer {
                 if let Some(message) =
                     transfer.on_direct(ctx, |local| &mut local.result, from, msg, attachment)
                 {
-                    broadcast(ctx, message, Message::Result);
+                    if next_sender(ctx.shared()) == Some(ctx.me()) {
+                        broadcast(ctx, message, Message::Result)
+                            .expect("one agreed message per transfer fits the queue");
+                    } else {
+                        ctx.local_mut().held = Some(Message::Result(message));
+                    }
                 }
             }
             _ => {}
@@ -321,14 +344,13 @@ pub mod verified_transfer {
 
     /// Each transfer offers at most one agreed message and the queue holds
     /// 16, so a full queue is a programming error.
-    fn broadcast(
-        ctx: &mut LocalContext<Shared, Local>,
+    fn broadcast<M: arena0::EffectMode>(
+        ctx: &mut arena0::Ctx<Shared, Local, M>,
         message: transfer::TransferMessage,
         route: fn(transfer::TransferMessage) -> Message,
-    ) {
+    ) -> M::Broadcast {
         ctx.primitive_output(message)
             .broadcast_via(&mut ctx.effects(), route)
-            .expect("one agreed message per transfer fits the queue");
     }
 
     fn on_message(
@@ -336,6 +358,9 @@ pub mod verified_transfer {
         from: Participant,
         msg: Message,
     ) -> arena0::MessageApply<VerifiedTransfer> {
+        if next_sender(ctx.shared()) != Some(from) {
+            return Ok(ApplyDecision::Reject);
+        }
         match msg {
             Message::Input(message) => {
                 Transfer::handle(ctx, |shared| &mut shared.input, from, message)?
@@ -344,11 +369,22 @@ pub mod verified_transfer {
                 Transfer::handle(ctx, |shared| &mut shared.result, from, message)?
             }
         }
-        Ok(ApplyDecision::Accept(if writer(ctx.shared()).is_none() {
-            Transition::End
-        } else {
-            Transition::Stay
-        }))
+        if ctx.local().held.is_some()
+            && next_sender(ctx.shared()) == Some(ctx.me())
+            && let Some(message) = ctx.local_mut().held.take()
+        {
+            match message {
+                Message::Input(message) => broadcast(ctx, message, Message::Input),
+                Message::Result(message) => broadcast(ctx, message, Message::Result),
+            }
+        }
+        Ok(ApplyDecision::Accept(
+            if next_sender(ctx.shared()).is_none() {
+                Transition::End
+            } else {
+                Transition::Stay
+            },
+        ))
     }
 
     fn outcome(shared: &Shared) -> Outcome {

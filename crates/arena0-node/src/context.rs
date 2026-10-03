@@ -38,7 +38,7 @@ pub enum ExecError {
     /// contained message is safe to expose to the caller.
     #[error("callout answer rejected: {0}")]
     InputRejected(String),
-    /// A valid writer message was rejected or did not reproduce its post-state.
+    /// A valid message was rejected or did not reproduce its post-state.
     #[error("{0}")]
     Diverged(String),
     /// An agreed step's broadcasts would overflow this Host's outgoing queue.

@@ -1,5 +1,5 @@
 //! Five replicas select a starting participant through N-party commit-reveal,
-//! then count in single-writer round-robin order over `LocalTransport`.
+//! then count in round-robin order over `LocalTransport`.
 
 use std::time::Duration;
 

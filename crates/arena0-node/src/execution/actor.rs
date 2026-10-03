@@ -207,7 +207,7 @@ impl ExecutionActor {
     /// Keep one error boundary for recovery, commands, progress, and transport
     /// settlement. A durably recorded terminal continues on the same actor
     /// loop so inbound acknowledgements and delivery retries cannot deadlock.
-    async fn continue_after(&mut self, result: Result<(), ExecError>) -> bool {
+    pub(super) async fn continue_after(&mut self, result: Result<(), ExecError>) -> bool {
         match result {
             Ok(()) => true,
             Err(error @ ExecError::DeliveryInvariant(_)) => {
@@ -395,7 +395,7 @@ impl ExecutionActor {
         };
         if state.pending_shared().is_some() {
             self.ensure_step_signature().await?;
-        } else if self.may_author()? {
+        } else if self.may_author() {
             self.author_next_message().await?;
         }
         self.announce_callout().await?;
