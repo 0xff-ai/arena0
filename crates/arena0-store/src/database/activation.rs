@@ -1,4 +1,5 @@
 use super::*;
+
 /// Raw SQLite activation columns; decoding validates envelopes and every denormalized index together.
 struct RawActivationRow {
     execution_id: ExecId,
@@ -9,6 +10,7 @@ struct RawActivationRow {
     updated_at_ms: i64,
     facts_bytes: Vec<u8>,
 }
+
 /// Own the record's envelope decoding and index checks together, so timed
 /// reads and transactional reads reject the same inconsistent evidence.
 impl RawActivationRow {

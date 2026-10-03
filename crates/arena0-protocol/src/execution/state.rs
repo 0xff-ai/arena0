@@ -1338,7 +1338,12 @@ impl ExecutionState {
         Ok(())
     }
 
-    /// Keep a repeated unanswered callout identity; accepted answers consume it, and terminal results withdraw it.
+    /// Derive the open callout installed with a dispatch result.
+    ///
+    /// A terminal result or an absent program request withdraws the callout. A
+    /// repeated index and context keep their identity for a non-answer event;
+    /// a different request gets a fresh event-position identity. An accepted
+    /// answer consumes its identity even if the next question repeats it.
     fn next_open_callout(
         &self,
         event: &Event<Vec<u8>>,

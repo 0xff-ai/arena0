@@ -96,7 +96,9 @@ impl ReadDb {
 }
 
 impl IdSpace {
-    /// Count and page the same index union; bounded selects an exclusive upper bound and the caller owns the read transaction.
+    /// Count and page the same index union within the caller's read transaction.
+    /// `bounded` selects `id >= ?1 AND id < ?2`; an all-f prefix has no upper
+    /// bound and uses only `id >= ?1`.
     pub(crate) fn statements(self, bounded: bool, limit: i64) -> [String; 2] {
         let bound = if bounded {
             ">= ?1 AND {id} < ?2"
