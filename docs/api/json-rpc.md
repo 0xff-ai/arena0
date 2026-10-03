@@ -150,6 +150,8 @@ updates an entry without changing its first-seen time or emitting another
 | `exec.list` | — | `ExecList` |
 | `exec.status` | `{exec_id}` | `Status` |
 | `exec.inspect` | `{exec_id, events_from?, events_limit}` | `Inspection` |
+| `exec.records` | `{exec_id, from, limit}` | `Records` `{from, records, total, next}` |
+| `resolve` | `{kind, reference}` | `Resolved` |
 | `exec.await` | `{exec_id, until}` | `Awaited` |
 | `exec.next` | `{exec_id}` | `Next` |
 | `exec.submit` | `{exec_id, pending_id, answer?}` | `Ack` |
@@ -196,18 +198,17 @@ truncated.
 
 `at_step` renders the shared state after that agreed step instead of the latest
 state; `step` in the reply is then `at_step`. The latest agreed step is the
-`step` of the last trace entry. The Host does not store past states. It
-replays the agreed steps `0` through `at_step` in a fresh program instance,
-checks the initial state and every step's `post_state` against the agreed
-trace, and renders the result, so the cost grows with `at_step`. It works for
-active and terminal executions. Errors:
+`step` of the last trace entry. The Host reads the shared state it stored
+atomically with that agreed step and checks it against the step's `post_state`
+before rendering.
+It works for active and terminal executions. Errors:
 
 - `BadRequest`: `at_step` is beyond the latest agreed step
   (`step 9 is beyond the latest agreed step 4`).
 - `Execution`: the execution has no agreed step yet (a negotiating or
-  activating execution returns the error a latest view returns), or the replay
-  did not reproduce the agreed trace. The message names the step; nothing is
-  rendered from a state that disagrees with the trace.
+  activating execution returns the error a latest view returns).
+- `Storage`: the stored state is missing or does not match the step's
+  `post_state`; nothing is rendered.
 
 `blobs` lists hashes of imported blobs this participant grants the execution;
 it defaults to none. An unknown hash is `NotFound`, before anything is
@@ -289,6 +290,30 @@ store-bounded window. The response exposes the page through `events_from`,
 records are omitted.
 Inspection data is local diagnostic evidence, not a protocol receipt or
 semantic system-event stream.
+
+`exec.records` returns the same record summaries as `exec.inspect`, without
+projecting status or activation or decoding execution state. `from` is a local
+event position, not an agreed step; for an execution with a journal it is
+clamped to the journal's total.
+`limit` must be between 1 and 256. The store may shorten a page to keep its
+response within its byte bound. Request `next` to continue; it is `null` at the
+end. A known execution that has not started returns an empty page. An unknown
+execution returns `NotFound`; an invalid limit returns `BadRequest`.
+
+`resolve` accepts `kind` = `exec`, `session`, or `receipt` and a full id or hex
+prefix. The daemon trims whitespace and lowercases ASCII. Empty, non-hex and
+references longer than 64 characters return `{"resolved":"none"}`. A resident
+full id wins; a unique prefix returns `{"resolved":"exec","exec_id":...}`,
+`{"resolved":"session","session_id":...}`, or
+`{"resolved":"receipt","entry":...}` (the same entry as `receipt.list`).
+Several matches return `{"resolved":"ambiguous","candidates":[...],"matches":N}`:
+at most eight full lowercase ids in ascending id order and the total count.
+Sessions are deduplicated across committed activations, executions and receipts.
+This indexed lookup is the common matching rule for CLI, MCP and UI.
+
+For `exec.view`, an omitted or `null` `at_step` renders the latest state; an
+integer renders the state after that agreed step. A historical view is one
+indexed read of the stored shared state plus one render; no replay.
 
 `exec.trace` returns the agreed steps in `[from, to)`, each as
 `{certified_at_ms, entry, message}`. `entry` is the portable trace entry.

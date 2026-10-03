@@ -15,6 +15,7 @@ pub(crate) enum EnvelopeKind {
     ExecutionSalt = 11,
     Program = 12,
     ExecutionAdmission = 13,
+    StepState = 14,
 }
 
 impl EnvelopeKind {

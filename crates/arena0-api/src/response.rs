@@ -51,6 +51,10 @@ pub enum ResponseOk {
         queue_position: Option<usize>,
     },
     ExecList(Vec<ExecSummary>),
+    /// `exec.records`: one page of local event records.
+    Records(RecordsPage),
+    /// `resolve`.
+    Resolved(Resolved),
     Status(ExecStatus),
     /// `exec.inspect`: an additive, bounded local diagnostic projection.
     Inspection(ExecutionInspection),
@@ -663,4 +667,44 @@ pub struct ReceiptListEntry {
     pub program_id: ProgramHash,
     pub completed: bool,
     pub provenance: arena0_protocol::ReceiptProvenance,
+}
+
+/// One `exec.records` page: records at positions `from..`, the durable total,
+/// and the next position to request (`None` when this page reached the end).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct RecordsPage {
+    pub from: u64,
+    pub records: Vec<EventRecordSummary>,
+    pub total: u64,
+    pub next: Option<u64>,
+}
+
+/// A `resolve` result. Matching: the reference is trimmed and lowercased; an
+/// empty, non-hex or longer-than-64-character reference matches nothing;
+/// a full id that exists wins
+/// outright; otherwise every id starting with the prefix matches.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "resolved", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub enum Resolved {
+    Exec {
+        exec_id: ExecId,
+    },
+    Session {
+        session_id: SessionHash,
+    },
+    /// The receipt's list entry (its provenance and session decide what the
+    /// caller may do with it).
+    Receipt {
+        entry: ReceiptListEntry,
+    },
+    None,
+    /// Several ids match: the first eight in id order, full lowercase hex, and
+    /// how many matched in total.
+    Ambiguous {
+        candidates: Vec<String>,
+        matches: u64,
+    },
 }

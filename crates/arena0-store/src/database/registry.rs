@@ -81,24 +81,32 @@ impl Database {
                 return Ok(ProgramStoreOutcome::Conflict);
             }
             if removed_at_ms.is_some() {
-                self.connection.execute(
-                    "UPDATE programs SET removed_at_ms = NULL WHERE program_hash = ?1",
-                    params![hash.as_bytes().to_vec()],
-                )?;
+                self.transaction(|store| {
+                    store.connection.execute(
+                        "UPDATE programs SET removed_at_ms = NULL WHERE program_hash = ?1",
+                        params![hash.as_bytes().to_vec()],
+                    )?;
+                    store.record_change(ChangeKey::Program(hash));
+                    Ok(())
+                })?;
                 return Ok(ProgramStoreOutcome::Reactivated);
             } else {
                 return Ok(ProgramStoreOutcome::AlreadyStored);
             }
         }
-        self.connection.execute(
-            "INSERT INTO programs (program_hash, wasm, imported_at_ms, removed_at_ms)
+        self.transaction(|store| {
+            store.connection.execute(
+                "INSERT INTO programs (program_hash, wasm, imported_at_ms, removed_at_ms)
              VALUES (?1, ?2, ?3, NULL)",
-            params![
-                hash.as_bytes().to_vec(),
-                envelope(EnvelopeKind::Program, &wasm)?,
-                sqlite_u64(now_ms)?,
-            ],
-        )?;
+                params![
+                    hash.as_bytes().to_vec(),
+                    envelope(EnvelopeKind::Program, &wasm)?,
+                    sqlite_u64(now_ms)?,
+                ],
+            )?;
+            store.record_change(ChangeKey::Program(hash));
+            Ok(())
+        })?;
         Ok(ProgramStoreOutcome::Stored)
     }
 
@@ -167,10 +175,14 @@ impl Database {
         if removed_at_ms.is_some() {
             return Ok(ProgramRemoveOutcome::AlreadyRemoved);
         }
-        self.connection.execute(
-            "UPDATE programs SET removed_at_ms = ?1 WHERE program_hash = ?2 AND removed_at_ms IS NULL",
-            params![sqlite_u64(now_ms)?, hash.as_bytes().to_vec()],
-        )?;
+        self.transaction(|store| {
+            store.connection.execute(
+                "UPDATE programs SET removed_at_ms = ?1 WHERE program_hash = ?2 AND removed_at_ms IS NULL",
+                params![sqlite_u64(now_ms)?, hash.as_bytes().to_vec()],
+            )?;
+            store.record_change(ChangeKey::Program(hash));
+            Ok(())
+        })?;
         Ok(ProgramRemoveOutcome::Removed)
     }
 

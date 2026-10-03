@@ -206,6 +206,8 @@ fn router(
     axum::Router::new()
         .route("/rpc", post(rpc))
         .route("/events", get(events))
+        .route("/sync", get(sync))
+        .route("/sync/{cursor}", get(sync_from))
         .route(
             "/uploads",
             post(upload).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
@@ -297,6 +299,48 @@ async fn events(
             .map(|message| (Ok::<_, Infallible>(message), rx))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// `GET /sync`: a stream with no cursor (every Host is snapshotted). Each SSE
+/// event is named `sync` and carries one `SyncFrame` as JSON.
+async fn sync(State(daemon): State<Arc<Daemon>>) -> HttpResponse {
+    let stream = crate::sync::sync_frames(daemon, arena0_api::SyncCursor::default()).map(|frame| {
+        Ok::<_, Infallible>(
+            Event::default()
+                .event("sync")
+                .json_data(frame)
+                .expect("sync frame serializes"),
+        )
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+/// `GET /sync/{cursor}`: resume from `cursor`, the lowercase hex encoding of
+/// a `SyncCursor`'s JSON bytes (hex keeps it a single path segment without
+/// percent-decoding). A cursor that is not hex or not a valid `SyncCursor` is
+/// a client error: 400 with the parse error as text, no stream.
+async fn sync_from(State(daemon): State<Arc<Daemon>>, Path(cursor): Path<String>) -> HttpResponse {
+    let bytes = match hex::decode(cursor) {
+        Ok(bytes) => bytes,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    let cursor = match serde_json::from_slice::<arena0_api::SyncCursor>(&bytes) {
+        Ok(cursor) => cursor,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    let stream = crate::sync::sync_frames(daemon, cursor).map(|frame| {
+        Ok::<_, Infallible>(
+            Event::default()
+                .event("sync")
+                .json_data(frame)
+                .expect("sync frame serializes"),
+        )
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 async fn upload(

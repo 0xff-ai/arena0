@@ -419,22 +419,15 @@ mod tests {
     use serde_json::json;
 
     #[cfg(unix)]
-    fn script(body: &str) -> (tempfile::TempDir, PathBuf) {
-        use std::io::Write as _;
-        use std::os::unix::fs::PermissionsExt as _;
+    mod executable_fixture {
+        include!("../tests/support/executable_fixture.rs");
+    }
 
+    #[cfg(unix)]
+    fn script(body: &str) -> (tempfile::TempDir, PathBuf) {
         let directory = tempfile::tempdir().expect("temporary agent directory");
         let path = directory.path().join("agent");
-        let mut file = std::fs::File::create(&path).expect("create agent script");
-        file.write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
-            .expect("write agent script");
-        file.sync_all().expect("sync agent script");
-        drop(file);
-        let mut permissions = std::fs::metadata(&path)
-            .expect("agent metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&path, permissions).expect("make agent executable");
+        executable_fixture::install_script(&path, &format!("#!/bin/sh\n{body}\n"));
         (directory, path)
     }
 

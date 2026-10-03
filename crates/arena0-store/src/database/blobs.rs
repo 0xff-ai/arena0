@@ -10,6 +10,15 @@ use arena0_protocol::execution::{BlobChange, BlobPartial};
 use std::io::Write;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 
+fn blob_record_row(row: &rusqlite::Row<'_>) -> Result<BlobRecord, StoreError> {
+    Ok(BlobRecord {
+        hash: BlobHash(array32(&row.get::<_, Vec<u8>>(0)?, "blob hash")?),
+        length: sqlite_i64(row.get(1)?)?,
+        path: PathBuf::from(row.get::<_, String>(2)?),
+        linked: row.get(3)?,
+    })
+}
+
 impl Database {
     /// The owned file for a copied blob: `<blob_dir>/own-<hash hex>`.
     pub(crate) fn owned_path(&self, hash: BlobHash) -> PathBuf {
@@ -27,11 +36,17 @@ impl Database {
         let path = path.to_str().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "blob path is not UTF-8")
         })?;
-        Ok(self.connection.execute(
-            "INSERT INTO blobs (hash, length, path, linked) VALUES (?1, ?2, ?3, 0)
+        self.transaction(|store| {
+            let inserted = store.connection.execute(
+                "INSERT INTO blobs (hash, length, path, linked) VALUES (?1, ?2, ?3, 0)
              ON CONFLICT(hash) DO NOTHING",
-            params![hash.0.as_slice(), sqlite_u64(length)?, path],
-        )? != 0)
+                params![hash.0.as_slice(), sqlite_u64(length)?, path],
+            )? != 0;
+            if inserted {
+                store.record_change(ChangeKey::Blob(hash));
+            }
+            Ok(inserted)
+        })
     }
 
     pub(crate) fn create_blob_tables(connection: &Connection) -> Result<(), StoreError> {
@@ -113,13 +128,18 @@ impl Database {
         let path = path.to_str().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "blob path is not UTF-8")
         })?;
-        self.connection.execute(
-            "INSERT INTO blobs (hash, length, path, linked) VALUES (?1, ?2, ?3, 1)
+        self.transaction(|store| {
+            let changed = store.connection.execute(
+                "INSERT INTO blobs (hash, length, path, linked) VALUES (?1, ?2, ?3, 1)
              ON CONFLICT(hash) DO UPDATE SET length = excluded.length, path = excluded.path
              WHERE blobs.linked = 1",
-            params![hash.0.as_slice(), sqlite_u64(length)?, path],
-        )?;
-        Ok(())
+                params![hash.0.as_slice(), sqlite_u64(length)?, path],
+            )?;
+            if changed != 0 {
+                store.record_change(ChangeKey::Blob(hash));
+            }
+            Ok(())
+        })
     }
 
     pub(crate) fn blob_location(
@@ -147,26 +167,20 @@ impl Database {
         let mut statement = self
             .connection
             .prepare("SELECT hash, length, path, linked FROM blobs ORDER BY hash")?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, bool>(3)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter()
-            .map(|(hash, length, path, linked)| {
-                Ok(BlobRecord {
-                    hash: BlobHash(array32(&hash, "blob hash")?),
-                    length: sqlite_i64(length)?,
-                    path: PathBuf::from(path),
-                    linked,
-                })
-            })
-            .collect()
+        let mut rows = statement.query([])?;
+        let mut blobs = Vec::new();
+        while let Some(row) = rows.next()? {
+            blobs.push(blob_record_row(row)?);
+        }
+        Ok(blobs)
+    }
+
+    pub(crate) fn blob_record(&self, hash: BlobHash) -> Result<Option<BlobRecord>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT hash, length, path, linked FROM blobs WHERE hash = ?1")?;
+        let mut rows = statement.query(params![hash.0.as_slice()])?;
+        rows.next()?.map(blob_record_row).transpose()
     }
 
     pub(crate) fn blob_granted(
@@ -251,11 +265,14 @@ impl Database {
                             "blob path is not UTF-8",
                         )
                     })?;
-                    self.connection.execute(
+                    let changed = self.connection.execute(
                         "INSERT INTO blobs (hash, length, path, linked) VALUES (?1, ?2, ?3, 0)
                          ON CONFLICT(hash) DO UPDATE SET length = excluded.length, path = excluded.path, linked = 0 WHERE blobs.linked = 1",
                         params![hash.0.as_slice(), sqlite_u64(partial.length)?, path],
                     )?;
+                    if changed != 0 {
+                        self.record_change(ChangeKey::Blob(hash));
+                    }
                     self.connection.execute(
                         "INSERT OR IGNORE INTO blob_grants (execution_id, hash) VALUES (?1, ?2)",
                         params![execution_id.0.as_slice(), hash.0.as_slice()],
