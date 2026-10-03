@@ -192,14 +192,32 @@ pub(crate) struct DispatchScope {
 impl DispatchScope {
     /// Start empty observations and budgets with no execution capabilities installed.
     fn new() -> Self {
-        todo!("STUB(sandbox)")
+        Self {
+            logs: Vec::new(),
+            effect_queue: Vec::new(),
+            entropy: Entropy::live(),
+            ledger: ResourceLedger::new(),
+            signer: crate::signing::SignerSlot::default(),
+            verifier: None,
+            blobs: None,
+            staged_blobs: Vec::new(),
+            attachment: None,
+            direct_queued: Vec::new(),
+            peer_id: None,
+            session: None,
+        }
     }
 }
 /// Apply immutable engine limits with the caller-selected work-memory ceiling.
 /// Resident preparation supplies its observed capacity; fresh calls use the profile ceiling.
 fn store_limits(profile: &ExecutionProfile, memory_size: usize) -> StoreLimits {
-    let _ = (profile, memory_size);
-    todo!("STUB(sandbox)")
+    StoreLimitsBuilder::new()
+        .memory_size(memory_size)
+        .table_elements(profile.limits.max_table_elements as usize)
+        .instances(profile.limits.max_instances as usize)
+        .tables(profile.limits.max_tables as usize)
+        .memories(profile.limits.max_memories as usize)
+        .build()
 }
 impl HostState {
     pub(crate) fn new(
