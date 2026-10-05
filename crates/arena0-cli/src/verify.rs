@@ -2,14 +2,15 @@
 //!
 //! - a **session id** or **receipt id** the daemon holds -> the daemon verifies and
 //!   returns the evidence;
-//! - a **file path** -> verified daemonlessly: parsing authenticates the artifact.
+//! - a **file path** -> light verification is daemonless: parsing authenticates
+//!   the artifact. Full verification sends it to a Host for program replay.
 
 use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, bail};
 use arena0_client::api::{
-    HostRequest, ReceiptArtifact, ReceiptSummary, ReceiptTermination, ResponseOk,
+    HostRequest, ReceiptArtifact, ReceiptRef, ReceiptSummary, ReceiptTermination, ResponseOk,
 };
 use arena0_client::proto::DaemonClient;
 use arena0_client::protocol::{ABI_VERSION, PeerId, ProgramHash};
@@ -26,6 +27,8 @@ struct Evidence {
     summary: ReceiptSummary,
     program_name: Option<String>,
     local_peer: Option<PeerId>,
+    full: bool,
+    outcome_json: Option<serde_json::Value>,
 }
 
 pub(crate) async fn verify(ctx: &Ctx, target: String) -> anyhow::Result<()> {
@@ -35,6 +38,48 @@ pub(crate) async fn verify(ctx: &Ctx, target: String) -> anyhow::Result<()> {
     } else {
         verify_resident(ctx, &target).await
     }
+}
+
+/// Fully verify `target` through the selected Host.
+///
+/// A file path is read with [`read_receipt`] and sent inline; a receipt or
+/// session id resolves exactly as for light verification. The Host replays
+/// the receipt; the CLI never loads Wasm. Renders the light evidence with
+/// `verified (full)` as its first line and the program's JSON outcome in
+/// place of the "unavailable without the program" note.
+pub(crate) async fn verify_full(ctx: &Ctx, target: String) -> anyhow::Result<()> {
+    if !ctx.client().daemon_up().await {
+        let socket = ctx.client.socket().display();
+        bail!(
+            "full verification needs the daemon at {socket}: it replays the receipt in a Host's copy of the program"
+        );
+    }
+    let path = Path::new(&target);
+    let receipt = if is_path_target(path, &target) {
+        ReceiptRef::Inline(Box::new(read_receipt(path)?))
+    } else {
+        ctx.client().resolve_receipt_ref(&ctx.host, &target).await?
+    };
+    let ResponseOk::VerifiedFull(verified) = ctx
+        .call(&HostRequest::ReceiptVerifyFull { receipt })
+        .await?
+    else {
+        bail!("unexpected receipt.verify_full response");
+    };
+    let names = ctx.client().program_name_map(&ctx.host).await;
+    let local_peer = node_peer_id(ctx).await;
+    render(
+        ctx.mode,
+        ctx.palette,
+        &Evidence {
+            program_name: names.get(&verified.summary.program_id).cloned(),
+            summary: verified.summary,
+            local_peer,
+            full: true,
+            outcome_json: verified.outcome_json,
+        },
+    );
+    Ok(())
 }
 
 /// Verify every Host of one resident session through independently named
@@ -162,6 +207,8 @@ async fn verify_resident(ctx: &Ctx, target: &str) -> anyhow::Result<()> {
             program_name: names.get(&summary.program_id).cloned(),
             summary,
             local_peer,
+            full: false,
+            outcome_json: None,
         },
     );
     Ok(())
@@ -208,6 +255,8 @@ async fn verify_file_offline(
             summary,
             program_name,
             local_peer,
+            full: false,
+            outcome_json: None,
         },
     );
     Ok(())
@@ -242,7 +291,7 @@ async fn node_peer_id(ctx: &Ctx) -> Option<PeerId> {
 fn render(mode: crate::ui::Mode, palette: crate::ui::Palette, ev: &Evidence) {
     let summary = &ev.summary;
     if mode.is_json() {
-        crate::ui::print_json(&json!({
+        let mut document = json!({
             "program_id": summary.program_id.to_string(),
             "program": ev.program_name,
             "session_id": summary.session_id.to_string(),
@@ -251,12 +300,24 @@ fn render(mode: crate::ui::Mode, palette: crate::ui::Palette, ev: &Evidence) {
             "steps": summary.steps,
             "terminal": summary.terminal,
             "outcome_borsh": summary.outcome_borsh,
-        }));
+        });
+        if ev.full {
+            document["full"] = json!(true);
+            document["outcome_json"] = json!(ev.outcome_json);
+        }
+        crate::ui::print_json(&document);
         return;
     }
 
     let p = palette;
-    println!("{}", p.green("verified"));
+    println!(
+        "{}",
+        p.green(if ev.full {
+            "verified (full)"
+        } else {
+            "verified"
+        })
+    );
     let name = ev
         .program_name
         .clone()
@@ -276,7 +337,11 @@ fn render(mode: crate::ui::Mode, palette: crate::ui::Palette, ev: &Evidence) {
     match &summary.terminal {
         ReceiptTermination::Completed => {
             println!("  steps       {}, chain intact, all agreed", summary.steps);
-            println!("  outcome     (JSON projection unavailable without the program)");
+            if ev.full {
+                println!("  outcome     {}", json!(ev.outcome_json));
+            } else {
+                println!("  outcome     (JSON projection unavailable without the program)");
+            }
         }
         ReceiptTermination::Stopped { cause } => {
             println!("  steps       {}, chain intact", summary.steps);

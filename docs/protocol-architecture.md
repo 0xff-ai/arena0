@@ -818,15 +818,29 @@ A local session reference resolves only that Host's production relation; it
 never picks an arbitrary imported report. Each Host keeps its own database and
 proof evidence even when the canonical artifact is identical across Hosts.
 
-Portable verification is the only receipt verification boundary. It
-checks the activation binding, ordered v3 trace chain, full participant
-agreements, terminal evidence, and derived v5 receipt identity without loading
-the program. Completion evidence is a final trace entry whose certified
-terminal value is `StepTerminal::End` and whose outcome bytes equal the
-receipt's outcome. A completed result includes authenticated opaque `outcome_borsh`
+Receipts have two verification levels. Light verification checks the
+activation binding, ordered v3 trace chain, full participant agreements,
+terminal evidence, and derived v5 receipt identity without loading the
+program. Completion evidence is a final trace entry whose certified terminal
+value is `StepTerminal::End` and whose outcome bytes equal the receipt's
+outcome. A completed result includes authenticated opaque `outcome_borsh`
 bytes. A stopped result includes the exact `StopCause`, preserving the
 distinction between an authenticated unilateral report and a shared N-of-N
-stop. Verification does not execute Wasm and stops at these checks.
+stop. Light verification does not execute Wasm.
+
+Full verification adds a replay, and only a Host runs it. The Host loads the
+program the activation names from its own catalog, checks that the
+activation's execution profile is the one it runs, initializes the program
+with the offer's params, and checks the offer's initial state. It then
+dispatches every trace entry's event in order as the first committed
+participant: every participant certified each shared transition, so any one
+of them reproduces it. Each step must be accepted, reach the entry's
+`post_state`, and end the session exactly as the entry's `terminal` records,
+derived from the step's lifecycle effect. For a completion, the program's
+outcome projection of the final shared state must equal the receipt's
+outcome bytes, and the result carries that projection's JSON. A stopped
+artifact replays its certified prefix. Full verification fails at the first
+step it cannot reproduce. The CLI never links the sandbox; it asks a Host.
 
 This release uses store schema version 11 and rejects earlier databases with an
 unsupported-schema error. It does not rewrite or delete old evidence. Version-1

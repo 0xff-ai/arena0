@@ -39,9 +39,9 @@ pub use response::{
     ActivationInspection, ActivationInspectionState, ActivationParticipant, AgreedStep, ApiError,
     ApiErrorCode, BlobEntry, CalloutSummary, DaemonInfo, DecodedMessage, EventRecordSummary,
     ExecEndPhase, ExecEndStatus, ExecStatus, ExecStatusState, ExecSummary, ExecutionInspection,
-    HostInfo, HostStatus, IdInfo, NextEvent, OpenOffer, PendingCalloutStatus, ProgramDetail,
-    ProgramSummary, ReceiptListEntry, RecordsPage, Resolved, Response, ResponseOk, SessionProgress,
-    SessionStatus,
+    FullReceiptSummary, HostInfo, HostStatus, IdInfo, NextEvent, OpenOffer, PendingCalloutStatus,
+    ProgramDetail, ProgramSummary, ReceiptListEntry, RecordsPage, Resolved, Response, ResponseOk,
+    SessionProgress, SessionStatus,
 };
 pub use sync::{HostCursor, Observation, RowOp, StepTimes, SyncCursor, SyncFrame};
 
@@ -152,6 +152,12 @@ mod tests {
                     receipt: ReceiptRef::Produced(SessionHash([10u8; 32])),
                 },
                 "receipt.verify",
+            ),
+            (
+                HostRequest::ReceiptVerifyFull {
+                    receipt: ReceiptRef::Produced(SessionHash([10u8; 32])),
+                },
+                "receipt.verify_full",
             ),
         ];
         for (req, path) in cases {
