@@ -10,7 +10,7 @@ Check changes from BASE (default HEAD), including local untracked files.
 With HEAD, check only the committed BASE..HEAD range.
 
   --plan   Print the selected commands without running checks.
-  --scope  Print docs, cli, daemon, programs, or full for CI.
+  --scope  Print docs, cli, daemon, programs, client, or full for CI.
   --help   Show this help.
 
 Shared, mixed code owners, unknown, empty, or unavailable changes select the full gate.
@@ -43,6 +43,7 @@ classify_paths() {
             README.md|SECURITY.md|LICENSE|LICENSE-*|docs/*.md|docs/*.svg|docs/*.png|docs/*.jpg|docs/*.jpeg|docs/*.gif)
                 owner=docs ;;
             crates/arena0-cli/*) owner=cli ;;
+            npm/arena0-client/*) owner=client ;;
             crates/arena0-daemon/*|crates/arena0d/*) owner=daemon ;;
             programs/*) owner=programs ;;
             *) owner=full ;;
@@ -100,10 +101,11 @@ fi
 
 commands=()
 case $scope in
-    cli) commands=(just check-cli test-cli) ;;
-    daemon) commands=(just check-daemon test-daemon) ;;
+    cli) commands=(just check-cli test-cli check-client) ;;
+    client) commands=(just check-client test-client) ;;
+    daemon) commands=(just check-daemon test-daemon check-client) ;;
     programs) commands=(just check-programs test-programs) ;;
-    full) commands=(just build-programs check test doc) ;;
+    full) commands=(just build-programs check test doc check-client test-client) ;;
 esac
 
 check_untracked() {

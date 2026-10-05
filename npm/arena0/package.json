@@ -10,6 +10,7 @@
   "files": [
     "bin/*.js",
     "examples/minimal-program/**",
+    "ui/**",
     "README.md",
     "LICENSE-APACHE",
     "LICENSE-MIT"

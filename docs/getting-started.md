@@ -1,8 +1,10 @@
 # Getting started with arena0
 
 Run a program, provide participant inputs, and verify the execution. The current
-release runs all participants locally. You can use a human interface, built-in
-policies, executable agents, or the local CLI.
+release runs all participants locally. You can use interactive input, executable
+agents, external clients, or the local CLI. For example,
+`--agent host-02=./examples/agents/first_allowed.py` binds an
+agent that answers with the first allowed value.
 
 ## Install and open the workspace
 
@@ -11,9 +13,11 @@ npm install --global @0xff-ai/arena0
 arena0
 ```
 
-Select a program, choose the participant count, assign human or built-in input,
-and set the parameters. The workspace follows negotiation, execution, and
-verification. Use `arena0 --tmp` for a disposable workspace that does not retain
+`arena0 ui` prints the daemon's URL and opens the browser workspace, where you
+launch sessions, answer callouts and verify receipts.
+Bare `arena0` on a terminal opens the same workspace. It starts the daemon when
+none runs; Ctrl-C stops only the daemon it started.
+Use `arena0 --tmp` for a disposable workspace that does not retain
 identities, executions, or receipts after it closes.
 
 The package supports macOS 14 or newer on arm64 and Linux x64 with glibc 2.35 or
@@ -25,11 +29,40 @@ The package installs `arena0`, the service executable `arena0d`, and
 service unless the requested participants are already served. Bare `arena0`
 prints help when its standard streams are not terminals.
 
-## Guided flow
+## The workspace
 
-Run `arena0` and follow the prompts to configure and launch an execution.
-The terminal interface shows pending input, program state, public agreement,
-and activity. Each answer enters through the program's input contract.
+- **Explorer** (left): the local Hosts, the programs they hold, and the latest
+  receipts. Import a program or a receipt, or add a Host, from its headers.
+- **Needs input, Problems, Activity** (below the Explorer): callouts waiting
+  on your participants, sessions that look wrong (a long
+  wait, a failure, a stop report instead of a receipt), and the daemon's
+  activity log.
+- **Sessions** (centre): every session with its participants and a lifecycle
+  strip. Filter by state, Host, program or time; brushing the timeline below
+  sets the time range.
+- **Session document**: one session's steps with each Host's agreement, the
+  program's view at any step (boards and tables where the program provides
+  them), the negotiation, queries, and the evidence with a Verify button.
+- **Composer**: opens under the document to answer a callout with a form
+  generated from the program's input schema. Press Mod+Enter to submit.
+- **Program document**: the program's schemas, callouts and phases. New
+  session opens a launch form where each participant is You or an external client.
+  Executable agents are configured through `arena0 run --agent`.
+
+Press Mod+K for the command palette. Your participants (title bar) choose
+which Hosts' callouts you answer here; they are not an access boundary.
+
+## Answer at the terminal
+
+Use `arena0 run PROGRAM --human HOST` to answer that participant's callouts at
+the terminal prompt. For example, play against an agent that answers with the
+first allowed value:
+
+```console
+arena0 run rock-paper-scissors --human host-01 --agent host-02=./examples/agents/first_allowed.py
+```
+
+Each answer enters through the program's input contract.
 
 ## Keep a service running
 
@@ -86,8 +119,7 @@ From a repository checkout, run the supplied Prisoner's Dilemma agents:
 ```console
 arena0 run prisoner-dilemma \
   --agent host-01=./examples/agents/tit_for_tat.py \
-  --agent host-02=./examples/agents/grim.py \
-  --no-tui
+  --agent host-02=./examples/agents/grim.py
 ```
 
 Each executable reads one callout as a JSON object on a line of standard input,
@@ -101,21 +133,22 @@ Malformed output, a timeout, or unexpected process exit fails the run. The
 executable runs with the invoking user's privileges; the program's Wasm sandbox
 does not sandbox the external agent process.
 
-## Launch and monitor
+## Launch headlessly and attach
 
-To select a program and launch two Codex Participants side by side in the
+To launch two Codex participants on a program side by side in the
 current Herdr or tmux session, run:
 
 ```console
-arena0 launch --agents
+arena0 launch --agents chess
 ```
 
-The launcher uses a private temporary arena0 home, installs the packaged skill
+The command uses a private temporary arena0 home, installs the packaged skill
 there, and gives each Codex session a distinct harness context. The current
 pane runs the creator and a new right pane runs an open joiner. Both sessions
-must exit before the launcher stops its daemon and removes the temporary state.
+must exit before the command stops its daemon and removes the temporary state.
 
-Launch a four-participant auction in one terminal:
+`arena0 launch PROGRAM` runs headlessly. Launch a four-participant auction in
+one terminal:
 
 ```console
 arena0 launch vickrey-auction --hosts alpha,beta,gamma,delta \
@@ -125,17 +158,17 @@ arena0 launch vickrey-auction --hosts alpha,beta,gamma,delta \
 Attach from another terminal using the same `ARENA0_HOME`:
 
 ```console
-arena0 monitor
+arena0 ui --attach
 ```
 
 `launch` stays in the foreground. Unbound participants wait for input from CLI
-clients or the monitor. The monitor shows program state, pending callouts,
-agreement, and activity. A human can answer a pending callout; this does not
+clients or the browser workspace. Answering a pending callout does not
 reserve the input while an agent is working. If another client answers first,
 fetch the next decision point rather than resubmitting the stale answer.
 
-Detaching from the monitor leaves the execution running. A launch stops only
-the service it started. Start a service with the required participant set first
+Ctrl-C in `arena0 ui --attach` closes the command and leaves the daemon and
+execution running. A launch stops only the service it started.
+Start a service with the required participant set first
 when its lifetime must be independent of a launch.
 
 ## Verify retained evidence
