@@ -51,6 +51,7 @@ impl Database {
         let started =
             tracing::enabled!(target: PERFORMANCE_TARGET, tracing::Level::DEBUG).then(Instant::now);
         if let Err(error) = self.connection.execute_batch("COMMIT") {
+            self.pending.clear();
             return match self.connection.execute_batch("ROLLBACK") {
                 Ok(()) => {
                     record_transaction(
@@ -74,11 +75,16 @@ impl Database {
                 }
             };
         }
+        self.changes
+            .lock()
+            .expect("change log lock")
+            .publish(self.pending.drain(..));
         record_transaction(started, "sqlite_transaction_commit", true, "committed");
         Ok(value)
     }
 
     pub(super) fn rollback_result<T>(&mut self, error: StoreError) -> Result<T, StoreError> {
+        self.pending.clear();
         let started =
             tracing::enabled!(target: PERFORMANCE_TARGET, tracing::Level::DEBUG).then(Instant::now);
         match self.connection.execute_batch("ROLLBACK") {

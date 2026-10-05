@@ -158,6 +158,7 @@ impl Database {
                 columns.outcome_json,
             ],
         )?;
+        self.record_change(ChangeKey::Exec(state.execution_id()));
         Ok(())
     }
 
@@ -568,6 +569,10 @@ impl Database {
         Ok(steps[start..end].to_vec())
     }
 
+    /// Read the record payloads using the scalar event-position index for
+    /// the total. List-style reads trust that index; detail decodes validate
+    /// it against the execution state. Only the requested record envelopes
+    /// are decoded here, never the execution state or activation.
     pub(crate) fn read_event_summaries(
         &mut self,
         execution_id: ExecId,
@@ -579,10 +584,16 @@ impl Database {
                 "event inspection limit is outside the fixed bound",
             ));
         }
-        let state = self
-            .load_execution_in_transaction(execution_id)?
+        let total = self
+            .connection
+            .query_row(
+                "SELECT event_position FROM executions WHERE execution_id = ?1",
+                params![execution_id.0.as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
             .ok_or(StoreError::ExecutionNotFound(execution_id))?;
-        let total = state.event_position();
+        let total = sqlite_i64(total)?;
         let start = from
             .unwrap_or_else(|| total.saturating_sub(limit as u64))
             .min(total);
@@ -676,7 +687,7 @@ impl Database {
         state: &ExecutionState,
     ) -> Result<Vec<AgreedStepRecord>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT step, origin_event_position, version, artifact, entry_hash, certified_at_ms
+            "SELECT step, origin_event_position, version, artifact, entry_hash, certified_at_ms, post_state
              FROM agreed_steps WHERE execution_id = ?1 ORDER BY step",
         )?;
         let mut rows = statement.query(params![state.execution_id().0.to_vec()])?;
@@ -689,6 +700,7 @@ impl Database {
                 row.get::<_, Vec<u8>>(3)?,
                 row.get::<_, Vec<u8>>(4)?,
                 row.get::<_, i64>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
             ));
         }
         drop(rows);
@@ -697,7 +709,15 @@ impl Database {
         let mut trace_bytes = 0u64;
         for (
             index,
-            (step, origin_event_position, version, artifact, entry_hash, certified_at_ms),
+            (
+                step,
+                origin_event_position,
+                version,
+                artifact,
+                entry_hash,
+                certified_at_ms,
+                post_state,
+            ),
         ) in raw.into_iter().enumerate()
         {
             let step = sqlite_i64(step)?;
@@ -739,7 +759,10 @@ impl Database {
                 )?,
                 "agreed trace entry",
             )?;
-            if entry.step != step || entry.entry_hash() != array32(&entry_hash, "entry hash")? {
+            if entry.step != step
+                || entry.entry_hash() != array32(&entry_hash, "entry hash")?
+                || entry.post_state.0 != array32(&post_state, "step post-state")?
+            {
                 return Err(StoreError::Corruption(
                     "agreed step index does not match entry".into(),
                 ));
@@ -790,6 +813,7 @@ impl Database {
             proposal.event_position(),
             version,
             proposal.entry(),
+            proposal.shared_state(),
             now_ms,
         )?;
         self.persist_effects(
@@ -830,6 +854,7 @@ impl Database {
         origin_event_position: u64,
         version: ExecutionVersion,
         entry: &arena0_protocol::TraceEntry,
+        shared_state: &SharedStateBytes,
         now_ms: u64,
     ) -> Result<(), StoreError> {
         let bytes = borsh::to_vec(entry)
@@ -837,8 +862,8 @@ impl Database {
         self.connection.execute(
             "INSERT INTO agreed_steps
              (execution_id, step, origin_event_position, version, artifact, entry_hash,
-              certified_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+              certified_at_ms, post_state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 execution_id.0.to_vec(),
                 sqlite_u64(entry.step)?,
@@ -847,12 +872,28 @@ impl Database {
                 envelope(EnvelopeKind::AgreedStep, &bytes)?,
                 entry.entry_hash().to_vec(),
                 sqlite_u64(now_ms)?,
+                entry.post_state.0.to_vec(),
+            ],
+        )?;
+        // The step and its renderable post-state commit together. The agreed
+        // row owns the expected hash; the state envelope is checked on read.
+        self.connection.execute(
+            "INSERT INTO step_states (execution_id, step, shared_state) VALUES (?1, ?2, ?3)",
+            params![
+                execution_id.0.as_slice(),
+                sqlite_u64(entry.step)?,
+                envelope(EnvelopeKind::StepState, shared_state.as_bytes())?
             ],
         )?;
         self.connection.execute(
             "UPDATE executions SET last_step_at_ms = ?2 WHERE execution_id = ?1",
             params![execution_id.0.to_vec(), sqlite_u64(now_ms)?],
         )?;
+        self.record_change(ChangeKey::Step {
+            exec_id: execution_id,
+            step: entry.step,
+        });
+        self.record_change(ChangeKey::Exec(execution_id));
         Ok(())
     }
 
@@ -896,6 +937,7 @@ impl Database {
         if changed != 1 {
             return Err(StoreError::Corruption("execution version moved".into()));
         }
+        self.record_change(ChangeKey::Exec(next.execution_id()));
         Ok(())
     }
 
@@ -962,6 +1004,18 @@ impl Database {
         state: &ExecutionState,
     ) -> Result<Vec<arena0_protocol::TraceEntry>, StoreError> {
         let trace = self.load_agreed_trace_in_transaction(state)?;
+        // Unfinished execution validation checks completeness without opening
+        // archived image envelopes; each image's integrity is checked on read.
+        let state_count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM step_states WHERE execution_id = ?1",
+            params![state.execution_id().0.as_slice()],
+            |row| row.get(0),
+        )?;
+        if sqlite_i64(state_count)? != trace.len() as u64 {
+            return Err(StoreError::Corruption(
+                "step states do not match agreed trace".into(),
+            ));
+        }
         let cursor = arena0_protocol::validate_agreed_trace(state.binding(), &trace)
             .map_err(|error| StoreError::Corruption(format!("agreed trace: {error}")))?;
         if cursor.state_hash() != state.agreed_state() || cursor.chain_hash() != state.agreed_link()

@@ -14,6 +14,7 @@ reachable only from loopback. There are no Origin or Host checks.
 |---|---|---|
 | `POST /rpc` | `application/json`, a [daemon Request](json-rpc.md) | HTTP 200 with the JSON `Response`, including API errors |
 | `GET /events` | No body | SSE, with keepalives; `host` events contain `EventFrame`, `activity` events contain `ActivityFrame` |
+| `GET /sync`, `GET /sync/{cursor}` | Optional hex-encoded applied cursor in the path | [Summary synchronization](sync.md): SSE `sync` events containing `SyncFrame`; malformed cursors return HTTP 400 |
 | `POST /uploads` | Binary bytes; exactly `application/wasm` or `application/octet-stream` | HTTP 201, `{"upload":"<BLAKE3 hex>","length":123}` |
 | `GET /hosts/{host}/blobs/{hash}` | Host name and full blob hash | Binary bytes, `application/octet-stream`, attachment filename equal to the hash; 404 for an unknown Host or blob |
 | `/mcp` | MCP Streamable HTTP | MCP service |

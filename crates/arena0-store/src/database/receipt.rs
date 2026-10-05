@@ -216,6 +216,7 @@ impl Database {
             "INSERT INTO receipt_imports (receipt_id, imported_at_ms) VALUES (?1, ?2)",
             params![receipt_id.as_bytes().to_vec(), sqlite_u64(now_ms)?],
         )?;
+        self.record_change(ChangeKey::Receipt(receipt_id));
         Ok(if existed {
             ReceiptImportOutcome::AlreadyProduced
         } else {
@@ -275,6 +276,7 @@ impl Database {
                 receipt.body().header().program_hash().as_bytes().to_vec(),
                 matches!(receipt.body().termination(), arena0_protocol::ReceiptTermination::Completed)],
         )?;
+        self.record_change(ChangeKey::Receipt(receipt_id));
         Ok(())
     }
 
@@ -313,6 +315,23 @@ impl Database {
                 execution_id.0.to_vec()
             ],
         )?;
+        self.record_change(ChangeKey::Receipt(receipt.receipt_id()));
+        // receipt_produced is session-derived, so every local execution for
+        // the session changes, even when it did not produce this artifact.
+        let ids = {
+            let mut statement = self.connection.prepare(
+                "SELECT execution_id FROM executions WHERE session_id = ?1 ORDER BY execution_id",
+            )?;
+            statement
+                .query_map(
+                    params![receipt.body().header().session_hash().0.to_vec()],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for id in ids {
+            self.record_change(ChangeKey::Exec(ExecId(array32(&id, "receipt execution")?)));
+        }
         Ok(())
     }
 

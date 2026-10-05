@@ -126,6 +126,7 @@ impl Database {
                     encode_facts(&facts)?,
                 ],
             )?;
+            self.record_change(ChangeKey::Exec(execution_id));
             return Ok(PrepareActivationOutcome::Prepared(Box::new(incoming)));
         };
         if existing.prepared() == &prepared {
@@ -241,6 +242,7 @@ impl Database {
                 "activation commit compare-and-set changed no row".into(),
             ));
         }
+        self.record_change(ChangeKey::Exec(execution_id));
         Ok(CommitActivationOutcome::Committed(Box::new(incoming)))
     }
 
