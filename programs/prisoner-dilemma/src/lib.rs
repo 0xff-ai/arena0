@@ -197,10 +197,6 @@ pub mod prisoner_dilemma {
         }
     }
 
-    fn writer(state: &Shared) -> Option<Participant> {
-        state.commit_reveal.expected_writer()
-    }
-
     fn view(state: &Shared, _ensemble: &Ensemble, vp: &Viewport) -> View {
         let current_round = if state.is_game_over() {
             state.total_rounds
@@ -301,7 +297,7 @@ pub mod prisoner_dilemma {
     }
 
     fn callout(ctx: &CalloutContext<Shared, Local>) -> Option<Callout> {
-        (ctx.shared().commit_reveal.is_writer(ctx.me())
+        (ctx.shared().commit_reveal.is_next(ctx.me())
             && ctx
                 .shared()
                 .commit_reveal
@@ -315,9 +311,9 @@ pub mod prisoner_dilemma {
         msg: Message,
     ) -> MessageApply<PrisonerDilemma> {
         let Message::CommitReveal(cr_msg) = msg;
-        // Unique-writer rule: only the expected writer may write here; any
+        // Sender-order rule: only the next sender may write here; any
         // other sender is a deterministic reject (no sibling candidates).
-        if !ctx.shared().commit_reveal.is_writer(from) {
+        if !ctx.shared().commit_reveal.is_next(from) {
             return Ok(ApplyDecision::Reject);
         }
         if ctx.commit_reveal().handle(from, cr_msg).is_err() {
@@ -338,7 +334,7 @@ pub mod prisoner_dilemma {
     }
 
     fn on_input(ctx: &mut LocalContext<Shared, Local>, input: Input) -> arena0::anyhow::Result<()> {
-        if !ctx.shared().commit_reveal.is_writer(ctx.me()) {
+        if !ctx.shared().commit_reveal.is_next(ctx.me()) {
             return Err(anyhow!("this participant does not own the next choice"));
         }
         let Input::Choose(choice) = input;
@@ -351,7 +347,7 @@ pub mod prisoner_dilemma {
     fn on_query(_shared: &Shared, _: ()) {}
 
     /// Queue the owed reveal once every commit is in, when this node is the
-    /// expected writer.
+    /// next sender.
     fn queue_setup_action(ctx: &mut Context<Shared, Local>) {
         if let Some(MyTurn::Reveal(reveal)) = ctx.commit_reveal().my_turn() {
             reveal.broadcast(&mut ctx.effects());

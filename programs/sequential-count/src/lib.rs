@@ -2,7 +2,7 @@
 //!
 //! Every participant first commits and reveals a private random nonce. The XOR
 //! of all nonces selects the first participant. The program then counts from
-//! one to `count_to`, with exactly one authenticated writer per step and the
+//! one to `count_to`, with exactly one authenticated sender per step and the
 //! turn moving around the committed ensemble after every count.
 
 use std::fmt::Write;
@@ -106,13 +106,6 @@ pub mod sequential_count {
         }
     }
 
-    fn writer(state: &Shared) -> Option<Participant> {
-        match state.phase() {
-            Phase::Setup => state.commit_reveal.expected_writer(),
-            Phase::Counting => state.turns.as_ref().map(TurnManager::current),
-        }
-    }
-
     fn view(state: &Shared, _ensemble: &Ensemble, vp: &Viewport) -> View {
         View::new()
             .header(vp.fit_text(format!(
@@ -155,7 +148,7 @@ pub mod sequential_count {
 
         let mut body = format!("Count: {} / {}", state.count, state.count_to);
         if !state.history.is_empty() {
-            body.push_str("\nRecent writers:");
+            body.push_str("\nRecent senders:");
             let start = state.history.len().saturating_sub(8);
             for participant in &state.history[start..] {
                 let _ = write!(body, " P{}", participant.index());
@@ -223,10 +216,10 @@ pub mod sequential_count {
                 if ctx.shared().phase() != Phase::Setup {
                     return Ok(ApplyDecision::Reject);
                 }
-                // Unique-writer rule (Setup phase): only the participant whose
+                // Sender-order rule (Setup phase): only the participant whose
                 // commit or reveal is next may write; any other sender is a
                 // deterministic reject (no sibling candidates at one position).
-                if !ctx.shared().commit_reveal.is_writer(from) {
+                if !ctx.shared().commit_reveal.is_next(from) {
                     return Ok(ApplyDecision::Reject);
                 }
                 if ctx.commit_reveal().handle(from, message).is_err() {
@@ -245,13 +238,13 @@ pub mod sequential_count {
                 if ctx.shared().phase() != Phase::Counting {
                     return Ok(ApplyDecision::Reject);
                 }
-                let expected_writer = ctx
+                let next_participant = ctx
                     .shared()
                     .turns
                     .as_ref()
                     .expect("turn order initialized")
                     .current();
-                if from != expected_writer {
+                if from != next_participant {
                     return Ok(ApplyDecision::Reject);
                 }
                 let expected_value = ctx.shared().count + 1;
@@ -274,7 +267,7 @@ pub mod sequential_count {
 
     fn on_query(_shared: &Shared, _: ()) {}
 
-    /// Queue this node's next commit or reveal when it owns the setup writer.
+    /// Queue this node's next commit or reveal when it is the next setup sender.
     fn queue_setup_action(ctx: &mut Context<Shared, Local>) -> arena0::anyhow::Result<()> {
         match ctx.commit_reveal().my_turn() {
             Some(MyTurn::Reveal(reveal)) => reveal.broadcast(&mut ctx.effects()),

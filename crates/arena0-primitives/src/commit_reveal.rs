@@ -42,7 +42,7 @@ pub enum Message<T> {
     Reveal { value: T, salt: [u8; 32] },
 }
 
-/// What this node owes on its turn as the expected writer; see
+/// What this node owes on its turn as the next sender; see
 /// [`CommitRevealAuthorExt::my_turn`].
 #[derive(Debug)]
 pub enum MyTurn<O> {
@@ -186,7 +186,7 @@ pub trait CommitRevealAuthorExt<T, Route = RawPrimitiveRoute> {
     /// Returns `None` until the reveal is due and at most once per round.
     fn take_reveal(self) -> Option<PrimitiveOutput<Message<T>, Route>>;
 
-    /// What this node owes when it is the expected writer: its reveal once
+    /// What this node owes when it is the next sender: its reveal once
     /// due (taken as by [`take_reveal`](Self::take_reveal)), else its commit
     /// if still owed. `None` when another participant writes next or nothing
     /// is owed.
@@ -247,7 +247,7 @@ where
     fn my_turn(mut self) -> Option<MyTurn<PrimitiveOutput<Message<T>, Route>>> {
         let me = self.me();
         let turn = self.with_shared_local(|cr, local| {
-            if !cr.is_writer(me) {
+            if !cr.is_next(me) {
                 return None;
             }
             let local = local.commit_reveal_local_mut();
@@ -305,10 +305,10 @@ impl<T> CommitReveal<T> {
 
     /// The participant whose message the current base is waiting for, if any:
     /// the first missing slot in the current phase (commit hashes during
-    /// `Idle`, revealed values during `Revealing`). The unique-writer rule: a
+    /// `Idle`, revealed values during `Revealing`). The sender-order rule: a
     /// message from any other participant is a deterministic reject.
     #[must_use]
-    pub fn expected_writer(&self) -> Option<Participant> {
+    pub fn next_participant(&self) -> Option<Participant> {
         let slot = match self.phase {
             Phase::Idle => self.hashes.iter().position(Option::is_none),
             Phase::Revealing => self.values.iter().position(Option::is_none),
@@ -317,10 +317,10 @@ impl<T> CommitReveal<T> {
         slot.and_then(|index| Participant::try_from(index).ok())
     }
 
-    /// Whether `participant` is the [`expected_writer`](Self::expected_writer).
+    /// Whether `participant` is the [`next_participant`](Self::next_participant).
     #[must_use]
-    pub fn is_writer(&self, participant: Participant) -> bool {
-        self.expected_writer() == Some(participant)
+    pub fn is_next(&self, participant: Participant) -> bool {
+        self.next_participant() == Some(participant)
     }
     /// Reset for a new round. Shared-handler code: bumps the shared round
     /// counter so each node's local stash keys itself to the fresh round.
@@ -563,10 +563,10 @@ mod tests {
         let b_commit = b.commit_with_salt(&mut b_local, 99, [0xBB; 32]).unwrap();
 
         // Canonical order: P0's commit then P1's, applied by both replicas.
-        assert!(a.is_writer(P0) && !a.is_writer(P1));
+        assert!(a.is_next(P0) && !a.is_next(P1));
         apply_both(&mut a, &mut b, P0, &a_commit);
         assert_eq!(a.phase(), Phase::Idle);
-        assert!(a.is_writer(P1) && !a.is_writer(P0));
+        assert!(a.is_next(P1) && !a.is_next(P0));
         apply_both(&mut a, &mut b, P1, &b_commit);
         assert_eq!(a.phase(), Phase::Revealing);
 
@@ -771,7 +771,7 @@ mod tests {
         protocol.handle(P0, reveal).unwrap();
 
         assert_eq!(protocol.phase(), Phase::Revealing);
-        assert_eq!(protocol.expected_writer(), Some(P1));
+        assert_eq!(protocol.next_participant(), Some(P1));
         assert!(!protocol.is_complete());
     }
 

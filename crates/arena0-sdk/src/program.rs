@@ -95,14 +95,6 @@ pub trait Program: Sized {
     /// [`Effect::SessionEnd`](crate::Effect::SessionEnd).
     fn outcome(shared: &Self::Shared) -> Self::Outcome;
 
-    /// Select the sole participant allowed to author the next agreed message.
-    ///
-    /// This is a pure function of replicated state. Returning `None` closes the
-    /// agreed-message boundary until another agreed event changes that state.
-    /// The host checks this result before invoking [`Self::on_message`], so
-    /// network arrival order cannot select between sibling message results.
-    fn writer(shared: &Self::Shared) -> Option<Participant>;
-
     /// Session boundary handler. It receives the committed participant set as
     /// explicit input and may update both state values or emit effects.
     fn on_session_started(

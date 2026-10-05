@@ -85,7 +85,7 @@ pub mod minimal_choice {
     type Input = super::Input;
     type Outcome = super::Outcome;
 
-    fn writer(state: &Shared) -> Option<Participant> {
+    fn next_sender(state: &Shared) -> Option<Participant> {
         state
             .choices
             .iter()
@@ -141,7 +141,7 @@ pub mod minimal_choice {
     }
 
     fn callout(ctx: &CalloutContext<Shared, Local>) -> Option<Callout> {
-        (!ctx.local().choice_pending && writer(ctx.shared()) == Some(ctx.me())).then(|| {
+        (!ctx.local().choice_pending && next_sender(ctx.shared()) == Some(ctx.me())).then(|| {
             let previous = ctx.shared().choices.iter().flatten().next().copied();
             callouts::Choose { previous }.into()
         })
@@ -152,7 +152,7 @@ pub mod minimal_choice {
         from: Participant,
         message: Message,
     ) -> MessageApply<MinimalChoice> {
-        if writer(ctx.shared()) != Some(from) {
+        if next_sender(ctx.shared()) != Some(from) {
             return Ok(ApplyDecision::Reject);
         }
         let Message::Choice(choice) = message;
@@ -162,7 +162,7 @@ pub mod minimal_choice {
     }
 
     fn on_input(ctx: &mut LocalContext<Shared, Local>, input: Input) -> arena0::anyhow::Result<()> {
-        if writer(ctx.shared()) != Some(ctx.me()) {
+        if next_sender(ctx.shared()) != Some(ctx.me()) {
             return Err(anyhow!("this participant does not own the next choice"));
         }
         let Input::Choose(choice) = input;
@@ -179,7 +179,7 @@ pub mod minimal_choice {
         choice: Choice,
     ) -> ProgramTransition<MinimalChoice> {
         state.choices[from.index()] = Some(choice);
-        if writer(state).is_none() {
+        if next_sender(state).is_none() {
             Transition::End
         } else {
             Transition::Stay
