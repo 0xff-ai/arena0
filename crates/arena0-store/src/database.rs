@@ -14,7 +14,6 @@ mod step_state;
 mod summary;
 mod timers;
 
-pub(crate) use resolve::resolve_statements;
 pub use resolve::{IdMatches, IdSpace};
 pub(crate) use summary::ReadDb;
 

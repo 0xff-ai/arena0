@@ -70,8 +70,12 @@ fn register_messaging(linker: &mut Linker<HostState>) -> Result<(), SandboxError
                         .expect("peer width"),
                 );
                 let state = caller.data();
-                let session = state.session.as_ref().expect("dispatch session installed");
-                if Some(to) == state.peer_id || !session.peers().contains(&to) {
+                let session = state
+                    .scope
+                    .session
+                    .as_ref()
+                    .expect("dispatch session installed");
+                if Some(to) == state.scope.peer_id || !session.peers().contains(&to) {
                     return Err(wasmtime::Error::msg(
                         "send_direct: recipient must be another participant",
                     ));
@@ -88,7 +92,10 @@ fn register_messaging(linker: &mut Linker<HostState>) -> Result<(), SandboxError
                         caller.read_guest_bytes(range_ptr, range_len, imports::SEND_DIRECT)?;
                     let range: RangeAttachment =
                         borsh::from_slice(&bytes).map_err(wasmtime::Error::new)?;
-                    let length = blob_view(caller.data())?
+                    let length = caller
+                        .data()
+                        .scope
+                        .blob_view()?
                         .granted(range.hash)
                         .map_err(wasmtime::Error::msg)?
                         .ok_or_else(|| wasmtime::Error::msg("send_direct: blob not granted"))?;
@@ -102,12 +109,14 @@ fn register_messaging(linker: &mut Linker<HostState>) -> Result<(), SandboxError
                 };
                 let queued = caller
                     .data()
+                    .scope
                     .direct_queued
                     .iter()
                     .find(|(peer, _)| *peer == to)
                     .map_or(0, |(_, len)| *len);
                 let here = caller
                     .data()
+                    .scope
                     .effect_queue
                     .iter()
                     .filter(|e| matches!(e, Effect::SendDirect { to: peer, .. } if *peer == to))
@@ -138,6 +147,7 @@ fn register_messaging(linker: &mut Linker<HostState>) -> Result<(), SandboxError
                     let queued_before = caller.data().outgoing_len;
                     let queued_here = caller
                         .data()
+                        .scope
                         .effect_queue
                         .iter()
                         .filter(|effect| matches!(effect, Effect::Broadcast { .. }))
@@ -169,13 +179,6 @@ fn blob_status(error: BlobError) -> u32 {
     u32::from(borsh::to_vec(&error).expect("blob error encoding")[0]) + 1
 }
 
-fn blob_view(state: &HostState) -> Result<Arc<dyn BlobView>, wasmtime::Error> {
-    state
-        .blobs
-        .clone()
-        .ok_or_else(|| wasmtime::Error::msg("blob view unavailable"))
-}
-
 fn read_blob_hash(
     caller: &mut Caller<'_, HostState>,
     ptr: u32,
@@ -202,48 +205,6 @@ struct Receive {
     durable: bool,
 }
 
-fn receive_state(state: &HostState, hash: BlobHash) -> Result<Receive, wasmtime::Error> {
-    let partial = blob_view(state)?
-        .partial(hash)
-        .map_err(wasmtime::Error::msg)?;
-    let mut receive = Receive {
-        length: partial.as_ref().map(|p| p.length),
-        written: partial.as_ref().map_or(0, |p| p.written),
-        committed: partial.as_ref().is_some_and(|p| p.committed),
-        durable: partial.is_some(),
-    };
-    for change in &state.staged_blobs {
-        match change {
-            BlobChange::Append {
-                hash: h,
-                length,
-                bytes,
-                ..
-            } if *h == hash => {
-                receive.length = Some(*length);
-                receive.written += bytes.len() as u64;
-            }
-            BlobChange::Commit { hash: h } if *h == hash => receive.committed = true,
-            _ => {}
-        }
-    }
-    Ok(receive)
-}
-
-/// The staged appended bytes for `hash`, concatenated in call order.
-fn staged_tail(state: &HostState, hash: BlobHash) -> Vec<u8> {
-    state
-        .staged_blobs
-        .iter()
-        .filter_map(|change| match change {
-            BlobChange::Append { hash: h, bytes, .. } if *h == hash => Some(bytes.as_slice()),
-            _ => None,
-        })
-        .flatten()
-        .copied()
-        .collect()
-}
-
 /// The attachment stays readable for the entire dispatch; staging owns a copy.
 fn blob_append(
     caller: &mut Caller<'_, HostState>,
@@ -257,6 +218,7 @@ fn blob_append(
     }
     let Some(bytes) = caller
         .data()
+        .scope
         .attachment
         .as_ref()
         .filter(|b| attachment == 0 && !b.is_empty())
@@ -264,7 +226,7 @@ fn blob_append(
         return Ok(blob_status(BlobError::BadAttachment));
     };
     let len = bytes.len();
-    let receive = receive_state(caller.data(), hash)?;
+    let receive = caller.data().scope.receive_state(hash)?;
     if receive.committed
         || receive.length.is_some_and(|known| known != length)
         || receive.written + len as u64 > length
@@ -274,28 +236,34 @@ fn blob_append(
     let max = caller.data().profile.limits.max_host_bytes;
     caller
         .data_mut()
+        .scope
         .ledger
         .copy_bytes(len, max)
         .map_err(wasmtime::Error::new)?;
     let bytes = caller
         .data()
+        .scope
         .attachment
         .as_ref()
         .expect("attachment checked")
         .clone();
-    caller.data_mut().staged_blobs.push(BlobChange::Append {
-        hash,
-        length,
-        offset: receive.written,
-        bytes,
-    });
+    caller
+        .data_mut()
+        .scope
+        .staged_blobs
+        .push(BlobChange::Append {
+            hash,
+            length,
+            offset: receive.written,
+            bytes,
+        });
     Ok(0)
 }
 
 /// Hash only after completeness and fuel checks, leaving mismatches unstaged.
 fn blob_commit(caller: &mut Caller<'_, HostState>, hash_ptr: u32) -> Result<u32, wasmtime::Error> {
     let hash = read_blob_hash(caller, hash_ptr, imports::BLOB_COMMIT)?;
-    let receive = receive_state(caller.data(), hash)?;
+    let receive = caller.data().scope.receive_state(hash)?;
     let Some(length) = receive.length else {
         return Ok(blob_status(BlobError::NotFound));
     };
@@ -309,9 +277,12 @@ fn blob_commit(caller: &mut Caller<'_, HostState>, hash_ptr: u32) -> Result<u32,
         length * caller.data().profile.fuel.hash_per_byte,
         imports::BLOB_COMMIT,
     )?;
-    let tail = staged_tail(caller.data(), hash);
+    let tail = caller.data().scope.staged_tail(hash);
     let digest = if receive.durable {
-        blob_view(caller.data())?
+        caller
+            .data()
+            .scope
+            .blob_view()?
             .hash_partial(hash, &tail)
             .map_err(wasmtime::Error::msg)?
     } else {
@@ -325,6 +296,7 @@ fn blob_commit(caller: &mut Caller<'_, HostState>, hash_ptr: u32) -> Result<u32,
     }
     caller
         .data_mut()
+        .scope
         .staged_blobs
         .push(BlobChange::Commit { hash });
     Ok(0)
@@ -344,7 +316,7 @@ fn subtree_cv(
     let source: CvSource =
         borsh::from_slice(&caller.read_guest_bytes(source_ptr, source_len, imports::SUBTREE_CV)?)
             .map_err(wasmtime::Error::new)?;
-    let view = blob_view(caller.data())?;
+    let view = caller.data().scope.blob_view()?;
     let len = match source {
         CvSource::Blob { hash, start, end } => {
             if start >= end || end - start > MAX_DIRECT_RANGE_BYTES {
@@ -361,6 +333,7 @@ fn subtree_cv(
         CvSource::Attachment(token) => {
             let Some(bytes) = caller
                 .data()
+                .scope
                 .attachment
                 .as_ref()
                 .filter(|b| token.0 == 0 && !b.is_empty())
@@ -384,6 +357,7 @@ fn subtree_cv(
     let max = caller.data().profile.limits.max_host_bytes;
     caller
         .data_mut()
+        .scope
         .ledger
         .copy_bytes(32, max)
         .map_err(wasmtime::Error::new)?;
@@ -401,6 +375,7 @@ fn subtree_cv(
         }
         CvSource::Attachment(_) => caller
             .data()
+            .scope
             .attachment
             .as_deref()
             .expect("attachment checked"),
@@ -507,12 +482,12 @@ fn register_sign(
                 let scheme = u32_to_sign_scheme(scheme)?;
                 reject_if_sign_scheme_disallowed(imports::SIGN, scheme, &allowed_schemes)?;
                 let payload = caller.read_guest_bytes(data_ptr, data_len, imports::SIGN)?;
-                let Some(signer) = caller.data().signer.signer() else {
+                let Some(signer) = caller.data().scope.signer.signer() else {
                     return Err(wasmtime::Error::msg(
                         "sign is only available in local handlers",
                     ));
                 };
-                let call_index = caller.data_mut().signer.next_call();
+                let call_index = caller.data_mut().scope.signer.next_call();
                 let (signed_bytes, signature) = signer
                     .sign(call_index, scheme, &payload)
                     .map_err(|error| wasmtime::Error::msg(format!("sign: {error}")))?;
@@ -527,6 +502,7 @@ fn register_sign(
                 let max_host_bytes = caller.data().profile.limits.max_host_bytes;
                 caller
                     .data_mut()
+                    .scope
                     .ledger
                     .copy_bytes(encoded.len(), max_host_bytes)
                     .map_err(wasmtime::Error::new)?;
@@ -552,6 +528,58 @@ fn reject_if_sign_scheme_disallowed(
         Err(wasmtime::Error::msg(format!(
             "{function_name}: sign scheme {scheme:?} is not declared"
         )))
+    }
+}
+
+impl super::super::DispatchScope {
+    /// Require this dispatch's installed blob capability; no view survives reset.
+    fn blob_view(&self) -> Result<Arc<dyn BlobView>, wasmtime::Error> {
+        self.blobs
+            .clone()
+            .ok_or_else(|| wasmtime::Error::msg("blob view unavailable"))
+    }
+
+    /// Overlay durable partial state with staged append/commit operations in dispatch order without publishing any effect.
+    fn receive_state(&self, hash: BlobHash) -> Result<Receive, wasmtime::Error> {
+        let partial = self
+            .blob_view()?
+            .partial(hash)
+            .map_err(wasmtime::Error::msg)?;
+        let mut receive = Receive {
+            length: partial.as_ref().map(|p| p.length),
+            written: partial.as_ref().map_or(0, |p| p.written),
+            committed: partial.as_ref().is_some_and(|p| p.committed),
+            durable: partial.is_some(),
+        };
+        for change in &self.staged_blobs {
+            match change {
+                BlobChange::Append {
+                    hash: h,
+                    length,
+                    bytes,
+                    ..
+                } if *h == hash => {
+                    receive.length = Some(*length);
+                    receive.written += bytes.len() as u64;
+                }
+                BlobChange::Commit { hash: h } if *h == hash => receive.committed = true,
+                _ => {}
+            }
+        }
+        Ok(receive)
+    }
+
+    /// Project this dispatch's appended bytes in call order; durable bytes remain owned by the installed view.
+    fn staged_tail(&self, hash: BlobHash) -> Vec<u8> {
+        self.staged_blobs
+            .iter()
+            .filter_map(|change| match change {
+                BlobChange::Append { hash: h, bytes, .. } if *h == hash => Some(bytes.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect()
     }
 }
 
@@ -651,7 +679,9 @@ mod tests {
             );
             hs.dispatch = dispatch;
             if with_signer {
-                hs.signer.install(Some(std::sync::Arc::new(TestSigner)));
+                hs.scope
+                    .signer
+                    .install(Some(std::sync::Arc::new(TestSigner)));
             }
             hs
         });
@@ -687,7 +717,7 @@ mod tests {
             instantiate_timer_test_module(crate::call::DispatchKind::Local);
         set_timer.call(&mut store, ()).unwrap();
         assert_eq!(
-            store.data().effect_queue,
+            store.data().scope.effect_queue,
             vec![Effect::SetTimer {
                 delay_ms: 25,
                 timer: TimerPayload {
@@ -704,7 +734,7 @@ mod tests {
             instantiate_timer_test_module(crate::call::DispatchKind::Agreed);
         store.data_mut().call_kind = CallKind::Query;
         assert!(set_timer.call(&mut store, ()).is_err());
-        assert!(store.data().effect_queue.is_empty());
+        assert!(store.data().scope.effect_queue.is_empty());
     }
 
     #[test]
@@ -717,7 +747,7 @@ mod tests {
         );
         let error = sign.call(&mut store, ()).unwrap_err();
         assert!(format!("{error:?}").contains("local handlers"), "{error:?}");
-        assert!(store.data().effect_queue.is_empty());
+        assert!(store.data().scope.effect_queue.is_empty());
     }
 
     #[test]
@@ -748,7 +778,7 @@ mod tests {
             true,
         );
         assert!(sign.call(&mut store, ()).is_err());
-        assert!(store.data().effect_queue.is_empty());
+        assert!(store.data().scope.effect_queue.is_empty());
     }
 
     #[test]
@@ -760,7 +790,7 @@ mod tests {
             true,
         );
         assert!(sign.call(&mut store, ()).is_err());
-        assert!(store.data().effect_queue.is_empty());
+        assert!(store.data().scope.effect_queue.is_empty());
     }
 
     fn instantiate_effect_test_module(
@@ -821,7 +851,7 @@ mod tests {
             format!("{error:?}").contains("only available to agreed events"),
             "{error:?}"
         );
-        assert!(store.data().effect_queue.is_empty());
+        assert!(store.data().scope.effect_queue.is_empty());
     }
 
     #[test]
@@ -877,7 +907,7 @@ mod tests {
         store.data_mut().outgoing_len = arena0_protocol::execution::MAX_OUTGOING_MESSAGES - 1;
         // The first broadcast fills the queue; the second observes the bound.
         assert_eq!(call.call(&mut store, ()).unwrap(), 1);
-        assert_eq!(store.data().effect_queue.len(), 1);
+        assert_eq!(store.data().scope.effect_queue.len(), 1);
     }
 
     #[test]
@@ -889,7 +919,7 @@ mod tests {
         );
         store.data_mut().outgoing_len = arena0_protocol::execution::MAX_OUTGOING_MESSAGES;
         assert_eq!(call.call(&mut store, ()).unwrap(), 1);
-        assert!(store.data().effect_queue.is_empty());
+        assert!(store.data().scope.effect_queue.is_empty());
     }
 
     #[test]
@@ -902,7 +932,7 @@ mod tests {
             2,
         );
         assert_eq!(call.call(&mut store, ()).unwrap(), 0);
-        assert_eq!(store.data().effect_queue.len(), 1);
+        assert_eq!(store.data().scope.effect_queue.len(), 1);
 
         let (mut store, call) = instantiate_effect_test_module_with_pages(
             crate::call::DispatchKind::Local,
@@ -911,7 +941,7 @@ mod tests {
             2,
         );
         assert!(call.call(&mut store, ()).is_err());
-        assert!(store.data().effect_queue.is_empty());
+        assert!(store.data().scope.effect_queue.is_empty());
     }
 
     #[test]
@@ -931,7 +961,7 @@ mod tests {
             imports,
         );
         assert_eq!(call.call(&mut store, ()).unwrap(), 0);
-        assert_eq!(store.data().effect_queue.len(), count);
+        assert_eq!(store.data().scope.effect_queue.len(), count);
 
         let (mut store, call) = instantiate_effect_test_module(
             crate::call::DispatchKind::Agreed,
@@ -939,7 +969,7 @@ mod tests {
             imports,
         );
         assert!(call.call(&mut store, ()).is_err());
-        assert_eq!(store.data().effect_queue.len(), count);
+        assert_eq!(store.data().scope.effect_queue.len(), count);
     }
 
     #[test]
@@ -950,6 +980,6 @@ mod tests {
             r#"(import "arena0" "broadcast" (func $broadcast (param i32 i32) (result i32)))"#,
         );
         assert_eq!(call.call(&mut store, ()).unwrap(), 0);
-        assert_eq!(store.data().effect_queue.len(), 1);
+        assert_eq!(store.data().scope.effect_queue.len(), 1);
     }
 }

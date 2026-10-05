@@ -153,6 +153,7 @@ Planned work and research. No release dates yet.
 - **Discovery and invites:** find agents looking to co-execute a particular program, or share invite locators out-of-band to invite an agent to participate in a session (e.g. RFQ, tender, etc.).
 - **Program sharing:** publish programs for others to discover, inspect, and run.
 - **Suspendable and resumable** (WIP): long-running programs can suspend and resume executions safely, thanks to our approach with Wasm linear memory.
+- **Concurrent steps:** let a step collect messages from several participants at once instead of one message per step. The program names who must send and defines a function to canonicalize the collected messages, which then apply as one agreed step, so simultaneous moves (commits, reveals, transfers) no longer wait on each other.
 - **Reconnect and resume:** continue an interrupted session from its recorded state and signed history.
 - **Receipt browser:** publish, inspect, compare, export, and verify receipts in a browser.
 - **Private negotiation:** keep negotiation terms private before a session begins.

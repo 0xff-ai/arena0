@@ -167,12 +167,19 @@ pub(crate) struct HostState {
     pub dispatch: crate::call::DispatchKind,
     /// Committed outgoing messages before this dispatch began.
     pub outgoing_len: usize,
+    pub profile: ExecutionProfile,
+    pub callout_inputs: Vec<arena0_program::JsonSchemaDocument>,
+    pub scope: DispatchScope,
+}
+
+/// Per-call observations, accounting and live capabilities. Preparation and each
+/// resident re-entry replace this scope so no signer, attachment or effect survives.
+/// Store limits, immutable profile and call headers remain owned by HostState.
+pub(crate) struct DispatchScope {
     pub logs: Vec<(String, String)>,
     pub effect_queue: Vec<Effect>,
     pub entropy: Entropy,
     pub ledger: ResourceLedger,
-    pub profile: ExecutionProfile,
-    pub callout_inputs: Vec<arena0_program::JsonSchemaDocument>,
     pub signer: crate::signing::SignerSlot,
     pub verifier: Option<Arc<dyn crate::GuestVerifier>>,
     pub blobs: Option<Arc<dyn crate::BlobView>>,
@@ -183,30 +190,14 @@ pub(crate) struct HostState {
     pub session: Option<arena0_protocol::Ensemble<arena0_protocol::Committed>>,
 }
 
-impl HostState {
-    pub(crate) fn new(
-        profile: ExecutionProfile,
-        call_kind: CallKind,
-        dispatch: crate::call::DispatchKind,
-        callout_inputs: Vec<arena0_program::JsonSchemaDocument>,
-    ) -> Self {
+impl DispatchScope {
+    /// Start empty observations and budgets with no execution capabilities installed.
+    fn new() -> Self {
         Self {
-            limits: StoreLimitsBuilder::new()
-                .memory_size(profile.limits.max_memory_bytes as usize)
-                .table_elements(profile.limits.max_table_elements as usize)
-                .instances(profile.limits.max_instances as usize)
-                .tables(profile.limits.max_tables as usize)
-                .memories(profile.limits.max_memories as usize)
-                .build(),
-            call_kind,
-            dispatch,
-            outgoing_len: 0,
             logs: Vec::new(),
             effect_queue: Vec::new(),
             entropy: Entropy::live(),
             ledger: ResourceLedger::new(),
-            profile,
-            callout_inputs,
             signer: crate::signing::SignerSlot::default(),
             verifier: None,
             blobs: None,
@@ -217,16 +208,47 @@ impl HostState {
             session: None,
         }
     }
+}
+
+/// Apply immutable engine limits with the caller-selected work-memory ceiling.
+/// Resident preparation supplies its observed capacity; fresh calls use the profile ceiling.
+fn store_limits(profile: &ExecutionProfile, memory_size: usize) -> StoreLimits {
+    StoreLimitsBuilder::new()
+        .memory_size(memory_size)
+        .table_elements(profile.limits.max_table_elements as usize)
+        .instances(profile.limits.max_instances as usize)
+        .tables(profile.limits.max_tables as usize)
+        .memories(profile.limits.max_memories as usize)
+        .build()
+}
+
+impl HostState {
+    pub(crate) fn new(
+        profile: ExecutionProfile,
+        call_kind: CallKind,
+        dispatch: crate::call::DispatchKind,
+        callout_inputs: Vec<arena0_program::JsonSchemaDocument>,
+    ) -> Self {
+        Self {
+            limits: store_limits(&profile, profile.limits.max_memory_bytes as usize),
+            call_kind,
+            dispatch,
+            outgoing_len: 0,
+            profile,
+            callout_inputs,
+            scope: DispatchScope::new(),
+        }
+    }
 
     pub(crate) fn finish_observations(
         &mut self,
         fuel_used: u64,
     ) -> Result<crate::CallObservations, SandboxError> {
         Ok(crate::CallObservations {
-            effects: std::mem::take(&mut self.effect_queue),
+            effects: std::mem::take(&mut self.scope.effect_queue),
             fuel_used,
-            random_draws: self.entropy.finish(),
-            logs: std::mem::take(&mut self.logs),
+            random_draws: self.scope.entropy.finish(),
+            logs: std::mem::take(&mut self.scope.logs),
         })
     }
 
@@ -240,18 +262,7 @@ impl HostState {
         self.call_kind = CallKind::Dispatch;
         self.dispatch = dispatch;
         self.outgoing_len = outgoing_len;
-        self.logs.clear();
-        self.effect_queue.clear();
-        self.ledger = ResourceLedger::new();
-        self.entropy.reset();
-        self.signer.clear();
-        self.verifier = None;
-        self.blobs = None;
-        self.staged_blobs.clear();
-        self.attachment = None;
-        self.direct_queued.clear();
-        self.peer_id = None;
-        self.session = None;
+        self.scope = DispatchScope::new();
     }
 
     /// Clear setup observations while retaining the call kind selected for a
@@ -260,18 +271,7 @@ impl HostState {
     /// in the subsequent call.
     pub(crate) fn reset_after_prepare(&mut self, call_kind: CallKind) {
         self.call_kind = call_kind;
-        self.logs.clear();
-        self.effect_queue.clear();
-        self.ledger = ResourceLedger::new();
-        self.entropy.reset();
-        self.signer.clear();
-        self.verifier = None;
-        self.blobs = None;
-        self.staged_blobs.clear();
-        self.attachment = None;
-        self.direct_queued.clear();
-        self.peer_id = None;
-        self.session = None;
+        self.scope = DispatchScope::new();
     }
 }
 

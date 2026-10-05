@@ -40,7 +40,7 @@ impl Database {
                     }
                 }
             };
-            let encoded = envelope(EnvelopeKind::ExecutionSalt, salt.as_bytes())?;
+            let encoded = DurableEnvelope::seal(EnvelopeKind::ExecutionSalt, salt.as_bytes())?;
             store.connection.execute(
                 "INSERT INTO execution_salts (execution_id, salt, created_at_ms)
                  VALUES (?1, ?2, ?3)",
@@ -71,7 +71,7 @@ impl Database {
             )
             .optional()?;
         if let Some((stored, removed_at_ms)) = existing {
-            let payload = open_envelope(EnvelopeKind::Program, &stored, max)?;
+            let payload = DurableEnvelope::open(EnvelopeKind::Program, &stored, max)?;
             if ProgramHash::of(&payload) != hash {
                 return Err(StoreError::Corruption(
                     "program hash does not match its envelope".into(),
@@ -100,7 +100,7 @@ impl Database {
              VALUES (?1, ?2, ?3, NULL)",
                 params![
                     hash.as_bytes().to_vec(),
-                    envelope(EnvelopeKind::Program, &wasm)?,
+                    DurableEnvelope::seal(EnvelopeKind::Program, &wasm)?,
                     sqlite_u64(now_ms)?,
                 ],
             )?;
@@ -125,7 +125,7 @@ impl Database {
         else {
             return Ok(None);
         };
-        let wasm = open_envelope(EnvelopeKind::Program, &encoded, max_program_bytes()?)?;
+        let wasm = DurableEnvelope::open(EnvelopeKind::Program, &encoded, max_program_bytes()?)?;
         if ProgramHash::of(&wasm) != hash {
             return Err(StoreError::Corruption(
                 "program registry indexes do not match Wasm content".into(),
@@ -210,7 +210,8 @@ impl Database {
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let hash = ProgramHash(array32(&row.get::<_, Vec<u8>>(0)?, "program hash")?);
-            let wasm = open_envelope(EnvelopeKind::Program, &row.get::<_, Vec<u8>>(1)?, max)?;
+            let wasm =
+                DurableEnvelope::open(EnvelopeKind::Program, &row.get::<_, Vec<u8>>(1)?, max)?;
             if wasm.is_empty() || wasm.len() > max || ProgramHash::of(&wasm) != hash {
                 return Err(StoreError::Corruption(
                     "program registry row failed content validation".into(),

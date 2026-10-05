@@ -81,7 +81,7 @@ impl Database {
         &mut self,
         row: RawReceiptRow,
     ) -> Result<(StoredReceipt, Option<ExecId>), StoreError> {
-        let payload = open_envelope(
+        let payload = DurableEnvelope::open(
             EnvelopeKind::Receipt,
             &row.artifact,
             arena0_protocol::MAX_RECEIPT_BYTES,
@@ -241,7 +241,7 @@ impl Database {
         let session_id = receipt.body().header().session_hash();
         let kind = artifact_kind(receipt);
         if let Some(row) = self.receipt_row_by_id(receipt_id)? {
-            let payload = open_envelope(
+            let payload = DurableEnvelope::open(
                 EnvelopeKind::Receipt,
                 &row.artifact,
                 arena0_protocol::MAX_RECEIPT_BYTES,
@@ -272,7 +272,7 @@ impl Database {
             "INSERT INTO receipts (receipt_id, session_id, kind, artifact, stored_at_ms, program_hash, completed)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![receipt_id.as_bytes().to_vec(), session_id.0.to_vec(), kind,
-                envelope(EnvelopeKind::Receipt, &bytes)?, sqlite_u64(now_ms)?,
+                DurableEnvelope::seal(EnvelopeKind::Receipt, &bytes)?, sqlite_u64(now_ms)?,
                 receipt.body().header().program_hash().as_bytes().to_vec(),
                 matches!(receipt.body().termination(), arena0_protocol::ReceiptTermination::Completed)],
         )?;
