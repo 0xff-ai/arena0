@@ -19,4 +19,6 @@ test-group = 'integration'
 # CI runs show every failure instead of stopping at the first one.
 [profile.ci]
 fail-fast = false
-test-threads = 2
+# CI runs on the self-hosted ficus runner: one test per available CPU. The
+# `integration` group above still caps daemon-booting tests at 4.
+test-threads = "num-cpus"
