@@ -485,8 +485,10 @@ mod tests {
         for n in [0, 1, 64, arena0_program::profile::MAX_PERMUTATION_LEN] {
             run.call(&mut store, n).unwrap();
             let actual = memory.data(&store)[64..64 + 4 * n as usize]
-                .chunks_exact(4)
-                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| u32::from_le_bytes(*bytes))
                 .collect::<Vec<_>>();
             assert_eq!(actual, arena0_crypto::permutation([7; 32], n).unwrap());
         }

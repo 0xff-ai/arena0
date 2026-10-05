@@ -1,5 +1,17 @@
 use super::*;
 
+fn validate_negotiation_index(
+    admission: &ExecutionAdmission,
+    stored: Option<Vec<u8>>,
+) -> Result<(), StoreError> {
+    if stored != admission.negotiation_id().map(|id| id.0.to_vec()) {
+        return Err(StoreError::Corruption(
+            "request negotiation index does not match admission".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl Database {
     pub(crate) fn create_execution_request(
         &mut self,
@@ -56,8 +68,8 @@ impl Database {
             }
             store.connection.execute(
                 "INSERT INTO exec_requests
-                 (execution_id, program_hash, params, admission, created_at_ms, failure, grants)
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
+                 (execution_id, program_hash, params, admission, created_at_ms, failure, grants, negotiation_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
                 params![
                     execution_id.0.to_vec(),
                     program_hash.as_bytes().to_vec(),
@@ -65,6 +77,7 @@ impl Database {
                     envelope(EnvelopeKind::ExecutionAdmission, &admission_bytes)?,
                     sqlite_u64(created_at_ms)?,
                     grants_bytes,
+                    admission.negotiation_id().map(|id| id.0.to_vec()),
                 ],
             )?;
             for hash in grants {
@@ -133,11 +146,12 @@ impl Database {
                 });
             }
             store.connection.execute(
-                "UPDATE exec_requests SET admission = ?1
+                "UPDATE exec_requests SET admission = ?1, negotiation_id = ?3
                  WHERE execution_id = ?2 AND failure IS NULL",
                 params![
                     envelope(EnvelopeKind::ExecutionAdmission, &admission_bytes)?,
                     execution_id.0.to_vec(),
+                    admission.negotiation_id().map(|id| id.0.to_vec()),
                 ],
             )?;
             Ok(AdmissionBindingOutcome::Bound)
@@ -152,7 +166,7 @@ impl Database {
             .connection
             .query_row(
                 "SELECT created_order, program_hash, params, admission,
-                        created_at_ms, failure
+                        created_at_ms, failure, negotiation_id
                  FROM exec_requests WHERE execution_id = ?1",
                 params![execution_id.0.to_vec()],
                 |row| {
@@ -163,12 +177,21 @@ impl Database {
                         row.get::<_, Vec<u8>>(3)?,
                         row.get::<_, i64>(4)?,
                         row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<Vec<u8>>>(6)?,
                     ))
                 },
             )
             .optional()?;
         row.map(
-            |(created_order, program_hash, params_bytes, admission, created_at_ms, failure)| {
+            |(
+                created_order,
+                program_hash,
+                params_bytes,
+                admission,
+                created_at_ms,
+                failure,
+                negotiation_id,
+            )| {
                 let admission: ExecutionAdmission = decode_borsh(
                     &open_envelope(
                         EnvelopeKind::ExecutionAdmission,
@@ -177,6 +200,7 @@ impl Database {
                     )?,
                     "execution admission",
                 )?;
+                validate_negotiation_index(&admission, negotiation_id)?;
                 let params = params_bytes
                     .map(|bytes| {
                         JsonBytes::try_new(bytes)
@@ -303,10 +327,13 @@ impl Database {
         Ok(())
     }
 
+    /// Validate request and activation evidence for unfinished executions and
+    /// requests with neither an aggregate nor a recorded failure. Archived
+    /// evidence is checked on explicit reads.
     pub(super) fn validate_execution_requests(&mut self) -> Result<(), StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT execution_id, created_order, program_hash, params,
-                    admission, created_at_ms, failure FROM exec_requests
+                    admission, created_at_ms, failure, negotiation_id FROM exec_requests
              ORDER BY created_order",
         )?;
         let mut rows = statement.query([])?;
@@ -320,6 +347,7 @@ impl Database {
                 row.get::<_, Vec<u8>>(4)?,
                 row.get::<_, i64>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<Vec<u8>>>(7)?,
             ));
         }
         drop(rows);
@@ -332,8 +360,12 @@ impl Database {
             admission_bytes,
             created_at_ms,
             failure,
+            negotiation_id,
         ) in values
         {
+            if self.execution_is_archived(execution_id)? {
+                continue;
+            }
             if sqlite_i64(created_order)? == 0
                 || params_bytes
                     .as_ref()
@@ -356,6 +388,7 @@ impl Database {
                 )?,
                 "execution admission",
             )?;
+            validate_negotiation_index(&admission, negotiation_id)?;
             validate_local_admission(self.host_id, &admission).map_err(|error| {
                 StoreError::Corruption(format!("invalid durable execution admission: {error}"))
             })?;

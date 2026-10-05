@@ -391,9 +391,11 @@ dependencies = [
  "arena0-transport",
  "borsh",
  "hex",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
  "tracing-subscriber",
  "wat",
 ]

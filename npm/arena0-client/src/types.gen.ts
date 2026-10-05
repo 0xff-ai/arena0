@@ -108,6 +108,8 @@ input: JsonSchemaDocument,
  */
 output: JsonSchemaDocument, };
 
+export type CalloutSummary = { pending_id: CalloutId, callout_index: number, name: string, opened_at_ms: number, };
+
 export type Cell = { text: string, tone: Tone, participant?: number, };
 
 export type ColorDepth = "Mono" | "Ansi16" | "Ansi256" | "TrueColor";
@@ -162,8 +164,6 @@ export type ExecEndStatus = { phase: ExecEndPhase, unconfirmed: Array<string>, }
 
 export type ExecLifecycle = "Negotiating" | "Activating" | "Waiting" | "Active" | "Completed" | "Aborted" | "Failed";
 
-export type ExecListEntry = { status: ExecStatus, activation: ActivationInspection | null, };
-
 export type ExecOrigin = "request" | "recovery";
 
 export type ExecStatus = {
@@ -182,6 +182,32 @@ created_at_ms: number,
 updated_at_ms: number, };
 
 export type ExecStatusState = { "exec_state": "Negotiating", queue_position: number | null, } | { "exec_state": "Activating", session_id: string | null, } | { "exec_state": "Active", session: SessionStatus, } | { "exec_state": "Completed", session: SessionStatus, outcome: JsonValue | null, } | { "exec_state": "Aborted", session: SessionStatus, reason: string, } | { "exec_state": "Failed", session: SessionProgress | null, reason: string | null, };
+
+export type ExecSummary = { exec_id: string, negotiation_id: string | null, program_id: ProgramHash, lifecycle: ExecLifecycle, session_id: string | null,
+/**
+ * Agreed step count when status exposes a started session.
+ */
+step: number | null,
+/**
+ * Local time this Host stored its latest agreed step, Unix ms.
+ */
+last_step_at_ms: number | null,
+/**
+ * Committed ensemble size when status exposes a started session.
+ */
+participants: number | null,
+/**
+ * Committed remote participants (local Host excluded).
+ */
+peers: Array<string>, pending_callout: CalloutSummary | null, receipt_available: boolean, turn: string | null, phase: string | null, end: ExecEndStatus,
+/**
+ * Aborted/failed reason.
+ */
+reason: string | null,
+/**
+ * Completed outcome, program-owned JSON.
+ */
+outcome: JsonValue | null, activation: ActivationInspection | null, created_at_ms: number, updated_at_ms: number, };
 
 export type ExecutionFailureKind = "negotiation" | "host_stopped" | "program_aborted" | "runtime" | "invalid_guest_output";
 
@@ -491,7 +517,7 @@ negotiation_id: string | null,
 /**
  * Absent until the N-of-N activation is durably stored.
  */
-session_id: string | null, exec_state: ExecLifecycle, queue_position: number | null, } } | { "ExecList": Array<ExecListEntry> } | { "Status": ExecStatus } | { "Inspection": ExecutionInspection } | { "Awaited": { exec_id: string, exec_state: ExecLifecycle, reason: string | null, } } | { "Next": NextEvent } | { "Query": { result: JsonValue, } } | { "ExecView": {
+session_id: string | null, exec_state: ExecLifecycle, queue_position: number | null, } } | { "ExecList": Array<ExecSummary> } | { "Status": ExecStatus } | { "Inspection": ExecutionInspection } | { "Awaited": { exec_id: string, exec_state: ExecLifecycle, reason: string | null, } } | { "Next": NextEvent } | { "Query": { result: JsonValue, } } | { "ExecView": {
 /**
  * Index of the latest agreed step applied to the rendered state (steps
  * are numbered from 0, like trace entries). `None` renders the initial

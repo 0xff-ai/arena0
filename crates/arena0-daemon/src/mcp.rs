@@ -404,8 +404,17 @@ struct ExecutionStatusOutput {
 }
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct ExecutionSummaryOutput {
+    execution: ExecRef,
+    negotiation_id: Option<String>,
+    program: ProgramRef,
+    /// The ExecSummary as JSON (same encoding as `state` in ExecutionStatusOutput).
+    summary: Value,
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
 struct ExecutionListOutput {
-    executions: Vec<ExecutionStatusOutput>,
+    executions: Vec<ExecutionSummaryOutput>,
 }
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
@@ -717,7 +726,16 @@ impl Arena0Mcp {
             ResponseOk::ExecList(statuses) => Ok(Json(ExecutionListOutput {
                 executions: statuses
                     .into_iter()
-                    .map(|entry| status_output(entry.status))
+                    .map(|summary| {
+                        Ok(ExecutionSummaryOutput {
+                            execution: exec_ref(summary.exec_id),
+                            negotiation_id: summary.negotiation_id.map(|id| id.to_string()),
+                            program: ProgramRef {
+                                program_id: summary.program_id.to_string(),
+                            },
+                            summary: serialized_value(&summary)?,
+                        })
+                    })
                     .collect::<Result<_, _>>()?,
             })),
             other => Err(unexpected(&other)),

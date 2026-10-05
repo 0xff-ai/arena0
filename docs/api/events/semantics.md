@@ -55,6 +55,11 @@ durable state through the ordinary API methods:
 | Existing executions | `exec.list` and `exec.status` |
 | Prior trace and terminal evidence | `exec.trace`, receipt, and verification methods |
 
+`exec.list` returns compact `ExecSummary` entries from durable index columns;
+`exec.status` retains callout prompts, schemas, and context. List callout
+opening times survive restart. Terminal executions expose no turn or phase in
+either projection.
+
 A graceful stop publishes `host.stopped`. A process failure closes the socket
 without that frame. Treat an unexpected close as a possible process failure.
 

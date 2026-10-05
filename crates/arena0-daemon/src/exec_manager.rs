@@ -113,8 +113,8 @@ impl ExecutionHandle {
         let activation = self.activation().await?;
         Ok(project_lifecycle(
             request.is_some_and(|request| request.failure().is_some()),
-            activation.as_ref(),
-            state.as_ref(),
+            activation.is_some(),
+            state.as_ref().map(ExecutionState::lifecycle),
         ))
     }
 
@@ -396,19 +396,21 @@ impl ExecutionHandle {
     }
 }
 
-/// The one public lifecycle projection. An execution aggregate owns its
-/// lifecycle (a certified step stays `Active` until its receipt is published);
+/// The lifecycle `exec.status` and `exec.list` publish. An execution aggregate
+/// owns its lifecycle (a certified step stays `Active` until its receipt is published);
 /// before one exists, a recorded request failure, then a durable activation,
-/// decide the phase.
+/// decide the phase. `Waiting` is published as `Active` (the turn fields say
+/// whose move it is).
 pub(crate) fn project_lifecycle(
     request_failed: bool,
-    activation: Option<&arena0_store::ActivationRecord>,
-    state: Option<&ExecutionState>,
+    activation_exists: bool,
+    state: Option<ExecLifecycle>,
 ) -> ExecLifecycle {
     match state {
-        Some(state) => state.lifecycle(),
+        Some(ExecLifecycle::Waiting) => ExecLifecycle::Active,
+        Some(lifecycle) => lifecycle,
         None if request_failed => ExecLifecycle::Failed,
-        None if activation.is_some() => ExecLifecycle::Activating,
+        None if activation_exists => ExecLifecycle::Activating,
         None => ExecLifecycle::Negotiating,
     }
 }

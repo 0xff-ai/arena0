@@ -50,7 +50,7 @@ pub enum ResponseOk {
         exec_state: ExecLifecycle,
         queue_position: Option<usize>,
     },
-    ExecList(Vec<ExecListEntry>),
+    ExecList(Vec<ExecSummary>),
     Status(ExecStatus),
     /// `exec.inspect`: an additive, bounded local diagnostic projection.
     Inspection(ExecutionInspection),
@@ -313,14 +313,65 @@ pub enum ExecStatusState {
     },
 }
 
-/// One `exec.list` entry: the execution's status and, once preparation has
-/// started, its durable activation facts.
+/// One `exec.list` entry (replaces `ExecListEntry`): what a list of
+/// executions shows, built from the store's index columns without decoding
+/// any activation record or receipt. A cold turn-memo miss decodes a
+/// non-terminal started session's state once; Activating and terminal entries
+/// decode nothing.
+///
+/// Equivalence (the test oracle): for the same execution at the same store
+/// state, every field equals the matching fact of `exec.status` and
+/// `exec.inspect` (`lifecycle` = `ExecStatus::lifecycle()`, `session_id` =
+/// `ExecStatus::session_id()`, `step`/`peers`/`participants`/
+/// `receipt_available`/`turn`/`phase` = the `SessionStatus` fields,
+/// `reason`/`outcome` = the terminal variant's fields, `end`, `created_at_ms`,
+/// `updated_at_ms` = `ExecStatus`'s, `activation` = `ExecutionInspection.activation`),
+/// except `pending_callout`, which carries the callout's identity and opening
+/// time instead of its prompt, schema and context.
+///
+/// `turn` and `phase` are `None` for terminal executions, in `exec.status`
+/// too: the turn is projected only while an execution can still step.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct ExecListEntry {
-    pub status: ExecStatus,
+pub struct ExecSummary {
+    pub exec_id: ExecId,
+    pub negotiation_id: Option<NegotiationId>,
+    pub program_id: ProgramHash,
+    pub lifecycle: ExecLifecycle,
+    pub session_id: Option<SessionHash>,
+    /// Agreed step count when status exposes a started session.
+    pub step: Option<u64>,
+    /// Local time this Host stored its latest agreed step, Unix ms.
+    pub last_step_at_ms: Option<u64>,
+    /// Committed ensemble size when status exposes a started session.
+    pub participants: Option<usize>,
+    /// Committed remote participants (local Host excluded).
+    pub peers: Vec<PeerId>,
+    pub pending_callout: Option<CalloutSummary>,
+    pub receipt_available: bool,
+    pub turn: Option<PeerId>,
+    pub phase: Option<String>,
+    pub end: ExecEndStatus,
+    /// Aborted/failed reason.
+    pub reason: Option<String>,
+    /// Completed outcome, program-owned JSON.
+    pub outcome: Option<Value>,
     pub activation: Option<ActivationInspection>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+/// An open callout in a list: identity, program-declared name, and the local
+/// time it opened. The prompt, schema and context stay in `exec.status`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct CalloutSummary {
+    pub pending_id: CalloutId,
+    pub callout_index: u32,
+    pub name: String,
+    pub opened_at_ms: u64,
 }
 
 /// Session facts retained after a session starts.

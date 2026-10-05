@@ -35,10 +35,10 @@ pub use request::{
 };
 pub use response::{
     ActivationInspection, ActivationInspectionState, ActivationParticipant, AgreedStep, ApiError,
-    ApiErrorCode, BlobEntry, DaemonInfo, DecodedMessage, EventRecordSummary, ExecEndPhase,
-    ExecEndStatus, ExecListEntry, ExecStatus, ExecStatusState, ExecutionInspection, HostInfo,
-    HostStatus, IdInfo, NextEvent, OpenOffer, PendingCalloutStatus, ProgramDetail, ProgramSummary,
-    ReceiptListEntry, Response, ResponseOk, SessionProgress, SessionStatus,
+    ApiErrorCode, BlobEntry, CalloutSummary, DaemonInfo, DecodedMessage, EventRecordSummary,
+    ExecEndPhase, ExecEndStatus, ExecStatus, ExecStatusState, ExecSummary, ExecutionInspection,
+    HostInfo, HostStatus, IdInfo, NextEvent, OpenOffer, PendingCalloutStatus, ProgramDetail,
+    ProgramSummary, ReceiptListEntry, Response, ResponseOk, SessionProgress, SessionStatus,
 };
 
 #[cfg(test)]
