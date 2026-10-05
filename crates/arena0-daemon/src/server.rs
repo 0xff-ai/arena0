@@ -52,7 +52,7 @@ use tracing::Instrument as _;
 
 use crate::catalog::{CatalogError, ProgramCatalog};
 use crate::exec_manager::{
-    ExecutionHandle, ExecutionHandles, NEGOTIATION_TIMEOUT, Supervisor, project_durable_next,
+    ExecutionHandle, ExecutionHandles, Supervisor, negotiation_timeout, project_durable_next,
     project_lifecycle, satisfies,
 };
 use crate::offers::{OFFER_SWEEP, OfferBook};
@@ -2144,7 +2144,7 @@ impl HostService {
                     let lifecycle = if satisfies(status.lifecycle(), until) {
                         status.lifecycle()
                     } else if let Some(entry) = self.execs.get(&exec_id) {
-                        let deadline = Instant::now() + NEGOTIATION_TIMEOUT;
+                        let deadline = Instant::now() + negotiation_timeout();
                         entry.await_state(until, deadline).await?
                     } else {
                         return Err(ApiError::new(
@@ -3010,7 +3010,7 @@ impl HostService {
     }
 
     async fn await_withdrawal(&self, entry: &ExecutionHandle) -> Result<(), ApiError> {
-        let deadline = Instant::now() + NEGOTIATION_TIMEOUT;
+        let deadline = Instant::now() + negotiation_timeout();
         loop {
             let changed = entry.change_notified();
             match entry
@@ -3111,7 +3111,7 @@ impl HostService {
         execution_store: HostExecutionStore,
     ) -> Result<(), ApiError> {
         let _guard = self.runtime.negotiation_guard().await;
-        let deadline = Instant::now() + NEGOTIATION_TIMEOUT;
+        let deadline = Instant::now() + negotiation_timeout();
         let prepared = record.prepared().clone();
         let offer = prepared.offer().clone();
         let program_id = offer.data().program_hash;
@@ -3339,7 +3339,9 @@ impl HostService {
         };
         let deadline = match &plan {
             NegotiationPlan::Create { .. } | NegotiationPlan::Join { target: None } => None,
-            NegotiationPlan::Join { target: Some(_) } => Some(Instant::now() + NEGOTIATION_TIMEOUT),
+            NegotiationPlan::Join { target: Some(_) } => {
+                Some(Instant::now() + negotiation_timeout())
+            }
         };
 
         let program = self

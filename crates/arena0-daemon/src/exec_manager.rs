@@ -7,7 +7,7 @@
 //! or execution key.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -28,8 +28,30 @@ use crate::server::{Events, HostEvent};
 /// How often to warn while an active session emits no messages.
 const STALL_TIMEOUT: Duration = Duration::from_secs(300);
 const EXECUTION_STOP_TIMEOUT: Duration = Duration::from_secs(6);
-/// Time allowed to finish a selected activation or an exact targeted join.
-pub(crate) const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Time allowed to finish a selected activation or an exact targeted join:
+/// 30 s. Debug builds read `ARENA0_NEGOTIATION_TIMEOUT_MS` once per process
+/// so browser suites can watch a real negotiation time out without waiting
+/// 30 s; release builds ignore the variable. A value that is not a positive
+/// integer number of milliseconds panics on first use: it is a test seam,
+/// not user input.
+pub(crate) fn negotiation_timeout() -> Duration {
+    static OVERRIDE: OnceLock<Duration> = OnceLock::new();
+    if cfg!(debug_assertions) {
+        *OVERRIDE.get_or_init(|| {
+            match std::env::var("ARENA0_NEGOTIATION_TIMEOUT_MS") {
+                Err(_) => Duration::from_secs(30),
+                Ok(raw) => match raw.parse::<u64>() {
+                    Ok(ms) if ms > 0 => Duration::from_millis(ms),
+                    _ => panic!(
+                        "ARENA0_NEGOTIATION_TIMEOUT_MS must be a positive integer number of milliseconds, got {raw:?}"
+                    ),
+                },
+            }
+        })
+    } else {
+        Duration::from_secs(30)
+    }
+}
 
 #[derive(Debug)]
 struct NegotiationHandle {
