@@ -100,6 +100,22 @@ macro_rules! id_type {
         )]
         $vis struct $name(pub [u8; 32]);
 
+        // JSON carries hex strings. Treating ids as a TS primitive also avoids
+        // collisions between domain-local names such as `Id` and `Hash`.
+        #[cfg(feature = "ts")]
+        impl ::ts_rs::TS for $name {
+            type WithoutGenerics = Self;
+            type OptionInnerType = Self;
+
+            fn name(_: &::ts_rs::Config) -> String {
+                "string".into()
+            }
+
+            fn inline(_: &::ts_rs::Config) -> String {
+                "string".into()
+            }
+        }
+
         impl ::serde::Serialize for $name {
             fn serialize<S>(&self, serializer: S) -> ::core::result::Result<S::Ok, S::Error>
             where

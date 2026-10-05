@@ -30,6 +30,8 @@ use arena0_program::bounded;
     Hash,
     valuable::Valuable,
 )]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(type = "string"))]
 pub struct CalloutId(u64);
 
 impl CalloutId {

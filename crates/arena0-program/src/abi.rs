@@ -21,6 +21,8 @@ pub const MAX_CALL_PAYLOAD_BYTES: usize = crate::profile::MAX_INPUT_BYTES as usi
 pub const MAX_SESSION_CONTEXT_BYTES: usize = 1024 * 1024;
 /// Maximum UTF-8 bytes returned as the reason for a rejected input dispatch.
 pub const MAX_REJECTION_REASON_BYTES: usize = 1024;
+/// Maximum UTF-8 bytes in the phase name a view reports.
+pub const MAX_PHASE_NAME_BYTES: usize = 64;
 /// Maximum bytes in the JSON context of one derived open callout.
 pub const MAX_CALLOUT_CONTEXT_BYTES: usize = 64 * 1024;
 /// Host bytes a synchronous `sign` call adds around the guest payload: the
@@ -37,6 +39,8 @@ pub const VERIFY_RESULT_OVERHEAD_BYTES: usize = 8;
 
 /// Bounded, complete JSON bytes at an agent-facing request or projection boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(as = "Vec<u8>"))]
 pub struct JsonBytes(Vec<u8>);
 
 impl JsonBytes {

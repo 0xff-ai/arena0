@@ -64,7 +64,10 @@ catalog. The local transport does not fetch programs; every selected Host must
 have the same exact Wasm locally. `ProgramSummary.participants` declares
 supported counts. Fixed programs use `{"kind":"exact","count":2}`,
 while variable-size programs use `{"kind":"range","min":2,"max":64}`. The
-requested participant count must fall within it.
+requested participant count must fall within it. The `schema` of `program.get`
+lists the program's declared `phases` in declaration order, each with `name`,
+`description`, `is_default`, and `is_terminal`; the list is empty when the
+program declares none. A session's `phase` is one of these names.
 
 ## Blobs
 
@@ -72,6 +75,7 @@ requested participant count must fall within it.
 |---|---|---|
 | `blob.import` | `{path}` | `BlobImported` `{hash, length}` |
 | `blob.export` | `{hash, path}` | `BlobExported` `{length}` |
+| `blob.list` | — | `BlobList` `[{hash, length, path, linked}]` |
 
 A blob is immutable content of at most 16 MiB, named by its BLAKE3 hash as 64
 hex characters. Paths are absolute paths on the Host's machine.
@@ -87,11 +91,15 @@ path, or content over the limit, is `BadRequest`.
 existing file (`BadRequest`). An unknown hash is `NotFound`; a blob whose file
 is gone or shorter than its length is `BadRequest`.
 
+`blob.list` returns every blob the Host stores, ordered by hash. `path` is the
+file the Host reads the blob from. `linked` is true for a file imported in
+place with `blob.import` and false for a file the Host received and owns.
+
 An execution reads only the blobs its participant grants in `exec.new` and the
 blobs it receives and commits. Pass a blob's `hash` and `length` to the program
 as ordinary params. The Host never logs blob bytes. The CLI wraps these as
-`arena0 blob import FILE`, `arena0 blob export HASH FILE`, and
-`arena0 exec create PROGRAM --blob HASH` (repeatable).
+`arena0 blob import FILE`, `arena0 blob export HASH FILE`, `arena0 blob list`,
+and `arena0 exec create PROGRAM --blob HASH` (repeatable).
 
 ## Execution
 
@@ -105,8 +113,8 @@ as ordinary params. The Host never logs blob bytes. The CLI wraps these as
 | `exec.next` | `{exec_id}` | `Next` |
 | `exec.submit` | `{exec_id, pending_id, answer?}` | `Ack` |
 | `exec.query` | `{exec_id, query?}` | `Query` |
-| `exec.view` | `{exec, width, color}` | `ExecView` |
-| `exec.trace` | `{exec_id, from, to}` | `Trace` |
+| `exec.view` | `{exec, width, color, at_step?}` | `ExecView` |
+| `exec.trace` | `{exec_id, from, to}` | `Trace` `[{certified_at_ms, entry}]` |
 | `exec.cancel_creation` | `{exec_id}` | `Ack` |
 | `exec.withdraw` | `{exec_id}` | `Ack` |
 | `exec.terminate` | `{exec_id, reason}` | `Ack` |
@@ -114,6 +122,51 @@ as ordinary params. The Host never logs blob bytes. The CLI wraps these as
 `exec.view` renders the program's shared-state view during execution and after
 termination. Terminal views use the saved shared state and remain available
 after the live execution driver exits. Negotiating executions have no view yet.
+The reply's `step` is the index of the latest agreed step the rendered state
+includes, numbered from 0 like `exec.trace` entries and `exec.session.step`
+events; `null` renders the initial state before step 0 is certified.
+
+The reply's `view` has the four text `slots` and, for programs that provide
+them, `blocks`: typed pieces a rich client can lay out, in the same order the
+program produced them. Text slots stay the portable rendering; a client that
+does not know a block ignores it. Every block is an object with a `kind`:
+
+| `kind` | Fields |
+| --- | --- |
+| `facts` | `title?`, `items: [{label, value: Cell}]` |
+| `table` | `title?`, `columns: [text]`, `rows: [[Cell]]` |
+| `board` | `title?`, `rows`, `cols`, `cells: [Cell]` (row-major), `row_labels`, `col_labels` |
+| `progress` | `label`, `value`, `max` |
+| `roster` | `title?`, `entries: [{participant, status: Cell, detail?}]` |
+
+A `Cell` is `{text, tone?, participant?}`. `tone` is one of `normal` (the
+default), `muted`, `good`, `warn`, `bad`, `highlight`; clients choose the
+colours. `participant` is an index into the committed ensemble, so a client
+colours a participant's values consistently. Blocks appear only in the reply
+when a program produces them; a view without blocks has no `blocks` field.
+
+The Host validates blocks before replying. At most 16 blocks; tables of at
+most 64 rows and 16 columns; boards of at most 32 rows and 32 columns whose
+`cells` hold exactly `rows * cols` cells and whose label lists are empty or one
+per row and column; rosters of at most 64 entries; every text at most 256
+bytes; every `participant` below the ensemble size. A view that breaks a limit
+fails the request with `Execution` and a message naming the limit. Nothing is
+truncated.
+
+`at_step` renders the shared state after that agreed step instead of the latest
+state; `step` in the reply is then `at_step`. The latest agreed step is the
+`step` of the last trace entry. The Host does not store past states. It
+replays the agreed steps `0` through `at_step` in a fresh program instance,
+checks the initial state and every step's `post_state` against the agreed
+trace, and renders the result, so the cost grows with `at_step`. It works for
+active and terminal executions. Errors:
+
+- `BadRequest`: `at_step` is beyond the latest agreed step
+  (`step 9 is beyond the latest agreed step 4`).
+- `Execution`: the execution has no agreed step yet (a negotiating or
+  activating execution returns the error a latest view returns), or the replay
+  did not reproduce the agreed trace. The message names the step; nothing is
+  rendered from a state that disagrees with the trace.
 
 `blobs` lists hashes of imported blobs this participant grants the execution;
 it defaults to none. An unknown hash is `NotFound`, before anything is
@@ -138,7 +191,20 @@ binding. The `exec.created` event omits the field while it is unknown.
 `exec.status` exposes the committed `session_id` as soon as activation commits.
 Once session progress exists, its `session` object also reports the public step,
 committed participants, pending callout summary, and whether this Host's
-receipt or stop report is durably available.
+receipt or stop report is durably available. It also carries the program's turn
+at the agreed step, as the program's view reports it: `turn`, the `PeerId` of
+the participant whose message the program accepts next (`null` when the program
+names none), and `phase`, the declared name of the program's current phase
+(`null` for a program that declares no phases). Every Host of the session
+reports the same `turn` and `phase` at the same step. The program computes both
+from the agreed shared state, and a status call fails rather than omit them
+when the program cannot project its view.
+
+`exec.status` also reports two local times in Unix milliseconds:
+`created_at_ms`, when the execution request was created, and `updated_at_ms`,
+the execution's latest durable transition. Before the execution exists,
+`updated_at_ms` is the activation record's latest change, and before that the
+request's `created_at_ms`.
 
 The top-level `end` object reports local confirmation of the terminal result:
 `{"phase":"open","unconfirmed":[]}`, `{"phase":"ending","unconfirmed":["<peer-id>"]}`,
@@ -148,14 +214,21 @@ of this phase.
 
 `exec.inspect` is a bounded, Host-local diagnostic projection for operator
 interfaces. It returns `exec.status`, durable activation facts, participant
-peer IDs and ticket commitments, and summaries of event dispatch records.
+peer IDs and ticket commitments, the offer `params` as JSON (every participant
+of the offer signed them), and summaries of event dispatch records.
 It never returns event payloads, replacement local state, signatures, keys,
-parameters, outcomes, or callout context. Event records are the latest
+outcomes, or callout context. Event records are the latest
 store-bounded window. The response exposes the page through `events_from`,
 `events`, `events_total`, and `events_next`; `events_total` reveals when older
 records are omitted.
 Inspection data is local diagnostic evidence, not a protocol receipt or
 semantic system-event stream.
+
+`exec.trace` returns the agreed steps in `[from, to)`, each as
+`{certified_at_ms, entry}`. `entry` is the portable trace entry.
+`certified_at_ms` is the local time, in Unix milliseconds, at which this Host
+durably stored the step. It is a local observation that differs between Hosts
+and is not part of the trace entry, the trace hashes, or any receipt.
 
 ### Admission
 

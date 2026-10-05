@@ -21,10 +21,12 @@ mod actor;
 mod blobs;
 mod delivery;
 mod guest;
+mod replay;
 mod terminal;
 
 pub(crate) use actor::spawn_execution;
 pub(crate) use delivery::authenticates;
+pub use replay::{ReplayError, replay_shared};
 pub(crate) use terminal::fail_execution;
 
 const COMMAND_CAPACITY: usize = 64;

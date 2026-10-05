@@ -775,6 +775,7 @@ mod resident_runtime_tests {
                 params: unit.clone(),
                 queries: Vec::new(),
                 outcome: unit,
+                phases: Vec::new(),
             },
         }
     }

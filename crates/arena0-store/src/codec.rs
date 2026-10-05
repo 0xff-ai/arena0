@@ -141,16 +141,19 @@ pub(crate) fn max_program_bytes() -> Result<usize, StoreError> {
 pub(crate) fn prepared_activation_record(
     execution_id: ExecId,
     prepared: PreparedActivation,
+    updated_at_ms: u64,
 ) -> ActivationRecord {
     ActivationRecord {
         execution_id,
         state: ActivationRecordState::Prepared { evidence: prepared },
+        updated_at_ms,
     }
 }
 
 pub(crate) fn committed_activation_record(
     execution_id: ExecId,
     activation: Activation,
+    updated_at_ms: u64,
 ) -> Result<ActivationRecord, StoreError> {
     let prepared = activation.prepared().clone();
     Ok(ActivationRecord {
@@ -159,6 +162,7 @@ pub(crate) fn committed_activation_record(
             evidence: prepared,
             activation: Box::new(activation),
         },
+        updated_at_ms,
     })
 }
 

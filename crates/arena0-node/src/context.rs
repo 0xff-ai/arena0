@@ -128,8 +128,9 @@ pub enum ExecCommand {
     View {
         /// Complete agent-facing JSON viewport.
         viewport: JsonBytes,
-        /// View result, paired with the durable public position observed.
-        reply: oneshot::Sender<Result<(u64, View), ExecError>>,
+        /// View result, paired with the index of the latest agreed step it
+        /// includes (`None` before step 0 is certified).
+        reply: oneshot::Sender<Result<(Option<u64>, View), ExecError>>,
     },
     /// Deliver one transport-authenticated frame after the stream reader has
     /// placed it on the actor's serialized command queue.

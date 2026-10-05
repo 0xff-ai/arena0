@@ -61,6 +61,7 @@ pub enum ReceiptWork {
 /// authorship is derived from an authenticated occurrence's sender and the
 /// execution producer; it is not a second persisted status dimension.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum StopCause {
     /// A signed local or peer abort/failure occurrence.
     Authenticated(AbortOccurrence),

@@ -288,11 +288,94 @@ pub mod vickrey_auction {
             status
         };
 
-        View::new()
+        let view = View::new()
+            .turn(match state.phase() {
+                Phase::Setup => None,
+                Phase::Bidding => state.bids.next_participant(),
+                Phase::TieBreak => state.entropy.next_participant(),
+            })
             .header(vp.fit_text(format!("Sealed-Bid Vickrey Auction | {}", state.item)))
             .agents(vp.fit_text(agents))
             .state(vp.fit_text(body))
             .status_bar(vp.fit_text(status))
+            .block(facts_block(state));
+        if state.bids.participant_count() > 1 {
+            view.block(bidders_block(state))
+        } else {
+            view
+        }
+    }
+
+    fn facts_block(state: &Shared) -> Block {
+        let count = state.bids.participant_count();
+        let reveals = (0..count)
+            .filter(|&index| bid_status(&state.bids, index) == "revealed")
+            .count();
+        let phase = if state.settlement.is_some() {
+            "complete"
+        } else {
+            phase_label(state.phase())
+        };
+        let fact = |label: &str, text: String| Fact {
+            label: label.into(),
+            value: Cell::text(text),
+        };
+        Block::Facts {
+            title: None,
+            items: vec![
+                fact(
+                    "Reserve",
+                    state
+                        .reserve
+                        .map_or_else(|| "none".to_owned(), |reserve| reserve.to_string()),
+                ),
+                fact("Phase", phase.to_owned()),
+                fact(
+                    "Commitments",
+                    format!("{}/{count}", count_commits(&state.bids)),
+                ),
+                fact("Reveals", format!("{reveals}/{count}")),
+            ],
+        }
+    }
+
+    /// One row per bidder. A bid appears only once every reveal has arrived,
+    /// exactly when the text view shows it.
+    fn bidders_block(state: &Shared) -> Block {
+        let bids = (state.bids.phase() == commit_reveal::Phase::Complete)
+            .then(|| state.bidder_bids())
+            .flatten();
+        let winner = match &state.settlement {
+            Some(Settlement::Sold { winner, .. }) => Some(winner.index()),
+            _ => None,
+        };
+        let rows = (1..state.bids.participant_count())
+            .map(|index| {
+                let status = bid_status(&state.bids, index);
+                let bid = bids
+                    .as_ref()
+                    .and_then(|bids| bids.get(index - 1))
+                    .map_or_else(|| "hidden".to_owned(), u64::to_string);
+                let tone = if winner == Some(index) {
+                    Tone::Good
+                } else {
+                    Tone::Normal
+                };
+                let index_u8 = u8::try_from(index).expect("auction participant fits in u8");
+                vec![
+                    Cell::text(format!("P{index}"))
+                        .participant(index_u8)
+                        .tone(tone),
+                    Cell::text(status).tone(tone),
+                    Cell::text(bid).tone(tone),
+                ]
+            })
+            .collect();
+        Block::Table {
+            title: Some("Bidders".into()),
+            columns: vec!["Bidder".into(), "Status".into(), "Bid".into()],
+            rows,
+        }
     }
 
     fn initialize(shared: &mut Shared, params: Params) -> Result<(), ProgramFault> {

@@ -11,6 +11,7 @@ use arena0_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 
 /// One response frame.
 pub type Response = Result<ResponseOk, ApiError>;
@@ -31,6 +32,8 @@ pub enum ResponseOk {
     BlobExported {
         length: u64,
     },
+    /// `blob.list`: every blob this Host stores, ordered by hash.
+    BlobList(Vec<BlobEntry>),
     /// `exec.new` returns immediately; negotiation runs in the background. The state
     /// is `Negotiating` (or its later observable states); `queue_position` is `Some`
     /// when this creation waits behind another daemon-wide negotiation.
@@ -62,10 +65,13 @@ pub enum ResponseOk {
     },
     /// `exec.view`: the program-authored view rendered for a terminal viewport.
     ExecView {
-        step: u64,
+        /// Index of the latest agreed step applied to the rendered state (steps
+        /// are numbered from 0, like trace entries). `None` renders the initial
+        /// state before step 0 is certified.
+        step: Option<u64>,
         view: View,
     },
-    Trace(Vec<TraceEntry>),
+    Trace(Vec<AgreedStep>),
     Receipt(Box<ReceiptArtifact>),
     ReceiptList(Vec<ReceiptListEntry>),
     /// `receipt.verify`: the recovered structural and cryptographic evidence,
@@ -199,6 +205,11 @@ pub struct ExecStatus {
     pub negotiation_id: Option<NegotiationId>,
     pub program_id: ProgramHash,
     pub state: ExecStatusState,
+    /// Local time the execution request was created, Unix milliseconds.
+    pub created_at_ms: u64,
+    /// Local time of the execution's latest durable transition, Unix
+    /// milliseconds.
+    pub updated_at_ms: u64,
 }
 
 /// Public local end-confirmation progress.
@@ -262,11 +273,17 @@ pub struct SessionStatus {
     pub pending_callout: Option<PendingCalloutStatus>,
     /// Whether this Host's locally produced artifact is durably available.
     pub receipt_available: bool,
+    /// The participant whose message the program accepts next, if any, as
+    /// the program's view reports it.
+    pub turn: Option<PeerId>,
+    /// The program's current phase name, for programs that declare phases.
+    pub phase: Option<String>,
 }
 
 /// A bounded, host-local projection of durable execution facts for inspection
-/// UIs. It contains no signatures, keys, parameters, outcomes, callout
-/// contexts, or participant-specific payload bytes.
+/// UIs. It contains the offer params, which every participant of the offer
+/// signed, and no signatures, keys, outcomes, callout contexts, or
+/// participant-specific payload bytes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionInspection {
@@ -304,6 +321,9 @@ pub struct ActivationInspection {
     pub initial_state: StateHash,
     /// All selected participants in canonical activation order.
     pub participants: Vec<ActivationParticipant>,
+    /// Offer params as JSON. Every participant of the offer signed them, so
+    /// they are public to the session's participants.
+    pub params: Value,
 }
 
 /// State of a durable activation record.
@@ -464,6 +484,28 @@ pub enum NextEvent {
     },
     /// The execution failed or aborted.
     Failed { reason: String },
+}
+
+/// One agreed step and the local time this Host durably stored it. The time
+/// is a local observation and is not part of the portable trace.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgreedStep {
+    pub certified_at_ms: u64,
+    pub entry: TraceEntry,
+}
+
+/// One stored blob.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BlobEntry {
+    pub hash: BlobHash,
+    pub length: u64,
+    /// The daemon-local file the blob reads from.
+    pub path: PathBuf,
+    /// True when imported in place (`blob.import`); false for a file this Host
+    /// received and owns.
+    pub linked: bool,
 }
 
 /// A `receipt.list` entry: the content address, its session and producer, program,

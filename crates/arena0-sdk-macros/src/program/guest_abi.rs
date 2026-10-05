@@ -495,11 +495,15 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
             let ensemble: ::arena0::Ensemble<::arena0::Committed> =
                 ::arena0::borsh::from_slice(&input.session)
                     .expect("view session context deserialization failed");
-            let view = <#program_ty as ::arena0::ProgramView>::view(
+            let mut view = <#program_ty as ::arena0::ProgramView>::view(
                 &shared,
                 &ensemble,
                 &viewport,
             );
+            view.phase = <#program_ty as ::arena0::Program>::__phase(&shared).map(|phase| {
+                <<#program_ty as ::arena0::Program>::Phase as ::arena0::Arena0Phase>::as_str(phase)
+                    .to_owned()
+            });
             let json = ::arena0::serde_json::to_vec(&view)
                 .expect("view serialization failed");
             __arena0_write_result(&::arena0::ViewOutput { json })
@@ -548,6 +552,15 @@ pub(super) fn guest_abi(input: GuestAbi) -> TokenStream2 {
                 params: <#params_ty as ::arena0::ProgramValue>::json_schema(),
                 queries: <#query_ty as ::arena0::Arena0Query>::schemas(),
                 outcome: <#outcome_ty as ::arena0::ProgramValue>::json_schema(),
+                phases: <#program_ty as ::arena0::Program>::__phase_decls()
+                    .iter()
+                    .map(|decl| ::arena0::PhaseSchema {
+                        name: decl.name.into(),
+                        description: decl.description.into(),
+                        is_default: decl.is_default,
+                        is_terminal: decl.is_terminal,
+                    })
+                    .collect(),
             };
             let bytes = ::arena0::ProgramDefinition { metadata, schema }
                 .encode()

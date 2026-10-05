@@ -139,15 +139,16 @@ pub use arena0_program::{
     MAX_LOCAL_STATE_BYTES, MAX_REJECTION_REASON_BYTES, MessageSchema, OutcomeBytes,
     OutcomeBytesError, OutcomeInput, OutcomeOutput, PROGRAM_DEFINITION_MAGIC,
     PROGRAM_DEFINITION_VERSION, PROGRAM_MAX_LEN, ParticipantCount, ParticipantCountError,
-    PrimitiveRouteSchema, ProgramDefinition, ProgramDefinitionError, ProgramHash, ProgramMetadata,
-    ProgramSchema, QueryInput, QueryOutput, QuerySchema, SharedStateBytes, StateBytesError,
-    StateSchema, ViewInput, ViewOutput, abi,
+    PhaseSchema, PrimitiveRouteSchema, ProgramDefinition, ProgramDefinitionError, ProgramHash,
+    ProgramMetadata, ProgramSchema, QueryInput, QueryOutput, QuerySchema, SharedStateBytes,
+    StateBytesError, StateSchema, ViewInput, ViewOutput, abi,
 };
 pub use arena0_protocol as types;
 pub use arena0_protocol::{
-    Attachment, BlobError, BlobHash, ChainingValue, Committed, CvSource, Effect, Ensemble,
-    EnsembleError, Event, LogLevel, Open, Participant, PeerId, RangeAttachment, SessionHash,
-    StateHash, TimerPayload, VerifyError, View, Viewport,
+    Attachment, BlobError, BlobHash, Block, Cell, ChainingValue, Committed, CvSource, Effect,
+    Ensemble, EnsembleError, Event, Fact, LogLevel, Open, Participant, PeerId, RangeAttachment,
+    RosterEntry, SessionHash, StateHash, TimerPayload, Tone, VerifyError, View, ViewError,
+    Viewport,
 };
 pub use borsh;
 pub use schemars;

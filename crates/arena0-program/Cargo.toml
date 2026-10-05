@@ -8,6 +8,7 @@ description = "Program artifacts, guest ABI contracts, schemas, and execution pr
 publish = true
 
 [dependencies]
+ts-rs = { workspace = true, optional = true }
 arena0-crypto = { path = "../arena0-crypto", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
@@ -22,3 +23,6 @@ blake3.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+ts = ["dep:ts-rs", "arena0-crypto/ts"]

@@ -80,9 +80,9 @@ impl Ctx {
     pub(crate) async fn fetch_exec_view(
         &self,
         exec_id: ExecId,
-    ) -> anyhow::Result<Option<(u64, View)>> {
+    ) -> anyhow::Result<Option<(Option<u64>, View)>> {
         self.client
-            .exec_view(&self.host, exec_id, self.viewport())
+            .exec_view(&self.host, exec_id, self.viewport(), None)
             .await
     }
 }
@@ -257,6 +257,8 @@ enum BlobCommand {
     /// and length for use as program parameters. The Host reads the file in
     /// place, so it must stay unchanged while executions use it.
     Import { file: PathBuf },
+    /// List the Host's stored blobs, ordered by hash.
+    List,
     /// Write the blob with this hash to a new file on the Host's machine.
     Export {
         #[arg(value_parser = |value: &str| value.parse::<arena0_client::protocol::BlobHash>().map(|_| value.to_owned()))]
@@ -310,8 +312,14 @@ enum ExecCommand {
     },
     /// Execute a read-only JSON query.
     Query { exec_id: String, input: String },
-    /// Render the program-authored view.
-    View { exec_id: String },
+    /// Render the program-authored view, by default of the latest state.
+    View {
+        exec_id: String,
+        /// Render the state after this agreed step instead. The Host replays
+        /// the agreed steps up to it, so the cost grows with the step.
+        #[arg(long)]
+        step: Option<u64>,
+    },
     /// Read the durable trace.
     Trace {
         exec_id: String,
@@ -1305,6 +1313,24 @@ async fn blob(ctx: &Ctx, command: BlobCommand) -> anyhow::Result<()> {
                 println!("{hash} {length}");
             }
         }
+        BlobCommand::List => {
+            let ResponseOk::BlobList(blobs) = ctx.call(&HostRequest::BlobList).await? else {
+                bail!("unexpected response to blob.list");
+            };
+            if ctx.mode.is_json() {
+                ui::print_json(&json!(blobs));
+            } else {
+                for blob in blobs {
+                    println!(
+                        "{} {} {} {}",
+                        blob.hash,
+                        blob.length,
+                        if blob.linked { "linked" } else { "received" },
+                        blob.path.display()
+                    );
+                }
+            }
+        }
         BlobCommand::Export { hash, file } => {
             let hash = hash.parse::<arena0_client::protocol::BlobHash>()?;
             let path = std::path::absolute(&file)
@@ -1326,6 +1352,34 @@ async fn blob(ctx: &Ctx, command: BlobCommand) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` for a Unix millisecond time, computed from the day
+/// count (no timezone crate). Sub-second precision is dropped.
+fn rfc3339_utc_seconds(unix_ms: u64) -> String {
+    let secs = unix_ms / 1000;
+    let (days, time) = (secs / 86_400, secs % 86_400);
+    // Civil date from days since 1970-01-01 (Hinnant's `civil_from_days`).
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let day_of_era = z % 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + u64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        time / 3600,
+        (time % 3600) / 60,
+        time % 60
+    )
 }
 
 async fn program(ctx: &Ctx, command: ProgramCommand) -> anyhow::Result<()> {
@@ -1623,7 +1677,7 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
                 other => bail!("unexpected response to exec.query: {other:?}"),
             }
         }
-        ExecCommand::View { exec_id } => {
+        ExecCommand::View { exec_id, step } => {
             let exec_id = ctx.client().resolve_exec(&ctx.host, &exec_id).await?;
             let viewport = ctx.viewport();
             match ctx
@@ -1631,6 +1685,7 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
                     exec: exec_id,
                     width: viewport.width,
                     color: viewport.color,
+                    at_step: step,
                 })
                 .await?
             {
@@ -1650,14 +1705,17 @@ async fn execution(ctx: &Ctx, command: ExecCommand) -> anyhow::Result<()> {
                 .call(&HostRequest::ExecTrace { exec_id, from, to })
                 .await?
             {
-                ResponseOk::Trace(entries) => {
+                ResponseOk::Trace(steps) => {
                     if ctx.mode.is_json() {
-                        ui::print_json(&json!({ "entries": entries }));
+                        ui::print_json(&json!({ "steps": steps }));
                     } else {
-                        for entry in entries {
+                        for step in steps {
                             println!(
-                                "step {}  {} -> {}",
-                                entry.step, entry.pre_state, entry.post_state
+                                "step {}  certified {}  {} -> {}",
+                                step.entry.step,
+                                rfc3339_utc_seconds(step.certified_at_ms),
+                                step.entry.pre_state,
+                                step.entry.post_state
                             );
                         }
                     }
