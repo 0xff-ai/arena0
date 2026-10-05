@@ -12,6 +12,7 @@ use crate::ApiErrorCode;
 
 /// One daemon-scoped operational activity frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ActivityFrame {
     pub boot_id: String,
     pub seq: u64,
@@ -23,14 +24,17 @@ pub struct ActivityFrame {
 /// One lifecycle or stream-control activity record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ActivityData {
     #[serde(rename = "started")]
     Started {
         call_id: String,
         tool: String,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         host: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         exec_id: Option<ExecId>,
     },
     #[serde(rename = "finished")]
@@ -46,12 +50,14 @@ pub enum ActivityData {
 /// Result class for one completed MCP tool call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ActivityResult {
     #[serde(rename = "ok")]
     Ok,
     #[serde(rename = "tool_error")]
     ToolError {
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         code: Option<ApiErrorCode>,
     },
     #[serde(rename = "interrupted")]

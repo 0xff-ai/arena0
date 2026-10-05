@@ -9,7 +9,7 @@ use arena0_test_engine::shared_test_engine;
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
 
-use crate::{Daemon, McpConfig};
+use crate::{Daemon, HttpConfig};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -32,7 +32,7 @@ impl TestDaemon {
 
     async fn from_root_with_names(root: TempDir, names: Vec<HostName>) -> Self {
         let home = Home::from_root(root.path().to_path_buf()).expect("home");
-        let mcp = McpConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)), None).expect("MCP config");
+        let mcp = HttpConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)), None).expect("MCP config");
         let engine = shared_test_engine();
         let daemon = Daemon::start(names, mcp, engine, home.clone(), true)
             .await
@@ -262,7 +262,7 @@ async fn failed_initial_socket_startup_releases_all_resources_for_retry() {
     let root = tempfile::tempdir().expect("temporary daemon home");
     let home = Home::from_root(root.path().to_path_buf()).expect("home");
     let socket = home.socket();
-    let mcp = McpConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)), None).expect("MCP config");
+    let mcp = HttpConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)), None).expect("MCP config");
     let engine = shared_test_engine();
     let daemon = Daemon::start(
         vec!["first".parse().unwrap(), "second".parse().unwrap()],

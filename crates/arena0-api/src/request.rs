@@ -18,10 +18,21 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::events::EventFilter;
+
+/// Bytes read for an import: a daemon-local file (socket callers only), or
+/// an upload named by the BLAKE3 hash of its bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub enum FileSource {
+    Path(PathBuf),
+    Upload(BlobHash),
+}
 /// One request to the daemon's shared Unix endpoint. Host operations always
 /// name their target explicitly; daemon operations do not select a Host.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "method", content = "params", deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum Request {
     /// Dispatch an existing Host operation in one exact local namespace.
     #[serde(rename = "host.call")]
@@ -46,7 +57,10 @@ pub enum Request {
 /// Event subscriptions acknowledge the request, then stream Host event frames.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "method", content = "params", deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum HostRequest {
+    #[serde(rename = "negotiation.offers")]
+    NegotiationOffers,
     #[serde(rename = "host.info")]
     Info,
     // Identity / custody (CLI only; never sent by the MCP server). Seeds never
@@ -61,12 +75,12 @@ pub enum HostRequest {
     #[serde(rename = "program.get")]
     ProgramGet { program: String },
     #[serde(rename = "program.import")]
-    ProgramImport { wasm: Vec<u8> },
+    ProgramImport { source: FileSource },
     // Blobs. Paths are on the daemon's filesystem. Import links the file in
     // place: the daemon hashes it once and reads it again only to send or
     // export ranges; the file must stay unchanged while executions use it.
     #[serde(rename = "blob.import")]
-    BlobImport { path: PathBuf },
+    BlobImport { source: FileSource },
     #[serde(rename = "blob.export")]
     BlobExport { hash: BlobHash, path: PathBuf },
     #[serde(rename = "blob.list")]
@@ -171,6 +185,7 @@ pub enum HostRequest {
 
 /// The state `exec.await` blocks for: session established, or terminal.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum AwaitState {
     /// The session has confirmed and started (execution can run).
     Active,
@@ -180,6 +195,7 @@ pub enum AwaitState {
 
 /// How `exec.new` starts or joins a negotiation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum EnsembleSpec {
     /// Create an offer and collect exactly this many participants, including
     /// the local Host.
@@ -191,6 +207,7 @@ pub enum EnsembleSpec {
 
 /// Select exact stored evidence, this Host's session publication, or an inline artifact.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ReceiptRef {
     Produced(SessionHash),
     Stored(arena0_protocol::ReceiptId),

@@ -1491,7 +1491,7 @@ async fn request_is_idempotent_and_salt_is_durable() {
     );
     assert_eq!(
         writer
-            .create_execution_request(hash, Some(params), admission, &[], 3)
+            .create_execution_request(hash, Some(params.clone()), admission.clone(), &[], 3)
             .await
             .expect("retry"),
         ExecutionRequestOutcome::AlreadyExists

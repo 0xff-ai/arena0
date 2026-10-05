@@ -26,9 +26,14 @@ bypasses the filter. `host.stopped` is a normal shutdown event.
 | Tag | Data |
 |---|---|
 | `negotiation.offer_seen` | `{program_id, negotiation_id, creator, offer_seq}` |
+| `negotiation.offer_closed` | `{program_id, negotiation_id, creator, reason}` |
 
-This event reports an offer observed by the local host before it has an
-execution record. It has no `exec_id` or `session_id`.
+`offer_seen` reports an authenticated offer newly added to this Host's open
+offers, independently of any local Join. `offer_closed` reports its removal
+because it completed (`complete`), its deadline passed (`expired`), or its
+program left the catalog (`unwatched`). Capacity eviction emits no closure.
+Both events are Host-local, with no `exec_id` or `session_id`, and do not emit
+system events. A Join's acceptance is `exec.negotiation.offer_accepted`.
 
 ## Execution events
 
@@ -68,6 +73,7 @@ The activation events `prepared`, `resumed`, and `committed` carry
 | `exec.session.callout_answered` | `{pending_id}` |
 | `exec.session.step` | `{step, pre_state, post_state, signers, participants}` |
 | `exec.session.ended` | `{terminal}` |
+| `exec.session.end_progress` | `{phase, unconfirmed}` |
 
 `exec.session.callout_answered` is emitted only for an accepted answer. A
 program-level rejection leaves the pending callout open and emits no event.

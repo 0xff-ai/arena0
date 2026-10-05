@@ -6,6 +6,12 @@ local Host ID explicitly; identity and storage remain independent per Host.
 `arena0-api` owns the DTOs, `arena0-daemon` dispatches them, and
 `arena0-client::DaemonClient` is the shared Unix-socket client used by the CLI.
 
+The same requests are available over [HTTP](http.md). `daemon.info` returns
+`DaemonInfo { version, abi_version, uptime_secs, socket, http_url, ui }`;
+`http_url` is the base HTTP URL, with MCP at `{http_url}/mcp`. The boolean
+`ui` reports whether a UI directory was configured with `ARENA0_UI_DIR`;
+it does not check whether its files still exist after startup.
+
 ## Framing
 
 Each request and response is UTF-8 JSON preceded by a big-endian `u32`
@@ -54,8 +60,13 @@ Seeds never cross the socket. `IdInfo` contains public identity material only.
 |---|---|---|
 | `program.list` | — | `ProgramList` |
 | `program.get` | `{program}` | `Program` |
-| `program.import` | `{wasm}` | `Program` |
+| `program.import` | `{source}` | `Program` |
 | `program.remove` | `{program}` | `Ack` |
+
+`source` is either `{"path":"/absolute/file.wasm"}` (socket only) or
+`{"upload":"<64-hex>"}` from `POST /uploads`. Programs require an
+`application/wasm` upload. Missing uploads are `NotFound`; an octet-stream
+upload is `BadRequest`.
 
 `program` accepts a local name, an unambiguous content-hash prefix, or a full
 `ProgramHash`. Program import validates the complete guest ABI and embedded
@@ -73,33 +84,63 @@ program declares none. A session's `phase` is one of these names.
 
 | Method | Params | Success |
 |---|---|---|
-| `blob.import` | `{path}` | `BlobImported` `{hash, length}` |
+| `blob.import` | `{source}` | `BlobImported` `{hash, length}` |
 | `blob.export` | `{hash, path}` | `BlobExported` `{length}` |
-| `blob.list` | — | `BlobList` `[{hash, length, path, linked}]` |
+| `blob.list` | — | `BlobList` `[{hash, length, linked}]` |
 
 A blob is immutable content of at most 16 MiB, named by its BLAKE3 hash as 64
 hex characters. Paths are absolute paths on the Host's machine.
 
-`blob.import` links the file in place: the Host hashes it once and records its
+`blob.import` with `{"source":{"path":"/absolute/file"}}` links the file in place: the Host hashes it once and records its
 path, without copying it or reading it whole into memory. The file must stay
 unchanged while executions use it; a program that checks what it receives
 detects a changed file, but the Host does not. Importing the same content again
 succeeds with the same hash and records the new path. A missing or unreadable
 path, or content over the limit, is `BadRequest`.
 
-`blob.export` writes the blob to a new file at `path` and never replaces an
+`blob.import` with `{"source":{"upload":"<64-hex>"}}` copies an upload
+into an owned file (`linked: false`), preferring an octet-stream upload over
+a Wasm upload of the same hash. Content already held keeps its existing
+record. Uploads are shared across Hosts and cleared at daemon start; the
+owned copy survives that cleanup.
+
+`blob.export` is socket-only and writes the blob to a new file at `path` and never replaces an
 existing file (`BadRequest`). An unknown hash is `NotFound`; a blob whose file
 is gone or shorter than its length is `BadRequest`.
 
-`blob.list` returns every blob the Host stores, ordered by hash. `path` is the
-file the Host reads the blob from. `linked` is true for a file imported in
-place with `blob.import` and false for a file the Host received and owns.
+`blob.list` returns every blob the Host stores, ordered by hash, without
+filesystem paths. `linked` is true for a file imported in place and false
+for an owned copy or a file received through execution.
 
 An execution reads only the blobs its participant grants in `exec.new` and the
 blobs it receives and commits. Pass a blob's `hash` and `length` to the program
 as ordinary params. The Host never logs blob bytes. The CLI wraps these as
 `arena0 blob import FILE`, `arena0 blob export HASH FILE`, `arena0 blob list`,
 and `arena0 exec create PROGRAM --blob HASH` (repeatable).
+
+## Open offers
+
+`negotiation.offers` is a Host request with no params. It returns
+`Offers(Vec<OpenOffer>)`, ordered by `(program_id, creator, negotiation_id)`.
+Each `OpenOffer` contains `program_id`, `negotiation_id`, `creator`, `offer_seq`,
+`target_size`, `params` (JSON), `deadline_unix_ms`, and `first_seen_ms` (the local
+Unix-millisecond time this Host first observed that negotiation).
+
+Each Host watches every program in its catalog, including programs imported
+after startup. The list contains other peers' offers authenticated by the
+creator's Active ticket; the Host's own offers are excluded. Discovery does
+not initialize the guest: a Join still checks whether the offered params and
+initial state are usable before accepting. Use the listed `creator` and
+`negotiation_id` as an `exec.new` Join target.
+
+New entries emit `negotiation.offer_seen`. Completion, expiration, and catalog
+removal emit `negotiation.offer_closed` with `complete`, `expired`, or `unwatched`.
+Listing removes expired entries immediately; otherwise a five-second sweep
+expires them. The list holds at most 256 offers, evicting the oldest local
+observation without a closure event when full. Refresh the list to reconcile
+capacity eviction or a lagged event stream. A newer or equal offer sequence
+updates an entry without changing its first-seen time or emitting another
+`offer_seen` event.
 
 ## Execution
 
@@ -114,7 +155,7 @@ and `arena0 exec create PROGRAM --blob HASH` (repeatable).
 | `exec.submit` | `{exec_id, pending_id, answer?}` | `Ack` |
 | `exec.query` | `{exec_id, query?}` | `Query` |
 | `exec.view` | `{exec, width, color, at_step?}` | `ExecView` |
-| `exec.trace` | `{exec_id, from, to}` | `Trace` `[{certified_at_ms, entry}]` |
+| `exec.trace` | `{exec_id, from, to}` | `Trace` `[{certified_at_ms, entry, message}]` |
 | `exec.cancel_creation` | `{exec_id}` | `Ack` |
 | `exec.withdraw` | `{exec_id}` | `Ack` |
 | `exec.terminate` | `{exec_id, reason}` | `Ack` |
@@ -206,18 +247,30 @@ the execution's latest durable transition. Before the execution exists,
 `updated_at_ms` is the activation record's latest change, and before that the
 request's `created_at_ms`.
 
+Terminal states retain their result: `Completed` carries `outcome` (JSON or
+`null` when the program omits it), `Aborted` carries a `reason` string, and
+`Failed` carries an optional `reason`. A failed request's reason takes precedence
+over its execution's terminal cause when both exist.
+
+`exec.list` returns `ExecList` entries shaped as `{status, activation}`. `status`
+has the same shape as `exec.status`; `activation` is `null` until preparation
+starts, then carries the same durable activation facts as `exec.inspect`.
+
 The top-level `end` object reports local confirmation of the terminal result:
 `{"phase":"open","unconfirmed":[]}`, `{"phase":"ending","unconfirmed":["<peer-id>"]}`,
 or `{"phase":"ended","unconfirmed":[]}`. `ended` can retain unconfirmed
 peers when the confirmation window expires; receipt availability is independent
 of this phase.
+`exec.session.end_progress` events carry `{phase, unconfirmed}` after each
+durable change to these local handshake facts.
 
 `exec.inspect` is a bounded, Host-local diagnostic projection for operator
 interfaces. It returns `exec.status`, durable activation facts, participant
 peer IDs and ticket commitments, the offer `params` as JSON (every participant
 of the offer signed them), and summaries of event dispatch records.
-It never returns event payloads, replacement local state, signatures, keys,
-outcomes, or callout context. Event records are the latest
+Its status includes the local participant's callout context and terminal outcome.
+It never returns event payloads, replacement local state, signatures, or keys.
+Event records are the latest
 store-bounded window. The response exposes the page through `events_from`,
 `events`, `events_total`, and `events_next`; `events_total` reveals when older
 records are omitted.
@@ -225,7 +278,12 @@ Inspection data is local diagnostic evidence, not a protocol receipt or
 semantic system-event stream.
 
 `exec.trace` returns the agreed steps in `[from, to)`, each as
-`{certified_at_ms, entry}`. `entry` is the portable trace entry.
+`{certified_at_ms, entry, message}`. `entry` is the portable trace entry.
+`message` is `null` for session start. For message steps it is
+`{"Json": <decoded JSON>}` or `{"Undecodable":{"error":"..."}}`, decoded
+using the program's first Borsh message schema. Decode errors describe the
+schema mismatch without payload bytes. A missing schema reports
+`program declares no message schema`.
 `certified_at_ms` is the local time, in Unix milliseconds, at which this Host
 durably stored the step. It is a local observation that differs between Hosts
 and is not part of the trace entry, the trace hashes, or any receipt.
@@ -274,8 +332,10 @@ or consumed is specified once, in
 and [durable delivery](../protocol-architecture.md#durable-delivery). While an
 answered result is staged for agreement, the committed callout stays visible; a
 duplicate submission waits for agreement and then returns `CalloutNotPending`.
-`pending_callout` in `exec.status` contains only `pending_id` and
-`callout_index`.
+`pending_callout` in `exec.status` contains `pending_id`, `callout_index`,
+`name`, `prompt`, `schema`, and `context`, with the same values as `exec.next`.
+Names, prompts, and answer schemas come from the program schema; context is
+guest-produced JSON for the local participant.
 
 `exec.submit` returns `InputRejected` when the pending callout still belongs to
 the execution but the program rejects the answer. The response message carries

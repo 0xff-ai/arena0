@@ -148,6 +148,8 @@ pub(crate) type InboundStreamPayload = (arena0_protocol::PeerId, RecvHandle);
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum SessionMessage {
+    /// The local end handshake changed phase or confirmations.
+    EndChanged { end: arena0_protocol::EndPhase },
     /// A shared trace step became durable.
     TraceAppended { step: u64 },
     /// Activation was durable and the guest received the session-start

@@ -110,12 +110,14 @@ fn rps_wasm() -> anyhow::Result<Vec<u8>> {
 }
 
 async fn import_rps(client: &DaemonClient, hosts: &[&HostName], wasm: &[u8]) -> anyhow::Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    std::fs::write(file.path(), wasm)?;
     for host in hosts {
         let response = client
             .call_host(
                 host,
                 &HostRequest::ProgramImport {
-                    wasm: wasm.to_vec(),
+                    source: arena0_client::api::FileSource::Path(file.path().to_path_buf()),
                 },
             )
             .await?;
@@ -157,7 +159,7 @@ async fn ctrl_c_stops_real_two_host_server_with_active_execution() -> anyhow::Re
     wait_for_socket(&socket, startup_deadline).await?;
     let client = DaemonClient::new(&socket);
     let endpoint = match client.call(&Request::DaemonInfo).await? {
-        ResponseOk::DaemonInfo(info) => info.mcp_endpoint,
+        ResponseOk::DaemonInfo(info) => format!("{}/mcp", info.http_url),
         other => return Err(anyhow!("unexpected daemon info response: {other:?}")),
     };
     let mcp_address: SocketAddr = endpoint
